@@ -8,8 +8,10 @@
 //!   leaves. Disconnect clears all subscriptions immediately.
 //! * Each due subscription appends a `PaneCapture` record carrying a bounded
 //!   text snapshot (at most the requested bytes, never more than 64 KiB, the
-//!   newest lines first). Captures are admitted below every other record
-//!   class, so pressure on the spool stops them first.
+//!   newest lines first). Unchanged text is not appended again until a
+//!   keep-alive interval has passed, so an idle pane does not fill the hub's
+//!   ingress quota. Captures are admitted below every other record class, so
+//!   pressure on the spool stops them first.
 //! * Subscriptions are memory only. A restarted spoke has none, which is right:
 //!   the hub's next renewal reopens whatever is still being watched.
 //!
@@ -35,12 +37,17 @@ use boss_spoke_outbound::SharedJournal;
 
 /// How often the loop looks for due subscriptions; finer than the fastest cadence.
 const TICK: Duration = Duration::from_millis(250);
+/// An idle pane still emits one snapshot this often so a viewer can tell the
+/// feed is alive. Shorter than this, identical text is not appended.
+const KEEP_ALIVE: Duration = Duration::from_secs(60);
 
 struct Subscription {
     generation: u64,
     run: Run,
     max_bytes: usize,
     schedule: Schedule,
+    /// Digest and time of the last appended snapshot, for skipping unchanged text.
+    last_snapshot: Option<(u64, Instant)>,
 }
 
 struct Schedule {
@@ -152,6 +159,7 @@ impl Captures {
                     expires,
                     next_due: now,
                 },
+                last_snapshot: None,
             },
         );
         Applied::Opened
@@ -229,9 +237,10 @@ impl Captures {
         }
         let cancelling = capture.ttl_seconds != 0 && capture.ttl_seconds <= CANCEL_CAPTURE_TTL_SECONDS;
         if !cancelling {
-            match live_record(journal, run) {
-                Ok(Some(_)) => {}
-                Ok(None) => return reply(ResultCode::Absent, "no live worker for this run"),
+            match live_worker(journal, run) {
+                Ok(LiveWorker::Present(_)) => {}
+                Ok(LiveWorker::NotStarted) => return reply(ResultCode::Unknown, "worker has not started"),
+                Ok(LiveWorker::Ended) => return reply(ResultCode::Absent, "no live worker for this run"),
                 Err(error) => return reply(ResultCode::OutcomeUncertain, &format!("{error:#}")),
             }
         }
@@ -242,18 +251,40 @@ impl Captures {
     }
 }
 
+/// What the journal says about `run` for a capture command or tick.
+enum LiveWorker {
+    Present(Box<ExecutionRecord>),
+    /// No execution record yet: Spawn has not been journaled.
+    NotStarted,
+    /// The record is terminal, or it is a different execution or generation.
+    Ended,
+}
+
 /// The execution record for `run`, when it is this run and not yet finished.
-fn live_record(journal: &SharedJournal, run: &Run) -> Result<Option<ExecutionRecord>> {
+fn live_worker(journal: &SharedJournal, run: &Run) -> Result<LiveWorker> {
     let bytes = journal
         .lock()
         .map_err(|_| anyhow::Error::from(Fault::LockPoisoned))?
         .load_execution(&run.run_id, &run.spawn_token)?;
-    let Some(bytes) = bytes else { return Ok(None) };
+    let Some(bytes) = bytes else {
+        return Ok(LiveWorker::NotStarted);
+    };
     let record: ExecutionRecord = serde_json::from_slice(&bytes)?;
-    Ok((record.execution_id == run.execution_id
+    if record.execution_id == run.execution_id
         && record.assignment_generation == run.assignment_generation
-        && record.phase != Phase::Terminal)
-        .then_some(record))
+        && record.phase != Phase::Terminal
+    {
+        Ok(LiveWorker::Present(Box::new(record)))
+    } else {
+        Ok(LiveWorker::Ended)
+    }
+}
+
+fn text_digest(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Look at every due subscription once. Separate from [`serve`] so a test can
@@ -269,9 +300,10 @@ pub async fn tick(
         if !Captures::current(&captures.table(), &due, now.max(Instant::now())) {
             continue;
         }
-        let record = match live_record(journal, &due.run) {
-            Ok(Some(record)) => record,
-            Ok(None) => {
+        let record = match live_worker(journal, &due.run) {
+            Ok(LiveWorker::Present(record)) => record,
+            Ok(LiveWorker::NotStarted) => continue,
+            Ok(LiveWorker::Ended) => {
                 captures.remove_current(&due);
                 continue;
             }
@@ -292,6 +324,7 @@ pub async fn tick(
             }
         };
         let (text, truncated) = bound_snapshot(&text, due.max_bytes);
+        let digest = text_digest(&text);
         let capture = Record {
             observed: Some(stamp()?),
             run: Some(due.run.clone()),
@@ -302,17 +335,29 @@ pub async fn tick(
             })),
             ..Default::default()
         };
-        let table = captures.table();
+        let mut table = captures.table();
         if !Captures::current(&table, &due, now.max(Instant::now())) {
+            continue;
+        }
+        if let Some(existing) = table.get(&due.subscription_id)
+            && let Some((last_digest, at)) = existing.last_snapshot
+            && last_digest == digest
+            && now.saturating_duration_since(at) < KEEP_ALIVE
+        {
             continue;
         }
         let appended = journal
             .lock()
             .map_err(|_| anyhow::Error::from(Fault::LockPoisoned))?
             .append(capture, Admission::Capture);
-        drop(table);
         match appended {
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(existing) = table.get_mut(&due.subscription_id)
+                    && existing.generation == due.generation
+                {
+                    existing.last_snapshot = Some((digest, now));
+                }
+            }
             // Captures are the first thing the spool sheds; the next look retries.
             Err(error) if Fault::is_full(&error) => {
                 tracing::debug!(run = due.run.run_id, "capture dropped: spool pressure");
@@ -504,7 +549,9 @@ mod tests {
         let ask = |captures: &Captures, command: &Command, ttl, now_ms| {
             captures.command(&journal, command, &subscribe("s", ttl, 0), now_ms, Instant::now())
         };
-        assert_eq!(ask(&captures, &command, 30, 1).code, ResultCode::Absent as i32);
+        let not_started = ask(&captures, &command, 30, 1);
+        assert_eq!(not_started.code, ResultCode::Unknown as i32);
+        assert_eq!(not_started.reason, "worker has not started");
         save(&journal, Phase::Alive);
         assert_eq!(ask(&captures, &command, 30, 1).code, ResultCode::Ok as i32);
         assert_eq!(captures.len(), 1);
@@ -553,6 +600,41 @@ mod tests {
         assert_eq!(found[1].subscription_id, "s");
         assert!(found[1].truncated && found[1].text_utf8.len() <= 16);
         assert_eq!(String::from_utf8(found[1].text_utf8.clone()).unwrap(), "newest");
+        assert_eq!(captures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identical_reads_do_not_append_duplicate_records() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        save(&journal, Phase::Alive);
+        let captures = Captures::default();
+        let start = Instant::now();
+        captures.apply(&run(), &subscribe("s", 120, 1000), start);
+        let source = Script(Mutex::new((0..8).map(|_| PaneRead::Text("same pane".into())).collect()));
+        for second in 0..4 {
+            tick(
+                &journal,
+                &captures,
+                &source,
+                &stamp,
+                start + Duration::from_secs(second),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            captured(&journal).len(),
+            1,
+            "unchanged text is not re-appended inside the keep-alive window"
+        );
+        tick(&journal, &captures, &source, &stamp, start + KEEP_ALIVE)
+            .await
+            .unwrap();
+        let found = captured(&journal);
+        assert_eq!(found.len(), 2, "a keep-alive snapshot is appended after the window");
+        assert_eq!(found[0].text_utf8, b"same pane");
+        assert_eq!(found[1].text_utf8, b"same pane");
         assert_eq!(captures.len(), 1);
     }
 

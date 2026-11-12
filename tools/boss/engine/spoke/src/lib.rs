@@ -168,7 +168,23 @@ mod tests {
             }
         };
         drop(inner);
-        self::journal(root, limits)
+        // Sibling tests fork shim children in this process. A child forked while
+        // our lock fd was open keeps the flock's open file description alive
+        // until its exec closes it, so the lock can stay held briefly after the
+        // journal is dropped. Retry until that window closes.
+        let path = root.join("state");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match Journal::open(&path, "host", limits) {
+                Ok(journal) => return Arc::new(Mutex::new(journal)),
+                Err(error)
+                    if error.to_string().contains("daemon lock is held") && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("reopen {}: {error}", path.display()),
+            }
+        }
     }
     fn execution(root: &Path) -> ExecutionRecord {
         let pending = root.join("pending");

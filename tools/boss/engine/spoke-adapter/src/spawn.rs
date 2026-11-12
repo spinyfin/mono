@@ -653,8 +653,12 @@ impl SpokeHostAdapter {
         Ok(match sent {
             Ok(result) => match ResultCode::try_from(result.code) {
                 Ok(ResultCode::Ok) => PaneCaptureOutcome::Accepted,
-                Ok(ResultCode::Absent) => PaneCaptureOutcome::Ended,
                 Ok(ResultCode::Rejected) => PaneCaptureOutcome::Refused(result.reason),
+                // An open assignment may outlive the host's terminal record.
+                Ok(ResultCode::Absent) => PaneCaptureOutcome::Unreachable(format!(
+                    "host {host} reports the worker has finished; waiting for the assignment to resolve: {}",
+                    result.reason
+                )),
                 _ => PaneCaptureOutcome::Unreachable(format!("host {host} could not answer: {}", result.reason)),
             },
             Err(CommandOutcome::Invalid) => PaneCaptureOutcome::Refused("the capture request was invalid".to_owned()),

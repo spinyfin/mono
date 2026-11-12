@@ -55,6 +55,58 @@ pub const REQUIRED_FEATURES: [&str; 8] = [
     feature::ARTIFACT,
 ];
 
+/// Features a workspace-executor Hello adds on top of journal. Keep this list
+/// in lockstep with executor support: every workspace op that needs a
+/// negotiated feature is advertised from here, so Hello and the executor
+/// cannot drift. Protocol-optional names (`workspace-reset-release`,
+/// `spawn-launch-inputs`, `pane-capture`) stay optional; the rest are
+/// required. `pane-capture` is offered because the production spoke runs the
+/// capture loop beside the session; a hub that predates it simply negotiates
+/// it away.
+pub const EXECUTOR_FEATURES: &[&str] = &[
+    feature::WORKSPACE,
+    feature::EXECUTION,
+    feature::WORKSPACE_RESET_RELEASE,
+    feature::SPAWN_LAUNCH_INPUTS,
+    feature::SPAWN_WORKER_POSTURE,
+    feature::WORKER_EVENT,
+    feature::TRANSCRIPT_DELTA,
+    feature::PANE_CAPTURE,
+    feature::WORKER_API,
+    feature::PROPOSAL_JSON,
+    feature::ARTIFACT,
+];
+
+/// Epoch 1 with journal at revision 1 required. The journal-only Hello and
+/// the executor Hello both start here so the journal revision cannot drift.
+pub fn journal_contracts() -> Contracts {
+    Contracts {
+        min_epoch: EPOCH,
+        max_epoch: EPOCH,
+        features: vec![Feature {
+            name: feature::JOURNAL.into(),
+            revision: 1,
+        }],
+        required: vec![feature::JOURNAL.into()],
+    }
+}
+
+/// Journal plus the executor-backed workspace/execution set. This is the
+/// production executor Hello.
+pub fn executor_contracts() -> Contracts {
+    let mut contracts = journal_contracts();
+    for &name in EXECUTOR_FEATURES {
+        contracts.features.push(Feature {
+            name: name.into(),
+            revision: 1,
+        });
+        if !OPTIONAL_FEATURES.contains(&name) {
+            contracts.required.push(name.into());
+        }
+    }
+    contracts
+}
+
 /// Negotiated per connection when both sides offer them; a mixed-version
 /// connection keeps execution without them.
 pub const OPTIONAL_FEATURES: [&str; 5] = [
@@ -416,6 +468,58 @@ mod tests {
         let mut partial = required_at(1);
         partial.pop();
         assert!(local.confirm(&welcome(1, partial)).is_err(), "required feature dropped");
+    }
+
+    #[test]
+    fn journal_contracts_are_the_shared_journal_only_base() {
+        let offered = journal_contracts();
+        assert_eq!(offered.min_epoch, EPOCH);
+        assert_eq!(offered.max_epoch, EPOCH);
+        assert_eq!(
+            offered.features,
+            vec![Feature {
+                name: feature::JOURNAL.into(),
+                revision: 1,
+            }]
+        );
+        assert_eq!(offered.required, vec![feature::JOURNAL.to_owned()]);
+        let executor = executor_contracts();
+        for item in &offered.features {
+            assert!(executor.features.iter().any(|feature| feature == item));
+        }
+        for name in &offered.required {
+            assert!(executor.required.iter().any(|required| required == name));
+        }
+    }
+
+    #[test]
+    fn executor_contracts_offer_the_executor_set_with_optional_names_optional() {
+        let offered = executor_contracts();
+        assert_eq!(offered.min_epoch, EPOCH);
+        assert_eq!(offered.max_epoch, EPOCH);
+        assert!(
+            offered
+                .features
+                .iter()
+                .any(|item| item.name == feature::JOURNAL && item.revision == 1)
+        );
+        for &name in EXECUTOR_FEATURES {
+            assert!(
+                offered
+                    .features
+                    .iter()
+                    .any(|item| item.name == name && item.revision == 1),
+                "{name}"
+            );
+            let required = offered.required.iter().any(|required| required == name);
+            assert_eq!(required, !OPTIONAL_FEATURES.contains(&name), "{name}");
+        }
+        let selection = Contracts::first_release()
+            .select(&hello(1, 1, offered.features))
+            .unwrap();
+        for name in [feature::WORKER_API, feature::PROPOSAL_JSON, feature::ARTIFACT] {
+            assert!(selection.has(name), "{name}");
+        }
     }
 
     #[test]

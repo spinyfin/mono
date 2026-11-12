@@ -128,7 +128,7 @@ impl PaneViewers {
 /// Keeps `run_id`'s capture alive while someone watches it.
 async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWake>) {
     let topic = pane_capture_topic(&run_id);
-    let sub_id = subscription_id(&run_id);
+    let mut sub_id = subscription_id(&run_id);
     let mut snapshots = state.pane_viewers.feed.subscribe();
     let renew_every = Duration::from_millis(state.pane_viewers.renew_every_ms.load(Ordering::SeqCst).max(1));
     let mut renew = tokio::time::interval(renew_every);
@@ -140,6 +140,14 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
     // What viewers were last told about the capture's health, so an unchanged
     // failure is not re-pushed on every renewal.
     let mut told: Option<(PaneCaptureState, String)> = None;
+    // Last Live snapshot this task published. A late joiner, while no health
+    // banner is current, is replayed from here so they do not wait for the
+    // spoke's keep-alive. Each newer snapshot replaces it; a health or terminal
+    // publish leaves it in place, and `told` gates the join path so a
+    // superseded Live is not replayed. Recovery from a banner waits for a
+    // fresh snapshot: the next host request uses a new subscription id so the
+    // spoke captures immediately instead of waiting out keep-alive.
+    let mut last_live: Option<Arc<PaneSnapshot>> = None;
     let mut first = true;
 
     loop {
@@ -152,6 +160,7 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
                     match snapshot {
                         Ok(snapshot) if snapshot.run_id == run_id && snapshot.subscription_id == sub_id => {
                             told = None;
+                            last_live = Some(Arc::clone(&snapshot));
                             publish_snapshot(&state, &snapshot).await;
                         }
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -176,6 +185,13 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
                 cancel(adapter.as_ref(), &run_id, &sub_id).await;
             }
             return;
+        }
+        if joined {
+            if let Some((status, detail)) = told.clone() {
+                tell_if_new(&state, &run_id, &host_id, &mut told, status, detail, true).await;
+            } else if let Some(cached) = &last_live {
+                publish_snapshot(&state, cached).await;
+            }
         }
         if !due && !joined {
             // Only a departure woke the task, and a viewer remains.
@@ -202,9 +218,11 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
                             format!("could not read the worker's assignment: {error:#}"),
                         ),
                     };
-                    publish_state(&state, &run_id, &host_id, status, &detail).await;
-                    finish(&state, &run_id).await;
-                    return;
+                    tell_if_new(&state, &run_id, &host_id, &mut told, status, detail, joined).await;
+                    if finish_if_unwatched(&state, &run_id, &topic).await {
+                        return;
+                    }
+                    continue;
                 }
                 Err(error) => {
                     tell_if_new(
@@ -235,20 +253,31 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
             Ok(Err(error)) => PaneCaptureOutcome::Unreachable(format!("{error:#}")),
             Err(_) => PaneCaptureOutcome::Unreachable("the host did not answer in time".to_owned()),
         };
+        if !matches!(outcome, PaneCaptureOutcome::Accepted) && told.is_none() {
+            // Fence queued snapshots before publishing a health banner. Only
+            // the recovery subscription may restore Live. Retire the old
+            // subscription even if its renewal timed out at the hub.
+            let previous = std::mem::replace(&mut sub_id, subscription_id(&run_id));
+            cancel(host.as_ref(), &run_id, &previous).await;
+        }
         match outcome {
-            // Snapshots arrive on the feed.
+            // Snapshots arrive on the feed. Do not restore Live from the cache:
+            // Accepted is not evidence a pane read succeeded.
             PaneCaptureOutcome::Accepted => {}
             PaneCaptureOutcome::Ended => {
-                publish_state(
+                tell_if_new(
                     &state,
                     &run_id,
                     &host_id,
+                    &mut told,
                     PaneCaptureState::Ended,
-                    "the worker has ended",
+                    "the worker has ended".to_owned(),
+                    joined,
                 )
                 .await;
-                finish(&state, &run_id).await;
-                return;
+                if finish_if_unwatched(&state, &run_id, &topic).await {
+                    return;
+                }
             }
             PaneCaptureOutcome::Unsupported(reason) => {
                 tell_if_new(
@@ -288,11 +317,19 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
             }
         }
     }
-    finish(&state, &run_id).await;
+    state.pane_viewers.running.lock().await.remove(&run_id);
 }
 
-async fn finish(state: &ServerState, run_id: &str) {
-    state.pane_viewers.running.lock().await.remove(run_id);
+/// Drop the task from the registry only when nobody is watching. A viewer that
+/// arrives between a terminal publish and this check is attached to a live
+/// task rather than one that is about to return.
+async fn finish_if_unwatched(state: &ServerState, run_id: &str, topic: &str) -> bool {
+    let mut running = state.pane_viewers.running.lock().await;
+    if state.topic_broker.has_subscribers(topic).await {
+        return false;
+    }
+    running.remove(run_id);
+    true
 }
 
 async fn cancel(adapter: &dyn boss_execution_contracts::HostAdapter, run_id: &str, sub_id: &str) {
@@ -486,6 +523,7 @@ mod flow_tests {
     struct Remote {
         answer: Mutex<PaneCaptureOutcome>,
         requests: Mutex<Vec<PaneCaptureRequest>>,
+        pending: Mutex<Option<tokio::sync::oneshot::Receiver<PaneCaptureOutcome>>>,
     }
     struct Provider(Arc<Remote>);
 
@@ -501,6 +539,7 @@ mod flow_tests {
             Arc::new(Self {
                 answer: Mutex::new(answer),
                 requests: Mutex::new(vec![]),
+                pending: Mutex::new(None),
             })
         }
         fn opens(&self) -> usize {
@@ -574,6 +613,14 @@ mod flow_tests {
         }
         async fn capture_worker_pane(&self, _: &str, request: &PaneCaptureRequest) -> Result<PaneCaptureOutcome> {
             self.requests.lock().unwrap().push(request.clone());
+            let pending = if request.cancel {
+                None
+            } else {
+                self.pending.lock().unwrap().take()
+            };
+            if let Some(pending) = pending {
+                return Ok(pending.await.unwrap());
+            }
             Ok(if request.cancel {
                 PaneCaptureOutcome::Accepted
             } else {
@@ -739,6 +786,143 @@ mod flow_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_viewer_gets_the_last_snapshot_without_a_new_host_snapshot() {
+        let remote = Remote::new(PaneCaptureOutcome::Accepted);
+        let (state, _dir) = state_with(&remote, true);
+        state.pane_viewers.set_renew_every(Duration::from_secs(600));
+        let first = viewer(&state, "viewer-a").await;
+        until("the capture to open", || remote.opens() >= 1).await;
+
+        state.pane_viewers.feed().send(snapshot(&remote, "idle pane")).unwrap();
+        assert_eq!(next_capture(&first).await.1, "idle pane");
+
+        let second = viewer(&state, "viewer-b").await;
+        let envelope = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let envelope = second.next().await.expect("sink closed");
+                if let FrontendEvent::TopicEvent {
+                    event:
+                        TopicEventPayload::WorkerPaneCapture {
+                            state: PaneCaptureState::Live,
+                            text,
+                            observed_unix_ms,
+                            truncated,
+                            ..
+                        },
+                    ..
+                } = envelope.payload
+                {
+                    return (text, observed_unix_ms, truncated);
+                }
+            }
+        })
+        .await
+        .expect("second viewer did not receive the cached pane");
+        // The original observation time is preserved; a join must not look like
+        // a freshly captured pane.
+        assert_eq!(envelope, ("idle pane".into(), Some(1_700_000_000_000), true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepted_after_a_banner_does_not_republish_cached_live_text() {
+        let remote = Remote::new(PaneCaptureOutcome::Accepted);
+        let (state, _dir) = state_with(&remote, true);
+        let sink = viewer(&state, "viewer-a").await;
+        until("the capture to open", || remote.opens() >= 1).await;
+        let original_sub = remote.latest_subscription();
+
+        state.pane_viewers.feed().send(snapshot(&remote, "x")).unwrap();
+        assert_eq!(next_capture(&sink).await.1, "x");
+
+        *remote.answer.lock().unwrap() = PaneCaptureOutcome::Unreachable("host spoke is not connected".into());
+        assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Unreachable);
+
+        *remote.answer.lock().unwrap() = PaneCaptureOutcome::Accepted;
+        let opened = remote.opens();
+        until("the Accepted recovery request", || remote.opens() > opened).await;
+        assert_ne!(
+            remote.latest_subscription(),
+            original_sub,
+            "recovery opens a new subscription so the spoke captures immediately"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_capture(&sink))
+                .await
+                .is_err(),
+            "Accepted after a banner must not republish cached Live text"
+        );
+
+        let second = viewer(&state, "viewer-b").await;
+        assert_eq!(next_capture(&second).await.0, PaneCaptureState::Unreachable);
+        assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Unreachable);
+        state.pane_viewers.feed().send(snapshot(&remote, "fresh")).unwrap();
+        assert_eq!(next_capture(&second).await.1, "fresh");
+        let (capture_state, text, ..) = next_capture(&sink).await;
+        assert_eq!((capture_state, text.as_str()), (PaneCaptureState::Live, "fresh"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_snapshot_cannot_clear_a_new_health_banner() {
+        let remote = Remote::new(PaneCaptureOutcome::Accepted);
+        let (state, _dir) = state_with(&remote, true);
+        let sink = viewer(&state, "viewer-a").await;
+        until("the capture to open", || remote.opens() >= 1).await;
+        let stale = snapshot(&remote, "queued stale text");
+        let old_id = remote.latest_subscription();
+        let (answer, pending) = tokio::sync::oneshot::channel();
+        *remote.pending.lock().unwrap() = Some(pending);
+        until("the pending renewal", || remote.pending.lock().unwrap().is_none()).await;
+        state.pane_viewers.feed().send(stale).unwrap();
+        answer.send(PaneCaptureOutcome::Unreachable("offline".into())).unwrap();
+        assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Unreachable);
+        until("the recovery subscription", || remote.latest_subscription() != old_id).await;
+        assert!(
+            remote
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.cancel && r.subscription_id == old_id)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next_capture(&sink))
+                .await
+                .is_err()
+        );
+        state.pane_viewers.feed().send(snapshot(&remote, "recovered")).unwrap();
+        assert_eq!(next_capture(&sink).await.1, "recovered");
+        let recovery_id = remote.latest_subscription();
+        unsubscribe(&state, "viewer-a").await;
+        until("the recovery cancel", || {
+            remote
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.cancel && r.subscription_id == recovery_id)
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_does_not_replay_live_text_after_the_host_became_unreachable() {
+        let remote = Remote::new(PaneCaptureOutcome::Accepted);
+        let (state, _dir) = state_with(&remote, true);
+        let first = viewer(&state, "viewer-a").await;
+        until("the capture to open", || remote.opens() >= 1).await;
+        state.pane_viewers.feed().send(snapshot(&remote, "stale")).unwrap();
+        assert_eq!(next_capture(&first).await.1, "stale");
+
+        *remote.answer.lock().unwrap() = PaneCaptureOutcome::Unreachable("host spoke is not connected".into());
+        assert_eq!(next_capture(&first).await.0, PaneCaptureState::Unreachable);
+
+        let second = viewer(&state, "viewer-b").await;
+        let (capture_state, text, ..) = next_capture(&second).await;
+        assert_eq!(capture_state, PaneCaptureState::Unreachable);
+        assert!(text.is_empty(), "a superseded Live snapshot must not be replayed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_disconnected_viewer_stops_the_capture_but_a_second_viewer_keeps_it() {
         let remote = Remote::new(PaneCaptureOutcome::Accepted);
         let (state, _dir) = state_with(&remote, true);
@@ -807,11 +991,36 @@ mod flow_tests {
         let (state, _dir) = state_with(&remote, true);
         let sink = viewer(&state, "viewer-a").await;
         assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Ended);
+        assert!(
+            futures_executor_block(state.pane_viewers.active_runs()) > 0,
+            "the still-subscribed viewer keeps the task so a later recovery is not lost"
+        );
+        unsubscribe(&state, "viewer-a").await;
         until("the task to end", || {
             futures_executor_block(state.pane_viewers.active_runs()) == 0
         })
         .await;
-        assert_eq!(remote.cancels(), 0, "there is nothing left to cancel");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_that_answers_absent_then_accepted_keeps_the_view() {
+        let remote = Remote::new(PaneCaptureOutcome::Unreachable("no live worker for this run".into()));
+        let (state, _dir) = state_with(&remote, true);
+        let assignment = state.work_db.spoke_assignment_for_execution(RUN).unwrap().unwrap();
+        assert!(!assignment.resolved, "the assignment is still open");
+        let sink = viewer(&state, "viewer-a").await;
+        assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Unreachable);
+        assert!(
+            futures_executor_block(state.pane_viewers.active_runs()) > 0,
+            "a worker that has not spawned yet must not end the view"
+        );
+
+        *remote.answer.lock().unwrap() = PaneCaptureOutcome::Accepted;
+        let opened = remote.opens();
+        until("the next renewal", || remote.opens() > opened).await;
+        state.pane_viewers.feed().send(snapshot(&remote, "started")).unwrap();
+        let (capture_state, text, ..) = next_capture(&sink).await;
+        assert_eq!((capture_state, text.as_str()), (PaneCaptureState::Live, "started"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -828,6 +1037,11 @@ mod flow_tests {
         let sink = viewer(&state, "viewer-a").await;
         assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Ended);
         assert!(remote.requests.lock().unwrap().is_empty());
+        unsubscribe(&state, "viewer-a").await;
+        until("the task to end", || {
+            futures_executor_block(state.pane_viewers.active_runs()) == 0
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -839,6 +1053,11 @@ mod flow_tests {
         assert_eq!(capture_state, PaneCaptureState::Unsupported);
         assert!(detail.unwrap().contains("spoke-connected"));
         assert!(remote.requests.lock().unwrap().is_empty());
+        unsubscribe(&state, "viewer-a").await;
+        until("the task to end", || {
+            futures_executor_block(state.pane_viewers.active_runs()) == 0
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
