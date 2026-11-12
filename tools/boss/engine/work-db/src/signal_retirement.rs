@@ -140,41 +140,12 @@ pub(crate) fn clear_resolved_signal_in_tx(
     let task_transitioned = if ci {
         crate::blocking::clear_blocked_ci_failure_in_tx(conn, item, pr, false, actor)?.is_some()
     } else {
-        // The PR is mergeable, which is the authority for lifting the block.
-        // The one thing that stops it is a block owned by a *different live*
-        // attempt (a newer conflict that has its own fix in flight). A task
-        // with no recorded `blocked_attempt_id` (a legacy row, or one whose
-        // attempt was adopted without being recorded) or one pointing at an
-        // ended attempt has no live owner to protect, so it is cleared.
-        let owner_blocks_clear = match conflict.as_ref() {
-            Some(a) => {
-                let recorded = query_task(conn, item)?.and_then(|t| t.blocked_attempt_id);
-                match recorded {
-                    Some(recorded) if recorded != a.id => conn
-                        .query_row(
-                            "SELECT 1 FROM conflict_resolutions
-                              WHERE id = ?1 AND status IN ('pending', 'running')",
-                            [&recorded],
-                            |_| Ok(()),
-                        )
-                        .optional()?
-                        .is_some(),
-                    _ => false,
-                }
-            }
-            None => false,
-        };
-        if owner_blocks_clear {
-            tracing::info!(
-                work_item_id = item,
-                pr_url = pr,
-                attempt_id = conflict.as_ref().map(|a| a.id.as_str()),
-                "signal retirement declined: the merge_conflict block belongs to a different live attempt",
-            );
-            false
-        } else {
-            crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some()
-        }
+        // A definitive mergeable observation of the task's current PR is the
+        // authority for lifting the block, whichever attempt (if any) is
+        // recorded as its owner: a stale or foreign `blocked_attempt_id` must
+        // never keep a mergeable PR blocked. Attempt retirement is handled
+        // separately below.
+        crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some()
     };
     let retire_conflict = conflict
         .as_ref()
@@ -495,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_clear_declines_when_a_different_live_attempt_owns_the_block() {
+    fn conflict_clear_recovers_when_a_different_live_attempt_owns_the_block() {
         let db = db();
         let product = create_test_product(&db).id;
         let (item, pr) = blocked_on_conflict(&db, &product, "Owned elsewhere");
@@ -512,11 +483,24 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
+        assert_ne!(
             db.clear_resolved_pr_signal(&item, &pr, false).unwrap(),
-            ClearResolvedSignal::Nothing
+            ClearResolvedSignal::Nothing,
+            "a mergeable PR must unblock the task whoever owns the block"
         );
         let task = query_task(&db.connect().unwrap(), &item).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.status, TaskStatus::InReview);
+        // Repeated calls converge: attempt retirement may take a call or two,
+        // but the task stays unblocked and the calls settle on `Nothing`.
+        let mut settled = false;
+        for _ in 0..4 {
+            if db.clear_resolved_pr_signal(&item, &pr, false).unwrap() == ClearResolvedSignal::Nothing {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "repeated calls must converge on Nothing");
+        let task = query_task(&db.connect().unwrap(), &item).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::InReview);
     }
 }

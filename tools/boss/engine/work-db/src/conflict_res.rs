@@ -248,33 +248,40 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
-        // A newer attempt for the work item supersedes every older `pending`
-        // one. A `pending` row that outlives its successor is never retired by
-        // anything else, and a later UNIQUE collision on re-detection would
-        // adopt it as the live attempt, so retire it here, in the same
-        // transaction as the insert. The key's base sha is NULLed (see
-        // `abandon_conflict_resolution_for_supersede`) so the stale row cannot
-        // collide with a future insert either. `running` rows are left alone:
+        // A newer *live* attempt for the work item supersedes older `pending`
+        // ones that never spawned a fix vehicle. A `pending` row that outlives
+        // its successor is never retired by anything else, and a later UNIQUE
+        // collision on re-detection would adopt it as the live attempt, so
+        // retire it here, in the same transaction as the insert. The key's
+        // base sha is NULLed (see `abandon_conflict_resolution_for_supersede`)
+        // so the stale row cannot collide with a future insert either.
+        // Skipped when the churn guard pre-abandoned the new row (it supersedes
+        // nothing), and for rows with a `revision_task_id`: an in-flight
+        // revision must be closed alongside its attempt by the caller's
+        // supersede path, not orphaned here. `running` rows are left alone:
         // they hold a lease on a real worker.
-        let retired = tx.execute(
-            "UPDATE conflict_resolutions
-                SET status              = 'abandoned',
-                    failure_reason      = 'superseded_by_newer_attempt',
-                    base_sha_at_trigger = NULL,
-                    finished_at         = COALESCE(finished_at, ?3)
-              WHERE work_item_id = ?1
-                AND id != ?2
-                AND status = 'pending'
-                AND event_source != 'speculative_predicted'",
-            params![input.work_item_id, id, now],
-        )?;
-        if retired > 0 {
-            tracing::info!(
-                work_item_id = %input.work_item_id,
-                new_attempt_id = %id,
-                retired,
-                "conflict_resolutions: retired older pending attempts superseded by a newer attempt",
-            );
+        if !churn_tripped {
+            let retired = tx.execute(
+                "UPDATE conflict_resolutions
+                    SET status              = 'abandoned',
+                        failure_reason      = 'superseded_by_newer_attempt',
+                        base_sha_at_trigger = NULL,
+                        finished_at         = COALESCE(finished_at, ?3)
+                  WHERE work_item_id = ?1
+                    AND id != ?2
+                    AND status = 'pending'
+                    AND revision_task_id IS NULL
+                    AND event_source != 'speculative_predicted'",
+                params![input.work_item_id, id, now],
+            )?;
+            if retired > 0 {
+                tracing::info!(
+                    work_item_id = %input.work_item_id,
+                    new_attempt_id = %id,
+                    retired,
+                    "conflict_resolutions: retired older pending attempts superseded by a newer attempt",
+                );
+            }
         }
         // Only stamp the parent's `blocked_attempt_id` for live
         // attempts; an immediately-abandoned churn-guard row would

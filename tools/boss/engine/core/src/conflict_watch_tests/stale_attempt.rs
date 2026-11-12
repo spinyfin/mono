@@ -47,6 +47,14 @@ async fn newer_attempt_retires_older_pending_attempts() {
     assert_eq!(stale_row.status, "abandoned");
     assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
     assert!(stale_row.base_sha_at_trigger.is_none(), "key slot must be freed");
+    eprintln!(
+        "DBG status={:?} attempts={:?}",
+        chore_status(&db, &chore),
+        db.list_conflict_resolutions(None, &[], Some(&chore), None).map(|v| v
+            .into_iter()
+            .map(|a| (a.id, a.status, a.revision_task_id))
+            .collect::<Vec<_>>())
+    );
     assert_eq!(
         db.active_conflict_resolution_for_work_item(&chore)
             .unwrap()
@@ -152,13 +160,35 @@ async fn adopting_a_live_attempt_records_it_as_the_blocked_attempt() {
     )
     .await;
 
-    // Whether the attempt then spawned a revision (parent back in review) or
-    // not, the attempt that was reused must never be left unrecorded while
-    // the task is still blocked on it.
-    let t = task(&db, &chore);
-    if t.status == TaskStatus::Blocked {
-        assert_eq!(t.blocked_attempt_id, Some(attempt.id));
-    }
+    // The key holder was the live attempt, so it is the one adopted: the fix
+    // vehicle is spawned against it.
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(
+        row.revision_task_id.is_some(),
+        "the fix must be spawned against the adopted key holder",
+    );
+}
+
+#[tokio::test]
+async fn recording_an_adopted_attempt_stamps_blocked_attempt_id() {
+    // The adoption path's stamp, asserted directly: the parent is still
+    // blocked, so the outcome is observable (a spawned fix would otherwise
+    // return the parent to review and clear it).
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (product, chore) = make_in_review(&db, "C-record-direct", PR);
+    block_on_merge_conflict(&db, &chore);
+    let attempt = insert_attempt(&db, &product, &chore, "abc123", "head-A");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET blocked_attempt_id = NULL WHERE id = ?1",
+            rusqlite::params![chore],
+        )
+        .unwrap();
+
+    assert!(db.record_blocked_conflict_attempt(&chore, &attempt.id).unwrap());
+    assert_eq!(blocked_attempt_id(&db, &chore), Some(attempt.id));
 }
 
 #[tokio::test]
@@ -256,4 +286,114 @@ async fn genuinely_conflicting_pr_still_blocks() {
         "a conflicting PR with no fix vehicle stays blocked"
     );
     assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+/// Seed the legacy state: a `pending` attempt left behind by an older build
+/// (insert-time retirement would have abandoned it), holding `base` with
+/// `head`, alongside a `succeeded` attempt holding the key re-detection will
+/// probe with.
+fn seed_legacy_stale_and_holder(
+    db: &WorkDb,
+    db_path: &std::path::Path,
+    product: &str,
+    chore: &str,
+) -> (crate::work::ConflictResolution, crate::work::ConflictResolution) {
+    let stale = insert_attempt(db, product, chore, "abc123", "head-old");
+    for head in ["head-2", "head-3"] {
+        let a = insert_attempt(db, product, chore, "abc123", head);
+        db.mark_conflict_resolution_succeeded(&a.id, None).unwrap().unwrap();
+    }
+    let holder = insert_attempt(db, product, chore, "abc123", "head-A");
+    db.mark_conflict_resolution_succeeded(&holder.id, None).unwrap();
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .execute(
+            "UPDATE conflict_resolutions
+                SET status = 'pending', failure_reason = NULL, finished_at = NULL,
+                    base_sha_at_trigger = 'abc123'
+              WHERE id = ?1",
+            rusqlite::params![stale.id],
+        )
+        .unwrap();
+    rewind_attempt_created_at(db_path, &stale.id, 600);
+    (stale, holder)
+}
+
+#[tokio::test]
+async fn full_sequence_stale_attempt_collision_then_mergeable_unblocks_task() {
+    // The reported bug end to end: a stale pending attempt, newer succeeded
+    // attempts, a UNIQUE collision on re-detection, then the PR turns
+    // mergeable. The collision must not adopt the stale row, and the task
+    // must leave `blocked` once GitHub reports the PR mergeable.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let (product, chore) = make_in_review(&db, "C-full-sequence", PR);
+    block_on_merge_conflict(&db, &chore);
+    let (stale, holder) = seed_legacy_stale_and_holder(&db, &db_path, &product, &chore);
+    if chore_status(&db, &chore).0 != TaskStatus::Blocked {
+        block_on_merge_conflict(&db, &chore);
+    }
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, PR),
+        &probe_with_head(PR, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-A"),
+    )
+    .await;
+
+    // Collision outcome: the stale row is not adopted as the task's owner and
+    // no fix is spawned against it.
+    let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
+    assert!(stale_row.revision_task_id.is_none());
+    assert_ne!(blocked_attempt_id(&db, &chore).as_deref(), Some(stale.id.as_str()));
+    assert_ne!(blocked_attempt_id(&db, &chore).as_deref(), Some(holder.id.as_str()));
+
+    // Re-assert the "blocked on a conflict" state the poller would observe,
+    // whatever the detection step did with the parent, then resolve.
+    if chore_status(&db, &chore).0 != TaskStatus::Blocked {
+        block_on_merge_conflict(&db, &chore);
+    }
+    let resolved = on_resolved(
+        &db,
+        pub_.as_ref(),
+        None,
+        &candidate(&product, &chore, PR),
+        &[],
+        "MERGEABLE",
+        "CLEAN",
+    )
+    .await;
+
+    assert!(resolved, "a mergeable PR must report a transition");
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview, "a mergeable PR must unblock the task");
+    assert!(reason.is_none());
+    assert!(
+        db.active_blocked_signals(&chore)
+            .unwrap()
+            .iter()
+            .all(|s| s.reason != "merge_conflict"),
+        "the merge_conflict signal must be cleared",
+    );
+}
+
+#[tokio::test]
+async fn revision_backed_pending_attempt_is_not_retired_by_a_newer_attempt() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (product, chore) = make_in_review(&db, "C-keep-revision-backed", PR);
+    block_on_merge_conflict(&db, &chore);
+
+    let backed = insert_attempt(&db, &product, &chore, "base-1", "head-1");
+    db.set_conflict_resolution_revision_task_id(&backed.id, &chore).unwrap();
+    insert_attempt(&db, &product, &chore, "base-1", "head-2");
+
+    let row = db.get_conflict_resolution(&backed.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending", "an in-flight revision must not be orphaned");
+    assert!(row.base_sha_at_trigger.is_some());
 }

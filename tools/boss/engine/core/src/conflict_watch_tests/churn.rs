@@ -61,6 +61,12 @@ async fn churn_guard_pre_abandons_fourth_attempt_in_window() {
         "pre-abandoned attempt must carry finished_at so it's terminal",
     );
 
+    // A pre-abandoned row supersedes nothing: a3 must stay live.
+    assert_eq!(
+        db.get_conflict_resolution(&a3.id).unwrap().unwrap().status,
+        "pending",
+        "a churn-tripped insert must not retire the prior live attempt",
+    );
     // Parent's `blocked_attempt_id` must still point at the
     // most-recent live attempt (a3), not the dead a4.
     match db.get_work_item(&chore).unwrap() {
