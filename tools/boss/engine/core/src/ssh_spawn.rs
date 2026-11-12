@@ -454,11 +454,11 @@ pub async fn perform_remote_launch(
 ///
 /// Always cancels the reverse events forward. The owning host verifies inherited
 /// execution identity and process birth time before TERM/KILL, including detached
-/// descendants. A stale handshake PID or worker.pid is never signal authority.
+/// descendants. A stale handshake PID or worker.pid is never signal authority:
+/// this path does not take a pid argument and never signals by pid.
 pub async fn reap_failed_remote_turn(
     exec: &dyn SshExec,
     run_id: &str,
-    _remote_pid: Option<i64>,
     workspace_path: &str,
     events_socket_path: &str,
     engine_events_socket: &str,
@@ -1618,16 +1618,15 @@ mod tests {
 
     #[tokio::test]
     async fn failed_remote_turn_uses_owned_cleanup_even_with_stale_pid_evidence() {
-        for (exec, pid) in [
-            (FakeExec::new(0, ""), Some(4242)),
-            (FakeExec::new(0, "").with_published_worker_pid(7777), None),
-            (FakeExec::new(0, "").with_environ_scan_pids(vec![4242, 4243]), None),
-            (FakeExec::new(1, ""), None),
+        for exec in [
+            FakeExec::new(0, ""),
+            FakeExec::new(0, "").with_published_worker_pid(7777),
+            FakeExec::new(0, "").with_environ_scan_pids(vec![4242, 4243]),
+            FakeExec::new(1, ""),
         ] {
             reap_failed_remote_turn(
                 &exec,
                 "run-1",
-                pid,
                 "/remote/ws",
                 "/tmp/boss-events-run-1.sock",
                 "/engine.sock",

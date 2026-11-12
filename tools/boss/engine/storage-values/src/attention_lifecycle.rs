@@ -201,10 +201,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         LEASE_UNRELEASED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "A gate kept a finished run's lease after its pane was gone (process cleanup failed or left \
-         occupants, the owning host was unreachable, or a remote worker could not be confirmed gone). \
-         The release path resolves it when the lease returns; a run starting elsewhere proves nothing \
-         about this lease.",
+        "A gate kept a finished run's lease: process cleanup failed or left occupants after the pane \
+         was gone, the leftover-lease sweep still sees a terminal row with a present pane (a live \
+         registration or a recorded shell PID whose death is unconfirmed), the owning host was \
+         unreachable, or a remote worker could not be confirmed gone. The release path resolves it \
+         when the lease returns; a run starting elsewhere proves nothing about this lease.",
     ),
     entry(
         LEASE_RELEASE_FAILED_ATTENTION_KIND,

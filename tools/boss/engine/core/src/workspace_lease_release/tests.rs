@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::*;
 use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 mod preservation_retry;
@@ -602,89 +603,12 @@ fn wait_until_occupied(path: &Path) -> Occupancy {
 }
 
 #[test]
-fn linux_occupancy_scan_skips_namespace_init() {
-    use std::ffi::OsStr;
-    assert_eq!(linux_occupancy_pid(OsStr::new("0")), None);
-    assert_eq!(linux_occupancy_pid(OsStr::new("1")), None);
-    assert_eq!(linux_occupancy_pid(OsStr::new("self")), None);
-    assert_eq!(linux_occupancy_pid(OsStr::new("42")), Some(42));
-
-    let dir = tempfile::TempDir::new().unwrap();
-    // A same-uid unreadable PID 1 is inconclusive if recorded, which is why
-    // the enumerator must skip it.
-    let mut recorded = ProcessSnapshot {
-        cwds: vec![],
-        complete: true,
-    };
-    recorded.record(1, Err(std::io::Error::from_raw_os_error(libc::EPERM)), || {
-        Some(unsafe { libc::geteuid() })
-    });
-    assert_eq!(recorded.occupancy(dir.path()), Occupancy::Unknown);
-
-    let skipped = ProcessSnapshot {
-        cwds: vec![],
-        complete: true,
-    };
-    assert_eq!(skipped.occupancy(dir.path()), Occupancy::Empty);
-}
-
-#[test]
-fn complete_snapshot_of_an_empty_unique_dir_is_empty() {
-    let dir = tempfile::TempDir::new().unwrap();
-    assert_eq!(
-        ProcessSnapshot {
-            cwds: vec![],
-            complete: true
-        }
-        .occupancy(dir.path()),
-        Occupancy::Empty
-    );
-}
-#[test]
-fn inconclusive_cwd_and_path_probes_keep_the_lease() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let mut snapshot = ProcessSnapshot {
-        cwds: vec![],
-        complete: true,
-    };
-    snapshot.record(123, Err(std::io::Error::from_raw_os_error(libc::EPERM)), || {
-        Some(unsafe { libc::geteuid() })
-    });
-    // A directory that provably does not exist cannot hold a process.
-    assert_eq!(snapshot.occupancy(&dir.path().join("missing")), Occupancy::Empty);
-    let occupancy = snapshot.occupancy(dir.path());
-    assert_eq!(occupancy, Occupancy::Unknown);
-    assert_eq!(
-        decide(TerminalCause::Inferred, PaneStatus::Gone, occupancy),
-        LeaseReleaseDecision::Keep(KeepReason::OccupancyUnconfirmed)
-    );
-}
-
-#[test]
-fn other_users_unreadable_processes_and_deleted_cwds_do_not_block_empty() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let mut snapshot = ProcessSnapshot {
-        cwds: vec![],
-        complete: true,
-    };
-    let other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-    snapshot.record(1, Err(std::io::Error::from_raw_os_error(libc::EPERM)), || {
-        Some(other_uid)
-    });
-    snapshot.record(2, Ok(dir.path().join("deleted-cwd")), || None);
-    assert_eq!(snapshot.occupancy(dir.path()), Occupancy::Empty);
-    // An unknown owner for a failed lookup stays inconclusive.
-    snapshot.record(3, Err(std::io::Error::from_raw_os_error(libc::EACCES)), || None);
-    assert_eq!(snapshot.occupancy(dir.path()), Occupancy::Unknown);
-}
-
-#[test]
-fn real_host_snapshot_of_a_fresh_dir_is_never_occupied() {
+fn real_host_scan_of_a_fresh_dir_is_never_occupied() {
     let dir = tempfile::TempDir::new().unwrap();
     // A sandboxed CI host can hold same-uid processes whose cwd is
     // unreadable, which legitimately yields `Unknown`; what must never
     // happen is a fresh directory reading as occupied.
-    assert_ne!(ProcessSnapshot::capture().occupancy(dir.path()), Occupancy::Occupied);
+    assert_ne!(HostOccupancy.occupancy(dir.path()), Occupancy::Occupied);
 }
 
 #[tokio::test]

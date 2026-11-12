@@ -183,3 +183,78 @@ async fn a_running_runs_process_keeps_the_lease_past_the_unowned_bound() {
     let _ = owned.kill();
     let _ = owned.wait();
 }
+
+#[tokio::test]
+async fn unknown_owner_occupant_is_unowned_and_releases_after_the_bound() {
+    let (_dir, db) = open_db();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let execution = orphaned(&db, workspace.path(), "lease-unknown-owner");
+    let mut stray = spawn_detached(workspace.path(), Some("exec_from_isolated_engine"));
+
+    set_finished_ago(&db, &execution.id, 5);
+    let kept = release_with_host_occupancy(&db, &execution).await;
+    assert!(matches!(kept, LeaseReleaseOutcome::Kept { .. }), "{kept:?}");
+    assert!(
+        stray.try_wait().unwrap().is_none(),
+        "unknown owners are never signalled"
+    );
+
+    set_finished_ago(&db, &execution.id, UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    let released = release_with_host_occupancy(&db, &execution).await;
+    assert_eq!(released, LeaseReleaseOutcome::Released);
+    assert!(stray.try_wait().unwrap().is_none(), "still never signalled");
+    let items = db.list_attention_items(&execution.id).unwrap();
+    let item = items
+        .iter()
+        .find(|item| item.kind == UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND)
+        .expect("a loud attention item names the unknown-owner processes");
+    assert!(
+        item.body_markdown.contains(&stray.id().to_string()),
+        "{}",
+        item.body_markdown
+    );
+    assert!(
+        item.body_markdown.contains("exec_from_isolated_engine"),
+        "{}",
+        item.body_markdown
+    );
+    let _ = stray.kill();
+    let _ = stray.wait();
+}
+
+#[tokio::test]
+async fn terminal_owner_with_no_recorded_pid_is_unowned_and_releases_after_the_bound() {
+    let (_dir, db) = open_db();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let current = orphaned(&db, workspace.path(), "lease-no-pid");
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "old-no-pid");
+    let old = create_ready_chore_execution(&db, chore.id);
+    db.start_execution_run(&old.id, "worker", "mono", "lease-old", "ws-old", "/tmp/ws-old")
+        .unwrap();
+    db.cancel_running_execution(&old.id).unwrap();
+    let mut orphan = spawn_detached(workspace.path(), Some(&old.id));
+
+    set_finished_ago(&db, &current.id, UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    let outcome = release_with_host_occupancy(&db, &current).await;
+    assert_eq!(
+        outcome,
+        LeaseReleaseOutcome::Released,
+        "{:?}",
+        db.list_attention_items(&current.id).unwrap()
+    );
+    assert!(
+        orphan.try_wait().unwrap().is_none(),
+        "no recorded pid means no signalling"
+    );
+    let items = db.list_attention_items(&current.id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND && item.body_markdown.contains(&old.id)),
+        "{items:?}"
+    );
+    let _ = orphan.kill();
+    let _ = orphan.wait();
+}

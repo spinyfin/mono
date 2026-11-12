@@ -760,11 +760,22 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             && self.tmux.runner().manages_host_processes()
             && let Some(record) = self.loaded(run)?
         {
-            let workspace = self.workspace_path(&record.workspace_id, &record.lease_id).await?;
-            self.tmux
-                .cleanup_run_processes(&record.execution_id, &workspace)
-                .await?;
-            self.tmux.verify_workspace_quiescent(&workspace).await?;
+            // Stop's result is about the worker. Occupants a human or IDE left
+            // in the workspace are a lease-release concern, not a failed stop.
+            match self.workspace_path(&record.workspace_id, &record.lease_id).await {
+                Ok(workspace) => {
+                    if let Err(err) = self.tmux.cleanup_run_processes(&record.execution_id, &workspace).await {
+                        eprintln!(
+                            "boss: owned process cleanup after stop failed for {}; the worker is stopped: {err:#}",
+                            record.execution_id
+                        );
+                    }
+                }
+                Err(err) => eprintln!(
+                    "boss: could not resolve workspace for post-stop process cleanup for {}; the worker is stopped: {err:#}",
+                    record.execution_id
+                ),
+            }
         }
         Ok(result)
     }
@@ -791,32 +802,26 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         // remain-on-exit session without demoting the phase or replacing the
         // stored evidence; otherwise a later Adopt would report Missing.
         if record.phase == Phase::Terminal {
-            return Ok(
-                match self
-                    .tmux
-                    .kill_session_verified(&record.session, &record.spawn_token)
-                    .await
-                {
-                    Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => outcome(
-                        command,
-                        ResultCode::Ok,
-                        String::new(),
-                        Some(self.observe(&record).await),
-                    ),
-                    Err(KillSessionError::TokenMismatch { actual, .. }) => outcome(
-                        command,
-                        ResultCode::Rejected,
-                        format!("refusing stop: live token {actual} is not this execution"),
-                        Some(self.observe(&record).await),
-                    ),
-                    Err(error) => outcome(
-                        command,
-                        ResultCode::OutcomeUncertain,
-                        error.to_string(),
-                        Some(self.observe(&record).await),
-                    ),
-                },
-            );
+            return Ok(match self.kill_this_session(&record).await {
+                Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => outcome(
+                    command,
+                    ResultCode::Ok,
+                    String::new(),
+                    Some(self.observe(&record).await),
+                ),
+                Err(KillSessionError::TokenMismatch { actual, .. }) => outcome(
+                    command,
+                    ResultCode::Rejected,
+                    format!("refusing stop: live token {actual} is not this execution"),
+                    Some(self.observe(&record).await),
+                ),
+                Err(error) => outcome(
+                    command,
+                    ResultCode::OutcomeUncertain,
+                    error.to_string(),
+                    Some(self.observe(&record).await),
+                ),
+            });
         }
         record.phase = Phase::Stopping;
         self.persist(&record)?;
@@ -829,11 +834,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 observed = self.observe(&record).await;
             }
         }
-        match self
-            .tmux
-            .kill_session_verified(&record.session, &record.spawn_token)
-            .await
-        {
+        match self.kill_this_session(&record).await {
             Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
                 // Keep a pre-kill Exited/BriefNotDelivered observation. Killing
                 // a still-alive pane records Missing from the kill outcome.
@@ -871,6 +872,19 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
     }
 
+    async fn kill_this_session(
+        &self,
+        record: &ExecutionRecord,
+    ) -> std::result::Result<KillSessionOutcome, KillSessionError> {
+        let workspace = self
+            .workspace_path(&record.workspace_id, &record.lease_id)
+            .await
+            .unwrap_or_default();
+        self.tmux
+            .kill_session_verified_in(&record.session, &record.spawn_token, &workspace.to_string_lossy())
+            .await
+    }
+
     async fn workspace_path(&self, workspace_id: &str, lease_id: &str) -> Result<PathBuf> {
         let rows = cube::registered_workspaces(&self.cube).await?;
         let row = rows
@@ -898,11 +912,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             if Instant::now() >= deadline {
                 let mut pane = pane;
                 if pane_life(&pane) == PaneLife::Alive && !delivered {
-                    pane.life = match self
-                        .tmux
-                        .kill_session_verified(&record.session, &record.spawn_token)
-                        .await
-                    {
+                    pane.life = match self.kill_this_session(record).await {
                         Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
                             PaneLife::BriefNotDelivered.into()
                         }
@@ -1001,21 +1011,6 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
     /// records are settled once the session is Missing, or once an
     /// Exited/BriefNotDelivered pane's session has been killed.
     async fn settle(&self, record: &mut ExecutionRecord, pane: &PaneState) -> Result<()> {
-        if matches!(
-            pane_life(pane),
-            PaneLife::Exited | PaneLife::BriefNotDelivered | PaneLife::Missing
-        ) {
-            self.tmux.cleanup_worker_processes(&record.spawn_token).await?;
-            if self.tmux.runner().manages_host_processes() {
-                let workspace = self
-                    .workspace_path(&record.workspace_id, &record.lease_id)
-                    .await
-                    .unwrap_or_default();
-                self.tmux
-                    .cleanup_run_processes(&record.execution_id, &workspace)
-                    .await?;
-            }
-        }
         match record.phase {
             // An uncertain launch leaves the record here. Whatever the pane
             // shows now decides it: a session that exists is a launched
@@ -1026,10 +1021,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                     record.pane_id = (!pane.pane_id.is_empty()).then(|| pane.pane_id.clone());
                     adopt_pid(record, (pane.pid > 0).then_some(pane.pid));
                     self.persist(record)?;
-                    Box::pin(self.settle(record, pane)).await
+                    return Box::pin(self.settle(record, pane)).await;
                 }
-                PaneLife::Missing => self.record_terminal(record, pane),
-                _ => Ok(()),
+                PaneLife::Missing => self.record_terminal(record, pane)?,
+                _ => {}
             },
             Phase::Alive | Phase::Delivering => {
                 if !matches!(
@@ -1047,30 +1042,62 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                     }
                     return Ok(());
                 }
-                self.record_terminal(record, pane)
+                self.record_terminal(record, pane)?;
             }
             Phase::Stopping => match pane_life(pane) {
-                PaneLife::Missing => self.record_terminal(record, pane),
-                PaneLife::Exited | PaneLife::BriefNotDelivered => {
-                    match self
-                        .tmux
-                        .kill_session_verified(&record.session, &record.spawn_token)
-                        .await
-                    {
-                        Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
-                            self.record_terminal(record, pane)
-                        }
-                        _ => Ok(()),
+                PaneLife::Missing => self.record_terminal(record, pane)?,
+                PaneLife::Exited | PaneLife::BriefNotDelivered => match self.kill_this_session(record).await {
+                    Ok(KillSessionOutcome::Killed | KillSessionOutcome::Absent) => {
+                        self.record_terminal(record, pane)?;
                     }
-                }
-                _ => Ok(()),
+                    Err(KillSessionError::TokenMismatch { .. }) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "boss: session teardown after stop reported an error for {}; recording terminal evidence: {error}",
+                            record.execution_id
+                        );
+                        self.record_terminal(record, pane)?;
+                    }
+                },
+                _ => {}
             },
             Phase::Terminal if !record.reclaimed => {
                 self.reclaim(record);
-                self.persist(record)
+                self.persist(record)?;
             }
-            _ => Ok(()),
+            _ => {}
         }
+        // Terminal evidence is recorded before process cleanup so a cleanup
+        // failure cannot look like unknown liveness to Adopt / probe_pid_alive.
+        if record.phase == Phase::Terminal
+            && matches!(
+                pane_life(pane),
+                PaneLife::Exited | PaneLife::BriefNotDelivered | PaneLife::Missing
+            )
+            && let Err(err) = self.cleanup_settled_processes(record).await
+        {
+            eprintln!(
+                "boss: settled worker process cleanup failed for {}: {err:#}",
+                record.execution_id
+            );
+        }
+        Ok(())
+    }
+
+    async fn cleanup_settled_processes(&self, record: &ExecutionRecord) -> Result<()> {
+        let workspace = self
+            .workspace_path(&record.workspace_id, &record.lease_id)
+            .await
+            .unwrap_or_default();
+        self.tmux
+            .cleanup_worker_processes_in(&record.spawn_token, &workspace.to_string_lossy())
+            .await?;
+        if self.tmux.runner().manages_host_processes() {
+            self.tmux
+                .cleanup_run_processes(&record.execution_id, &workspace)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Remove the run's input home and settings file; the outputs directory is retained (see below). The outcome is recorded

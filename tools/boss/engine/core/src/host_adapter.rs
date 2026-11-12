@@ -53,41 +53,6 @@ use boss_host_execution::types::{
 /// settings under the system temp dir.
 const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 
-/// Prints `EMPTY`, `OCCUPIED` or `UNKNOWN` for "does any process owned by the
-/// current user have its cwd in `$1`". Only the user's own processes are
-/// scanned (another user's cwd is unreadable and cannot be a workspace
-/// occupant); an unreadable same-user process, or an unavailable probe tool,
-/// is `UNKNOWN`. A workspace directory that does not exist is `EMPTY`.
-const REMOTE_OCCUPANCY_SCRIPT: &str = r#"
-ws="$1"
-if [ ! -e "$ws" ] && [ ! -L "$ws" ]; then echo EMPTY; exit 0; fi
-ws=$(cd "$ws" 2>/dev/null && pwd -P) || { echo UNKNOWN; exit 0; }
-inside() { case "$1" in "$ws"|"$ws"/*) return 0;; esac; return 1; }
-if [ -d /proc/self ]; then
-  unknown=0
-  for p in /proc/[0-9]*; do
-    [ -O "$p" ] || continue
-    if c=$(readlink "$p/cwd" 2>/dev/null); then
-      if inside "$c"; then echo OCCUPIED; exit 0; fi
-    elif [ -e "$p" ] && ! grep -q '^State:[[:space:]]*[ZX]' "$p/status" 2>/dev/null; then
-      # Same-uid unreadable cwd (sandbox init, non-dumpable helper). Keep
-      # scanning: an occupant later in /proc still makes this OCCUPIED, matching
-      # the local ProcessSnapshot probe. UNKNOWN only if nothing was inside.
-      unknown=1
-    fi
-  done
-  if [ "$unknown" -eq 1 ]; then echo UNKNOWN; else echo EMPTY; fi
-else
-  out=$(lsof -a -u "$(id -u)" -d cwd -Fn 2>/dev/null) || { echo UNKNOWN; exit 0; }
-  if printf '%s
-' "$out" | awk -v ws="$ws" 'index($0, "n" ws) == 1 { r = substr($0, length(ws) + 2, 1); if (r == "" || r == "/") f = 1 } END { exit !f }'; then
-    echo OCCUPIED
-  else
-    echo EMPTY
-  fi
-fi
-"#;
-
 #[async_trait]
 impl Jj for SshHostAdapter {
     async fn workspace_exists(&self, workspace: &Path) -> Result<bool> {
@@ -1273,7 +1238,6 @@ impl HostAdapter for SshHostAdapter {
         // registry, or a transcript_path on the current work_runs row.
         let turn_timeout = crate::runner::spawn_confirmation::turn_start_timeout_for_driver(driver.as_ref());
         let poll = crate::runner::spawn_confirmation::SPAWN_CONFIRM_POLL;
-        let remote_pid = outcome.remote_pid;
         let work_db = Arc::clone(&self.work_db);
         let live_worker_states = self.live_worker_states.clone();
         let transport = self.transport.clone();
@@ -1303,7 +1267,6 @@ impl HostAdapter for SshHostAdapter {
                 reap_failed_remote_turn(
                     &transport,
                     &reap_run_id,
-                    remote_pid,
                     &reap_workspace,
                     &reap_remote_socket,
                     &reap_engine_socket,
@@ -1332,7 +1295,6 @@ impl HostAdapter for SshHostAdapter {
                     reap_failed_remote_turn(
                         &transport,
                         &reap_run_id,
-                        remote_pid,
                         &reap_workspace,
                         &reap_remote_socket,
                         &reap_engine_socket,
@@ -1414,7 +1376,14 @@ impl HostAdapter for SshHostAdapter {
         let workspace = workspace.to_str().context("workspace path is not UTF-8")?;
         let output = self
             .transport
-            .run(&["sh", "-c", REMOTE_OCCUPANCY_SCRIPT, "sh", workspace])
+            .run(&[
+                "python3",
+                "-c",
+                boss_worker_processes::SCRIPT,
+                "BOSS_RUN_ID",
+                "",
+                workspace,
+            ])
             .await?;
         anyhow::ensure!(
             output.success(),
@@ -1422,10 +1391,13 @@ impl HostAdapter for SshHostAdapter {
             self.transport.host_id,
             output.stderr
         );
-        Ok(match output.stdout.trim() {
-            "EMPTY" => Occupancy::Empty,
-            "OCCUPIED" => Occupancy::Occupied,
-            _ => Occupancy::Unknown,
+        let result: boss_worker_processes::Cleanup = serde_json::from_str(&output.stdout)?;
+        Ok(if !result.unknown.is_empty() {
+            Occupancy::Unknown
+        } else if result.occupants.is_empty() {
+            Occupancy::Empty
+        } else {
+            Occupancy::Occupied
         })
     }
 
@@ -1877,81 +1849,6 @@ mod tests {
         let expected = crate::merge_poller::review_signal_checks_for_owner(owner);
         assert!(!expected.is_empty(), "fixture owner must have human-gated checks");
         assert_eq!((opts.review_signal_checks)(owner), expected);
-    }
-
-    fn run_occupancy_script(workspace: &Path) -> String {
-        let output = std::process::Command::new("sh")
-            .args(["-c", REMOTE_OCCUPANCY_SCRIPT, "sh"])
-            .arg(workspace)
-            .output()
-            .expect("run the occupancy script");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    /// The script decides whether a remote lease is returned, so its verdicts
-    /// are pinned against real processes rather than canned probe results.
-    #[test]
-    fn remote_occupancy_script_reports_empty_occupied_and_prefix_siblings() {
-        struct Reaped(std::process::Child);
-        impl Drop for Reaped {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("ws");
-        let sibling = root.path().join("ws-sibling");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&sibling).unwrap();
-
-        assert_eq!(run_occupancy_script(&root.path().join("missing")), "EMPTY");
-        let empty = run_occupancy_script(&workspace);
-        // An incomplete scan (macOS `lsof` denied; Linux sandbox init with an
-        // unreadable cwd) is UNKNOWN. EMPTY and prefix-sibling assertions run
-        // only when a complete empty scan is possible.
-        let scan_complete = empty != "UNKNOWN";
-        if scan_complete {
-            assert_eq!(empty, "EMPTY");
-        }
-
-        // A process whose cwd merely shares the workspace name as a prefix is not inside it.
-        let _prefix = Reaped(
-            std::process::Command::new("sleep")
-                .arg("60")
-                .current_dir(&sibling)
-                .spawn()
-                .unwrap(),
-        );
-        if scan_complete {
-            assert_eq!(run_occupancy_script(&workspace), "EMPTY");
-        }
-
-        let nested = workspace.join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        let _inside = Reaped(
-            std::process::Command::new("sleep")
-                .arg("60")
-                .current_dir(&nested)
-                .spawn()
-                .unwrap(),
-        );
-        // The child's chdir happens in the forked process; poll until visible.
-        let mut seen = String::new();
-        for _ in 0..100 {
-            seen = run_occupancy_script(&workspace);
-            if seen == "OCCUPIED" {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if seen == "UNKNOWN" {
-            // macOS hermetic sandbox denies `lsof`; a Linux host whose every
-            // same-uid cwd is unreadable also cannot observe occupancy.
-            return;
-        }
-        assert_eq!(seen, "OCCUPIED");
     }
 
     /// A `WorkerSetupInput` shaped like the one the remote spawn builds.

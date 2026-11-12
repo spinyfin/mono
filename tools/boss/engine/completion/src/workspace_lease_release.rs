@@ -28,6 +28,8 @@ pub use boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_
 
 pub use boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND;
 
+pub use boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND;
+
 use boss_engine_recovery::execution_bookmark::{BoundaryOwnership, WorkspaceTipSource};
 use boss_execution_contracts::{CubeClient, HostAdapter};
 
@@ -312,6 +314,15 @@ impl WorkspaceOccupancy for EmptyOccupancy {
     }
 }
 
+/// Always-occupied occupancy, for tests that inject a process in the workspace.
+pub struct OccupiedOccupancy;
+
+impl WorkspaceOccupancy for OccupiedOccupancy {
+    fn occupancy(&self, _: &Path) -> Occupancy {
+        Occupancy::Occupied
+    }
+}
+
 /// Release `lease_id` for `execution` when [`decide`] says so, after one
 /// best-effort teardown preservation. Cube is claimed with a compare-and-clear
 /// before cube is called. Only the claim owner may restore the lease after a
@@ -366,7 +377,7 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
     } else if !local && !occupancy.probes_owning_host() {
         Occupancy::Unknown
     } else if local && let Some(cleanup) = occupancy.cleanup(db, execution) {
-        cleanup.await.unwrap_or_else(|err| {
+        bound_unowned_occupants(db, execution, cleanup.await).unwrap_or_else(|err| {
             raise_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND,
                 "Workspace recovery needs process cleanup", &format!("Lease {lease_id}: {err:#}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected."));
             tracing::error!(execution_id = %execution.id, lease_id, error = %err, "workspace process cleanup failed");
@@ -641,6 +652,22 @@ fn report_preservation_failure(
     }
 }
 
+/// Durable evidence that a remote worker's lease is being kept, so a recovery
+/// successor fails with a reason once its bounded wait ends instead of holding
+/// forever. Lowered by the release path when the lease returns.
+pub fn keep_remote_lease(db: &WorkDb, execution: &WorkExecution, host_id: Option<&str>, reason: &str) {
+    raise_attention(
+        db,
+        execution,
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        "Remote worker could not be confirmed gone",
+        &format!(
+            "Host {}: {reason}. The workspace lease stays held. Restore connectivity or inspect the worker on that host, then retry recovery.",
+            host_id.unwrap_or("(unrecorded)")
+        ),
+    );
+}
+
 pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
     match db.list_attention_items(&execution.id) {
         Ok(items) if items.iter().any(|item| item.kind == kind && item.status == "open") => {
@@ -688,8 +715,8 @@ pub fn resolve_unreleased_attention(db: &WorkDb, execution_id: &str) {
 }
 
 /// How long after a run ended unowned occupants may keep its lease. Owned
-/// processes are TERM/KILLed within one cleanup pass (grace 5 s, measured at
-/// tens of milliseconds for a TERM-able child) and the sweep retries every
+/// processes are TERM/KILLed within one cleanup pass (grace 5 s; detached-shell
+/// cleanup has been measured at a 316 ms peak) and the sweep retries every
 /// minute, so a process that survives ten sweeps is not a registration race: it
 /// has no owner that will ever claim it.
 pub const UNOWNED_OCCUPANT_BOUND_SECS: i64 = 10 * 60;
@@ -733,7 +760,7 @@ pub fn bound_unowned_occupants(db: &WorkDb, execution: &WorkExecution, result: R
         boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND,
         "Workspace lease released with unowned processes inside",
         &format!(
-            "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the owning host and stop them if they are stale.",
+            "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No live run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the owning host and stop them if they are stale. {err:#}",
             unowned.occupants
         ),
     );

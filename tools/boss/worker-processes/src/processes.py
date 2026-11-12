@@ -32,17 +32,32 @@ def private_registry():
     return root
 
 
-def registered_environment(pid, birth):
+def registered_record(pid, birth):
     try:
         record = json.loads((registry() / f"{pid}.json").read_text())
         expected = list(birth) if isinstance(birth, tuple) else birth
         if record["birth"] == expected:
-            return [os.fsencode(key + "=" + value) for key, value in record["identity"].items()]
+            return record
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         # Missing, truncated or foreign records mean "unregistered". One bad
         # file must not fail every cleanup on the host.
         pass
-    return []
+    return None
+
+
+def registered_environment(pid, birth):
+    record = registered_record(pid, birth)
+    if not record:
+        return []
+    try:
+        return [os.fsencode(key + "=" + value) for key, value in record["identity"].items()]
+    except (KeyError, TypeError, AttributeError):
+        return []
+
+
+def registered_lineage(pid, birth):
+    record = registered_record(pid, birth)
+    return bool(record and record.get("lineage"))
 
 
 def register(pid):
@@ -54,12 +69,15 @@ def register(pid):
     record_identity(pid, birth, identity)
 
 
-def record_identity(pid, birth, identity):
+def record_identity(pid, birth, identity, lineage=False):
     root = private_registry()
     previous = dict(os.fsdecode(entry).split("=", 1) for entry in registered_environment(pid, birth))
     previous.update(identity)
+    record = {"birth": birth, "identity": previous}
+    if lineage or registered_lineage(pid, birth):
+        record["lineage"] = True
     with tempfile.NamedTemporaryFile(mode="w", dir=root, delete=False) as output:
-        json.dump({"birth": birth, "identity": previous}, output)
+        json.dump(record, output)
     os.replace(output.name, root / f"{pid}.json")
 
 
@@ -94,16 +112,32 @@ def install(source):
     # caller's value, so it runs in its original context, then the hook
     # directory is put back.
     hook = shlex.quote(str(root))
-    original = f'export ZDOTDIR={shlex.quote(original_zdotdir)}\n' if original_zdotdir else 'unset ZDOTDIR\n'
+    # ~/.zshenv may redirect ZDOTDIR (XDG: export ZDOTDIR=$HOME/.config/zsh).
+    # Capture that directory after sourcing it, then keep the hook as ZDOTDIR
+    # so later zsh startup files and nested shells still register.
+    restore = f'export ZDOTDIR={shlex.quote(original_zdotdir)}\n' if original_zdotdir else 'unset ZDOTDIR\n'
+    zshenv = register_line + restore
+    zshenv += 'if [ -r "${ZDOTDIR:-$HOME}/.zshenv" ]; then . "${ZDOTDIR:-$HOME}/.zshenv"; fi\n'
+    zshenv += '__boss_user_zdotdir=${ZDOTDIR:-$HOME}\n'
+    # zsh (and macOS /etc/zshrc) default HISTFILE to $ZDOTDIR/.zsh_history.
+    # That lands in the hook directory unless we pin the user's path after
+    # every later startup file: /etc/zshrc runs after .zprofile and before
+    # .zshrc, with ZDOTDIR already restored to the hook.
+    hook_hist = shlex.quote(str(root / ".zsh_history"))
+    zshenv += (
+        'if [ -z "$HISTFILE" ] || [ "$HISTFILE" = "$__boss_user_zdotdir/.zsh_history" ] || '
+        f'[ "$HISTFILE" = "$HOME/.zsh_history" ] || [ "$HISTFILE" = {hook_hist} ]; then '
+        '__boss_user_histfile="$__boss_user_zdotdir/.zsh_history"; '
+        'else __boss_user_histfile="$HISTFILE"; fi\n'
+        'HISTFILE="$__boss_user_histfile"\n'
+    )
+    zshenv += f'export ZDOTDIR={hook}\n'
     def user_file(name):
-        return (original + f'if [ -r "${{ZDOTDIR:-$HOME}}/{name}" ]; then . "${{ZDOTDIR:-$HOME}}/{name}"; fi\n'
-                + f'export ZDOTDIR={hook}\n')
-    # System startup files run before the user's own and derive the history
-    # file from ZDOTDIR, so pin it to the user's directory first.
-    user_dir = shlex.quote(original_zdotdir) if original_zdotdir else '"$HOME"'
-    zshenv = register_line
-    zshenv += f'if [ -z "$HISTFILE" ]; then HISTFILE={user_dir}/.zsh_history; fi\n'
-    zshenv += user_file(".zshenv")
+        return (f'export ZDOTDIR="$__boss_user_zdotdir"\n'
+                f'if [ -r "$__boss_user_zdotdir/{name}" ]; then . "$__boss_user_zdotdir/{name}"; fi\n'
+                f'export ZDOTDIR={hook}\n'
+                f'if [ -z "$HISTFILE" ] || [ "$HISTFILE" = {hook_hist} ]; then '
+                f'HISTFILE="$__boss_user_histfile"; fi\n')
     startups = [("bash-env", bash_env), (".zshenv", zshenv)]
     startups += [(name, user_file(name)) for name in (".zprofile", ".zshrc", ".zlogin", ".zlogout")]
     for name, startup in startups:
@@ -156,21 +190,26 @@ def birth_and_parent(pid):
     return birth, parent
 
 
-def inspect(pid):
+def kern_argmax_buffer():
+    mib = (ctypes.c_int * 2)(1, 8)  # CTL_KERN, KERN_ARGMAX
+    capacity = ctypes.c_int()
+    size = ctypes.c_size_t(ctypes.sizeof(capacity))
+    library = ctypes.CDLL(None, use_errno=True)
+    if library.sysctl(mib, 2, ctypes.byref(capacity), ctypes.byref(size), None, 0):
+        raise OSError(ctypes.get_errno(), "KERN_ARGMAX")
+    return ctypes.create_string_buffer(capacity.value)
+
+
+def inspect(pid, argmax_buffer=None):
     birth, parent = birth_and_parent(pid)
     if sys.platform == "darwin":
         cwd_info = ctypes.create_string_buffer(2352)
         darwin_call("proc_pidinfo", pid, 9, 0, cwd_info, len(cwd_info))
         cwd = os.fsdecode(cwd_info.raw[152:1176].split(b"\0", 1)[0])
-        mib = (ctypes.c_int * 2)(1, 8)  # CTL_KERN, KERN_ARGMAX
-        capacity = ctypes.c_int()
-        size = ctypes.c_size_t(ctypes.sizeof(capacity))
-        library = ctypes.CDLL(None, use_errno=True)
-        if library.sysctl(mib, 2, ctypes.byref(capacity), ctypes.byref(size), None, 0):
-            raise OSError(ctypes.get_errno(), "KERN_ARGMAX")
-        buffer = ctypes.create_string_buffer(capacity.value)
+        buffer = argmax_buffer if argmax_buffer is not None else kern_argmax_buffer()
         size = ctypes.c_size_t(len(buffer))
         mib = (ctypes.c_int * 3)(1, 49, pid)  # KERN_PROCARGS2
+        library = ctypes.CDLL(None, use_errno=True)
         if library.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0):
             error = ctypes.get_errno()
             if error not in (errno.EPERM, errno.EACCES):
@@ -182,7 +221,9 @@ def inspect(pid):
             argv, environment = [], []
         else:
             argc = struct.unpack_from("i", buffer)[0]
-            strings = buffer.raw[4:size.value].split(b"\0", 1)[1].lstrip(b"\0").split(b"\0")
+            payload = ctypes.string_at(ctypes.addressof(buffer) + 4, max(size.value - 4, 0))
+            parts = payload.split(b"\0", 1)
+            strings = parts[1].lstrip(b"\0").split(b"\0") if len(parts) > 1 else []
             argv, environment = strings[:argc], strings[argc:]
     else:
         root = Path("/proc") / str(pid)
@@ -215,12 +256,14 @@ def snapshot(key, value, workspace):
     private_registry()
     owned, occupants, unknown, owners = {}, [], [], {}
     lineage = {}
+    skipped = []
     needle = os.fsencode(key + "=" + value) if value else None
+    argmax_buffer = kern_argmax_buffer() if sys.platform == "darwin" else None
     for pid in pids():
         if pid == os.getpid():
             continue
         try:
-            birth, cwd, argv, environment, parent = inspect(pid)
+            birth, cwd, argv, environment, parent = inspect(pid, argmax_buffer)
         except OSError as error:
             if error.errno not in (errno.ESRCH, errno.ENOENT):
                 # libproc can return zero without ESRCH when a process exits
@@ -241,7 +284,15 @@ def snapshot(key, value, workspace):
             continue
         lineage[pid] = (parent, birth)
         if needle and needle in environment:
-            owned[pid] = birth
+            # Environment identity alone is not enough outside the workspace:
+            # daemons a worker happened to start (gpg-agent, ssh ControlMaster)
+            # inherit the token. A registry record means this PID ran the
+            # worker hook (the pane or a nested shell). Lineage means capture
+            # saw it as a descendant while the pane was alive.
+            if inside or registered_record(pid, birth) or registered_lineage(pid, birth):
+                owned[pid] = birth
+            else:
+                skipped.append(pid)
         if inside:
             occupants.append(pid)
             for entry in environment:
@@ -260,8 +311,12 @@ def snapshot(key, value, workspace):
                 except OSError:
                     continue
                 owned[pid] = birth
-                record_identity(pid, birth, {key: value})
+                record_identity(pid, birth, {key: value}, lineage=True)
                 changed = True
+    leftover = [pid for pid in skipped if pid not in owned]
+    if leftover:
+        print(f"boss: not signalling pids {leftover}; they carry this identity outside the workspace",
+              file=sys.stderr)
     return owned, occupants, unknown, owners
 
 
@@ -361,6 +416,7 @@ if __name__ == "__main__":
     elif sys.argv[1] == "--alive":
         print(json.dumps(shell_alive(sys.argv[2], sys.argv[3], int(sys.argv[4]))))
     elif sys.argv[1] == "--capture":
-        snapshot(sys.argv[2], sys.argv[3], None)
+        workspace = os.path.realpath(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
+        snapshot(sys.argv[2], sys.argv[3], workspace)
     else:
         print(json.dumps(run(*sys.argv[1:])))

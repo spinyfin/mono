@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::*;
 use boss_engine_recovery::execution_bookmark::{self, Jj, LocalJj};
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
+use std::path::PathBuf;
 
 /// A scan seam that must never run.
 async fn forbidden_scan(why: &str) -> EmptyOccupancy {
@@ -524,6 +525,10 @@ async fn sweep_requires_both_durable_pane_death_and_empty_cwds() {
         .held,
         1
     );
+    assert!(
+        open_kinds(&db, &execution.id).contains(&LEASE_UNRELEASED_ATTENTION_KIND.to_owned()),
+        "a terminal row held Present still files unreleased-lease attention when a live registration exists"
+    );
     live.release_slot(0);
 
     let mut child = std::process::Command::new("true").spawn().unwrap();
@@ -531,12 +536,7 @@ async fn sweep_requires_both_durable_pane_death_and_empty_cwds() {
     child.wait().unwrap();
     db.set_run_shell_pid_for_execution(&execution.id, i64::from(pid))
         .unwrap();
-    let occupied = || async {
-        ProcessSnapshot {
-            cwds: vec![(std::process::id() + 1, repo.worker.canonicalize().unwrap())],
-            complete: true,
-        }
-    };
+    let occupied = || async { OccupiedOccupancy };
     assert_eq!(run_one_pass_with_occupancy(&db, &cube, &live, occupied).await.kept, 1);
     assert_eq!(cube.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(
@@ -754,10 +754,7 @@ async fn occupied_workspace_is_not_preserved() {
         ReleaseEvidence {
             cause: TerminalCause::Inferred,
             pane: PaneStatus::Gone,
-            occupancy: &ProcessSnapshot {
-                cwds: vec![(std::process::id() + 1, repo.worker.canonicalize().unwrap())],
-                complete: true,
-            },
+            occupancy: &OccupiedOccupancy,
             preservation: &DbPreservation::new(&db, None),
         },
         async { panic!("an occupied workspace is not released") },
@@ -781,32 +778,6 @@ async fn occupied_workspace_is_not_preserved() {
     assert_eq!(
         open_kinds(&db, &execution.id),
         vec![LEASE_UNRELEASED_ATTENTION_KIND.to_owned()]
-    );
-}
-
-#[test]
-fn zombie_and_dead_processes_are_not_occupants() {
-    assert!(proc_state_is_gone("Name:\tsh\nState:\tZ (zombie)\nPid:\t1\n"));
-    assert!(proc_state_is_gone("State:\tX (dead)\n"));
-    assert!(!proc_state_is_gone("Name:\tsh\nState:\tS (sleeping)\n"));
-    assert!(!proc_state_is_gone("Name:\tsh\n"));
-}
-
-#[test]
-fn unreadable_same_uid_cwd_is_inconclusive_but_other_users_are_not() {
-    let denied = || std::io::Error::from_raw_os_error(libc::EACCES);
-    let mut snapshot = ProcessSnapshot {
-        cwds: Vec::new(),
-        complete: true,
-    };
-    // SAFETY: geteuid has no preconditions.
-    let own_uid = unsafe { libc::geteuid() };
-    snapshot.record(1, Err(denied()), || Some(own_uid.wrapping_add(1)));
-    assert!(snapshot.complete, "another user's process cannot be an occupant");
-    snapshot.record(2, Err(denied()), || Some(own_uid));
-    assert!(
-        !snapshot.complete,
-        "a same-uid process with an unreadable cwd is never assumed away"
     );
 }
 
