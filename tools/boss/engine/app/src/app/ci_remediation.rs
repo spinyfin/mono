@@ -52,7 +52,6 @@ pub(super) async fn handle_classify_ci_remediation(ctx: Dispatch, req: FrontendR
 pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
-        work_db,
         sink,
         request_id,
         ..
@@ -65,59 +64,9 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
     else {
         unreachable!()
     };
-    if let Err(err) = work_db.validate_queue_ci_failure(&attempt_id, queue_ci_evidence.as_ref(), &reason) {
-        send_work_error(&sink, &request_id, &err);
-        return;
-    }
-    let reason = match queue_ci_evidence {
-        Some(evidence) => format!(
-            "{reason}\nQueue verification: main_sha={} verified_head_sha={} runs={}",
-            evidence.main_sha,
-            evidence.verified_head_sha,
-            evidence
-                .runs
-                .iter()
-                .map(|run| format!("{}: {} (exit {})", run.check_name, run.command, run.exit_code))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
-        None => reason,
-    };
-    {
-        match work_db.mark_ci_remediation_failed(&attempt_id, &reason) {
-            Ok(Some(attempt)) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    work_item_id = %attempt.work_item_id,
-                    pr_url = %attempt.pr_url,
-                    %reason,
-                    "mark_ci_remediation_failed: attempt flipped to failed",
-                );
-                server_state
-                    .publisher
-                    .publish_frontend_event_on_product(
-                        &attempt.product_id,
-                        FrontendEvent::CiRemediationFailed {
-                            attempt: work_db.remediation_entry(attempt.list_entry()),
-                            product_id: attempt.product_id.clone(),
-                            work_item_id: attempt.work_item_id.clone(),
-                            attempt_id: attempt.id.clone(),
-                            pr_url: attempt.pr_url.clone(),
-                            failure_reason: reason.clone(),
-                        },
-                    )
-                    .await;
-                send_response(&sink, &request_id, FrontendEvent::CiRemediationMarkedFailed { attempt });
-            }
-            Ok(None) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("ci_remediation attempt {attempt_id:?} is unknown or already terminal",),
-                },
-            ),
-            Err(err) => send_work_error(&sink, &request_id, &err),
-        }
+    match run_writes::ci_mark_failed(&server_state, &attempt_id, &reason, queue_ci_evidence.as_ref(), None).await {
+        Ok(attempt) => send_response(&sink, &request_id, FrontendEvent::CiRemediationMarkedFailed { attempt }),
+        Err(err) => run_writes::send_write_error(&sink, &request_id, err),
     }
 }
 

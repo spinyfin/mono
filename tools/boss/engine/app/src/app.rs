@@ -59,9 +59,9 @@ use boss_protocol::{
     work_product_topic,
 };
 use boss_work_db::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
-    ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome,
-    SetRunTranscriptPathOutcome, THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    ANSWER_AGENT_RUN_STATUS_FAILED, ActionedAttentionGroup, DuplicateTaskError, ExecutionKind, ExecutionStatus,
+    GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome, SetRunTranscriptPathOutcome,
+    Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use tokio::time::{Duration, timeout};
 
@@ -128,6 +128,7 @@ pub(crate) mod readoption;
 mod review;
 mod review_guide;
 mod review_start;
+mod run_writes;
 mod selected_product;
 mod server;
 mod sessions;
@@ -136,6 +137,7 @@ mod spoke_installation;
 #[cfg(test)]
 mod spoke_probe_tests;
 mod spoke_probes;
+mod spoke_projection;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
@@ -667,6 +669,10 @@ struct ServerStateOverrides {
     /// Prepared coordinator session directory. `None` uses the production
     /// directory under Application Support.
     coordinator_working_directory: Option<PathBuf>,
+    /// Skip hub binding and its startup guard, for a test that rebuilds a server
+    /// over spoke hosts without hub configuration. Injecting a database alone does not.
+    #[builder(default)]
+    skip_hub_installation: bool,
 }
 
 #[derive(bon::Builder)]
@@ -686,8 +692,8 @@ struct ServerState {
     hub_stream: StdMutex<Option<boss_engine_runtime::hub::HubStream>>,
     /// Where each spoke-supervised worker is in its turn. A spoke run has no
     /// local slot, so the slot's live activity cannot say whether it is parked.
-    /// Nothing in production fills this yet: the hub does not project a spoke's
-    /// journaled hook events into worker-event dispatch (see `SpokeTurns`).
+    /// Filled by hook events the hub projects from a spoke's journal (see
+    /// `spoke_projection`) as they take the ordinary worker-event fan-out.
     #[builder(default)]
     spoke_turns: spoke_probes::SpokeTurns,
     /// Read-only remote pane viewers: one capture task per run being watched.
@@ -1404,6 +1410,7 @@ impl ServerState {
             coordinator_handoff_delivery: coordinator_handoff_delivery_override,
             coordinator_tmux: coordinator_tmux_override,
             coordinator_working_directory: coordinator_working_directory_override,
+            skip_hub_installation,
         } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
@@ -1843,7 +1850,11 @@ impl ServerState {
         let provider_events_socket = boss_engine_runtime::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = boss_ssh_transport::default_control_socket_dir();
         let remote_pane_releaser = pane_releaser.clone();
-        let spoke_installation = spoke_installation::prepare(work_db.as_ref().clone(), &cfg.work.hub)?;
+        let spoke_installation = if skip_hub_installation {
+            None
+        } else {
+            spoke_installation::prepare(work_db.as_ref().clone(), &cfg.work.hub)?
+        };
         let hub_stream = spoke_installation.as_ref().map(|prepared| prepared.stream());
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_host_adapter_and_publisher(
@@ -2152,6 +2163,9 @@ impl ServerState {
 
         if let Some(stream) = hub_stream {
             pane_viewers::bridge_hub_stream(&server_state, &stream);
+            // Apply what the spokes' durable journals received. Receipt does not
+            // wait for this, and a restart resumes from the application cursor.
+            spoke_projection::start(&server_state, &stream);
             server_state.set_hub_stream(Some(stream));
         }
         Ok(server_state)

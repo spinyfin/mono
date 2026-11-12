@@ -1526,6 +1526,7 @@ fn applied(reg: &LiveWorkerStateRegistry, seq: u64, event: &WorkerEvent, from_su
         HookOrigin {
             ingress_seq: Some(seq),
             from_subagent,
+            observed_at_ms: None,
         },
         event,
     )

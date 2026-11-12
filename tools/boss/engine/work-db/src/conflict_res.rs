@@ -1,4 +1,5 @@
 use super::*;
+use crate::spoke_projection::{get_spoke_applied_write_on, insert_spoke_applied_write_on};
 
 /// The full-worker fallback rung (design's rung 3). Rung 1 (engine-direct
 /// mechanical rebase) and rung 0 (deterministic resolvers,
@@ -495,6 +496,18 @@ impl WorkDb {
         attempt_id: &str,
         reason: &str,
     ) -> Result<Option<ConflictResolution>> {
+        self.mark_conflict_resolution_failed_applied(attempt_id, reason, None)
+    }
+
+    /// [`Self::mark_conflict_resolution_failed`] that also records a spoke
+    /// submission's result in the same transaction, so a crash cannot leave
+    /// the attempt failed with no result row.
+    pub fn mark_conflict_resolution_failed_applied(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+        application: Option<crate::SpokeWriteApplication<'_>>,
+    ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
@@ -508,6 +521,9 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
+        if rows > 0 {
+            crate::spoke_projection::record_application_on(&tx, application)?;
+        }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
@@ -1127,6 +1143,20 @@ impl WorkDb {
 
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(application_key) = input.application_key.as_deref()
+            && let Some(existing) = get_spoke_applied_write_on(&tx, application_key)?
+        {
+            tx.commit()?;
+            let id = serde_json::from_str::<serde_json::Value>(&existing.result_json)
+                .ok()
+                .and_then(|value| value.get("conflict_id")?.as_str().map(str::to_owned));
+            if let Some(id) = id
+                && let Some(row) = self.get_conflict_resolution(&id)?
+            {
+                return Ok(row);
+            }
+            bail!("producer conflict application key {application_key} is recorded without a conflict row");
+        }
         let id = next_id("crz");
         let now = now_string();
         tx.execute(
@@ -1156,6 +1186,20 @@ impl WorkDb {
         )?;
         let inserted = query_conflict_resolution(&tx, &id)?
             .with_context(|| format!("unknown conflict_resolution after producer-side insert: {id}"))?;
+        if let Some(application_key) = input.application_key.as_deref() {
+            insert_spoke_applied_write_on(
+                &tx,
+                &SpokeAppliedWrite {
+                    application_key: application_key.to_owned(),
+                    host_id: input.spoke_host_id.clone().unwrap_or_default(),
+                    contract: "conflict-producer/1".into(),
+                    accepted: true,
+                    reason: String::new(),
+                    result_json: serde_json::json!({"state": "applied", "conflict_id": id}).to_string(),
+                    created_at_ms: boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+                },
+            )?;
+        }
         tx.commit()?;
         Ok(inserted)
     }

@@ -808,6 +808,10 @@ pub struct ProducerConflictInsertInput {
     pub head_branch: String,
     pub base_branch: String,
     pub conflicted_files: Vec<String>,
+    /// Submission identity recorded in the same transaction as the conflict
+    /// row so a replay is keyed on the write, not on matching branch names.
+    pub application_key: Option<String>,
+    pub spoke_host_id: Option<String>,
 }
 
 /// Pre-insert payload for [`WorkDb::record_speculative_conflict_prediction`]

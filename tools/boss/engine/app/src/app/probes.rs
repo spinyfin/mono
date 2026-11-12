@@ -796,6 +796,9 @@ impl ServerState {
     /// Settle queued and in-flight probes for a run whose pane is being released, and forget its spoke turn state.
     pub(super) async fn settle_probes_for_released_run(&self, run_id: &str) {
         self.spoke_turns.forget(run_id);
+        if let Err(error) = self.work_db.forget_spoke_turn_state(run_id) {
+            tracing::warn!(run_id, error = %error, "cannot forget persisted spoke turn state");
+        }
         let abandoned = self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
         self.surface_undelivered_probes(
             run_id,

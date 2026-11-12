@@ -1,13 +1,17 @@
 //! Production hub stream service: a WorkDb-backed observation journal and
 //! command outbox, composed with host enrollment on one optional-client-auth
-//! mTLS listener.
+//! mTLS listener, and the projection that applies what the journal received.
 //!
 //! Engine startup binds this listener from configuration when listen,
-//! credentials and TLS identity are all set. This crate still does not
-//! install a host adapter; new work stays on SSH (`HostTransport::LegacySsh`)
-//! until a later composition proves host readiness and wires
-//! [`HubStream::manager`] into dispatch.
+//! credentials and TLS identity are all set. This crate does not install a
+//! host adapter; new work stays on SSH (`HostTransport::LegacySsh`) until a
+//! host is proven ready and [`HubStream::manager`] is wired into dispatch.
+//!
+//! Receipt and application are separate: the sink stores frames and advances
+//! the receipt, and [`projection::Projector`] applies them to work state on its
+//! own cursor. See that module for what makes an effect happen once.
 
+pub mod projection;
 mod serve;
 mod store;
 
@@ -16,6 +20,7 @@ use std::sync::Arc;
 use boss_host_enrollment::HostCredentials;
 use boss_spoke_stream::{Config, StreamManager};
 use boss_work_db::WorkDb;
+use tokio::sync::Notify;
 
 pub use serve::{HubListener, server_tls};
 pub use store::{WorkDbOutbox, WorkDbSink};
@@ -26,6 +31,8 @@ pub use store::{WorkDbOutbox, WorkDbSink};
 pub struct HubStream {
     manager: StreamManager,
     credentials: Arc<HostCredentials>,
+    /// Notified after each committed record; the projector's prompt to apply it.
+    projection_wake: Arc<Notify>,
 }
 
 impl HubStream {
@@ -33,10 +40,33 @@ impl HubStream {
     /// manager. The caller supplies the hub identity in `config`; nothing here
     /// binds a socket.
     pub fn new(config: Config, credentials: Arc<HostCredentials>, db: WorkDb) -> Self {
-        let sink = Arc::new(WorkDbSink::new(db.clone()));
+        let projection_wake = Arc::new(Notify::new());
+        let sink = Arc::new(WorkDbSink::with_wake(db.clone(), Arc::clone(&projection_wake)));
         let outbox = Arc::new(WorkDbOutbox::new(db));
         let manager = StreamManager::new(config, credentials.clone(), sink, outbox);
-        Self { manager, credentials }
+        Self {
+            manager,
+            credentials,
+            projection_wake,
+        }
+    }
+
+    /// A projector over `db` that applies what this stream's sink receives
+    /// through `applier` and delivers its decisions over this stream's manager.
+    /// The caller runs it ([`projection::Projector::run`]) on its task scope.
+    pub fn projector(
+        &self,
+        db: WorkDb,
+        applier: Arc<dyn projection::ObservationApplier>,
+        config: projection::ProjectorConfig,
+    ) -> projection::Projector {
+        projection::Projector::new(
+            db,
+            applier,
+            Arc::new(self.manager.clone()),
+            Arc::clone(&self.projection_wake),
+            config,
+        )
     }
 
     /// Compose with the hub identity strings engine configuration carries.

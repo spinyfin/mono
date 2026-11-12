@@ -561,11 +561,11 @@ impl RunWriteKind {
 
     fn contract(self) -> &'static str {
         match self {
-            Self::GuideOutcome => "guide-outcome/1",
-            Self::AnswerReply => "answer-reply/1",
-            Self::ConflictProducer => "conflict-producer/1",
-            Self::ConflictMarkFailed => "conflict-mark-failed/1",
-            Self::CiMarkFailed => "ci-mark-failed/1",
+            Self::GuideOutcome => boss_protocol_spoke::proposal::GUIDE_OUTCOME,
+            Self::AnswerReply => boss_protocol_spoke::proposal::ANSWER_REPLY,
+            Self::ConflictProducer => boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+            Self::ConflictMarkFailed => boss_protocol_spoke::proposal::CONFLICT_MARK_FAILED,
+            Self::CiMarkFailed => boss_protocol_spoke::proposal::CI_MARK_FAILED,
         }
     }
 
@@ -1262,9 +1262,11 @@ impl Gateway {
         };
         // Preserve the exact validated frontend payload, including its kind;
         // the hub reuses the same validator and role authorization on replay.
-        let canonical = serde_json::to_vec(
-            &json!({"kind": kind, "payload": serde_json::from_str::<Value>(&validated.canonical_json)?, "idempotency_key": id}),
-        )?;
+        let canonical = serde_json::to_vec(&boss_protocol_spoke::proposal::ProposalJsonEnvelope {
+            kind,
+            payload: serde_json::from_str::<Value>(&validated.canonical_json)?,
+            idempotency_key: id.clone(),
+        })?;
         // What the transcript source is right now, never the ingestion cursor:
         // a lagging or credit-starved tail must not understate completion
         // evidence. Resolved before the journal lock is taken.
@@ -1272,7 +1274,10 @@ impl Gateway {
         let queued = Queued {
             id,
             label: kind.as_str().to_owned(),
-            wire: (wire_kind(kind), "proposal-json/1"),
+            wire: (
+                boss_protocol_spoke::proposal::wire_kind(kind),
+                boss_protocol_spoke::proposal::PROPOSAL_JSON,
+            ),
             canonical,
             supersedes: None,
         };
@@ -1351,10 +1356,13 @@ impl Gateway {
                 kind: RunWriteKind::GuideOutcome,
                 scope: comment_id.clone(),
                 fields,
-                canonical: json!({
-                    "run_id": execution.execution_id, "comment_id": comment_id, "disposition": disposition,
-                    "body": body, "request_regeneration": request_regeneration,
-                }),
+                canonical: boss_protocol_spoke::proposal::guide_outcome_body(
+                    &execution.execution_id,
+                    &comment_id,
+                    &disposition,
+                    &body,
+                    request_regeneration,
+                ),
             },
             stamp,
         )
@@ -1384,7 +1392,7 @@ impl Gateway {
                 kind: RunWriteKind::AnswerReply,
                 scope: String::new(),
                 fields,
-                canonical: json!({"run_id": execution.execution_id, "body": body}),
+                canonical: boss_protocol_spoke::proposal::answer_reply_body(&execution.execution_id, &body),
             },
             stamp,
         )
@@ -1421,10 +1429,12 @@ impl Gateway {
                 kind: RunWriteKind::ConflictProducer,
                 scope: String::new(),
                 fields,
-                canonical: json!({
-                    "execution_id": execution.execution_id, "head_branch": head_branch,
-                    "base_branch": base_branch, "conflicted_files": conflicted_files,
-                }),
+                canonical: boss_protocol_spoke::proposal::conflict_producer_body(
+                    &execution.execution_id,
+                    &head_branch,
+                    &base_branch,
+                    conflicted_files,
+                ),
             },
             stamp,
         )
@@ -1475,9 +1485,20 @@ impl Gateway {
                 kind,
                 scope: attempt_id.clone(),
                 fields,
-                canonical: json!({
-                    "run_id": execution.execution_id, "attempt_id": attempt_id, "reason": reason, "extra": extra,
-                }),
+                canonical: match kind {
+                    RunWriteKind::CiMarkFailed => boss_protocol_spoke::proposal::ci_mark_failed_body(
+                        &execution.execution_id,
+                        &attempt_id,
+                        &reason,
+                        extra,
+                    ),
+                    _ => boss_protocol_spoke::proposal::conflict_mark_failed_body(
+                        &execution.execution_id,
+                        &attempt_id,
+                        &reason,
+                        extra,
+                    ),
+                },
             },
             stamp,
         )
@@ -1675,17 +1696,6 @@ fn receipt_event(receipt: &Receipt, duplicate: bool) -> FrontendEvent {
         json!({"receipt": receipt, "already_submitted": duplicate,
             "message": "Durably queued for hub validation. A local receipt does not finalize the run or release its workspace."}),
     )
-}
-
-fn wire_kind(kind: ProposalKind) -> v1::ProposalKind {
-    match kind {
-        ProposalKind::PrCreated => v1::ProposalKind::PrCreated,
-        ProposalKind::RunDone => v1::ProposalKind::RunDone,
-        ProposalKind::Wait => v1::ProposalKind::Wait,
-        ProposalKind::ReviewReport => v1::ProposalKind::ReviewReport,
-        ProposalKind::ReviewVerdict => v1::ProposalKind::ReviewVerdict,
-        _ => v1::ProposalKind::OtherValidated,
-    }
 }
 
 #[cfg(test)]

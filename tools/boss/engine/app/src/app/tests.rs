@@ -58,8 +58,15 @@ pub(super) fn test_server_state_with_overrides(
     // Copy the storage fixture's immutable, fully migrated schema instead of
     // replaying every migration for every server (480 times in the question
     // matrix alone). Each fixture still owns its own on-disk WAL database.
-    let (temp, db) = boss_work_db::test_support::open_db();
-    overrides.work_db = Some(db);
+    // An injected `work_db` is kept so a restart can rebuild ServerState over
+    // the same file.
+    let temp = if overrides.work_db.is_none() {
+        let (temp, db) = boss_work_db::test_support::open_db();
+        overrides.work_db = Some(db);
+        temp
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     let cfg = Arc::new(RuntimeConfig::from_parts(
         boss_engine_runtime::config::WorkConfig::builder()
             .cwd(temp.path().to_path_buf())

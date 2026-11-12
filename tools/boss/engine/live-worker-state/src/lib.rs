@@ -1778,6 +1778,7 @@ impl LiveWorkerStateRegistry {
             HookOrigin {
                 ingress_seq,
                 from_subagent: false,
+                observed_at_ms: None,
             },
             event,
         )
@@ -1868,13 +1869,27 @@ impl LiveWorkerStateRegistry {
         let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
         let before = state.clone();
 
-        state.last_event_at = Some(now.clone());
+        // A replayed hook carries the time the host saw it. Both the display
+        // stamp and the liveness checkpoint use that time, so draining a
+        // backlog after an outage does not make a worker that died during the
+        // outage look freshly active.
+        let observed_at = origin
+            .observed_at_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| iso8601_utc(ms.div_euclid(1000)));
+        let event_time = observed_at.unwrap_or_else(|| now.clone());
+        state.last_event_at = Some(event_time.clone());
         // Driver-originated only: this method is the hook/JSONL ingress.
         // Engine-synthesized display stamps (`mark_stalled_spawns`,
         // `mark_errored`) never reach here, so they cannot advance the
-        // semantic checkpoint.
-        if !matches!(event, WorkerEvent::Notification { .. }) {
-            meta.semantic_progress_at = Some(now);
+        // semantic checkpoint. The checkpoint never moves backwards.
+        if !matches!(event, WorkerEvent::Notification { .. })
+            && meta
+                .semantic_progress_at
+                .as_deref()
+                .is_none_or(|current| current < event_time.as_str())
+        {
+            meta.semantic_progress_at = Some(event_time);
         }
         meta.semantic_tool_condition = next_tool_condition(event, meta.semantic_tool_condition);
         // A subagent's tool hooks say nothing about the main session's turn:
@@ -2521,6 +2536,9 @@ pub struct HookOrigin {
     /// session's turn has ended, so its tool hooks are not evidence that the
     /// main session started a new turn.
     pub from_subagent: bool,
+    /// When the spoke observed this event, in unix milliseconds. `None` means
+    /// stamp activity as "now" (live local ingress).
+    pub observed_at_ms: Option<i64>,
 }
 
 /// A turn boundary (`Stop`) the main session was parked behind. `seq` is

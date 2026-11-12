@@ -71,16 +71,18 @@ enum SpokeTurn {
 
 /// The latest turn boundary seen for each spoke-supervised run.
 ///
-/// Turn evidence reaches this map only through `record_spoke_turn_event`, whose
-/// sole production caller handles hook events arriving on the engine's local
-/// events socket. A spoke host journals its worker's hook events and sends them
-/// to the hub as stream records, but the hub does not yet project those records
-/// into worker-event dispatch, so no production path records a turn boundary for
-/// a spoke run today. Until that projection lands the map stays empty and
-/// `spoke_parked_for_delivery` stays closed: mid-turn delivery to a spoke worker
-/// is refused rather than guessed at.
+/// Turn evidence reaches this map through `record_spoke_turn_event`, which the
+/// worker-event fan-out calls for every hook event. A spoke host journals its
+/// worker's hook events and sends them to the hub as stream records; the hub's
+/// projection (`spoke_projection`) applies them in order through that same
+/// fan-out. Until a run's first turn event has been projected the map has no
+/// entry for it and `spoke_parked_for_delivery` stays closed: mid-turn delivery
+/// to a spoke worker is refused rather than guessed at.
 #[derive(Default)]
-pub(super) struct SpokeTurns(std::sync::Mutex<std::collections::HashMap<String, SpokeTurn>>);
+pub(super) struct SpokeTurns(
+    std::sync::Mutex<std::collections::HashMap<String, SpokeTurn>>,
+    std::sync::atomic::AtomicBool,
+);
 
 impl SpokeTurns {
     fn record(&self, run: &str, turn: SpokeTurn) {
@@ -98,21 +100,65 @@ impl SpokeTurns {
             turns.remove(run);
         }
     }
+
+    /// Publish a complete set of durable turn states. A run already recorded
+    /// from a live event is newer than the stored row and is kept.
+    fn restore_all(&self, restored: Vec<(String, bool)>) {
+        if let Ok(mut turns) = self.0.lock() {
+            for (run, parked) in restored {
+                turns
+                    .entry(run)
+                    .or_insert(if parked { SpokeTurn::Parked } else { SpokeTurn::Working });
+            }
+        }
+    }
+
+    fn restored(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark_restored(&self) {
+        self.1.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear(&self) {
+        if let Ok(mut turns) = self.0.lock() {
+            turns.clear();
+        }
+        self.1.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Mid-turn delivery to a spoke worker is allowed only once a turn's `Stop` has
 /// been recorded and nothing since. A worker with no recorded turn boundary is
 /// not known to be idle, so it is refused; as the type's docs explain, that is
-/// every spoke worker until stream-record projection exists.
+/// a spoke worker whose first turn event has not been projected yet.
 pub(super) fn spoke_parked_for_delivery(state: &ServerState, run: &str) -> bool {
     state.spoke_turns.get(run) == Some(SpokeTurn::Parked)
 }
 
 impl ServerState {
-    /// Note a turn boundary for a run no local slot tracks. Runs with a slot
-    /// are covered by the slot's own activity, so they are not recorded here.
-    pub(super) fn record_spoke_turn_event(&self, run: &str, event: &boss_protocol::WorkerEvent) {
+    /// Note a turn boundary for a spoke-supervised run. Local tmux slots keep
+    /// their own activity, so they are skipped here. Subagent events never
+    /// move the parent session's parked/working state.
+    pub(super) fn record_spoke_turn_event(
+        &self,
+        run: &str,
+        event: &boss_protocol::WorkerEvent,
+        from_subagent: bool,
+    ) -> Result<(), String> {
         use boss_protocol::WorkerEvent;
+        if from_subagent {
+            return Ok(());
+        }
+        if self
+            .worker_registry
+            .pane_for_run(run)
+            .is_some_and(|pane| pane.tmux_session_name.is_some())
+        {
+            return Ok(());
+        }
         let turn = match event {
             WorkerEvent::Stop { .. } => SpokeTurn::Parked,
             WorkerEvent::UserPromptSubmit { .. }
@@ -121,12 +167,56 @@ impl ServerState {
             | WorkerEvent::ToolPoll { .. }
             | WorkerEvent::ModelProgress { .. } => SpokeTurn::Working,
             WorkerEvent::SessionStart { .. } | WorkerEvent::Notification { .. } | WorkerEvent::SessionEnd { .. } => {
-                return;
+                return Ok(());
             }
         };
-        if self.worker_registry.slot_for_run(run).is_none() && self.spoke_probe_owner_remains(run) {
-            self.spoke_turns.record(run, turn);
+        // A remote worker gets a virtual live-status slot on its first hook.
+        // That slot is display-only; mid-turn delivery still reads this map,
+        // so turn state is keyed on spoke ownership rather than slot absence.
+        if !self.spoke_probe_owner_remains(run) {
+            return Ok(());
         }
+        let assignment_generation = match self.work_db.spoke_assignment_for_execution(run) {
+            Ok(Some(assignment)) => assignment.assignment_generation,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(format!("{error:#}")),
+        };
+        self.work_db
+            .upsert_spoke_turn_state(&boss_work_db::SpokeTurnState {
+                execution_id: run.to_owned(),
+                assignment_generation,
+                parked: turn == SpokeTurn::Parked,
+            })
+            .map_err(|error| format!("{error:#}"))?;
+        self.spoke_turns.record(run, turn);
+        Ok(())
+    }
+
+    /// Rebuild the in-memory turn map from durable rows after a hub restart.
+    pub(super) fn restore_spoke_turns(&self) -> Result<(), String> {
+        if self.spoke_turns.restored() {
+            return Ok(());
+        }
+        let stored = self.work_db.spoke_turn_states().map_err(|error| format!("{error:#}"))?;
+        // Build the whole set before publishing any of it, so a read failure
+        // part-way never leaves a partially restored map that looks usable.
+        let mut restored = Vec::with_capacity(stored.len());
+        for turn in stored {
+            match self.work_db.spoke_assignment_for_execution(&turn.execution_id) {
+                Ok(Some(assignment))
+                    if assignment.assignment_generation == turn.assignment_generation && !assignment.resolved =>
+                {
+                    restored.push((turn.execution_id, turn.parked));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(format!("{error:#}"));
+                }
+            }
+        }
+        self.spoke_turns.restore_all(restored);
+        self.spoke_turns.mark_restored();
+        Ok(())
     }
 
     /// A database read failure is not evidence that a remote worker vanished.

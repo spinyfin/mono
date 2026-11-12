@@ -47,6 +47,7 @@ boss-review-guide = { path = "../review-guide" }
 boss-engine-proposal-validation = { path = "../proposal-validation" }
 boss-engine-recovery = { path = "../recovery" }
 boss-protocol = { path = "../../protocol" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
 boss-ssh-transport = { path = "../ssh-transport" }
 boss-timer-wheel = { path = "../timer-wheel" }
 boss-event-bus = { path = "../event-bus" }
@@ -69,6 +70,7 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+prost = { workspace = true }
 boss-worker-processes = { path = "../../worker-processes" }
 boss-engine-runtime = { path = "../core/runtime", features = ["test-support"] }
 boss-engine-completion = { path = "../completion", features = ["test-support"] }

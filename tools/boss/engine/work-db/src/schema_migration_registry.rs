@@ -404,6 +404,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: driver_allocation::sol_selection::migrate,
         },
         Migration {
+            id: spoke_projection::APPLIED_WRITES_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_projection::migrate_applied_writes,
+        },
+        Migration {
             id: spoke_hub::MIGRATION_ID.into(),
             legacy_version: None,
             apply: spoke_hub::migrate,
@@ -412,6 +417,16 @@ pub(super) fn all() -> Vec<Migration> {
             id: spoke_ingress::MIGRATION_ID.into(),
             legacy_version: None,
             apply: spoke_ingress::migrate,
+        },
+        Migration {
+            id: spoke_projection::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_projection::migrate,
+        },
+        Migration {
+            id: spoke_projection::TURN_STATE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_projection::migrate_turn_state,
         },
         Migration {
             id: task_status_audit::DEFERRED_MIGRATION_ID.into(),

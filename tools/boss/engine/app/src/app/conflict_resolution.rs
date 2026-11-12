@@ -241,7 +241,6 @@ pub(super) async fn handle_abandon_conflict_resolution(ctx: Dispatch, req: Front
 pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
-        work_db,
         sink,
         request_id,
         ..
@@ -254,100 +253,28 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
     else {
         unreachable!()
     };
-    if reason == boss_protocol::CONFLICT_ARCHITECTURAL_MISMATCH_REASON {
-        // Not a dead end: the evidence is validated and recorded on the live
-        // attempt, and the worker's blocked declaration then raises the
-        // rewrite-or-force-a-merge question. The attempt is not marked failed.
-        match work_db.record_conflict_architectural_mismatch(&attempt_id, evidence.as_ref()) {
-            Ok(Some(attempt)) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    work_item_id = %attempt.work_item_id,
-                    pr_url = %attempt.pr_url,
-                    "architectural_mismatch recorded; the repo owner will be asked",
-                );
-                send_response(&sink, &request_id, FrontendEvent::ConflictResolution { attempt });
-            }
-            Ok(None) => send_response(
+    match run_writes::conflict_mark_failed(&server_state, &attempt_id, &reason, evidence.as_ref(), None).await {
+        Ok(run_writes::ConflictMarked::ArchitecturalMismatch(attempt)) => {
+            send_response(
                 &sink,
                 &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("conflict resolution attempt {attempt_id:?} is unknown or already terminal",),
-                },
-            ),
-            Err(err) => send_work_error(&sink, &request_id, &err),
+                FrontendEvent::ConflictResolution { attempt: *attempt },
+            );
         }
-        return;
-    }
-    if let Err(message) = boss_protocol::validate_conflict_mark_failed_reason(&reason) {
-        send_work_error(&sink, &request_id, &message);
-        return;
-    }
-    {
-        // Worker-facing stop-condition surface. `User` tier:
-        // the worker pane invokes `boss engine conflicts
-        // mark-failed`, which descends from a worker pane and
-        // therefore wouldn't pass `AppOrBoss`. The only state
-        // change is on a `conflict_resolutions` row keyed by
-        // an opaque id — a worker forging an attempt id has
-        // no row to clobber, so authority gates aren't
-        // load-bearing here. Non-canonical reasons are rejected
-        // above; engine-internal reasons such as
-        // `no_push_no_stop_condition` call
-        // `WorkDb::mark_conflict_resolution_failed` directly.
-        match work_db.mark_conflict_resolution_failed(&attempt_id, &reason) {
-            Ok(Some(attempt)) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    work_item_id = %attempt.work_item_id,
-                    pr_url = %attempt.pr_url,
-                    %reason,
-                    "mark_conflict_resolution_failed: attempt flipped to failed",
-                );
-                // Phase 4 #12: broadcast the typed activity-feed
-                // event so subscribers (the macOS app) can
-                // render the failed-attempt entry without
-                // round-tripping through the CLI's response.
-                server_state
-                    .publisher
-                    .publish_frontend_event_on_product(
-                        &attempt.product_id,
-                        FrontendEvent::ConflictResolutionFailed {
-                            attempt: work_db.remediation_entry(attempt.list_entry()),
-                            product_id: attempt.product_id.clone(),
-                            work_item_id: attempt.work_item_id.clone(),
-                            attempt_id: attempt.id.clone(),
-                            pr_url: attempt.pr_url.clone(),
-                            failure_reason: reason.clone(),
-                        },
-                    )
-                    .await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::ConflictResolutionMarkedFailed { attempt },
-                );
-            }
-            Ok(None) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: format!("conflict resolution attempt {attempt_id:?} is unknown or already terminal",),
-                    },
-                );
-            }
-            Err(err) => {
-                send_work_error(&sink, &request_id, &err);
-            }
+        Ok(run_writes::ConflictMarked::Failed(attempt)) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::ConflictResolutionMarkedFailed { attempt: *attempt },
+            );
         }
+        Err(err) => run_writes::send_write_error(&sink, &request_id, err),
     }
 }
 
 pub(super) async fn handle_record_producer_side_conflict(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
-        work_db,
         sink,
         request_id,
         ..
@@ -361,38 +288,17 @@ pub(super) async fn handle_record_producer_side_conflict(ctx: Dispatch, req: Fro
     else {
         unreachable!()
     };
-    {
-        // Worker-facing telemetry surface. Same
-        // `User`-tier reasoning as `mark_conflict_resolution_failed`:
-        // the only state change is a fresh, self-contained
-        // `conflict_resolutions` row — a worker forging bogus content
-        // has nothing else to clobber.
-        let input = ProducerConflictInsertInput::builder()
-            .execution_id(execution_id)
-            .head_branch(head_branch)
-            .base_branch(base_branch)
-            .conflicted_files(conflicted_files)
-            .build();
-        match work_db.record_producer_side_conflict(input) {
-            Ok(attempt) => {
-                tracing::info!(
-                    attempt_id = %attempt.id,
-                    work_item_id = %attempt.work_item_id,
-                    product_id = %attempt.product_id,
-                    "record_producer_side_conflict: telemetry row recorded",
-                );
-                if let Some(class) = attempt.conflict_class.as_deref() {
-                    boss_engine_merge_poller::record_conflict_class_counter(
-                        &server_state.metrics,
-                        &attempt.product_id,
-                        class,
-                    );
-                }
-                send_response(&sink, &request_id, FrontendEvent::ConflictResolution { attempt });
-            }
-            Err(err) => {
-                send_work_error(&sink, &request_id, &err);
-            }
-        }
+    // Worker-facing telemetry surface. `User` tier, like
+    // `mark_conflict_resolution_failed`: the only state change is a fresh,
+    // self-contained `conflict_resolutions` row.
+    let input = ProducerConflictInsertInput::builder()
+        .execution_id(execution_id)
+        .head_branch(head_branch)
+        .base_branch(base_branch)
+        .conflicted_files(conflicted_files)
+        .build();
+    match run_writes::producer_conflict(&server_state, input) {
+        Ok(attempt) => send_response(&sink, &request_id, FrontendEvent::ConflictResolution { attempt }),
+        Err(err) => run_writes::send_write_error(&sink, &request_id, err),
     }
 }

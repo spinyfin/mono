@@ -1509,7 +1509,6 @@ async fn end_answer_agent_on_thread_terminal(
 pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
-        work_db,
         sink,
         session_id,
         request_id,
@@ -1525,105 +1524,21 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
     else {
         unreachable!()
     };
-    if body.trim().is_empty() {
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: "guide outcome body may not be empty".to_owned(),
-            },
-        );
-        return;
-    }
-    let execution = match work_db.get_execution(&run_id) {
-        Ok(execution) => execution,
-        Err(err) => {
-            send_work_error(&sink, &request_id, &err);
-            return;
-        }
+    let outcome = boss_protocol::GuideCommentOutcome::builder()
+        .comment_id(comment_id)
+        .disposition(disposition)
+        .response(body)
+        .request_regeneration(request_regeneration)
+        .build();
+    let origin = run_writes::WriteOrigin {
+        session_id: &session_id,
+        request_id: &request_id,
     };
-    if execution.kind != ExecutionKind::RevisionImplementation {
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: format!("run '{run_id}' is not a revision execution"),
-            },
-        );
-        return;
-    }
-    match work_db.record_guide_comment_outcome(
-        &execution.work_item_id,
-        boss_protocol::GuideCommentOutcome::builder()
-            .comment_id(comment_id)
-            .disposition(disposition)
-            .response(body)
-            .request_regeneration(request_regeneration)
-            .build(),
-    ) {
-        Ok(recorded) => {
-            match recorded.regeneration {
-                Some(Ok(boss_work_db::RetryReviewGuideOutcome::Created(_))) => {
-                    if let Some(root) = work_db
-                        .root_task_id_for_review_guide_series(&recorded.comment.artifact_id)
-                        .ok()
-                        .flatten()
-                    {
-                        boss_engine_completion::execution_publisher::notify_review_guide_changed(
-                            &work_db,
-                            &server_state.publisher,
-                            &root,
-                            "review_guide_retry_queued",
-                        )
-                        .await;
-                    }
-                }
-                Some(Ok(boss_work_db::RetryReviewGuideOutcome::AlreadyRequested(_))) => {
-                    tracing::info!(
-                        comment_id = %recorded.comment.id,
-                        series_id = %recorded.comment.artifact_id,
-                        "guide outcome regeneration already queued for this revision"
-                    );
-                }
-                Some(Ok(boss_work_db::RetryReviewGuideOutcome::NoComparison)) => {
-                    tracing::warn!(
-                        comment_id = %recorded.comment.id,
-                        series_id = %recorded.comment.artifact_id,
-                        "guide outcome requested regeneration but no source comparison exists"
-                    );
-                }
-                Some(Err(err)) => {
-                    // The outcome itself is already durably recorded (see
-                    // `RecordedGuideCommentOutcome::regeneration`'s doc) —
-                    // only the regeneration retry failed. Still publish the
-                    // comment invalidation and reply with success below;
-                    // surfacing this as a `WorkError` would tell the caller
-                    // the whole request failed when the disposition it
-                    // asked to record is sitting in the DB. Logged at `warn`
-                    // so the partial success is visible in engine logs; the
-                    // response has no field to carry it.
-                    tracing::warn!(
-                        comment_id = %recorded.comment.id,
-                        series_id = %recorded.comment.artifact_id,
-                        error = %err,
-                        "guide comment outcome recorded but its regeneration request failed"
-                    );
-                }
-                None => {}
-            }
-            let comment = recorded.comment;
-            let revision = publish_comment_invalidation(
-                &server_state,
-                &session_id,
-                &request_id,
-                &comment.artifact_kind,
-                &comment.artifact_id,
-                "guide_comment_outcome_recorded",
-            )
-            .await;
-            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
+    match run_writes::guide_outcome(&server_state, origin, &run_id, outcome, None).await {
+        Ok((comment, revision)) => {
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment })
         }
-        Err(err) => send_work_error(&sink, &request_id, &err),
+        Err(err) => run_writes::send_write_error(&sink, &request_id, err),
     }
 }
 
@@ -1642,7 +1557,6 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
 pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
-        work_db,
         sink,
         session_id,
         request_id,
@@ -1651,108 +1565,15 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
     let FrontendRequest::CommentsPostAnswer { run_id, body } = req else {
         unreachable!()
     };
-    if body.trim().is_empty() {
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: "reply body may not be empty".to_owned(),
-            },
-        );
-        return;
-    }
-
-    let execution = match work_db.get_execution(&run_id) {
-        Ok(execution) => execution,
-        Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("unknown run '{run_id}': {err}"),
-                },
-            );
-            return;
-        }
+    let origin = run_writes::WriteOrigin {
+        session_id: &session_id,
+        request_id: &request_id,
     };
-    if execution.kind != ExecutionKind::AnswerAgent {
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: format!("run '{run_id}' is not an answer-agent execution"),
-            },
-        );
-        return;
-    }
-    let comment_id = execution.work_item_id.clone();
-
-    let run = match work_db.running_answer_agent_run_for_comment(&comment_id) {
-        Ok(Some(run)) => run,
-        Ok(None) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: "no running answer-agent run found for this comment (already replied?)".to_owned(),
-                },
-            );
-            return;
+    match run_writes::answer_reply(&server_state, origin, &run_id, &body, None).await {
+        Ok((comment, revision)) => {
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment })
         }
-        Err(err) => {
-            send_work_error(&sink, &request_id, &err);
-            return;
-        }
-    };
-
-    if let Err(err) = work_db.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_REPLIED, Some(&body), None) {
-        send_work_error(&sink, &request_id, &err);
-        return;
-    }
-    boss_engine_completion::answer_agent_observability::record_replied(&server_state.metrics);
-
-    if let Err(err) = work_db.create_comment_thread_entry(
-        &comment_id,
-        THREAD_ENTRY_KIND_ANSWER,
-        "engine",
-        &body,
-        None,
-        Some(&run.id),
-    ) {
-        // The run is already `replied` — surfacing this as a hard error would
-        // tempt the agent into a (now-guarded, hence failing) retry. Log
-        // loudly and continue to the status transition; the thread entry is
-        // an audit/UI artifact, not load-bearing for `answering → answered`.
-        tracing::error!(
-            comment_id = %comment_id,
-            run_id = %run.id,
-            err = %err,
-            "CommentsPostAnswer: run completed but failed to create the thread entry",
-        );
-    }
-
-    match work_db.transition_comment_to_answered(&comment_id) {
-        Ok(comment) => {
-            let revision = publish_comment_invalidation(
-                &server_state,
-                &session_id,
-                &request_id,
-                &comment.artifact_kind,
-                &comment.artifact_id,
-                "comment_answered",
-            )
-            .await;
-            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
-        }
-        Err(err) => {
-            tracing::error!(
-                comment_id = %comment_id,
-                err = %err,
-                "CommentsPostAnswer: run completed and thread entry posted, but failed to \
-                 transition the comment to 'answered'",
-            );
-            send_work_error(&sink, &request_id, &err);
-        }
+        Err(err) => run_writes::send_write_error(&sink, &request_id, err),
     }
 }
 
@@ -1794,7 +1615,7 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::{ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_IN_REVISION};
+    use boss_protocol::{ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_IN_REVISION, THREAD_ENTRY_KIND_ANSWER};
 
     fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();

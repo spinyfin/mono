@@ -6,14 +6,22 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-backoff = { path = "../../backoff" }
 boss-host-enrollment = { path = "../host-enrollment" }
+boss-protocol = { path = "../../protocol" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
 boss-spoke-stream = { path = "../spoke-stream" }
 boss-work-db = { path = "../work-db" }
 prost = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

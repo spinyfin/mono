@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/client:__pkg__",
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-hub:__pkg__",
         "//tools/boss/engine/spoke-outbound:__pkg__",
         "//tools/boss/http_retry:__pkg__",
     ],

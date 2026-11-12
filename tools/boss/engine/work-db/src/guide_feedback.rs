@@ -143,6 +143,19 @@ impl WorkDb {
         revise_task_id: &str,
         outcome: GuideCommentOutcome,
     ) -> Result<RecordedGuideCommentOutcome> {
+        self.record_guide_comment_outcome_applied(revise_task_id, outcome, None)
+    }
+
+    /// [`Self::record_guide_comment_outcome`] that also records a spoke
+    /// submission's result in the same transaction as the outcome. A replay
+    /// whose result row exists re-reads the comment and writes nothing, so a
+    /// comment that has since moved on is not refused for an applied outcome.
+    pub fn record_guide_comment_outcome_applied(
+        &self,
+        revise_task_id: &str,
+        outcome: GuideCommentOutcome,
+        application: Option<crate::SpokeWriteApplication<'_>>,
+    ) -> Result<RecordedGuideCommentOutcome> {
         let disposition = outcome.disposition.as_str();
         anyhow::ensure!(
             !outcome.response.trim().is_empty(),
@@ -158,6 +171,15 @@ impl WorkDb {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let comment = super::comments::query_comment(&tx, &comment_id)?
                 .with_context(|| format!("unknown comment: {comment_id}"))?;
+            if let Some(application) = application.as_ref()
+                && crate::spoke_projection::get_spoke_applied_write_on(&tx, application.key)?.is_some()
+            {
+                tx.commit()?;
+                return Ok(RecordedGuideCommentOutcome {
+                    comment,
+                    regeneration: None,
+                });
+            }
             anyhow::ensure!(
                 comment.artifact_kind == "pr_review_guide",
                 "guide outcomes apply only to review-guide comments"
@@ -247,6 +269,7 @@ impl WorkDb {
                     params![comment_id, now, revise_task_id],
                 )?;
             }
+            crate::spoke_projection::record_application_on(&tx, application)?;
             tx.commit()?;
         }
 
