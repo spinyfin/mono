@@ -369,11 +369,15 @@ async fn a_worker_the_host_no_longer_has_ends_the_view() {
     let (state, _dir) = state_with(&remote, true);
     let sink = viewer(&state, "viewer-a").await;
     assert_eq!(next_capture(&sink).await.0, PaneCaptureState::Ended);
+    assert!(
+        futures_executor_block(state.pane_viewers.active_runs()) > 0,
+        "the still-subscribed viewer keeps the task so a later recovery is not lost"
+    );
+    unsubscribe(&state, "viewer-a").await;
     until("the task to end", || {
         futures_executor_block(state.pane_viewers.active_runs()) == 0
     })
     .await;
-    assert_eq!(remote.cancels(), 0, "there is nothing left to cancel");
 }
 
 #[tokio::test(flavor = "multi_thread")]
