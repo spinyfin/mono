@@ -205,6 +205,12 @@ impl ExecutionCoordinator {
     /// report the local slot as always-free (`active_runs = 0`) and let
     /// only remote hosts be gated by their `work_runs` active count.
     ///
+    /// A host on a spoke transport is not counted that way: its seats come from
+    /// the fresh resource budget and outstanding reservations
+    /// ([`crate::work::WorkDb::available_host_budget`]), which is zero whenever the host has
+    /// not answered a fresh challenge and reported capacity. A host that cannot
+    /// read its budget admits nothing without hiding the other hosts.
+    ///
     /// The execution's resolved agent driver is a hard placement
     /// constraint: only hosts whose auto-discovered capabilities include
     /// `driver=<slug>` are candidates. There is no silent fall-back to a
@@ -261,13 +267,25 @@ impl ExecutionCoordinator {
                     .list_host_capabilities(&host.id)
                     .map(|caps| caps.into_iter().map(|c| c.capability).collect::<BTreeSet<_>>())
                     .context("host-selection: host capabilities")?;
-                let active_runs = if host.id == "local" {
+                let mut slot_host = host.clone();
+                let active_runs = if self.work_db.host_transport(&host.id)? != boss_work_db::HostTransport::LegacySsh {
+                    slot_host.pool_size = self
+                        .work_db
+                        .available_host_budget(&host.id)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(host_id = %host.id, %error, "host-selection: host budget unavailable");
+                            0
+                        })
+                        .try_into()
+                        .unwrap_or(i64::MAX);
+                    0
+                } else if host.id == "local" {
                     0
                 } else {
                     *active.get(&host.id).unwrap_or(&0)
                 };
                 Ok(HostSlot {
-                    host: host.clone(),
+                    host: slot_host,
                     capabilities,
                     active_runs,
                     // Branch-affinity tiebreaker is deferred (PR4): the

@@ -7,6 +7,72 @@ use prost::Message;
 use crate::support::*;
 
 #[tokio::test]
+async fn capacity_is_admitted_only_after_a_fresh_pulse_and_applied_inventory() {
+    let (_dir, db) = work_db();
+    db.add_host("host-a", "", 2, &[]).unwrap();
+    spoke_ready(&db, "host-a");
+    let (sink, _) = stores(db.clone());
+    let admission = sink.open(&hello("host-a"), &selection()).await.unwrap();
+    let current = session("host-a", admission.generation);
+    let mut report = capacity(1);
+    report.body = Some(record::Body::Capacity(v1::Capacity {
+        generation: 1,
+        total_slots: 2,
+        available_cpu_millis: 2000,
+        available_memory_bytes: 2 * 1024 * 1024 * 1024,
+        free_disk_bytes: 8 * 1024 * 1024 * 1024,
+        inventory: Some(v1::Inventory::default()),
+        ..Default::default()
+    }));
+    sink.commit(&current, &report.encode_to_vec(), &report).await.unwrap();
+    assert_eq!(db.available_host_budget("host-a").unwrap(), 0);
+    sink.pulse(&current, &stamp()).await.unwrap();
+    let inventory = Record {
+        sequence: 2,
+        observed: Some(stamp()),
+        body: Some(record::Body::Inventory(InventorySnapshot {
+            through_record: 1,
+            last_page: true,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    sink.commit(&current, &inventory.encode_to_vec(), &inventory)
+        .await
+        .unwrap();
+    report.sequence = 3;
+    if let Some(record::Body::Capacity(capacity)) = &mut report.body {
+        capacity.generation = 3;
+    }
+    sink.commit(&current, &report.encode_to_vec(), &report).await.unwrap();
+    assert_eq!(
+        db.available_host_budget("host-a").unwrap(),
+        0,
+        "receipt is not applied inventory"
+    );
+    for sequence in 1..=2 {
+        db.advance_spoke_projection("host-a", "journal", sequence, &[]).unwrap();
+    }
+    assert_eq!(db.available_host_budget("host-a").unwrap(), 2);
+    let owned = db.admit_spoke_assignment("worker", "host-a").unwrap();
+    sink.disconnected(&current).await.unwrap();
+    assert_eq!(db.available_host_budget("host-a").unwrap(), 0);
+    assert!(db.get_host("host-a").unwrap().unwrap().enabled);
+    assert_eq!(db.spoke_assignment_for_execution("worker").unwrap().unwrap(), owned);
+    let mut reconnect = hello("host-a");
+    reconnect.last_record = 3;
+    let admission = sink.open(&reconnect, &selection()).await.unwrap();
+    let next = session("host-a", admission.generation);
+    sink.pulse(&next, &stamp()).await.unwrap();
+    sink.commit(&next, &report.encode_to_vec(), &report).await.unwrap();
+    assert_eq!(
+        db.available_host_budget("host-a").unwrap(),
+        0,
+        "replayed capacity cannot reopen admission"
+    );
+}
+
+#[tokio::test]
 async fn restart_replays_the_durable_receipt_and_generation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("work.db");

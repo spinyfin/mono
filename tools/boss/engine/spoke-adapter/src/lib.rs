@@ -1180,7 +1180,7 @@ impl HostAdapterProvider for SpokeHostAdapterProvider {
             if local || transport != HostTransport::SpokeReady || db.legacy_destination_host(&execution)?.is_some() {
                 return db.claim_legacy_destination(&execution, &host_id, transport);
             }
-            db.reserve_spoke_assignment(&execution, &host_id).map(Some)
+            db.admit_spoke_assignment(&execution, &host_id).map(Some)
         })
         .await
         .context("work database task failed")??;

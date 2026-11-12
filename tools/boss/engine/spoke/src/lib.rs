@@ -1,4 +1,5 @@
 //! Host-local observations terminate at durable normalized journal records.
+pub mod capacity;
 pub mod capture;
 pub mod hooks;
 pub mod transcripts;
