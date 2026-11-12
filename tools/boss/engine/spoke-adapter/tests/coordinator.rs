@@ -65,6 +65,7 @@ fn quick() -> SpokeInDoubtTiming {
         spawn_retry_sleep: Duration::from_millis(100),
         attention_after: Duration::from_millis(200),
         spawn_poll: Duration::from_millis(100),
+        sweep_item_timeout: Duration::from_secs(5),
     }
 }
 
@@ -186,6 +187,27 @@ fn assert_never_failed(fx: &Fixture, execution_id: &str) {
     assert!(!row.status.is_terminal(), "{row:?}");
     assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
     assert_eq!(fx.db.list_executions(None).unwrap().len(), 1, "no second execution");
+}
+
+fn persona_held(fx: &Fixture, execution_id: &str) -> bool {
+    fx.db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1 AND persona_lease_active = 1)",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A coordinator over the same database after the previous process's run tasks
+/// have been aborted, with a fresh automation pool so a held slot cannot block
+/// resume.
+async fn restarted(fx: &Fixture, previous: &Arc<ExecutionCoordinator>, slots: usize) -> Arc<ExecutionCoordinator> {
+    previous.abort_driving_runs();
+    let pool = WorkerPool::new_automation(slots);
+    coordinator_over(fx, slots, &pool).await
 }
 
 #[tokio::test]
@@ -341,13 +363,23 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
     let fx = Fixture::with(short(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "cancel in doubt");
+    let alive = Arc::new(AtomicBool::new(false));
+    let gone = Arc::new(AtomicBool::new(false));
+    let (script_alive, script_gone) = (Arc::clone(&alive), Arc::clone(&gone));
     let peer = fx
         .spoke(
-            Box::new(|command| match &command.body {
+            Box::new(move |command| match &command.body {
                 Some(command::Body::Spawn(_)) => {
                     Some(refused(command, ResultCode::OutcomeUncertain, "interrupted launch"))
                 }
-                Some(command::Body::Adopt(_)) => Some(refused(command, ResultCode::OutcomeUncertain, "no session")),
+                Some(command::Body::Adopt(_)) if script_gone.load(Ordering::SeqCst) => {
+                    Some(ok(command, Some(pane(PaneLife::Exited))))
+                }
+                Some(command::Body::Adopt(_)) if !script_alive.load(Ordering::SeqCst) => {
+                    Some(refused(command, ResultCode::OutcomeUncertain, "no session"))
+                }
+                Some(command::Body::Adopt(_)) => Some(ok(command, Some(pane(PaneLife::Alive)))),
+                Some(command::Body::Stop(_)) => None,
                 _ => answer(command),
             }),
             None,
@@ -356,6 +388,8 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
         .await;
     env.coordinator.kick();
     until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    fx.db.lease_persona_for_execution(&execution.id).unwrap();
+    assert!(persona_held(&fx, &execution.id));
     fx.db
         .cancel_execution_with(
             &execution.id,
@@ -375,6 +409,38 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
         !released(&peer.commands()),
         "the stored spawn may still run: no release may be sent"
     );
+    assert!(
+        persona_held(&fx, &execution.id),
+        "persona stays leased while the spawn is still in doubt"
+    );
+
+    alive.store(true, Ordering::SeqCst);
+    env.coordinator.reconcile_ended_in_doubt_spokes().await;
+    until("an unconfirmed stop to be sent", || stopped(&peer.commands())).await;
+    assert!(
+        persona_held(&fx, &execution.id),
+        "persona stays leased while stop is unconfirmed"
+    );
+    assert!(!released(&peer.commands()));
+    assert!(attention_open(&fx, &execution.id));
+
+    gone.store(true, Ordering::SeqCst);
+    let stop = peer
+        .commands()
+        .into_iter()
+        .find(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        .unwrap();
+    peer.answer_late(&stop, ok(&stop, Some(pane(PaneLife::Exited)))).await;
+    for _ in 0..50 {
+        env.coordinator.reconcile_ended_in_doubt_spokes().await;
+        if released(&peer.commands()) && !persona_held(&fx, &execution.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(released(&peer.commands()), "released after the confirmed stop");
+    assert!(!persona_held(&fx, &execution.id), "persona released with the workspace");
+    assert!(!attention_open(&fx, &execution.id));
 }
 
 #[tokio::test]
@@ -638,6 +704,8 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
             .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
     })
     .await;
+    fx.db.lease_persona_for_execution(&execution.id).unwrap();
+    assert!(persona_held(&fx, &execution.id));
     fx.db
         .cancel_execution_with(
             &execution.id,
@@ -649,15 +717,17 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
         )
         .unwrap();
     until("the attention item to be raised", || attention_open(&fx, &execution.id)).await;
+    assert!(persona_held(&fx, &execution.id));
 
     // A restarted engine has only stored state to go on. The host says the
     // session does not exist, but the spawn is unanswered and still deliverable.
-    let restarted = coordinator_over(&fx, 1, &env.pool).await;
+    let restarted = restarted(&fx, &env.coordinator, 1).await;
     restarted.reconcile_ended_in_doubt_spokes().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     restarted.reconcile_ended_in_doubt_spokes().await;
     assert!(!released(&peer.commands()), "no release while the spawn is unanswered");
     assert!(attention_open(&fx, &execution.id));
+    assert!(persona_held(&fx, &execution.id));
 
     // The host's late answer shows the worker did start: it is stopped, and
     // only then is the workspace released.
@@ -677,5 +747,278 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
     }
     assert!(stopped(&peer.commands()), "the late worker is stopped");
     assert!(released(&peer.commands()), "released after the confirmed stop");
+    assert!(!persona_held(&fx, &execution.id), "persona released with the workspace");
     assert!(!attention_open(&fx, &execution.id));
+}
+
+#[tokio::test]
+async fn a_parked_running_spawn_is_reconciled_from_stored_state_after_a_restart() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "parked running spawn");
+    let peer = fx
+        .spoke(
+            Box::new(|command| {
+                if matches!(command.body, Some(command::Body::Spawn(_))) {
+                    None
+                } else {
+                    answer(command)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    assert_eq!(
+        fx.db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Running
+    );
+
+    let restarted = restarted(&fx, &env.coordinator, 1).await;
+    restarted.reconcile_ended_in_doubt_spokes().await;
+    assert_never_failed(&fx, &execution.id);
+    assert_eq!(
+        fx.db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Running
+    );
+
+    let spawn = peer
+        .commands()
+        .into_iter()
+        .find(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        .unwrap();
+    peer.answer_late(&spawn, answer(&spawn).unwrap()).await;
+    for _ in 0..50 {
+        restarted.reconcile_ended_in_doubt_spokes().await;
+        if fx.db.get_execution(&execution.id).unwrap().status != ExecutionStatus::Running
+            || peer
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Adopt(_))))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_never_failed(&fx, &execution.id);
+}
+
+#[tokio::test]
+async fn an_unanswered_spawn_still_in_pre_attention_retries_is_reconciled_after_a_restart() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "pre-attention spawn");
+    let peer = fx
+        .spoke(
+            Box::new(|command| {
+                if matches!(command.body, Some(command::Body::Spawn(_))) {
+                    None
+                } else {
+                    answer(command)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("the spawn to be sent", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+    })
+    .await;
+    assert!(
+        !attention_open(&fx, &execution.id),
+        "the spawn is still in its pre-attention retries"
+    );
+
+    let restarted = restarted(&fx, &env.coordinator, 1).await;
+    restarted.reconcile_ended_in_doubt_spokes().await;
+    assert!(!attention_open(&fx, &execution.id));
+    assert_never_failed(&fx, &execution.id);
+
+    let spawn = peer
+        .commands()
+        .into_iter()
+        .find(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        .unwrap();
+    peer.answer_late(&spawn, answer(&spawn).unwrap()).await;
+    for _ in 0..50 {
+        restarted.reconcile_ended_in_doubt_spokes().await;
+        if fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count > 0
+            || fx.db.get_execution(&execution.id).unwrap().status.is_terminal()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_never_failed(&fx, &execution.id);
+}
+
+#[tokio::test]
+async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "cancelled unanswered lease");
+    let show_lease = Arc::new(AtomicBool::new(false));
+    let script_show = Arc::clone(&show_lease);
+    let peer = fx
+        .spoke(
+            Box::new(move |command| {
+                if is_lease(command) {
+                    return None;
+                }
+                if matches!(&command.body, Some(command::Body::Workspace(op))
+                    if op.kind == i32::from(WorkspaceKind::ListWorkspaces))
+                    && script_show.load(Ordering::SeqCst)
+                {
+                    return Some(ok(
+                        command,
+                        Some(workspace(
+                            command,
+                            json!([{
+                                "workspace_id": "worker",
+                                "workspace_path": "/hosts/workspaces/worker",
+                                "state": "leased",
+                                "lease_id": "lease-1"
+                            }]),
+                        )),
+                    ));
+                }
+                answer(command)
+            }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("the lease to be parked", || attention_open(&fx, &execution.id)).await;
+    fx.db
+        .cancel_execution_with(
+            &execution.id,
+            CancelExecutionOpts {
+                reason: Some("operator cancel".into()),
+                queued_only: false,
+                record_failure_reason: false,
+            },
+        )
+        .unwrap();
+    env.coordinator.abort_driving_runs();
+    env.coordinator.reconcile_ended_in_doubt_spokes().await;
+    assert!(
+        attention_open(&fx, &execution.id),
+        "the lease is still unanswered: keep the item open"
+    );
+    assert!(!released(&peer.commands()));
+
+    let lease = peer.commands().into_iter().find(is_lease).unwrap();
+    show_lease.store(true, Ordering::SeqCst);
+    peer.answer_late(&lease, answer(&lease).unwrap()).await;
+    for _ in 0..50 {
+        env.coordinator.reconcile_ended_in_doubt_spokes().await;
+        if released(&peer.commands()) && !attention_open(&fx, &execution.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(released(&peer.commands()), "the late grant is released");
+    assert!(!attention_open(&fx, &execution.id));
+}
+
+#[tokio::test]
+async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_second_host() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 3).await;
+    let parked = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
+    let peer = fx
+        .spoke(
+            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("both unanswered leases to be parked", || {
+        parked.iter().all(|e| attention_open(&fx, &e.id))
+    })
+    .await;
+    fx.db.set_host_enabled(HOST, false).unwrap();
+    fx.add_spoke_host("other", 8);
+    let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
+    let third = triage(&fx, &env, "third");
+    env.coordinator.kick();
+    until("the third execution to lease and spawn on the other host", || {
+        other
+            .commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id)
+    })
+    .await;
+    assert!(
+        !peer
+            .commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id),
+        "the third execution must not spawn on the host whose leases are in doubt"
+    );
+    for execution in &parked {
+        let row = fx.db.get_execution(&execution.id).unwrap();
+        assert!(!row.status.is_terminal(), "{row:?}");
+        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
+    let fx = Fixture::with(short(5_000)).await;
+    let env = env(&fx, 2).await;
+    let first = triage(&fx, &env, "hung adopt");
+    let first_id = first.id.clone();
+    let _peer = fx
+        .spoke(
+            Box::new(move |command| match &command.body {
+                Some(command::Body::Spawn(_)) if run_of(command) == first_id => {
+                    Some(refused(command, ResultCode::OutcomeUncertain, "interrupted launch"))
+                }
+                Some(command::Body::Adopt(_)) if run_of(command) == first_id => None,
+                _ => answer(command),
+            }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("the first spawn to be parked", || attention_open(&fx, &first.id)).await;
+    fx.db
+        .cancel_execution_with(
+            &first.id,
+            CancelExecutionOpts {
+                reason: Some("operator cancel".into()),
+                queued_only: false,
+                record_failure_reason: false,
+            },
+        )
+        .unwrap();
+    fx.db.set_host_enabled(HOST, false).unwrap();
+    fx.add_spoke_host("other", 8);
+    let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
+    let second = triage(&fx, &env, "stranded ready");
+    let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if other
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == second.id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a stranded ready row is re-kicked within one heartbeat interval while Adopt is unanswered");
 }

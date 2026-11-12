@@ -405,6 +405,62 @@ async fn an_adopted_alive_worker_keeps_the_lease_until_its_session_is_gone() {
 }
 
 #[tokio::test]
+async fn a_settled_uncertain_spawn_adopted_alive_is_stopped_then_released() {
+    let fx = Fixture::with(short(500)).await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let gone = Arc::new(AtomicBool::new(false));
+    let adopt_gone = Arc::clone(&gone);
+    let stop_gone = Arc::clone(&gone);
+    let peer = fx
+        .spoke(
+            interrupted_spawn(
+                move |c| {
+                    let life = if adopt_gone.load(Ordering::SeqCst) {
+                        PaneLife::Exited
+                    } else {
+                        PaneLife::Alive
+                    };
+                    Some(ok(c, Some(pane(life))))
+                },
+                move |c| {
+                    stop_gone.store(true, Ordering::SeqCst);
+                    Some(ok(c, Some(pane(PaneLife::Exited))))
+                },
+            ),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let outcome = spawn(&adapter).await.expect("an alive adopted worker is launched");
+    assert_eq!(outcome.wait_state, RunWaitState::WorkerPaneAlive);
+    let refused = adapter.release_workspace("lease-1").await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("may have started a worker"),
+        "{refused:#}"
+    );
+    adapter
+        .stop_worker("exec_1", Duration::ZERO)
+        .await
+        .expect("the confirmed stop is delivered");
+    assert!(
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Stop(_)))),
+        "Stop is issued rather than flipping Adopt to Exited"
+    );
+    adapter.release_workspace("lease-1").await.unwrap();
+    assert!(
+        fx.db
+            .spoke_assignment_for_execution("exec_1")
+            .unwrap()
+            .unwrap()
+            .resolved
+    );
+}
+
+#[tokio::test]
 async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_reported_running() {
     let fx = Fixture::with(short(300)).await;
     fx.ready(HOST);

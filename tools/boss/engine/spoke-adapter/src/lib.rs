@@ -459,7 +459,8 @@ pub struct SpokeHostAdapter {
     /// Set once a launched worker's prompt was never confirmed and the stop sent
     /// to reap it was not confirmed either. The spawn itself is settled by then,
     /// so later attempts retry only the stop instead of waiting for the prompt
-    /// again.
+    /// again. Lives only on this adapter instance: a new adapter (after a
+    /// restart, or the in-doubt sweep's) does the full prompt wait.
     stop_unconfirmed: std::sync::atomic::AtomicBool,
 }
 
@@ -983,6 +984,10 @@ impl HostAdapter for SpokeHostAdapter {
 
     async fn observe_worker(&self, execution_id: &str) -> Result<Option<WorkerPane>> {
         self.ctl_observe(execution_id).await
+    }
+
+    async fn complete_in_doubt_lease(&self) -> Result<Option<CubeWorkspaceLease>> {
+        self.ws_complete_in_doubt_lease().await
     }
 
     async fn cleanup_legacy_store(

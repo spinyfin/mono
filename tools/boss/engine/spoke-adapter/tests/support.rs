@@ -1,5 +1,6 @@
 //! A real hub (stream manager over mTLS gRPC, work database, command outbox)
 //! and a scripted spoke on the other end of a real stream.
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,15 +42,20 @@ pub const HOST: &str = "host";
 
 struct Authority {
     events: broadcast::Sender<CredentialEvent>,
-    leaf: Vec<u8>,
+    leaves: Arc<Mutex<HashMap<Vec<u8>, String>>>,
 }
 impl HostAuthorizer for Authority {
     fn authorize(&self, chain: &[CertificateDer<'_>]) -> Result<AuthorizedHost, Denial> {
-        if !chain.first().is_some_and(|c| c.as_ref() == self.leaf) {
-            return Err(Denial::Untrusted);
-        }
+        let der = chain.first().ok_or(Denial::Untrusted)?;
+        let host_id = self
+            .leaves
+            .lock()
+            .unwrap()
+            .get(der.as_ref())
+            .cloned()
+            .ok_or(Denial::Untrusted)?;
         Ok(AuthorizedHost {
-            host_id: HOST.into(),
+            host_id,
             serial: "serial".into(),
             valid_until: SystemTime::now() + STEP * 100,
         })
@@ -62,36 +68,46 @@ impl HostAuthorizer for Authority {
     }
 }
 
+/// Per-host journal cursor kept by [`Sink`].
+#[derive(Default)]
+struct HostJournal {
+    generation: u64,
+    journal_id: Option<String>,
+    through: u64,
+}
+
 /// The ingress half of the hub as the observation task will provide it: it
 /// settles a command result in the same place it records the receipt.
 struct Sink {
     db: Arc<WorkDb>,
-    state: Mutex<(u64, Option<String>, u64)>,
+    state: Mutex<HashMap<String, HostJournal>>,
 }
 #[tonic::async_trait]
 impl SpokeObservationSink for Sink {
     async fn open(&self, hello: &Hello, _: &Selection) -> Result<Admission, StoreError> {
-        let mut state = self.state.lock().unwrap();
-        if state.1.as_ref().is_some_and(|id| id != &hello.journal_id) {
+        let mut map = self.state.lock().unwrap();
+        let state = map.entry(hello.host_id.clone()).or_default();
+        if state.journal_id.as_ref().is_some_and(|id| id != &hello.journal_id) {
             return Err(StoreError::ReplayGap);
         }
-        state.1 = Some(hello.journal_id.clone());
-        state.0 += 1;
+        state.journal_id = Some(hello.journal_id.clone());
+        state.generation += 1;
         Ok(Admission {
-            generation: state.0,
+            generation: state.generation,
             received: Cursor {
                 journal_id: hello.journal_id.clone(),
-                through: state.2,
+                through: state.through,
             },
         })
     }
     async fn commit(&self, session: &Session, _raw: &[u8], record: &Record) -> Result<Cursor, StoreError> {
-        let mut state = self.state.lock().unwrap();
-        if session.generation != state.0 {
+        let mut map = self.state.lock().unwrap();
+        let state = map.get_mut(&session.host_id).ok_or(StoreError::Denied)?;
+        if session.generation != state.generation {
             return Err(StoreError::Denied);
         }
-        if record.sequence > state.2 {
-            if record.sequence != state.2 + 1 {
+        if record.sequence > state.through {
+            if record.sequence != state.through + 1 {
                 return Err(StoreError::ReplayGap);
             }
             if let Some(record::Body::Result(result)) = &record.body {
@@ -113,11 +129,11 @@ impl SpokeObservationSink for Sink {
                         None => StoreError::Unavailable,
                     })?;
             }
-            state.2 = record.sequence;
+            state.through = record.sequence;
         }
         Ok(Cursor {
             journal_id: session.journal_id.clone(),
-            through: state.2,
+            through: state.through,
         })
     }
 }
@@ -329,6 +345,9 @@ pub struct Fixture {
     legacy: Arc<Legacy>,
     dialer: Endpoint,
     server: tokio::task::JoinHandle<()>,
+    issuer: Arc<CertifiedIssuer<'static, KeyPair>>,
+    addr: std::net::SocketAddr,
+    leaves: Arc<Mutex<HashMap<Vec<u8>, String>>>,
     #[builder(name = dir)]
     _dir: tempfile::TempDir,
 }
@@ -360,13 +379,15 @@ impl Fixture {
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         let leaf = params.signed_by(&key, &ca).unwrap();
         let identity = Identity::from_pem(leaf.pem(), key.serialize_pem());
+        let leaves = Arc::new(Mutex::new(HashMap::from([(leaf.der().to_vec(), HOST.to_owned())])));
+        let issuer = Arc::new(ca);
         let auth = Arc::new(Authority {
             events: broadcast::channel(4).0,
-            leaf: leaf.der().to_vec(),
+            leaves: Arc::clone(&leaves),
         });
         let sink = Arc::new(Sink {
             db: Arc::clone(&db),
-            state: Mutex::new((0, None, 0)),
+            state: Mutex::new(HashMap::new()),
         });
         let outbox = WorkDbOutbox::new(Arc::clone(&db));
         let manager = StreamManager::new(
@@ -388,7 +409,7 @@ impl Fixture {
         let addr = listener.local_addr().unwrap();
         let tls = ServerTlsConfig::new()
             .identity(server_identity)
-            .client_ca_root(Certificate::from_pem(ca.pem()))
+            .client_ca_root(Certificate::from_pem(issuer.pem()))
             .client_auth_optional(true);
         let service = manager.service();
         let server = tokio::spawn(async move {
@@ -401,7 +422,7 @@ impl Fixture {
                 .unwrap();
         });
         let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(ca.pem()))
+            .ca_certificate(Certificate::from_pem(issuer.pem()))
             .domain_name("localhost")
             .identity(identity);
         let dialer = Endpoint::from_shared(format!("https://{addr}"))
@@ -426,6 +447,9 @@ impl Fixture {
             .legacy(legacy)
             .dialer(dialer)
             .server(server)
+            .issuer(issuer)
+            .addr(addr)
+            .leaves(leaves)
             .dir(dir)
             .build()
     }
@@ -498,9 +522,34 @@ impl Fixture {
             .await
     }
 
+    /// A spoke-ready host with the driver capability the coordinator requires.
+    pub fn add_spoke_host(&self, id: &str, pool_size: i64) {
+        self.db.add_host(id, &format!("worker@{id}"), pool_size, &[]).unwrap();
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
+                [id],
+            )
+            .unwrap();
+        self.ready(id);
+    }
+
     /// Connect a scripted spoke that has already produced `last_record` records.
     pub async fn spoke(&self, script: Script, command_cursor: Option<Cursor>, last_record: u64) -> Peer {
-        self.spoke_contracts(script, command_cursor, last_record, Contracts::first_release())
+        self.spoke_as(HOST, script, command_cursor, last_record).await
+    }
+
+    /// Connect a scripted spoke whose certificate names `host_id`.
+    pub async fn spoke_as(
+        &self,
+        host_id: &str,
+        script: Script,
+        command_cursor: Option<Cursor>,
+        last_record: u64,
+    ) -> Peer {
+        self.spoke_as_contracts(host_id, script, command_cursor, last_record, Contracts::first_release())
             .await
     }
 
@@ -511,11 +560,49 @@ impl Fixture {
         last_record: u64,
         contracts: Contracts,
     ) -> Peer {
+        self.spoke_as_contracts(HOST, script, command_cursor, last_record, contracts)
+            .await
+    }
+
+    pub async fn spoke_as_contracts(
+        &self,
+        host_id: &str,
+        script: Script,
+        command_cursor: Option<Cursor>,
+        last_record: u64,
+        contracts: Contracts,
+    ) -> Peer {
+        let dialer = if host_id == HOST {
+            self.dialer.clone()
+        } else {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::default();
+            params.subject_alt_names = vec![SanType::URI(format!("urn:boss:host:{host_id}").try_into().unwrap())];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            let leaf = params.signed_by(&key, self.issuer.as_ref()).unwrap();
+            self.leaves
+                .lock()
+                .unwrap()
+                .insert(leaf.der().to_vec(), host_id.to_owned());
+            let identity = Identity::from_pem(leaf.pem(), key.serialize_pem());
+            let tls = ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(self.issuer.pem()))
+                .domain_name("localhost")
+                .identity(identity);
+            Endpoint::from_shared(format!("https://{}", self.addr))
+                .unwrap()
+                .tls_config(tls)
+                .unwrap()
+        };
         let (tx, rx) = mpsc::channel(32);
         tx.send(SpokeFrame {
             body: Some(spoke_frame::Body::Hello(Hello {
-                host_id: HOST.into(),
-                journal_id: "journal".into(),
+                host_id: host_id.into(),
+                journal_id: if host_id == HOST {
+                    "journal".into()
+                } else {
+                    format!("journal-{host_id}")
+                },
                 boot_id: "boot".into(),
                 min_epoch: 1,
                 max_epoch: 1,
@@ -529,10 +616,7 @@ impl Fixture {
         })
         .await
         .unwrap();
-        let channel = tokio::time::timeout(STEP, self.dialer.connect())
-            .await
-            .unwrap()
-            .unwrap();
+        let channel = tokio::time::timeout(STEP, dialer.connect()).await.unwrap().unwrap();
         let mut incoming = tokio::time::timeout(
             STEP,
             spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)),

@@ -1,6 +1,7 @@
 //! Running an execution to completion: spawn, conflict-diagnosis capture,
 //! worker release, and run-completion bookkeeping. Part of the `coordinator`
 //! module split; see [`super`] for the struct and shared types.
+use super::spoke_in_doubt::execution_no_longer_runnable;
 use super::*;
 
 pub use boss_engine_storage_values::attention_kinds::PANE_SPAWN_FAILED_ATTENTION_KIND;
@@ -83,6 +84,29 @@ impl ExecutionCoordinator {
     // `change` is `None` for `pr_review` executions that checked out the PR
     // head directly; `Some` for all other executions that created a jj change.
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_run_execution(
+        self: &Arc<Self>,
+        execution: WorkExecution,
+        run: WorkRun,
+        work_item: WorkItem,
+        worker_id: String,
+        lease: CubeWorkspaceLease,
+        change: Option<CubeChangeHandle>,
+        adapter: Arc<dyn HostAdapter>,
+    ) {
+        let execution_id = execution.id.clone();
+        self.begin_driving_run(&execution_id);
+        let coordinator = Arc::clone(self);
+        let handle = boss_task_scope::spawn(async move {
+            coordinator
+                .run_execution(execution, run, work_item, worker_id, lease, change, adapter)
+                .await;
+        });
+        self.store_driving_handle(&execution_id, handle.abort_handle());
+    }
+
+    // Same argument list as `spawn_run_execution`; clippy counts the Arc receiver.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_execution(
         self: Arc<Self>,
         execution: WorkExecution,
@@ -93,7 +117,11 @@ impl ExecutionCoordinator {
         change: Option<CubeChangeHandle>,
         adapter: Arc<dyn HostAdapter>,
     ) {
-        // Keep the cube lease alive for blocking runners (in-process test
+        let _driving = DrivingRunGuard {
+            coordinator: Arc::clone(&self),
+            execution_id: execution.id.clone(),
+        };
+        // Keep the cube lease alive for blocking runners (in-process test)
         // fakes, ACP-style runners). For pane-spawn (the production path),
         // spawn_worker returns immediately and this guard is dropped below
         // without ever firing — pane workers are covered instead by the
@@ -130,7 +158,7 @@ impl ExecutionCoordinator {
             // Only after a spawn has been sent can a cancellation leave a worker
             // that may still start. A failed read is not a cancellation.
             if let Some(uncertain) = last_uncertain.as_ref() {
-                match super::execution::execution_no_longer_runnable(&self.work_db, &execution.id) {
+                match execution_no_longer_runnable(&self.work_db, &execution.id) {
                     Ok(true) => {
                         break Err(anyhow::Error::new(uncertain.clone()).context(format!(
                             "execution {} was cancelled or became terminal while its spoke spawn was in doubt",
@@ -1013,6 +1041,17 @@ impl ExecutionCoordinator {
     /// spawn can still be reconciled; only the pool slot (and with it the
     /// dispatch pass) is freed.
     async fn park_in_doubt_spawn(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str, err: &anyhow::Error) {
+        if let Ok(Some(assignment)) = self.work_db.spoke_assignment_for_execution(&execution.id)
+            && let Err(error) = self
+                .work_db
+                .set_spoke_in_doubt(&execution.id, assignment.assignment_generation, true)
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{error:#}"),
+                "could not flag the spoke assignment as in doubt"
+            );
+        }
         self.raise_spoke_in_doubt_attention(execution, "worker spawn", err, Duration::ZERO);
         self.pool_for_worker_id(worker_id)
             .release_worker_if_execution(worker_id, &execution.id, None)
@@ -1373,17 +1412,24 @@ impl ExecutionCoordinator {
             }
         };
 
-        let host = self
+        let host_id = self
             .work_db
             .latest_run_host_for_execution(&execution.id)?
+            .or_else(|| self.work_db.spoke_host_holding_execution(&execution.id).ok().flatten())
             .unwrap_or_else(|| "local".to_owned());
-        if host != "local" {
-            return Err(anyhow!(
-                "cannot resume pane spawn for {}: host `{host}` is not local (remote reattach owns that path)",
-                execution.id
-            ));
-        }
-        let adapter = self.host_adapter();
+        let adapter = if host_id == "local" {
+            self.host_adapter()
+        } else {
+            let host = self.work_db.get_host(&host_id)?.ok_or_else(|| {
+                anyhow!(
+                    "cannot resume pane spawn for {}: host `{host_id}` is gone",
+                    execution.id
+                )
+            })?;
+            self.host_adapter_provider
+                .adapter_for_execution(&host, &execution.id)
+                .await?
+        };
 
         if leaseless {
             // A checkout-free run re-enters its own spawn path: the scratch
@@ -1406,14 +1452,19 @@ impl ExecutionCoordinator {
             workspace_path: PathBuf::from(workspace_path),
             dirty_verified: None,
         };
-        let execution = execution.clone();
-        let coordinator = Arc::clone(self);
-        boss_task_scope::spawn(async move {
-            coordinator
-                .run_execution(execution, run, work_item, worker_id, lease, None, adapter)
-                .await;
-        });
+        self.spawn_run_execution(execution.clone(), run, work_item, worker_id, lease, None, adapter);
         Ok(())
+    }
+}
+
+struct DrivingRunGuard {
+    coordinator: Arc<ExecutionCoordinator>,
+    execution_id: String,
+}
+
+impl Drop for DrivingRunGuard {
+    fn drop(&mut self) {
+        self.coordinator.forget_driving_run(&self.execution_id);
     }
 }
 

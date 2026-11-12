@@ -278,6 +278,14 @@ pub struct StoredHostCommand {
     pub wire: Vec<u8>,
 }
 
+/// The newest stored lease command for a run, including an optional result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLeaseCommand {
+    pub command_id: String,
+    pub wire: Vec<u8>,
+    pub result: Option<Vec<u8>>,
+}
+
 const ASSIGNMENT_COLUMNS: &str = "execution_id, assignment_generation, run_id, spawn_token, host_id, repo_id,
     workspace_id, lease_id, display_path, pane_pid, resolved_at_ms";
 
@@ -407,6 +415,57 @@ impl WorkDb {
             assignment_may_have_started(&conn, execution_id, open.assignment_generation as i64)?
                 .then_some(open.host_id),
         )
+    }
+
+    /// Executions whose open spoke assignment is still in doubt: the flag is
+    /// set, or a stored lease/spawn command has no result yet. Used after a
+    /// restart, when the in-memory run task and the attention item may both
+    /// be gone.
+    pub fn list_in_doubt_spoke_execution_ids(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT execution_id FROM spoke_assignments
+              WHERE resolved_at_ms IS NULL AND (
+                in_doubt <> 0
+                OR EXISTS (
+                    SELECT 1 FROM host_commands c
+                     WHERE c.run_execution_id = spoke_assignments.execution_id
+                       AND c.run_generation = spoke_assignments.assignment_generation
+                       AND c.result IS NULL
+                       AND (c.command_id LIKE 'lease-%' OR c.command_id LIKE 'spawn-%')
+                )
+              )",
+        )?;
+        let ids = stmt.query_map([], |row| row.get(0))?;
+        ids.collect::<rusqlite::Result<Vec<String>>>().map_err(Into::into)
+    }
+
+    /// Whether this run has a stored spawn command, answered or not.
+    pub fn assignment_has_stored_spawn(&self, host_id: &str, run_id: &str) -> Result<bool> {
+        let id = host_command_spawn_id(run_id);
+        Ok(self.host_command_wire(host_id, &id)?.is_some())
+    }
+
+    /// The newest stored lease command for `run_id` on `host_id`, with its
+    /// wire and optional result. `None` when no lease was ever stored.
+    pub fn current_lease_command(&self, host_id: &str, run_id: &str) -> Result<Option<StoredLeaseCommand>> {
+        let prefix = format!("{HOST_COMMAND_LEASE_PREFIX}{run_id}-%");
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT command_id, wire, result FROM host_commands
+                  WHERE host_id = ?1 AND command_id LIKE ?2
+                  ORDER BY created_at_ms DESC LIMIT 1",
+                params![host_id, prefix],
+                |row| {
+                    Ok(StoredLeaseCommand {
+                        command_id: row.get(0)?,
+                        wire: row.get(1)?,
+                        result: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// How long the execution's open assignment has been held, in milliseconds.
@@ -1371,6 +1430,45 @@ mod tests {
         assert!(host_command_stop_id(250, "run").starts_with(HOST_COMMAND_STOP_PREFIX));
         assert_eq!(host_command_spawn_id("exec_1-g1"), "spawn-exec_1-g1");
         assert_eq!(host_command_stop_id(0, "exec_1-g1"), "stop-0-exec_1-g1");
+    }
+
+    #[test]
+    fn list_in_doubt_spoke_execution_ids_includes_unanswered_commands_without_the_flag() {
+        let db = spoke_db();
+        let reserved = db.reserve_spoke_assignment("exec_1", "host-a").unwrap();
+        assert!(db.list_in_doubt_spoke_execution_ids().unwrap().is_empty());
+        append(
+            &db,
+            "host-a",
+            &host_command_lease_id(&reserved.run_id, 1),
+            Some(&key(&reserved)),
+            b"lease",
+        )
+        .unwrap();
+        assert_eq!(db.list_in_doubt_spoke_execution_ids().unwrap(), ["exec_1"]);
+        db.settle_host_command(
+            "host-a",
+            &host_command_lease_id(&reserved.run_id, 1),
+            Some(&key(&reserved)),
+            b"ok",
+        )
+        .unwrap();
+        assert!(db.list_in_doubt_spoke_execution_ids().unwrap().is_empty());
+        db.set_spoke_in_doubt("exec_1", reserved.assignment_generation, true)
+            .unwrap();
+        assert_eq!(db.list_in_doubt_spoke_execution_ids().unwrap(), ["exec_1"]);
+        let other = db.reserve_spoke_assignment("exec_2", "host-b").unwrap();
+        append(
+            &db,
+            "host-b",
+            &host_command_spawn_id(&other.run_id),
+            Some(&key(&other)),
+            b"spawn",
+        )
+        .unwrap();
+        let mut ids = db.list_in_doubt_spoke_execution_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, ["exec_1", "exec_2"]);
     }
 
     fn held_by(error: &anyhow::Error) -> Option<String> {

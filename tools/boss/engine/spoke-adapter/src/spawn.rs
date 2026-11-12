@@ -297,7 +297,14 @@ impl SpokeHostAdapter {
             }
         }
         if self.stop_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
-            return self.retry_unconfirmed_stop(execution, command_id).await;
+            // The flag lives only on this adapter instance. A new adapter (the
+            // in-doubt sweep's, or one created after a restart) never sees it
+            // and waits for prompt evidence the usual way.
+            if self.hub.signals.has_prompt_accepted_for_run(&execution.id) {
+                self.stop_unconfirmed.store(false, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                return self.retry_unconfirmed_stop(execution, command_id).await;
+            }
         }
         let mut stopped = None;
         let confirmed = boss_execution_contracts::confirm_prompt_accepted_or_reap(
@@ -343,9 +350,11 @@ impl SpokeHostAdapter {
     }
 
     /// A launched worker whose prompt was never confirmed and whose stop is
-    /// still unconfirmed: ask for the stable stop again, and only that. A prompt
-    /// that has been accepted since ends the question; a delivered stop is the
-    /// definitive failure the first attempt could not establish.
+    /// still unconfirmed: ask for the stable stop again, and only that. Prompt
+    /// acceptance is checked by [`Self::finish_launch`] before this runs; a
+    /// delivered stop is the definitive failure the first attempt could not
+    /// establish. The `stop_unconfirmed` flag is in-memory on this adapter
+    /// instance only, so a new adapter falls back to the full prompt wait.
     async fn retry_unconfirmed_stop(&self, execution: &WorkExecution, command_id: &str) -> Result<RunOutcome> {
         match self.ctl_stop(&execution.id, Duration::ZERO).await {
             Ok(ControlOutcome::Delivered(_)) => {

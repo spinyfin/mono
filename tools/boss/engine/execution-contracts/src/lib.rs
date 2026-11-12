@@ -1866,6 +1866,16 @@ pub trait HostAdapter: Send + Sync {
     async fn observe_worker(&self, _execution_id: &str) -> Result<Option<WorkerPane>> {
         Ok(None)
     }
+
+    /// Replay the stored in-doubt lease command and bind a late grant.
+    ///
+    /// `Ok(Some(lease))` when the host granted (or recovered) a lease.
+    /// `Ok(None)` when there is no stored lease, or it settled as a refusal.
+    /// `Err` with [`LeaseOutcomeUncertain`] while the command is still
+    /// unanswered or settled-uncertain with no lease to show.
+    async fn complete_in_doubt_lease(&self) -> Result<Option<CubeWorkspaceLease>> {
+        Ok(None)
+    }
 }
 
 /// Which text a control request types into a worker.

@@ -5,6 +5,7 @@ use crate::work::CancelExecutionOpts;
 use anyhow::bail;
 use boss_protocol::ReviewBatchPhase;
 
+use super::spoke_in_doubt::waitable_spoke_lease;
 use super::*;
 
 /// The original dispatch failure is already visible in the event stream.
@@ -2147,12 +2148,7 @@ impl ExecutionCoordinator {
                 // as "inapplicable" — never noisier than the
                 // pre-change behaviour.
                 self.execution_started_hook.on_execution_started(&execution.id).await;
-                let coordinator = self.clone();
-                boss_task_scope::spawn(async move {
-                    coordinator
-                        .run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter)
-                        .await;
-                });
+                self.spawn_run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter);
                 Ok(())
             }
             Err(err) => {
@@ -2574,7 +2570,7 @@ impl ExecutionCoordinator {
             .await;
     }
 
-    fn persist_acquired_lease(&self, execution: &WorkExecution, lease: &CubeWorkspaceLease) {
+    pub(super) fn persist_acquired_lease(&self, execution: &WorkExecution, lease: &CubeWorkspaceLease) {
         if let Err(err) = self.work_db.restore_execution_workspace(
             &execution.id,
             &lease.lease_id,
@@ -2899,30 +2895,6 @@ impl ExecutionCoordinator {
         Ok(())
     }
 
-    /// Refresh the owning review-guide card after a pre-start failure. The
-    /// attempt row is already terminal; this is the board-invalidation the
-    /// comparison-id `work_item_id` cannot provide on its own.
-    pub(super) fn notify_review_guide_pre_start_failure(&self, execution: &WorkExecution) {
-        if execution.kind != ExecutionKind::PrReviewGuide {
-            return;
-        }
-        let work_db = self.work_db.clone();
-        let publisher = self.publisher.clone();
-        let lifecycle = self.lifecycle.clone();
-        let execution_id = execution.id.clone();
-        boss_task_scope::spawn(async move {
-            let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
-                return;
-            };
-            let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
-                return;
-            };
-            lifecycle
-                .notify_review_guide_changed(&publisher, &root_task_id, "review_guide_failed")
-                .await;
-        });
-    }
-
     /// A recoverable pre-start failure (host adapter build, `cube repo
     /// ensure`, workspace lease, cube change create, ...) on an execution
     /// with a request-scoped `--host` constraint must not fall through to
@@ -3011,18 +2983,6 @@ impl ExecutionCoordinator {
             }
         }
     }
-}
-
-fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeUncertain> {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<LeaseOutcomeUncertain>())
-}
-
-/// Whether the execution has been cancelled or finished. A failed read is not
-/// an answer: callers must not treat it as a cancellation, because that would
-/// release state a worker may still be using.
-pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str) -> Result<bool> {
-    Ok(work_db.get_execution(execution_id)?.status.is_terminal())
 }
 
 #[cfg(test)]

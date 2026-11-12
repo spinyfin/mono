@@ -44,6 +44,8 @@ use boss_execution_contracts::{
 /// at once, since re-sending it only replays the stored result.
 const SPOKE_UNSETTLED_RETRY_LIMIT: u32 = 3;
 const SPOKE_UNSETTLED_RETRY_SLEEP: Duration = Duration::from_secs(5);
+/// How many in-doubt executions one sweep pass asks about at once.
+const IN_DOUBT_SWEEP_CONCURRENCY: usize = 4;
 
 /// Timing of the wait on a spoke host that has not said whether it granted a
 /// lease or started a worker. Neither wait holds dispatch capacity, spends the
@@ -63,6 +65,9 @@ pub struct SpokeInDoubtTiming {
     /// How often a parked spawn re-asks the host (replaying the stored spawn
     /// and observing the worker's session).
     pub spawn_poll: Duration,
+    /// Bound on one in-doubt sweep item so a silent host cannot stall the
+    /// rest of the pass. The stored command stays; the next pass asks again.
+    pub sweep_item_timeout: Duration,
 }
 
 impl Default for SpokeInDoubtTiming {
@@ -72,8 +77,17 @@ impl Default for SpokeInDoubtTiming {
             spawn_retry_sleep: SPOKE_UNSETTLED_RETRY_SLEEP,
             attention_after: Duration::from_secs(60),
             spawn_poll: Duration::from_secs(30),
+            sweep_item_timeout: Duration::from_secs(5),
         }
     }
+}
+
+/// In-flight `run_execution` tasks. Empty after an engine restart, which is
+/// how the in-doubt sweep knows it must resume a parked spawn itself.
+#[derive(Default)]
+struct DrivingRuns {
+    ids: HashSet<String>,
+    handles: HashMap<String, tokio::task::AbortHandle>,
 }
 
 // Phase-3 counter handles for the cube workspace lease boundary.
@@ -866,6 +880,14 @@ pub struct ExecutionCoordinator {
     /// 90s.
     #[builder(default = CUBE_LEASE_TIMEOUT)]
     cube_lease_timeout: Duration,
+    /// Executions whose `run_execution` task is currently driving a spawn.
+    /// After a restart this is empty even if the rows are still `running`.
+    #[builder(skip = std::sync::Mutex::new(DrivingRuns::default()))]
+    driving_runs: std::sync::Mutex<DrivingRuns>,
+    /// Single-flight latch for the in-doubt spoke sweep so the heartbeat can
+    /// kick without waiting on a silent host.
+    #[builder(default)]
+    in_doubt_sweep_active: AtomicBool,
 }
 
 mod blocked_workspace;

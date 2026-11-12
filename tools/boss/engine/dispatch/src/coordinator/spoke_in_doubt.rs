@@ -3,6 +3,7 @@
 //! item once the wait exceeds its bound, and resolve it when the host answers.
 use super::*;
 use boss_execution_contracts::WorkerLife;
+use boss_protocol::ExecutionKind;
 
 impl ExecutionCoordinator {
     /// Park an attempt whose spoke lease the host has not answered: back to
@@ -91,9 +92,11 @@ impl ExecutionCoordinator {
             "The spoke host has not confirmed the {what} for execution `{execution_id}` for {secs}s. \
              The host may have granted the lease or started the worker, so the execution keeps its \
              assignment, workspace and persona and is neither failed nor re-dispatched. The dispatcher \
-             keeps asking the host about the stored command, and about the worker's session if the \
-             execution has ended. The item resolves once the host reports the outcome; if the host \
-             stays unreachable it stays open.\n\n**Last answer:** {err:#}",
+             keeps asking the host about the stored command from persisted assignment state, including \
+             after an engine restart and while the spawn is still running. If the execution has ended it \
+             also asks about the worker's session. The item resolves once the host reports the outcome \
+             and any granted lease is released; if the host stays unreachable it stays open.\n\n\
+             **Last answer:** {err:#}",
             execution_id = execution.id,
             secs = age.as_secs(),
         );
@@ -111,50 +114,108 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Settle executions that ended while their spoke spawn was still in doubt.
+    /// Reconcile spoke leases and spawns that are still in doubt.
     ///
-    /// Driven from persisted state (the open in-doubt attention item and the
-    /// execution's open assignment), so it works after the task that parked
-    /// the spawn is gone: after a cancel, and after an engine restart. For each
-    /// one it asks the host about the worker's session. A live worker is
-    /// stopped. Once the host reports the session gone, the workspace lease
-    /// is released (the release itself still refuses while the stored spawn
-    /// is unanswered or settled as uncertain, since it may yet start a
-    /// worker), and only then are the persona and live state handed back and
-    /// the attention item resolved. Executions that have not ended are left to
-    /// the task driving them.
+    /// Driven from persisted open assignments and stored command state, plus
+    /// any open in-doubt attention item, so a parked spawn is still asked
+    /// about after an engine restart: there is then no live `run_execution`
+    /// task, and there may not yet be an attention item. A still-running
+    /// execution with no driver is resumed onto the stored spawn (Alive
+    /// continues the launch path; definitive evidence fails it). An ended
+    /// execution is asked about the worker, stopped if alive, and released
+    /// only once the spawn and any granted lease have a definitive answer.
     pub async fn reconcile_ended_in_doubt_spokes(self: &Arc<Self>) {
-        let items = match self
+        let mut ids = std::collections::BTreeSet::new();
+        match self
             .work_db
             .list_open_attention_items_of_kind(SPOKE_ASSIGNMENT_IN_DOUBT_ATTENTION_KIND)
         {
-            Ok(items) => items,
+            Ok(items) => {
+                for item in items {
+                    if let Some(execution_id) = item.execution_id {
+                        ids.insert(execution_id);
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "could not list the in-doubt spoke attention items");
-                return;
             }
-        };
-        for item in items {
-            let Some(execution_id) = item.execution_id.as_deref() else {
-                continue;
-            };
-            self.reconcile_ended_in_doubt_spoke(execution_id).await;
         }
+        match self.work_db.list_in_doubt_spoke_execution_ids() {
+            Ok(open) => ids.extend(open),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "could not list in-doubt spoke assignments");
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let timeout = self.spoke_in_doubt_timing.sweep_item_timeout;
+        let mut set = tokio::task::JoinSet::new();
+        for execution_id in ids {
+            while set.len() >= IN_DOUBT_SWEEP_CONCURRENCY {
+                let _ = set.join_next().await;
+            }
+            let coordinator = Arc::clone(self);
+            boss_task_scope::spawn_into(&mut set, async move {
+                if tokio::time::timeout(timeout, coordinator.reconcile_in_doubt_spoke(&execution_id))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        execution_id,
+                        "in-doubt spoke reconcile timed out; will retry on the next pass"
+                    );
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
     }
 
-    async fn reconcile_ended_in_doubt_spoke(self: &Arc<Self>, execution_id: &str) {
+    /// Fire the in-doubt sweep without waiting for it. A second call while a
+    /// pass is running is a no-op, so the scheduler heartbeat can kick on its
+    /// own interval even when a host is silent.
+    pub fn spawn_in_doubt_reconcile(self: &Arc<Self>) {
+        if self.in_doubt_sweep_active.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let coordinator = Arc::clone(self);
+        boss_task_scope::spawn(async move {
+            coordinator.reconcile_ended_in_doubt_spokes().await;
+            coordinator.in_doubt_sweep_active.store(false, Ordering::Release);
+        });
+    }
+
+    async fn reconcile_in_doubt_spoke(self: &Arc<Self>, execution_id: &str) {
         let execution = match self.work_db.get_execution(execution_id) {
-            Ok(execution) if execution.status.is_terminal() => execution,
-            Ok(_) => return,
+            Ok(execution) => execution,
             Err(error) => {
                 tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read an execution with an in-doubt spoke");
                 return;
             }
         };
+        if execution.status.is_live() {
+            if self.is_driving_run(execution_id) {
+                return;
+            }
+            match self.resume_pane_spawn_for_running_execution(&execution).await {
+                Ok(()) => {}
+                Err(error) => tracing::warn!(
+                    execution_id,
+                    error = %format!("{error:#}"),
+                    "could not resume a running in-doubt spoke spawn"
+                ),
+            }
+            return;
+        }
+        if !execution.status.is_terminal() {
+            // Ready/claimed parked leases stay with the dispatch loop, which
+            // retries the stored command without spending the pre-start budget.
+            return;
+        }
         let host_id = match self.work_db.spoke_host_holding_execution(execution_id) {
             Ok(Some(host_id)) => host_id,
             Ok(None) => {
-                // Nothing is held on any host any more.
                 self.resolve_spoke_in_doubt_attention(execution_id);
                 return;
             }
@@ -178,52 +239,177 @@ impl ExecutionCoordinator {
                 return;
             }
         };
-        match adapter.observe_worker(execution_id).await {
-            Ok(Some(pane)) if !matches!(pane.life, WorkerLife::Exited | WorkerLife::Missing) => {
-                if pane.life == WorkerLife::Alive {
-                    match adapter.stop_worker(execution_id, Duration::ZERO).await {
-                        Ok(outcome) => tracing::warn!(
-                            execution_id,
-                            ?outcome,
-                            "stopped the worker an ended execution left on its spoke host"
-                        ),
-                        Err(error) => {
-                            tracing::warn!(execution_id, error = %format!("{error:#}"), "could not stop the worker an ended execution left on its spoke host")
+        let assignment = match self.work_db.spoke_assignment_for_execution(execution_id) {
+            Ok(Some(assignment)) => assignment,
+            Ok(None) => {
+                self.resolve_spoke_in_doubt_attention(execution_id);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the in-doubt spoke assignment");
+                return;
+            }
+        };
+        let has_spawn = match self
+            .work_db
+            .assignment_has_stored_spawn(&assignment.host_id, &assignment.run_id)
+        {
+            Ok(has_spawn) => has_spawn,
+            Err(error) => {
+                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the stored spawn");
+                return;
+            }
+        };
+        let released = if has_spawn {
+            match adapter.observe_worker(execution_id).await {
+                Ok(Some(pane)) if !matches!(pane.life, WorkerLife::Exited | WorkerLife::Missing) => {
+                    if pane.life == WorkerLife::Alive {
+                        match adapter.stop_worker(execution_id, Duration::ZERO).await {
+                            Ok(outcome) => tracing::warn!(
+                                execution_id,
+                                ?outcome,
+                                "stopped the worker an ended execution left on its spoke host"
+                            ),
+                            Err(error) => {
+                                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not stop the worker an ended execution left on its spoke host")
+                            }
                         }
                     }
+                    return;
                 }
-                return;
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(execution_id, error = %format!("{error:#}"), "could not ask the spoke host about an ended execution's worker");
+                    return;
+                }
             }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(execution_id, error = %format!("{error:#}"), "could not ask the spoke host about an ended execution's worker");
-                return;
+            let execution = match self.work_db.get_execution(execution_id) {
+                Ok(execution) => execution,
+                Err(_) => return,
+            };
+            match execution.cube_lease_id.as_deref() {
+                Some(lease_id) => matches!(
+                    self.lifecycle
+                        .apply_proven_workspace_release(
+                            &execution,
+                            lease_id,
+                            TerminalCause::ProvenStopped,
+                            adapter.as_ref()
+                        )
+                        .await,
+                    LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
+                ),
+                None => true,
             }
-        }
-        let released = match execution.cube_lease_id.as_deref() {
-            Some(lease_id) => matches!(
-                self.lifecycle
-                    .apply_proven_workspace_release(
-                        &execution,
-                        lease_id,
-                        TerminalCause::ProvenStopped,
-                        adapter.as_ref()
-                    )
-                    .await,
-                LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
-            ),
-            None => true,
+        } else {
+            match self.complete_pending_lease(&execution, adapter.as_ref()).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    tracing::warn!(execution_id, error = %format!("{error:#}"), "could not complete a pending in-doubt lease");
+                    return;
+                }
+            }
+            let execution = match self.work_db.get_execution(execution_id) {
+                Ok(execution) => execution,
+                Err(_) => return,
+            };
+            match execution.cube_lease_id.as_deref() {
+                Some(lease_id) => matches!(
+                    self.lifecycle
+                        .release_lease_after_proven_never_started(&execution, lease_id, adapter.as_ref())
+                        .await,
+                    LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
+                ),
+                None => match self
+                    .work_db
+                    .current_lease_command(&assignment.host_id, &assignment.run_id)
+                {
+                    Ok(Some(stored)) => stored.result.is_some(),
+                    Ok(None) => true,
+                    Err(error) => {
+                        tracing::warn!(execution_id, error = %format!("{error:#}"), "could not read the stored lease");
+                        return;
+                    }
+                },
+            }
         };
         if !released {
             return;
         }
+        self.release_in_doubt_persona(execution_id);
+        self.resolve_spoke_in_doubt_attention(execution_id);
+    }
+
+    /// `Ok(true)` when the stored lease is settled and any grant is bound on
+    /// the execution (ready to release). `Ok(false)` when it is still unanswered
+    /// or settled-uncertain: keep the item open.
+    async fn complete_pending_lease(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        adapter: &dyn HostAdapter,
+    ) -> anyhow::Result<bool> {
+        if execution.cube_lease_id.is_some() {
+            return Ok(true);
+        }
+        match adapter.complete_in_doubt_lease().await {
+            Ok(Some(lease)) => {
+                self.persist_acquired_lease(execution, &lease);
+                Ok(true)
+            }
+            Ok(None) => Ok(true),
+            Err(error) if waitable_spoke_lease(&error).is_some() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn release_in_doubt_persona(&self, execution_id: &str) {
         if let Some(states) = &self.live_worker_states {
             states.release_slot_for_run(execution_id);
             states.release_persona_for_run(execution_id);
         } else if let Err(error) = self.work_db.release_persona(execution_id) {
             tracing::error!(execution_id, %error, "could not release persona after reconciling an in-doubt spoke");
         }
-        self.resolve_spoke_in_doubt_attention(execution_id);
+    }
+
+    pub(super) fn begin_driving_run(&self, execution_id: &str) -> bool {
+        self.driving_runs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .ids
+            .insert(execution_id.to_owned())
+    }
+
+    pub(super) fn store_driving_handle(&self, execution_id: &str, handle: tokio::task::AbortHandle) {
+        self.driving_runs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .handles
+            .insert(execution_id.to_owned(), handle);
+    }
+
+    pub(super) fn forget_driving_run(&self, execution_id: &str) {
+        let mut runs = self.driving_runs.lock().unwrap_or_else(|poison| poison.into_inner());
+        runs.ids.remove(execution_id);
+        runs.handles.remove(execution_id);
+    }
+
+    fn is_driving_run(&self, execution_id: &str) -> bool {
+        self.driving_runs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .ids
+            .contains(execution_id)
+    }
+
+    /// Stop every in-flight `run_execution` task. Tests use this to simulate an
+    /// engine restart: the next coordinator has an empty driving set.
+    pub fn abort_driving_runs(&self) {
+        let mut runs = self.driving_runs.lock().unwrap_or_else(|poison| poison.into_inner());
+        runs.ids.clear();
+        for (_, handle) in runs.handles.drain() {
+            handle.abort();
+        }
     }
 
     /// The host answered: whatever was in doubt is settled.
@@ -235,4 +421,40 @@ impl ExecutionCoordinator {
             tracing::warn!(execution_id, error = %format!("{error:#}"), "could not resolve the in-doubt spoke attention item");
         }
     }
+
+    /// Refresh the owning review-guide card after a pre-start failure. The
+    /// attempt row is already terminal; this is the board-invalidation the
+    /// comparison-id `work_item_id` cannot provide on its own.
+    pub(super) fn notify_review_guide_pre_start_failure(&self, execution: &WorkExecution) {
+        if execution.kind != ExecutionKind::PrReviewGuide {
+            return;
+        }
+        let work_db = self.work_db.clone();
+        let publisher = self.publisher.clone();
+        let lifecycle = self.lifecycle.clone();
+        let execution_id = execution.id.clone();
+        boss_task_scope::spawn(async move {
+            let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
+                return;
+            };
+            let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
+                return;
+            };
+            lifecycle
+                .notify_review_guide_changed(&publisher, &root_task_id, "review_guide_failed")
+                .await;
+        });
+    }
+}
+
+pub(super) fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeUncertain> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<LeaseOutcomeUncertain>())
+}
+
+/// Whether the execution has been cancelled or finished. A failed read is not
+/// an answer: callers must not treat it as a cancellation, because that would
+/// release state a worker may still be using.
+pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str) -> Result<bool> {
+    Ok(work_db.get_execution(execution_id)?.status.is_terminal())
 }

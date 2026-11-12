@@ -19,7 +19,7 @@ use boss_execution_contracts::{
     WorkerLife,
 };
 use boss_protocol_spoke::v1::{
-    Bookmark, ResultCode, WorkspaceKind as Kind, WorkspaceOp, WorkspaceResult, command, command_result,
+    Bookmark, Command, ResultCode, WorkspaceKind as Kind, WorkspaceOp, WorkspaceResult, command, command_result,
 };
 use boss_work_db::{SpokeAssignment, host_command_lease_id, host_command_spawn_id};
 use prost::Message;
@@ -289,6 +289,110 @@ impl SpokeHostAdapter {
             .await?;
         self.set_doubt(&assignment, false).await?;
         Ok(lease)
+    }
+
+    /// Replay the stored lease command (the same id) and bind a late grant.
+    /// Used after the execution has ended, when no dispatch pass will ask.
+    pub(crate) async fn ws_complete_in_doubt_lease(&self) -> Result<Option<CubeWorkspaceLease>> {
+        let assignment = match self.bound_open().await {
+            Ok(assignment) => assignment,
+            Err(_) => return Ok(None),
+        };
+        if let (Some(workspace_id), Some(lease_id), Some(path)) = (
+            assignment.workspace_id.clone(),
+            assignment.lease_id.clone(),
+            assignment.display_path.clone(),
+        ) {
+            return Ok(Some(CubeWorkspaceLease {
+                lease_id,
+                workspace_id,
+                workspace_path: PathBuf::from(path),
+                dirty_verified: None,
+            }));
+        }
+        let (host, run_id) = (self.host_name().to_owned(), assignment.run_id.clone());
+        let stored = self.db(move |db| db.current_lease_command(&host, &run_id)).await?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let result = match stored.result {
+            Some(bytes) => boss_protocol_spoke::v1::CommandResult::decode(bytes.as_slice())?,
+            None => {
+                let command = Command::decode(stored.wire.as_slice())?;
+                match self
+                    .hub
+                    .send_command(self.host_name(), "lease", command, self.hub.config.command_deadline)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(HostCallError::Uncertain { reason, .. }) => {
+                        return Err(anyhow::Error::new(LeaseOutcomeUncertain {
+                            host_id: self.host_name().to_owned(),
+                            command_id: stored.command_id.clone(),
+                            reason,
+                            settled: false,
+                        }));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
+        self.bind_lease_result(&assignment, &stored.command_id, result).await
+    }
+
+    async fn bind_lease_result(
+        &self,
+        assignment: &SpokeAssignment,
+        id: &str,
+        result: boss_protocol_spoke::v1::CommandResult,
+    ) -> Result<Option<CubeWorkspaceLease>> {
+        let generation = assignment.assignment_generation;
+        let uncertain = |reason: String, settled: bool| {
+            anyhow::Error::new(LeaseOutcomeUncertain {
+                host_id: self.host_name().to_owned(),
+                command_id: id.to_owned(),
+                reason,
+                settled,
+            })
+        };
+        let code = ResultCode::try_from(result.code).unwrap_or(ResultCode::ResultUnspecified);
+        let recovered = code == ResultCode::OutcomeUncertain
+            && matches!(&result.value, Some(command_result::Value::Workspace(w)) if !w.lease_id.is_empty());
+        if matches!(code, ResultCode::Rejected | ResultCode::Absent) {
+            self.set_doubt(assignment, false).await?;
+            return Ok(None);
+        }
+        let result = if recovered {
+            result
+        } else if code == ResultCode::OutcomeUncertain {
+            return Err(uncertain(
+                if result.reason.is_empty() {
+                    "the host reported an uncertain outcome".to_owned()
+                } else {
+                    result.reason
+                },
+                true,
+            ));
+        } else {
+            expect_ok(self.host_name(), "lease", result)?
+        };
+        let granted = Self::workspace_value(self.host_name(), "lease", result)?;
+        let lease: CubeWorkspaceLease = json(&granted, "lease")?;
+        ensure!(
+            lease.workspace_id == granted.workspace_id && lease.lease_id == granted.lease_id,
+            "host {} answered a lease that disagrees with its own result",
+            self.host_name()
+        );
+        let (execution, workspace, lease_id, path) = (
+            assignment.execution_id.clone(),
+            lease.workspace_id.clone(),
+            lease.lease_id.clone(),
+            lease.workspace_path.display().to_string(),
+        );
+        self.db(move |db| db.bind_spoke_lease(&execution, generation, &workspace, &lease_id, &path))
+            .await?;
+        self.set_doubt(assignment, false).await?;
+        Ok(Some(lease))
     }
 
     async fn set_doubt(&self, assignment: &SpokeAssignment, in_doubt: bool) -> Result<()> {

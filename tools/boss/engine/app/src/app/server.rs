@@ -2532,6 +2532,10 @@ async fn serve_scoped(
     let _scheduler_heartbeat_handle = server_state
         .execution_coordinator
         .spawn_scheduler_heartbeat(Duration::from_secs(15));
+    // Ask about parked spoke leases and spawns from persisted state at boot,
+    // without waiting on the heartbeat's startup stagger. Later passes ride
+    // the heartbeat via `spawn_in_doubt_reconcile` (single-flight).
+    server_state.execution_coordinator.spawn_in_doubt_reconcile();
 
     // DispatchReady bus subscriber — no-op (returns `None`, spawns nothing)
     // unless `BOSS_ENABLE_DISPATCH_READY_BUS` is on. When it is, this is
