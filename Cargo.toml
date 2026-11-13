@@ -93,6 +93,7 @@ members = [
   "tools/boss/engine/stdout-progress",
   "tools/boss/engine/storage-values",
   "tools/boss/engine/work-db",
+  "tools/boss/engine/write-batch",
   "tools/boss/engine/prose-vocabulary",
   "tools/boss/engine/structured-output",
   "tools/boss/engine/test-git",

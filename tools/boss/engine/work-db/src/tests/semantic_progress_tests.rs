@@ -48,6 +48,33 @@ fn session_start() -> WorkerEvent {
 }
 
 #[test]
+fn queued_local_checkpoints_share_commits_and_preserve_the_last_accepted_state() {
+    let db = WorkDb::open(temp_db_path("semantic-progress-batch")).unwrap();
+    let execution = started_execution(&db);
+    let held = db.connect().unwrap();
+    let mut receipts = Vec::new();
+    for _ in 0..32 {
+        receipts.push(
+            db.enqueue_record_semantic_progress_observed(&execution, &pre_tool(), Some(1000))
+                .unwrap(),
+        );
+        receipts.push(
+            db.enqueue_record_semantic_progress_observed(&execution, &post_tool(), Some(2000))
+                .unwrap(),
+        );
+    }
+    drop(held);
+    for receipt in receipts {
+        assert!(receipt.wait().unwrap());
+    }
+    let checkpoint = db.get_run_semantic_progress_checkpoint(&execution).unwrap().unwrap();
+    assert_eq!(checkpoint.tool_condition, SemanticToolCondition::Idle);
+    assert_eq!(checkpoint.progress_at, "1970-01-01T00:00:02Z");
+    // Exact coalescing depends on scheduling; every event still has a receipt.
+    assert!(db.ingress_writer().unwrap().committed_batches() < 64);
+}
+
+#[test]
 fn semantic_progress_query_round_trips_and_legacy_null_is_none() {
     let db = WorkDb::open(temp_db_path("semantic-progress-query")).unwrap();
     let execution_id = started_execution(&db);

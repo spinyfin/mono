@@ -738,6 +738,8 @@ pub struct WorkDb {
     /// `WorkDb::clone` share the one connection across copies (`WorkDb` is
     /// cloned freely across the engine).
     conn: Arc<Mutex<Connection>>,
+    #[builder(default)]
+    ingress_writer: Arc<std::sync::OnceLock<boss_write_batch::Writer>>,
     /// The Boothby action the executor is currently performing, if any.
     /// Set by [`WorkDb::arm_boothby_action`] and read by the mutation layer
     /// when a write arrives with `actor = "boothby"`, which is how the
@@ -776,6 +778,7 @@ impl Clone for WorkDb {
             engine_build_identity: self.engine_build_identity.clone(),
             memory: self.memory.clone(),
             conn: Arc::clone(&self.conn),
+            ingress_writer: Arc::clone(&self.ingress_writer),
             boothby_action: Arc::clone(&self.boothby_action),
             engine_rebase_holds: Arc::clone(&self.engine_rebase_holds),
             event_bus: Arc::clone(&self.event_bus),
@@ -1207,3 +1210,6 @@ pub use legacy_store_cleanup::{LegacyStoreCleanup, LegacyStoreCleanupStatus};
 mod preserved_cleanup;
 mod preserved_work;
 mod teardown_preservation_attention;
+
+mod ingress_writer;
+pub use boss_write_batch::Receipt as IngressReceipt;

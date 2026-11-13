@@ -52,21 +52,36 @@ impl WorkDb {
         event: &WorkerEvent,
         observed_at_ms: Option<i64>,
     ) -> Result<bool> {
-        if matches!(event, WorkerEvent::Notification { .. }) {
-            return Ok(false);
-        }
-        let conn = self.connect()?;
-        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
-            return Ok(false);
-        };
+        self.enqueue_record_semantic_progress_observed(execution_id, event, observed_at_ms)?
+            .wait()
+    }
+
+    pub fn enqueue_record_semantic_progress_observed(
+        &self,
+        execution_id: &str,
+        event: &WorkerEvent,
+        observed_at_ms: Option<i64>,
+    ) -> Result<IngressReceipt<bool>> {
         let now = progress_time(observed_at_ms);
         // Bound independently: each column is carried through unchanged
         // (`COALESCE`) when its own signal is absent, so a divergence between
         // the two signal functions can never drop a transition.
         let tool = tool_condition_signal(event).map(|c| c.as_str());
         let turn = turn_condition_signal(event).map(|c| c.as_str());
-        conn.execute(
-            "UPDATE work_runs
+        let execution_id = execution_id.to_owned();
+        let notification = matches!(event, WorkerEvent::Notification { .. });
+        let urgent = matches!(event, WorkerEvent::Stop { .. } | WorkerEvent::UserPromptSubmit { .. });
+        self.ingress_writer()?
+            .submit("local".into(), execution_id.len() + 128, urgent, move |conn| {
+                if notification {
+                    return Ok(false);
+                }
+
+                let Some(run_id) = resolve_run_id_for_execution_hooks(conn, &execution_id)? else {
+                    return Ok(false);
+                };
+                conn.execute(
+                    "UPDATE work_runs
              SET semantic_progress_at = CASE WHEN semantic_progress_at IS NULL OR semantic_progress_at < ?2
                                              THEN ?2 ELSE semantic_progress_at END,
                  semantic_tool_condition = COALESCE(?3, semantic_tool_condition),
@@ -75,9 +90,10 @@ impl WorkDb {
                AND (semantic_progress_at IS NOT ?2
                     OR (?3 IS NOT NULL AND semantic_tool_condition IS NOT ?3)
                     OR (?4 IS NOT NULL AND semantic_turn_condition IS NOT ?4))",
-            params![run_id, now, tool, turn],
-        )?;
-        Ok(true)
+                    params![run_id, now, tool, turn],
+                )?;
+                Ok(true)
+            })
     }
 
     /// Persist the registry's post-apply checkpoint for a run.
@@ -96,24 +112,38 @@ impl WorkDb {
         execution_id: &str,
         checkpoint: &SemanticProgressCheckpoint,
     ) -> Result<bool> {
-        let conn = self.connect()?;
-        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
-            return Ok(false);
-        };
+        self.enqueue_record_semantic_checkpoint(execution_id, checkpoint)?
+            .wait()
+    }
+
+    pub fn enqueue_record_semantic_checkpoint(
+        &self,
+        execution_id: &str,
+        checkpoint: &SemanticProgressCheckpoint,
+    ) -> Result<IngressReceipt<bool>> {
         let tool =
             (checkpoint.tool_condition != SemanticToolCondition::Unknown).then(|| checkpoint.tool_condition.as_str());
         let turn =
             (checkpoint.turn_condition != SemanticTurnCondition::Unknown).then(|| checkpoint.turn_condition.as_str());
-        conn.execute(
-            "UPDATE work_runs
+        let urgent = checkpoint.turn_condition == SemanticTurnCondition::Ended;
+        let progress_at = checkpoint.progress_at.clone();
+        let execution_id = execution_id.to_owned();
+        self.ingress_writer()?
+            .submit("local".into(), execution_id.len() + 128, urgent, move |conn| {
+                let Some(run_id) = resolve_run_id_for_execution_hooks(conn, &execution_id)? else {
+                    return Ok(false);
+                };
+                conn.execute(
+                    "UPDATE work_runs
              SET semantic_progress_at = CASE WHEN semantic_progress_at IS NULL OR semantic_progress_at < ?2
                                              THEN ?2 ELSE semantic_progress_at END,
                  semantic_tool_condition = COALESCE(?3, semantic_tool_condition),
                  semantic_turn_condition = COALESCE(?4, semantic_turn_condition)
              WHERE id = ?1",
-            params![run_id, checkpoint.progress_at, tool, turn],
-        )?;
-        Ok(true)
+                    params![run_id, progress_at, tool, turn],
+                )?;
+                Ok(true)
+            })
     }
 
     /// Stamp driver progress time alone, leaving both conditions as stored.
@@ -130,17 +160,29 @@ impl WorkDb {
         execution_id: &str,
         observed_at_ms: Option<i64>,
     ) -> Result<bool> {
-        let conn = self.connect()?;
-        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
-            return Ok(false);
-        };
+        self.enqueue_record_semantic_progress_stamp_observed(execution_id, observed_at_ms)?
+            .wait()
+    }
+
+    pub fn enqueue_record_semantic_progress_stamp_observed(
+        &self,
+        execution_id: &str,
+        observed_at_ms: Option<i64>,
+    ) -> Result<IngressReceipt<bool>> {
         let now = progress_time(observed_at_ms);
-        conn.execute(
-            "UPDATE work_runs SET semantic_progress_at = ?2
+        let execution_id = execution_id.to_owned();
+        self.ingress_writer()?
+            .submit("local".into(), execution_id.len() + 128, false, move |conn| {
+                let Some(run_id) = resolve_run_id_for_execution_hooks(conn, &execution_id)? else {
+                    return Ok(false);
+                };
+                conn.execute(
+                    "UPDATE work_runs SET semantic_progress_at = ?2
              WHERE id = ?1 AND (semantic_progress_at IS NULL OR semantic_progress_at < ?2)",
-            params![run_id, now],
-        )?;
-        Ok(true)
+                    params![run_id, now],
+                )?;
+                Ok(true)
+            })
     }
 
     /// Read back the run's semantic-progress checkpoint.

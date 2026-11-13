@@ -8,6 +8,7 @@ workspace = "../../../.."
 test-support = ["dep:tempfile", "dep:tracing-subscriber", "rusqlite/backup"]
 
 [dependencies]
+boss-write-batch = { path = "../write-batch" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }

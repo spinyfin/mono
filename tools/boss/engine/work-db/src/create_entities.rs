@@ -107,6 +107,7 @@ impl WorkDb {
     fn open_writer(path: PathBuf) -> Result<Self> {
         let conn = Self::open_raw_connection(&path, None)?;
         Ok(Self {
+            ingress_writer: Default::default(),
             path,
             memory: None,
             conn: Arc::new(Mutex::new(conn)),
@@ -136,6 +137,7 @@ impl WorkDb {
         let anchor = InMemoryAnchor { uri };
         let conn = Self::open_raw_connection(&PathBuf::from(":memory:"), Some(&anchor))?;
         Ok(Self {
+            ingress_writer: Default::default(),
             path: PathBuf::from(":memory:"),
             memory: Some(anchor),
             conn: Arc::new(Mutex::new(conn)),

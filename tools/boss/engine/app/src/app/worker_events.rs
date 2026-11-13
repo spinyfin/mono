@@ -499,18 +499,18 @@ fn persist_semantic_progress(
     origin: HookOrigin,
     outcome: Option<&ApplyEventOutcome>,
     settled: Option<boss_engine_live_worker_state::semantic_progress::SemanticProgressCheckpoint>,
-) {
+) -> Option<anyhow::Result<boss_engine_runtime::work::IngressReceipt<bool>>> {
     if matches!(event, boss_protocol::WorkerEvent::Notification { .. }) {
-        return;
+        return None;
     }
     let result = match (outcome, settled) {
-        (Some(ApplyEventOutcome::ObservedDead), _) => return,
+        (Some(ApplyEventOutcome::ObservedDead), _) => return None,
         (Some(ApplyEventOutcome::Stale { .. }), _) | (Some(ApplyEventOutcome::Applied { .. }), None) => server_state
             .work_db
-            .record_semantic_progress_stamp_observed(run_id, origin.observed_at_ms),
-        (Some(ApplyEventOutcome::Applied { .. }), Some(checkpoint)) => {
-            server_state.work_db.record_semantic_checkpoint(run_id, &checkpoint)
-        }
+            .enqueue_record_semantic_progress_stamp_observed(run_id, origin.observed_at_ms),
+        (Some(ApplyEventOutcome::Applied { .. }), Some(checkpoint)) => server_state
+            .work_db
+            .enqueue_record_semantic_checkpoint(run_id, &checkpoint),
         _ if origin.from_subagent
             && matches!(
                 event,
@@ -519,23 +519,29 @@ fn persist_semantic_progress(
         {
             server_state
                 .work_db
-                .record_semantic_progress_stamp_observed(run_id, origin.observed_at_ms)
+                .enqueue_record_semantic_progress_stamp_observed(run_id, origin.observed_at_ms)
         }
         _ => server_state
             .work_db
-            .record_semantic_progress_observed(run_id, event, origin.observed_at_ms),
+            .enqueue_record_semantic_progress_observed(run_id, event, origin.observed_at_ms),
     };
-    match result {
+    Some(result)
+}
+
+fn finish_semantic_progress(
+    run_id: &str,
+    pending: Option<anyhow::Result<boss_engine_runtime::work::IngressReceipt<bool>>>,
+) {
+    let Some(result) = pending else { return };
+    match result.and_then(|receipt| receipt.wait()) {
         Ok(true) => {}
         Ok(false) => tracing::debug!(
             run_id,
             "semantic-progress event observed before any run row existed; not recorded"
         ),
-        Err(err) => tracing::warn!(
-            run_id,
-            error = %format!("{err:#}"),
-            "failed to persist semantic worker-progress checkpoint",
-        ),
+        Err(err) => {
+            tracing::warn!(run_id, error = %format!("{err:#}"), "failed to persist semantic worker-progress checkpoint")
+        }
     }
 }
 
@@ -557,11 +563,12 @@ pub(super) fn persist_applied_semantic_progress(
         from_subagent: incoming.connection.from_subagent,
         observed_at_ms: incoming.connection.observed_at_ms,
     };
-    server_state
+    let pending = server_state
         .live_worker_states
         .with_semantic_progress(slot_id, run_id, |settled| {
-            persist_semantic_progress(server_state, run_id, &incoming.event, origin, Some(outcome), settled);
+            persist_semantic_progress(server_state, run_id, &incoming.event, origin, Some(outcome), settled)
         });
+    finish_semantic_progress(run_id, pending);
 }
 
 pub(super) async fn dispatch_live_worker_state(
@@ -706,7 +713,8 @@ pub(super) async fn dispatch_live_worker_state(
                         from_cache,
                     )
                     .await;
-                    persist_semantic_progress(server_state, run_id, &incoming.event, origin, None, None);
+                    let pending = persist_semantic_progress(server_state, run_id, &incoming.event, origin, None, None);
+                    finish_semantic_progress(run_id, pending);
                     // No slot, and not a live remote worker. Before we
                     // drop the event, check whether it belongs to an
                     // execution the engine already believes is terminal —
