@@ -118,11 +118,12 @@ fn assert_named(state: &str, runtime: &TaskRuntime, code: &str) -> String {
     assert!(!label.to_lowercase().contains("unknown"), "{state}: {label}");
     assert_ne!(code, DISPATCH_WAIT_REASON_UNCLASSIFIED, "{state}");
     if runtime.dispatch_wait_blocker.is_none() {
-        let phrase = dispatch_wait_phrase(code);
-        assert!(
-            label == phrase || label.to_lowercase().starts_with(&phrase.to_lowercase()),
-            "{state}: phrase `{phrase}` vs `{label}`"
-        );
+        let phrase = if code == DISPATCH_WAIT_REASON_FAILURE_BACKOFF {
+            failure_backoff_wait_label(2)
+        } else {
+            dispatch_wait_phrase(code)
+        };
+        assert_eq!(label, phrase, "{state}");
     }
     code.to_owned()
 }
@@ -1596,3 +1597,6 @@ fn merge_order_stagger_keeps_scheduled_not_before() {
     assert_eq!(wait.dispatch_not_before.as_deref(), expected_deadline.as_deref());
     assert!(wait.dispatch_failures.is_empty());
 }
+
+#[path = "dispatch_failure_history_tests.rs"]
+mod dispatch_failure_history_tests;

@@ -291,7 +291,7 @@ fn queued_wait_pre_start_failure_backoff_carries_retry_and_not_before() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET dispatch_not_before = ?2, pre_start_failure_count = 1 WHERE id = ?1",
+            "UPDATE work_executions SET dispatch_not_before = ?2, dispatch_not_before_source = 'failure_backoff', pre_start_failure_count = 1 WHERE id = ?1",
             params![execution.id, future],
         )
         .unwrap();

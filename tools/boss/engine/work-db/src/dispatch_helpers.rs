@@ -503,6 +503,7 @@ pub struct ComputedRuntime {
 /// - the chosen execution's latest `work_runs` row: insert, delete, or an
 ///   update of `status`, `execution_id` or `created_at`;
 /// - `dispatch_not_before` against `now`: `expires_at`;
+/// - failure history (start events, run errors and attention bodies): not cached;
 /// - dependency gating, project order and chain-hold blockers: not
 ///   versioned, `cacheable` is false.
 ///

@@ -191,7 +191,7 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
-        DROP TABLE schema_migrations;
+        DROP TABLE dispatch_start_failures; ALTER TABLE work_executions DROP COLUMN dispatch_not_before_source; DROP TABLE schema_migrations;
         INSERT OR REPLACE INTO metadata VALUES ('schema_version', '38');";
 
     /// Undo later schema steps so reopening replays the schema 43 re-arm.
@@ -201,7 +201,7 @@ mod tests {
         ALTER TABLE execution_bookmarks DROP COLUMN retired_at;
         ALTER TABLE execution_bookmarks DROP COLUMN retired_reason;
         ALTER TABLE tasks DROP COLUMN pr_updated_at;
-        DROP TABLE schema_migrations;
+        DROP TABLE dispatch_start_failures; ALTER TABLE work_executions DROP COLUMN dispatch_not_before_source; DROP TABLE schema_migrations;
         INSERT OR REPLACE INTO metadata VALUES ('schema_version', '42');";
 
     /// Create a chore under a fresh product and park it the way the

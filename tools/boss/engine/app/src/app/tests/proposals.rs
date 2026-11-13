@@ -151,6 +151,8 @@ async fn question_summary_survives_upgrade_of_existing_projection() {
          SELECT work_item_id, json_patch(question_json,
              json_object('id', id, 'asked_at', created_at, 'execution_id', execution_id)) AS view_json
          FROM operator_questions WHERE status = 'open';
+         DROP TABLE dispatch_start_failures;
+         ALTER TABLE work_executions DROP COLUMN dispatch_not_before_source;
          DROP TABLE schema_migrations;
          INSERT OR REPLACE INTO metadata VALUES ('schema_version', '35');",
         )

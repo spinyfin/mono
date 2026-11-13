@@ -1001,6 +1001,10 @@ mod floor_tests {
                 "20261105_1200_workspace_lease_generation",
                 Box::new(|c| preserved_work::migrate_lease_generation(c).unwrap()),
             ),
+            (
+                "20261113_0633_dispatch_failure_history",
+                Box::new(|c| pre_start_failure::migrate_dispatch_failure_history(c).unwrap()),
+            ),
         ];
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {

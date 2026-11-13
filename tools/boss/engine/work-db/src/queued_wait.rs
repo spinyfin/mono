@@ -220,35 +220,31 @@ fn unheld(execution: &WorkExecution) -> DispatchWait {
     }
 }
 
-/// Name a future `dispatch_not_before` from the source that stamped it.
-///
-/// Four writers set the column:
-/// - pre-start retry (`pre_start_failure_count > 0`) and transient resume
-///   (`transient_failure_count > 0`) → [`DISPATCH_WAIT_REASON_FAILURE_BACKOFF`];
-/// - spoke-lease park (`last_error` set, counts still 0) →
-///   [`DISPATCH_WAIT_REASON_HOST_LEASE_PARK`];
-/// - merge-order stagger (no counts, no `last_error`) →
-///   [`DISPATCH_WAIT_REASON_NOT_BEFORE`].
+/// Classify the current deadline by its writer.
 fn not_before_wait(conn: &Connection, execution: &WorkExecution) -> Result<DispatchWait> {
-    let pre_start = execution.pre_start_failure_count.max(0);
-    let transient = execution.transient_failure_count.max(0);
-    if pre_start > 0 || transient > 0 {
-        let attempt = pre_start.max(transient) + 1;
-        return Ok(DispatchWait {
-            reason: Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF.to_owned()),
-            label: Some(failure_backoff_wait_label(attempt)),
-            failures: collect_dispatch_failures(conn, &execution.work_item_id, &execution.id)?,
-            ..DispatchWait::default()
-        });
+    let source: Option<String> = conn.query_row(
+        "SELECT dispatch_not_before_source FROM work_executions WHERE id = ?1",
+        [&execution.id],
+        |row| row.get(0),
+    )?;
+    if source.as_deref() == Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF) {
+        return Ok(DispatchWait::builder()
+            .reason(DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
+            .label(failure_backoff_wait_label(
+                execution.pre_start_failure_count.max(execution.transient_failure_count) + 1,
+            ))
+            .failures(collect_dispatch_failures(conn, &execution.work_item_id, &execution.id)?)
+            // Failure details have no runtime epoch triggers.
+            .reads_other_items(true)
+            .build());
     }
-    if execution
-        .last_error
-        .as_deref()
-        .is_some_and(|error| !error.trim().is_empty())
-    {
-        return Ok(DispatchWait::named(DISPATCH_WAIT_REASON_HOST_LEASE_PARK));
-    }
-    Ok(DispatchWait::named(DISPATCH_WAIT_REASON_NOT_BEFORE))
+    Ok(DispatchWait::named(
+        if source.as_deref() == Some(DISPATCH_WAIT_REASON_HOST_LEASE_PARK) {
+            DISPATCH_WAIT_REASON_HOST_LEASE_PARK
+        } else {
+            DISPATCH_WAIT_REASON_NOT_BEFORE
+        },
+    ))
 }
 
 fn nonempty_text(value: Option<String>) -> Option<String> {
@@ -262,134 +258,83 @@ fn nonempty_text(value: Option<String>) -> Option<String> {
     })
 }
 
-/// Failures that fed the current backoff: predecessor runs (error text,
-/// orphaning reason, or hung/stale attention) plus this execution's
-/// `last_error` for a pre-start retry. Newest last. Never emits a blank
-/// or "unknown" line.
+/// One entry per failed start or failed execution in the current retry sequence.
 fn collect_dispatch_failures(
     conn: &Connection,
     work_item_id: &str,
     current_execution_id: &str,
 ) -> Result<Vec<DispatchFailureAttempt>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT e.id,
-                e.status,
-                e.last_error,
-                e.finished_at,
-                e.created_at,
-                r.error_text,
-                r.result_summary,
-                r.finished_at
+        "SELECT e.id, e.last_error, e.finished_at, e.created_at, r.error_text, r.finished_at
          FROM work_executions e
          LEFT JOIN work_runs r ON r.id = (
-             SELECT wr.id FROM work_runs wr
-             WHERE wr.execution_id = e.id
-             ORDER BY wr.created_at DESC, wr.id DESC
-             LIMIT 1
-         )
+             SELECT id FROM work_runs WHERE execution_id = e.id ORDER BY rowid DESC LIMIT 1)
          WHERE e.work_item_id = ?1
-           AND (
-                e.status IN ('orphaned', 'failed')
-                OR (e.id = ?2 AND e.last_error IS NOT NULL AND TRIM(e.last_error) != '')
-           )
-         ORDER BY CAST(COALESCE(r.finished_at, e.finished_at, e.created_at) AS INTEGER) ASC,
-                  e.id ASC",
+           AND e.kind = (SELECT kind FROM work_executions WHERE id = ?2)
+           AND e.rowid <= (SELECT rowid FROM work_executions WHERE id = ?2)
+           AND e.rowid > COALESCE((SELECT MAX(done.rowid) FROM work_executions done
+               WHERE done.work_item_id = ?1 AND done.kind = e.kind
+                 AND done.rowid < (SELECT rowid FROM work_executions WHERE id = ?2)
+                 AND done.status NOT IN ('failed', 'orphaned') AND done.finished_at IS NOT NULL), 0)
+           AND (e.status IN ('failed', 'orphaned') OR e.id = ?2)
+         ORDER BY e.rowid",
     )?;
-    let predecessors: Vec<_> = stmt
+    let rows = stmt
         .query_map(params![work_item_id, current_execution_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
             ))
         })?
-        .collect::<rusqlite::Result<_>>()?;
-    drop(stmt);
-    let attentions = work_item_attention_reasons(conn, work_item_id)?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut failures = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (execution_id, status, last_error, exec_finished, created_at, run_error, result_summary, run_finished) in
-        predecessors
-    {
-        let happened_at = nonempty_text(run_finished)
-            .or_else(|| nonempty_text(exec_finished))
-            .unwrap_or(created_at);
+    for (id, last_error, finished, created, run_error, run_finished) in rows {
+        let mut starts = conn.prepare_cached(
+            "SELECT error_text, happened_at FROM dispatch_start_failures WHERE execution_id = ?1 ORDER BY rowid",
+        )?;
+        let recorded = starts
+            .query_map([&id], |row| {
+                Ok(DispatchFailureAttempt {
+                    error_text: row.get(0)?,
+                    happened_at: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        failures.extend(recorded);
+        if id == current_execution_id {
+            continue;
+        }
+        let attention: Option<(String, String)> = conn
+            .query_row(
+                "SELECT COALESCE(NULLIF(TRIM(body_markdown), ''), title), created_at
+             FROM work_attention_items WHERE execution_id = ?1 AND kind IN ('hung_worker', 'stale_worker')
+             ORDER BY rowid DESC LIMIT 1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let error = nonempty_text(run_error)
             .or_else(|| nonempty_text(last_error))
-            .or_else(|| nonempty_text(result_summary))
             .or_else(|| {
-                attentions
-                    .iter()
-                    .rev()
-                    .find(|(attn_exec, _, _)| attn_exec.as_deref() == Some(execution_id.as_str()))
-                    .or_else(|| attentions.last())
-                    .map(|(_, _, text)| text.clone())
-            })
-            .or_else(|| match status.as_str() {
-                "orphaned" => Some("the previous worker was orphaned".to_owned()),
-                "failed" => Some("the previous run failed".to_owned()),
-                _ => None,
+                attention
+                    .as_ref()
+                    .and_then(|(body, _)| nonempty_text(Some(body.clone())))
             });
-        let Some(error_text) = error else {
-            continue;
-        };
-        if !seen.insert(error_text.clone()) {
-            continue;
-        }
-        failures.push(DispatchFailureAttempt {
-            error_text,
-            happened_at,
-        });
-    }
-    for (execution_id, happened_at, error_text) in attentions {
-        let _ = execution_id;
-        if seen.insert(error_text.clone()) {
+        if let Some(error_text) = error {
             failures.push(DispatchFailureAttempt {
                 error_text,
-                happened_at,
+                happened_at: finished
+                    .or(run_finished)
+                    .or_else(|| attention.map(|(_, time)| time))
+                    .unwrap_or(created),
             });
         }
     }
-    failures.sort_by(|left, right| {
-        let left_epoch = left.happened_at.parse::<i64>().ok();
-        let right_epoch = right.happened_at.parse::<i64>().ok();
-        left_epoch
-            .cmp(&right_epoch)
-            .then_with(|| left.happened_at.cmp(&right.happened_at))
-    });
     Ok(failures)
-}
-
-fn work_item_attention_reasons(conn: &Connection, work_item_id: &str) -> Result<Vec<(Option<String>, String, String)>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT execution_id, created_at, title, body_markdown FROM work_attention_items
-         WHERE kind IN ('hung_worker', 'stale_worker')
-           AND (work_item_id = ?1
-                OR execution_id IN (SELECT id FROM work_executions WHERE work_item_id = ?1))
-         ORDER BY CAST(created_at AS INTEGER) ASC, id ASC",
-    )?;
-    let rows = stmt.query_map([work_item_id], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (execution_id, created_at, title, body) = row?;
-        let Some(error_text) = nonempty_text(Some(body)).or_else(|| nonempty_text(Some(title))) else {
-            continue;
-        };
-        out.push((execution_id, created_at, error_text));
-    }
-    Ok(out)
 }
 
 /// The earlier task of `task`'s project that the reconciler's ordinal chain

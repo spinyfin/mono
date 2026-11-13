@@ -297,9 +297,59 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
                 let target = target.clone();
                 move |b| {
                     b.sql(
-                        "UPDATE work_executions SET pre_start_failure_count = 2, dispatch_not_before = ?2
+                        "UPDATE work_executions SET dispatch_not_before_source = 'failure_backoff', pre_start_failure_count = 2, dispatch_not_before = ?2
                          WHERE work_item_id = ?1 AND status = 'ready'",
                         &[&target, &FAR_FUTURE],
+                    )
+                }
+            }),
+            1,
+        ),
+        (
+            "failure run error stamp",
+            Box::new({
+                let first = first.clone();
+                move |b| {
+                    b.sql("UPDATE work_runs SET error_text = 'worker stopped', finished_at = '1234' WHERE execution_id = ?1", &[&first])
+                }
+            }),
+            1,
+        ),
+        (
+            "failure attention fallback",
+            Box::new({
+                let first = first.clone();
+                move |b| {
+                    b.sql(
+                        "UPDATE work_runs SET error_text = NULL WHERE execution_id = ?1",
+                        &[&first],
+                    );
+                    b.sql("INSERT INTO work_attention_items(id, execution_id, kind, status, title, body_markdown, created_at)
+                           VALUES ('cache_failure', ?1, 'hung_worker', 'open', 'Hung worker', 'driver stopped producing output', '1235')", &[&first]);
+                }
+            }),
+            1,
+        ),
+        (
+            "failure attention update",
+            Box::new({
+                let first = first.clone();
+                move |b| {
+                    b.sql("UPDATE work_attention_items SET body_markdown = 'driver stalled awaiting output' WHERE execution_id = ?1", &[&first])
+                }
+            }),
+            1,
+        ),
+        (
+            "failure start event",
+            Box::new({
+                let target = target.clone();
+                move |b| {
+                    b.sql(
+                        "INSERT INTO dispatch_start_failures(id, execution_id, happened_at, error_text)
+                    SELECT 'cache_start_failure', id, '1236', 'lease acquisition failed'
+                    FROM work_executions WHERE work_item_id = ?1 AND status = 'ready'",
+                        &[&target],
                     )
                 }
             }),
@@ -435,11 +485,26 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
         let (misses, _) = board.assert_equivalent();
         assert_eq!(misses, changed, "{label}: recomputed items");
         let (misses, queries) = board.assert_equivalent();
-        assert_eq!(
-            (misses, queries),
-            (0, 1 + board.annotation_statements()),
-            "{label}: settled board runs only the epoch read and task-derived annotation"
-        );
+        if matches!(
+            label,
+            "retry backoff"
+                | "failure run error stamp"
+                | "failure attention fallback"
+                | "failure attention update"
+                | "failure start event"
+        ) {
+            assert_eq!(misses, 1, "{label}: failure details are recomputed on every read");
+            assert!(
+                queries > 1 + board.annotation_statements(),
+                "{label}: failure details are queried again"
+            );
+        } else {
+            assert_eq!(
+                (misses, queries),
+                (0, 1 + board.annotation_statements()),
+                "{label}: settled board runs only the epoch read and task-derived annotation"
+            );
+        }
     }
 }
 

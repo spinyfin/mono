@@ -80,7 +80,7 @@ fn upgrade_rearms_legacy_pr_anchor_failure_once_without_releasing_the_chain() {
     .unwrap();
     conn.execute("UPDATE tasks SET status = 'blocked', autostart = 0, blocked_reason = 'execution_recovery_failed', blocked_detail = 'PR head bookmark pr/42 must resolve to exactly one change; it is conflicted' WHERE id = ?1", [&revision]).unwrap();
     conn.execute_batch(
-        "DROP TABLE schema_migrations; INSERT OR REPLACE INTO metadata VALUES ('schema_version', '58');",
+        "DROP TABLE dispatch_start_failures; ALTER TABLE work_executions DROP COLUMN dispatch_not_before_source; DROP TABLE schema_migrations; INSERT OR REPLACE INTO metadata VALUES ('schema_version', '58');",
     )
     .unwrap();
     drop(conn);

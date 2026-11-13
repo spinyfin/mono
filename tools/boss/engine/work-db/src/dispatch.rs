@@ -1591,7 +1591,7 @@ impl WorkDb {
         let not_before = boss_engine_utils::epoch_time::now_epoch_secs() + stagger_secs as i64;
         let updated = conn.execute(
             "UPDATE work_executions
-             SET dispatch_not_before = ?2
+             SET dispatch_not_before = ?2, dispatch_not_before_source = 'not_before'
              WHERE id = ?1 AND status IN ('ready', 'claimed') AND dispatch_not_before IS NULL",
             params![execution_id, not_before.to_string()],
         )?;

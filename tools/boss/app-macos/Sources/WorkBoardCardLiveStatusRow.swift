@@ -133,9 +133,9 @@ private struct DispatchFailureHistoryList: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Failed attempts")
                 .font(.headline)
-            ForEach(Array(failures.enumerated()), id: \.offset) { index, attempt in
+            ForEach(Array(failures.enumerated()), id: \.offset) { _, attempt in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(attemptHeading(index: index, attempt: attempt))
+                    Text(formattedFailureTime(attempt.happenedAt) ?? "Failure recorded")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(attempt.errorText)
@@ -146,13 +146,5 @@ private struct DispatchFailureHistoryList: View {
         }
         .padding(12)
         .frame(maxWidth: 380, alignment: .leading)
-    }
-
-    private func attemptHeading(index: Int, attempt: DispatchFailureAttempt) -> String {
-        let label = "Attempt \(index + 1)"
-        if let when = formattedFailureTime(attempt.happenedAt) {
-            return "\(label) · \(when)"
-        }
-        return label
     }
 }
