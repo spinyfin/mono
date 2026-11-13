@@ -839,3 +839,85 @@ fn upgrade_baselines_existing_items_and_starts_recording_deferred() {
         Some(&history_row(Some("1"), "0", "human", "update_task"))
     );
 }
+
+fn insert_trigger_rows(db: &WorkDb, id: &str) -> Vec<(String, Option<String>, String, String)> {
+    let conn = db.connect().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT property, new_value, actor, basis FROM task_status_audit
+             WHERE work_item_id = ?1 AND old_value IS NULL
+             ORDER BY property",
+        )
+        .unwrap();
+    stmt.query_map([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+#[test]
+fn production_creates_record_insert_trigger_rows_with_creator_basis() {
+    let db = WorkDb::open(temp_db_path("audit-insert-creators")).unwrap();
+    let product = create_test_product_named(&db, "Insert creators");
+    let project = db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Alpha")
+                .build(),
+        )
+        .unwrap();
+    let design_id: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM tasks WHERE project_id = ?1 AND kind = 'design'",
+            [&project.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Project task")
+                .build(),
+        )
+        .unwrap();
+    let investigation = db
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Investigate")
+                .build(),
+        )
+        .unwrap();
+    let postmortem = db
+        .create_design_postmortem(&product.id, &project.id, &project.name, "review merged PRs".to_owned())
+        .unwrap();
+
+    let expected_properties = [
+        "autostart",
+        "blocked_reason",
+        "deferred",
+        "dispatch_failed_reason",
+        "status",
+    ];
+    for (id, basis) in [
+        (design_id.as_str(), "insert_design_task_for_project_in_tx"),
+        (task.id.as_str(), "insert_task_in_tx_as_actor"),
+        (investigation.id.as_str(), "insert_investigation_in_tx_as_actor"),
+        (postmortem.id.as_str(), "insert_design_postmortem_in_tx"),
+    ] {
+        let rows = insert_trigger_rows(&db, id);
+        let properties: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(properties, expected_properties, "creator {basis}");
+        assert!(
+            rows.iter().all(|row| row.2 == "engine" && row.3 == basis),
+            "creator {basis} rows: {rows:?}"
+        );
+        let status = rows.iter().find(|row| row.0 == "status").unwrap();
+        assert_eq!(status.1.as_deref(), Some("todo"));
+    }
+}

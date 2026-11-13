@@ -975,6 +975,7 @@ mod stuck_report;
 mod stuck_snapshot;
 pub use progression_brief_reads::{ExecutionDiagnosis, ProductPrCiSnapshot, ProgressionCreateBudget, StatusAuditRow};
 mod sweep_reads;
+mod task_insert;
 mod task_status_audit;
 mod task_status_backfill;
 mod task_targets;

@@ -862,24 +862,22 @@ fn insert_seeded_design_task_in_tx(
     let now = now_string();
     let ordinal = next_task_ordinal(conn, project_id)?;
     let short_id = allocate_short_id(conn, product_id)?;
-    crate::task_status_audit::execute(
+    crate::task_insert::insert_task_row(
         conn,
-        &crate::task_status_audit::compose_basis("insert_seeded_design_task_in_tx", provenance),
-        actor,
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
-         pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id) \
-         VALUES (?1, ?2, ?3, 'design', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, 1, 'medium', ?8, ?9)",
-        params![
-            id,
-            product_id,
-            project_id,
-            name,
-            description,
-            ordinal,
-            now,
-            CREATED_VIA_ATTENTION,
-            short_id,
-        ],
+        &crate::task_insert::TaskInsert::builder()
+            .id(&id)
+            .product_id(product_id)
+            .project_id(project_id)
+            .kind("design")
+            .name(name)
+            .description(description)
+            .ordinal(ordinal)
+            .created_at(&now)
+            .created_via(CREATED_VIA_ATTENTION)
+            .short_id(short_id)
+            .build(),
+        crate::task_status_audit::WriteAttribution { actor, provenance },
+        "insert_seeded_design_task_in_tx",
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing seeded design task after insert: {id}"))
 }

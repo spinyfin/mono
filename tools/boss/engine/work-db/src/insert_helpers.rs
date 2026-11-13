@@ -210,13 +210,33 @@ pub fn insert_task_in_tx_as_actor_with_provenance(
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
-    crate::task_status_audit::execute(
+    crate::task_insert::insert_task_row(
         conn,
-        &crate::task_status_audit::compose_basis("insert_task_in_tx_as_actor", provenance),
-        actor,
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred_value, human_driven_value, effort_matched_rule, effort_reasons],
+        &crate::task_insert::TaskInsert::builder()
+            .id(&id)
+            .product_id(&input.product_id)
+            .project_id(&input.project_id)
+            .kind("project_task")
+            .name(&input.name)
+            .description(description)
+            .ordinal(ordinal)
+            .created_at(&now)
+            .autostart(autostart_value != 0)
+            .deferred(deferred_value != 0)
+            .human_driven(human_driven_value != 0)
+            .priority(&priority)
+            .created_via(&created_via)
+            .maybe_repo_remote_url(repo_remote_url)
+            .maybe_effort_level(effort_level)
+            .maybe_model_override(model_override)
+            .reasoning(&reasoning)
+            .maybe_driver(driver)
+            .short_id(short_id)
+            .maybe_effort_matched_rule(effort_matched_rule)
+            .maybe_effort_reasons(effort_reasons)
+            .build(),
+        crate::task_status_audit::WriteAttribution { actor, provenance },
+        "insert_task_in_tx_as_actor",
     )?;
     if super::critical_priority::is_critical(&priority) {
         super::critical_priority::stamp_create_provenance(conn, &id, actor, &now)?;
@@ -353,13 +373,35 @@ fn insert_chore_with_project_in_tx_as_actor(
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
-    crate::task_status_audit::execute(
+    crate::task_insert::insert_task_row(
         conn,
-        &crate::task_status_audit::compose_basis("insert_chore_with_project_in_tx_as_actor", provenance),
-        actor,
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, origin_task_short_id, origin_pr_number, deferred, human_driven, effort_matched_rule, effort_reasons)
-         VALUES (?1, ?2, ?22, ?3, ?4, ?5, 'todo', ?23, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value, human_driven_value, effort_matched_rule, effort_reasons, project_id, ordinal],
+        &crate::task_insert::TaskInsert::builder()
+            .id(&id)
+            .product_id(&input.product_id)
+            .maybe_project_id(project_id)
+            .kind(kind_str)
+            .name(&input.name)
+            .description(description)
+            .maybe_ordinal(ordinal)
+            .created_at(&now)
+            .autostart(autostart_value != 0)
+            .deferred(deferred_value != 0)
+            .human_driven(human_driven_value != 0)
+            .priority(&priority)
+            .created_via(&created_via)
+            .maybe_repo_remote_url(repo_remote_url)
+            .maybe_effort_level(effort_level)
+            .maybe_model_override(model_override)
+            .reasoning(&reasoning)
+            .maybe_driver(driver)
+            .short_id(short_id)
+            .maybe_origin_task_short_id(input.origin_task_short_id)
+            .maybe_origin_pr_number(input.origin_pr_number)
+            .maybe_effort_matched_rule(effort_matched_rule)
+            .maybe_effort_reasons(effort_reasons)
+            .build(),
+        crate::task_status_audit::WriteAttribution { actor, provenance },
+        "insert_chore_with_project_in_tx_as_actor",
     )?;
     if super::critical_priority::is_critical(&priority) {
         super::critical_priority::stamp_create_provenance(conn, &id, actor, &now)?;
@@ -423,18 +465,32 @@ pub fn insert_investigation_in_tx_as_actor_with_provenance(
     let reasoning = seed_reasoning(input.reasoning, &TaskKind::Investigation, input.effort_level);
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
-    crate::task_status_audit::execute(
+    crate::task_insert::insert_task_row(
         conn,
-        &crate::task_status_audit::compose_basis("insert_investigation_in_tx_as_actor", provenance),
-        actor,
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
-         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-        params![
-            id, input.product_id, input.project_id, input.name, description, now,
-            autostart_value, priority, created_via, repo_remote_url,
-            effort_level, model_override, reasoning, driver, short_id, deferred_value,
-            human_driven_value, effort_matched_rule, effort_reasons
-        ],
+        &crate::task_insert::TaskInsert::builder()
+            .id(&id)
+            .product_id(&input.product_id)
+            .maybe_project_id(input.project_id)
+            .kind("investigation")
+            .name(&input.name)
+            .description(description)
+            .created_at(&now)
+            .autostart(autostart_value != 0)
+            .deferred(deferred_value != 0)
+            .human_driven(human_driven_value != 0)
+            .priority(&priority)
+            .created_via(&created_via)
+            .maybe_repo_remote_url(repo_remote_url)
+            .maybe_effort_level(effort_level)
+            .maybe_model_override(model_override)
+            .reasoning(&reasoning)
+            .maybe_driver(driver)
+            .short_id(short_id)
+            .maybe_effort_matched_rule(effort_matched_rule)
+            .maybe_effort_reasons(effort_reasons)
+            .build(),
+        crate::task_status_audit::WriteAttribution { actor, provenance },
+        "insert_investigation_in_tx_as_actor",
     )?;
     if super::critical_priority::is_critical(&priority) {
         super::critical_priority::stamp_create_provenance(conn, &id, actor, &now)?;
