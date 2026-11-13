@@ -1,7 +1,7 @@
 //! Resource reports and serialized spawn admission for the host command loop.
 use anyhow::Result;
 use boss_host_execution::{
-    capacity,
+    capacity::{self, Resources},
     worker::{ExecutionRecord, Phase},
 };
 use boss_protocol_spoke::v1::{
@@ -10,6 +10,33 @@ use boss_protocol_spoke::v1::{
 };
 use boss_spoke_journal::{Admission, Journal};
 use std::path::Path;
+
+/// Logical CPU count, reclaimable memory and free disk for `root`. A failed
+/// probe is an error the caller fail-closes.
+fn sample_host(root: &Path, active: u64) -> Result<(u32, Resources)> {
+    let cpus = std::thread::available_parallelism()?.get() as u64;
+    let disk = fs4::available_space(root)?;
+    Ok((
+        cpus as u32,
+        capacity::observe(cpus, capacity::available_memory()?, disk, active),
+    ))
+}
+
+fn current_sample(root: &Path, active: u64) -> Result<(u32, Resources)> {
+    #[cfg(test)]
+    if let Some(sample) = SAMPLE_OVERRIDE.with(std::cell::Cell::get) {
+        return sample(root, active);
+    }
+    sample_host(root, active)
+}
+
+#[cfg(test)]
+type SampleFn = fn(&Path, u64) -> Result<(u32, Resources)>;
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_OVERRIDE: std::cell::Cell<Option<SampleFn>> = const { std::cell::Cell::new(None) };
+}
 
 fn executions(journal: &Journal) -> Result<Vec<ExecutionRecord>> {
     journal
@@ -44,8 +71,8 @@ pub fn admission(
     let reason = if !failures.is_empty() {
         Some("host resource budget or preflight unavailable".to_owned())
     } else {
-        match capacity::sample(root, active) {
-            Ok(resources) if resources.workers(0) > 0 => None,
+        match current_sample(root, active) {
+            Ok((_, resources)) if resources.workers(0) > 0 => None,
             Ok(_) => Some("host resource budget or preflight unavailable".to_owned()),
             Err(error) => {
                 tracing::error!(%error, "host resource sampling failed; rejecting spawn");
@@ -66,15 +93,15 @@ pub fn admission(
 pub fn report(journal: &mut Journal, root: &Path, observed: Stamp, inventory: Inventory, load: f64) -> Result<()> {
     let runs = executions(journal)?;
     let active = runs.iter().filter(|r| r.phase != Phase::Terminal).count() as u32;
-    // A failed probe publishes zero capacity, which admits nothing, and the
-    // next report retries.
-    let resources = capacity::sample(root, u64::from(active)).unwrap_or_else(|error| {
+    // A failed probe, including a failed CPU count, publishes zero capacity,
+    // which admits nothing, and the next report retries. The daemon stays up.
+    let (total_slots, resources) = current_sample(root, u64::from(active)).unwrap_or_else(|error| {
         tracing::error!(%error, "host resource sampling failed; publishing zero capacity");
-        Default::default()
+        (0, Resources::default())
     });
     let capacity = Capacity {
         generation: journal.record_bounds()?.1 + 1,
-        total_slots: std::thread::available_parallelism()?.get() as u32,
+        total_slots,
         active_slots: active,
         available_cpu_millis: resources.cpu_millis.try_into()?,
         available_memory_bytes: resources.memory_bytes,
@@ -127,6 +154,7 @@ mod tests {
     use super::*;
     use boss_protocol_spoke::v1::{Run, Spawn};
     use boss_spoke_journal::Limits;
+    use prost::Message;
 
     fn journal(dir: &Path) -> Journal {
         Journal::open(
@@ -153,6 +181,41 @@ mod tests {
         }
     }
 
+    fn stamp() -> Stamp {
+        Stamp {
+            boot_id: "boot".into(),
+            wall_unix_ms: 1,
+            ..Default::default()
+        }
+    }
+
+    struct Override;
+    impl Drop for Override {
+        fn drop(&mut self) {
+            SAMPLE_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+    fn override_sample(sample: fn(&Path, u64) -> Result<(u32, Resources)>) -> Override {
+        SAMPLE_OVERRIDE.with(|cell| cell.set(Some(sample)));
+        Override
+    }
+
+    fn cpu_probe_fails(_: &Path, _: u64) -> Result<(u32, Resources)> {
+        anyhow::bail!("available_parallelism failed")
+    }
+
+    fn zero_workers(_: &Path, _: u64) -> Result<(u32, Resources)> {
+        Ok((4, Resources::default()))
+    }
+
+    fn capacity_of(journal: &Journal) -> Capacity {
+        let stored = journal.next_record(0).unwrap().expect("capacity record");
+        match Record::decode(stored.bytes.as_slice()).unwrap().body {
+            Some(record::Body::Capacity(capacity)) => capacity,
+            other => panic!("expected Capacity, got {other:?}"),
+        }
+    }
+
     #[test]
     fn failed_preflights_reject_a_spawn() {
         let dir = tempfile::tempdir().unwrap();
@@ -172,6 +235,18 @@ mod tests {
         let result = admission(&journal, &missing, &spawn(), &[]).unwrap().expect("rejected");
         assert_eq!(result.code, i32::from(ResultCode::Rejected));
         assert!(result.reason.contains("sampling failed"), "{}", result.reason);
+    }
+
+    #[test]
+    fn a_zero_budget_sample_rejects_a_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let _guard = override_sample(zero_workers);
+        let result = admission(&journal, dir.path(), &spawn(), &[])
+            .unwrap()
+            .expect("rejected");
+        assert_eq!(result.code, i32::from(ResultCode::Rejected));
+        assert_eq!(result.reason, "host resource budget or preflight unavailable");
     }
 
     #[test]
@@ -209,17 +284,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = journal(dir.path());
         let missing = dir.path().join("does-not-exist");
-        report(
-            &mut journal,
-            &missing,
-            Stamp {
-                boot_id: "boot".into(),
-                wall_unix_ms: 1,
-                ..Default::default()
-            },
-            Inventory::default(),
-            0.0,
-        )
-        .unwrap();
+        report(&mut journal, &missing, stamp(), Inventory::default(), 0.0).unwrap();
+        let capacity = capacity_of(&journal);
+        assert_eq!(capacity.total_slots, 0);
+        assert_eq!(capacity.available_cpu_millis, 0);
+        assert_eq!(capacity.available_memory_bytes, 0);
+        assert_eq!(capacity.free_disk_bytes, 0);
+    }
+
+    #[test]
+    fn a_cpu_probe_failure_publishes_zero_capacity_and_the_loop_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let _guard = override_sample(cpu_probe_fails);
+        report(&mut journal, dir.path(), stamp(), Inventory::default(), 0.0).unwrap();
+        let first = capacity_of(&journal);
+        assert_eq!(first.total_slots, 0);
+        assert_eq!(first.available_cpu_millis, 0);
+        assert_eq!(first.available_memory_bytes, 0);
+        assert_eq!(first.free_disk_bytes, 0);
+        report(&mut journal, dir.path(), stamp(), Inventory::default(), 0.0).unwrap();
+        let second = journal.next_record(1).unwrap().expect("second capacity record");
+        match Record::decode(second.bytes.as_slice()).unwrap().body {
+            Some(record::Body::Capacity(capacity)) => {
+                assert_eq!(capacity.total_slots, 0);
+                assert_eq!(capacity.available_cpu_millis, 0);
+            }
+            other => panic!("expected Capacity, got {other:?}"),
+        }
     }
 }

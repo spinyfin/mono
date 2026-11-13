@@ -2823,8 +2823,11 @@ impl ExecutionCoordinator {
         }
         // Park already returned the row to ready without spending the retry
         // budget. A drain that re-claims before this runs must not count the
-        // same unanswered lease as a start failure.
-        if waitable_spoke_lease(err).is_some() {
+        // same unanswered lease or a budget deferral as a start failure.
+        if waitable_spoke_lease(err).is_some()
+            || err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_some()
+            || err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some()
+        {
             return;
         }
         if current.status != ExecutionStatus::Claimed {

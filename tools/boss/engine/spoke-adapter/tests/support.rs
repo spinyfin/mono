@@ -533,7 +533,7 @@ impl Fixture {
         self.refresh_budget(id);
     }
 
-    fn refresh_budget(&self, id: &str) {
+    pub fn refresh_budget(&self, id: &str) {
         let Some(journal) = self.db.spoke_journal(id).unwrap() else {
             return;
         };
