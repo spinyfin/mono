@@ -199,7 +199,10 @@ the capacity scheduling work.
 `.buildkite/steps/spoke-release.sh` (pipeline `.buildkite/pipeline-spoke-release.yml`,
 product record `tools/boss/spoke-release.toml`) builds with Bazel on each
 platform's agent, runs `build` and `sign`, and publishes through `//tools/release`.
-It refuses to run without the signing key. It is not registered anywhere yet.
+Each Boss release pins that spoke tag to the same version and source commit.
+The dedicated pipeline and signing key stay unregistered until they are
+provisioned; until then Boss releases skip the spoke block and the hub shows
+unpublished. A build phase still refuses to upload an unsigned package.
 There is no Linux arm64 agent, so those assets are optional.
 
 ## Tests

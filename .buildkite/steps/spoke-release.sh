@@ -20,6 +20,7 @@ INSTALLER_TARGET="//tools/boss/spoke-package:boss-spoke-package"
 # Distinct from the Boss app pipeline's `release-tag` meta-data key, so a
 # matching spoke draft can be prepared in the same Buildkite build.
 export RELEASE_TAG_KEY="${RELEASE_TAG_KEY:-spoke-release-tag}"
+RELEASE_SHA_KEY="${RELEASE_SHA_KEY:-spoke-release-sha}"
 REQUIRED_CATALOG_PLATFORMS=(macos-arm64 linux-amd64)
 
 # The platform id the package and manifest are named for; it must match
@@ -41,10 +42,43 @@ signing_key() {
   fi
 }
 
+record_pin_sha() {
+  local sha="${1:-}"
+  [[ -n "${sha}" ]] || return 0
+  export RELEASE_PIN_SHA="${sha}"
+  if command -v buildkite-agent &>/dev/null; then
+    buildkite-agent meta-data set "${RELEASE_SHA_KEY}" "${sha}"
+  fi
+}
+
+resolve_pin_sha() {
+  if [[ -n "${RELEASE_PIN_SHA:-}" ]]; then
+    printf '%s' "${RELEASE_PIN_SHA}"
+    return
+  fi
+  if command -v buildkite-agent &>/dev/null; then
+    local recorded
+    recorded="$(buildkite-agent meta-data get "${RELEASE_SHA_KEY}" --default '' 2>/dev/null || true)"
+    if [[ -n "${recorded}" ]]; then
+      printf '%s' "${recorded}"
+      return
+    fi
+  fi
+}
+
+checkout_pin_sha() {
+  local sha
+  sha="$(resolve_pin_sha)"
+  [[ -n "${sha}" ]] || die "spoke packages require RELEASE_PIN_SHA (the Boss tag commit)"
+  git fetch --tags --prune origin >/dev/null
+  git checkout --detach "${sha}"
+  echo "[spoke-release] building from ${sha}"
+}
+
 phase_prepare() {
   echo "[spoke-release] agent: $(uname -a)"
-  # The hub looks up boss-spoke-v{Boss version}. Pin to that version so a
-  # Boss release always has a matching signed spoke catalog.
+  # The hub looks up boss-spoke-v{Boss version}. Pin to that version and the
+  # matching Boss tag commit so a package labelled 1.0.N is that commit.
   if [[ -z "${RELEASE_PIN_VERSION:-}" ]]; then
     local boss_tag
     boss_tag="$(git tag --list 'boss-v*' --sort=-v:refname | head -1 || true)"
@@ -53,8 +87,16 @@ phase_prepare() {
       return
     fi
     export RELEASE_PIN_VERSION="${boss_tag#"boss-v"}"
+    if [[ -z "${RELEASE_PIN_SHA:-}" ]]; then
+      RELEASE_PIN_SHA="$(git rev-list -n 1 "${boss_tag}")"
+    fi
+  elif [[ -z "${RELEASE_PIN_SHA:-}" ]]; then
+    RELEASE_PIN_SHA="$(git rev-list -n 1 "boss-v${RELEASE_PIN_VERSION}" 2>/dev/null || true)"
+    [[ -n "${RELEASE_PIN_SHA}" ]] || die "no commit for boss-v${RELEASE_PIN_VERSION}"
   fi
-  echo "[spoke-release] pinning spoke packages to Boss version ${RELEASE_PIN_VERSION}"
+  record_pin_sha "${RELEASE_PIN_SHA}"
+  checkout_pin_sha
+  echo "[spoke-release] pinning spoke packages to Boss ${RELEASE_PIN_VERSION} at ${RELEASE_PIN_SHA}"
   local tag
   tag="$(bin/release prepare --config "${CONFIG}")"
   if [[ -z "${tag}" ]]; then
@@ -75,6 +117,7 @@ phase_build() {
   tag="${RELEASE_TAG}"
   version="${tag#"${TAG_PREFIX}"}"
   platform="$(platform_id)"
+  checkout_pin_sha
 
   key="$(signing_key)"
   [[ -n "${key}" ]] || die "BOSS_SPOKE_RELEASE_SIGNING_KEY is not set; refusing to build an unsigned release"

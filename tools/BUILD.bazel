@@ -1,1 +1,6 @@
 # Tools
+
+exports_files(
+    ["boss/spoke-release.toml"],
+    visibility = ["//tools/release:__pkg__"],
+)

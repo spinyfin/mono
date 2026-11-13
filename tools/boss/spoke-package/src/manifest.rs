@@ -86,10 +86,10 @@ impl Platform {
 
     /// Package id for a host's reported `(os, arch)` pair, matching inventory.
     pub fn from_os_arch(os: &str, arch: &str) -> Option<Self> {
-        match (os, arch) {
-            ("macos", "aarch64") => Some(Self::MacosArm64),
-            ("linux", "x86_64") => Some(Self::LinuxAmd64),
-            ("linux", "aarch64") => Some(Self::LinuxArm64),
+        match boss_protocol_spoke::package_platform(os, arch)? {
+            "macos-arm64" => Some(Self::MacosArm64),
+            "linux-amd64" => Some(Self::LinuxAmd64),
+            "linux-arm64" => Some(Self::LinuxArm64),
             _ => None,
         }
     }

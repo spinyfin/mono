@@ -9,7 +9,6 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 boss-http-retry = { path = "../../http_retry" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
-boss-spoke-package = { path = "../../spoke-package" }
 boss-spoke-stream = { path = "../spoke-stream" }
 boss-work-db = { path = "../work-db" }
 prost = { workspace = true }

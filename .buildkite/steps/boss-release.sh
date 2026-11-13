@@ -122,21 +122,36 @@ log "[boss-release] uploading Boss-{version}.zip"
 bin/release upload --config "${CONFIG}" --tag "${TAG}" \
   --asset "Boss-{version}.zip=${ZIP_PATH}"
 
-# Matching signed spoke packages for this Boss version. The hub fetches
-# boss-spoke-v{same version}/spoke-packages.json; an independent spoke
-# patch counter would never line up.
-VERSION="${TAG#"boss-v"}"
-log "[boss-release] preparing spoke packages for ${VERSION}"
-export RELEASE_PIN_VERSION="${VERSION}"
-export RELEASE_TAG_KEY="spoke-release-tag"
-SPOKE_TAG="$(bin/release prepare --config tools/boss/spoke-release.toml)"
-if [[ -z "${SPOKE_TAG}" ]]; then
-  die "spoke package prepare for Boss ${VERSION} produced no tag"
-fi
-echo "[boss-release] spoke release tag: ${SPOKE_TAG}"
-buildkite-agent pipeline upload .buildkite/pipeline-spoke-release-builds.yml
-
 log "[boss-release] publishing ${TAG}"
 bin/release publish --config "${CONFIG}" --tag "${TAG}"
 
-log "[boss-release] done — release ${TAG} published; spoke packages ${SPOKE_TAG} building"
+# Matching signed spoke packages for this Boss version and commit. The hub
+# fetches boss-spoke-v{same version}/spoke-packages.json. Skip when the
+# signing key is not registered so a missing spoke pipeline cannot block
+# the Boss publish; the hub then shows unpublished.
+VERSION="${TAG#"boss-v"}"
+SPOKE_KEY="$(_read_secret BOSS_SPOKE_RELEASE_SIGNING_KEY)"
+if [[ -z "${SPOKE_KEY}" ]]; then
+  echo "[boss-release] BOSS_SPOKE_RELEASE_SIGNING_KEY is not set; spoke packages stay unpublished"
+else
+  log "[boss-release] preparing spoke packages for ${VERSION}"
+  export BOSS_SPOKE_RELEASE_SIGNING_KEY="${SPOKE_KEY}"
+  export RELEASE_PIN_VERSION="${VERSION}"
+  export RELEASE_PIN_SHA
+  RELEASE_PIN_SHA="$(git rev-parse HEAD)"
+  export RELEASE_TAG_KEY="spoke-release-tag"
+  buildkite-agent meta-data set spoke-release-sha "${RELEASE_PIN_SHA}"
+  SPOKE_TAG="$(bin/release prepare --config tools/boss/spoke-release.toml)"
+  if [[ -z "${SPOKE_TAG}" ]]; then
+    echo "[boss-release] spoke package prepare skipped for ${VERSION}"
+  else
+    echo "[boss-release] spoke release tag: ${SPOKE_TAG}"
+    if buildkite-agent step get id --step "spoke-release-publish" &>/dev/null; then
+      echo "[boss-release] spoke build phases for ${SPOKE_TAG} are already present"
+    else
+      buildkite-agent pipeline upload .buildkite/pipeline-spoke-release-builds.yml
+    fi
+  fi
+fi
+
+log "[boss-release] done — release ${TAG} published"

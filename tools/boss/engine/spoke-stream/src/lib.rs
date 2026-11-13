@@ -195,19 +195,23 @@ impl StreamManager {
     }
 
     /// Durable result for `command_id`, if the outbox has committed one.
-    pub async fn command_result(&self, host_id: &str, command_id: &str) -> Option<CommandResult> {
-        self.0
-            .storage
-            .outbox
-            .completed(host_id, command_id)
-            .await
-            .ok()
-            .flatten()
+    /// A store error is distinct from an absent command.
+    pub async fn command_result(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> Result<Option<CommandResult>, store::StoreError> {
+        self.0.storage.outbox.completed(host_id, command_id).await
     }
 
     /// Durable original command, if the outbox still has it.
-    pub async fn stored_command(&self, host_id: &str, command_id: &str) -> Option<boss_protocol_spoke::v1::Command> {
-        self.0.storage.outbox.command(host_id, command_id).await.ok().flatten()
+    /// A store error is distinct from an absent command.
+    pub async fn stored_command(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> Result<Option<boss_protocol_spoke::v1::Command>, store::StoreError> {
+        self.0.storage.outbox.command(host_id, command_id).await
     }
 
     pub(crate) fn publish_capture(&self, host_id: &str, record: &boss_protocol_spoke::v1::Record) {

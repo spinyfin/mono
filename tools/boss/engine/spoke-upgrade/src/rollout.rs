@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,10 +18,17 @@ use crate::{
 const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(600);
 const NOT_AFTER_UNIX_MS: i64 = 4_102_444_800_000;
+/// Tick-to-tick gaps larger than this are hub sleep or a missed interval, not
+/// connected upgrade time.
+const MAX_CONNECTED_SAMPLE_GAP_SECS: i64 = 15;
 
 struct UpgradeBounds {
     command_deadline: Duration,
     upgrade_timeout: Duration,
+    /// Last connected sample in this controller session. Not persisted: a
+    /// restart or reconnect starts a new baseline so hub downtime is not
+    /// charged as connected upgrade time.
+    progress_sample: Mutex<Option<(String, i64)>>,
 }
 
 pub struct UpgradeController {
@@ -47,6 +54,7 @@ impl UpgradeController {
             bounds: UpgradeBounds {
                 command_deadline: COMMAND_DEADLINE,
                 upgrade_timeout: UPGRADE_TIMEOUT,
+                progress_sample: Mutex::new(None),
             },
         }
     }
@@ -88,9 +96,12 @@ impl UpgradeController {
                 }
             }
         };
+        if rollout.halted && rollout.desired_release == self.desired_release {
+            return Ok(());
+        }
         if let Some(host_id) = rollout.in_flight_host_id.clone() {
             match self.reconcile_in_flight(&mut rollout, &host_id, &catalog).await? {
-                InFlight::Wait => return Ok(()),
+                InFlight::Wait | InFlight::Unresolved => return Ok(()),
                 InFlight::Healthy => {
                     self.clear_in_flight(&mut rollout)?;
                 }
@@ -102,6 +113,8 @@ impl UpgradeController {
                         self.halt(&mut rollout, &host_id, &reason)?;
                         return Ok(());
                     }
+                    // Terminal evidence that the previous command cannot still
+                    // run: the fleet gate may move to the new desired release.
                     self.clear_in_flight(&mut rollout)?;
                 }
             }
@@ -128,6 +141,7 @@ impl UpgradeController {
                 rollout.halt_host_id = None;
                 rollout.halt_reason = None;
                 rollout.halt_at = None;
+                rollout.halt_command_id = None;
             } else {
                 let published_platforms = rollout.published_platforms.clone();
                 rollout = SpokeUpgradeRollout::for_release(&self.desired_release, rollout.packages_published);
@@ -156,83 +170,120 @@ impl UpgradeController {
         catalog: &SpokePackageCatalog,
     ) -> Result<InFlight> {
         let durable_result = match rollout.in_flight_command_id.as_deref() {
-            Some(command_id) => self.streams.command_result(host_id, command_id).await,
+            Some(command_id) => match self.streams.command_result(host_id, command_id).await {
+                Ok(result) => result,
+                Err(_) => return Ok(InFlight::Wait),
+            },
             None => None,
         };
-        if let Some(result) = durable_result.as_ref()
-            && result.code != ResultCode::Ok as i32
-        {
-            let reason = if result.reason.is_empty() {
-                format!("upgrade refused ({})", result.code)
-            } else {
-                result.reason.clone()
-            };
-            return Ok(InFlight::Failed(reason));
+        if let Some(result) = durable_result.as_ref() {
+            match result.code {
+                code if code == ResultCode::Ok as i32 => {}
+                code if code == ResultCode::Rejected as i32 => {
+                    let reason = if result.reason.is_empty() {
+                        format!("upgrade refused ({code})")
+                    } else {
+                        result.reason.clone()
+                    };
+                    return Ok(InFlight::Failed(reason));
+                }
+                _ => return Ok(InFlight::Unresolved),
+            }
         }
         let command_id = rollout.in_flight_command_id.clone();
         if durable_result.is_none()
             && let Some(command_id) = command_id
-            && self.streams.stored_command(host_id, &command_id).await.is_none()
         {
-            if let Some(command) = rollout
-                .in_flight_command
-                .as_deref()
-                .and_then(|bytes| Command::decode(bytes).ok())
-            {
-                match self
-                    .streams
-                    .command(
-                        host_id,
-                        CommandAdmission::Recovery,
-                        command,
-                        self.bounds.command_deadline,
-                    )
-                    .await
+            let stored = match self.streams.stored_command(host_id, &command_id).await {
+                Ok(stored) => stored,
+                Err(_) => return Ok(InFlight::Wait),
+            };
+            if stored.is_none() {
+                if let Some(command) = rollout
+                    .in_flight_command
+                    .as_deref()
+                    .and_then(|bytes| Command::decode(bytes).ok())
                 {
-                    Ok(result) => {
-                        if result.code != ResultCode::Ok as i32 {
-                            return Ok(InFlight::Failed(if result.reason.is_empty() {
-                                format!("upgrade refused ({})", result.code)
-                            } else {
-                                result.reason
-                            }));
+                    match self
+                        .streams
+                        .command(
+                            host_id,
+                            CommandAdmission::Recovery,
+                            command,
+                            self.bounds.command_deadline,
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            if result.code == ResultCode::Rejected as i32 {
+                                return Ok(InFlight::Failed(if result.reason.is_empty() {
+                                    format!("upgrade refused ({})", result.code)
+                                } else {
+                                    result.reason
+                                }));
+                            }
+                            if result.code != ResultCode::Ok as i32 {
+                                return Ok(InFlight::Unresolved);
+                            }
+                        }
+                        Err(CommandOutcome::Unavailable)
+                        | Err(CommandOutcome::Invalid)
+                        | Err(CommandOutcome::Busy)
+                        | Err(CommandOutcome::NotSubmitted) => {
+                            self.clear_in_flight(rollout)?;
+                            return Ok(InFlight::Wait);
+                        }
+                        Err(CommandOutcome::OutcomeUncertain) | Err(CommandOutcome::ResetReleaseUnsupported) => {
+                            return Ok(InFlight::Unresolved);
                         }
                     }
-                    Err(CommandOutcome::Unavailable)
-                    | Err(CommandOutcome::Invalid)
-                    | Err(CommandOutcome::Busy)
-                    | Err(CommandOutcome::NotSubmitted) => {
-                        self.clear_in_flight(rollout)?;
-                        return Ok(InFlight::Wait);
-                    }
-                    Err(CommandOutcome::OutcomeUncertain) | Err(CommandOutcome::ResetReleaseUnsupported) => {}
+                } else if catalog.packages.is_empty() {
+                    return Ok(InFlight::Wait);
                 }
-            } else if catalog.packages.is_empty() {
-                return Ok(InFlight::Wait);
             }
+        }
+        let progress = self.in_flight_progress(host_id, rollout)?;
+        if !matches!(progress, InFlight::Wait) {
+            return Ok(progress);
         }
         self.note_connected_progress(rollout, host_id).await?;
         if self.timed_out(rollout) {
-            return Ok(InFlight::Failed("upgrade_timeout".into()));
+            let same_desired = rollout.in_flight_release.as_deref() == Some(self.desired_release.as_str())
+                || rollout.in_flight_release.is_none();
+            if same_desired {
+                self.halt(rollout, host_id, "upgrade_timeout")?;
+            }
+            return Ok(InFlight::Unresolved);
         }
-        self.in_flight_progress(host_id, rollout)
+        Ok(InFlight::Wait)
     }
 
     async fn note_connected_progress(&self, rollout: &mut SpokeUpgradeRollout, host_id: &str) -> Result<()> {
         let connected = self.streams.connected_hosts().await.iter().any(|id| id == host_id);
         let now = unix_epoch_secs_string();
         let now_secs: i64 = now.parse().unwrap_or(0);
+        let mut sample = self
+            .bounds
+            .progress_sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if connected {
-            if let Some(last) = rollout.in_flight_last_progress_at.as_deref() {
-                let last_secs: i64 = last.parse().unwrap_or(now_secs);
-                rollout.in_flight_connected_secs = rollout
-                    .in_flight_connected_secs
-                    .saturating_add((now_secs - last_secs).max(0));
+            if let Some((sampled_host, last_secs)) = sample.as_ref()
+                && sampled_host == host_id
+            {
+                let gap = (now_secs - last_secs).max(0);
+                if gap > 0 && gap <= MAX_CONNECTED_SAMPLE_GAP_SECS {
+                    rollout.in_flight_connected_secs = rollout.in_flight_connected_secs.saturating_add(gap);
+                }
             }
+            *sample = Some((host_id.to_owned(), now_secs));
             rollout.in_flight_last_progress_at = Some(now);
+            drop(sample);
             self.persist(rollout)?;
         } else {
+            *sample = None;
             rollout.in_flight_last_progress_at = None;
+            drop(sample);
             self.persist(rollout)?;
         }
         Ok(())
@@ -365,6 +416,9 @@ impl UpgradeController {
         if result.code == ResultCode::Ok as i32 {
             return Ok(());
         }
+        if result.code != ResultCode::Rejected as i32 {
+            return Ok(());
+        }
         let reason = if result.reason.is_empty() {
             format!("upgrade refused ({})", result.code)
         } else {
@@ -374,6 +428,9 @@ impl UpgradeController {
     }
 
     fn halt(&self, rollout: &mut SpokeUpgradeRollout, host_id: &str, reason: &str) -> Result<()> {
+        if rollout.halted && rollout.desired_release == self.desired_release {
+            return Ok(());
+        }
         if let Some(command_id) = rollout.in_flight_command_id.as_deref() {
             let helper_already_reported = self
                 .db
@@ -382,15 +439,21 @@ impl UpgradeController {
                 .flatten()
                 .is_some_and(|status| status.last_upgrade_command_id == command_id);
             if !helper_already_reported {
+                let result = if reason == "upgrade_timeout" {
+                    "timeout"
+                } else {
+                    "refused"
+                };
                 let _ = self
                     .db
-                    .record_upgrade_command_outcome(host_id, command_id, "refused", reason);
+                    .record_upgrade_command_outcome(host_id, command_id, result, reason);
             }
         }
         rollout.halted = true;
         rollout.halt_host_id = Some(host_id.to_owned());
         rollout.halt_reason = Some(reason.to_owned());
         rollout.halt_at = Some(unix_epoch_secs_string());
+        rollout.halt_command_id = rollout.in_flight_command_id.clone();
         tracing::error!(
             host_id,
             desired_release = %rollout.desired_release,
@@ -420,6 +483,7 @@ impl UpgradeController {
 
 enum InFlight {
     Wait,
+    Unresolved,
     Healthy,
     Failed(String),
 }

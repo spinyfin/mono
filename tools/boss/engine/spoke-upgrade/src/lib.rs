@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use boss_spoke_package::manifest::Platform;
 use boss_spoke_stream::StreamManager;
 use boss_work_db::WorkDb;
 use serde::Deserialize;
@@ -258,7 +257,7 @@ pub fn release_has_published_packages(release_id: &str) -> bool {
 }
 
 pub fn package_platform(os: &str, arch: &str) -> Option<&'static str> {
-    Platform::from_os_arch(os, arch).map(Platform::as_str)
+    boss_protocol_spoke::package_platform(os, arch)
 }
 
 pub fn decode_sha256(hex: &str) -> Option<Vec<u8>> {
@@ -336,7 +335,7 @@ mod tests {
         assert_eq!(package_platform("linux", "aarch64"), Some("linux-arm64"));
         assert_eq!(
             package_platform("linux", "aarch64"),
-            Platform::from_os_arch("linux", "aarch64").map(Platform::as_str)
+            boss_protocol_spoke::package_platform("linux", "aarch64")
         );
     }
 

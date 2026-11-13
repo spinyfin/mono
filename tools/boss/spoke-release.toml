@@ -10,9 +10,9 @@
 # signature; authenticity is the `.manifest.json.sig` and the installer `.sig`
 # against the pinned release key.
 #
-# change_paths lists the spoke's own crates. A change in a library it links (the
-# driver or tmux crates, say) does not by itself cut a scheduled release; a
-# manual run always does.
+# change_paths lists the spoke's own crates. Scheduled runs no longer cut a
+# new release from HEAD: they only resume a draft whose tag SHA matches the
+# pinned Boss commit. A Boss release (or a manual run) creates that draft.
 repo = "spinyfin/mono"
 tag_prefix = "boss-spoke-v"
 title_prefix = "Boss spoke"

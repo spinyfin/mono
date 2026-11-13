@@ -35,11 +35,20 @@ impl WorkDbSink {
 /// Command outbox backed by `host_commands` / `host_command_journals`.
 pub struct WorkDbOutbox {
     db: WorkDb,
+    fail_reads: std::sync::atomic::AtomicBool,
 }
 
 impl WorkDbOutbox {
     pub fn new(db: WorkDb) -> Self {
-        Self { db }
+        Self {
+            db,
+            fail_reads: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Test seam: make `command` / `completed` return Unavailable.
+    pub fn inject_read_failures(&self, fail: bool) {
+        self.fail_reads.store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -302,6 +311,9 @@ impl CommandOutbox for WorkDbOutbox {
     }
 
     async fn command(&self, host: &str, command_id: &str) -> Result<Option<Command>, StoreError> {
+        if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
         let host = host.to_owned();
         let command_id = command_id.to_owned();
         blocking(&self.db, move |db| {
@@ -314,6 +326,9 @@ impl CommandOutbox for WorkDbOutbox {
     }
 
     async fn completed(&self, host: &str, command_id: &str) -> Result<Option<CommandResult>, StoreError> {
+        if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
         let host = host.to_owned();
         let command_id = command_id.to_owned();
         blocking(&self.db, move |db| {

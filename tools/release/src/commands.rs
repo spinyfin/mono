@@ -31,6 +31,7 @@ pub const BUILDKITE_TAG_KEY: &str = "release-tag";
 /// Pin `prepare` to this version instead of incrementing the product counter.
 /// Used so spoke packages are tagged `boss-spoke-v{Boss version}`.
 const PIN_VERSION_ENV: &str = "RELEASE_PIN_VERSION";
+const PIN_SHA_ENV: &str = "RELEASE_PIN_SHA";
 const TAG_KEY_ENV: &str = "RELEASE_TAG_KEY";
 
 const UPLOAD_ATTEMPTS: usize = 3;
@@ -101,6 +102,7 @@ pub fn prepare(
         buildkite_job_id,
         resume_draft,
         pin_version_from_env().as_deref(),
+        pin_sha_from_env().as_deref(),
     )
 }
 
@@ -111,6 +113,7 @@ fn prepare_with_pin(
     buildkite_job_id: Option<&str>,
     resume_draft: bool,
     pin_version: Option<&str>,
+    pin_sha: Option<&str>,
 ) -> Result<PrepareOutcome> {
     let trigger = assert_allowed_trigger(trigger_source)?;
     fetch_tags(runner)?;
@@ -140,6 +143,10 @@ fn prepare_with_pin(
 
     if let Some(version) = pin_version {
         let tag = format!("{}{version}", config.tag_prefix);
+        let expected_sha = pin_sha.unwrap_or(head_sha.as_str());
+        if pin_sha.is_some_and(|sha| sha != head_sha) {
+            bail!("HEAD {head_sha} is not the pinned commit {expected_sha}; checkout that commit before prepare");
+        }
         if state
             .releases
             .iter()
@@ -153,10 +160,21 @@ fn prepare_with_pin(
             .iter()
             .find(|release| release.tag_name == tag && release.draft)
         {
+            let draft_sha = resolve_tag_sha(runner, config, Some(draft))?;
+            if draft_sha.as_deref() != Some(expected_sha) {
+                bail!(
+                    "refusing to resume {tag} at commit {}; wanted {expected_sha}",
+                    draft_sha.as_deref().unwrap_or("unknown")
+                );
+            }
             record_tag(runner, buildkite_job_id, &draft.tag_name)?;
             return Ok(PrepareOutcome::Resumed {
                 tag: draft.tag_name.clone(),
             });
+        }
+        if trigger == Trigger::Schedule {
+            eprintln!("release skipped: scheduled pin {tag} has no draft at {expected_sha}");
+            return Ok(PrepareOutcome::Skipped);
         }
         create_draft(
             runner,
@@ -619,9 +637,17 @@ pub fn pin_version_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn pin_sha_from_env() -> Option<String> {
+    std::env::var(PIN_SHA_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 /// Asset names a release script passes to `bin/release upload --asset name=`.
 /// `${platform}` expands to macos-arm64, linux-amd64 and linux-arm64.
-pub fn upload_asset_names_from_script(script: &str) -> Vec<String> {
+#[cfg(test)]
+fn upload_asset_names_from_script(script: &str) -> Vec<String> {
     const PLATFORMS: [&str; 3] = ["macos-arm64", "linux-amd64", "linux-arm64"];
     let mut names = Vec::new();
     for line in script.lines() {
@@ -1297,7 +1323,8 @@ source = "github-generated"
             success(""),
             success(""),
         ]);
-        let outcome = prepare_with_pin(&runner, &config, "ui", Some("job-1"), false, Some("1.0.42")).expect("prepare");
+        let outcome =
+            prepare_with_pin(&runner, &config, "ui", Some("job-1"), false, Some("1.0.42"), None).expect("prepare");
         assert_eq!(
             outcome,
             PrepareOutcome::Created {
@@ -1318,62 +1345,42 @@ source = "github-generated"
             success("head\n"),
             success("oldsha\n"),
         ]);
-        let outcome = prepare_with_pin(&runner, &config, "ui", Some("job-1"), false, Some("1.0.5")).expect("prepare");
+        let outcome =
+            prepare_with_pin(&runner, &config, "ui", Some("job-1"), false, Some("1.0.5"), None).expect("prepare");
         assert_eq!(outcome, PrepareOutcome::Skipped);
     }
 
     #[test]
-    fn spoke_catalog_upload_names_are_declared_in_the_release_config() {
-        // Mirrors .buildkite/steps/spoke-release.sh --asset flags and
-        // tools/boss/spoke-release.toml. ${platform} expands to all three ids.
-        let script = r#"
-  bin/release upload --config "${CONFIG}" --tag "${tag}" \
-    --asset "boss-spoke-${platform}.tar.gz=${out}/boss-spoke-${platform}.tar.gz" \
-    --asset "boss-spoke-${platform}.manifest.json=${out}/boss-spoke-${platform}.manifest.json" \
-    --asset "boss-spoke-${platform}.manifest.json.sig=${out}/boss-spoke-${platform}.manifest.json.sig" \
-    --asset "boss-spoke-package-${platform}=${installer}" \
-    --asset "boss-spoke-package-${platform}.sig=${out}/boss-spoke-package-${platform}.sig" \
-    --asset "spoke-packages.${platform}.json=${catalog}"
-  bin/release upload --config "${CONFIG}" --tag "${tag}" \
-    --asset "spoke-packages.json=${work}/spoke-packages.json"
-"#;
-        let config = ReleaseConfig::parse(
-            r#"
-repo = "spinyfin/mono"
-tag_prefix = "boss-spoke-v"
-title_prefix = "Boss spoke"
-change_paths = ["tools/boss/"]
-required_assets = [
-  "boss-spoke-macos-arm64.tar.gz",
-  "boss-spoke-macos-arm64.manifest.json",
-  "boss-spoke-macos-arm64.manifest.json.sig",
-  "boss-spoke-package-macos-arm64",
-  "boss-spoke-package-macos-arm64.sig",
-  "boss-spoke-linux-amd64.tar.gz",
-  "boss-spoke-linux-amd64.manifest.json",
-  "boss-spoke-linux-amd64.manifest.json.sig",
-  "boss-spoke-package-linux-amd64",
-  "boss-spoke-package-linux-amd64.sig",
-  "spoke-packages.macos-arm64.json",
-  "spoke-packages.linux-amd64.json",
-  "spoke-packages.json",
-]
-optional_assets = [
-  "boss-spoke-linux-arm64.tar.gz",
-  "boss-spoke-linux-arm64.manifest.json",
-  "boss-spoke-linux-arm64.manifest.json.sig",
-  "boss-spoke-package-linux-arm64",
-  "boss-spoke-package-linux-arm64.sig",
-  "spoke-packages.linux-arm64.json",
-]
-[version]
-scheme = "patch-counter"
-major_minor = "1.0"
-[notes]
-source = "github-generated"
-"#,
+    fn prepare_does_not_resume_a_pinned_draft_at_a_different_sha() {
+        let root = tempdir().expect("repo root");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            success(""),
+            repo_root_response(root.path()),
+            success(r#"[{"tag_name":"demo-v1.0.42","draft":true},{"tag_name":"demo-v1.0.5","draft":false}]"#),
+            success("othersha\trefs/tags/demo-v1.0.42\nsha\trefs/tags/demo-v1.0.5\n"),
+            success("wanted\n"),
+            success("publishedsha\n"),
+            success("othersha\n"),
+            success("othersha\n"),
+        ]);
+        let error = prepare_with_pin(
+            &runner,
+            &config,
+            "ui",
+            Some("job-1"),
+            false,
+            Some("1.0.42"),
+            Some("wanted"),
         )
-        .expect("config");
+        .expect_err("mismatched draft sha");
+        assert!(error.to_string().contains("refusing to resume"), "{error:#}");
+    }
+
+    #[test]
+    fn spoke_catalog_upload_names_are_declared_in_the_release_config() {
+        let script = include_str!(env!("SPOKE_RELEASE_SH"));
+        let config = ReleaseConfig::parse(include_str!(env!("SPOKE_RELEASE_TOML"))).expect("config");
         let names = upload_asset_names_from_script(script);
         assert!(names.contains(&"spoke-packages.json".to_owned()), "{names:?}");
         assert!(
