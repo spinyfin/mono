@@ -162,23 +162,25 @@ pub fn insert_design_postmortem_in_tx(
     let now = now_string();
     let name = format!("Design postmortem: {project_name}");
     let short_id = allocate_short_id(conn, product_id)?;
-    crate::task_status_audit::execute(
+    crate::task_insert::insert_task_row(
         conn,
+        &crate::task_insert::TaskInsert::builder()
+            .id(&id)
+            .product_id(product_id)
+            .project_id(project_id)
+            .kind("design_postmortem")
+            .name(&name)
+            .description(description)
+            .created_at(&now)
+            .created_via(CREATED_VIA_ENGINE_AUTO)
+            .short_id(short_id)
+            .effort_level(EffortLevel::Medium.as_str())
+            .build(),
+        crate::task_status_audit::WriteAttribution {
+            actor: "engine",
+            provenance: None,
+        },
         "insert_design_postmortem_in_tx",
-        "engine",
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, effort_level)
-         VALUES (?1, ?2, ?3, 'design_postmortem', ?6, ?7, 'todo', NULL, NULL, NULL, ?4, ?4, 1, 'medium', ?5, ?8, ?9)",
-        params![
-            id,
-            product_id,
-            project_id,
-            now,
-            CREATED_VIA_ENGINE_AUTO,
-            name,
-            description,
-            short_id,
-            EffortLevel::Medium.as_str()
-        ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design postmortem task after insert: {id}"))
 }

@@ -66,4 +66,22 @@ async fn create_revision_handler_records_the_callers_actor_on_the_insert_row() {
         "insert_revision_in_tx rpc:create_revision peer=socket_client pid=unknown session=session-test request=req-1"
     );
     assert_eq!(actor, boss_protocol::LAST_STATUS_ACTOR_HUMAN);
+    let flags: Vec<(String, Option<String>)> = conn
+        .prepare(
+            "SELECT property, new_value FROM task_status_audit
+             WHERE work_item_id = ?1 AND property IN ('autostart', 'deferred') AND old_value IS NULL
+             ORDER BY property",
+        )
+        .unwrap()
+        .query_map([&revision_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        flags,
+        [
+            ("autostart".into(), Some("1".into())),
+            ("deferred".into(), Some("0".into())),
+        ]
+    );
 }

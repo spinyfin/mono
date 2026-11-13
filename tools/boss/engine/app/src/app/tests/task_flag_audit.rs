@@ -3,15 +3,15 @@
 //! and the calling peer, through the real request handlers.
 
 use super::*;
-use crate::app::{executions, ideas, planner_ops, projects, work_items};
+use crate::app::{attentions, executions, ideas, planner_ops, projects, work_items};
 use boss_engine_runtime::test_support::{
     create_ready_chore_execution, create_test_chore, create_test_chore_manual, create_test_product_named,
     create_test_product_with_repo, finish_run_worker_pane_alive,
 };
 use boss_protocol::{
-    BoardColumn, BoardDropTarget, CreateChoreInput, CreateIdeaInput, CreateProjectInput, CreateTaskInput,
-    FrontendRequest, IdeaGraduationKind, OperatorAnswer, OperatorAnswerType, OperatorQuestion, RequestExecutionInput,
-    TaskFieldAuditRow, TaskKind, WorkItemPatch,
+    BoardColumn, BoardDropTarget, CreateAttentionInput, CreateChoreInput, CreateIdeaInput, CreateInvestigationInput,
+    CreateProjectInput, CreateTaskInput, FrontendRequest, IdeaGraduationKind, OperatorAnswer, OperatorAnswerType,
+    OperatorQuestion, RequestExecutionInput, TaskFieldAuditRow, TaskKind, WorkItemPatch,
 };
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
@@ -846,6 +846,116 @@ async fn graduating_an_idea_to_a_project_records_the_socket_caller() {
             Some("0".into()),
             "human".into(),
             format!("insert_design_task_for_project_in_tx {basis}")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn creating_an_investigation_records_the_socket_caller() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag create investigation");
+    let sink = make_session_sink();
+    work_items::handle_create_investigation(
+        dispatch(&state, &sink, "req-create-investigation"),
+        FrontendRequest::CreateInvestigation {
+            input: CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Look into it")
+                .autostart(false)
+                .build(),
+        },
+    )
+    .await;
+    sink.close();
+    let investigation_id = match sink.next().await.expect("handler must reply").payload {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(task),
+        } => task.id,
+        other => panic!("expected WorkItemCreated investigation, got {other:?}"),
+    };
+    let basis = socket_basis("rpc:create_investigation", "req-create-investigation");
+    assert_eq!(
+        history(&state, &investigation_id, "autostart"),
+        [(
+            None,
+            Some("0".into()),
+            "human".into(),
+            format!("insert_investigation_in_tx_as_actor {basis}")
+        )]
+    );
+    assert_eq!(
+        history(&state, &investigation_id, "deferred"),
+        [(
+            None,
+            Some("0".into()),
+            "human".into(),
+            format!("insert_investigation_in_tx_as_actor {basis}")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn actioning_a_question_group_records_the_socket_caller_on_the_seeded_design() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_named(&state.work_db, "Flag seeded design");
+    let project = state
+        .work_db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Seeded")
+                .goal("Hold a design")
+                .build(),
+        )
+        .unwrap();
+    let (attention, group) = state
+        .work_db
+        .create_attention(
+            CreateAttentionInput::builder()
+                .kind("question")
+                .association_project_id(&project.id)
+                .source_kind("design_doc")
+                .source_doc_path("docs/seeded.md")
+                .question_type("prompt")
+                .prompt_text("keep the table?")
+                .build(),
+        )
+        .unwrap();
+    state
+        .work_db
+        .answer_attention(&attention.id, Some("yes".to_owned()), false, false)
+        .unwrap();
+    let sink = make_session_sink();
+    attentions::handle_action_attention_group(
+        dispatch(&state, &sink, "req-action-questions"),
+        FrontendRequest::ActionAttentionGroup {
+            id: group.id,
+            skip_unanswered: false,
+            member_overrides: Default::default(),
+        },
+    )
+    .await;
+    sink.close();
+    match sink.next().await.expect("handler must reply").payload {
+        FrontendEvent::AttentionGroupActioned { .. } => {}
+        other => panic!("expected AttentionGroupActioned, got {other:?}"),
+    }
+    let seeded_id = state
+        .work_db
+        .list_tasks(&product.id, Some(&project.id), None, false)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.kind == TaskKind::Design && task.created_via == "attention")
+        .expect("seeded design")
+        .id;
+    let basis = socket_basis("rpc:action_attention_group", "req-action-questions");
+    assert_eq!(
+        history(&state, &seeded_id, "autostart"),
+        [(
+            None,
+            Some("1".into()),
+            "human".into(),
+            format!("insert_seeded_design_task_in_tx {basis}")
         )]
     );
 }

@@ -1732,36 +1732,31 @@ pub fn insert_revision_in_tx(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| revision_name_from_description(&description));
-    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
-    crate::task_status_audit::execute(
+    crate::task_insert::insert_task_row(
         conn,
-        &crate::task_status_audit::compose_basis("insert_revision_in_tx", provenance),
-        actor,
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
-         pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
-         effort_level, model_override, reasoning, driver, short_id, parent_task_id, repo_remote_url, effort_matched_rule, effort_reasons) \
-         VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-        params![
-            id,
-            product_id,
-            project_id,
-            name,
-            description,
-            now,
-            autostart_value,
-            priority,
-            created_via,
-            effort_level,
-            model_override,
-            reasoning,
-            driver,
-            short_id,
-            parent_id,
-            repo_remote_url,
-            effort_matched_rule,
-            effort_reasons,
-        ],
+        &crate::task_insert::TaskInsert::builder()
+            .id(&id)
+            .product_id(product_id)
+            .maybe_project_id(project_id)
+            .kind("revision")
+            .name(&name)
+            .description(description)
+            .created_at(&now)
+            .autostart(input.autostart)
+            .priority(&priority)
+            .created_via(&created_via)
+            .maybe_effort_level(effort_level)
+            .maybe_model_override(model_override)
+            .maybe_reasoning(reasoning)
+            .maybe_driver(driver)
+            .short_id(short_id)
+            .parent_task_id(parent_id)
+            .maybe_repo_remote_url(repo_remote_url)
+            .maybe_effort_matched_rule(effort_matched_rule)
+            .maybe_effort_reasons(effort_reasons)
+            .build(),
+        crate::task_status_audit::WriteAttribution { actor, provenance },
+        "insert_revision_in_tx",
     )?;
     // `query_task` reads the trailing `parent_task_id` column (via
     // `map_task_with_parent`), so the returned revision row already carries
@@ -1805,27 +1800,26 @@ pub fn insert_design_task_for_project_in_tx(
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
-    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let name = format!("Design {}", input.name);
     let short_id = allocate_short_id(conn, &input.product_id)?;
-    crate::task_status_audit::execute(
+    crate::task_insert::insert_task_row(
         conn,
-        &crate::task_status_audit::compose_basis("insert_design_task_for_project_in_tx", provenance),
-        actor,
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, design_reasoning_effort_xhigh)
-         VALUES (?1, ?2, ?3, 'design', ?7, ?10, 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8, ?9)",
-        params![
-            id,
-            input.product_id,
-            project_id,
-            now,
-            autostart_value,
-            CREATED_VIA_ENGINE_AUTO,
-            name,
-            short_id,
-            input.design_reasoning_effort_xhigh as i64,
-            description,
-        ],
+        &crate::task_insert::TaskInsert::builder()
+            .id(&id)
+            .product_id(&input.product_id)
+            .project_id(project_id)
+            .kind("design")
+            .name(&name)
+            .description(description)
+            .ordinal(0)
+            .created_at(&now)
+            .autostart(input.autostart)
+            .design_reasoning_effort_xhigh(input.design_reasoning_effort_xhigh)
+            .created_via(CREATED_VIA_ENGINE_AUTO)
+            .short_id(short_id)
+            .build(),
+        crate::task_status_audit::WriteAttribution { actor, provenance },
+        "insert_design_task_for_project_in_tx",
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))
 }
