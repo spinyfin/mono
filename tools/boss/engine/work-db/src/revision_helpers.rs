@@ -1732,7 +1732,6 @@ pub fn insert_revision_in_tx(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| revision_name_from_description(&description));
-    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     crate::task_insert::insert_task_row(
         conn,
         &crate::task_insert::TaskInsert::builder()
@@ -1743,7 +1742,7 @@ pub fn insert_revision_in_tx(
             .name(&name)
             .description(description)
             .created_at(&now)
-            .autostart(autostart_value != 0)
+            .autostart(input.autostart)
             .priority(&priority)
             .created_via(&created_via)
             .maybe_effort_level(effort_level)
@@ -1801,7 +1800,6 @@ pub fn insert_design_task_for_project_in_tx(
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
-    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let name = format!("Design {}", input.name);
     let short_id = allocate_short_id(conn, &input.product_id)?;
     crate::task_insert::insert_task_row(
@@ -1815,7 +1813,7 @@ pub fn insert_design_task_for_project_in_tx(
             .description(description)
             .ordinal(0)
             .created_at(&now)
-            .autostart(autostart_value != 0)
+            .autostart(input.autostart)
             .design_reasoning_effort_xhigh(input.design_reasoning_effort_xhigh)
             .created_via(CREATED_VIA_ENGINE_AUTO)
             .short_id(short_id)
