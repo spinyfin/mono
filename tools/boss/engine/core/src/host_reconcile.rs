@@ -45,9 +45,10 @@
 //! boot-time pass) still finds and drains the offline-host binding.
 //!
 //! **Spoke hosts.** The disable drain above is the legacy-transport contract.
-//! A host on a spoke transport is drained only when removed: disabling it
+//! A host on the ready spoke transport is drained only when removed: disabling it
 //! stops dispatch, and losing contact with it never abandons a worker that may
-//! still be running. Each pass instead calls
+//! still be running. A `spoke_pending` host still launches over SSH and is
+//! treated like a legacy host. Each pass instead calls
 //! [`WorkDb::reconcile_unreachable_hosts`], which raises one deduplicated
 //! `host_unreachable` attention item per unresolved run after six hours
 //! without a fresh challenge reply and clears it when the host answers.
@@ -175,8 +176,10 @@ async fn one_pass(
 /// Run a single host-reconcile pass: drain every non-terminal execution
 /// bound to an offline host. Returns a summary; callers may log it.
 ///
-/// A host on a spoke transport is offline only when removed; the pass also
-/// reconciles `host_unreachable` attention for silent spoke hosts.
+/// A host on the ready spoke transport is offline only when removed; the pass
+/// also reconciles `host_unreachable` attention for silent ready spoke hosts.
+/// A `spoke_pending` host still launches over SSH and is treated like a legacy
+/// host.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,

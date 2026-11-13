@@ -2,7 +2,6 @@
 #[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::{Result, ensure};
-use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
 
 pub const WORKER_CPU_MILLIS: u64 = 1_000;
 pub const WORKER_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
@@ -27,34 +26,24 @@ impl Resources {
     }
 }
 
-/// Sample the filesystem that holds work and OS memory. CPU is a configured
-/// share of logical processors; running workers consume one share each.
-pub fn sample(root: &Path, active: u64) -> Result<Resources> {
-    let path = CString::new(root.as_os_str().as_bytes())?;
-    let mut disk = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: path is NUL terminated and disk has the exact output layout.
-    ensure!(
-        unsafe { libc::statvfs(path.as_ptr(), disk.as_mut_ptr()) } == 0,
-        "disk observation failed"
-    );
-    // SAFETY: a successful statvfs initialized the entire output.
-    let disk = unsafe { disk.assume_init() };
-    let cpus = std::thread::available_parallelism()?.get() as u64;
-    Ok(Resources {
-        cpu_millis: cpus.saturating_sub(active) * WORKER_CPU_MILLIS,
-        memory_bytes: available_memory()?,
-        disk_bytes: wide(disk.f_bavail).saturating_mul(wide(disk.f_frsize)),
-    })
+/// Conservative remaining budget from already-sampled observations. CPU is a
+/// configured share of logical processors; running workers consume one share
+/// each. Disk is measured by the caller (the spoke uses `fs4::available_space`).
+pub fn observe(cpu_count: u64, memory_bytes: u64, disk_bytes: u64, active: u64) -> Resources {
+    Resources {
+        cpu_millis: cpu_count.saturating_sub(active) * WORKER_CPU_MILLIS,
+        memory_bytes,
+        disk_bytes,
+    }
 }
 
-/// The statvfs field widths differ by platform, so widen without a cast that
-/// is redundant on some of them.
-fn wide(value: impl Into<u64>) -> u64 {
-    value.into()
+/// Reclaimable memory the host can still promise a new worker.
+pub fn available_memory() -> Result<u64> {
+    memory()
 }
 
 #[cfg(target_os = "linux")]
-fn available_memory() -> Result<u64> {
+fn memory() -> Result<u64> {
     let memory = std::fs::read_to_string("/proc/meminfo")?;
     let available = memory
         .lines()
@@ -74,7 +63,7 @@ fn available_memory() -> Result<u64> {
 /// and speculative pages, purgeable pages and clean file-backed cache. Compressed
 /// and wired pages are never promised to a new worker.
 #[cfg(target_os = "macos")]
-fn available_memory() -> Result<u64> {
+fn memory() -> Result<u64> {
     fn pages(name: &std::ffi::CStr) -> Result<u64> {
         // The kernel exports some page counters as 32-bit and others as 64-bit
         // integers; a short buffer fails with ENOMEM. macOS is little-endian,
@@ -147,12 +136,13 @@ mod tests {
     }
 
     #[test]
-    fn samples_the_work_filesystem_and_host() {
-        let root = tempfile::tempdir().unwrap();
-        let resources = sample(root.path(), 0).unwrap();
-        assert!(resources.cpu_millis > 0);
-        assert!(resources.memory_bytes > 0);
-        assert!(resources.disk_bytes > 0);
-        assert_eq!(sample(root.path(), u64::MAX).unwrap().cpu_millis, 0);
+    fn observe_subtracts_active_cpu_shares() {
+        let resources = observe(4, 8 * WORKER_MEMORY_BYTES, DISK_FLOOR_BYTES + 8 * WORKER_DISK_BYTES, 1);
+        assert_eq!(resources.cpu_millis, 3 * WORKER_CPU_MILLIS);
+        assert_eq!(
+            observe(4, 8 * WORKER_MEMORY_BYTES, DISK_FLOOR_BYTES, u64::MAX).cpu_millis,
+            0
+        );
+        assert!(available_memory().unwrap() > 0);
     }
 }

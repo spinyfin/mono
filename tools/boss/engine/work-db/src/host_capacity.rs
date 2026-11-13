@@ -149,6 +149,7 @@ impl WorkDb {
         tx.execute(
             "INSERT OR IGNORE INTO host_capacity(host_id, connection_generation, hub_boot, backlog, unreachable_since_ms)
              SELECT DISTINCT a.host_id, 0, '', 0, ?1 FROM spoke_assignments a
+             JOIN hosts h ON h.id = a.host_id
              WHERE a.resolved_at_ms IS NULL",
             params![now],
         )?;
@@ -160,6 +161,7 @@ impl WorkDb {
         let runs: Vec<(String, String)> = {
             let mut statement = tx.prepare(
                 "SELECT a.execution_id, a.host_id FROM spoke_assignments a
+                 JOIN hosts h ON h.id = a.host_id
                  JOIN host_capacity c ON c.host_id = a.host_id
                  JOIN work_executions e ON e.id = a.execution_id
                  WHERE a.resolved_at_ms IS NULL AND c.unreachable_since_ms <= ?1
@@ -231,9 +233,10 @@ pub(crate) fn require_budget(conn: &Connection, host: &str) -> Result<()> {
     Ok(())
 }
 
-/// Seats a spoke-transport host can take now. A host on the legacy transport
-/// has no reports to age, so it has no budget here: its seats are still the
-/// configured pool minus its active runs, counted by the caller.
+/// Seats a ready spoke host can take now. A host on the legacy SSH transport,
+/// or a `spoke_pending` host that still launches over SSH, has no reports to
+/// age, so it has no budget here: its seats are still the configured pool
+/// minus its active runs, counted by the caller.
 fn available(conn: &Connection, host: &str, now: i64) -> Result<u64> {
     let config: Option<(bool, i64)> = conn
         .query_row("SELECT enabled, pool_size FROM hosts WHERE id = ?1", [host], |r| {
@@ -511,5 +514,44 @@ mod tests {
         }
         let error = db.admit_spoke_assignment("e4", "host").unwrap_err();
         assert!(error.downcast_ref::<HostBudgetExhausted>().is_some(), "{error:#}");
+    }
+
+    #[test]
+    fn a_removed_host_is_not_seeded_or_raised() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        db.add_host("seeded", "", 4, &[]).unwrap();
+        db.reserve_spoke_assignment("seeded-run", "seeded").unwrap();
+        db.remove_host("seeded").unwrap();
+        db.add_host("raised", "", 4, &[]).unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+                 VALUES ('orphan', 'item', 'task_implementation', 'running', 'https://example.test/r', '1')",
+                [],
+            )
+            .unwrap();
+        db.reserve_spoke_assignment("orphan", "raised").unwrap();
+        let now = now_ms();
+        db.open_host_capacity("raised", 0, 0, now - HOST_UNREACHABLE_ATTENTION_MS - 1)
+            .unwrap();
+        db.remove_host("raised").unwrap();
+        db.reconcile_unreachable_hosts(now).unwrap();
+        db.reconcile_unreachable_hosts(now + HOST_UNREACHABLE_ATTENTION_MS + 1)
+            .unwrap();
+        let seeded: i64 = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM host_capacity WHERE host_id = 'seeded'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(seeded, 0, "a removed host must not be inserted into host_capacity");
+        assert!(
+            db.list_open_attention_items_of_kind("host_unreachable")
+                .unwrap()
+                .is_empty(),
+            "a removed host must not raise host_unreachable"
+        );
     }
 }

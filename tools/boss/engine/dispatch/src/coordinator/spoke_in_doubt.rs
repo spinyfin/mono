@@ -4,6 +4,37 @@
 use super::*;
 use boss_execution_contracts::WorkerLife;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(super) struct HostSelectionFailure {
+    pub report: Vec<Eligibility>,
+    pub message: String,
+}
+
+impl HostSelectionFailure {
+    /// At least one host could run this work except that it has no free seats
+    /// or fresh budget. Capability, enablement and pin mismatches are not
+    /// budget deferrals.
+    pub(super) fn is_budget_only(&self) -> bool {
+        self.report.iter().any(|row| {
+            !row.reasons.is_empty()
+                && row
+                    .reasons
+                    .iter()
+                    .all(|reason| matches!(reason, IneligibilityReason::NoFreeSlots))
+        })
+    }
+}
+
+/// Claimed dispatch that must be retried without a pre-start failure. Kept in
+/// the error chain so [`super::ExecutionCoordinator::recover_failed_dispatch`]
+/// can ignore a drain that re-claims the row first.
+#[derive(Debug, thiserror::Error)]
+#[error("dispatch deferred: {reason}")]
+pub(super) struct DispatchDeferred {
+    pub reason: &'static str,
+}
+
 impl ExecutionCoordinator {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn note_spoke_pass_start(&self, execution_id: &str) {
@@ -21,6 +52,36 @@ impl ExecutionCoordinator {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         *map.entry(execution_id.to_owned()).or_insert(0) += 1;
+    }
+
+    /// Return the claimed row to `ready` without a pre-start failure or
+    /// requested-host cancel. Emits a terminal `host_selected` event so the
+    /// stall watchdog does not treat `worker_claimed/ok` as stalled.
+    pub(super) async fn defer_claimed_dispatch(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        err: anyhow::Error,
+        details: serde_json::Value,
+    ) -> anyhow::Error {
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_error(&err)
+                    .with_details(details),
+            )
+            .await;
+        if let Err(release_err) = self.work_db.release_dispatch_claim(&execution.id) {
+            tracing::error!(
+                execution_id = %execution.id,
+                ?release_err,
+                "failed to release dispatch claim after budget deferral"
+            );
+        }
+        self.repo_lease_limiter.release(&execution.id);
+        err
     }
 
     /// Park an attempt whose spoke lease the host has not answered: back to

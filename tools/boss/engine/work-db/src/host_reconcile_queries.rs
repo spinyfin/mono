@@ -27,10 +27,11 @@ impl WorkDb {
     /// host row being absent (`remove_host`) or present with
     /// `enabled = 0` (`set_host_enabled(false)` / auto-disable).
     ///
-    /// A host on a spoke transport is offline only when removed. Disabling it
-    /// stops dispatch, and silence from it is surfaced as attention
+    /// A host on the ready spoke transport is offline only when removed.
+    /// Disabling it stops dispatch, and silence from it is surfaced as attention
     /// (`reconcile_unreachable_hosts`); neither is evidence that its worker is
-    /// gone, so neither abandons the run.
+    /// gone, so neither abandons the run. A `spoke_pending` host still launches
+    /// over SSH and is treated like a legacy host: disabling it is offline.
     pub fn list_nonterminal_executions_on_offline_hosts(&self) -> Result<Vec<HostBoundExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -77,9 +78,10 @@ impl WorkDb {
     /// rather than emitting `outcome=error` events forever (the second
     /// half of the 2026-07-03 anaplian incident). Returns `false` when
     /// the run is `local` or its host is still enabled, and when the
-    /// execution has no run yet (nothing is bound). A host on a spoke
+    /// execution has no run yet (nothing is bound). A host on the ready spoke
     /// transport counts only when removed: disabled or silent, its worker may
-    /// still be running.
+    /// still be running. A `spoke_pending` host still launches over SSH and is
+    /// treated like a legacy host.
     pub fn execution_bound_host_offline(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let offline: Option<i64> = conn

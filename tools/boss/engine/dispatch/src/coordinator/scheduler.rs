@@ -2863,9 +2863,13 @@ impl ExecutionCoordinator {
                 .release_lease_after_proven_never_started(&current, &lease_id, self.host_adapter().as_ref())
                 .await;
         }
-        // Parked attempts were already returned to ready without spending the
-        // retry budget; do not record a pre-start failure or unclaim them again.
-        if err.is::<super::spoke_in_doubt::SpokeAttemptParked>() {
+        // Parked attempts and budget deferrals were already returned to ready
+        // without spending the retry budget; do not record a pre-start failure
+        // or unclaim them again.
+        if err.is::<super::spoke_in_doubt::SpokeAttemptParked>()
+            || err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_some()
+            || err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some()
+        {
             return;
         }
         if current.status != ExecutionStatus::Claimed {
