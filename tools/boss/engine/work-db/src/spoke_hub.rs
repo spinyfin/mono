@@ -180,6 +180,9 @@ pub enum RunAdmission {
     Start,
     /// Recovery operations stay addressable after the assignment resolves.
     Recovery,
+    /// A data-free rejection may answer a historical assignment on its owning
+    /// host. The wire outbox selects this only for rejected worker replies.
+    Rejection,
 }
 
 impl HostTransport {
@@ -1131,14 +1134,17 @@ impl WorkDb {
             // superseded attempt's key is stale, whatever else it still matches.
             // Start-class commands also require the assignment still be open, so
             // a fenced or released newest generation cannot spawn or lease.
-            // Recovery keeps a resolved newest generation addressable.
+            // Recovery keeps a resolved newest generation addressable. A
+            // rejection only answers a request; it may address an older owned
+            // assignment without granting it any authority to perform work.
             let start = matches!(admission, RunAdmission::Start);
+            let rejection = matches!(admission, RunAdmission::Rejection);
             let owned: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM spoke_assignments
                   WHERE execution_id = ?1 AND assignment_generation = ?2 AND run_id = ?3
                     AND spawn_token = ?4 AND host_id = ?5
-                    AND assignment_generation = (SELECT MAX(assignment_generation) FROM spoke_assignments
-                                                  WHERE execution_id = ?1)
+                    AND (?7 = 1 OR assignment_generation = (SELECT MAX(assignment_generation) FROM spoke_assignments
+                                                  WHERE execution_id = ?1))
                     AND (?6 = 0 OR resolved_at_ms IS NULL))",
                 params![
                     run.execution_id,
@@ -1146,7 +1152,8 @@ impl WorkDb {
                     run.run_id,
                     run.spawn_token,
                     host_id,
-                    start as i64
+                    start as i64,
+                    rejection as i64
                 ],
                 |row| row.get(0),
             )?;
@@ -2217,6 +2224,35 @@ mod tests {
         // Once a newer attempt exists the old key is stale, even on its own host.
         let refused = append(&db, "host-a", "c3", Some(&stale), b"late").unwrap_err();
         assert_eq!(fault_of(&refused), Some(HostOutboxFault::Denied));
+        append_with(
+            &db,
+            "host-a",
+            "denied",
+            Some(&stale),
+            RunAdmission::Rejection,
+            b"refused",
+        )
+        .unwrap();
+        let cross_host = append_with(
+            &db,
+            "host-b",
+            "forged",
+            Some(&stale),
+            RunAdmission::Rejection,
+            b"refused",
+        )
+        .unwrap_err();
+        assert_eq!(fault_of(&cross_host), Some(HostOutboxFault::Denied));
+        let recovery = append_with(
+            &db,
+            "host-a",
+            "stale-recovery",
+            Some(&stale),
+            RunAdmission::Recovery,
+            b"restore",
+        )
+        .unwrap_err();
+        assert_eq!(fault_of(&recovery), Some(HostOutboxFault::Denied));
         append(&db, "host-b", "c4", Some(&key(&second)), b"go").unwrap();
     }
 

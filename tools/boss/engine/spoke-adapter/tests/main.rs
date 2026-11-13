@@ -156,7 +156,7 @@ async fn a_command_naming_a_run_the_hub_does_not_hold_is_never_stored_or_sent() 
             Duration::from_secs(2),
         )
         .await;
-    assert_eq!(outcome, Err(boss_spoke_stream::CommandOutcome::NotSubmitted));
+    assert_eq!(outcome, Err(boss_spoke_stream::CommandOutcome::Denied));
     assert!(fx.db.host_command_wire(HOST, "forged").unwrap().is_none());
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(peer.commands().is_empty());

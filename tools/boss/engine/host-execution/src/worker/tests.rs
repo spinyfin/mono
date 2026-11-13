@@ -6,7 +6,7 @@ use boss_tmux::{CommandOutput, CommandRunner};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::{Arc, Mutex};
 
 type StoredExecutions = HashMap<(String, String), Vec<u8>>;
@@ -323,6 +323,13 @@ fn shared_homes() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
         let root = homes::process_root();
+        // Ensure the leaf exists before tightening it. Otherwise a sibling
+        // create_dir_all can create a 0755 root between tightening and pin.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         tighten_owner_only(&root);
         homes::pin(&root).unwrap()
     })
@@ -1593,7 +1600,11 @@ async fn unknown_output_kind_is_rejected_before_launch_intent() {
     spawn.structured_output_kind = Some("future-unknown-output".into());
     let result = supervisor.execute(&command, false, 1).await;
     assert_eq!(result.code, ResultCode::Rejected as i32, "{}", result.reason);
-    assert!(result.reason.contains("unknown structured output kind"));
+    assert!(
+        result.reason.contains("unknown structured output kind"),
+        "{}",
+        result.reason
+    );
     assert!(fake.launches.lock().unwrap().is_empty());
     assert!(supervisor.store.load("run-test", "token").unwrap().is_none());
 }

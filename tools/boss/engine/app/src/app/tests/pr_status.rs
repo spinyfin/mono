@@ -260,6 +260,15 @@ impl MergeProbe for ErrProbe {
     }
 }
 
+struct HangProbe;
+
+#[async_trait]
+impl MergeProbe for HangProbe {
+    async fn probe(&self, _url: &str) -> anyhow::Result<PrLifecycleProbe> {
+        std::future::pending().await
+    }
+}
+
 #[tokio::test]
 async fn status_without_refresh_reads_stored_snapshot_only() {
     let fx = PrFixture::new();
@@ -430,6 +439,32 @@ async fn status_refresh_probe_failure_falls_back_to_stored_snapshot() {
     assert_eq!(status.mergeable.as_deref(), Some("mergeable"));
     assert_eq!(status.head_sha.as_deref(), Some("stable-sha"));
     assert_eq!(status.observed_at.as_deref(), Some("1000000000"));
+}
+
+#[tokio::test]
+async fn a_hung_refresh_probe_falls_back_to_the_stored_snapshot() {
+    let fx = PrFixture::new_with_probe(Some(Arc::new(HangProbe)));
+    fx.seed_snapshot("mergeable", "CLEAN", "stable-sha", "1000000000");
+    let caller = crate::app::proposals::AttributedCaller {
+        execution_id: fx.execution_id.clone(),
+        work_item_id: fx.task_id.clone(),
+    };
+    let event = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pr_status::status_for_caller_timed(
+            &fx.server_state,
+            &fx.server_state.work_db,
+            &caller,
+            true,
+            Some(std::time::Duration::from_millis(50)),
+        ),
+    )
+    .await
+    .expect("the hub probe bound must return the stored snapshot");
+    let status = status_view(event);
+    assert!(!status.refreshed);
+    assert!(!status.refresh_throttled);
+    assert_eq!(status.head_sha.as_deref(), Some("stable-sha"));
 }
 
 #[tokio::test]

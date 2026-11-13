@@ -57,16 +57,55 @@ pub(super) async fn handle_get_worker_context(ctx: Dispatch, req: FrontendReques
         Err(err) => {
             tracing::error!(
                 work_item_id = %caller.work_item_id,
-                ?err,
+                %err,
                 "get_worker_context failed to read",
             );
-            send_rejection(
-                &sink,
-                &request_id,
-                ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("failed to build context: {err}")),
-            );
+            send_rejection(&sink, &request_id, err.as_proposal_error("failed to build context"));
         }
     }
+}
+
+/// A worker-attributed read failed. Transient storage errors retry; missing
+/// or inconsistent rows are a durable denial — a read has no side effect to
+/// preserve, so answering with a data-free rejection is always safe.
+#[derive(Debug)]
+pub(super) enum AttributedReadError {
+    Denied(String),
+    Transient(anyhow::Error),
+}
+
+impl AttributedReadError {
+    pub(super) fn from_storage(err: anyhow::Error) -> Self {
+        if err.chain().any(|cause| cause.is::<rusqlite::Error>()) {
+            Self::Transient(err)
+        } else {
+            Self::Denied(err.to_string())
+        }
+    }
+
+    pub(super) fn as_proposal_error(&self, prefix: &str) -> ProposalSubmissionError {
+        match self {
+            Self::Denied(message) => {
+                ProposalSubmissionError::new(ProposalErrorCode::NotAccepted, format!("{prefix}: {message}"))
+            }
+            Self::Transient(err) => {
+                ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("{prefix}: {err}"))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AttributedReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied(message) => f.write_str(message),
+            Self::Transient(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+fn storage<T>(result: Result<T>) -> std::result::Result<T, AttributedReadError> {
+    result.map_err(AttributedReadError::from_storage)
 }
 
 /// The caller's own task/chore row. Both `WorkItem::Task` and
@@ -76,12 +115,13 @@ pub(super) async fn handle_get_worker_context(ctx: Dispatch, req: FrontendReques
 ///
 /// `pub(super)`: reused by `app::pr_status`, which is attributed and scoped
 /// identically (own task lookup off the caller's attributed work item).
-pub(super) fn own_task(work_db: &WorkDb, work_item_id: &str) -> Result<Task> {
-    match work_db.get_work_item(work_item_id)? {
-        WorkItem::Task(task) | WorkItem::Chore(task) => Ok(task),
-        item @ (WorkItem::Product(_) | WorkItem::Project(_)) => {
-            bail!("execution's work item {work_item_id} resolved to a non-task work item: {item:?}")
-        }
+pub(super) fn own_task(work_db: &WorkDb, work_item_id: &str) -> std::result::Result<Task, AttributedReadError> {
+    match work_db.get_work_item(work_item_id) {
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => Ok(task),
+        Ok(_) => Err(AttributedReadError::Denied(format!(
+            "execution's work item {work_item_id} is not a task"
+        ))),
+        Err(err) => Err(AttributedReadError::from_storage(err)),
     }
 }
 
@@ -92,39 +132,49 @@ fn dependencies_for(work_db: &WorkDb, work_item_id: &str) -> Result<WorkItemDepe
     })
 }
 
-fn build_bundle(work_db: &WorkDb, work_item_id: &str) -> Result<WorkerContextBundle> {
+pub(super) fn build_bundle(
+    work_db: &WorkDb,
+    work_item_id: &str,
+) -> std::result::Result<WorkerContextBundle, AttributedReadError> {
     let task = own_task(work_db, work_item_id)?;
-    let product = work_db
-        .get_product(&task.product_id)?
-        .with_context(|| format!("unknown product: {}", task.product_id))?;
-    let project = task
-        .project_id
-        .as_deref()
-        .map(|id| work_db.get_project(id))
-        .transpose()?;
+    let product = match work_db.get_product(&task.product_id) {
+        Ok(Some(product)) => product,
+        Ok(None) => {
+            return Err(AttributedReadError::Denied(format!(
+                "unknown product: {}",
+                task.product_id
+            )));
+        }
+        Err(err) => return Err(AttributedReadError::from_storage(err)),
+    };
+    let project = match task.project_id.as_deref() {
+        Some(id) => Some(storage(work_db.get_project(id))?),
+        None => None,
+    };
 
     let sibling_tasks = match &project {
         Some(project) => work_db
-            .list_tasks(&task.product_id, Some(&project.id), None, false)?
+            .list_tasks(&task.product_id, Some(&project.id), None, false)
+            .map_err(AttributedReadError::from_storage)?
             .into_iter()
             .filter(|sibling| sibling.id != task.id)
             .map(|sibling| {
-                let dependencies = dependencies_for(work_db, &sibling.id)?;
+                let dependencies = storage(dependencies_for(work_db, &sibling.id))?;
                 Ok(WorkerContextSiblingTask {
                     task: sibling,
                     dependencies,
                 })
             })
-            .collect::<Result<Vec<_>>>()?,
+            .collect::<std::result::Result<Vec<_>, AttributedReadError>>()?,
         None => Vec::new(),
     };
 
-    let own_dependencies = dependencies_for(work_db, &task.id)?;
+    let own_dependencies = storage(dependencies_for(work_db, &task.id))?;
 
     let attention_groups: Vec<AttentionGroup> =
-        work_db.list_attention_groups(&task.product_id, None, Some(&task.id), None, None)?;
+        storage(work_db.list_attention_groups(&task.product_id, None, Some(&task.id), None, None))?;
 
-    let proposals = work_db.list_worker_proposals_for_work_item(work_item_id, None, None)?;
+    let proposals = storage(work_db.list_worker_proposals_for_work_item(work_item_id, None, None))?;
 
     Ok(WorkerContextBundle {
         task,

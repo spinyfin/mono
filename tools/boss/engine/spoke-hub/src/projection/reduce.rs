@@ -78,6 +78,13 @@ pub struct ProposalObservation {
     pub request: ProposalRequest,
 }
 
+/// An online read, bound to the assignment authenticated at ingress.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerObservation {
+    pub origin: Origin,
+    pub request: v1::WorkerRequest,
+}
+
 /// A pane the host looked at, from a `PaneState` record or an inventory page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaneObservation {
@@ -124,6 +131,7 @@ pub enum Observation {
     Event(EventObservation),
     Proposal(ProposalObservation),
     Pane(PaneObservation),
+    Worker(WorkerObservation),
 }
 
 impl Observation {
@@ -132,6 +140,7 @@ impl Observation {
             Self::Event(observation) => &observation.origin,
             Self::Proposal(observation) => &observation.origin,
             Self::Pane(observation) => &observation.origin,
+            Self::Worker(observation) => &observation.origin,
         }
     }
 }
@@ -248,7 +257,15 @@ pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reducti
         record::Body::Transcript(_) => Reduction::Skip(Skip::OtherConsumer("transcript")),
         record::Body::Artifact(_) => Reduction::Skip(Skip::OtherConsumer("artifact")),
         record::Body::Gap(_) => Reduction::Skip(Skip::OtherConsumer("gap")),
-        record::Body::Request(_) => Reduction::Skip(Skip::OtherConsumer("worker-request")),
+        record::Body::Request(request) => {
+            let Some(run) = run else {
+                return Reduction::Quarantine("worker request has no run".into());
+            };
+            Reduction::Observations(vec![Observation::Worker(WorkerObservation {
+                origin: origin(run),
+                request,
+            })])
+        }
     }
 }
 

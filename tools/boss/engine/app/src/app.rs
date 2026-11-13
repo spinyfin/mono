@@ -138,6 +138,7 @@ mod spoke_installation;
 mod spoke_probe_tests;
 mod spoke_probes;
 mod spoke_projection;
+mod spoke_requests;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
@@ -2162,11 +2163,7 @@ impl ServerState {
         timeline.finish();
 
         if let Some(stream) = hub_stream {
-            pane_viewers::bridge_hub_stream(&server_state, &stream);
-            // Apply what the spokes' durable journals received. Receipt does not
-            // wait for this, and a restart resumes from the application cursor.
             spoke_projection::start(&server_state, &stream);
-            server_state.set_hub_stream(Some(stream));
         }
         Ok(server_state)
     }

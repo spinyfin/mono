@@ -42,7 +42,11 @@
 //! database is busy) holds that host's cursor and is retried with backoff; it
 //! is never skipped. Work that waits on something other than the database, such
 //! as the spoke being reachable to receive a decision, is a durable *effect*
-//! that does not hold the cursor.
+//! that does not hold the cursor. A bounded `pr status --refresh` GitHub probe
+//! is the exception that still runs under the cursor: it falls back to the
+//! stored snapshot if it exceeds one second, matching the two-second gateway
+//! wait. Permanent read failures (a deleted task, an unknown product) are
+//! denied rather than retried so they cannot hold the cursor either.
 //!
 //! # What this does not decide
 //!
@@ -51,6 +55,8 @@
 //! already reflects such evidence; the hub's existing policy decides the rest.
 
 pub mod reduce;
+mod worker;
+pub use worker::{WORKER_REPLY, WorkerRead, WorkerResponse};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -64,7 +70,7 @@ use boss_backoff::exponential_delay;
 use boss_protocol::ProposalKind;
 use boss_protocol_spoke::{
     limits::MAX_PAYLOAD_BYTES,
-    v1::{Command, CommandResult, ProposalDecision, ResultCode, command},
+    v1::{Command, CommandResult, ProposalDecision, ResultCode, Stamp, WorkerReply, command},
 };
 pub use boss_spoke_stream::CommandOutcome;
 use boss_spoke_stream::{StreamManager, store::CommandAdmission};
@@ -79,7 +85,8 @@ use tokio::sync::Notify;
 use tokio::task::{Id, JoinSet};
 
 pub use reduce::{
-    EventObservation, Life, Observation, Origin, PaneObservation, ProposalObservation, ProposalRequest, Reduction, Skip,
+    EventObservation, Life, Observation, Origin, PaneObservation, ProposalObservation, ProposalRequest, Reduction,
+    Skip, WorkerObservation,
 };
 
 /// Effect kind: the decision for a queued proposal, owed to the spoke.
@@ -159,6 +166,13 @@ pub enum Proposed {
 /// attempt superseded.
 #[async_trait]
 pub trait ObservationApplier: Send + Sync {
+    /// Serve only the gateway's online reads. The projector checks assignment
+    /// ownership; the applier rechecks host authorization before reading data.
+    async fn worker_request(&self, observation: &WorkerObservation, method: WorkerRead) -> WorkerResponse {
+        let _ = (observation, method);
+        WorkerResponse::Denied("worker reads are not supported by this hub".into())
+    }
+
     /// Fan one hook event out to live state, completion, probes and the other
     /// worker-progress consumers, as a hook arriving on the local events socket
     /// would be.
@@ -674,6 +688,7 @@ impl Inner {
     async fn apply_observation(&self, observation: Observation, owed: &mut Vec<Owed>) -> Result<(), Interrupted> {
         let currentness = self.currentness(observation.origin()).await?;
         match (observation, currentness) {
+            (Observation::Worker(request), currentness) => self.apply_worker(request, currentness, owed).await,
             (Observation::Proposal(proposal), currentness) => self.apply_proposal(proposal, currentness, owed).await,
             (observation, Currentness::Superseded(why)) => {
                 tracing::debug!(
@@ -865,7 +880,7 @@ impl Inner {
 
     async fn deliver(&self, effect: &SpokeEffect) -> SpokeEffectOutcome {
         match effect.kind.as_str() {
-            PROPOSAL_DECISION => self.deliver_decision(effect).await,
+            PROPOSAL_DECISION | WORKER_REPLY => self.deliver_decision(effect).await,
             other => SpokeEffectOutcome::Failed(format!("no delivery for effect kind `{other}`")),
         }
     }
@@ -874,6 +889,12 @@ impl Inner {
     /// id byte for byte, as the outbox requires; after the spoke refuses a
     /// command the decision goes out under a fresh id, since the spoke applies a
     /// decision by compare-and-swap and the same bytes are always safe to repeat.
+    ///
+    /// A successful worker reply that has not been admitted yet cannot cross a
+    /// replaced assignment's command fence. Convert it to a data-free rejection
+    /// (the only reply the outbox will admit for an older owned assignment) so
+    /// the worker gets an explicit denial and later effects for this host are
+    /// not held behind a retry that can never succeed.
     async fn deliver_decision(&self, effect: &SpokeEffect) -> SpokeEffectOutcome {
         let mut command = match Command::decode(effect.payload.as_slice()) {
             Ok(command) => command,
@@ -887,6 +908,7 @@ impl Inner {
             Ok(stored) => stored,
             Err(Interrupted::Retry(reason) | Interrupted::Halt(reason)) => return SpokeEffectOutcome::Retry(reason),
         };
+        let queued = stored.is_some();
         match stored {
             Some(wire) => match Command::decode(wire.as_slice()) {
                 Ok(mut original) => {
@@ -897,26 +919,127 @@ impl Inner {
             },
             None => command.not_after_unix_ms = unix_ms(SystemTime::now() + self.config.decision_ttl),
         }
+        if !queued {
+            command = self.fence_unqueued_worker_reply(effect, command).await;
+            if let Some(outcome) = self.persist_fenced_reply(effect, &command).await {
+                return outcome;
+            }
+        }
+        match self.send_effect(effect, command.clone()).await {
+            SendOnce::Outcome(outcome) => outcome,
+            SendOnce::AuthorizationDenied if !queued => {
+                match assignment_fenced_reply(command, "the assignment was replaced before the reply was admitted") {
+                    Some(rewritten) => {
+                        if let Some(outcome) = self.persist_fenced_reply(effect, &rewritten).await {
+                            return outcome;
+                        }
+                        match self.send_effect(effect, rewritten).await {
+                            SendOnce::Outcome(outcome) => outcome,
+                            SendOnce::AuthorizationDenied => {
+                                SpokeEffectOutcome::Failed("the outbox refused even a data-free rejection".into())
+                            }
+                        }
+                    }
+                    None => SpokeEffectOutcome::Failed("the outbox refused authorization for this command".into()),
+                }
+            }
+            SendOnce::AuthorizationDenied => {
+                SpokeEffectOutcome::Failed("the outbox refused authorization for this command".into())
+            }
+        }
+    }
+
+    /// Keep the stored effect in lock-step with a data-free rejection so a
+    /// retry after a crash sends the same command the outbox already admitted.
+    async fn persist_fenced_reply(&self, effect: &SpokeEffect, command: &Command) -> Option<SpokeEffectOutcome> {
+        let Some(command::Body::WorkerReply(reply)) = &command.body else {
+            return None;
+        };
+        if reply.code != ResultCode::Rejected as i32 || !reply.result_json.is_empty() {
+            return None;
+        }
+        let payload = command.encode_to_vec();
+        if payload == effect.payload {
+            return None;
+        }
+        let (host, kind, key) = (effect.host_id.clone(), effect.kind.clone(), effect.key.clone());
+        match self
+            .blocking(move |db| db.replace_pending_spoke_effect_payload(&host, &kind, &key, &payload))
+            .await
+        {
+            Ok(()) => None,
+            Err(Interrupted::Retry(reason) | Interrupted::Halt(reason)) => Some(SpokeEffectOutcome::Retry(reason)),
+        }
+    }
+
+    async fn fence_unqueued_worker_reply(&self, effect: &SpokeEffect, command: Command) -> Command {
+        let Some(run) = command.run.clone() else {
+            return command;
+        };
+        let origin = Origin {
+            host_id: effect.host_id.clone(),
+            journal_id: String::new(),
+            sequence: 0,
+            observed: Stamp::default(),
+            run,
+        };
+        match self.currentness(&origin).await {
+            Ok(Currentness::Superseded(reason)) => assignment_fenced_reply(command.clone(), &reason).unwrap_or(command),
+            _ => command,
+        }
+    }
+
+    async fn send_effect(&self, effect: &SpokeEffect, command: Command) -> SendOnce {
         match self
             .sender
             .send(&effect.host_id, command, self.config.delivery_deadline)
             .await
         {
-            Ok(result) if result.code == ResultCode::Ok as i32 => SpokeEffectOutcome::Done,
+            Ok(result) if result.code == ResultCode::Ok as i32 => SendOnce::Outcome(SpokeEffectOutcome::Done),
             Ok(result) => {
                 let reason = format!("the spoke refused the decision: {}", result.reason);
-                if effect.rejections + 1 >= self.config.max_rejections {
+                SendOnce::Outcome(if effect.rejections + 1 >= self.config.max_rejections {
                     SpokeEffectOutcome::Failed(reason)
                 } else {
                     SpokeEffectOutcome::Rejected(reason)
-                }
+                })
             }
             Err(CommandOutcome::Invalid | CommandOutcome::ResetReleaseUnsupported) => {
-                SpokeEffectOutcome::Failed("the decision command is invalid".into())
+                SendOnce::Outcome(SpokeEffectOutcome::Failed("the decision command is invalid".into()))
             }
-            Err(outcome) => SpokeEffectOutcome::Retry(outcome.to_string()),
+            Err(CommandOutcome::Denied) => SendOnce::AuthorizationDenied,
+            Err(outcome) => SendOnce::Outcome(SpokeEffectOutcome::Retry(outcome.to_string())),
         }
     }
+}
+
+enum SendOnce {
+    Outcome(SpokeEffectOutcome),
+    AuthorizationDenied,
+}
+
+/// A successful worker reply that has not been queued cannot address a
+/// superseded assignment. The data-free rejection can, and is the worker's
+/// explicit denial.
+fn assignment_fenced_reply(mut command: Command, reason: &str) -> Option<Command> {
+    let request_id = match &command.body {
+        Some(command::Body::WorkerReply(reply))
+            if reply.code == ResultCode::Ok as i32 && !reply.result_json.is_empty() =>
+        {
+            reply.request_id.clone()
+        }
+        _ => return None,
+    };
+    command.body = Some(command::Body::WorkerReply(WorkerReply {
+        request_id,
+        code: ResultCode::Rejected as i32,
+        reason: format!("worker_assignment_denied: {reason}")
+            .chars()
+            .take(MAX_REASON_CHARS)
+            .collect(),
+        ..Default::default()
+    }));
+    Some(command)
 }
 
 /// An effect a record owes, held until its cursor advances.

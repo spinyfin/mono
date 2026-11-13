@@ -10,13 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boss_protocol::{ProposalKind, WorkerEvent};
+use boss_protocol::{FrontendEvent, PrStatusView, ProposalKind, WorkerEvent};
 use boss_protocol_spoke::v1::{self, Command, CommandResult, ResultCode, Run, command, record, spoke_frame};
 use boss_protocol_spoke::worker_event;
 use boss_spoke_hub::WorkDbSink;
 use boss_spoke_hub::projection::{
     Applied, CommandSender, Decision, EventObservation, ObservationApplier, Origin, PROPOSAL_DECISION, PaneObservation,
-    Projector, ProjectorConfig, Proposed, QUARANTINE,
+    Projector, ProjectorConfig, Proposed, QUARANTINE, WORKER_REPLY, WorkerObservation, WorkerRead, WorkerResponse,
 };
 use boss_spoke_stream::CommandOutcome;
 use boss_spoke_stream::store::SpokeObservationSink;
@@ -126,6 +126,12 @@ impl ObservationApplier for Applier {
             .push((observation.origin.run.execution_id.clone(), observation.pane.life));
         Applied::Done
     }
+
+    async fn worker_request(&self, _: &WorkerObservation, _: WorkerRead) -> WorkerResponse {
+        WorkerResponse::Read(Box::new(FrontendEvent::PrStatusResult {
+            status: PrStatusView::builder().build(),
+        }))
+    }
 }
 
 /// Records every command and answers from a script.
@@ -222,6 +228,18 @@ fn stop_record(sequence: u64, run: &Run) -> v1::Record {
             stop_hook_active: false,
             stop_reason: boss_protocol::StopReason::Completed,
         })),
+    )
+}
+
+fn worker_record(sequence: u64, run: &Run) -> v1::Record {
+    record_of(
+        sequence,
+        run,
+        record::Body::Request(v1::WorkerRequest {
+            request_id: "req-1".into(),
+            method: v1::WorkerMethod::RunContext as i32,
+            ..Default::default()
+        }),
     )
 }
 
@@ -731,6 +749,82 @@ async fn a_decision_waits_for_the_host_and_a_refusing_spoke_gets_it_under_a_fres
     let decision = &decisions(&db)[0];
     assert_eq!((decision.state, decision.rejections), (SpokeEffectState::Done, 1));
     assert_eq!(applier.log(|l| l.proposals.len()), 1);
+}
+
+#[tokio::test]
+async fn a_successful_reply_fenced_before_admission_becomes_a_denial_and_unblocks_later_effects() {
+    let world = World::new();
+    let db = world.open();
+    let (old_key, old_run) = assign(&db, "exec_1");
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&worker_record(1, &old_run)).await;
+    let sender = Arc::new(Sender::default());
+    sender.will(Err(CommandOutcome::Unavailable));
+    let projector = projector(&db, &Applier::default(), &sender, Arc::new(Notify::new()));
+    projector.drain().await;
+    let reply = db
+        .spoke_effect(HOST, WORKER_REPLY, &format!("{}:req-1", old_run.run_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.state, SpokeEffectState::Pending);
+    assert!(db.host_command_wire(HOST, &command_id(&reply)).unwrap().is_none());
+
+    db.resolve_spoke_assignment("exec_1", old_key.assignment_generation, "abandoned")
+        .unwrap();
+    let (_, new_run) = assign(&db, "exec_1");
+    projector.drain().await;
+    let sent = sender.sent();
+    let Some(command::Body::WorkerReply(denied)) = &sent.last().unwrap().1.body else {
+        panic!("the fenced reply is delivered as a worker reply");
+    };
+    assert_eq!(denied.code, ResultCode::Rejected as i32);
+    assert!(denied.result_json.is_empty());
+    assert!(denied.reason.contains("worker_assignment_denied"), "{}", denied.reason);
+    assert_eq!(
+        db.spoke_effect(HOST, WORKER_REPLY, &format!("{}:req-1", old_run.run_id))
+            .unwrap()
+            .unwrap()
+            .state,
+        SpokeEffectState::Done
+    );
+
+    spoke.send(&proposal_record(2, &new_run, "later-key")).await;
+    projector.drain().await;
+    let sent = sender.sent();
+    let Some(command::Body::ProposalDecision(later)) = &sent.last().unwrap().1.body else {
+        panic!("a later run's decision is delivered after the fenced reply");
+    };
+    assert_eq!(later.code, ResultCode::Ok as i32);
+}
+
+#[tokio::test]
+async fn an_outbox_denial_of_an_unqueued_successful_reply_is_delivered_as_a_rejection() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    Spoke::connect(&db, None).await.send(&worker_record(1, &run)).await;
+    let sender = Arc::new(Sender::default());
+    sender.will(Err(CommandOutcome::Unavailable));
+    sender.will(Err(CommandOutcome::Denied));
+    let projector = projector(&db, &Applier::default(), &sender, Arc::new(Notify::new()));
+    projector.drain().await;
+    projector.drain().await;
+    let sent = sender.sent();
+    assert_eq!(
+        sent.len(),
+        3,
+        "unavailable, denied success, then the data-free rejection"
+    );
+    let Some(command::Body::WorkerReply(denied)) = &sent[2].1.body else {
+        panic!("the denied success is replaced with a worker reply");
+    };
+    assert_eq!(denied.code, ResultCode::Rejected as i32);
+    assert!(denied.result_json.is_empty());
+    assert!(denied.reason.contains("worker_assignment_denied"));
+}
+
+fn command_id(effect: &boss_work_db::SpokeEffect) -> String {
+    Command::decode(effect.payload.as_slice()).unwrap().command_id
 }
 
 #[tokio::test]
