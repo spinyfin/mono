@@ -1,0 +1,42 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "write-batch",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/crash_fixture.rs"],
+    ),
+    crate_name = "boss_write_batch",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = ["//tools/boss/engine/work-db:__pkg__"],
+    deps = [
+        "@mono_crates//:anyhow",
+        "@mono_crates//:rusqlite",
+        "@mono_crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "write_batch_test",
+    size = "small",
+    crate = ":write-batch",
+    data = [":crash_fixture"],
+    edition = "2024",
+    env = {"CRASH_FIXTURE": "$(rootpath :crash_fixture)"},
+    deps = ["@mono_crates//:tempfile"],
+)
+
+rust_binary(
+    name = "crash_fixture",
+    testonly = True,
+    srcs = ["src/crash_fixture.rs"],
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":write-batch",
+        "@mono_crates//:rusqlite",
+    ],
+)

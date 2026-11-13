@@ -1990,6 +1990,7 @@ dependencies = [
  "boss-protocol-spoke",
  "boss-review-guide",
  "boss-task-scope",
+ "boss-write-batch",
  "chrono",
  "fastrand 2.4.1",
  "fs4",
@@ -2019,6 +2020,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-write-batch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

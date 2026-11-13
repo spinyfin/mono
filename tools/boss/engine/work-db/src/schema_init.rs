@@ -209,6 +209,7 @@ impl WorkDb {
             .with_context(|| format!("opening existing database {} for inspection", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_millis(250))?;
         Ok(Self {
+            ingress_writer: Default::default(),
             path,
             memory: None,
             conn: Arc::new(Mutex::new(conn)),
@@ -242,6 +243,7 @@ impl WorkDb {
             .with_context(|| format!("opening existing database {}", path.display()))?;
         Self::configure_connection(&mut conn, false)?;
         Ok(Self {
+            ingress_writer: Default::default(),
             path,
             memory: None,
             conn: Arc::new(Mutex::new(conn)),

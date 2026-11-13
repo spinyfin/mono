@@ -159,6 +159,7 @@ impl SpokeObservationSink for WorkDbSink {
         // Snapshots are live display data: receipt them so the spoke can
         // advance, but do not keep the bytes against the host's quota.
         let retain = !matches!(record.body, Some(record::Body::Capture(_)));
+        let urgent = matches!(record.body, Some(record::Body::Proposal(_)));
         let cursor = blocking(&self.db, move |db| {
             let result_run = result.as_ref().and_then(|(_, run, _)| run.as_ref());
             let result_ref = result.as_ref().map(|(command_id, _, bytes)| SpokeIngressResult {
@@ -179,6 +180,7 @@ impl SpokeObservationSink for WorkDbSink {
                         .observed_at_ms(observed_at_ms)
                         .runs(runs.as_slice())
                         .maybe_result(result_ref)
+                        .urgent(urgent)
                         .retain(retain)
                         .build(),
                 )
