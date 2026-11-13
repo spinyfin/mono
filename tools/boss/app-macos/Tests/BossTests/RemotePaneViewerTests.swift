@@ -82,10 +82,39 @@ final class RemotePaneViewerTests: XCTestCase {
     }
 
     func testAnOldSnapshotIsStale() {
-        let old = live(receivedAgo: 40, observedAgo: 41)
+        let age = RemotePaneViewState.staleAfterSeconds + 1
+        let old = live(receivedAgo: age, observedAgo: age + 1)
         let view = state(old, last: old)
-        XCTAssertEqual(view.freshness, .stale(ageSeconds: 40))
+        XCTAssertEqual(view.freshness, .stale(ageSeconds: age))
         XCTAssertTrue(view.footer.hasSuffix("may be out of date"), view.footer)
+    }
+
+    func testStaleThresholdOutlastsSpokeKeepAlive() {
+        // Producer values are pinned by //tools/boss/protocol-spoke:capture_stale_threshold_test.
+        let keepAlive = RemotePaneViewState.spokeKeepAliveSeconds
+        let interval = RemotePaneViewState.spokeCaptureIntervalSeconds
+        XCTAssertEqual(
+            RemotePaneViewState.staleAfterSeconds,
+            keepAlive + interval + RemotePaneViewState.staleRenewalSlackSeconds
+        )
+        XCTAssertGreaterThan(
+            RemotePaneViewState.staleAfterSeconds,
+            keepAlive + interval,
+            "an idle pane re-sends only at keep-alive; the viewer must not go stale in between"
+        )
+        let idle = live(receivedAgo: keepAlive + interval, observedAgo: keepAlive + interval + 1)
+        XCTAssertEqual(
+            state(idle, last: idle).freshness,
+            .fresh(ageSeconds: keepAlive + interval)
+        )
+    }
+
+    func testUnconfirmedSnapshotAfterReconnectIsStale() {
+        let recent = live(receivedAgo: 1)
+        let view = state(nil, last: recent)
+        XCTAssertEqual(view.freshness, .stale(ageSeconds: 1))
+        XCTAssertEqual(view.banner, "Waiting for the first snapshot…")
+        XCTAssertTrue(view.showsText)
     }
 
     func testALostConnectionMakesWhatIsShownStaleEvenIfRecent() {
@@ -160,6 +189,9 @@ final class RemotePaneViewerTests: XCTestCase {
         XCTAssertEqual(recorder.subscribed, [["pane_capture.run-1"], ["pane_capture.run-1"]])
         XCTAssertTrue(model.captures.isEmpty, "snapshots from the old session are history")
         XCTAssertNotNil(model.lastSnapshots["run-1"], "the last text stays, marked stale until a new one arrives")
+        let view = model.viewState(runId: "run-1", now: now, hostFallback: "fallback")
+        XCTAssertEqual(view.freshness, .stale(ageSeconds: 0))
+        XCTAssertEqual(view.banner, "Waiting for the first snapshot…")
 
         model.stopWatching()
         model.connectionLost()
@@ -174,6 +206,32 @@ final class RemotePaneViewerTests: XCTestCase {
         XCTAssertTrue(recorder.subscribed.isEmpty)
         model.connectionRestored()
         XCTAssertEqual(recorder.subscribed, [["pane_capture.run-1"]])
+    }
+
+    func testWatchingAfterDisconnectDoesNotSendUnsubscribe() {
+        let (model, recorder) = model()
+        model.watch("run-1")
+        model.connectionLost()
+        model.watch("run-2")
+        XCTAssertEqual(recorder.unsubscribed, [], "unsubscribe on a down socket posts a spurious chat message")
+        XCTAssertEqual(recorder.subscribed, [["pane_capture.run-1"]], "no subscribe while disconnected")
+        XCTAssertEqual(model.watching, ["run-2"])
+    }
+
+    func testOnlyWorkersWithAnExplicitNonLocalHostAreRemote() {
+        XCTAssertFalse(worker(hostId: nil).isSpokeHosted)
+        XCTAssertFalse(worker(hostId: WorkerLiveState.localHostId).isSpokeHosted)
+        XCTAssertTrue(worker(hostId: "spoke-a").isSpokeHosted)
+        XCTAssertFalse(worker(hostId: nil).isLocalMember)
+    }
+
+    private func worker(hostId: String?) -> WorkerLiveState {
+        WorkerLiveState(
+            slotId: 1, runId: "run-1", model: "opus", shellPid: 1,
+            lastEventAt: nil, currentTool: nil, lastToolEndedAt: nil,
+            activity: .working, liveStatus: nil, liveStatusAt: nil,
+            recoveryStatus: nil, tmuxHosted: true, hostId: hostId
+        )
     }
 
     func testExplicitControlsGoThroughTheEngineRequests() {

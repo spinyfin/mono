@@ -6,6 +6,7 @@
 //! had while it lived directly in `app.rs`.
 
 use super::*;
+use tokio::sync::watch;
 
 /// Maximum events that can be queued in one session's **bulk lane** before we
 /// start shedding load. Sized for typical work-invalidation traffic: each
@@ -680,14 +681,28 @@ impl SessionSink {
     }
 }
 
-#[derive(Default)]
 pub(super) struct TopicBroker {
     pub(super) decision_snapshot: Mutex<Option<Vec<boss_protocol::OperatorDecisionNotification>>>,
     pub(super) inner: Mutex<TopicBrokerInner>,
-    /// Wakes capture tasks when a session that held a pane topic is dropped
-    /// (disconnect or slow-queue eviction). Unsubscribe already calls
+    /// Generation bumped when a session that held a pane topic is evicted
+    /// (slow-queue). Capture tasks subscribe and select on `changed()`, which
+    /// cannot be missed: a bump while the task is publishing or awaiting a
+    /// host request is still visible on the next wait.
+    ///
+    /// Disconnect still calls `viewers_may_have_left` in app.rs, so this
+    /// signal matters only for eviction. Unsubscribe already calls
     /// `viewers_may_have_left` on its own.
-    pub(super) pane_departures: Notify,
+    pub(super) pane_departures: watch::Sender<u64>,
+}
+
+impl Default for TopicBroker {
+    fn default() -> Self {
+        Self {
+            decision_snapshot: Mutex::default(),
+            inner: Mutex::default(),
+            pane_departures: watch::channel(0).0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -724,7 +739,8 @@ impl TopicBroker {
             .iter()
             .any(|topic| boss_protocol::pane_capture_topic_run(topic).is_some())
         {
-            self.pane_departures.notify_waiters();
+            self.pane_departures
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
         removed
     }

@@ -149,6 +149,9 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
     // spoke captures immediately instead of waiting out keep-alive.
     let mut last_live: Option<Arc<PaneSnapshot>> = None;
     let mut first = true;
+    let mut departures = state.topic_broker.pane_departures.subscribe();
+    // The first `changed()` is ready on subscribe; that is not an eviction.
+    departures.mark_unchanged();
 
     loop {
         let mut due = first;
@@ -156,7 +159,7 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
             tokio::select! {
                 _ = renew.tick() => { due = true; }
                 _ = wake.notify.notified() => {}
-                _ = state.topic_broker.pane_departures.notified() => {}
+                _ = departures.changed() => {}
                 snapshot = snapshots.recv() => {
                     match snapshot {
                         Ok(snapshot) if snapshot.run_id == run_id && snapshot.subscription_id == sub_id => {
@@ -164,10 +167,14 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
                             last_live = Some(Arc::clone(&snapshot));
                             publish_snapshot(&state, &snapshot).await;
                         }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    continue;
+                    // Fall through to `has_subscribers` rather than `continue`:
+                    // publishing this snapshot can itself evict the last viewer's
+                    // session, and nothing else would wake this task.
+                    // `departures.changed()` retains a bump that happens during
+                    // the host request the same way.
                 }
             }
         }
@@ -1213,5 +1220,47 @@ mod flow_tests {
         let opens = remote.opens();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(remote.opens(), opens, "eviction must not wait for a renewal tick");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_publish_slow_queue_eviction_cancels_the_capture_without_waiting_for_renewal() {
+        let remote = Remote::new(PaneCaptureOutcome::Accepted);
+        let (state, _dir) = state_with(&remote, true);
+        state.pane_viewers.set_renew_every(Duration::from_secs(600));
+        let sink = viewer(&state, "viewer-a").await;
+        until("the capture to open", || remote.opens() >= 1).await;
+
+        {
+            let mut q = sink.queue.lock().unwrap();
+            let mut i = 0usize;
+            while q.items.len() < crate::app::session_queue::MAX_SESSION_QUEUE {
+                assert_eq!(
+                    q.enqueue(FrontendEventEnvelope::response(
+                        format!("r-{i}"),
+                        FrontendEvent::ProductsList { products: vec![] },
+                    )),
+                    crate::app::session_queue::EnqueueOutcome::Enqueued
+                );
+                i += 1;
+            }
+            q.backdate_oldest_bulk_entry(crate::app::session_queue::STUCK_CLIENT_AGE_MS + 100);
+        }
+
+        // The capture task's own snapshot publish is what evicts: no waiter
+        // is parked in select when that publish evicts the session.
+        state.pane_viewers.feed().send(snapshot(&remote, "overflow")).unwrap();
+
+        until("the cancel after self-publish eviction", || remote.cancels() >= 1).await;
+        until("the task to end after self-publish eviction", || {
+            futures_executor_block(state.pane_viewers.active_runs()) == 0
+        })
+        .await;
+        let opens = remote.opens();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            remote.opens(),
+            opens,
+            "self-publish eviction must not wait for a renewal tick"
+        );
     }
 }

@@ -859,6 +859,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertEqual(live.badgeType, .coding)
         XCTAssertEqual(live.agentProject, .project(id: "proj-1"))
         XCTAssertTrue(live.isLocalMember)
+        XCTAssertFalse(live.isSpokeHosted)
         XCTAssertEqual(live.activity.agentsPaneLabel, "Starting")
     }
 

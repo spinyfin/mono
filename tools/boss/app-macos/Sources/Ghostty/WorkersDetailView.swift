@@ -99,7 +99,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
     /// the grid; the panel below it shows a read-only text view of one.
     private var remoteWorkers: [WorkerLiveState] {
         liveStates.byRunID.values
-            .filter { !$0.isLocalMember && $0.activity != .terminated && $0.activity != .errored }
+            .filter { $0.isSpokeHosted && $0.activity != .terminated && $0.activity != .errored }
             .sorted { ($0.startedAt ?? "", $0.runId) < ($1.startedAt ?? "", $1.runId) }
     }
 

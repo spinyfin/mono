@@ -29,8 +29,9 @@ use anyhow::Result;
 use boss_host_execution::capture::{PaneRead, PaneSource, bound_snapshot};
 use boss_host_execution::worker::{ExecutionRecord, Phase};
 use boss_protocol_spoke::limits::{
-    CANCEL_CAPTURE_TTL_SECONDS, DEFAULT_CAPTURE_INTERVAL_MS, DEFAULT_CAPTURE_TTL_SECONDS, MAX_CAPTURE_BYTES,
-    MAX_CAPTURE_INTERVAL_MS, MAX_CAPTURE_SUBSCRIPTIONS, MAX_CAPTURE_TTL_SECONDS, MIN_CAPTURE_INTERVAL_MS,
+    CANCEL_CAPTURE_TTL_SECONDS, CAPTURE_KEEP_ALIVE_SECONDS, DEFAULT_CAPTURE_INTERVAL_MS, DEFAULT_CAPTURE_TTL_SECONDS,
+    MAX_CAPTURE_BYTES, MAX_CAPTURE_INTERVAL_MS, MAX_CAPTURE_SUBSCRIPTIONS, MAX_CAPTURE_TTL_SECONDS,
+    MIN_CAPTURE_INTERVAL_MS,
 };
 use boss_protocol_spoke::v1::{Capture, Command, CommandResult, PaneCapture, Record, ResultCode, Run, Stamp, record};
 use boss_spoke_journal::{Admission, Fault};
@@ -40,7 +41,7 @@ use boss_spoke_outbound::SharedJournal;
 const TICK: Duration = Duration::from_millis(250);
 /// An idle pane still emits one snapshot this often so a viewer can tell the
 /// feed is alive. Shorter than this, identical text is not appended.
-const KEEP_ALIVE: Duration = Duration::from_secs(60);
+const KEEP_ALIVE: Duration = Duration::from_secs(CAPTURE_KEEP_ALIVE_SECONDS as u64);
 
 struct Subscription {
     generation: u64,

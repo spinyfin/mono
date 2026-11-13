@@ -113,8 +113,21 @@ enum RemotePaneFreshness: Equatable {
 /// Everything the viewer's header and footer say, derived from a capture, the
 /// current time and the connection, so it can be tested without a view.
 struct RemotePaneViewState: Equatable {
-    /// A snapshot older than this (three missed 5-second captures) is stale.
-    static let staleAfterSeconds = 15
+    /// Spoke `CAPTURE_KEEP_ALIVE_SECONDS`: unchanged pane text is not re-sent
+    /// until this many seconds have passed. `capture_stale_threshold_test`
+    /// pins this and `spokeCaptureIntervalSeconds` to
+    /// `boss_protocol_spoke::limits`.
+    static let spokeKeepAliveSeconds = 60
+    /// Spoke `DEFAULT_CAPTURE_INTERVAL_MS`.
+    static let spokeCaptureIntervalSeconds = 5
+    /// Hub renewal tick plus scheduling slack, so a keep-alive that lands a
+    /// little late is not marked stale.
+    static let staleRenewalSlackSeconds = 25
+    /// A snapshot older than this is stale. The spoke re-sends unchanged text
+    /// only every `spokeKeepAliveSeconds`, so this is keep-alive + capture
+    /// interval + renewal slack — long enough that a healthy idle pane stays
+    /// Live, short enough that a dead feed is still obvious.
+    static let staleAfterSeconds = spokeKeepAliveSeconds + spokeCaptureIntervalSeconds + staleRenewalSlackSeconds
 
     let hostLabel: String
     let freshness: RemotePaneFreshness
@@ -150,7 +163,10 @@ struct RemotePaneViewState: Equatable {
         showsText = shown != nil
 
         if let age, shown != nil {
-            let isStale = !connected || age > Self.staleAfterSeconds || (capture?.state != .live && capture != nil)
+            // `capture == nil` (reconnect, before the new session's first push)
+            // is stale: the text is not confirmed by the current session.
+            // `capture?.state != .live` covers that and every non-live banner.
+            let isStale = !connected || age > Self.staleAfterSeconds || capture?.state != .live
             freshness = isStale ? .stale(ageSeconds: age) : .fresh(ageSeconds: age)
         } else {
             freshness = .none
@@ -211,7 +227,9 @@ final class RemotePaneViewerModel: ObservableObject {
         let leaving = watching.subtracting(wanted)
         let joining = wanted.subtracting(watching)
         watching = wanted
-        if !leaving.isEmpty { unsubscribe(leaving.sorted().map(Self.topic)) }
+        // The engine drops every subscription with the session, so an
+        // unsubscribe on a down socket is a no-op that posts "Not connected".
+        if !leaving.isEmpty && isConnected { unsubscribe(leaving.sorted().map(Self.topic)) }
         if !joining.isEmpty && isConnected { subscribe(joining.sorted().map(Self.topic)) }
     }
 
@@ -289,6 +307,8 @@ struct RemotePaneViewerView: View {
             }
             if state.showsText {
                 // Plain `Text`: it renders characters, never terminal actions.
+                // The capture is the visible tmux screen, newest lines at the
+                // bottom, so the viewer opens (and stays) on the prompt.
                 ScrollView {
                     Text(RemotePaneText.display(model.lastSnapshots[runId]?.text ?? ""))
                         .font(.system(.caption, design: .monospaced))
@@ -296,6 +316,7 @@ struct RemotePaneViewerView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(8)
                 }
+                .defaultScrollAnchor(.bottom)
                 .opacity({ if case .stale = state.freshness { 0.6 } else { 1 } }())
                 .accessibilityIdentifier("remote-pane-text")
             } else {
