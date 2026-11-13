@@ -57,6 +57,14 @@ filegroup(
     visibility = ["//tools/boss/engine/work-db:__pkg__"],
 )
 
+# Live Swift source read by the protocol-spoke contract test so the viewer's
+# stale threshold cannot drift from the spoke capture keep-alive.
+filegroup(
+    name = "remote_pane_viewer_swift",
+    srcs = ["Sources/RemotePaneViewer.swift"],
+    visibility = ["//tools/boss/protocol-spoke:__pkg__"],
+)
+
 swift_library(
     name = "boss_mac_app_lib",
     # CrashWatchdog is excluded so it is only ever compiled as its own module

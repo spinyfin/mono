@@ -34,6 +34,8 @@ pub const DEFAULT_CAPTURE_TTL_SECONDS: u32 = 30;
 /// so an idle pane does not fill the hub's ingress quota. A viewer's stale
 /// threshold must exceed this plus [`DEFAULT_CAPTURE_INTERVAL_MS`] and a
 /// renewal slack, or a healthy idle pane is marked stale between keep-alives.
+/// `//tools/boss/protocol-spoke:capture_stale_threshold_test` pins the Swift
+/// copies in `RemotePaneViewer.swift` to these values.
 pub const CAPTURE_KEEP_ALIVE_SECONDS: u32 = 60;
 
 /// A spoke raises a faster cadence to this and lowers a slower one to the max.

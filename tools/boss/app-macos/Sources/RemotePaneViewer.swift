@@ -114,7 +114,8 @@ enum RemotePaneFreshness: Equatable {
 /// current time and the connection, so it can be tested without a view.
 struct RemotePaneViewState: Equatable {
     /// Spoke `CAPTURE_KEEP_ALIVE_SECONDS`: unchanged pane text is not re-sent
-    /// until this many seconds have passed. Keep in lock-step with
+    /// until this many seconds have passed. `capture_stale_threshold_test`
+    /// pins this and `spokeCaptureIntervalSeconds` to
     /// `boss_protocol_spoke::limits`.
     static let spokeKeepAliveSeconds = 60
     /// Spoke `DEFAULT_CAPTURE_INTERVAL_MS`.

@@ -167,14 +167,14 @@ async fn capture_task(state: Arc<ServerState>, run_id: String, wake: Arc<TaskWak
                             last_live = Some(Arc::clone(&snapshot));
                             publish_snapshot(&state, &snapshot).await;
                         }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    // Fall through to `has_subscribers`: a Slow enqueue of this
-                    // snapshot may have just evicted the session, and
-                    // `notify_waiters` would have been lost while we awaited
-                    // publish. `departures.changed()` retains a bump that
-                    // happens during the host request the same way.
+                    // Fall through to `has_subscribers` rather than `continue`:
+                    // publishing this snapshot can itself evict the last viewer's
+                    // session, and nothing else would wake this task.
+                    // `departures.changed()` retains a bump that happens during
+                    // the host request the same way.
                 }
             }
         }
@@ -1247,7 +1247,7 @@ mod flow_tests {
         }
 
         // The capture task's own snapshot publish is what evicts: no waiter
-        // is parked in select at that moment, so a Notify would be lost.
+        // is parked in select when that publish evicts the session.
         state.pane_viewers.feed().send(snapshot(&remote, "overflow")).unwrap();
 
         until("the cancel after self-publish eviction", || remote.cancels() >= 1).await;

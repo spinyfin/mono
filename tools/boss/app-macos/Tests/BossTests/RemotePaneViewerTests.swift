@@ -90,6 +90,7 @@ final class RemotePaneViewerTests: XCTestCase {
     }
 
     func testStaleThresholdOutlastsSpokeKeepAlive() {
+        // Producer values are pinned by //tools/boss/protocol-spoke:capture_stale_threshold_test.
         let keepAlive = RemotePaneViewState.spokeKeepAliveSeconds
         let interval = RemotePaneViewState.spokeCaptureIntervalSeconds
         XCTAssertEqual(

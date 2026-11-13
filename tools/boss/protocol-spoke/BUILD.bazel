@@ -118,6 +118,21 @@ rust_test(
     ),
 )
 
+# Pins the macOS viewer's stale threshold to this crate's capture keep-alive
+# and interval. A producer-only cadence change must fail here so a healthy idle
+# pane is not marked Stale between keep-alives.
+rust_test(
+    name = "capture_stale_threshold_test",
+    size = "small",
+    srcs = ["tests/capture_stale_threshold.rs"],
+    data = ["//tools/boss/app-macos:remote_pane_viewer_swift"],
+    edition = "2024",
+    env = {
+        "REMOTE_PANE_VIEWER_SWIFT": "$(rootpath //tools/boss/app-macos:remote_pane_viewer_swift)",
+    },
+    deps = [":protocol-spoke"],
+)
+
 # The protoc plugins and the prost/tonic runtime come from one Cargo.lock; this
 # fails if a bump splits them (see tests/toolchain_coherence.rs).
 rust_test(
