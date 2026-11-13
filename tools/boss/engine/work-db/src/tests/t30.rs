@@ -456,3 +456,104 @@ fn invalidate_stale_succeeded_is_noop_on_non_succeeded_rows() {
         "unknown id yields Ok(None)"
     );
 }
+
+/// Re-open a row as `pending` so tests can plant the leftover state an older
+/// engine left behind (insert-time retirement would already have abandoned it).
+fn replant_pending(db: &WorkDb, attempt_id: &str, base_sha: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE conflict_resolutions
+                SET status = 'pending', failure_reason = NULL, finished_at = NULL,
+                    base_sha_at_trigger = ?2
+              WHERE id = ?1",
+            params![attempt_id, base_sha],
+        )
+        .unwrap();
+}
+
+// ── retire stale pending attempts ──────────────────────────────────────
+
+/// Succeeding a later attempt abandons an older leftover `pending` row
+/// (the insert-time path already does this for a fresh insert; this is
+/// the terminal-transition path for rows planted after that).
+#[test]
+fn succeeding_a_later_attempt_retires_older_pending() {
+    let (db, product, chore) = seed_product_and_chore("succeed-supersede-pending");
+    let stale = insert_attempt(&db, &product, &chore, "base-old");
+    let later = insert_attempt(&db, &product, &chore, "base-new");
+    assert_eq!(
+        db.get_conflict_resolution(&stale.id).unwrap().unwrap().status,
+        "abandoned",
+        "insert of the later attempt already retires the older pending"
+    );
+    replant_pending(&db, &stale.id, "base-old");
+    assert_eq!(
+        db.get_conflict_resolution(&stale.id).unwrap().unwrap().status,
+        "pending"
+    );
+
+    db.mark_conflict_resolution_succeeded(&later.id, None)
+        .unwrap()
+        .expect("later attempt is still pending");
+
+    let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
+    assert_eq!(stale_row.status, "abandoned");
+    assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
+    assert!(stale_row.base_sha_at_trigger.is_none(), "the UNIQUE slot is freed");
+}
+
+/// A leftover pending row next to a later succeeded attempt is retired even
+/// when the PR is still conflicting (`pr_is_mergeable = false`): supersession
+/// does not wait for mergeability.
+#[test]
+fn retire_stale_pending_abandons_superseded_row_while_still_conflicting() {
+    let (db, product, chore) = seed_product_and_chore("retire-superseded-conflicting");
+    let stale = insert_attempt(&db, &product, &chore, "base-old");
+    let later = insert_attempt(&db, &product, &chore, "base-new");
+    db.mark_conflict_resolution_succeeded(&later.id, None).unwrap();
+    replant_pending(&db, &stale.id, "base-old");
+
+    let n = db.retire_stale_pending_conflict_attempts(&chore, false).unwrap();
+    assert_eq!(n, 1);
+    let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
+    assert_eq!(stale_row.status, "abandoned");
+    assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
+}
+
+/// A bare pending attempt on a mergeable PR, with no later terminal row, is
+/// abandoned so it cannot keep pre-empting CI.
+#[test]
+fn retire_stale_pending_abandons_bare_pending_when_pr_is_mergeable() {
+    let (db, product, chore) = seed_product_and_chore("retire-mergeable-bare");
+    let pending = insert_attempt(&db, &product, &chore, "base-only");
+
+    let n = db.retire_stale_pending_conflict_attempts(&chore, true).unwrap();
+    assert_eq!(n, 1);
+    let row = db.get_conflict_resolution(&pending.id).unwrap().unwrap();
+    assert_eq!(row.status, "abandoned");
+    assert_eq!(row.failure_reason.as_deref(), Some("pr_mergeable_attempt_stale"));
+    assert!(db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none());
+}
+
+/// A running attempt holds a worker lease: mergeable-PR cleanup must not
+/// abandon it.
+#[test]
+fn retire_stale_pending_leaves_a_running_attempt() {
+    let (db, product, chore) = seed_product_and_chore("retire-keep-running");
+    let attempt = insert_attempt(&db, &product, &chore, "base-run");
+    db.mark_conflict_resolution_running(&attempt.id, "lease-1", "ws-1", "worker-1")
+        .unwrap()
+        .unwrap();
+
+    let n = db.retire_stale_pending_conflict_attempts(&chore, true).unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(
+        db.get_conflict_resolution(&attempt.id).unwrap().unwrap().status,
+        "running"
+    );
+    assert!(
+        db.conflict_attempt_holds_live_worker(&db.get_conflict_resolution(&attempt.id).unwrap().unwrap())
+            .unwrap()
+    );
+}

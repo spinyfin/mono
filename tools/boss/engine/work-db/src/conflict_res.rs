@@ -48,6 +48,28 @@ impl WorkDb {
         Ok(enabled.map(|v| v != 0).unwrap_or(true))
     }
 
+    /// Latest non-terminal `rebase_attempts` row covering the given PR
+    /// url, as `(id, status)`. Used by CI-watch so a deferral can name
+    /// the attempt. The table ships with the auto-rebase flow; until it
+    /// lands this short-circuits to `None`.
+    pub fn active_rebase_attempt_for_pr(&self, pr_url: &str) -> Result<Option<(String, String)>> {
+        let conn = self.connect()?;
+        if !table_exists(&conn, "rebase_attempts")? {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT id, status FROM rebase_attempts
+              WHERE dependent_pr_url = ?1
+                AND status IN ('pending', 'running', 'escalated')
+              ORDER BY id DESC
+              LIMIT 1",
+            params![pr_url],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// True iff there's a non-terminal `rebase_attempts` row covering
     /// the given PR url. Used by `conflict_watch::on_conflict_detected`
     /// to defer when the `auto-rebase-stacked-prs` flow already owns
@@ -58,18 +80,7 @@ impl WorkDb {
     /// dispatch site reads identically before and after auto-rebase
     /// is wired up.
     pub fn has_active_rebase_attempt_for_pr(&self, pr_url: &str) -> Result<bool> {
-        let conn = self.connect()?;
-        if !table_exists(&conn, "rebase_attempts")? {
-            return Ok(false);
-        }
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM rebase_attempts
-              WHERE dependent_pr_url = ?1
-                AND status IN ('pending', 'running', 'escalated')",
-            params![pr_url],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        Ok(self.active_rebase_attempt_for_pr(pr_url)?.is_some())
     }
 
     /// A revision that is genuinely running or queued owns resolution for its
@@ -262,27 +273,7 @@ impl WorkDb {
         // supersede path, not orphaned here. `running` rows are left alone:
         // they hold a lease on a real worker.
         if !churn_tripped {
-            let retired = tx.execute(
-                "UPDATE conflict_resolutions
-                    SET status              = 'abandoned',
-                        failure_reason      = 'superseded_by_newer_attempt',
-                        base_sha_at_trigger = NULL,
-                        finished_at         = COALESCE(finished_at, ?3)
-                  WHERE work_item_id = ?1
-                    AND id != ?2
-                    AND status = 'pending'
-                    AND revision_task_id IS NULL
-                    AND event_source != 'speculative_predicted'",
-                params![input.work_item_id, id, now],
-            )?;
-            if retired > 0 {
-                tracing::info!(
-                    work_item_id = %input.work_item_id,
-                    new_attempt_id = %id,
-                    retired,
-                    "conflict_resolutions: retired older pending attempts superseded by a newer attempt",
-                );
-            }
+            retire_superseded_pending_conflict_attempts_in_tx(&tx, &input.work_item_id, &id, &now)?;
         }
         // Only stamp the parent's `blocked_attempt_id` for live
         // attempts; an immediately-abandoned churn-guard row would
@@ -385,6 +376,76 @@ impl WorkDb {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    /// True when this attempt still owns a worker or an in-flight mechanical
+    /// rung. A bare `pending` row with no revision and no ladder marker is
+    /// not live: it must not pre-empt CI on a mergeable PR.
+    pub fn conflict_attempt_holds_live_worker(&self, attempt: &ConflictResolution) -> Result<bool> {
+        if attempt.status == "running" || attempt.mechanical_rung_in_flight.is_some() {
+            return Ok(true);
+        }
+        match attempt.revision_task_id.as_deref() {
+            Some(revision) => self.is_conflict_revision_running_or_queued(revision),
+            None => Ok(false),
+        }
+    }
+
+    /// Abandon `pending` conflict attempts that are no longer live: a later
+    /// attempt for the same work item has reached a terminal state, or the
+    /// PR is mergeable and no worker is running them. Leaves `running`
+    /// rows, in-flight mechanical rungs, and pending attempts whose
+    /// revision is still queued or working. Used by the merge poller on
+    /// unblocked rows (the blocked-row retire path does not run for them)
+    /// and by CI-watch so a leftover pending row cannot suppress a
+    /// CI-fix revision. Returns how many rows were abandoned.
+    pub fn retire_stale_pending_conflict_attempts(&self, work_item_id: &str, pr_is_mergeable: bool) -> Result<usize> {
+        let pending = self.list_conflict_resolutions(None, &["pending".to_owned()], Some(work_item_id), None)?;
+        let mut retired = 0;
+        for attempt in pending {
+            if attempt.event_source == "speculative_predicted" {
+                continue;
+            }
+            if self.conflict_attempt_holds_live_worker(&attempt)? {
+                continue;
+            }
+            let superseded = self.later_terminal_conflict_attempt_exists(&attempt)?;
+            let reason = if superseded {
+                "superseded_by_newer_attempt"
+            } else if pr_is_mergeable {
+                "pr_mergeable_attempt_stale"
+            } else {
+                continue;
+            };
+            if self
+                .abandon_conflict_resolution_for_supersede(&attempt.id, reason)?
+                .is_some()
+            {
+                retired += 1;
+                tracing::info!(
+                    work_item_id,
+                    attempt_id = %attempt.id,
+                    reason,
+                    "conflict_resolutions: retired a stale pending attempt",
+                );
+            }
+        }
+        Ok(retired)
+    }
+
+    fn later_terminal_conflict_attempt_exists(&self, attempt: &ConflictResolution) -> Result<bool> {
+        let conn = self.connect()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM conflict_resolutions
+              WHERE work_item_id = ?1
+                AND id != ?2
+                AND status IN ('succeeded', 'failed', 'abandoned')
+                AND event_source != 'speculative_predicted'
+                AND (created_at > ?3 OR (created_at = ?3 AND id > ?2))",
+            params![attempt.work_item_id, attempt.id, attempt.created_at],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// Store the engine-collected diagnosis JSON on a pending attempt,
@@ -523,6 +584,9 @@ impl WorkDb {
         )?;
         if rows > 0 {
             crate::spoke_projection::record_application_on(&tx, application)?;
+            if let Some(updated) = query_conflict_resolution(&tx, attempt_id)? {
+                retire_superseded_pending_conflict_attempts_in_tx(&tx, &updated.work_item_id, attempt_id, &now)?;
+            }
         }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
@@ -783,6 +847,11 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
+        if rows > 0
+            && let Some(updated) = query_conflict_resolution(&tx, attempt_id)?
+        {
+            retire_superseded_pending_conflict_attempts_in_tx(&tx, &updated.work_item_id, attempt_id, &now)?;
+        }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
@@ -1481,7 +1550,44 @@ pub(crate) fn mark_conflict_resolution_succeeded_at_rung_in_tx(
     if rows == 0 {
         return Ok(None);
     }
-    query_conflict_resolution(conn, attempt_id)
+    let updated = query_conflict_resolution(conn, attempt_id)?;
+    if let Some(row) = &updated {
+        retire_superseded_pending_conflict_attempts_in_tx(conn, &row.work_item_id, attempt_id, &now)?;
+    }
+    Ok(updated)
+}
+
+/// Abandon older `pending` attempts for `work_item_id` that never spawned a
+/// fix vehicle, now that `newer_attempt_id` exists or has just become
+/// terminal. Leaves `running` rows and revision-backed pending rows alone.
+pub(crate) fn retire_superseded_pending_conflict_attempts_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    newer_attempt_id: &str,
+    now: &str,
+) -> Result<usize> {
+    let retired = conn.execute(
+        "UPDATE conflict_resolutions
+            SET status              = 'abandoned',
+                failure_reason      = 'superseded_by_newer_attempt',
+                base_sha_at_trigger = NULL,
+                finished_at         = COALESCE(finished_at, ?3)
+          WHERE work_item_id = ?1
+            AND id != ?2
+            AND status = 'pending'
+            AND revision_task_id IS NULL
+            AND event_source != 'speculative_predicted'",
+        params![work_item_id, newer_attempt_id, now],
+    )?;
+    if retired > 0 {
+        tracing::info!(
+            work_item_id,
+            new_attempt_id = newer_attempt_id,
+            retired,
+            "conflict_resolutions: retired older pending attempts superseded by a newer attempt",
+        );
+    }
+    Ok(retired)
 }
 
 /// Retire a moot revision inside the caller's transaction, preserving attribution.

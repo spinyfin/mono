@@ -1340,6 +1340,19 @@ pub(crate) fn retire_moot_conflict_revisions(
     candidate: &PendingMergeCheck,
     labels: &[String],
 ) -> usize {
+    // Ledger cleanup for leftover `pending` attempts: a later attempt that
+    // already reached a terminal state, or a pending row sitting on a
+    // mergeable PR with no worker. Runs even when the parent is unblocked
+    // (the `maybe_clear_blocked` retire path never sees those rows) and
+    // even when the product opted out of auto-maintenance — this is not a
+    // new remediation, it is retiring an attempt that is no longer live.
+    if let Err(err) = work_db.retire_stale_pending_conflict_attempts(&candidate.work_item_id, true) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            ?err,
+            "conflict_watch: failed to retire stale pending conflict attempts on a mergeable PR",
+        );
+    }
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return 0;
     }
