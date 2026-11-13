@@ -2830,6 +2830,11 @@ impl ExecutionCoordinator {
                         )
                         .await;
                     coordinator.recover_failed_dispatch(&execution, &worker_id, &err).await;
+                    // The freed slot can serve other rows now; a deferred row is
+                    // held by `dispatch_not_before`, so this cannot re-claim it.
+                    if err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some() {
+                        coordinator.kick();
+                    }
                 }
             }
         });
@@ -2863,13 +2868,25 @@ impl ExecutionCoordinator {
                 .release_lease_after_proven_never_started(&current, &lease_id, self.host_adapter().as_ref())
                 .await;
         }
-        // Parked attempts and budget deferrals were already returned to ready
-        // without spending the retry budget; do not record a pre-start failure
-        // or unclaim them again.
-        if err.is::<super::spoke_in_doubt::SpokeAttemptParked>()
-            || err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_some()
+        // Parked attempts were already returned to ready without spending the
+        // retry budget; do not record a pre-start failure or unclaim them again.
+        if err.is::<super::spoke_in_doubt::SpokeAttemptParked>() {
+            return;
+        }
+        if err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_some()
             || err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some()
         {
+            // The deferral already held the row; if a transient DB error left it
+            // claimed, release it here rather than waiting for the boot sweep.
+            if current.status == ExecutionStatus::Claimed
+                && let Err(release_err) = self.work_db.release_dispatch_claim(&current.id)
+            {
+                tracing::error!(
+                    execution_id = %current.id,
+                    ?release_err,
+                    "budget deferral: failed to release a still-claimed dispatch"
+                );
+            }
             return;
         }
         if current.status != ExecutionStatus::Claimed {
