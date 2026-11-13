@@ -684,6 +684,10 @@ impl SessionSink {
 pub(super) struct TopicBroker {
     pub(super) decision_snapshot: Mutex<Option<Vec<boss_protocol::OperatorDecisionNotification>>>,
     pub(super) inner: Mutex<TopicBrokerInner>,
+    /// Wakes capture tasks when a session that held a pane topic is dropped
+    /// (disconnect or slow-queue eviction). Unsubscribe already calls
+    /// `viewers_may_have_left` on its own.
+    pub(super) pane_departures: Notify,
 }
 
 #[derive(Default)]
@@ -714,6 +718,13 @@ impl TopicBroker {
                     }
                 }
             }
+        }
+        drop(inner);
+        if removed
+            .iter()
+            .any(|topic| boss_protocol::pane_capture_topic_run(topic).is_some())
+        {
+            self.pane_departures.notify_waiters();
         }
         removed
     }

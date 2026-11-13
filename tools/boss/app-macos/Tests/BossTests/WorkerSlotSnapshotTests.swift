@@ -974,15 +974,18 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testDetailViewEquatableIgnoresClosures() {
         let workspace = WorkersWorkspaceModel()
         let liveStates = LiveWorkerStateStore()
+        let remotePanes = RemotePaneViewerModel()
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            remotePanes: remotePanes,
             isVisible: true,
             onRevealWorkItem: { _, _ in XCTFail("First reveal handler must not run during equality") }
         )
         let b = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            remotePanes: remotePanes,
             isVisible: true,
             onRevealWorkItem: { _, _ in XCTFail("Second reveal handler must not run during equality") }
         )
@@ -992,14 +995,17 @@ final class WorkerSlotSnapshotTests: XCTestCase {
     func testDetailViewEquatableTracksVisibility() {
         let workspace = WorkersWorkspaceModel()
         let liveStates = LiveWorkerStateStore()
+        let remotePanes = RemotePaneViewerModel()
         let visible = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            remotePanes: remotePanes,
             isVisible: true
         )
         let hidden = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            remotePanes: remotePanes,
             isVisible: false
         )
         XCTAssertNotEqual(visible, hidden)
@@ -1010,15 +1016,18 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         // ContentView skip Agents body on an unrelated ChatViewModel publish.
         let workspace = WorkersWorkspaceModel()
         let liveStates = LiveWorkerStateStore()
+        let remotePanes = RemotePaneViewerModel()
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            remotePanes: remotePanes,
             isVisible: true
         )
         let otherWorkspace = WorkersWorkspaceModel()
         let c = WorkersDetailView(
             workspace: otherWorkspace,
             liveStates: liveStates,
+            remotePanes: remotePanes,
             isVisible: true
         )
         XCTAssertNotEqual(a, c)

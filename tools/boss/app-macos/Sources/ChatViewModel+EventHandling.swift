@@ -46,6 +46,8 @@ extension ChatViewModel {
             criticalPriorityRequests.removeAll { $0.id == id }
         case .connected:
             handleConnected()
+        case .workerPaneCapture(let capture):
+            remotePaneViewer.apply(capture)
         case .resyncRequired:
             handleResyncRequired() // socket never went down; see ChatViewModel+ResyncRefetch.swift
         case .appSessionRegistered:
@@ -61,6 +63,8 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            // The engine ends a capture with its session.
+            remotePaneViewer.connectionLost()
             failOutstandingMergeRequests(message: "Connection lost while requesting merge. Check the PR before retrying.")
             reviewNotifier.suspendDecisionReminders()
             remediationStateRequestID = nil

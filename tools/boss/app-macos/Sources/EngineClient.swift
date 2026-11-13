@@ -821,6 +821,9 @@ final class EngineClient: @unchecked Sendable {
                 ))
             } else if eventType == "resync_required" {
                 emit(.resyncRequired)
+            } else if eventType == "worker_pane_capture",
+                      let capture = RemotePaneCapture(wire: eventPayload) {
+                emit(.workerPaneCapture(capture))
             }
         case "products_list":
             let products = (payload["products"] as? [[String: Any]] ?? []).compactMap(parseProduct)

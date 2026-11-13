@@ -512,6 +512,10 @@ final class ChatViewModel: ObservableObject {
     /// panel, ContentView root). Only the views that actually read
     /// live state subscribe to the store.
     let liveWorkerStates = LiveWorkerStateStore()
+    /// Read-only views of workers on other hosts. Its own `ObservableObject`
+    /// for the same reason as `liveWorkerStates`: snapshots arrive every few
+    /// seconds and must not invalidate views that observe `ChatViewModel`.
+    let remotePaneViewer = RemotePaneViewerModel()
     /// Engine-owned membership; publish only when a card changes section,
     /// not for every tool/activity event in the high-rate live worker feed.
     @Published var doingSectionsByID: [String: DoingSection] = [:]
@@ -942,6 +946,7 @@ final class ChatViewModel: ObservableObject {
         defer { isRestoringWorkSelection = false }
         isWorkSidebarHidden = defaults.bool(forKey: "boss.work.sidebarHidden")
         bindBoardReadObserver()
+        bindRemotePaneViewer()
         commentBridge.onSubmissionRejected = { [weak self] action in
             self?.showActionNotSaved(requestKind: action)
         }

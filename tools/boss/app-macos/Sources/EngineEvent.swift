@@ -39,6 +39,9 @@ enum EngineEvent {
     /// `ChatViewModel+ResyncRefetch.swift`), silently, with no
     /// connection-lost UI.
     case resyncRequired
+    /// A read-only text snapshot (or the reason there is none) of a remote
+    /// worker's pane, pushed on `pane_capture.<run_id>` while subscribed.
+    case workerPaneCapture(RemotePaneCapture)
     case workInvalidated(topic: String, productId: String?, itemIds: [String], invalidationClass: InvalidationClass = .structural)
     /// Reply to `get_work_runtime_patch`: the named cards, and the rest of
     /// each one's revision chain, re-read without a board assembly. `absent`
