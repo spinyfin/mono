@@ -18,6 +18,18 @@ pub(crate) const RUNG_FULL_WORKER: i64 = 3;
 /// queued for its first dispatch.
 const UNDISPATCHED_REVISION_GRACE_SECS: i64 = 30 * 60;
 
+#[cfg(test)]
+type AfterStalePendingSelectionHook = Box<dyn FnMut(&rusqlite::Transaction<'_>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Invoked inside [`WorkDb::retire_stale_pending_conflict_attempts`] after
+    /// the eligibility read and before each UPDATE, so tests can stamp liveness
+    /// in that window. Taken once per call.
+    static AFTER_STALE_PENDING_SELECTION: std::cell::RefCell<Option<AfterStalePendingSelectionHook>> =
+        std::cell::RefCell::new(None);
+}
+
 /// One candidate row read by
 /// [`WorkDb::reconcile_orphaned_conflict_ladder_attempts`]:
 /// `(work_item_id, product_id, pr_url, blocked_attempt_id, attempt_status,
@@ -122,53 +134,7 @@ impl WorkDb {
     ///      engine restart, so it is not trusted on its own.
     pub fn is_conflict_revision_running_or_queued(&self, revision_task_id: &str) -> Result<bool> {
         let conn = self.connect()?;
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT status, created_at FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
-                params![revision_task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((status, created_at)) = row else {
-            return Ok(false);
-        };
-        let (started, queued, any): (bool, bool, bool) = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_executions
-                            WHERE work_item_id = ?1
-                              AND status NOT IN ('queued', 'ready', 'waiting_dependency',
-                                                 'completed', 'failed', 'abandoned', 'cancelled', 'orphaned')),
-                    EXISTS(SELECT 1 FROM work_executions
-                            WHERE work_item_id = ?1
-                              AND status IN ('queued', 'ready', 'waiting_dependency')),
-                    EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1)",
-            params![revision_task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        if started {
-            return Ok(true);
-        }
-        // A revision parked on the architectural-mismatch question is waiting
-        // for the repo owner, not dead: it stays the attempt's fix vehicle so
-        // the poller neither supersedes it nor mints a competitor.
-        if status == "blocked"
-            && super::conflict_mismatch::conflict_revision_awaits_mismatch_answer(&conn, revision_task_id)?
-        {
-            return Ok(true);
-        }
-        if !matches!(status.as_str(), "todo" | "active") {
-            return Ok(false);
-        }
-        if queued {
-            return Ok(true);
-        }
-        if any {
-            return Ok(false);
-        }
-        // Never dispatched: queued for its first dispatch, but only for a
-        // grace window so an undispatchable revision cannot wedge the PR.
-        let created: i64 = created_at.parse().unwrap_or(0);
-        let now: i64 = now_string().parse().unwrap_or(0);
-        Ok(now - created <= UNDISPATCHED_REVISION_GRACE_SECS)
+        is_conflict_revision_running_or_queued_on(&conn, revision_task_id)
     }
 
     /// Insert a `conflict_resolutions` row with `status='pending'`
@@ -378,6 +344,22 @@ impl WorkDb {
         }
     }
 
+    /// Non-terminal conflict attempts for `work_item_id`, newest first.
+    /// CI-watch uses the full list so an older live writer is not hidden
+    /// by a newer pending row whose revision is already dead.
+    pub fn active_conflict_resolutions_for_work_item(&self, work_item_id: &str) -> Result<Vec<ConflictResolution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CONFLICT_RESOLUTION_COLUMNS}
+             FROM conflict_resolutions
+             WHERE work_item_id = ?1
+               AND status IN ('pending', 'running')
+             ORDER BY created_at DESC, id DESC",
+        ))?;
+        let rows = stmt.query_map([work_item_id], map_conflict_resolution)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// True when this attempt still owns a worker or an in-flight mechanical
     /// rung. A bare `pending` row with no revision and no ladder marker is
     /// not live: it must not pre-empt CI on a mergeable PR.
@@ -394,18 +376,23 @@ impl WorkDb {
     /// Abandon `pending` conflict attempts that are no longer live: a later
     /// attempt for the same work item has reached a terminal state, or the
     /// PR is mergeable and no worker is running them. Leaves `running`
-    /// rows, in-flight mechanical rungs, and pending attempts that have a
-    /// revision. Used by the merge poller on unblocked rows (the
+    /// rows, in-flight mechanical rungs, and pending attempts whose linked
+    /// revision is still running or queued. A pending row whose revision is
+    /// already dead is retired — that is an orphan-sweep leftover, not a
+    /// live writer. Used by the merge poller on unblocked rows (the
     /// blocked-row retire path does not run for them) and by CI-watch so
     /// a leftover pending row cannot suppress a CI-fix revision. Eligibility
-    /// and the UPDATE run in one immediate transaction; the UPDATE itself
-    /// requires `pending`, no revision, and no in-flight mechanical rung, so
-    /// a row that becomes live after it is listed is not abandoned.
-    /// Returns how many rows were abandoned.
+    /// and the UPDATE run in one immediate transaction. Revision liveness is
+    /// checked on that transaction; the UPDATE requires `pending`, no
+    /// in-flight mechanical rung, and `revision_task_id` still equal to the
+    /// value that was read, so a row that becomes live after it is listed
+    /// is not abandoned. Returns how many rows were abandoned.
     pub fn retire_stale_pending_conflict_attempts(&self, work_item_id: &str, pr_is_mergeable: bool) -> Result<usize> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
+        #[cfg(test)]
+        let after_selection = AFTER_STALE_PENDING_SELECTION.with(|cell| cell.borrow_mut().take());
         let pending = {
             let mut stmt = tx.prepare(&format!(
                 "SELECT {CONFLICT_RESOLUTION_COLUMNS}
@@ -416,15 +403,26 @@ impl WorkDb {
             let rows = stmt.query_map(params![work_item_id], map_conflict_resolution)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        #[cfg(test)]
+        if let Some(mut hook) = after_selection {
+            hook(&tx);
+        }
         let mut retired = 0;
         for attempt in pending {
             if attempt.event_source == "speculative_predicted" {
                 continue;
             }
-            // A revision or in-flight mechanical rung is a live branch writer.
-            // The UPDATE repeats these predicates so a row that becomes live
-            // after this read is not abandoned.
-            if attempt.revision_task_id.is_some() || attempt.mechanical_rung_in_flight.is_some() {
+            // An in-flight mechanical rung is a live branch writer. A linked
+            // revision is live only while it is running or queued; a dead
+            // revision must not keep the row around. The UPDATE repeats the
+            // mechanical-rung and revision-id predicates so a row that
+            // becomes live after this read is not abandoned.
+            if attempt.mechanical_rung_in_flight.is_some() {
+                continue;
+            }
+            if let Some(revision) = attempt.revision_task_id.as_deref()
+                && is_conflict_revision_running_or_queued_on(&tx, revision)?
+            {
                 continue;
             }
             let superseded = later_terminal_conflict_attempt_exists_on(&tx, &attempt)?;
@@ -443,9 +441,9 @@ impl WorkDb {
                         finished_at         = COALESCE(finished_at, ?3)
                   WHERE id = ?1
                     AND status = 'pending'
-                    AND revision_task_id IS NULL
-                    AND mechanical_rung_in_flight IS NULL",
-                params![attempt.id, reason, now],
+                    AND mechanical_rung_in_flight IS NULL
+                    AND revision_task_id IS ?4",
+                params![attempt.id, reason, now, attempt.revision_task_id.as_deref()],
             )?;
             if rows > 0 {
                 retired += 1;
@@ -459,6 +457,16 @@ impl WorkDb {
         }
         tx.commit()?;
         Ok(retired)
+    }
+
+    /// Install a one-shot hook that runs after this connection lists pending
+    /// rows and before it applies the stale-pending UPDATE. Tests use it to
+    /// stamp liveness in that window; production never sets it.
+    #[cfg(test)]
+    pub fn set_after_stale_pending_selection_hook(&self, hook: impl FnMut(&rusqlite::Transaction<'_>) + 'static) {
+        AFTER_STALE_PENDING_SELECTION.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(hook));
+        });
     }
 
     /// Store the engine-collected diagnosis JSON on a pending attempt,
@@ -1568,6 +1576,59 @@ pub(crate) fn mark_conflict_resolution_succeeded_at_rung_in_tx(
         retire_superseded_pending_conflict_attempts_in_tx(conn, &row.work_item_id, attempt_id, &now)?;
     }
     Ok(updated)
+}
+
+/// Same liveness rules as [`WorkDb::is_conflict_revision_running_or_queued`],
+/// evaluated on an already-open connection so a caller holding an IMMEDIATE
+/// transaction sees a consistent snapshot.
+fn is_conflict_revision_running_or_queued_on(conn: &Connection, revision_task_id: &str) -> Result<bool> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT status, created_at FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            params![revision_task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((status, created_at)) = row else {
+        return Ok(false);
+    };
+    let (started, queued, any): (bool, bool, bool) = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_executions
+                        WHERE work_item_id = ?1
+                          AND status NOT IN ('queued', 'ready', 'waiting_dependency',
+                                             'completed', 'failed', 'abandoned', 'cancelled', 'orphaned')),
+                EXISTS(SELECT 1 FROM work_executions
+                        WHERE work_item_id = ?1
+                          AND status IN ('queued', 'ready', 'waiting_dependency')),
+                EXISTS(SELECT 1 FROM work_executions WHERE work_item_id = ?1)",
+        params![revision_task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if started {
+        return Ok(true);
+    }
+    // A revision parked on the architectural-mismatch question is waiting
+    // for the repo owner, not dead: it stays the attempt's fix vehicle so
+    // the poller neither supersedes it nor mints a competitor.
+    if status == "blocked"
+        && super::conflict_mismatch::conflict_revision_awaits_mismatch_answer(conn, revision_task_id)?
+    {
+        return Ok(true);
+    }
+    if !matches!(status.as_str(), "todo" | "active") {
+        return Ok(false);
+    }
+    if queued {
+        return Ok(true);
+    }
+    if any {
+        return Ok(false);
+    }
+    // Never dispatched: queued for its first dispatch, but only for a
+    // grace window so an undispatchable revision cannot wedge the PR.
+    let created: i64 = created_at.parse().unwrap_or(0);
+    let now: i64 = now_string().parse().unwrap_or(0);
+    Ok(now - created <= UNDISPATCHED_REVISION_GRACE_SECS)
 }
 
 /// True when a later (by `created_at`, then `id`) non-speculative attempt

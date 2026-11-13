@@ -1342,10 +1342,13 @@ pub(crate) fn retire_moot_conflict_revisions(
 ) -> usize {
     // Ledger cleanup for leftover `pending` attempts: a later attempt that
     // already reached a terminal state, or a pending row sitting on a
-    // mergeable PR with no worker. Runs even when the parent is unblocked
-    // (the `maybe_clear_blocked` retire path never sees those rows) and
-    // even when the product opted out of auto-maintenance — this is not a
-    // new remediation, it is retiring an attempt that is no longer live.
+    // mergeable PR with no live worker. A pending row whose linked
+    // revision is already dead is retired too; only a running/queued
+    // revision or an in-flight mechanical rung keeps the row. Runs even
+    // when the parent is unblocked (the `maybe_clear_blocked` retire path
+    // never sees those rows) and even when the product opted out of
+    // auto-maintenance — this is not a new remediation, it is retiring an
+    // attempt that is no longer live.
     if let Err(err) = work_db.retire_stale_pending_conflict_attempts(&candidate.work_item_id, true) {
         tracing::warn!(
             work_item_id = %candidate.work_item_id,

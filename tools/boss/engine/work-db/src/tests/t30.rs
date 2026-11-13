@@ -645,3 +645,81 @@ fn retire_stale_pending_leaves_attempt_that_became_live() {
         "pending"
     );
 }
+
+/// Plant a `kind=revision` row, flip it to a terminal status so liveness
+/// reports it dead, and link it on the attempt.
+fn attach_dead_revision(db: &WorkDb, product_id: &str, chore_id: &str, attempt_id: &str) -> String {
+    let revision = insert_revision_row(db, product_id, chore_id);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", params![revision])
+        .unwrap();
+    db.set_conflict_resolution_revision_task_id(attempt_id, &revision)
+        .unwrap()
+        .unwrap();
+    revision
+}
+
+/// A pending attempt whose linked revision is already dead is retired as
+/// superseded even while the PR is still conflicting.
+#[test]
+fn retire_stale_pending_abandons_dead_revision_when_superseded() {
+    let (db, product, chore) = seed_product_and_chore("retire-dead-rev-superseded");
+    let stale = insert_attempt(&db, &product, &chore, "base-old");
+    attach_dead_revision(&db, &product, &chore, &stale.id);
+    let later = insert_attempt(&db, &product, &chore, "base-new");
+    db.mark_conflict_resolution_succeeded(&later.id, None).unwrap();
+    assert_eq!(
+        db.get_conflict_resolution(&stale.id).unwrap().unwrap().status,
+        "pending",
+        "insert-time supersession leaves a revision-backed pending row"
+    );
+
+    let n = db.retire_stale_pending_conflict_attempts(&chore, false).unwrap();
+    assert_eq!(n, 1);
+    let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
+    assert_eq!(stale_row.status, "abandoned");
+    assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
+}
+
+/// A pending attempt whose linked revision is already dead is retired on a
+/// mergeable PR even with no later terminal row.
+#[test]
+fn retire_stale_pending_abandons_dead_revision_when_pr_is_mergeable() {
+    let (db, product, chore) = seed_product_and_chore("retire-dead-rev-mergeable");
+    let pending = insert_attempt(&db, &product, &chore, "base-only");
+    attach_dead_revision(&db, &product, &chore, &pending.id);
+
+    let n = db.retire_stale_pending_conflict_attempts(&chore, true).unwrap();
+    assert_eq!(n, 1);
+    let row = db.get_conflict_resolution(&pending.id).unwrap().unwrap();
+    assert_eq!(row.status, "abandoned");
+    assert_eq!(row.failure_reason.as_deref(), Some("pr_mergeable_attempt_stale"));
+    assert!(db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none());
+}
+
+/// A liveness write that lands after the eligibility read must survive:
+/// the UPDATE requires the revision id that was read and no mechanical
+/// rung, so stamping a rung in that window is a no-op on the row.
+#[test]
+fn retire_stale_pending_leaves_attempt_that_became_live_after_selection() {
+    let (db, product, chore) = seed_product_and_chore("retire-race-live");
+    let attempt = insert_attempt(&db, &product, &chore, "base-race");
+    let attempt_id = attempt.id.clone();
+    db.set_after_stale_pending_selection_hook(move |tx| {
+        tx.execute(
+            "UPDATE conflict_resolutions
+                SET mechanical_rung_in_flight = 0,
+                    cube_lease_id = 'lease-race',
+                    cube_workspace_id = 'ws-race'
+              WHERE id = ?1",
+            params![attempt_id],
+        )
+        .unwrap();
+    });
+
+    assert_eq!(db.retire_stale_pending_conflict_attempts(&chore, true).unwrap(), 0);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.mechanical_rung_in_flight, Some(0));
+}

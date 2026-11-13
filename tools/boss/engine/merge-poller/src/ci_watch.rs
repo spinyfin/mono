@@ -433,8 +433,11 @@ pub async fn on_ci_failure_detected(
     // auto-rebase attempt owns the slot. A leftover `pending` conflict
     // row on a mergeable PR does not — retire it (so upgrade leftover
     // rows are cleaned without a DB edit) and continue into CI handling.
-    // Superseded pending rows retire even when mergeability is Unknown;
-    // bare pending rows retire only on a clean PR.
+    // Superseded pending rows, including those whose linked revision is
+    // already dead, retire even when mergeability is Unknown; bare
+    // pending rows retire only on a clean PR. The gate then scans every
+    // remaining active attempt so an older live writer is not hidden by
+    // a newer dead-revision pending row.
     let mergeability_clean = probe_mergeability_clean(probe);
     if let Err(err) = work_db.retire_stale_pending_conflict_attempts(&candidate.work_item_id, mergeability_clean) {
         tracing::warn!(
@@ -461,22 +464,31 @@ pub async fn on_ci_failure_detected(
             return false;
         }
     }
-    match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
-        Ok(Some(attempt)) => {
-            let live = work_db.conflict_attempt_holds_live_worker(&attempt).unwrap_or(true);
-            if live || !mergeability_clean {
-                log_ci_failure_deferred(candidate, "active_conflict_resolution", Some(&attempt.id));
+    match work_db.active_conflict_resolutions_for_work_item(&candidate.work_item_id) {
+        Ok(attempts) => {
+            // Any live writer pre-empts CI, including an older mechanical
+            // rung hidden behind a newer pending row whose revision is dead.
+            if let Some(live) = attempts
+                .iter()
+                .find(|attempt| work_db.conflict_attempt_holds_live_worker(attempt).unwrap_or(true))
+            {
+                log_ci_failure_deferred(candidate, "active_conflict_resolution", Some(&live.id));
                 return false;
             }
-            tracing::info!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                gate = "stale_conflict_attempt_ignored",
-                attempt_id = %attempt.id,
-                "ci_watch: pending conflict attempt is not live on a mergeable PR; not deferring",
-            );
+            if let Some(attempt) = attempts.first() {
+                if !mergeability_clean {
+                    log_ci_failure_deferred(candidate, "active_conflict_resolution", Some(&attempt.id));
+                    return false;
+                }
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    gate = "stale_conflict_attempt_ignored",
+                    attempt_id = %attempt.id,
+                    "ci_watch: pending conflict attempt is not live on a mergeable PR; not deferring",
+                );
+            }
         }
-        Ok(None) => {}
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,

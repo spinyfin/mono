@@ -329,6 +329,30 @@ async fn pending_conflict_on_unknown_mergeability_still_defers() {
     assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
 }
 
+fn attach_dead_conflict_revision(db: &WorkDb, chore: &str, attempt_id: &str) -> String {
+    let revision = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(chore.to_owned())
+                .description("Resolve merge conflict against main")
+                .created_via(format!("merge-conflict:{attempt_id}"))
+                .build(),
+            &fix_checker(),
+        )
+        .unwrap();
+    db.set_conflict_resolution_revision_task_id(attempt_id, &revision.id)
+        .unwrap()
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+    revision.id
+}
+
 #[tokio::test]
 async fn superseded_pending_conflict_on_unknown_mergeability_does_not_suppress_ci_fix() {
     let dir = tempdir().unwrap();
@@ -359,6 +383,91 @@ async fn superseded_pending_conflict_on_unknown_mergeability_does_not_suppress_c
     let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
     assert_eq!(stale_row.status, "abandoned");
     assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
+}
+
+#[tokio::test]
+async fn superseded_pending_with_dead_revision_on_unknown_mergeability_does_not_suppress_ci_fix() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/49";
+    let (product, chore) = make_in_review(&db, "C-dead-rev-unknown", pr);
+
+    let stale = insert_conflict_attempt(&db, &product, &chore, pr, 49, "base-1", "head-old");
+    attach_dead_conflict_revision(&db, &chore, &stale.id);
+    let later = insert_conflict_attempt(&db, &product, &chore, pr, 49, "base-1", "head-new");
+    db.mark_conflict_resolution_succeeded(&later.id, None).unwrap().unwrap();
+    assert_eq!(
+        db.get_conflict_resolution(&stale.id).unwrap().unwrap().status,
+        "pending",
+        "a dead-revision pending row survives insert of a later attempt"
+    );
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_unknown_mergeability(pr, "head-fail"),
+        &one_failure(),
+    )
+    .await;
+    assert!(
+        flipped,
+        "a superseded pending row with a dead revision must be retired even while mergeability is unknown"
+    );
+    let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
+    assert_eq!(stale_row.status, "abandoned");
+    assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("a CI-fix attempt must be created");
+    assert_eq!(attempt.attempt_kind, "fix");
+}
+
+#[tokio::test]
+async fn older_mechanical_rung_preempts_ci_when_newer_pending_revision_is_dead() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/50";
+    let (product, chore) = make_in_review(&db, "C-older-mech-dead-rev", pr);
+
+    let live = insert_conflict_attempt(&db, &product, &chore, pr, 50, "base-1", "head-old");
+    db.stamp_conflict_resolution_mechanical_rung(&live.id, 1, "lease-1", "ws-1")
+        .unwrap()
+        .unwrap();
+    let newer = insert_conflict_attempt(&db, &product, &chore, pr, 50, "base-1", "head-new");
+    attach_dead_conflict_revision(&db, &chore, &newer.id);
+    assert_eq!(
+        db.active_conflict_resolution_for_work_item(&chore)
+            .unwrap()
+            .map(|a| a.id),
+        Some(newer.id.clone()),
+        "the newest pending row is the dead-revision attempt"
+    );
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-fail"),
+        &one_failure(),
+    )
+    .await;
+    assert!(
+        !flipped,
+        "an older in-flight mechanical rung must still pre-empt CI on a mergeable PR"
+    );
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+    let live_row = db.get_conflict_resolution(&live.id).unwrap().unwrap();
+    assert_eq!(live_row.status, "pending");
+    assert_eq!(live_row.mechanical_rung_in_flight, Some(1));
+    let newer_row = db.get_conflict_resolution(&newer.id).unwrap().unwrap();
+    assert_eq!(newer_row.status, "abandoned");
+    assert_eq!(newer_row.failure_reason.as_deref(), Some("pr_mergeable_attempt_stale"));
 }
 
 #[tokio::test]
