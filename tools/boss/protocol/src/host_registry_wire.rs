@@ -38,6 +38,25 @@ pub struct HostSnapshot {
     /// All capabilities on this host (both auto-discovered and
     /// user-tagged), ordered source-then-name.
     pub capabilities: Vec<HostCapabilitySnapshot>,
+    /// Release the spoke reports it is running. Absent for hosts that
+    /// have never sent inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_release: Option<String>,
+    /// Release the hub wants this host on (the hub's own Boss release).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_release: Option<String>,
+    /// `current`, `behind`, `upgrading`, `failed`, or `unpublished`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_state: Option<String>,
+    /// Epoch-seconds of the last helper attempt the spoke reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upgrade_at: Option<String>,
+    /// Helper result code (`ok`, `manifest_sig`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upgrade_result: Option<String>,
+    /// Helper error text from the last attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upgrade_error: Option<String>,
 }
 
 /// One capability on a host.

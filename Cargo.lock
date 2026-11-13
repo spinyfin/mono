@@ -646,6 +646,7 @@ dependencies = [
  "boss-review-guide",
  "boss-single-flight",
  "boss-spoke-adapter",
+ "boss-spoke-upgrade",
  "boss-ssh-transport",
  "boss-task-scope",
  "boss-timer-wheel",
@@ -1794,6 +1795,7 @@ dependencies = [
  "base64 0.22.1",
  "bon",
  "boss-http-retry",
+ "boss-protocol-spoke",
  "boss-spoke-preflight",
  "clap",
  "flate2",
@@ -1846,6 +1848,30 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "boss-spoke-upgrade"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "boss-host-enrollment",
+ "boss-http-retry",
+ "boss-protocol-spoke",
+ "boss-spoke-hub",
+ "boss-spoke-stream",
+ "boss-work-db",
+ "prost",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

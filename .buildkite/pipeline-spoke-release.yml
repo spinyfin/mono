@@ -11,8 +11,10 @@
 # NOT automatic: it ships inert until the fleet administrator registers it and
 # stores the release signing key. See tools/boss/spoke-package/README.md.
 #
-# Trigger model: scheduled (cron) builds skip unless a spoke crate changed since
-# the last tag; manual builds always release. Do not wire it to build on push.
+# Trigger model: a Boss release pins spoke packages to that Boss version and
+# source commit. Scheduled runs never cut a spoke release from HEAD and never
+# resume a draft, so they cannot race a build already filling one. Manual UI/API
+# builds create or resume the pinned draft at that SHA. Do not wire it to build on push.
 #
 # Structure: a static `prepare` step (skip logic, version, tag, DRAFT GitHub
 # Release) uploads .buildkite/pipeline-spoke-release-builds.yml only when a

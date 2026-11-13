@@ -15,6 +15,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/spoke-hub:__pkg__",
+        "//tools/boss/engine/spoke-upgrade:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/host-enrollment",

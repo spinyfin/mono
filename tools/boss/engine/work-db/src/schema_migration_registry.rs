@@ -434,6 +434,21 @@ pub(super) fn all() -> Vec<Migration> {
             apply: spoke_projection::migrate_turn_state,
         },
         Migration {
+            id: spoke_upgrade::HUB_OUTCOME_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_upgrade::migrate_hub_outcome,
+        },
+        Migration {
+            id: spoke_upgrade::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_upgrade::migrate,
+        },
+        Migration {
+            id: spoke_upgrade::PROGRESS_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_upgrade::migrate_progress,
+        },
+        Migration {
             id: task_status_audit::DEFERRED_MIGRATION_ID.into(),
             legacy_version: None,
             apply: task_status_audit::migrate_deferred,

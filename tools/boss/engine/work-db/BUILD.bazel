@@ -23,6 +23,7 @@ rust_library(
         "//tools/boss/engine/progression-brief:__pkg__",
         "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/spoke-hub:__pkg__",
+        "//tools/boss/engine/spoke-upgrade:__pkg__",
     ],
     deps = [
         "//lib/rust/git_utils",
@@ -75,6 +76,7 @@ rust_library(
         "//tools/boss/engine/progression-brief:__pkg__",
         "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/spoke-hub:__pkg__",
+        "//tools/boss/engine/spoke-upgrade:__pkg__",
     ],
     deps = [
         "//lib/rust/git_utils",

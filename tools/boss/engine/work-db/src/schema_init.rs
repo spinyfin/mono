@@ -971,6 +971,18 @@ mod floor_tests {
                 Box::new(|c| super::super::spoke_projection::migrate_applied_writes(c).unwrap()),
             ),
             (
+                super::super::spoke_upgrade::HUB_OUTCOME_MIGRATION_ID,
+                Box::new(|c| super::super::spoke_upgrade::migrate_hub_outcome(c).unwrap()),
+            ),
+            (
+                super::super::spoke_upgrade::MIGRATION_ID,
+                Box::new(|c| super::super::spoke_upgrade::migrate(c).unwrap()),
+            ),
+            (
+                super::super::spoke_upgrade::PROGRESS_MIGRATION_ID,
+                Box::new(|c| super::super::spoke_upgrade::migrate_progress(c).unwrap()),
+            ),
+            (
                 super::super::parking::MIGRATION_ID,
                 Box::new(|c| super::super::parking::migrate(c).unwrap()),
             ),

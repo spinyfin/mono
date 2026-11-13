@@ -10,9 +10,9 @@
 # signature; authenticity is the `.manifest.json.sig` and the installer `.sig`
 # against the pinned release key.
 #
-# change_paths lists the spoke's own crates. A change in a library it links (the
-# driver or tmux crates, say) does not by itself cut a scheduled release; a
-# manual run always does.
+# change_paths lists the spoke's own crates. Scheduled runs never cut a new
+# release from HEAD and never resume a draft: a Boss release (or a manual run)
+# creates and builds the draft at the pinned Boss commit.
 repo = "spinyfin/mono"
 tag_prefix = "boss-spoke-v"
 title_prefix = "Boss spoke"
@@ -40,6 +40,9 @@ required_assets = [
   "boss-spoke-linux-amd64.manifest.json.sig",
   "boss-spoke-package-linux-amd64",
   "boss-spoke-package-linux-amd64.sig",
+  "spoke-packages.macos-arm64.json",
+  "spoke-packages.linux-amd64.json",
+  "spoke-packages.json",
 ]
 # No Linux arm64 build agent exists yet; the step script already builds it when
 # one runs the `build` phase, and `publish` accepts it when present.
@@ -49,6 +52,7 @@ optional_assets = [
   "boss-spoke-linux-arm64.manifest.json.sig",
   "boss-spoke-package-linux-arm64",
   "boss-spoke-package-linux-arm64.sig",
+  "spoke-packages.linux-arm64.json",
 ]
 
 [version]

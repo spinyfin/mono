@@ -5,3 +5,8 @@ exports_files(
     ["disk-cache-gc-cap.sh"],
     visibility = ["//.buildkite/steps/tests:__pkg__"],
 )
+
+exports_files(
+    ["spoke-release.sh"],
+    visibility = ["//tools/release:__pkg__"],
+)

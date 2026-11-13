@@ -21,6 +21,7 @@ rust_library(
     deps = [
         "//tools/boss/engine/spoke-preflight",
         "//tools/boss/http_retry",
+        "//tools/boss/protocol-spoke",
     ] + all_crate_deps(normal = True),
 )
 

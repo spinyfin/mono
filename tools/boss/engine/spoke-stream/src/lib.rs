@@ -173,6 +173,56 @@ impl StreamManager {
         Some(connection.session.selection.has(feature))
     }
 
+    /// Connection generation of `host_id`'s active connection, `None` when it
+    /// is not connected. A different value means the spoke reconnected.
+    pub async fn connection_generation(&self, host_id: &str) -> Option<u64> {
+        let host = self.0.hosts.lock().await.get(host_id).cloned()?;
+        let guard = host.lock().await;
+        let connection = guard.as_ref().filter(|c| c.active.load(Ordering::Acquire))?;
+        Some(connection.session.generation)
+    }
+
+    /// Host ids with an active connection, sorted. Used by sequential upgrade
+    /// so an offline host is offered when it next appears here.
+    pub async fn connected_hosts(&self) -> Vec<String> {
+        let hosts: Vec<(String, Host)> = {
+            let guard = self.0.hosts.lock().await;
+            guard.iter().map(|(id, host)| (id.clone(), Arc::clone(host))).collect()
+        };
+        let mut ids = Vec::new();
+        for (id, host) in hosts {
+            let guard = host.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|connection| connection.active.load(Ordering::Acquire))
+            {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    /// Durable result for `command_id`, if the outbox has committed one.
+    /// A store error is distinct from an absent command.
+    pub async fn command_result(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> Result<Option<CommandResult>, store::StoreError> {
+        self.0.storage.outbox.completed(host_id, command_id).await
+    }
+
+    /// Durable original command, if the outbox still has it.
+    /// A store error is distinct from an absent command.
+    pub async fn stored_command(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> Result<Option<boss_protocol_spoke::v1::Command>, store::StoreError> {
+        self.0.storage.outbox.command(host_id, command_id).await
+    }
+
     pub(crate) fn publish_capture(&self, host_id: &str, record: &boss_protocol_spoke::v1::Record) {
         use boss_protocol_spoke::v1::record::Body;
         let (Some(Body::Capture(capture)), Some(run)) = (&record.body, &record.run) else {

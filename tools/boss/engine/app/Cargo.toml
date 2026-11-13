@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 boss-spoke-adapter = { path = "../spoke-adapter" }
+boss-spoke-upgrade = { path = "../spoke-upgrade" }
 boss-command-runner = { path = "../../command-runner" }
 boss-engine-runtime = { path = "../core/runtime" }
 boss-execution-runner = { path = "../execution-runner" }

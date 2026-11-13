@@ -39,9 +39,11 @@ rust_library(
         "//tools/boss/engine/spoke-journal:__pkg__",
         "//tools/boss/engine/spoke-outbound:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
+        "//tools/boss/engine/spoke-upgrade:__pkg__",
         "//tools/boss/engine/spoke-worker-api:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
         "//tools/boss/spoke-credentials:__pkg__",
+        "//tools/boss/spoke-package:__pkg__",
     ],
     deps = [
         ":spoke_v1_rust_proto",

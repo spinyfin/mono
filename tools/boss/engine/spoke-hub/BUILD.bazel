@@ -16,6 +16,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-upgrade:__pkg__",
     ],
     deps = [
         "//tools/boss/backoff",
@@ -43,6 +44,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-upgrade:__pkg__",
     ],
     deps = [
         "//tools/boss/backoff",

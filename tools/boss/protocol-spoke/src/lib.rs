@@ -184,6 +184,16 @@ pub mod v1 {
 
 pub use validate::{Validate, ValidationError};
 
+/// Package id for inventory `(os, arch)`, matching spoke package platforms.
+pub fn package_platform(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("macos-arm64"),
+        ("linux", "x86_64") => Some("linux-amd64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        _ => None,
+    }
+}
+
 /// Whether a spawn reply requires a fresh observation before finalizing launch.
 pub fn spawn_result_is_uncertain(result: &v1::CommandResult) -> bool {
     use v1::{PaneLife, ResultCode, command_result};

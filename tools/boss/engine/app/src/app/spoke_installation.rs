@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use boss_engine_runtime::hub::{BoundHub, HubConfig, HubStream};
 use boss_execution_contracts::{HostAdapterProvider, RunOutcome, RunWaitState};
 use boss_spoke_adapter::{ComposedSpawn, SpawnComposer, SpawnInput, SpokeAdapterConfig, SpokeHostAdapterProvider};
+use boss_spoke_upgrade::UpgradeController;
 use boss_work_db::WorkDb;
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -142,14 +143,20 @@ impl Prepared {
         signals: Arc<dyn boss_execution_contracts::DriverSignals>,
     ) -> Arc<dyn HostAdapterProvider> {
         let Self { db, bound, hosts } = self;
+        let manager = bound.stream.manager().clone();
         let provider = Arc::new(SpokeHostAdapterProvider::new(
             inner,
-            bound.stream.manager().clone(),
+            manager.clone(),
             Arc::new(db.clone()),
-            Arc::new(Composer { db, hosts }),
+            Arc::new(Composer { db: db.clone(), hosts }),
             SpokeAdapterConfig::builder().build(),
             signals,
         ));
+        let desired = boss_engine_runtime::build_info::version().to_owned();
+        let catalog = boss_spoke_upgrade::production_catalog();
+        boss_task_scope::spawn(async move {
+            boss_spoke_upgrade::run(UpgradeController::new(db, manager, desired, catalog)).await;
+        });
         boss_task_scope::spawn(async move {
             if let Err(error) = bound.serve().await {
                 tracing::error!(error = %error, "spoke listener stopped");

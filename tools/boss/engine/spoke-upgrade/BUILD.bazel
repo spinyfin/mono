@@ -1,0 +1,80 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Hub-driven spoke upgrade rollout: desired release is the hub's own stamped
+# Boss version, offered one host at a time over the management contract.
+rust_library(
+    name = "spoke-upgrade",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_upgrade",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/app:__pkg__"],
+    deps = [
+        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/http_retry",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "spoke_upgrade_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+    },
+    crate_name = "boss_spoke_upgrade",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/app:__pkg__"],
+    deps = [
+        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/http_retry",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "spoke-upgrade_test",
+    size = "small",
+    crate = ":spoke-upgrade",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "integration_test",
+    size = "medium",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-upgrade",
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-hub",
+        "//tools/boss/engine/spoke-stream",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
