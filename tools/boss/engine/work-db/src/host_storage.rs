@@ -240,11 +240,11 @@ impl WorkDb {
             |r| r.get(0),
         )?;
         // Only a host on the legacy transport is disabled by failures. A spoke
-        // host's enablement is operator state; its failures surface through
-        // failed preflights and missing reports, which already withhold its
-        // budget without changing what the operator configured.
+        // host's enablement is explicit configuration; dispatch failures stay
+        // diagnostic and never change it. Failed preflights and missing reports
+        // already withhold its budget.
         let legacy: bool = conn.query_row(
-            "SELECT NOT EXISTS (SELECT 1 FROM host_transports WHERE host_id = ?1 AND transport != 'legacy_ssh')",
+            "SELECT NOT EXISTS (SELECT 1 FROM host_transports WHERE host_id = ?1 AND transport = 'spoke_ready')",
             params![id],
             |r| r.get(0),
         )?;
@@ -744,7 +744,7 @@ mod tests {
         );
     }
 
-    /// A spoke host's enablement is operator state: dispatch failures are
+    /// Enablement is explicit configuration: dispatch failures are
     /// recorded for diagnosis but never disable it or publish a disable.
     #[tokio::test]
     async fn spoke_host_dispatch_failures_never_change_enablement() {

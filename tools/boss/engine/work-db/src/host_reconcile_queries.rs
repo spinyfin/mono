@@ -51,7 +51,7 @@ impl WorkDb {
                    NOT EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id)
                    OR EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id AND h.enabled = 0
                               AND NOT EXISTS (SELECT 1 FROM host_transports t
-                                              WHERE t.host_id = h.id AND t.transport != 'legacy_ssh'))
+                                              WHERE t.host_id = h.id AND t.transport = 'spoke_ready'))
                )
              ORDER BY e.created_at ASC, e.id ASC",
         )?;
@@ -89,7 +89,7 @@ impl WorkDb {
                         WHEN NOT EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id) THEN 1
                         WHEN EXISTS (SELECT 1 FROM hosts h WHERE h.id = r.host_id AND h.enabled = 0
                                      AND NOT EXISTS (SELECT 1 FROM host_transports t
-                                                     WHERE t.host_id = h.id AND t.transport != 'legacy_ssh')) THEN 1
+                                                     WHERE t.host_id = h.id AND t.transport = 'spoke_ready')) THEN 1
                         ELSE 0
                     END
                  FROM work_runs r

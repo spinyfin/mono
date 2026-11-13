@@ -932,9 +932,6 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
     }
 
-    /// Classify the pane. `Missing` only when tmux positively reports the
-    /// session absent or owned by another token; any failed or unparseable
-    /// query is `Indeterminate`, never a guess.
     /// Observe token-identified sessions for a replay readiness barrier.
     pub async fn inventory(&self) -> Result<Vec<boss_protocol_spoke::v1::RunObservation>> {
         let mut observations = Vec::new();
@@ -953,6 +950,9 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         Ok(observations)
     }
 
+    /// Classify the pane. `Missing` only when tmux positively reports the
+    /// session absent or owned by another token; any failed or unparseable
+    /// query is `Indeterminate`, never a guess.
     async fn observe(&self, record: &ExecutionRecord) -> PaneState {
         let mut pane = PaneState {
             session: record.session.clone(),

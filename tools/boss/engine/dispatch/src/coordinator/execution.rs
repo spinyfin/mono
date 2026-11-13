@@ -268,7 +268,7 @@ impl ExecutionCoordinator {
                     .map(|caps| caps.into_iter().map(|c| c.capability).collect::<BTreeSet<_>>())
                     .context("host-selection: host capabilities")?;
                 let mut slot_host = host.clone();
-                let active_runs = if self.work_db.host_transport(&host.id)? != boss_work_db::HostTransport::LegacySsh {
+                let active_runs = if self.work_db.host_transport(&host.id)? == boss_work_db::HostTransport::SpokeReady {
                     slot_host.pool_size = self
                         .work_db
                         .available_host_budget(&host.id)
@@ -1160,6 +1160,21 @@ impl ExecutionCoordinator {
             .await
         {
             Ok(adapter) => adapter,
+            Err(err) if err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_some() => {
+                // Another dispatcher took the seat, or the freshness window closed
+                // after selection. Nothing has started: return the row to `ready`
+                // without spending a pre-start retry or raising attention.
+                tracing::info!(
+                    execution_id = %execution.id,
+                    host_id = %selected_host.id,
+                    "host budget was spent between selection and admission; deferring dispatch"
+                );
+                if let Err(release_err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(execution_id = %execution.id, ?release_err, "failed to release dispatch claim after budget deferral");
+                }
+                self.repo_lease_limiter.release(&execution.id);
+                return Err(anyhow!("serialized: execution {} deferred, {err:#}", execution.id));
+            }
             Err(err) if held_spoke_host.is_some() => {
                 return Err(self.park_held_spoke_attempt(execution, err).await);
             }

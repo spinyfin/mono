@@ -969,7 +969,7 @@ mod prompt_confirmation;
 mod semantic_progress;
 mod spoke_custody;
 mod spoke_hub;
-pub use host_capacity::{HOST_FRESHNESS_MS, HOST_UNREACHABLE_ATTENTION_MS, HostCapacityReport};
+pub use host_capacity::{HOST_FRESHNESS_MS, HOST_UNREACHABLE_ATTENTION_MS, HostBudgetExhausted, HostCapacityReport};
 mod spoke_ingress;
 mod spoke_probe;
 mod spoke_projection;

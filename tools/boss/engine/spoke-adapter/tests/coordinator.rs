@@ -446,7 +446,7 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
 }
 
 #[tokio::test]
-async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_retry_budget() {
+async fn unanswered_spoke_leases_park_without_spending_the_retry_budget() {
     // 300 ms is well under the 3 s observation window, so later dispatch
     // passes re-send the stored lease and hit the command deadline again.
     // Those re-sends must stay `LeaseOutcomeUncertain` (parked, retry
@@ -480,7 +480,7 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
     assert_eq!(
         env.pool.busy_count().await,
         0,
-        "no pool slot is held while a lease is in doubt"
+        "no worker-pool slot is held while a lease is in doubt"
     );
     assert_eq!(env.coordinator.repo_lease_limiter().in_flight(REPO), 0);
     assert_eq!(
@@ -510,6 +510,50 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
         executions.iter().all(|e| !attention_open(&fx, &e.id))
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_parked_lease_holds_a_host_seat_until_its_assignment_resolves() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
+    let peer = fx
+        .spoke(
+            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("one lease to be parked with attention", || {
+        executions.iter().any(|e| attention_open(&fx, &e.id))
+    })
+    .await;
+
+    // The single seat is taken: the other execution is not admitted.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let held: Vec<_> = executions
+        .iter()
+        .filter_map(|e| fx.db.spoke_assignment_for_execution(&e.id).unwrap().map(|a| (e, a)))
+        .collect();
+    assert_eq!(held.len(), 1, "only one execution holds the host's one seat");
+    assert_eq!(peer.commands().iter().filter(|c| is_lease(c)).count(), 1);
+    assert_eq!(fx.db.available_host_budget(HOST).unwrap(), 0);
+    // Losing the race for the seat defers the work; it is not a pre-start failure.
+    for execution in &executions {
+        let row = fx.db.get_execution(&execution.id).unwrap();
+        assert!(!row.status.is_terminal(), "{row:?}");
+        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    }
+
+    // Resolving the assignment frees the seat.
+    let (execution, assignment) = &held[0];
+    assert!(
+        fx.db
+            .resolve_spoke_assignment(&execution.id, assignment.assignment_generation, "never_started")
+            .unwrap()
+    );
+    assert_eq!(fx.db.available_host_budget(HOST).unwrap(), 1);
 }
 
 /// A host that stops answering after its lease was admitted, across more
