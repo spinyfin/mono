@@ -97,13 +97,12 @@ pub fn verb_decision(tier: RpcTier, request: &FrontendRequest) -> WorkerVerbDeci
 }
 
 fn worker_from_contract(request: &FrontendRequest) -> WorkerVerbDecision {
-    let verb = variant_name(request);
     match request_contract(request).worker {
         WorkerAccess::Allow => WorkerVerbDecision::Allow,
-        WorkerAccess::Redirect(selector) => redirect(verb, selector.as_command()),
-        WorkerAccess::Taxonomy => taxonomy(verb),
-        WorkerAccess::Runtime => runtime(verb),
-        WorkerAccess::Coordinator => coordinator(verb),
+        WorkerAccess::Redirect(selector) => redirect(variant_name(request), selector.as_command()),
+        WorkerAccess::Taxonomy => taxonomy(variant_name(request)),
+        WorkerAccess::Runtime => runtime(variant_name(request)),
+        WorkerAccess::Coordinator => coordinator(variant_name(request)),
     }
 }
 

@@ -87,6 +87,19 @@
 //! * [`WorkerAccess::Coordinator`]: coordinator/app verbs (session, planner,
 //!   automation management, operator comment actions).
 //!
+//! Per design §"Read-only model access and the exposure boundary", workers
+//! can read the model half: products, projects, sibling work items, dependency
+//! edges, PR bindings, attentions, comments, and sanitized execution/run rows.
+//! This lets them discover existing work and avoid acting on stale briefs.
+//! The runtime half stays isolated: dispatch, slots, panes, live status,
+//! transcripts, hosts, engine configuration, and session control remain denied.
+//! Execution rows are sanitized by worker-policy; GetRun/ListRuns additionally
+//! require the caller's own execution at the engine connection gate.
+//! Writes normally go through proposals; the narrow direct exceptions below
+//! are provenance-checked declarations or evidence from the caller's own run.
+//! See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`,
+//! §"Transport and authn: the worker RPC tier" and §"Non-goals".
+//!
 //! ## Progression access
 //!
 //! An independent Allow/Deny for every variant. Progression may read the work
@@ -281,6 +294,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
     match request {
         // Payload-dependent: the duplicate guard is off under `force_duplicate`.
         // Worker/progression do not follow that flag.
+        // New work goes through followup-task proposals, including bulk creates
+        // below; workers cannot directly expand the work taxonomy.
         R::CreateTask { input } => guarded_create(
             input.force_duplicate,
             WorkerAccess::Redirect(WorkerRedirect::FollowupTask),
@@ -297,6 +312,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             ProgressionAccess::Deny,
         ),
         // Payload-dependent: a redelivery re-pushes the handoff.
+        // The handoff contains the operator's standing instructions to the
+        // coordinator's successor; workers may neither read nor rewrite it.
         R::GetCoordinatorHandoff { redeliver } => RequestContract::new(
             if *redeliver {
                 ReplayContract::Never
@@ -308,6 +325,10 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             ProgressionAccess::Deny,
         ),
         // Payload-dependent: a refresh probe must not hold a bulk slot.
+        // Own-PR reads use peer pid → execution → work item, with a run_id
+        // cross-check, just like GetWorkerContext/GetPrBody. Refresh stays on
+        // the engine's bounded, rate-limited probe path; it grants no raw
+        // GitHub access to the caller.
         R::GetPrStatus { refresh, .. } => RequestContract::new(
             ReplayContract::Always,
             if *refresh {
@@ -327,12 +348,15 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             ProgressionAccess::Deny,
         ),
 
+        // Engine version permits version-skew diagnosis without runtime state.
         live_worker_allowed!(live_pattern) => RequestContract::new(
             ReplayContract::Always,
             AdmissionLane::Live,
             WorkerAccess::Allow,
             ProgressionAccess::Allow,
         ),
+        // Cheap local reads still expose runtime state: admission priority
+        // does not grant workers access to pools, health, live status or metrics.
         live_runtime_denied!(live_pattern) => RequestContract::new(
             ReplayContract::Always,
             AdmissionLane::Live,
@@ -340,6 +364,11 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             ProgressionAccess::Deny,
         ),
 
+        // Model reads expose sibling work, dependencies and prior attentions
+        // so workers can understand context and avoid duplicate proposals.
+        // Comment reads include the thread a revision/answer worker must read.
+        // Execution rows expose status, PR bindings and timestamps while the
+        // outbound sanitizer strips transcript paths and other runtime fields.
         R::CommentsBannerState { .. }
         | R::CommentsGet { .. }
         | R::CommentsList { .. }
@@ -349,7 +378,11 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::GetDecision { .. }
         | R::GetExecution { .. }
         | R::GetPrBody { .. }
+        // Product design docs read the product's own repo, already accessible
+        // through the worker's shell; this adds no authority over other repos.
         | R::GetProductDesignDoc { .. }
+        // GetRun/ListRuns require own-execution scoping at the connection gate;
+        // GetExecution/ListExecutions intentionally expose sibling model rows.
         | R::GetRun { .. }
         | R::GetWorkItem { .. }
         | R::GetWorkItemByShortId { .. }
@@ -357,6 +390,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::GetWorkTree { .. }
         | R::GetWorkerContext { .. }
         | R::ListAnswerAgentRuns { .. }
+        // Peer-attributed evidence listing resolves the caller's own execution.
         | R::ListAttachments { .. }
         | R::ListAttentionGroups { .. }
         | R::ListAttentionItems { .. }
@@ -371,12 +405,17 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::ListProductDesignDocs { .. }
         | R::ListProducts
         | R::ListProjects { .. }
+        // Proposal reads independently re-derive the execution from the peer.
         | R::ListProposals { .. }
         | R::ListRevisions { .. }
         | R::ListRuns { .. }
         | R::ListTaskFieldAudit { .. }
         | R::ListTasks { .. } => bulk_read(WorkerAccess::Allow, ProgressionAccess::Allow),
 
+        // Coordinator diagnostics/control reads are outside the exposed model:
+        // planner, editorial, CI/conflict operator state, auth and merge state.
+        // Automation state is coordinator configuration. Triage gets its id in
+        // its brief; CreateAutomationTask rechecks caps and dedup engine-side.
         R::GetAutomation { .. }
         | R::GetAutomationOpenTaskCount { .. }
         | R::GetAutomationState
@@ -384,7 +423,10 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::GetCiRemediation { .. }
         | R::GetConflictHotspots { .. }
         | R::GetConflictResolution { .. }
+        // Cost reports are operator/coordinator diagnostics, not work context.
         | R::GetCostWindowReport { .. }
+        // Ideas are human/coordinator drafts, deliberately not work items;
+        // a worker's task does not depend on reading or editing those drafts.
         | R::GetIdea { .. }
         | R::GetSolComparisonReport
         | R::GetStuckReport { .. }
@@ -398,12 +440,16 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::ListAutomations { .. }
         | R::ListCiRemediations { .. }
         | R::ListConflictResolutions { .. }
+        // BOSS_COORDINATOR.md is coordinator-facing by construction, keeping
+        // coordinator instructions out of worker context.
         | R::ListCoordinatorGuidance { .. }
         | R::ListEditorialActions { .. }
         | R::ListIdeas { .. }
         | R::ListPlannerRuns { .. }
         | R::TrunkStatus => bulk_read(WorkerAccess::Coordinator, ProgressionAccess::Deny),
 
+        // Runtime reads stay isolated (design §"Non-goals"). Transcripts are
+        // especially sensitive: they could expose another worker's session.
         R::DebugLiveStatusPipeline
         | R::ExecutionTranscript { .. }
         | R::GetCodexSolPercentage
@@ -419,6 +465,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::GetSelectedProduct
         | R::GetSettings
         | R::GetTaskRuntime { .. }
+        // Unscoped app listing names any work item; workers already have the
+        // peer-attributed ListAttachments surface for their own evidence.
         | R::ListAttachmentsForWorkItem { .. }
         | R::ListEngineAttempts { .. }
         | R::ListFeatureFlags
@@ -426,13 +474,26 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::ListLiveStatusDisabledSlots
         | R::TailRunTranscript { .. } => bulk_read(WorkerAccess::Runtime, ProgressionAccess::Deny),
 
+        // The mediated write API re-derives the caller's execution from the
+        // socket peer, so a payload cannot target another execution's work.
         R::SubmitProposal { .. } => ordered_replayable(WorkerAccess::Allow, ProgressionAccess::Allow),
 
+        // Sanctioned direct writes declare results from the caller's own run;
+        // handlers enforce provenance independently of this pure contract.
+        // CI marks are scoped to the attempt supplied to the remediation worker.
         R::MarkCiRemediationSucceededViaRebase { .. }
+        // Design workers record where they wrote the project deliverable,
+        // explicitly permitted by the design's worker-tier verb policy.
         | R::SetProjectDesignDoc { .. }
+        // Task-level counterpart: record the worker's deliverable document.
         | R::SetTaskDocPointer { .. }
+        // Evidence is a sanctioned write, not a taxonomy edit needing judgment.
+        // The handler confines the resolved path to the peer's own workspace
+        // and attributes the attachment to that execution, like proposals.
         | R::SubmitAttachment { .. } => ordered_replayable(WorkerAccess::Allow, ProgressionAccess::Deny),
 
+        // Retry/abandon, automation configuration and decisions are operator
+        // controls, distinct from the worker's own result declarations.
         R::AbandonCiRemediation { .. }
         | R::AbandonConflictResolution { .. }
         | R::DisableAutomation { .. }
@@ -443,6 +504,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::SetCiBudget { .. }
         | R::SetCoordinatorHandoff { .. } => ordered_replayable(WorkerAccess::Coordinator, ProgressionAccess::Deny),
 
+        // Runtime setters control dispatch, panes, hosts and engine config;
+        // read access to model rows grants no authority over their execution.
         R::RetirePane { .. }
         | R::RevealWorkItem { .. }
         | R::SetCodexSolPercentage { .. }
@@ -457,6 +520,9 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::StopRun { .. }
         | R::UpdateDispatchFocus { .. } => ordered_replayable(WorkerAccess::Runtime, ProgressionAccess::Deny),
 
+        // Structural taxonomy changes have no direct worker route. This also
+        // covers priority confirmation and product defaults: a worker cannot
+        // approve its own escalation or change policy for sibling work.
         R::AddDependency { .. }
         | R::ListCriticalPriorityRequests
         | R::RestoreWorkItem { .. }
@@ -466,24 +532,40 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::SetProductExternalTracker { .. }
         | R::SetProductMergeMechanism { .. } => ordered_replayable(WorkerAccess::Taxonomy, ProgressionAccess::Deny),
 
+        // Resolving a project's own design document has the same read-only
+        // authority as GetProductDesignDoc/ListProductDesignDocs.
         R::ResolveProjectDesignDoc { .. } => bulk_unreplayable(WorkerAccess::Allow, ProgressionAccess::Allow),
 
+        // Operator diagnostics, editorial evaluation and label resolution
+        // drive coordinator workflows, rather than exposing work-model reads.
         R::AuditProductEffort { .. } | R::EvaluateEditorialRules { .. } | R::ResolveExecutionLabels { .. } => {
             bulk_unreplayable(WorkerAccess::Coordinator, ProgressionAccess::Deny)
         }
 
+        // Admission evaluation exposes runtime dispatch policy.
         R::EvaluateDispatchAdmission { .. } => bulk_unreplayable(WorkerAccess::Runtime, ProgressionAccess::Deny),
 
+        // CI classifications and marks are attempt-scoped worker declarations.
         R::ClassifyCiRemediation { .. }
+        // The answer handler binds comment and run to the caller's execution.
         | R::CommentsPostAnswer { .. }
+        // Grounded review dispositions are bound to the caller's revision run.
         | R::CommentsRecordGuideOutcome { .. }
+        // Triage creates stay direct and provenance-checked; only outcome
+        // declarations are mediated (design §"Risks / open questions").
         | R::CreateAutomationTask { .. }
         | R::MarkCiRemediationFailed { .. }
         | R::MarkCiRemediationNoop { .. }
         | R::MarkCiRemediationRetriggered { .. }
+        // Conflict-worker telemetry records its own attempt's result.
         | R::MarkConflictResolutionFailed { .. }
+        // Producer conflict telemetry is required by the merge-conflict
+        // worker instructions and attributed to the caller's execution.
         | R::RecordProducerSideConflict { .. } => ordered_unreplayable(WorkerAccess::Allow, ProgressionAccess::Deny),
 
+        // An answer is operator authorization; a worker cannot grant its own.
+        // Other comment actions and planner/merge controls drive the operator's
+        // workflow; the worker may reply, but cannot resolve or rewrite it.
         R::AnswerOperatorQuestion { .. }
         | R::CommentsCreate { .. }
         | R::CommentsDismiss { .. }
@@ -508,6 +590,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::MergeWhenReady { .. }
         | R::PlanProject { .. }
         | R::RecreateCoordinator { .. }
+        // Registration establishes trust roots. Workers cannot repoint the
+        // engine's notion of its app, capabilities or coordinator session.
         | R::RegisterAppSession
         | R::RegisterCapabilities { .. }
         | R::ReleaseProject { .. }
@@ -527,11 +611,13 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::UpdateAutomation { .. }
         | R::UpdateIdea { .. } => ordered_unreplayable(WorkerAccess::Coordinator, ProgressionAccess::Deny),
 
+        // Attention writes must use the mediated human-attention proposal.
         R::CreateAttention { .. } | R::CreateAttentionItem { .. } => ordered_unreplayable(
             WorkerAccess::Redirect(WorkerRedirect::Attention),
             ProgressionAccess::Deny,
         ),
 
+        // Deferred work needs a proposal, not acceptance by its own author.
         R::AcceptDeferredScopeAttention { .. } | R::CreateTaskFromDeferredScopeAttention { .. } => {
             ordered_unreplayable(
                 WorkerAccess::Redirect(WorkerRedirect::DeferredScope),
@@ -539,6 +625,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             )
         }
 
+        // Effort changes require the explicit escalation proposal.
         R::RecordEffortEscalation { .. } => ordered_unreplayable(
             WorkerAccess::Redirect(WorkerRedirect::EffortEscalation),
             ProgressionAccess::Deny,
@@ -549,6 +636,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             ProgressionAccess::Deny,
         ),
 
+        // Runtime mutations include hosts, execution creation/cancellation,
+        // pane input and subscriptions; the firehose must remain isolated.
         R::AddHost { .. }
         | R::AddHostTag { .. }
         | R::CancelExecution { .. }
@@ -572,6 +661,9 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::Subscribe { .. }
         | R::Unsubscribe { .. } => ordered_unreplayable(WorkerAccess::Runtime, ProgressionAccess::Deny),
 
+        // Structural edits, dependency surgery and actions on others'
+        // attentions have no worker-facing equivalent; denials point to the
+        // blocked proposal escape hatch.
         R::ActionAttentionGroup { .. }
         | R::AnswerAttention { .. }
         | R::CreateProduct { .. }
@@ -580,6 +672,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::DeleteWorkItem { .. }
         | R::DismissAttention { .. }
         | R::LinkWorkItemExternalRef { .. }
+        // A kanban drag is a human gesture, not an UpdateWorkItem redirect.
+        // Workers request explicit status changes through proposals instead.
         | R::MoveWorkItemOnBoard { .. }
         | R::ParkWorkItem { .. }
         | R::RemoveDependency { .. }

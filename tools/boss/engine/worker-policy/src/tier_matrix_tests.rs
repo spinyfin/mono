@@ -328,6 +328,70 @@ fn classified_verbs() -> BTreeSet<String> {
     names
 }
 
+/// Independent denial expectations: literal command strings deliberately avoid
+/// the contract's redirect enum and command mapping. An empty UpdateWorkItem
+/// patch is synthesized by the matrix; payload-specific redirects are pinned
+/// separately in tests.rs.
+fn taxonomy_denial_fixtures() -> Vec<(&'static str, WorkerTierDenialReason, Option<&'static str>)> {
+    use WorkerTierDenialReason::MutatingTaxonomy;
+    vec![
+        ("CreateTask", MutatingTaxonomy, Some("boss propose followup-task")),
+        ("CreateChore", MutatingTaxonomy, Some("boss propose followup-task")),
+        (
+            "CreateInvestigation",
+            MutatingTaxonomy,
+            Some("boss propose followup-task"),
+        ),
+        ("CreateManyTasks", MutatingTaxonomy, Some("boss propose followup-task")),
+        ("CreateManyChores", MutatingTaxonomy, Some("boss propose followup-task")),
+        ("CreateAttention", MutatingTaxonomy, Some("boss propose attention")),
+        ("CreateAttentionItem", MutatingTaxonomy, Some("boss propose attention")),
+        (
+            "AcceptDeferredScopeAttention",
+            MutatingTaxonomy,
+            Some("boss propose deferred-scope"),
+        ),
+        (
+            "CreateTaskFromDeferredScopeAttention",
+            MutatingTaxonomy,
+            Some("boss propose deferred-scope"),
+        ),
+        (
+            "RecordEffortEscalation",
+            MutatingTaxonomy,
+            Some("boss propose effort-escalation"),
+        ),
+        (
+            "UpdateWorkItem",
+            MutatingTaxonomy,
+            Some("boss propose (pr-created, effort-escalation, blocked, ...)"),
+        ),
+        ("ActionAttentionGroup", MutatingTaxonomy, None),
+        ("AddDependency", MutatingTaxonomy, None),
+        ("AnswerAttention", MutatingTaxonomy, None),
+        ("CreateProduct", MutatingTaxonomy, None),
+        ("CreateProject", MutatingTaxonomy, None),
+        ("CreateRevision", MutatingTaxonomy, None),
+        ("DeleteWorkItem", MutatingTaxonomy, None),
+        ("DismissAttention", MutatingTaxonomy, None),
+        ("LinkWorkItemExternalRef", MutatingTaxonomy, None),
+        ("ListCriticalPriorityRequests", MutatingTaxonomy, None),
+        ("MoveWorkItemOnBoard", MutatingTaxonomy, None),
+        ("ParkWorkItem", MutatingTaxonomy, None),
+        ("RemoveDependency", MutatingTaxonomy, None),
+        ("ReorderProjectTasks", MutatingTaxonomy, None),
+        ("RequestCriticalPriority", MutatingTaxonomy, None),
+        ("ResolveCriticalPriorityRequest", MutatingTaxonomy, None),
+        ("RestoreWorkItem", MutatingTaxonomy, None),
+        ("SetProductDefaultDriver", MutatingTaxonomy, None),
+        ("SetProductDefaultModel", MutatingTaxonomy, None),
+        ("SetProductEditorialRules", MutatingTaxonomy, None),
+        ("SetProductExternalTracker", MutatingTaxonomy, None),
+        ("SetProductMergeMechanism", MutatingTaxonomy, None),
+        ("UnlinkWorkItemExternalRef", MutatingTaxonomy, None),
+    ]
+}
+
 #[test]
 fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
     let classified = classified_verbs();
@@ -351,6 +415,12 @@ fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
         );
     }
 
+    let denials = taxonomy_denial_fixtures();
+    let denial_verbs: BTreeSet<_> = denials.iter().map(|(verb, _, _)| *verb).collect();
+    assert_eq!(denial_verbs.len(), denials.len(), "duplicate denial fixture");
+    for verb in &denial_verbs {
+        assert!(classified.contains(*verb), "unknown denial fixture: {verb}");
+    }
     let mut fixtures = BTreeSet::new();
     let mut unsynthesised = Vec::new();
     for verb in &classified {
@@ -370,6 +440,18 @@ fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
             progression_allowed.contains(verb),
             "{verb} / Progression"
         );
+        if let Some((_, reason, use_instead)) = denials.iter().find(|(name, _, _)| *name == verb) {
+            let denial = worker.denial().expect("taxonomy verb must be denied");
+            assert_eq!(&denial.reason, reason, "{verb} / Worker reason");
+            assert_eq!(denial.use_instead.as_deref(), *use_instead, "{verb} / Worker redirect");
+        } else if let Some(denial) = worker.denial() {
+            assert_ne!(
+                denial.reason,
+                WorkerTierDenialReason::MutatingTaxonomy,
+                "{verb} missing taxonomy fixture"
+            );
+            assert_eq!(denial.use_instead, None, "{verb} unexpected redirect");
+        }
         if !progression.is_allowed() {
             let denial = progression.denial().expect("denied");
             assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope, "{verb}");

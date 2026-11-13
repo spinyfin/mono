@@ -16,8 +16,8 @@
 //! lives on [`boss_protocol::request_contract`]; this crate turns those
 //! values into denial objects and sanitizes outbound rows. Keeping it out of
 //! `boss-engine`'s rebuild/retest scope means changing a sanitizer or denial
-//! constructor recompiles a small leaf crate, mirroring the
-//! `proposal-validation` split from the previous task in this project.
+//! constructor recompiles a small leaf crate, as with the
+//! `proposal-validation` crate.
 //!
 //! ## The two halves
 //!
