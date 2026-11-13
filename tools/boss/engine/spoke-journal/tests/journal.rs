@@ -2,6 +2,8 @@ use boss_protocol_spoke::v1::{self, command, record};
 use boss_spoke_journal::{Admission, Fault, Journal, Limits};
 use prost::Message;
 
+mod inherited_lock;
+
 fn open(root: &std::path::Path) -> Journal {
     Journal::open(root, "host", Limits::default()).unwrap()
 }

@@ -139,6 +139,38 @@ fn command(run: &v1::Run, body: command::Body) -> v1::Command {
 }
 
 #[tokio::test]
+async fn cancelling_server_releases_idle_connections_before_restart() {
+    use tokio::io::AsyncReadExt;
+    let root = tempfile::tempdir().unwrap();
+    let gateway = open(root.path());
+    let socket = root.path().join("worker.sock");
+    let (accepted, ready) = tokio::sync::oneshot::channel();
+    let accepted = Mutex::new(Some(accepted));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let serving = gateway.clone();
+    let task = tokio::spawn(async move {
+        serving
+            .serve(listener, || {
+                if let Some(accepted) = accepted.lock().unwrap().take() {
+                    accepted.send(()).unwrap();
+                }
+                stamp()
+            })
+            .await
+    });
+    let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    ready.await.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(Arc::strong_count(&gateway.journal), 1, "handler outlived server");
+    drop(gateway);
+    let reopened = open(root.path());
+    let mut byte = [0];
+    assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    drop(reopened);
+}
+
+#[tokio::test]
 async fn actual_cli_queues_done_preserves_assignment_and_replays_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let mut execution = execution(root.path());

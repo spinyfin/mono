@@ -12,6 +12,7 @@ boss-host-execution = { path = "../host-execution" }
 boss-protocol = { path = "../../protocol" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
 boss-spoke-journal = { path = "../spoke-journal" }
+futures-util = "0.3"
 libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
