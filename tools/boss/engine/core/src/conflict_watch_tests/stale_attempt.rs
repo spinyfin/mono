@@ -383,6 +383,54 @@ async fn full_sequence_stale_attempt_collision_then_mergeable_unblocks_task() {
 }
 
 #[tokio::test]
+async fn mergeable_unblocked_task_retires_stale_pending_attempt() {
+    // The CI-suppression sequence: the parent is `in_review` with no
+    // blocked signal, a leftover `pending` attempt sits next to a later
+    // `succeeded` one, and the PR is mergeable. `maybe_clear_blocked`
+    // never runs; `retire_moot_conflict_revisions` must still abandon
+    // the leftover row.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let (product, chore) = make_in_review(&db, "C-unblocked-stale", PR);
+
+    let stale = insert_attempt(&db, &product, &chore, "abc123", "head-1");
+    let later = insert_attempt(&db, &product, &chore, "abc123", "head-2");
+    db.mark_conflict_resolution_succeeded(&later.id, None).unwrap().unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE conflict_resolutions
+                SET status = 'pending', failure_reason = NULL, finished_at = NULL,
+                    base_sha_at_trigger = 'abc123'
+              WHERE id = ?1",
+            rusqlite::params![stale.id],
+        )
+        .unwrap();
+    rewind_attempt_created_at(&db_path, &stale.id, 600);
+
+    assert_eq!(chore_status(&db, &chore).0, TaskStatus::InReview);
+    assert!(
+        db.active_blocked_signals(&chore).unwrap().is_empty(),
+        "the parent is unblocked",
+    );
+    assert_eq!(
+        db.active_conflict_resolution_for_work_item(&chore)
+            .unwrap()
+            .map(|a| a.id),
+        Some(stale.id.clone()),
+        "the leftover pending row is what CI-watch would see",
+    );
+
+    retire_moot_conflict_revisions(&db, &candidate(&product, &chore, PR), &[]);
+
+    let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
+    assert_eq!(stale_row.status, "abandoned");
+    assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
+    assert!(db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn revision_backed_pending_attempt_is_not_retired_by_a_newer_attempt() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();

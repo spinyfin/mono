@@ -27,10 +27,12 @@
 //! Composed ordering (design §Q7): the dispatch site (the merge
 //! poller's `sweep_one`) already routes a conflicting PR exclusively
 //! to `conflict_watch`, so this module is only ever invoked when
-//! `mergeability=Clean`. But an active higher-priority attempt — an
-//! `auto-rebase` or `conflict_resolutions` row — can still be
-//! covering the same PR (it cleared the conflict moments ago and
-//! hasn't retired yet). `on_ci_failure_detected` defers in that case.
+//! `mergeability=Clean` (or `Unknown`, which still runs the CI axis).
+//! A higher-priority attempt — an `auto-rebase` or `conflict_resolutions`
+//! row — pre-empts CI only while it is genuinely live: the PR is still
+//! conflicting / mergeability is unknown, or a worker (or in-flight
+//! mechanical rung) is actually running it. A leftover `pending`
+//! conflict row on a mergeable PR does not suppress CI remediation.
 
 #[cfg(test)]
 use boss_protocol::TaskKind;
@@ -43,8 +45,8 @@ use serde::Serialize;
 use crate::blocking_signal::{self, SignalKind};
 use crate::work::{
     ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
-    ClearResolvedSignal, CreateExecutionInput, PendingMergeCheck, PrStateChecker, SignalRetirement,
-    StrandedCiRemediationAttempt, WorkDb,
+    ClearResolvedSignal, CreateExecutionInput, InFlightCiFixRevision, PendingMergeCheck, PrStateChecker,
+    SignalRetirement, StrandedCiRemediationAttempt, WorkDb,
 };
 use crate::{
     OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out,
@@ -84,6 +86,60 @@ pub fn classify_pre_triage(failures: &[RequiredCheckFailure]) -> &'static str {
 /// louder log line) when the duration crosses `ALERT_THRESHOLD_SECS`.
 const NEVER_STARTS_WARN_THRESHOLD_SECS: i64 = 30 * 60;
 const NEVER_STARTS_ALERT_THRESHOLD_SECS: i64 = 2 * 60 * 60;
+
+/// Info-level record for every early return from [`on_ci_failure_detected`].
+/// A red PR that gets no CI-fix revision has to be explainable from the
+/// engine log: the gate name, and the blocking attempt id when one exists.
+fn log_ci_failure_deferred(candidate: &PendingMergeCheck, gate: &'static str, attempt_id: Option<&str>) {
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        gate,
+        attempt_id = attempt_id.unwrap_or(""),
+        "ci_watch: deferring ci_failure handling",
+    );
+}
+
+fn log_in_flight_ci_fix_deferred(candidate: &PendingMergeCheck, in_flight: &InFlightCiFixRevision) {
+    match in_flight.remediation_attempt_id.as_deref() {
+        Some(attempt_id) => tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            gate = "in_flight_ci_fix_revision",
+            attempt_id,
+            revision_id = %in_flight.revision_id,
+            "ci_watch: deferring ci_failure handling",
+        ),
+        None => tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            gate = "in_flight_ci_fix_revision",
+            attempt_id = "",
+            revision_id = %in_flight.revision_id,
+            ledger_row = "none",
+            "ci_watch: deferring ci_failure handling",
+        ),
+    }
+}
+
+fn probe_mergeability_clean(probe: &PrLifecycleProbe) -> bool {
+    matches!(
+        &probe.state,
+        PrLifecycleState::Open(open) if open.mergeability == OpenPrMergeability::Clean
+    )
+}
+
+/// A rebase attempt pre-empts CI while a worker is on it (`running` /
+/// `escalated`), or while mergeability is not yet definitively clean (the
+/// rebase may still own a conflicting PR). A leftover `pending` row on a
+/// mergeable PR does not.
+fn rebase_attempt_preempts_ci(status: &str, mergeability_clean: bool) -> bool {
+    match status {
+        "running" | "escalated" => true,
+        "pending" => !mergeability_clean,
+        _ => false,
+    }
+}
 
 /// Unified opt-out gate. Mirrors `conflict_watch::auto_pr_maintenance_disabled`;
 /// the design (Phase 6 #18 / §Q7) requires both auto-remediation
@@ -359,31 +415,44 @@ pub async fn on_ci_failure_detected(
     failures: &[RequiredCheckFailure],
 ) -> bool {
     if !matches!(&probe.state, PrLifecycleState::Open(open) if matches!(open.ci, OpenPrCiStatus::Failing { .. })) {
+        log_ci_failure_deferred(candidate, "probe_not_failing", None);
         return false;
     }
     if failures.is_empty() {
         // Defensive — the dispatch site already filtered on Failing,
         // but if a future caller hands us an empty set we should not
         // flip the row.
+        log_ci_failure_deferred(candidate, "empty_failures", None);
         return false;
     }
     if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
+        log_ci_failure_deferred(candidate, "auto_pr_maintenance_disabled", None);
         return false;
     }
-    // §Q7 composed ordering: an active conflict-resolution attempt
-    // (or auto-rebase escalation) for this PR owns the slot until
-    // terminal. CI watch defers; the next sweep re-evaluates once the
-    // higher-priority attempt clears.
-    match work_db.has_active_rebase_attempt_for_pr(&candidate.pr_url) {
-        Ok(true) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: rebase attempt active; deferring ci_failure flip",
-            );
+    // §Q7 composed ordering: a genuinely live conflict-resolution or
+    // auto-rebase attempt owns the slot. A leftover `pending` conflict
+    // row on a mergeable PR does not — retire it (so upgrade leftover
+    // rows are cleaned without a DB edit) and continue into CI handling.
+    // Superseded pending rows, including those whose linked revision is
+    // already dead, retire even when mergeability is Unknown; bare
+    // pending rows retire only on a clean PR. The gate then scans every
+    // remaining active attempt so an older live writer is not hidden by
+    // a newer dead-revision pending row.
+    let mergeability_clean = probe_mergeability_clean(probe);
+    if let Err(err) = work_db.retire_stale_pending_conflict_attempts(&candidate.work_item_id, mergeability_clean) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            ?err,
+            "ci_watch: failed to retire stale pending conflict attempts; continuing",
+        );
+    }
+    match work_db.active_rebase_attempt_for_pr(&candidate.pr_url) {
+        Ok(Some((id, status))) if rebase_attempt_preempts_ci(&status, mergeability_clean) => {
+            log_ci_failure_deferred(candidate, "active_rebase_attempt", Some(&id));
             return false;
         }
-        Ok(false) => {}
+        Ok(_) => {}
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
@@ -391,19 +460,35 @@ pub async fn on_ci_failure_detected(
                 ?err,
                 "ci_watch: failed to check rebase attempt; deferring",
             );
+            log_ci_failure_deferred(candidate, "rebase_attempt_check_failed", None);
             return false;
         }
     }
-    match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
-        Ok(Some(_)) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: conflict resolution attempt active; deferring ci_failure flip",
-            );
-            return false;
+    match work_db.active_conflict_resolutions_for_work_item(&candidate.work_item_id) {
+        Ok(attempts) => {
+            // Any live writer pre-empts CI, including an older mechanical
+            // rung hidden behind a newer pending row whose revision is dead.
+            if let Some(live) = attempts
+                .iter()
+                .find(|attempt| work_db.conflict_attempt_holds_live_worker(attempt).unwrap_or(true))
+            {
+                log_ci_failure_deferred(candidate, "active_conflict_resolution", Some(&live.id));
+                return false;
+            }
+            if let Some(attempt) = attempts.first() {
+                if !mergeability_clean {
+                    log_ci_failure_deferred(candidate, "active_conflict_resolution", Some(&attempt.id));
+                    return false;
+                }
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    gate = "stale_conflict_attempt_ignored",
+                    attempt_id = %attempt.id,
+                    "ci_watch: pending conflict attempt is not live on a mergeable PR; not deferring",
+                );
+            }
         }
-        Ok(None) => {}
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
@@ -411,6 +496,7 @@ pub async fn on_ci_failure_detected(
                 ?err,
                 "ci_watch: failed to check active conflict_resolutions; deferring",
             );
+            log_ci_failure_deferred(candidate, "conflict_resolution_check_failed", None);
             return false;
         }
     }
@@ -473,17 +559,12 @@ pub async fn on_ci_failure_detected(
     // not pushed a fix commit. Without this guard, a new revision can spawn
     // concurrently with the prior one, wasting the attempt budget and racing
     // the same PR branch (PR #1404).
-    match work_db.has_in_flight_ci_fix_revision(&candidate.work_item_id) {
-        Ok(true) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: ci-fix revision still in flight (worker active or blocked); \
-                 deferring to prevent overlapping attempts",
-            );
+    match work_db.in_flight_ci_fix_revision(&candidate.work_item_id) {
+        Ok(Some(in_flight)) => {
+            log_in_flight_ci_fix_deferred(candidate, &in_flight);
             return false;
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
@@ -491,6 +572,7 @@ pub async fn on_ci_failure_detected(
                 ?err,
                 "ci_watch: failed to check in-flight ci-fix revision; deferring",
             );
+            log_ci_failure_deferred(candidate, "in_flight_ci_fix_revision_check_failed", None);
             return false;
         }
     }
@@ -501,11 +583,7 @@ pub async fn on_ci_failure_detected(
     // row alone — the next sweep with a populated `headRefOid` will
     // pick it up.
     let Some(head_sha) = probe.head_ref_oid.as_deref() else {
-        tracing::debug!(
-            work_item_id = %candidate.work_item_id,
-            pr_url = %candidate.pr_url,
-            "ci_watch: probe missing headRefOid; cannot key the attempt — deferring",
-        );
+        log_ci_failure_deferred(candidate, "missing_head_sha", None);
         return false;
     };
 
@@ -515,12 +593,7 @@ pub async fn on_ci_failure_detected(
     // automatically by changing the key.
     match work_db.is_ci_failure_suppressed(&candidate.work_item_id, head_sha) {
         Ok(true) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                head_sha,
-                "ci_watch: ci_failure suppression active for this head_sha; skipping",
-            );
+            log_ci_failure_deferred(candidate, "ci_failure_suppressed", None);
             return false;
         }
         Ok(false) => {}
@@ -574,11 +647,7 @@ pub async fn on_ci_failure_detected(
                 return true;
             }
             Ok(None) => {
-                tracing::debug!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    "ci_watch: ci_failure_exhausted WHERE guard missed",
-                );
+                log_ci_failure_deferred(candidate, "ci_failure_exhausted_guard_missed", None);
                 return false;
             }
             Err(err) => {
@@ -588,6 +657,7 @@ pub async fn on_ci_failure_detected(
                     ?err,
                     "ci_watch: failed to flip row to blocked: ci_failure_exhausted",
                 );
+                log_ci_failure_deferred(candidate, "ci_failure_exhausted_flip_failed", None);
                 return false;
             }
         }
@@ -614,6 +684,7 @@ pub async fn on_ci_failure_detected(
             Ok(true) => {}
             Err(err) => {
                 tracing::warn!(?err, "ci_watch: cannot read failure identity; deferring");
+                log_ci_failure_deferred(candidate, "failure_identity_check_failed", None);
                 return false;
             }
         }
@@ -722,6 +793,7 @@ pub async fn on_ci_failure_detected(
                 ?err,
                 "ci_watch: failed to flip row to blocked: ci_failure",
             );
+            log_ci_failure_deferred(candidate, "ci_failure_flip_failed", None);
             return false;
         }
     };

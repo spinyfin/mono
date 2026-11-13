@@ -1507,10 +1507,15 @@ impl WorkDb {
         }
     }
 
-    /// Returns `true` when there is at least one engine-triggered
-    /// CI-fix revision (`created_via LIKE 'ci-fix:%'`) for the chore
-    /// `work_item_id` that is still in flight — a live writer per
-    /// `live_chain_writer_sql` (`todo` / `active`, or `blocked`
+    /// Returns `true` when [`Self::in_flight_ci_fix_revision`] finds a live
+    /// engine-triggered CI-fix revision for `work_item_id`.
+    pub fn has_in_flight_ci_fix_revision(&self, work_item_id: &str) -> Result<bool> {
+        Ok(self.in_flight_ci_fix_revision(work_item_id)?.is_some())
+    }
+
+    /// The live engine-triggered CI-fix revision (`created_via LIKE
+    /// 'ci-fix:%'`) for the chore `work_item_id`, if any — a live writer
+    /// per `live_chain_writer_sql` (`todo` / `active`, or `blocked`
     /// waiting on a dependency or still holding a live execution).
     /// A `blocked: worker_failed` or
     /// `blocked: spawning_attempt_retired_unsuccessfully` revision
@@ -1518,32 +1523,64 @@ impl WorkDb {
     /// stopped, and treating it as a writer would strand the next
     /// CI-fix behind a row that never runs again.
     ///
+    /// The associated `ci_remediations` row is included even when that
+    /// ledger row is already terminal: the primary gate (status IN
+    /// (`pending`, `running`)) can pass after
+    /// `try_retire_cleared_blocking_signal` marks the row `succeeded`
+    /// while the revision worker is still running. `remediation_attempt_id`
+    /// is `None` when no ledger row exists for the live revision.
+    ///
     /// Used by `boss_engine::ci_watch::on_ci_failure_detected` as a
-    /// secondary pre-flight gate: after the primary gate (based on
-    /// the `ci_remediations` status column) passes, this check
-    /// prevents a new CI-fix revision from spawning while a prior
-    /// revision's worker is still in flight. The primary gate can be
-    /// bypassed when `try_retire_cleared_blocking_signal` marks the
-    /// `ci_remediations` row `succeeded` prematurely (the originally-
-    /// failing checks cleared on a re-trigger while the worker is
-    /// still running and has not yet pushed a fix commit).
-    pub fn has_in_flight_ci_fix_revision(&self, work_item_id: &str) -> Result<bool> {
+    /// secondary pre-flight gate so a new CI-fix revision does not spawn
+    /// concurrently with the prior one.
+    pub fn in_flight_ci_fix_revision(&self, work_item_id: &str) -> Result<Option<InFlightCiFixRevision>> {
         let conn = self.connect()?;
         let live = live_chain_writer_sql("t");
-        let n: i64 = conn.query_row(
-            &format!(
-                "SELECT COUNT(*)
-             FROM tasks t
-             WHERE t.parent_task_id = ?1
-               AND t.kind = 'revision'
-               AND t.created_via LIKE 'ci-fix:%'
-               AND {live}
-               AND t.deleted_at IS NULL"
-            ),
-            params![work_item_id],
-            |row| row.get(0),
-        )?;
-        Ok(n > 0)
+        let revision: Option<(String, String)> = conn
+            .query_row(
+                &format!(
+                    "SELECT t.id, t.created_via
+                 FROM tasks t
+                 WHERE t.parent_task_id = ?1
+                   AND t.kind = 'revision'
+                   AND t.created_via LIKE 'ci-fix:%'
+                   AND {live}
+                   AND t.deleted_at IS NULL
+                 ORDER BY t.created_at DESC, t.id DESC
+                 LIMIT 1"
+                ),
+                params![work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((revision_id, created_via)) = revision else {
+            return Ok(None);
+        };
+        let rem_by_fk: Option<String> = conn
+            .query_row(
+                "SELECT id FROM ci_remediations
+                  WHERE revision_task_id = ?1
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT 1",
+                params![&revision_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let remediation_attempt_id = match rem_by_fk {
+            Some(id) => Some(id),
+            None => match created_via.strip_prefix(CREATED_VIA_CI_FIX_PREFIX) {
+                Some(id) if !id.is_empty() => conn
+                    .query_row("SELECT id FROM ci_remediations WHERE id = ?1", params![id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?,
+                _ => None,
+            },
+        };
+        Ok(Some(InFlightCiFixRevision {
+            revision_id,
+            remediation_attempt_id,
+        }))
     }
 
     /// Does the work item have a `ci_failure_suppressions` row for
