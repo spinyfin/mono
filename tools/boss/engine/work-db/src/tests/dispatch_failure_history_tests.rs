@@ -120,7 +120,68 @@ fn parks_after_either_retry_source_remain_host_lease_waits() {
             Some(DISPATCH_WAIT_REASON_HOST_LEASE_PARK)
         );
         assert!(wait.dispatch_failures.is_empty());
+        assert_eq!(
+            wait.dispatch_retry_at, None,
+            "a park after an earlier failure must not render as a retry"
+        );
     }
+}
+
+fn assert_attempt_follows_history(wait: &TaskRuntime, expected_failures: usize) {
+    assert_eq!(
+        wait.dispatch_failures.len(),
+        expected_failures,
+        "{:?}",
+        wait.dispatch_failures
+    );
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some(boss_engine_storage_values::dispatch_wait::failure_backoff_wait_label(
+            wait.dispatch_failures.len() as i64 + 1
+        ))
+        .as_deref()
+    );
+}
+
+#[test]
+fn attempt_number_counts_start_failures_before_a_transient_resume() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (item, execution) = ready_chore(&db, &product.id, "starts then resume");
+    for error in ["lease failed", "spawn failed"] {
+        db.record_pre_start_failure(&execution.id, "worker", None, error, &[Duration::from_secs(3600); 2])
+            .unwrap();
+    }
+    db.request_resume_execution(
+        &execution.id,
+        1,
+        boss_engine_utils::epoch_time::now_epoch_secs() + 3600,
+        "worker hung",
+    )
+    .unwrap()
+    .unwrap();
+    assert_attempt_follows_history(&wait_of(&db, &product.id, &item.id), 3);
+}
+
+#[test]
+fn attempt_number_counts_a_transient_failure_before_start_failures() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (item, execution) = ready_chore(&db, &product.id, "resume then starts");
+    let successor = db
+        .request_resume_execution(
+            &execution.id,
+            1,
+            boss_engine_utils::epoch_time::now_epoch_secs() + 3600,
+            "worker hung",
+        )
+        .unwrap()
+        .unwrap();
+    for error in ["lease failed", "spawn failed"] {
+        db.record_pre_start_failure(&successor.id, "worker", None, error, &[Duration::from_secs(3600); 2])
+            .unwrap();
+    }
+    assert_attempt_follows_history(&wait_of(&db, &product.id, &item.id), 3);
 }
 
 #[test]
@@ -301,8 +362,9 @@ fn upgrade_classifies_existing_deadlines_and_installs_attempt_storage() {
     let legacy = wait_of(&upgraded, &product.id, &retry_item.id);
     assert_eq!(legacy.dispatch_failures.len(), 1);
     assert_eq!(legacy.dispatch_failures[0].error_text, "preserved legacy failure");
-    assert!(
-        legacy.dispatch_failures[0].happened_at.parse::<i64>().unwrap() >= retry.created_at.parse::<i64>().unwrap()
+    assert_eq!(
+        legacy.dispatch_failures[0].happened_at, "",
+        "a migrated failure has no recorded time and must not borrow the upgrade time"
     );
     let wait = wait_of(&upgraded, &product.id, &item.id);
     assert_eq!(

@@ -135,7 +135,7 @@ private struct DispatchFailureHistoryList: View {
                 .font(.headline)
             ForEach(Array(failures.enumerated()), id: \.offset) { _, attempt in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(formattedFailureTime(attempt.happenedAt) ?? "Failure recorded")
+                    Text(formattedFailureTime(attempt.happenedAt) ?? "Time not recorded")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(attempt.errorText)

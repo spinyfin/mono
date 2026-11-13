@@ -80,11 +80,6 @@ extension WorkCardLiveStatus {
                let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw) {
                 return QueuedStatus(lead: label, detail: notBeforeDetail(date))
             }
-            if let raw = runtime?.dispatchRetryAt, let date = AutomationTime.parse(raw), date > now {
-                return QueuedStatus(
-                    lead: "Retrying dispatch",
-                    detail: "next attempt \(AutomationTime.relative(raw, now: now))")
-            }
             if let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw) {
                 if runtime?.dispatchWaitReason == hostLeaseParkReason,
                    let label = runtime?.dispatchWaitLabel, !label.isEmpty {

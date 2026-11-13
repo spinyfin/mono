@@ -109,14 +109,22 @@ final class QueuedWaitTests: XCTestCase {
         XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()), "Queued — \(label)")
     }
 
-    func testRetryBackoffWinsOverNotBeforeWhenBothAreSet() {
-        let now = Date()
-        let future = String(Int(now.timeIntervalSince1970) + 120)
-        var pending = runtime(reason: "not_before", label: "held until its scheduled dispatch time")
-        pending.dispatchNotBefore = future
-        pending.dispatchRetryAt = future
-        XCTAssertTrue(WorkCardLiveStatus.queuedLabel(runtime: pending, now: now)
-            .hasPrefix("Retrying dispatch — next attempt"))
+    /// A park after an earlier start failure may still carry a retry deadline
+    /// on the wire; the card names the wait the engine classified.
+    func testHostLeaseParkWithRetryDeadlineKeepsHostLeaseWording() throws {
+        let client = EngineClient(socketPath: "/tmp/queued-park-\(UUID().uuidString).sock")
+        let pending = try XCTUnwrap(client.parseTaskRuntime([
+            "work_item_id": "task_waiting", "execution_status": "ready",
+            "dispatch_wait_reason": "host_lease_park",
+            "dispatch_wait_label": "waiting for the host to confirm the workspace lease",
+            "dispatch_not_before": "1900000000",
+            "dispatch_retry_at": "1900000000",
+        ]))
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        XCTAssertEqual(
+            WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date(timeIntervalSince1970: 1_899_999_000)),
+            "Queued — waiting for the host to confirm the workspace lease — not before \(date.formatted(date: .abbreviated, time: .shortened))"
+        )
     }
 
     func testFailureBackoffUsesEngineLabelAndFormattedTime() throws {

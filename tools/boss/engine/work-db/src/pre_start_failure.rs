@@ -369,6 +369,8 @@ fn resolved_positioning_pr_url(conn: &Connection, execution: &WorkExecution) -> 
 }
 
 /// Install durable retry attempts and the source of each dispatch deadline.
+/// A failure already in backoff at upgrade has no recorded time, so its
+/// `happened_at` is the empty string ("time not recorded"), never the upgrade time.
 pub(super) fn migrate_dispatch_failure_history(conn: &Connection) -> Result<()> {
     conn.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_not_before_source TEXT;
                     UPDATE work_executions SET dispatch_not_before_source = CASE
@@ -381,7 +383,7 @@ pub(super) fn migrate_dispatch_failure_history(conn: &Connection) -> Result<()> 
                         happened_at TEXT NOT NULL, error_text TEXT NOT NULL);
                     CREATE INDEX dispatch_start_failures_execution ON dispatch_start_failures(execution_id);
                     INSERT INTO dispatch_start_failures(id, execution_id, happened_at, error_text)
-                        SELECT 'legacy_start_' || id, id, strftime('%s', 'now'), TRIM(last_error)
+                        SELECT 'legacy_start_' || id, id, '', TRIM(last_error)
                         FROM work_executions WHERE status IN ('ready', 'claimed')
                           AND dispatch_not_before_source = 'failure_backoff'
                           AND pre_start_failure_count > 0 AND TRIM(COALESCE(last_error, '')) != '';")?;

@@ -572,7 +572,15 @@ pub(crate) fn compute_task_runtime(
                 Some((id, status)) => (Some(status), Some(id)),
                 None => (None, None),
             };
-            let dispatch_retry_at = dispatch_retry_at_for_execution(&execution, now);
+            // Only a failure backoff is a "retry"; a host-lease park or scheduled
+            // delay keeps its own wording even when an earlier start failed.
+            let dispatch_retry_at = if wait.reason.as_deref()
+                == Some(boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
+            {
+                dispatch_retry_at_for_execution(&execution, now)
+            } else {
+                None
+            };
             let dispatch_wait_since = if wait.reason.is_some()
                 && wait.reason == execution.dispatch_wait_reason
                 && execution.status == ExecutionStatus::Ready

@@ -1444,7 +1444,8 @@ pub struct TaskRuntime {
 pub struct DispatchFailureAttempt {
     /// Error text, orphaning reason, or attention body. Never empty.
     pub error_text: String,
-    /// Unix epoch seconds (as a string) when this failure was recorded.
+    /// Unix epoch seconds (as a string) when this failure was recorded; empty
+    /// for a legacy failure whose time was never recorded.
     pub happened_at: String,
 }
 

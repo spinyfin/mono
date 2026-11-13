@@ -228,12 +228,16 @@ fn not_before_wait(conn: &Connection, execution: &WorkExecution) -> Result<Dispa
         |row| row.get(0),
     )?;
     if source.as_deref() == Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF) {
+        let failures = collect_dispatch_failures(conn, &execution.work_item_id, &execution.id)?;
+        // The upcoming attempt follows the same sequence the history lists; the
+        // row counters only cover legacy rows whose history is incomplete.
+        let legacy_count = execution.pre_start_failure_count.max(execution.transient_failure_count) as usize;
         return Ok(DispatchWait::builder()
             .reason(DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
             .label(failure_backoff_wait_label(
-                execution.pre_start_failure_count.max(execution.transient_failure_count) + 1,
+                (failures.len().max(legacy_count) + 1) as i64,
             ))
-            .failures(collect_dispatch_failures(conn, &execution.work_item_id, &execution.id)?)
+            .failures(failures)
             // Failure details have no runtime epoch triggers.
             .reads_other_items(true)
             .build());
