@@ -2722,17 +2722,8 @@ impl WorkDb {
 
 pub use crate::operator_answer_outcome::OperatorAnswerOutcome;
 
-/// Move the answered task back to Todo with `block` appended to its brief and
-/// carry the answer to the next worker. Returns `true` when a ready execution
-/// was minted for it to start now.
-///
-/// A task still gated by prerequisites (a conflict revision queued behind
-/// another writer on the same PR is the common case) cannot be started
-/// explicitly: that request is refused, which would roll the whole answer back
-/// and leave the question open. Such a task is parked as `blocked` /
-/// `dependency` with a waiting execution, matching revision insert and
-/// prerequisite approval, so the dependency cascade promotes it on the
-/// event path when the gate clears.
+/// Test shorthand for [`restart_after_answer_from`] answered by a human with no
+/// socket provenance.
 #[cfg(test)]
 pub(super) fn restart_after_answer(
     pending: &mut PendingEvents,
@@ -2756,6 +2747,19 @@ pub(super) fn restart_after_answer(
     )
 }
 
+/// Move the answered task back to Todo with `block` appended to its brief and
+/// carry the answer to the next worker. Returns `true` when a ready execution
+/// was minted for it to start now.
+///
+/// A task still gated by prerequisites (a conflict revision queued behind
+/// another writer on the same PR is the common case) cannot be started
+/// explicitly: that request is refused, which would roll the whole answer back
+/// and leave the question open. Such a task is parked as `blocked` /
+/// `dependency` with a waiting execution, matching revision insert and
+/// prerequisite approval, so the dependency cascade promotes it on the
+/// event path when the gate clears.
+///
+/// `attribution` supplies the ledger actor/basis and `last_status_actor`.
 pub(super) fn restart_after_answer_from(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,

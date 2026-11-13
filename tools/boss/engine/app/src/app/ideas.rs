@@ -165,6 +165,7 @@ pub(super) async fn handle_graduate_idea(ctx: Dispatch, req: FrontendRequest) {
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::GraduateIdea {
@@ -177,7 +178,16 @@ pub(super) async fn handle_graduate_idea(ctx: Dispatch, req: FrontendRequest) {
     else {
         unreachable!()
     };
-    match work_db.graduate_idea(&id, target, name, effort_level, reasoning) {
+    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:graduate_idea").await;
+    let actor = resolve_status_actor(&server_state, peer_pid);
+    match work_db.graduate_idea_as_actor_with_provenance(
+        &id,
+        target,
+        name,
+        effort_level,
+        reasoning,
+        (actor, Some(&provenance)),
+    ) {
         Ok((idea, chore, project)) => {
             let product_id = idea.product_id.clone();
             let mut item_ids = vec![idea.id.clone()];

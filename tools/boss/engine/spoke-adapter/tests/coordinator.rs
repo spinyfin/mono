@@ -839,6 +839,12 @@ async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
         .await;
     env.coordinator.kick();
     until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    until("the spawn command to reach the spoke", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+    })
+    .await;
     let spawn = peer
         .commands()
         .into_iter()

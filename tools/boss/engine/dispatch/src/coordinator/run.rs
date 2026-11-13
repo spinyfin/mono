@@ -1000,6 +1000,7 @@ impl ExecutionCoordinator {
                     && let Err(err) = self.work_db.request_execution(
                         boss_protocol::RequestExecutionInput::builder()
                             .work_item_id(execution.work_item_id.clone())
+                            .audit_basis("slot_busy_replacement")
                             .build(),
                     )
                 {

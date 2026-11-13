@@ -1785,8 +1785,17 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
     let FrontendRequest::CreateRevision { input } = req else {
         unreachable!()
     };
+    let provenance =
+        resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:create_revision").await;
     let created = resolve_write_actor(&server_state, peer_pid, input.priority.as_deref(), None)
-        .and_then(|actor| work_db.create_revision_as_actor(input, server_state.pr_state_checker.as_ref(), actor))
+        .and_then(|actor| {
+            work_db.create_revision_as_actor_with_provenance(
+                input,
+                server_state.pr_state_checker.as_ref(),
+                actor,
+                Some(&provenance),
+            )
+        })
         .map(WorkItem::Task);
     finish_create_work_item(
         &server_state,

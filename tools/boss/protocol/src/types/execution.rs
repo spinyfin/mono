@@ -716,17 +716,20 @@ pub struct RequestExecutionInput {
     #[builder(default)]
     pub explicit_start: bool,
 
-    /// Ledger actor for writes this request makes (clearing `deferred` on
-    /// an explicit start). The RequestExecution handler overwrites this from
-    /// the socket peer; automatic callers leave it unset so the row records
-    /// `engine`.
+    /// Actor for every status and flag write this request makes, including
+    /// `last_status_actor`; the RequestExecution handler overwrites it from
+    /// the socket peer. Automatic callers leave it unset so those writes
+    /// record `engine`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_actor: Option<String>,
 
     /// Ledger caller identity for those writes (`rpc:request_execution …` or
     /// `board_drop:request_execution …`). Combined with the helper name
-    /// (`explicit_start_clears_deferred`) at the write. Unset for automatic
-    /// callers.
+    /// (`explicit_start_clears_deferred`) at the write. Automatic callers
+    /// set this to the code path that requested the execution
+    /// (`reconcile_active_dispatch`, `rescan_active_dispatch`,
+    /// `dispatch_failure_recovery`, `preemption_requeue`,
+    /// `slot_busy_replacement`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_basis: Option<String>,
 

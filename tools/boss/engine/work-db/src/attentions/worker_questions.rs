@@ -75,6 +75,7 @@ pub(super) fn order_recovery_in_tx(
     source: &Task,
     recovery: &Task,
     actor: &str,
+    provenance: Option<&str>,
 ) -> Result<()> {
     let now = now_string();
     let prefix = boss_protocol::CREATED_VIA_CONFLICT_RECOVERY_PREFIX;
@@ -94,7 +95,7 @@ pub(super) fn order_recovery_in_tx(
     deps::insert_edge(conn, &source.id, &recovery.id, RELATION_BLOCKS, &now)?;
     crate::task_status_audit::execute(
         conn,
-        "order_recovery_in_tx",
+        &crate::task_status_audit::compose_basis("order_recovery_in_tx", provenance),
         actor,
         "UPDATE tasks SET autostart = 1 WHERE id = ?1",
         [&recovery.id],
@@ -158,6 +159,7 @@ pub(super) fn apply_typed_answer_in_tx(
     members: &[Attention],
     produced_ids: &[String],
     successor: QuestionSuccessor,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<()> {
     let answered_yes = members
         .iter()
@@ -184,10 +186,7 @@ pub(super) fn apply_typed_answer_in_tx(
                     answered_at,
                     now: &now,
                 },
-                crate::task_status_audit::WriteAttribution {
-                    actor: boss_protocol::LAST_STATUS_ACTOR_HUMAN,
-                    provenance: Some("attention_successor"),
-                },
+                attribution,
             )?;
             if task.kind == TaskKind::Revision {
                 let task = query_task(conn, id).require("task", id)?;

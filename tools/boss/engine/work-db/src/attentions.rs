@@ -855,6 +855,8 @@ fn insert_seeded_design_task_in_tx(
     project_id: &str,
     name: &str,
     description: &str,
+    actor: &str,
+    provenance: Option<&str>,
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
@@ -862,8 +864,8 @@ fn insert_seeded_design_task_in_tx(
     let short_id = allocate_short_id(conn, product_id)?;
     crate::task_status_audit::execute(
         conn,
-        "insert_seeded_design_task_in_tx",
-        "engine",
+        &crate::task_status_audit::compose_basis("insert_seeded_design_task_in_tx", provenance),
+        actor,
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id) \
          VALUES (?1, ?2, ?3, 'design', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, 1, 'medium', ?8, ?9)",
@@ -898,6 +900,7 @@ fn action_question_group(
     members: &[Attention],
     pr_checker: &dyn PrStateChecker,
     actor: &str,
+    provenance: Option<&str>,
 ) -> Result<(String, String, Vec<String>, worker_questions::QuestionSuccessor)> {
     let answered: Vec<&Attention> = members.iter().filter(|m| m.answer_state == "answered").collect();
     if answered.is_empty() {
@@ -941,10 +944,12 @@ fn action_question_group(
             // may be design or implementation work, so the chain root's
             // reasoning mode should be inherited.
             .build();
-        match assert_parent_revisable_and_insert_as_actor(pending, conn, input, pr_checker, actor) {
+        match assert_parent_revisable_and_insert_as_actor_with_provenance(
+            pending, conn, input, pr_checker, actor, provenance,
+        ) {
             Ok(revision) => {
                 if let Some(source) = recovery_source {
-                    worker_questions::order_recovery_in_tx(pending, conn, source, &revision, actor)?;
+                    worker_questions::order_recovery_in_tx(pending, conn, source, &revision, actor, provenance)?;
                 }
                 let reference = serde_json::json!({
                     "task_id": revision.id,
@@ -986,12 +991,12 @@ fn action_question_group(
         .unwrap_or(group.association_project_id.as_deref())
     {
         (
-            insert_seeded_design_task_in_tx(conn, &group.product_id, project_id, &name, &brief)?,
+            insert_seeded_design_task_in_tx(conn, &group.product_id, project_id, &name, &brief, actor, provenance)?,
             "design_task",
         )
     } else {
         (
-            insert_chore_in_tx(
+            insert_chore_in_tx_as_actor_with_provenance(
                 conn,
                 CreateChoreInput::builder()
                     .product_id(&group.product_id)
@@ -1001,6 +1006,8 @@ fn action_question_group(
                     .created_via(CREATED_VIA_ATTENTION)
                     .force_duplicate(true)
                     .build(),
+                actor,
+                provenance,
             )?,
             "chore",
         )
@@ -1276,6 +1283,27 @@ impl WorkDb {
         pr_checker: &dyn PrStateChecker,
         actor: &str,
     ) -> Result<ActionedAttentionGroup> {
+        self.action_attention_group_as_actor_with_provenance(
+            id,
+            skip_unanswered,
+            member_overrides,
+            pr_checker,
+            actor,
+            None,
+        )
+    }
+
+    /// [`Self::action_attention_group_as_actor`] with the socket caller
+    /// identity so prerequisite autostart rows name who approved them.
+    pub fn action_attention_group_as_actor_with_provenance(
+        &self,
+        id: &str,
+        skip_unanswered: bool,
+        member_overrides: &std::collections::HashMap<String, FollowupMemberOverride>,
+        pr_checker: &dyn PrStateChecker,
+        actor: &str,
+        provenance: Option<&str>,
+    ) -> Result<ActionedAttentionGroup> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -1335,7 +1363,7 @@ impl WorkDb {
 
         let mut pending = PendingEvents::new();
         let (produced_kind, produced_ref, produced_work_item_ids, successor) = match group.kind.as_str() {
-            "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker, actor)?,
+            "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker, actor, provenance)?,
             "followup" => {
                 let (kind, reference, ids) = action_followup_group(&tx, &group, &members, member_overrides)?;
                 (kind, reference, ids, worker_questions::QuestionSuccessor::NoPr)
@@ -1350,6 +1378,7 @@ impl WorkDb {
             &members,
             &produced_work_item_ids,
             successor,
+            crate::task_status_audit::WriteAttribution { actor, provenance },
         )?;
 
         let now = now_string();

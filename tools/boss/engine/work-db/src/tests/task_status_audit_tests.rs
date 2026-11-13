@@ -632,6 +632,34 @@ fn explicit_start_records_the_deferred_clear() {
 }
 
 #[test]
+fn reconcile_active_dispatch_names_itself_when_clearing_deferred() {
+    let db = WorkDb::open(temp_db_path("flag-audit-reconcile-deferred")).unwrap();
+    let product = create_test_product_named(&db, "Flag reconcile deferred");
+    let chore = create_test_chore(&db, &product.id, "Active and deferred");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            deferred: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
+    assert_eq!(redispatched, vec![chore.id.clone()]);
+    assert_eq!(
+        flag_history(&db, &chore.id, "deferred").last(),
+        Some(&history_row(
+            Some("1"),
+            "0",
+            "engine",
+            "explicit_start_clears_deferred reconcile_active_dispatch"
+        ))
+    );
+}
+
+#[test]
 fn engine_dispatch_paths_record_their_autostart_changes() {
     let db = WorkDb::open(temp_db_path("flag-audit-engine")).unwrap();
     let product = create_test_product_named(&db, "Flag engine");
