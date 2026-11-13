@@ -66,7 +66,7 @@ use boss_protocol_spoke::{
     limits::MAX_PAYLOAD_BYTES,
     v1::{Command, CommandResult, ProposalDecision, ResultCode, command},
 };
-use boss_spoke_custody::{Applied as Custodied, Evidence, Source};
+use boss_spoke_custody::{Applied as Custodied, Evidence, PendingCause, Source};
 pub use boss_spoke_custody::{Custody, Mark, TranscriptSource};
 pub use boss_spoke_stream::CommandOutcome;
 use boss_spoke_stream::{StreamManager, store::CommandAdmission};
@@ -353,6 +353,7 @@ enum Settled {
     Pending {
         have: u64,
         want: u64,
+        cause: PendingCause,
     },
 }
 
@@ -394,6 +395,8 @@ struct Inner {
     reported: Mutex<HashMap<String, u64>>,
     #[builder(skip)]
     delivering: AtomicBool,
+    #[builder(skip)]
+    settling: AtomicBool,
 }
 
 /// Applies each host's stored observations, in order, and delivers the effects
@@ -853,11 +856,11 @@ impl Inner {
                 Settled::Unavailable { reason, alert } => {
                     self.note_unavailable(origin, mark, &reason, alert, dest).await;
                 }
-                Settled::Pending { have, want } => {
+                Settled::Pending { have, want, cause } => {
                     self.note_unavailable(
                         origin,
                         mark,
-                        &pending_timeout_reason(have, want, self.config.watermark_wait),
+                        &pending_timeout_reason(&cause, have, want, self.config.watermark_wait),
                         true,
                         dest,
                     )
@@ -993,11 +996,11 @@ impl Inner {
                 Settled::Unavailable { reason, alert } => {
                     self.note_unavailable(&event.origin, &mark, &reason, alert, dest).await;
                 }
-                Settled::Pending { have, want } => {
+                Settled::Pending { have, want, cause } => {
                     self.note_unavailable(
                         &event.origin,
                         &mark,
-                        &pending_timeout_reason(have, want, self.config.watermark_wait),
+                        &pending_timeout_reason(&cause, have, want, self.config.watermark_wait),
                         true,
                         dest,
                     )
@@ -1079,7 +1082,7 @@ impl Inner {
             {
                 Evidence::Ready(source) => Settled::Ready(source),
                 Evidence::Unavailable(reason) => Settled::Unavailable { reason, alert: false },
-                Evidence::Pending { have, want } => Settled::Pending { have, want },
+                Evidence::Pending { have, want, cause } => Settled::Pending { have, want, cause },
             },
         )
     }
@@ -1093,6 +1096,10 @@ impl Inner {
     }
 
     async fn settle_parked_inner(&self, host: Option<&str>, wait: bool) {
+        if self.settling.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _pass = Delivering(&self.settling);
         loop {
             let pending = match self.blocking(|db| db.pending_spoke_observations()).await {
                 Ok(pending) => pending,
@@ -1190,9 +1197,12 @@ impl Inner {
         if let Some(remaining) = self.parked_still_waiting(&observation, parked).await? {
             return Ok(ParkedEnd::Waiting(remaining));
         }
+        let currentness = self.currentness(observation.origin()).await?;
         match observation {
-            Observation::Event(event) => self.dispatch_event(event, None).await?,
-            Observation::Proposal(proposal) => self.apply_proposal(proposal, Currentness::Current, None).await?,
+            Observation::Event(event) if matches!(currentness, Currentness::Current) => {
+                self.dispatch_event(event, None).await?
+            }
+            Observation::Proposal(proposal) => self.apply_proposal(proposal, currentness, None).await?,
             _ => {}
         }
         self.finish_parked(effect, SpokeEffectOutcome::Done).await;
@@ -1550,7 +1560,7 @@ enum ParkedEnd {
 }
 
 fn event_wants_capture(event: &EventObservation) -> bool {
-    matches!(event.event, boss_protocol::WorkerEvent::Stop { .. })
+    !event.from_subagent && matches!(event.event, boss_protocol::WorkerEvent::Stop { .. })
 }
 
 fn proposal_wants_capture(proposal: &ProposalObservation) -> bool {
@@ -1567,11 +1577,11 @@ fn parked_elapsed(parked_at_ms: i64) -> Duration {
     Duration::from_millis(unix_ms(SystemTime::now()).saturating_sub(parked_at_ms) as u64)
 }
 
-fn pending_timeout_reason(have: u64, want: u64, bound: Duration) -> String {
-    if have == 0 && want == 1 {
-        format!("named outputs did not arrive within {bound:?}")
-    } else {
-        format!("only {have} of {want} transcript bytes arrived within {bound:?}")
+fn pending_timeout_reason(cause: &PendingCause, have: u64, want: u64, bound: Duration) -> String {
+    match cause {
+        PendingCause::Transcript => format!("only {have} of {want} transcript bytes arrived within {bound:?}"),
+        PendingCause::OutputsNotConcluded => format!("output capture did not conclude within {bound:?}"),
+        PendingCause::Artifact { id } => format!("artifact {id}: only {have} of {want} bytes arrived within {bound:?}"),
     }
 }
 

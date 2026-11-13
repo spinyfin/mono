@@ -120,13 +120,17 @@ An artifact is complete only when `materialized` equals the declared `total_byte
 
 ### Watermarks: how a boundary waits without deadlocking
 
-A `Stop` or a queued proposal carries `(transcript_generation, transcript_through)`: the size the transcript had when the boundary was recorded. The spoke numbers the boundary at once and the bulk bytes only as send credit allows, so the bytes can sit **behind** the boundary in the journal. Holding the host cursor until they arrived would deadlock on that watermark and would block other runs on the same host.
+A main-session `Stop` or a queued proposal carries a durable `capture_epoch` and `(transcript_generation, transcript_through)`: the size the transcript had when the boundary was recorded. The spoke numbers the boundary at once and the bulk bytes only as send credit allows, so the bytes can sit **behind** the boundary in the journal. Holding the host cursor until they arrived would deadlock on that watermark and would block other runs on the same host.
 
 The projector therefore records the completion as a pending `pending_observation` outbox item and advances the cursor. Custody records that follow are applied independently. The parked item is applied when
 
-- the mark is met and every artifact identity the spoke's `output:concluded` marker named is complete, invalid, or unavailable: a `Stop` is dispatched carrying the hub's copy (`IncomingHookEvent::with_transcript_source`), confined to the run's custody directory, so cost capture, the run's recorded transcript path and completion read it exactly as they read a local transcript. A named output with no row yet is pending, not settled;
+- the mark is met and every artifact identity the spoke's `output:concluded:<epoch>` marker for this or a later capture named is complete, invalid, or unavailable: a `Stop` is dispatched carrying the hub's copy (`IncomingHookEvent::with_transcript_source`), confined to the run's custody directory, so cost capture, the run's recorded transcript path and completion read it exactly as they read a local transcript. A named output with no row yet is pending, not settled;
 - the spoke declared the bytes unavailable, or the resource is halted: the boundary proceeds without a copy; custody's row holds the reason;
 - `watermark_wait` (default 60 s) passes with the bytes still missing: the boundary proceeds without a copy and a failed `transcript_evidence_unavailable` effect is stored, so the host counts against engine health.
+
+Capture epochs persist in the spoke run state. A turn Stop advances the epoch before it is journaled; upkeep emits its concluded marker and then streams the artifacts. A done submission advances the epoch before capturing and stamps that same epoch on its proposal, including when capture must retry. Epoch zero reads legacy unversioned markers. An earlier capture failure cannot release a later epoch. Pending evidence names its cause explicitly: transcript bytes, capture not concluded, or a particular artifact.
+
+Settlement is serialized across sweeps and host drains. Only the oldest pending observation of a run is considered, and assignment identity is rechecked immediately before dispatch; a superseded Stop is discarded and a superseded proposal receives the existing refusal.
 
 Later observations of the same run stay parked until that completion applies, so live-state for that run stays in order. Other runs on the host are not held.
 
@@ -156,3 +160,5 @@ The execution-retention sweep calls the custody reclaim (`Custody::reclaim_execu
 - A resource's state and reason: `WorkDb::spoke_custody_for_execution(execution_id)`; `materialized` against the file's length; `source_sequence` names the record that last changed it.
 - A halted resource appears as a failed `custody_halt` effect (key `<run>:<resource>`) and counts in `spoke_projection_failed_effects` on `GetEngineHealth`. A boundary that went ahead because bytes never arrived is a failed `transcript_evidence_unavailable` effect. Neither is retried; the evidence is gone or distrusted, not pending.
 - A host that stalls at a `Stop`: the log says `a completion boundary goes ahead without the transcript bytes it named`, or a `pending_observation` effect is still pending while the spoke is still sending. The host's cursor is not held.
+
+The summary and cost tails recheck custody state before each poll and read only the committed prefix. Transcript views and probe offsets use the same ledger limit; halted and invalid resources are unavailable even if their old path remains recorded. Summary path lookups are throttled, and a missing lookup retains a valid existing tail. The spoke summary containment root comes from the configured transcript store and assignment identity, independently of the stored path. Transcript pointer persistence succeeds before the generation cache advances, allowing a failed database write to retry.

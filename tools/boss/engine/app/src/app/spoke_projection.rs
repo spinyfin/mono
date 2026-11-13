@@ -123,12 +123,20 @@ pub(super) fn start_summary_slot(state: &Arc<ServerState>, slot_id: u8, run_id: 
 /// on this machine, and its liveness is what the spoke reports. Treating the
 /// absence of a local process as death would mark a healthy remote worker
 /// terminated.
-struct SpokeSlotResolver(Arc<ServerState>);
+pub(super) struct SpokeSlotResolver(pub(super) Arc<ServerState>);
 
 #[async_trait]
 impl TranscriptPathResolver for SpokeSlotResolver {
     async fn transcript_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
         TranscriptPathResolver::transcript_path(self.0.as_ref(), run_id).await
+    }
+
+    async fn transcript_read_limit(&self, path: &std::path::Path) -> Result<u64, String> {
+        let root = boss_engine_driver::transcript_store::transcript_store_root().map_err(|e| e.to_string())?;
+        projection::Custody::new(self.0.work_db.as_ref().clone(), root)
+            .read_limit_at(path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "transcript is not recorded in custody".to_owned())
     }
 
     async fn worker_can_refresh(&self, run_id: &str) -> WorkerRefreshPermit {
@@ -139,9 +147,11 @@ impl TranscriptPathResolver for SpokeSlotResolver {
     }
 
     async fn transcript_containment_root(&self, run_id: &str) -> Option<std::path::PathBuf> {
-        self.transcript_path(run_id)
-            .await
-            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        let root = boss_engine_driver::transcript_store::transcript_store_root().ok()?;
+        let assignment = self.0.work_db.spoke_assignment_for_execution(run_id).ok()??;
+        projection::Custody::new(self.0.work_db.as_ref().clone(), root)
+            .run_dir(run_id, &assignment.run_id)
+            .ok()
     }
 }
 
@@ -240,20 +250,19 @@ impl ObservationApplier for ServerApplier {
         let path = source.path.to_string_lossy().into_owned();
         // A newer generation replaces the pointer; replaying an older one does
         // not roll it back. Local hooks stay first-writer-wins.
-        if !state
+        match state
             .transcript_path_cache
-            .record_if_newer(execution_id, &path, &source.generation)
-        {
-            // The cache already holds this or a newer generation. Still fill a
-            // work_runs row that did not exist when the first chunk attached.
-            if let Err(error) = state.work_db.set_run_transcript_path_if_unset(execution_id, &path) {
-                return Applied::Retry(format!("{error:#}"));
-            }
-            return Applied::Done;
-        }
-        match state.work_db.set_run_transcript_path(execution_id, &path) {
-            Ok(_) => {}
+            .record_if_newer(execution_id, &path, &source.generation, || {
+                state.work_db.set_run_transcript_path(execution_id, &path).map(|_| ())
+            }) {
             Err(error) => return Applied::Retry(format!("{error:#}")),
+            Ok(false) => {
+                if let Err(error) = state.work_db.set_run_transcript_path_if_unset(execution_id, &path) {
+                    return Applied::Retry(format!("{error:#}"));
+                }
+                return Applied::Done;
+            }
+            Ok(true) => {}
         }
         state
             .record_driver_signal(execution_id, DriverSignalKind::TranscriptPath)

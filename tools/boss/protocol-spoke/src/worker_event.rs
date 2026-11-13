@@ -80,6 +80,7 @@ pub fn to_wire(event: &Domain) -> v1::WorkerEvent {
                 reason: stop_reason_to_wire(*stop_reason) as i32,
                 transcript_generation: String::new(),
                 transcript_through: 0,
+                capture_epoch: 0,
             }),
         ),
         Domain::Notification { session_id, message } => (session_id, Event::Notification(message.clone())),

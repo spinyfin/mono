@@ -310,6 +310,7 @@ impl RunCostTail {
         transcript_path: &Path,
         containment_root: Option<&Path>,
         capture_provider_usage: bool,
+        limit: u64,
     ) -> Result<bool, String> {
         let replace = match self.tails.get(transcript_path) {
             Some(state)
@@ -331,7 +332,11 @@ impl RunCostTail {
             .tails
             .get_mut(transcript_path)
             .expect("transcript cost tail was just inserted");
-        let values = state.tail.poll().await.map_err(|error| error.to_string())?;
+        let values = state
+            .tail
+            .poll_through(limit)
+            .await
+            .map_err(|error| error.to_string())?;
         let mut full_replacement = replace;
         if state.tail.generation() != state.accumulator_generation {
             state.accumulator = CostAccumulator::default();
@@ -361,6 +366,15 @@ pub struct RunCostCapture {
     inner: StdMutex<HashMap<String, Arc<Mutex<RunCostTail>>>>,
 }
 
+/// Check a hub transcript against custody before opening it. Local paths have
+/// no custody row and retain their ordinary filesystem semantics.
+pub fn transcript_read_limit(db: &crate::work::WorkDb, path: &Path) -> Result<Option<u64>, String> {
+    let root = boss_engine_driver::transcript_store::transcript_store_root().map_err(|e| e.to_string())?;
+    crate::hub::projection::Custody::new(db.clone(), root)
+        .read_limit_at(path)
+        .map_err(|e| e.to_string())
+}
+
 impl RunCostCapture {
     pub fn new() -> Self {
         Self::default()
@@ -373,6 +387,7 @@ impl RunCostCapture {
         transcript_path: &Path,
         containment_root: Option<&Path>,
     ) -> Result<bool, String> {
+        let limit = transcript_read_limit(work_db, transcript_path)?.unwrap_or(u64::MAX);
         let state = {
             let mut guard = self.inner.lock().expect("run cost capture mutex poisoned");
             guard
@@ -388,7 +403,7 @@ impl RunCostCapture {
                 .is_some_and(|execution| execution.kind == boss_protocol::ExecutionKind::PrReviewGuide)
         });
         let full_replacement = state
-            .poll(transcript_path, containment_root, capture_provider_usage)
+            .poll(transcript_path, containment_root, capture_provider_usage, limit)
             .await?;
         let mut snapshot = match state.snapshot() {
             Some(snapshot) => snapshot,
@@ -548,7 +563,7 @@ mod tests {
         )
         .unwrap();
         let mut tail = RunCostTail::default();
-        assert!(!tail.poll(&path, None, false).await.unwrap());
+        assert!(!tail.poll(&path, None, false, u64::MAX).await.unwrap());
         let before = tail.snapshot().unwrap();
         assert_eq!(before.input_tokens, Some(150));
         assert_eq!(before.rounds, Some(2));
@@ -564,7 +579,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(tail.poll(&path, None, false).await.unwrap());
+        assert!(tail.poll(&path, None, false, u64::MAX).await.unwrap());
         let after = tail.snapshot().unwrap();
         assert_eq!(after.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(after.input_tokens, Some(7));
@@ -601,8 +616,8 @@ mod tests {
         .unwrap();
 
         let mut tail = RunCostTail::default();
-        tail.poll(&path, Some(&root), false).await.unwrap();
-        let downgrade_error = tail.poll(&path, None, false).await.unwrap_err();
+        tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap();
+        let downgrade_error = tail.poll(&path, None, false, u64::MAX).await.unwrap_err();
         assert!(
             downgrade_error.contains("containment downgrade"),
             "a contained cost tail must never become unrestricted: {downgrade_error}",
@@ -610,7 +625,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         symlink(&outside, &path).unwrap();
 
-        let error = tail.poll(&path, Some(&root), false).await.unwrap_err();
+        let error = tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap_err();
         assert!(
             error.contains("transcript"),
             "contained run-cost tail must reject path replacement: {error}",

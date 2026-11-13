@@ -257,6 +257,7 @@ pub enum Applied {
 pub struct Mark {
     pub generation: String,
     pub through: u64,
+    pub capture_epoch: u64,
 }
 
 impl Mark {
@@ -264,6 +265,7 @@ impl Mark {
         Self {
             generation: generation.to_owned(),
             through,
+            capture_epoch: 0,
         }
     }
 }
@@ -281,11 +283,18 @@ pub struct TranscriptSource {
 
 /// How far a transcript watermark has been met.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingCause {
+    Transcript,
+    OutputsNotConcluded,
+    Artifact { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Evidence {
     /// Every byte through the mark is on the hub.
     Ready(TranscriptSource),
     /// The bytes are still expected.
-    Pending { have: u64, want: u64 },
+    Pending { have: u64, want: u64, cause: PendingCause },
     /// They will not come, and why.
     Unavailable(String),
 }
@@ -447,7 +456,11 @@ impl Custody {
         if resource == OUTPUT_CAPTURE {
             return self.close(source, "output", resource, CustodyState::Unavailable, &reason, 0);
         }
-        if resource == OUTPUT_CONCLUDED {
+        if resource == OUTPUT_CONCLUDED
+            || resource
+                .strip_prefix("output:concluded:")
+                .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+        {
             return self.close(source, "output", resource, CustodyState::Complete, &reason, 0);
         }
         if resource == PR_URL_OUTPUT || resource == STRUCTURED_OUTPUT {
@@ -715,29 +728,56 @@ impl Custody {
             .iter()
             .filter(|row| row.assignment_generation == run.assignment_generation)
             .collect();
-        if artifacts_settled && let Some(pending) = self.capture_pending(&mine) {
+        if artifacts_settled && let Some(pending) = self.capture_pending(&mine, mark.capture_epoch) {
             return Ok(pending);
         }
         self.transcript_mark(&mine, mark)
     }
 
     /// Capture has not finished, or a named artifact is still arriving.
-    fn capture_pending(&self, rows: &[&SpokeCustody]) -> Option<Evidence> {
-        let capture_fail = rows.iter().any(|row| row.resource == OUTPUT_CAPTURE);
-        let concluded = rows.iter().find(|row| row.resource == OUTPUT_CONCLUDED);
+    fn capture_pending(&self, rows: &[&SpokeCustody], epoch: u64) -> Option<Evidence> {
+        let capture_fail = epoch == 0 && rows.iter().any(|row| row.resource == OUTPUT_CAPTURE);
+        let resource = if epoch == 0 {
+            OUTPUT_CONCLUDED.to_owned()
+        } else {
+            format!("{OUTPUT_CONCLUDED}:{epoch}")
+        };
+        let concluded = rows
+            .iter()
+            .filter(|row| {
+                row.resource == resource
+                    || (epoch > 0
+                        && row
+                            .resource
+                            .strip_prefix("output:concluded:")
+                            .and_then(|n| n.parse::<u64>().ok())
+                            .is_some_and(|n| n >= epoch))
+            })
+            .min_by_key(|row| row.source_sequence);
         if concluded.is_none() && !capture_fail {
-            return Some(Evidence::Pending { have: 0, want: 1 });
+            return Some(Evidence::Pending {
+                have: 0,
+                want: 1,
+                cause: PendingCause::OutputsNotConcluded,
+            });
         }
         let concluded = concluded?;
         let ids: Vec<String> = serde_json::from_str(concluded.reason.as_deref().unwrap_or("[]")).unwrap_or_default();
         for id in ids {
             let resource = format!("artifact:{id}");
             match rows.iter().find(|row| row.resource == resource) {
-                None => return Some(Evidence::Pending { have: 0, want: 1 }),
+                None => {
+                    return Some(Evidence::Pending {
+                        have: 0,
+                        want: 1,
+                        cause: PendingCause::Artifact { id },
+                    });
+                }
                 Some(row) if row.state == CustodyState::Open => {
                     return Some(Evidence::Pending {
                         have: row.materialized,
                         want: row.total_bytes.unwrap_or(row.materialized),
+                        cause: PendingCause::Artifact { id },
                     });
                 }
                 Some(_) => {}
@@ -763,6 +803,7 @@ impl Custody {
                 Evidence::Pending {
                     have: 0,
                     want: mark.through,
+                    cause: PendingCause::Transcript,
                 }
             });
         };
@@ -779,6 +820,7 @@ impl Custody {
             CustodyState::Open => Evidence::Pending {
                 have: row.materialized,
                 want: mark.through,
+                cause: PendingCause::Transcript,
             },
             _ => Evidence::Unavailable(format!(
                 "the transcript ends at {} bytes, before the {} the boundary needs: {}",
@@ -801,8 +843,7 @@ impl Custody {
 
     /// The execution's newest transcript generation that holds bytes.
     ///
-    /// Adapter tests and generation-advancing readers use this to find the
-    /// active file when a run has more than one transcript generation.
+    /// Used by adapter tests to inspect generation replacement.
     pub fn latest_transcript(&self, execution_id: &str) -> Result<Option<(TranscriptSource, CustodyState)>> {
         let rows = self.db.spoke_custody_for_execution(execution_id)?;
         rows.iter()
@@ -827,6 +868,16 @@ impl Custody {
     /// cannot fall through to another path. The read is bounded to the
     /// committed watermark.
     pub fn read_tail_at(&self, path: &Path, max_bytes: u64) -> Result<Option<String>> {
+        let Some(limit) = self.read_limit_at(path)? else {
+            return Ok(None);
+        };
+        write::tail(path, limit, max_bytes)
+            .map(Some)
+            .with_context(|| format!("reading {}", path.display()))
+    }
+
+    /// Validate the ledger state and return the committed byte limit.
+    pub fn read_limit_at(&self, path: &Path) -> Result<Option<u64>> {
         let Some(relative) = path.strip_prefix(&self.root).ok().and_then(Path::to_str) else {
             return Ok(None);
         };
@@ -843,9 +894,7 @@ impl Custody {
             }
             _ => {}
         }
-        write::tail(path, row.materialized, max_bytes)
-            .map(Some)
-            .with_context(|| format!("reading {}", path.display()))
+        Ok(Some(row.materialized))
     }
 
     /// The last `max_bytes` of the execution's worker-log artifact, if the spoke
@@ -1087,7 +1136,10 @@ fn verified(path: &Path, artifact: &ArtifactSpec) -> std::result::Result<(), Str
 }
 
 fn expected_output(rows: &[&SpokeCustody], kind: StructuredOutputKind) -> bool {
-    let Some(concluded) = rows.iter().find(|row| row.resource == OUTPUT_CONCLUDED) else {
+    let Some(concluded) = rows
+        .iter()
+        .find(|row| row.resource == OUTPUT_CONCLUDED || row.resource.starts_with("output:concluded:"))
+    else {
         return false;
     };
     let ids: Vec<String> = serde_json::from_str(concluded.reason.as_deref().unwrap_or("[]")).unwrap_or_default();
@@ -1325,12 +1377,20 @@ mod tests {
         let mark = Mark::new("0-1", 10);
         assert_eq!(
             f.custody.transcript_evidence(&f.run, &mark, false).unwrap(),
-            Evidence::Pending { have: 0, want: 10 }
+            Evidence::Pending {
+                have: 0,
+                want: 10,
+                cause: PendingCause::Transcript
+            }
         );
         f.transcript(1, "0-1", 0, b"01234");
         assert_eq!(
             f.custody.transcript_evidence(&f.run, &mark, false).unwrap(),
-            Evidence::Pending { have: 5, want: 10 }
+            Evidence::Pending {
+                have: 5,
+                want: 10,
+                cause: PendingCause::Transcript
+            }
         );
         f.transcript(2, "0-1", 5, b"56789");
         let Evidence::Ready(source) = f.custody.transcript_evidence(&f.run, &mark, false).unwrap() else {
@@ -1641,7 +1701,7 @@ mod tests {
             f.custody
                 .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
                 .unwrap(),
-            Evidence::Pending { have: 0, want: 1 }
+            Evidence::Pending { have: 0, want: 1, .. }
         ));
         assert_eq!(
             f.custody

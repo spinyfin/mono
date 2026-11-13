@@ -267,6 +267,8 @@ mod tests {
             (execution.id, held)
         };
         let (old_done, old_dir) = make("old-finished", "completed", 30);
+        let neighbour = old_dir.join("unregistered.txt");
+        std::fs::write(&neighbour, b"keep").unwrap();
         let (recent_done, recent_dir) = make("recent-finished", "completed", 1);
         let (old_live, live_dir) = make("old-but-running", "running", 30);
 
@@ -276,7 +278,11 @@ mod tests {
             .unwrap()
             .block_on(run_one_pass(&db));
 
-        assert!(!old_dir.exists(), "a long-finished run's hub copy is reclaimed");
+        assert!(
+            !old_dir.join("transcript.jsonl").exists(),
+            "the recorded hub copy is reclaimed"
+        );
+        assert_eq!(std::fs::read(&neighbour).unwrap(), b"keep");
         assert!(db.spoke_custody_for_execution(&old_done).unwrap().is_empty());
         assert!(recent_dir.exists(), "a recently finished run keeps its bytes");
         assert!(!db.spoke_custody_for_execution(&recent_done).unwrap().is_empty());

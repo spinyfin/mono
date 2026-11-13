@@ -1540,6 +1540,20 @@ pub(super) enum TranscriptResolution {
 /// hasn't yet emitted a transcript-bearing hook surfaces as
 /// `Buffering` rather than `Unknown`.
 pub(super) fn resolve_transcript_for_tail(server_state: &ServerState, run_id: &str) -> TranscriptResolution {
+    let result = resolve_transcript_path(server_state, run_id);
+    if let TranscriptResolution::Found { transcript_path } = &result
+        && boss_engine_runtime::run_cost::transcript_read_limit(
+            &server_state.work_db,
+            std::path::Path::new(transcript_path),
+        )
+        .is_err()
+    {
+        return TranscriptResolution::KnownNoTranscript;
+    }
+    result
+}
+
+fn resolve_transcript_path(server_state: &ServerState, run_id: &str) -> TranscriptResolution {
     // Hot path: the dispatcher's in-memory cache, keyed on the same
     // execution-id namespace the live registry uses. Populated by
     // every hook event that carries `transcript_path`, so once the

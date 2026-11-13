@@ -454,6 +454,8 @@ message TurnStop {
   StopReason reason = 2;
   string transcript_generation = 3;
   uint64 transcript_through = 4;
+  // Durable output capture boundary; zero is the legacy protocol.
+  uint64 capture_epoch = 5;
 }
 message TranscriptDelta {
   string generation = 1;
@@ -479,6 +481,7 @@ message Proposal {
   bytes canonical_json = 4;
   string transcript_generation = 5;
   uint64 transcript_through = 6;
+  uint64 capture_epoch = 7;
 }
 message ProposalDecision {
   string proposal_id = 1;

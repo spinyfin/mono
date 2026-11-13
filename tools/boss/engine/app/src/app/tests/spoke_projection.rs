@@ -2158,3 +2158,211 @@ async fn a_newer_transcript_generation_advances_the_run_pointer() {
         Some(second_path.as_str())
     );
 }
+
+#[tokio::test]
+async fn transcript_pointer_retry_persists_before_advancing_the_cache() {
+    use boss_engine_runtime::hub::projection::{Origin, TranscriptSource};
+    let fx = delivered_with_a_resolvable_pr();
+    let applier = crate::app::spoke_projection::applier(&fx.state);
+    let origin = Origin {
+        host_id: HOST.into(),
+        journal_id: "journal".into(),
+        sequence: 1,
+        observed: Default::default(),
+        run: fx.run(),
+    };
+    let first = TranscriptSource {
+        path: fx._dir.path().join("first"),
+        root: fx._dir.path().to_owned(),
+        generation: "0-1".into(),
+        materialized: 1,
+    };
+    assert!(matches!(
+        applier.transcript_attached(&origin, &first).await,
+        boss_engine_runtime::hub::projection::Applied::Done
+    ));
+    fx.state.work_db.connect().unwrap().execute_batch(
+        "CREATE TRIGGER fail_transcript_pointer BEFORE UPDATE OF transcript_path ON work_runs BEGIN SELECT RAISE(FAIL, 'pointer unavailable'); END;"
+    ).unwrap();
+    let second = TranscriptSource {
+        path: fx._dir.path().join("second"),
+        generation: "0-2".into(),
+        ..first.clone()
+    };
+    assert!(matches!(
+        applier.transcript_attached(&origin, &second).await,
+        boss_engine_runtime::hub::projection::Applied::Retry(_)
+    ));
+    assert_eq!(
+        fx.state.transcript_path_cache.get(&fx.execution_id).unwrap(),
+        first.path.to_str().unwrap()
+    );
+    fx.state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_transcript_pointer;")
+        .unwrap();
+    assert!(matches!(
+        applier.transcript_attached(&origin, &second).await,
+        boss_engine_runtime::hub::projection::Applied::Done
+    ));
+    assert_eq!(
+        fx.state
+            .work_db
+            .transcript_path_for_execution(&fx.execution_id)
+            .unwrap()
+            .unwrap(),
+        second.path.to_str().unwrap()
+    );
+    assert_eq!(
+        fx.state.transcript_path_cache.get(&fx.execution_id).unwrap(),
+        second.path.to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn custody_consumers_bound_reads_and_refuse_a_halted_copy() {
+    use boss_engine_runtime::hub::projection::Custody;
+    use boss_engine_runtime::live_status_loop::TranscriptPathResolver;
+    use sha2::{Digest, Sha256};
+    let mut fx = delivered_with_a_resolvable_pr();
+    let root = boss_engine_driver::transcript_store::transcript_store_root().unwrap();
+    let custody = Arc::new(Custody::new(fx.state.work_db.as_ref().clone(), &root));
+    let bytes = b"{\"type\":\"assistant\",\"message\":{\"id\":\"a\",\"model\":\"claude-opus\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n";
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 0,
+        data: bytes.to_vec(),
+        sha256: Sha256::digest(bytes).to_vec(),
+        eof: false,
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody.clone(),
+    )
+    .drain()
+    .await;
+    let path = std::path::PathBuf::from(
+        fx.state
+            .work_db
+            .transcript_path_for_execution(&fx.execution_id)
+            .unwrap()
+            .unwrap(),
+    );
+    let resolver = crate::app::spoke_projection::SpokeSlotResolver(fx.state.clone());
+    let trusted = resolver.transcript_containment_root(&fx.execution_id).await.unwrap();
+    assert_eq!(trusted, custody.run_dir(&fx.execution_id, &fx.run().run_id).unwrap());
+    let mut physical = bytes.to_vec();
+    physical.extend_from_slice(b"{\"uncommitted\":true}\n");
+    std::fs::write(&path, physical).unwrap();
+    // Exercise the production spoke resolver through a Codex summary slot.
+    fx.state
+        .live_worker_states
+        .register_spawn(1, &fx.execution_id, "codex", 0, None);
+    let driver = boss_engine_driver::DriverRegistry::default().require("codex").unwrap();
+    crate::app::spoke_projection::start_summary_slot(&fx.state, 1, &fx.execution_id, driver);
+    fx.state.live_status_manager.notify(
+        1,
+        boss_engine_runtime::live_status_loop::Trigger::ActivityChanged(boss_protocol::WorkerActivity::Working),
+    );
+    for _ in 0..100 {
+        if fx
+            .state
+            .live_status_manager
+            .debug_store()
+            .snapshot_for(1)
+            .transcript_path
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fx.state
+            .live_status_manager
+            .debug_store()
+            .snapshot_for(1)
+            .transcript_path
+            .as_deref(),
+        path.to_str()
+    );
+    fx.state.live_status_manager.stop_slot_for_run(1, &fx.execution_id);
+    let limit = resolver.transcript_read_limit(&path).await.unwrap();
+    assert_eq!(limit, bytes.len() as u64);
+    let mut tail = boss_engine_runtime::transcript_tail::TranscriptTail::new_contained(&path, &trusted).unwrap();
+    assert_eq!(tail.poll_through(limit).await.unwrap().len(), 1);
+    assert_eq!(
+        crate::app::executions::read_transcript_content(&fx.state.work_db, path.to_str().unwrap())
+            .await
+            .unwrap()
+            .as_bytes(),
+        bytes
+    );
+    assert!(
+        fx.state
+            .run_cost_capture
+            .capture_and_persist(&fx.state.work_db, &fx.execution_id, &path, Some(&trusted))
+            .await
+            .is_ok()
+    );
+    let outside = fx._dir.path().join("outside.jsonl");
+    std::fs::write(&outside, bytes).unwrap();
+    fx.state
+        .work_db
+        .set_run_transcript_path(&fx.execution_id, outside.to_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        resolver.transcript_containment_root(&fx.execution_id).await.unwrap(),
+        trusted
+    );
+    assert!(boss_engine_runtime::transcript_tail::TranscriptTail::new_contained(&outside, &trusted).is_err());
+    fx.state
+        .work_db
+        .set_run_transcript_path(&fx.execution_id, path.to_str().unwrap())
+        .unwrap();
+    // A hole halts this already-attached resource.
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 9999,
+        data: b"x".to_vec(),
+        sha256: Sha256::digest(b"x").to_vec(),
+        eof: false,
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody,
+    )
+    .drain()
+    .await;
+    assert!(resolver.transcript_read_limit(&path).await.is_err());
+    assert!(matches!(
+        crate::app::handler_helpers::resolve_transcript_for_tail(&fx.state, &fx.execution_id),
+        crate::app::handler_helpers::TranscriptResolution::KnownNoTranscript
+    ));
+    assert!(
+        crate::app::executions::read_transcript_content(&fx.state.work_db, path.to_str().unwrap())
+            .await
+            .is_err()
+    );
+    assert!(
+        fx.state
+            .run_cost_capture
+            .capture_and_persist(&fx.state.work_db, &fx.execution_id, &path, Some(&trusted))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        crate::app::worker_events::transcript_offset_for_run(&fx.state, &fx.execution_id).await,
+        (None, 0)
+    );
+}

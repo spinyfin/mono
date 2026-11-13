@@ -244,9 +244,10 @@ pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reducti
             // before the conversion drops it. A subagent's Stop is not a turn
             // boundary of the run and carries none.
             let mark = match &wire.event {
-                Some(WireEvent::Stop(stop)) if !wire.from_subagent => {
-                    Some(Mark::new(&stop.transcript_generation, stop.transcript_through))
-                }
+                Some(WireEvent::Stop(stop)) if !wire.from_subagent => Some(Mark {
+                    capture_epoch: stop.capture_epoch,
+                    ..Mark::new(&stop.transcript_generation, stop.transcript_through)
+                }),
                 _ => None,
             };
             match worker_event::from_wire(wire) {
@@ -264,7 +265,10 @@ pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reducti
             let Some(run) = run else {
                 return Reduction::Quarantine("proposal record has no run".into());
             };
-            let mark = Mark::new(&proposal.transcript_generation, proposal.transcript_through);
+            let mark = Mark {
+                capture_epoch: proposal.capture_epoch,
+                ..Mark::new(&proposal.transcript_generation, proposal.transcript_through)
+            };
             Reduction::Observations(vec![Observation::Proposal(ProposalObservation {
                 origin: origin(run),
                 request: proposal_request(&proposal),

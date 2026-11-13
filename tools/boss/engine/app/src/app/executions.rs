@@ -1387,7 +1387,8 @@ pub(super) async fn handle_execution_transcript(ctx: Dispatch, req: FrontendRequ
                 return;
             }
         };
-        match tokio::fs::read_to_string(&transcript_path).await {
+        let content = read_transcript_content(&work_db, &transcript_path).await;
+        match content {
             Ok(content) => {
                 // Same driver-aware path as Stop-boundary marker scans: a Codex
                 // rollout is unreadable by the Claude dialect parser, so a raw
@@ -1500,4 +1501,27 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
             background_work,
         },
     );
+}
+
+/// Read the committed prefix of a custody copy, or the whole local transcript.
+pub(super) async fn read_transcript_content(
+    work_db: &boss_work_db::WorkDb,
+    transcript_path: &str,
+) -> std::io::Result<String> {
+    match boss_engine_runtime::run_cost::transcript_read_limit(work_db, std::path::Path::new(&transcript_path)) {
+        Err(error) => Err(std::io::Error::other(error)),
+        Ok(Some(limit)) => {
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            match tokio::fs::File::open(&transcript_path).await {
+                Ok(file) => file
+                    .take(limit)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map(|_| String::from_utf8_lossy(&bytes).into_owned()),
+                Err(error) => Err(error),
+            }
+        }
+        Ok(None) => tokio::fs::read_to_string(&transcript_path).await,
+    }
 }

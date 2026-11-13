@@ -86,13 +86,16 @@ impl Custodied {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
 struct Applier {
     log: Arc<Mutex<Log>>,
     /// Applying a proposal parks forever, as a crash mid-application would.
     hang_proposals: Arc<AtomicBool>,
     entered: Arc<Notify>,
     event_retries: Arc<AtomicU32>,
+    block_events: Arc<AtomicBool>,
+    release_event: Arc<Notify>,
     custody: Custodied,
 }
 
@@ -131,6 +134,10 @@ impl ObservationApplier for Applier {
             .lock()
             .unwrap()
             .push((observation.origin.sequence, held));
+        if self.block_events.load(Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release_event.notified().await;
+        }
         Applied::Done
     }
 
@@ -1549,4 +1556,162 @@ async fn a_done_proposal_waits_for_a_named_output_arriving_later() {
 fn sqlite_rewind(db: &WorkDb) {
     let conn = db.connect().unwrap();
     conn.execute("UPDATE spoke_projection SET applied = 0", []).unwrap();
+}
+
+fn stop_epoch(sequence: u64, run: &Run, epoch: u64) -> v1::Record {
+    let mut record = stop_at(sequence, run, "0-1", 5);
+    if let Some(record::Body::Event(event)) = &mut record.body
+        && let Some(v1::worker_event::Event::Stop(stop)) = &mut event.event
+    {
+        stop.capture_epoch = epoch;
+    }
+    record
+}
+
+#[tokio::test]
+async fn second_turn_waits_for_its_own_capture_and_serializes_concurrent_settlers() {
+    use sha2::{Digest, Sha256};
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    let custody = world.custody(&db);
+    let applier = Applier::default();
+    let sender = Arc::new(Sender::default());
+    let wake = Arc::new(Notify::new());
+    let projector = custody_projector(&db, &applier, &sender, wake.clone(), &custody);
+    spoke.send(&transcript_record(1, &run, "0-1", 0, b"hello")).await;
+    spoke.send(&stop_epoch(2, &run, 1)).await;
+    spoke.send(&gap_record(3, &run, "output:concluded:1", 0, "[]")).await;
+    projector.drain().await;
+    assert_eq!(applier.log(|l| l.events.clone()), ["2#stop"]);
+    spoke.send(&stop_epoch(4, &run, 2)).await;
+    let running = tokio::spawn(projector.clone().run());
+    eventually("second Stop parked despite the first empty capture", || {
+        applied(&db) == 4
+    })
+    .await;
+    assert_eq!(applier.log(|l| l.events.clone()), ["2#stop"]);
+    let whole = br#"{"findings":[]}"#;
+    let digest: String = Sha256::digest(whole).iter().map(|b| format!("{b:02x}")).collect();
+    let id = format!("{}:{digest}", v1::ArtifactKind::ReviewResult as i32);
+    spoke
+        .send(&gap_record(
+            5,
+            &run,
+            "output:concluded:2",
+            0,
+            &serde_json::to_string(&[&id]).unwrap(),
+        ))
+        .await;
+    wake.notify_waiters();
+    eventually("marker projected before artifact", || applied(&db) == 5).await;
+    assert_eq!(applier.log(|l| l.events.clone()), ["2#stop"]);
+    applier.block_events.store(true, Ordering::SeqCst);
+    spoke
+        .send(&artifact_record(
+            6,
+            &run,
+            &id,
+            v1::ArtifactKind::ReviewResult,
+            whole,
+            br#"{"output_kind":"review-result"}"#,
+        ))
+        .await;
+    wake.notify_waiters();
+    applier.entered.notified().await;
+    let destination = world._dir.path().join("review.json");
+    assert_eq!(
+        custody
+            .collect_output(
+                "exec_1",
+                boss_spoke_custody::StructuredOutputKind::ReviewResult,
+                &destination
+            )
+            .unwrap(),
+        boss_spoke_custody::Collected::Installed
+    );
+    assert_eq!(std::fs::read(destination).unwrap(), whole);
+    // This independent drain competes with the blocked sweep/host drain.
+    spoke.send(&tool_record(7, &run)).await;
+    projector.drain().await;
+    assert_eq!(applier.log(|l| l.events.clone()), ["2#stop", "4#stop"]);
+    applier.block_events.store(false, Ordering::SeqCst);
+    applier.release_event.notify_one();
+    eventually("settlement committed", || {
+        db.pending_spoke_observations().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        applier.log(|l| l.events.clone()),
+        ["2#stop", "4#stop", "7#pre_tool_use"]
+    );
+    running.abort();
+    let _ = running.await;
+}
+
+#[tokio::test]
+async fn parked_stop_and_done_are_fenced_after_reassignment_and_restart() {
+    let world = World::new();
+    let db = world.open();
+    let (key, run) = assign(&db, "exec_1");
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&stop_epoch(1, &run, 1)).await;
+    let mut done = proposal_record(2, &run, "old-done");
+    if let Some(record::Body::Proposal(proposal)) = &mut done.body {
+        proposal.capture_epoch = 1;
+    }
+    spoke.send(&done).await;
+    let applier = Applier::default();
+    let sender = Arc::new(Sender::default());
+    let custody = world.custody(&db);
+    let running = tokio::spawn(custody_projector(&db, &applier, &sender, Arc::new(Notify::new()), &custody).run());
+    eventually("both boundaries parked", || applied(&db) == 2).await;
+    running.abort();
+    let _ = running.await;
+    db.resolve_spoke_assignment("exec_1", key.assignment_generation, "abandoned")
+        .unwrap();
+    assign(&db, "exec_1");
+    custody_projector(&world.open(), &applier, &sender, Arc::new(Notify::new()), &custody)
+        .drain()
+        .await;
+    assert!(applier.log(|l| l.events.is_empty() && l.proposals.is_empty()));
+    assert!(db.pending_spoke_observations().unwrap().is_empty());
+    let sent = sender.sent();
+    let Some(command::Body::ProposalDecision(decision)) = &sent[0].1.body else {
+        panic!("refusal expected")
+    };
+    assert_eq!(decision.code, ResultCode::Rejected as i32);
+}
+
+#[tokio::test]
+async fn subagent_stop_does_not_wait_for_main_capture() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    let mut stop = stop_at(1, &run, "", 0);
+    if let Some(record::Body::Event(event)) = &mut stop.body {
+        event.from_subagent = true;
+    }
+    spoke.send(&stop).await;
+    spoke.send(&tool_record(2, &run)).await;
+    let applier = Applier::default();
+    custody_projector(
+        &db,
+        &applier,
+        &Arc::new(Sender::default()),
+        Arc::new(Notify::new()),
+        &world.custody(&db),
+    )
+    .drain()
+    .await;
+    assert_eq!(applier.log(|l| l.events.clone()), ["1#stop", "2#pre_tool_use"]);
+    assert!(failed_effects(&db, "transcript_evidence_unavailable").is_empty());
+    assert!(
+        db.spoke_effect(HOST, "pending_observation", &format!("{}:1", run.run_id))
+            .unwrap()
+            .is_none(),
+        "a subagent Stop never enters the capture-wait outbox"
+    );
 }

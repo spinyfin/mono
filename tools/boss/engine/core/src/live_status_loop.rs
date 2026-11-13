@@ -418,15 +418,22 @@ impl TranscriptPathCache {
     /// already cached, so a replaced spoke transcript is not pinned to its
     /// first file. Replaying an older generation does not roll the pointer
     /// back.
-    pub fn record_if_newer(&self, run_id: &str, path: &str, generation: &str) -> bool {
+    pub fn record_if_newer<E>(
+        &self,
+        run_id: &str,
+        path: &str,
+        generation: &str,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
         let rank = generation_rank(generation);
         let mut guard = self.inner.lock().expect("transcript path cache poisoned");
         if let Some(cached) = guard.get(run_id)
             && let Some(current) = &cached.generation
             && generation_rank(current) >= rank
         {
-            return false;
+            return Ok(false);
         }
+        persist()?;
         guard.insert(
             run_id.to_owned(),
             CachedTranscriptPath {
@@ -434,7 +441,7 @@ impl TranscriptPathCache {
                 generation: Some(generation.to_owned()),
             },
         );
-        true
+        Ok(true)
     }
 
     pub fn get(&self, run_id: &str) -> Option<String> {
@@ -528,6 +535,11 @@ pub trait LiveStatusBroadcaster: Send + Sync {
 #[async_trait]
 pub trait TranscriptPathResolver: Send + Sync {
     async fn transcript_path(&self, run_id: &str) -> Option<PathBuf>;
+
+    /// Rechecked before every poll; errors suspend even an already-open tail.
+    async fn transcript_read_limit(&self, _path: &std::path::Path) -> Result<u64, String> {
+        Ok(u64::MAX)
+    }
 
     /// Check process/session liveness before reading a cached transcript.
     ///
@@ -926,6 +938,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         debug_store,
     } = cfg;
     let mut tail: Option<TranscriptTail> = None;
+    let mut last_path_lookup: Option<Instant> = None;
     let mut tailed_path: Option<PathBuf> = None;
     let mut transcript_session = driver.transcript_session();
     let mut transcript_buffer: Vec<Value> = Vec::new();
@@ -1155,7 +1168,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
 
         // Resolve the transcript path lazily, and again when a newer
         // generation attaches so the tail is not stuck on a closed file.
-        let resolved = resolver.transcript_path(&run_id).await;
+        let resolved = if tail.is_none() || last_path_lookup.is_none_or(|at| at.elapsed() >= SUCCESS_COOLDOWN) {
+            last_path_lookup = Some(Instant::now());
+            resolver.transcript_path(&run_id).await.or_else(|| tailed_path.clone())
+        } else {
+            tailed_path.clone()
+        };
         if tailed_path.as_ref() != resolved.as_ref() {
             match resolved {
                 Some(path) => {
@@ -1201,7 +1219,15 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // Pull any new transcript content into the buffer.
         let mut new_lines_count = 0usize;
         if let Some(t) = tail.as_mut() {
-            match t.poll().await {
+            let limit = match resolver.transcript_read_limit(t.path()).await {
+                Ok(limit) => limit,
+                Err(error) => {
+                    transcript_buffer.clear();
+                    tracing::warn!(%error, "live_status: transcript unavailable");
+                    continue;
+                }
+            };
+            match t.poll_through(limit).await {
                 Ok(new_lines) => {
                     new_lines_count = new_lines.len();
                     // Normalise through the run's driver before anything
@@ -1260,6 +1286,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
 
         match outcome {
             SummarizerOutcome::Success(text) => {
+                if let Some(t) = tail.as_ref()
+                    && resolver.transcript_read_limit(t.path()).await.is_err()
+                {
+                    transcript_buffer.clear();
+                    continue;
+                }
                 let prior = registry.get(slot_id).and_then(|s| s.live_status);
                 let transition = match (&prior, &Some(text.clone())) {
                     (None, Some(_)) => "none->some",
