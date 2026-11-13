@@ -71,11 +71,31 @@ fn live_lane_is_exactly_the_audited_local_only_set() {
             "{request:?}"
         );
     }
-    // Network-bound reads must stay out of the live lane.
+    // Non-audited reads and writes must not land on Live. Covering bulk,
+    // ordered, and payload-dependent arms catches a stray Live assignment
+    // outside the macro list.
     for request in [
         FrontendRequest::TrunkStatus,
         FrontendRequest::GitHubAuthStatus,
         FrontendRequest::ListCoordinatorGuidance { product_id: None },
+        FrontendRequest::ListProducts,
+        FrontendRequest::GetSettings,
+        FrontendRequest::GetPrStatus {
+            run_id: "run".into(),
+            refresh: false,
+        },
+        FrontendRequest::GetPrStatus {
+            run_id: "run".into(),
+            refresh: true,
+        },
+        FrontendRequest::GetCoordinatorHandoff { redeliver: false },
+        FrontendRequest::SetDispatchPaused {
+            paused: true,
+            reason: None,
+            scope: None,
+        },
+        FrontendRequest::Shutdown { token: "t".into() },
+        task(false),
     ] {
         assert_ne!(request_contract(&request).admission, AdmissionLane::Live, "{request:?}");
     }

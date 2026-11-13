@@ -1,10 +1,9 @@
 //! The per-request replay and admission contract.
 //!
-//! Two questions about a [`FrontendRequest`] used to be answered by two
-//! separate hand-maintained tables, one in the client (may a request whose
-//! outcome is unknown be sent again?) and one in the engine (which admission
-//! lane does it use?). Both are properties of the request itself, so both are
-//! answered here, once, by [`request_contract`].
+//! Every [`FrontendRequest`] has two per-request properties that the client
+//! and the engine consume independently: whether a request whose outcome is
+//! unknown may be sent again (replay), and which engine admission lane it
+//! uses. [`request_contract`] answers both for each request.
 //!
 //! [`request_contract`] is a single exhaustive `match` with no catch-all, so a
 //! new `FrontendRequest` variant does not compile until someone deliberately
@@ -49,9 +48,8 @@
 //!   Applies to `CreateTask`, `CreateChore` and `CreateInvestigation`, and only
 //!   when `force_duplicate` is false: with it set the guard is off. The window
 //!   itself is the client's concern, not part of this contract.
-//! * [`ReplayContract::Never`]: everything else: creates without a guard,
-//!   state transitions, fan-out commands, `Shutdown`, and any variant not
-//!   listed above.
+//! * [`ReplayContract::Never`]: creates without a guard, state transitions,
+//!   fan-out commands, and `Shutdown`.
 //!
 //! ## Admission
 //!
@@ -60,8 +58,9 @@
 //! * [`AdmissionLane::Live`]: the audited set of cheap, local-only reads that
 //!   must stay responsive while the bulk lane is saturated. Membership needs
 //!   an audit: the handler may read only local process state, local SQL, or the
-//!   local cube socket. `LIVE_VARIANTS` in this module's tests is that
-//!   inventory, and it is generated from the same list the `match` uses.
+//!   local cube socket. `LIVE_VARIANTS` (test-only) is generated from the same
+//!   macro list the match uses; the tests compare it with an independently
+//!   written audit list.
 //! * [`AdmissionLane::Ordered`]: everything else, handled in request order and
 //!   never subject to read admission. `GetPrStatus` is `Bulk` unless `refresh`
 //!   is set, since a refresh probe must not hold a bulk slot.
@@ -108,7 +107,6 @@ impl RequestContract {
 }
 
 const BULK_READ: RequestContract = RequestContract::new(ReplayContract::Always, AdmissionLane::Bulk);
-const LIVE_READ: RequestContract = RequestContract::new(ReplayContract::Always, AdmissionLane::Live);
 const ORDERED_REPLAYABLE: RequestContract = RequestContract::new(ReplayContract::Always, AdmissionLane::Ordered);
 const GUARDED_CREATE: RequestContract = RequestContract::new(ReplayContract::DuplicateGuarded, AdmissionLane::Ordered);
 const BULK_UNREPLAYABLE: RequestContract = RequestContract::new(ReplayContract::Never, AdmissionLane::Bulk);
@@ -182,7 +180,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             }
         }
 
-        with_live_variants!(live_pattern) => LIVE_READ,
+        with_live_variants!(live_pattern) => RequestContract::new(ReplayContract::Always, AdmissionLane::Live),
 
         R::CommentsBannerState { .. }
         | R::CommentsGet { .. }

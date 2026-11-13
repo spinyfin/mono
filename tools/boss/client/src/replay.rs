@@ -84,7 +84,7 @@ pub fn request_name(request: &FrontendRequest) -> String {
         .unwrap_or_else(|| "<unknown request>".to_owned())
 }
 
-/// Classify `request`; see the module docs for the full table.
+/// Classify `request`; see [`boss_protocol::request_contract`] for the full table.
 pub fn replay_safety(request: &FrontendRequest) -> ReplaySafety {
     replay_safety_with(request, DUPLICATE_GUARD_WINDOW)
 }
