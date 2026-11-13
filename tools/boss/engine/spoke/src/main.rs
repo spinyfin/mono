@@ -115,7 +115,15 @@ mod commands {
                     for (run, error) in supervisor.sweep().await {
                         tracing::warn!(run, error, "worker exit sweep failed");
                     }
-                    let observations = supervisor.inventory().await?;
+                    let observations = match supervisor.inventory().await {
+                        Ok(observations) => observations,
+                        Err(error) => {
+                            // No inventory means no readiness barrier; the next
+                            // sweep retries and control keeps running.
+                            tracing::error!(%error, "worker inventory failed; withholding it");
+                            continue;
+                        }
+                    };
                     let mut journal = journal.lock().map_err(|_| anyhow::Error::from(Fault::LockPoisoned))?;
                     // A full spool withholds the inventory, and with it the hub's
                     // readiness barrier; it must not take the daemon down.
