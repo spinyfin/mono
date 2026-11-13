@@ -520,7 +520,19 @@ fn every_run_carrying_event_is_sanitized() {
             runs: vec![run(), run()],
         },
     ] {
-        assert_nothing_leaked(&sanitize_event_for_worker(event));
+        let mut expected = serde_json::to_value(&event).unwrap();
+        if let Some(runs) = expected.get_mut("runs") {
+            for run in runs.as_array_mut().unwrap() {
+                run["transcript_path"] = serde_json::Value::Null;
+                run["artifacts_path"] = serde_json::Value::Null;
+            }
+        } else {
+            expected["run"]["transcript_path"] = serde_json::Value::Null;
+            expected["run"]["artifacts_path"] = serde_json::Value::Null;
+        }
+        let after = sanitize_event_for_worker(event);
+        assert_nothing_leaked(&after);
+        assert_eq!(serde_json::to_value(after).unwrap(), expected);
     }
 }
 
@@ -548,13 +560,16 @@ fn execution_rows_carry_no_runtime_half_fields() {
             execution: execution(),
             work_item_id: "chore_1".into(),
             pr_url: "https://github.com/o/r/pull/1".into(),
-            batch_id: None,
-            batch_generation: None,
-            batch_execution_ids: Vec::new(),
-            already_active: false,
+            batch_id: Some("batch_1".into()),
+            batch_generation: Some(4),
+            batch_execution_ids: vec!["exec_1".into(), "exec_2".into()],
+            already_active: true,
         },
     ] {
-        assert_nothing_leaked(&sanitize_event_for_worker(event));
+        let before = serde_json::to_value(&event).unwrap();
+        let after = sanitize_event_for_worker(event);
+        assert_nothing_leaked(&after);
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
     }
 }
 
@@ -593,7 +608,7 @@ fn worker_context_bundle() -> WorkerContextBundle {
 
 /// `boss context`'s bundle carries no `WorkExecution`/`WorkRun` rows, so it
 /// has nothing to strip — but it still has to be a deliberate, named
-/// pass-through in `sanitize_event_for_worker`'s exhaustive match (a
+/// pass-through in the event declaration (a
 /// compile error otherwise), and this pins that it stays leak-free even so.
 #[test]
 fn worker_context_result_carries_no_runtime_half_fields() {
@@ -626,9 +641,37 @@ fn pr_status_and_pr_body_results_carry_no_runtime_half_fields() {
 
 #[test]
 fn unrelated_events_pass_through_untouched() {
-    let before = FrontendEvent::ProductsList { products: vec![] };
-    let after = sanitize_event_for_worker(before);
-    assert!(matches!(after, FrontendEvent::ProductsList { .. }));
+    for event in [
+        FrontendEvent::ProductsList { products: vec![] },
+        FrontendEvent::ShutdownAccepted,
+        FrontendEvent::WorkRuntimePatch {
+            product_id: "prod_1".into(),
+            items: vec![],
+            absent: vec!["task_1".into()],
+        },
+        // TopicEvent remains pass-through, including its own host vocabulary;
+        // execution/run redaction must not turn into a recursive JSON scrubber.
+        FrontendEvent::TopicEvent {
+            topic: "worker.pane".into(),
+            revision: 7,
+            origin_session_id: "session_1".into(),
+            origin_request_id: Some("request_1".into()),
+            event: boss_protocol::TopicEventPayload::WorkerPaneCapture {
+                run_id: "run_1".into(),
+                host_id: "host_1".into(),
+                state: boss_protocol::PaneCaptureState::Live,
+                text: "pane contents".into(),
+                truncated: true,
+                observed_unix_ms: Some(100),
+                received_unix_ms: 200,
+                detail: Some("details".into()),
+            },
+        },
+    ] {
+        let before = serde_json::to_value(&event).unwrap();
+        let after = sanitize_event_for_worker(event);
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
+    }
 }
 
 fn idea_with_body() -> Idea {
@@ -670,7 +713,10 @@ fn work_tree_strips_ideas_for_workers() {
         dependencies: vec![],
         ideas: vec![idea_with_body()],
     };
+    let mut expected = serde_json::to_value(&before).unwrap();
+    expected["ideas"] = json!([]);
     let after = sanitize_event_for_worker(before);
+    assert_eq!(serde_json::to_value(&after).unwrap(), expected);
     let FrontendEvent::WorkTree {
         ideas,
         product: after_product,

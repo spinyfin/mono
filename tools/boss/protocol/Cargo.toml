@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../.."
 
 [dependencies]
+boss-protocol-macros = { path = "../protocol-macros" }
 bon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

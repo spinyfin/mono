@@ -2924,7 +2924,7 @@ pub enum FrontendRequest {
 }
 
 mod events;
-pub use events::FrontendEvent;
+pub use events::{FrontendEvent, FrontendEventWorkerVisitor};
 
 mod invalidation;
 pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePatchItem};

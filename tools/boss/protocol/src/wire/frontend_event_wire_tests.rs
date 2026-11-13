@@ -417,17 +417,17 @@ fn top_cost_report() -> crate::TopCostReport {
 fn tag_cases() -> Vec<TagCase> {
     vec![
         TagCase {
-            label: "operator_decision_snapshot",
+            label: "OperatorDecisionSnapshot",
             event: FrontendEvent::OperatorDecisionSnapshot { questions: vec![] },
             expected_tag: "operator_decision_snapshot",
         },
         TagCase {
-            label: "operator_questions",
+            label: "OperatorQuestionsList",
             event: FrontendEvent::OperatorQuestionsList { questions: vec![] },
             expected_tag: "operator_questions_list",
         },
         TagCase {
-            label: "task_field_audit",
+            label: "TaskFieldAuditList",
             event: FrontendEvent::TaskFieldAuditList {
                 work_item_id: "task_1".into(),
                 rows: vec![],
@@ -435,7 +435,7 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "task_field_audit_list",
         },
         TagCase {
-            label: "operator_question_error",
+            label: "OperatorQuestionError",
             event: FrontendEvent::OperatorQuestionError {
                 error: crate::OperatorQuestionError::NotFound,
             },
@@ -2228,7 +2228,7 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "idea_graduated",
         },
         TagCase {
-            label: "IdeaGraduatedWithChore",
+            label: "IdeaGraduated",
             event: FrontendEvent::IdeaGraduated {
                 idea: idea(),
                 chore: Some(Box::new(task())),
@@ -2523,6 +2523,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
 #[test]
 fn variants_serialize_under_their_snake_case_type_tag() {
     for case in tag_cases() {
+        assert_eq!(case.event.variant_label(), case.label);
         let v = serde_json::to_value(&case.event).unwrap();
         assert_eq!(
             v["type"], case.expected_tag,
