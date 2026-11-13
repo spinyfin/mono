@@ -139,8 +139,20 @@ impl Default for Limits {
 
 pub struct Journal {
     db: Connection,
-    _lock: File,
+    // Field order closes SQLite before releasing exclusive daemon ownership.
+    _lock: DaemonLock,
     limits: Limits,
+}
+
+struct DaemonLock(File);
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        // A child between fork and exec shares this open file description.
+        // Closing only our descriptor lets that child prolong the flock even
+        // though the journal is closed. Unlock explicitly before closing it.
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +219,7 @@ impl Journal {
         );
         let lock = private_file(&root.join("daemon.lock"))?;
         ensure!(FileExt::try_lock_exclusive(&lock)?, "spoke daemon lock is held");
+        let lock = DaemonLock(lock);
         let db_path = root.join("journal.db");
         private_file(&db_path)?;
         let mut db = Connection::open(db_path)?;

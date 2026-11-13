@@ -1859,6 +1859,7 @@ dependencies = [
  "boss-protocol",
  "boss-protocol-spoke",
  "boss-spoke-journal",
+ "futures-util",
  "libc",
  "prost",
  "serde",

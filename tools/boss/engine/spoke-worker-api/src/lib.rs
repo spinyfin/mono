@@ -505,9 +505,10 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
-    sync::Semaphore,
+    net::UnixStream,
 };
+
+mod server;
 
 pub type SharedJournal = Arc<Mutex<Journal>>;
 /// The transcript source as it is now: `(generation, observed size)`.
@@ -924,51 +925,6 @@ impl Gateway {
             _ => anyhow::bail!("unsupported worker command"),
         }
         Ok(())
-    }
-
-    /// Accept loop. Each exchange runs in its own bounded task, so a client
-    /// that connects and stalls, or a read waiting on an absent hub, cannot hold
-    /// up another worker's CLI. Accept and clock faults back off and retry.
-    pub async fn serve(&self, listener: UnixListener, stamp: impl Fn() -> Result<v1::Stamp>) -> Result<()> {
-        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-        let mut failures = 0u32;
-        loop {
-            let permit = Arc::clone(&permits).acquire_owned().await?;
-            let stream = match listener.accept().await {
-                Ok((stream, _)) => {
-                    failures = 0;
-                    stream
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "worker accept failed");
-                    let delay = if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
-                        50
-                    } else {
-                        (10u64 << failures.min(6)).min(500)
-                    };
-                    failures = failures.saturating_add(1);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    continue;
-                }
-            };
-            let stamp = match stamp() {
-                Ok(stamp) => stamp,
-                Err(error) => {
-                    tracing::warn!(%error, "worker RPC dropped: no clock stamp");
-                    continue;
-                }
-            };
-            let gateway = self.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                // Bound the entire exchange, including idle clients and hub waits.
-                match tokio::time::timeout(Duration::from_secs(5), gateway.exchange(stream, stamp)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "worker RPC rejected"),
-                    Err(error) => tracing::warn!(%error, "worker RPC deadline"),
-                }
-            });
-        }
     }
 
     async fn exchange(&self, stream: UnixStream, stamp: v1::Stamp) -> Result<()> {
