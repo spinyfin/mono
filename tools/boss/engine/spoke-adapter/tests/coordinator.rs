@@ -6,8 +6,12 @@ use boss_engine_runtime::{
     dispatch_events::{DispatchEventSink, RecordingDispatchEventSink},
     lifecycle_adapter::CoreLifecycleServices,
 };
+use boss_execution_contracts::LiveWorkerLiveness;
 use boss_execution_contracts::{HostAdapter, HostAdapterProvider, NoopExecutionPublisher, WorkerPool};
-use boss_protocol::{AutomationTrigger, CreateProductInput, ExecutionStatus, WorkExecution};
+use boss_protocol::{
+    AutomationTrigger, CreateChoreInput, CreateProductInput, ExecutionStatus, LiveWorkerState, RequestExecutionInput,
+    WorkExecution,
+};
 use boss_protocol_spoke::v1::{Command, CommandResult, Cursor, PaneLife, ResultCode, WorkspaceKind, command};
 use boss_work_db::{CancelExecutionOpts, CreateAutomationInput, Host};
 use serde_json::json;
@@ -715,7 +719,7 @@ async fn losing_the_seat_between_selection_and_admission_defers_then_retries() {
 }
 
 #[tokio::test]
-async fn a_stale_requested_spoke_host_defers_until_its_budget_is_fresh() {
+async fn a_stale_pinned_spoke_host_defers_until_its_budget_is_fresh() {
     let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "stale requested host");
@@ -755,6 +759,153 @@ async fn a_stale_requested_spoke_host_defers_until_its_budget_is_fresh() {
     let row = fx.db.get_execution(&execution.id).unwrap();
     assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
     assert!(!start_failure_attention(&fx, &execution.id));
+}
+
+#[tokio::test]
+async fn a_stale_request_scoped_spoke_host_defers_without_cancelling() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    let chore = fx
+        .db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(env.product_id.clone())
+                .name("stale request-scoped host")
+                .autostart(true)
+                .build(),
+        )
+        .unwrap();
+    let peer = fx.spoke(Box::new(answer), None, 0).await;
+    // Validated while the budget is fresh, so the request is accepted and the
+    // routing constraint is held for the dispatch (it is not a durable pin).
+    let execution = env
+        .coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id(HOST)
+                .build(),
+            Arc::new(NoLiveWorkers),
+        )
+        .unwrap();
+    let generation = fx.db.spoke_journal(HOST).unwrap().unwrap().generation;
+    fx.db
+        .host_capacity_disconnected(HOST, generation, now_ms_for_capacity())
+        .unwrap();
+    env.coordinator.kick();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Neither cancelled ("requested host became ineligible") nor charged a failure.
+    let row = fx.db.get_execution(&execution.id).unwrap();
+    assert_eq!(row.status, ExecutionStatus::Ready, "{row:?}");
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    assert!(!start_failure_attention(&fx, &execution.id));
+
+    fx.refresh_budget(HOST);
+    env.coordinator.kick();
+    until("the request-scoped execution to spawn once its budget is fresh", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == execution.id)
+    })
+    .await;
+    assert_eq!(fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count, 0);
+}
+
+#[tokio::test]
+async fn a_full_legacy_host_still_records_no_eligible_host() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    fx.db.add_host("legacy", "worker@legacy", 0, &[]).unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO host_capabilities (host_id, capability, source) VALUES ('legacy', 'driver=claude', 'auto')",
+            [],
+        )
+        .unwrap();
+    let execution = triage(&fx, &env, "full legacy host");
+    fx.db.set_execution_pinned_host(&execution.id, Some("legacy")).unwrap();
+    env.coordinator.kick();
+    until("the full legacy host to record a start failure", || {
+        fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count > 0
+            || fx
+                .db
+                .list_attention_items(&execution.id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind == "no_eligible_host")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_deferred_stale_host_does_not_starve_work_for_a_healthy_host() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    let coordinator = {
+        let local = fx.provider_adapter(HOST).await;
+        let mut c = ExecutionCoordinator::with_host_adapter_and_publisher(
+            fx.db.clone(),
+            WorkerPool::new(1),
+            local,
+            Arc::new(NoopExecutionPublisher),
+            CoreLifecycleServices::new(fx.db.clone()),
+        );
+        c.set_host_adapter_provider(fx.provider.clone());
+        c.set_automation_pool(env.pool.clone());
+        c.set_spoke_in_doubt_timing(quick());
+        Arc::new(c)
+    };
+    fx.db.add_host("healthy", "worker@healthy", 8, &[]).unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO host_capabilities (host_id, capability, source) VALUES ('healthy', 'driver=claude', 'auto')",
+            [],
+        )
+        .unwrap();
+    fx.serve_legacy();
+    let stale = triage(&fx, &env, "stale host first");
+    fx.db.set_execution_pinned_host(&stale.id, Some(HOST)).unwrap();
+    let healthy = triage(&fx, &env, "healthy host second");
+    fx.db.set_execution_pinned_host(&healthy.id, Some("healthy")).unwrap();
+    let _peer = fx.spoke(Box::new(answer), None, 0).await;
+    let generation = fx.db.spoke_journal(HOST).unwrap().unwrap().generation;
+    fx.db
+        .host_capacity_disconnected(HOST, generation, now_ms_for_capacity())
+        .unwrap();
+    coordinator.kick();
+    until(
+        "the healthy host's execution to be dispatched while the stale one waits",
+        || !fx.legacy_calls().is_empty(),
+    )
+    .await;
+    let row = fx.db.get_execution(&stale.id).unwrap();
+    assert_eq!(row.status, ExecutionStatus::Ready, "{row:?}");
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+}
+
+struct NoLiveWorkers;
+
+impl LiveWorkerLiveness for NoLiveWorkers {
+    fn is_run_live(&self, _run_id: &str) -> bool {
+        false
+    }
+    fn snapshot(&self) -> Vec<LiveWorkerState> {
+        Vec::new()
+    }
+    fn release_slot_for_run(&self, _run_id: &str) -> Option<u8> {
+        None
+    }
+    fn release_persona_for_run(&self, _run_id: &str) {}
+    fn last_event_at_for_run(&self, _run_id: &str) -> Option<String> {
+        None
+    }
+    fn current_tool_for_run(&self, _run_id: &str) -> Option<String> {
+        None
+    }
 }
 
 fn now_ms_for_capacity() -> i64 {

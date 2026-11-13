@@ -1,23 +1,39 @@
 //! What dispatch does while a spoke host has not said whether it granted a
 //! lease or started a worker: park the attempt, raise a deduplicated attention
 //! item once the wait exceeds its bound, and resolve it when the host answers.
+//! Also holds the typed budget deferral: a spoke host with no fresh seat sends
+//! the claimed row back to `ready` behind a short hold, with no pre-start
+//! failure, attention item or requested-host cancel.
 use super::*;
 use boss_execution_contracts::WorkerLife;
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+/// How long a budget-deferred dispatch is held before it is claimed again:
+/// about one challenge period, so a stale host has a chance to refresh while
+/// the pool slot serves other rows.
+const BUDGET_DEFER_HOLD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(super) struct HostSelectionFailure {
     pub report: Vec<Eligibility>,
     pub message: String,
+    /// Hosts whose seat count came from a spoke resource budget (a
+    /// `SpokeReady` host). Only these can miss a seat for a reason that
+    /// clears on its own; legacy SSH, `spoke_pending` and local hosts keep
+    /// their static pool accounting and their `no_eligible_host` handling.
+    pub budget_gated_hosts: BTreeSet<String>,
 }
 
 impl HostSelectionFailure {
-    /// At least one host could run this work except that it has no free seats
-    /// or fresh budget. Capability, enablement and pin mismatches are not
-    /// budget deferrals.
+    /// At least one spoke-budgeted host could run this work except that it has
+    /// no free seats or fresh budget. Capability, enablement and pin
+    /// mismatches, and full legacy or local hosts, are not budget deferrals.
     pub(super) fn is_budget_only(&self) -> bool {
         self.report.iter().any(|row| {
-            !row.reasons.is_empty()
+            self.budget_gated_hosts.contains(&row.host_id)
+                && !row.reasons.is_empty()
                 && row
                     .reasons
                     .iter()
@@ -36,11 +52,14 @@ pub(super) struct DispatchDeferred {
 }
 
 impl ExecutionCoordinator {
-    /// Return the claimed row to `ready` without a pre-start failure or
-    /// requested-host cancel. Emits a terminal `host_selected` event so the
+    /// Return the claimed row to `ready` behind a bounded hold, without a
+    /// pre-start failure or requested-host cancel. The hold keeps a drain from
+    /// re-claiming the row first on every pass while the host stays stale,
+    /// which would take a worker-pool slot from work for healthy hosts; a
+    /// delayed kick resumes it. Emits a terminal `host_selected` event so the
     /// stall watchdog does not treat `worker_claimed/ok` as stalled.
     pub(super) async fn defer_claimed_dispatch(
-        &self,
+        self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,
         err: anyhow::Error,
@@ -55,12 +74,28 @@ impl ExecutionCoordinator {
                     .with_details(details),
             )
             .await;
-        if let Err(release_err) = self.work_db.release_dispatch_claim(&execution.id) {
-            tracing::error!(
-                execution_id = %execution.id,
-                ?release_err,
-                "failed to release dispatch claim after budget deferral"
-            );
+        let delay = BUDGET_DEFER_HOLD;
+        let note = format!("host budget unavailable; deferred for {}s: {err:#}", delay.as_secs());
+        match self.work_db.park_pre_start_attempt(&execution.id, delay, &note) {
+            Ok(true) => {
+                let coordinator = Arc::clone(self);
+                boss_task_scope::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    coordinator.kick();
+                });
+            }
+            Ok(false) => {}
+            Err(park_err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    error = %format!("{park_err:#}"),
+                    "failed to hold execution after budget deferral; releasing the claim",
+                );
+                // `recover_failed_dispatch` retries the release if this fails too.
+                if let Err(release_err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(execution_id = %execution.id, ?release_err, "failed to release dispatch claim");
+                }
+            }
         }
         self.repo_lease_limiter.release(&execution.id);
         err

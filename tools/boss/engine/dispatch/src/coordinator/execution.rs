@@ -254,6 +254,7 @@ impl ExecutionCoordinator {
             .active_runs_per_host()
             .context("host-selection: active runs per host")?;
 
+        let mut budget_gated_hosts = BTreeSet::new();
         let slots: Vec<HostSlot> = hosts
             .iter()
             .map(|host| {
@@ -264,6 +265,7 @@ impl ExecutionCoordinator {
                     .context("host-selection: host capabilities")?;
                 let mut slot_host = host.clone();
                 let active_runs = if self.work_db.host_transport(&host.id)? == boss_work_db::HostTransport::SpokeReady {
+                    budget_gated_hosts.insert(host.id.clone());
                     slot_host.pool_size = self
                         .work_db
                         .available_host_budget(&host.id)
@@ -312,6 +314,7 @@ impl ExecutionCoordinator {
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
             None => Err(HostSelectionFailure {
                 report: report.clone(),
+                budget_gated_hosts,
                 message: format!(
                     "no eligible host for work item {}: {}{}",
                     work_item.primary_id(),
