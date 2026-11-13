@@ -49,6 +49,15 @@ extension WorkCardLiveStatus {
     /// dispatcher has not reached yet.
     private static let awaitingDispatchReason = "awaiting_dispatch"
 
+    /// `TaskRuntime.dispatch_wait_reason` for a retry after a pre-start or
+    /// transient failure. The engine names the attempt; the app only formats
+    /// the deadline.
+    private static let failureBackoffReason = "failure_backoff"
+
+    /// `TaskRuntime.dispatch_wait_reason` for a spoke-lease park. Not a
+    /// failure: the engine's phrase names the host wait.
+    private static let hostLeaseParkReason = "host_lease_park"
+
     /// A queued card's status as a leading word plus the reason behind it.
     private struct QueuedStatus {
         let lead: String
@@ -56,19 +65,34 @@ extension WorkCardLiveStatus {
         var isAwaitingDispatch = false
     }
 
+    private static func notBeforeDetail(_ date: Date) -> String {
+        "not before \(date.formatted(date: .abbreviated, time: .shortened))"
+    }
+
     private static func queuedStatus(runtime: WorkTaskRuntime?, now: Date) -> QueuedStatus {
         // The two deadlines are engine facts; only their formatting is local,
         // because a relative or local-time rendering cannot be done engine-side.
+        // Why the deadline was stamped is the engine's wait code: this view
+        // never classifies the source itself.
         if isPendingExecution(runtime) {
+            if runtime?.dispatchWaitReason == failureBackoffReason,
+               let label = runtime?.dispatchWaitLabel, !label.isEmpty,
+               let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw) {
+                return QueuedStatus(lead: label, detail: notBeforeDetail(date))
+            }
             if let raw = runtime?.dispatchRetryAt, let date = AutomationTime.parse(raw), date > now {
                 return QueuedStatus(
                     lead: "Retrying dispatch",
                     detail: "next attempt \(AutomationTime.relative(raw, now: now))")
             }
             if let raw = runtime?.dispatchNotBefore, let date = AutomationTime.parse(raw) {
-                return QueuedStatus(
-                    lead: queuedLead,
-                    detail: "not before \(date.formatted(date: .abbreviated, time: .shortened))")
+                if runtime?.dispatchWaitReason == hostLeaseParkReason,
+                   let label = runtime?.dispatchWaitLabel, !label.isEmpty {
+                    return QueuedStatus(
+                        lead: queuedLead,
+                        detail: "\(label) — \(notBeforeDetail(date))")
+                }
+                return QueuedStatus(lead: queuedLead, detail: notBeforeDetail(date))
             }
         }
         // The engine sends a phrase for every wait. A queued card without one

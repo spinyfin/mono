@@ -203,6 +203,11 @@ fn runtime_bytes(runtime: &TaskRuntime) -> usize {
                 + blocker.short_id.map_or(0, |_| std::mem::size_of::<i64>())
                 + blocker.kind.len()
         })
+        + runtime
+            .dispatch_failures
+            .iter()
+            .map(|failure| failure.error_text.len() + failure.happened_at.len())
+            .sum::<usize>()
 }
 
 #[cfg(test)]

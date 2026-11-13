@@ -481,7 +481,9 @@ extension EngineClient {
             dispatchWaitSince: payload["dispatch_wait_since"] as? String,
             dispatchNotBefore: payload["dispatch_not_before"] as? String,
             dispatchWaitBlocker: (payload["dispatch_wait_blocker"] as? [String: Any]).flatMap(DispatchWaitBlocker.init),
-            dispatchWaitLabel: payload["dispatch_wait_label"] as? String
+            dispatchWaitLabel: payload["dispatch_wait_label"] as? String,
+            dispatchFailures: (payload["dispatch_failures"] as? [[String: Any]] ?? [])
+                .compactMap(DispatchFailureAttempt.init)
         )
     }
 

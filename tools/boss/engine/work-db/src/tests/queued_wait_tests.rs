@@ -90,8 +90,16 @@ fn wait_of(db: &WorkDb, product_id: &str, work_item_id: &str) -> TaskRuntime {
         .find(|runtime| runtime.work_item_id == work_item_id)
         .unwrap_or_else(|| panic!("{work_item_id} is missing from the board"));
     assert_eq!(
-        (&on_board.dispatch_wait_reason, &on_board.dispatch_wait_label),
-        (&runtime.dispatch_wait_reason, &runtime.dispatch_wait_label),
+        (
+            &on_board.dispatch_wait_reason,
+            &on_board.dispatch_wait_label,
+            &on_board.dispatch_failures
+        ),
+        (
+            &runtime.dispatch_wait_reason,
+            &runtime.dispatch_wait_label,
+            &runtime.dispatch_failures
+        ),
         "the board and the single-item read disagree about why {work_item_id} is waiting"
     );
     runtime
@@ -110,7 +118,11 @@ fn assert_named(state: &str, runtime: &TaskRuntime, code: &str) -> String {
     assert!(!label.to_lowercase().contains("unknown"), "{state}: {label}");
     assert_ne!(code, DISPATCH_WAIT_REASON_UNCLASSIFIED, "{state}");
     if runtime.dispatch_wait_blocker.is_none() {
-        assert_eq!(label, dispatch_wait_phrase(code), "{state}");
+        let phrase = dispatch_wait_phrase(code);
+        assert!(
+            label == phrase || label.to_lowercase().starts_with(&phrase.to_lowercase()),
+            "{state}: phrase `{phrase}` vs `{label}`"
+        );
     }
     code.to_owned()
 }
@@ -188,10 +200,56 @@ fn every_waiting_state_yields_a_named_reason() {
         .unwrap();
     let deadline = wait_of(&db, pid, &chore.id);
     assert_eq!(deadline.dispatch_not_before.as_deref(), Some(future.as_str()));
+    assert!(deadline.dispatch_failures.is_empty());
     covered.insert(assert_named(
         "future deadline",
         &deadline,
         DISPATCH_WAIT_REASON_NOT_BEFORE,
+    ));
+
+    let (pre_start_chore, pre_start_exec) = ready_chore(&db, pid, "pre-start retry backoff");
+    db.record_pre_start_failure(
+        &pre_start_exec.id,
+        "worker",
+        None,
+        "cube lease failed",
+        &[std::time::Duration::from_secs(3600)],
+    )
+    .unwrap();
+    let pre_start_wait = wait_of(&db, pid, &pre_start_chore.id);
+    assert_eq!(
+        pre_start_wait.dispatch_wait_label.as_deref(),
+        Some("Retrying after error (attempt 2)")
+    );
+    assert!(
+        pre_start_wait
+            .dispatch_failures
+            .iter()
+            .any(|failure| failure.error_text.contains("cube lease failed")),
+        "{:?}",
+        pre_start_wait.dispatch_failures
+    );
+    covered.insert(assert_named(
+        "pre-start failure backoff",
+        &pre_start_wait,
+        DISPATCH_WAIT_REASON_FAILURE_BACKOFF,
+    ));
+
+    let (park_chore, park_exec) = ready_chore(&db, pid, "host lease park");
+    assert!(
+        db.park_pre_start_attempt(
+            &park_exec.id,
+            std::time::Duration::from_secs(30),
+            "spoke lease unresolved; parked for 30s: timeout"
+        )
+        .unwrap()
+    );
+    let park_wait = wait_of(&db, pid, &park_chore.id);
+    assert!(park_wait.dispatch_failures.is_empty());
+    covered.insert(assert_named(
+        "host lease park",
+        &park_wait,
+        DISPATCH_WAIT_REASON_HOST_LEASE_PARK,
     ));
 
     // ── A `waiting_dependency` execution ──────────────────────────────────
@@ -1339,4 +1397,202 @@ fn merge_only_wait_requires_the_whole_revision_family_to_be_idle() {
         db.get_task_runtime(&root).unwrap().dispatch_wait_reason.as_deref(),
         Some(DISPATCH_WAIT_REASON_REVIEW_BATCH)
     );
+}
+
+fn assert_failure_details(runtime: &TaskRuntime, expected_error: &str) {
+    assert_eq!(
+        runtime.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
+    );
+    assert!(
+        !runtime.dispatch_failures.is_empty(),
+        "failure-backoff waits carry the failures that produced them"
+    );
+    for failure in &runtime.dispatch_failures {
+        assert!(!failure.error_text.trim().is_empty(), "{failure:?}");
+        assert!(
+            !failure.error_text.to_lowercase().contains("unknown"),
+            "{}",
+            failure.error_text
+        );
+        assert!(!failure.happened_at.trim().is_empty(), "{failure:?}");
+    }
+    assert!(
+        runtime
+            .dispatch_failures
+            .iter()
+            .any(|failure| failure.error_text.contains(expected_error)),
+        "{expected_error} missing from {:?}",
+        runtime.dispatch_failures
+    );
+}
+
+#[test]
+fn pre_start_failure_stamps_failure_backoff_with_the_recorded_error() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let (chore, execution) = ready_chore(&db, pid, "pre-start source");
+    db.record_pre_start_failure(
+        &execution.id,
+        "worker",
+        None,
+        "cube lease failed after claim",
+        &[std::time::Duration::from_secs(3600)],
+    )
+    .unwrap();
+    let wait = wait_of(&db, pid, &chore.id);
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some("Retrying after error (attempt 2)")
+    );
+    assert!(wait.dispatch_retry_at.is_some());
+    assert!(wait.dispatch_not_before.is_some());
+    assert_failure_details(&wait, "cube lease failed after claim");
+}
+
+#[test]
+fn transient_resume_stamps_failure_backoff_with_orphaned_run_error() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let (chore, execution) = ready_chore(&db, pid, "transient source");
+    db.start_execution_run(&execution.id, "worker", "repo", "lease", "ws", "/tmp/transient-backoff")
+        .unwrap();
+    let error = "tmux session boss-7-18e779878055 is absent from list-sessions";
+    db.mark_execution_orphaned(&execution.id, error).unwrap();
+    let future = boss_engine_utils::epoch_time::now_epoch_secs() + 3600;
+    let successor = db
+        .request_resume_execution(&execution.id, 3, future, "resume after orphan")
+        .unwrap()
+        .expect("orphaned predecessor still resumes");
+    assert_eq!(successor.transient_failure_count, 3);
+    let wait = wait_of(&db, pid, &chore.id);
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some("Retrying after error (attempt 4)")
+    );
+    assert!(wait.dispatch_retry_at.is_none());
+    let expected_deadline = future.to_string();
+    assert_eq!(wait.dispatch_not_before.as_deref(), Some(expected_deadline.as_str()));
+    assert_failure_details(&wait, error);
+}
+
+#[test]
+fn hung_attention_fills_in_when_the_orphaned_run_has_no_error_text() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let (chore, execution) = ready_chore(&db, pid, "hung source");
+    let (_running, run) = db
+        .start_execution_run(&execution.id, "worker", "repo", "lease", "ws", "/tmp/hung-backoff")
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs
+             SET error_text = NULL, result_summary = NULL, finished_at = '1000', status = 'completed'
+             WHERE id = ?1",
+            [&run.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'orphaned', finished_at = '1000', last_error = NULL WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let attention_body = "Driver has made no observable progress while awaiting model output";
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_attention_items (id, execution_id, kind, status, title, body_markdown, created_at)
+             VALUES ('attn_hung', ?1, 'hung_worker', 'resolved', 'Hung worker', ?2, '1000')",
+            params![execution.id, attention_body],
+        )
+        .unwrap();
+    let future = boss_engine_utils::epoch_time::now_epoch_secs() + 3600;
+    db.request_resume_execution(&execution.id, 1, future, "resume after hung worker")
+        .unwrap()
+        .expect("orphaned predecessor still resumes");
+    let wait = wait_of(&db, pid, &chore.id);
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some("Retrying after error (attempt 2)")
+    );
+    assert_failure_details(&wait, attention_body);
+}
+
+#[test]
+fn host_lease_park_is_not_a_failure_backoff() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let (chore, execution) = ready_chore(&db, pid, "park source");
+    assert!(
+        db.park_pre_start_attempt(
+            &execution.id,
+            std::time::Duration::from_secs(45),
+            "spoke lease unresolved; parked for 45s: host did not confirm"
+        )
+        .unwrap()
+    );
+    let wait = wait_of(&db, pid, &chore.id);
+    assert_eq!(
+        wait.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_HOST_LEASE_PARK)
+    );
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some("waiting for the host to confirm the workspace lease")
+    );
+    assert!(wait.dispatch_not_before.is_some());
+    assert!(wait.dispatch_failures.is_empty());
+    assert_ne!(
+        wait.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
+    );
+}
+
+#[test]
+fn merge_order_stagger_keeps_scheduled_not_before() {
+    let db = db();
+    let product = create_test_product(&db);
+    let pid = product.id.as_str();
+    let first = create_test_chore(&db, pid, "first of a merge-order pair");
+    let later = create_test_chore(&db, pid, "later of a merge-order pair");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES (?1, ?2, 'merge_order', '1')",
+            params![later.id, first.id],
+        )
+        .unwrap();
+    let execution = pending(
+        &db,
+        &later.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Ready,
+    );
+    let stamped = db
+        .maybe_stagger_merge_order_dispatch(&execution.id, &later.id, 60)
+        .unwrap();
+    assert!(
+        stamped.is_some(),
+        "later side is staggered while the first side is still open"
+    );
+    let wait = wait_of(&db, pid, &later.id);
+    assert_eq!(
+        wait.dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_NOT_BEFORE)
+    );
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some("held until its scheduled dispatch time")
+    );
+    let expected_deadline = stamped.map(|epoch| epoch.to_string());
+    assert_eq!(wait.dispatch_not_before.as_deref(), expected_deadline.as_deref());
+    assert!(wait.dispatch_failures.is_empty());
 }

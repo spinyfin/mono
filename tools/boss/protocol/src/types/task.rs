@@ -1431,6 +1431,21 @@ pub struct TaskRuntime {
     /// Currently gating work item, resolved by the engine's dispatch rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_blocker: Option<DispatchWaitBlocker>,
+
+    /// Failed attempts that produced the current failure-backoff wait.
+    /// Empty unless `dispatch_wait_reason` is `failure_backoff`. Newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub dispatch_failures: Vec<DispatchFailureAttempt>,
+}
+
+/// One recorded failure that fed a `failure_backoff` wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchFailureAttempt {
+    /// Error text, orphaning reason, or attention body. Never empty.
+    pub error_text: String,
+    /// Unix epoch seconds (as a string) when this failure was recorded.
+    pub happened_at: String,
 }
 
 /// A prerequisite selected by the same gating rules used for dispatch.

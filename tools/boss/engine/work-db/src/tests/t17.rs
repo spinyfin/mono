@@ -298,6 +298,11 @@ fn queued_wait_pre_start_failure_backoff_carries_retry_and_not_before() {
     let runtime = db.get_task_runtime(&chore_id).unwrap();
     assert_eq!(runtime.dispatch_retry_at.as_deref(), Some(future.as_str()));
     assert_eq!(runtime.dispatch_not_before.as_deref(), Some(future.as_str()));
+    assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some("failure_backoff"));
+    assert_eq!(
+        runtime.dispatch_wait_label.as_deref(),
+        Some("Retrying after error (attempt 2)")
+    );
 }
 
 #[test]

@@ -609,6 +609,7 @@ pub(crate) fn compute_task_runtime(
         .maybe_dispatch_wait_since(dispatch_wait_since)
         .maybe_dispatch_not_before(wait.not_before)
         .maybe_dispatch_wait_blocker(wait.blocker)
+        .dispatch_failures(wait.failures)
         .build();
     Ok(ComputedRuntime {
         runtime,

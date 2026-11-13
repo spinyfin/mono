@@ -23,3 +23,22 @@ struct DispatchWaitBlocker: Hashable {
 
     var label: String { shortID.map { "\(kind == "project" ? "P" : "T")\($0)" } ?? "a dependency" }
 }
+
+/// One recorded failure that fed a `failure_backoff` wait.
+/// Mirrors `boss_protocol::DispatchFailureAttempt`.
+struct DispatchFailureAttempt: Hashable {
+    let errorText: String
+    let happenedAt: String
+
+    init(errorText: String, happenedAt: String) {
+        self.errorText = errorText
+        self.happenedAt = happenedAt
+    }
+
+    init?(payload: [String: Any]) {
+        guard let raw = payload["error_text"] as? String else { return nil }
+        let errorText = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !errorText.isEmpty else { return nil }
+        self.init(errorText: errorText, happenedAt: payload["happened_at"] as? String ?? "")
+    }
+}
