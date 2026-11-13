@@ -110,6 +110,11 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
     let daemon = hub.start();
     let mut first = hub.connection().await;
     assert_eq!(first.hello.features, boss_spoke_outbound::executor_contracts().features);
+    assert!(
+        first.hello.features.iter().any(|feature| {
+            feature.name == boss_protocol_spoke::negotiate::feature::UPGRADE && feature.revision == 1
+        })
+    );
     let identity = first.hello.journal_id.clone();
     let boot = first.hello.boot_id.clone();
     first.welcome(0).await;
@@ -183,6 +188,256 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
         after = stored.sequence;
     }
     assert_eq!(results, 1, "duplicate command never creates another result");
+}
+
+#[tokio::test]
+async fn actual_daemon_applies_an_upgrade_offer_and_reports_the_running_release() {
+    let mut hub = Fixture::new().await;
+    std::fs::write(
+        hub.dir.path().join("install.json"),
+        serde_json::json!({
+            "schema": 1,
+            "release_id": "1.0.1",
+            "platform": "macos-arm64",
+            "user": "boss-worker",
+            "host_id": "host",
+            "hub_url": "https://hub.example:7443",
+            "package_origin": "https://github.com/spinyfin/mono/releases"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        hub.dir.path().join("upgrade-status.json"),
+        serde_json::json!({
+            "schema": 1,
+            "command_id": "prev",
+            "release_id": "1.0.1",
+            "result": "ok",
+            "error": "",
+            "running_release_id": "1.0.1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let daemon = hub.start();
+    let mut connection = hub.connection().await;
+    assert!(
+        connection.hello.features.iter().any(|feature| {
+            feature.name == boss_protocol_spoke::negotiate::feature::UPGRADE && feature.revision == 1
+        })
+    );
+    connection.welcome(0).await;
+    loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            connection.receipt(record.sequence).await;
+            if let Some(record::Body::Capacity(capacity)) = record.body
+                && let Some(inventory) = capacity.inventory
+            {
+                assert_eq!(inventory.release_id, "1.0.1");
+                assert_eq!(inventory.last_upgrade_command_id, "prev");
+                assert_eq!(inventory.last_upgrade_result, "ok");
+                break;
+            }
+        }
+    }
+    let command = v1::Command {
+        sequence: 1,
+        command_id: "upgrade-one".into(),
+        not_after_unix_ms: i64::MAX,
+        body: Some(command::Body::Upgrade(v1::Upgrade {
+            release_id: "1.0.2".into(),
+            manifest_url: "https://github.com/spinyfin/mono/releases/download/x/manifest.json".into(),
+            manifest_sha256: vec![0xab; 32],
+        })),
+        ..Default::default()
+    };
+    connection.send(hub_frame::Body::Command(command)).await;
+    let mut accepted = false;
+    for _ in 0..8 {
+        match connection.next().await {
+            spoke_frame::Body::CommandReceipt(cursor) => assert_eq!(cursor.through, 1),
+            spoke_frame::Body::Record(record) => {
+                if let Some(record::Body::Result(result)) = &record.body {
+                    assert_eq!(result.command_id, "upgrade-one");
+                    assert_eq!(result.code, v1::ResultCode::Ok as i32);
+                    accepted = true;
+                }
+                connection.receipt(record.sequence).await;
+            }
+            _ => {}
+        }
+        if accepted {
+            break;
+        }
+    }
+    assert!(accepted, "the daemon must accept Upgrade on the management contract");
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.root().join("update-request").join("request.json")).unwrap())
+            .unwrap();
+    assert_eq!(request["release_id"], "1.0.2");
+    assert_eq!(request["command_id"], "upgrade-one");
+    drop(daemon);
+}
+
+fn management_features() -> Vec<v1::Feature> {
+    boss_spoke_outbound::contracts().features
+}
+
+async fn send_upgrade(connection: &mut hub::Connection, command_id: &str) -> bool {
+    let command = v1::Command {
+        sequence: 1,
+        command_id: command_id.into(),
+        not_after_unix_ms: i64::MAX,
+        body: Some(command::Body::Upgrade(v1::Upgrade {
+            release_id: "1.0.2".into(),
+            manifest_url: "https://github.com/spinyfin/mono/releases/download/x/manifest.json".into(),
+            manifest_sha256: vec![0xab; 32],
+        })),
+        ..Default::default()
+    };
+    connection.send(hub_frame::Body::Command(command)).await;
+    let mut accepted = false;
+    for _ in 0..8 {
+        match connection.next().await {
+            spoke_frame::Body::CommandReceipt(cursor) => assert_eq!(cursor.through, 1),
+            spoke_frame::Body::Record(record) => {
+                if let Some(record::Body::Result(result)) = &record.body {
+                    assert_eq!(result.command_id, command_id);
+                    assert_eq!(result.code, v1::ResultCode::Ok as i32);
+                    accepted = true;
+                }
+                connection.receipt(record.sequence).await;
+            }
+            _ => {}
+        }
+        if accepted {
+            break;
+        }
+    }
+    accepted
+}
+
+#[tokio::test]
+async fn actual_daemon_accepts_upgrade_when_welcome_selects_only_journal_and_upgrade() {
+    let mut hub = Fixture::new().await;
+    let daemon = hub.start();
+    let mut connection = hub.connection().await;
+    assert_eq!(
+        connection.hello.features,
+        boss_spoke_outbound::executor_contracts().features
+    );
+    connection.welcome_features(0, management_features()).await;
+    loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            connection.receipt(record.sequence).await;
+            if matches!(record.body, Some(record::Body::Capacity(_))) {
+                break;
+            }
+        }
+    }
+    assert!(
+        send_upgrade(&mut connection, "upgrade-mgmt").await,
+        "production daemon must accept Upgrade after a journal+upgrade Welcome"
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.root().join("update-request").join("request.json")).unwrap())
+            .unwrap();
+    assert_eq!(request["release_id"], "1.0.2");
+    assert_eq!(request["command_id"], "upgrade-mgmt");
+    drop(daemon);
+}
+
+#[tokio::test]
+async fn actual_daemon_retries_management_hello_after_disjoint_execution_epoch() {
+    let mut hub = Fixture::new().await;
+    let daemon = hub.start();
+    let first = hub.connection().await;
+    assert_eq!(first.hello.features, boss_spoke_outbound::executor_contracts().features);
+    first
+        .reject(
+            boss_protocol_spoke::negotiate::reject_code::NO_COMMON_EPOCH,
+            "execution epoch 2 does not overlap",
+        )
+        .await;
+    drop(first);
+    let mut second = hub.connection().await;
+    assert_eq!(second.hello.features, management_features());
+    assert_eq!(second.hello.min_epoch, 1);
+    assert_eq!(second.hello.max_epoch, 1);
+    second.welcome_features(0, management_features()).await;
+    loop {
+        if let spoke_frame::Body::Record(record) = second.next().await {
+            second.receipt(record.sequence).await;
+            if matches!(record.body, Some(record::Body::Capacity(_))) {
+                break;
+            }
+        }
+    }
+    assert!(
+        send_upgrade(&mut second, "upgrade-epoch").await,
+        "management reconnect must still accept Upgrade"
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.root().join("update-request").join("request.json")).unwrap())
+            .unwrap();
+    assert_eq!(request["command_id"], "upgrade-epoch");
+    drop(daemon);
+}
+
+#[tokio::test]
+async fn actual_daemon_refuses_a_second_upgrade_offer_while_one_is_pending() {
+    let mut hub = Fixture::new().await;
+    let daemon = hub.start();
+    let mut connection = hub.connection().await;
+    connection.welcome_features(0, management_features()).await;
+    loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            connection.receipt(record.sequence).await;
+            if matches!(record.body, Some(record::Body::Capacity(_))) {
+                break;
+            }
+        }
+    }
+    assert!(send_upgrade(&mut connection, "upgrade-a").await);
+    let second = v1::Command {
+        sequence: 2,
+        command_id: "upgrade-b".into(),
+        not_after_unix_ms: i64::MAX,
+        body: Some(command::Body::Upgrade(v1::Upgrade {
+            release_id: "1.0.3".into(),
+            manifest_url: "https://github.com/spinyfin/mono/releases/download/x/manifest.json".into(),
+            manifest_sha256: vec![0xcd; 32],
+        })),
+        ..Default::default()
+    };
+    connection.send(hub_frame::Body::Command(second)).await;
+    let mut busy = false;
+    for _ in 0..8 {
+        match connection.next().await {
+            spoke_frame::Body::CommandReceipt(_) => {}
+            spoke_frame::Body::Record(record) => {
+                if let Some(record::Body::Result(result)) = &record.body
+                    && result.command_id == "upgrade-b"
+                {
+                    assert_eq!(result.code, v1::ResultCode::Rejected as i32);
+                    assert!(result.reason.contains("upgrade_busy"), "{}", result.reason);
+                    busy = true;
+                }
+                connection.receipt(record.sequence).await;
+            }
+            _ => {}
+        }
+        if busy {
+            break;
+        }
+    }
+    assert!(busy, "overlapping Upgrade must be refused as busy");
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.root().join("update-request").join("request.json")).unwrap())
+            .unwrap();
+    assert_eq!(request["command_id"], "upgrade-a");
+    drop(daemon);
 }
 
 #[tokio::test]

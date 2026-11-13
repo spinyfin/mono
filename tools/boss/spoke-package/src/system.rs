@@ -6,12 +6,13 @@
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::install::{Account, Host, RunOutput};
 use crate::manifest::Platform;
-use crate::service::{LAUNCHD_LABEL, SYSTEMD_UNIT};
+use crate::service::{LAUNCHD_LABEL, LAUNCHD_UPDATE_LABEL, SYSTEMD_UNIT, SYSTEMD_UPDATE_PATH, SYSTEMD_UPDATE_SERVICE};
 
 pub struct System {
     pub platform: Platform,
@@ -93,10 +94,18 @@ impl Host for System {
         if self.platform.is_macos() {
             // Not loaded yet is the normal first-install case.
             let _ = run("launchctl", &["bootout", &format!("system/{LAUNCHD_LABEL}")]);
-            succeed("launchctl", &["bootstrap", "system", &definition.display().to_string()])
+            succeed("launchctl", &["bootstrap", "system", &definition.display().to_string()])?;
+            let helper = definition.with_file_name(format!("{LAUNCHD_UPDATE_LABEL}.plist"));
+            if helper.is_file() {
+                let _ = run("launchctl", &["bootout", &format!("system/{LAUNCHD_UPDATE_LABEL}")]);
+                succeed("launchctl", &["bootstrap", "system", &helper.display().to_string()])?;
+            }
+            Ok(())
         } else {
             succeed("systemctl", &["daemon-reload"])?;
-            succeed("systemctl", &["enable", SYSTEMD_UNIT])
+            succeed("systemctl", &["enable", SYSTEMD_UNIT])?;
+            succeed("systemctl", &["enable", SYSTEMD_UPDATE_SERVICE])?;
+            succeed("systemctl", &["enable", "--now", SYSTEMD_UPDATE_PATH])
         }
     }
 
@@ -114,9 +123,43 @@ impl Host for System {
 
     fn restart_service(&self) -> Result<()> {
         if self.platform.is_macos() {
-            succeed("launchctl", &["kickstart", "-k", &format!("system/{LAUNCHD_LABEL}")])
+            // `stop_service` boots the job out so launchd cannot relaunch it
+            // under KeepAlive; put it back before starting it.
+            let target = format!("system/{LAUNCHD_LABEL}");
+            if !run("launchctl", &["print", &target])?.status.success() {
+                let definition = format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist");
+                succeed("launchctl", &["bootstrap", "system", &definition])?;
+            }
+            succeed("launchctl", &["kickstart", "-k", &target])
         } else {
             succeed("systemctl", &["restart", SYSTEMD_UNIT])
+        }
+    }
+
+    fn stop_service(&self) -> Result<()> {
+        if self.platform.is_macos() {
+            // `launchctl kill` leaves a KeepAlive job free to relaunch the moment
+            // the daemon exits. Booting it out removes the job, so nothing can
+            // start a writer until `restart_service` bootstraps it again.
+            // AbandonProcessGroup keeps the tmux workers alive through it. A job
+            // that is not loaded is already stopped. `bootout` can return while
+            // the process is still handling SIGTERM; wait for that PID to exit
+            // so the journal has no writer.
+            let target = format!("system/{LAUNCHD_LABEL}");
+            let printed = run("launchctl", &["print", &target])?;
+            if printed.status.success() {
+                let pid = parse_instance(&String::from_utf8_lossy(&printed.stdout), true).map(|(pid, _)| pid);
+                bootout_and_wait_pid(
+                    pid,
+                    || succeed("launchctl", &["bootout", &target]),
+                    Duration::from_secs(120),
+                    Duration::from_millis(50),
+                    pid_is_alive,
+                )?;
+            }
+            Ok(())
+        } else {
+            succeed("systemctl", &["stop", SYSTEMD_UNIT])
         }
     }
 
@@ -160,11 +203,14 @@ impl Host for System {
 /// Stages a release into a directory (`install --root`) for inspection and
 /// tests: no account is created and no service manager is touched. The "user"
 /// is whoever runs it, and a service that was never started counts as healthy.
-pub struct Staged;
+#[derive(Default)]
+pub struct Staged {
+    stopped: std::cell::Cell<bool>,
+}
 
 impl Host for Staged {
     fn service_instance(&self) -> Result<Option<(u32, u64)>> {
-        Ok(Some((1, 0)))
+        Ok((!self.stopped.get()).then_some((1, 0)))
     }
 
     fn lookup_user(&self, _: &str) -> Result<Option<Account>> {
@@ -186,11 +232,17 @@ impl Host for Staged {
     }
 
     fn restart_service(&self) -> Result<()> {
+        self.stopped.set(false);
+        Ok(())
+    }
+
+    fn stop_service(&self) -> Result<()> {
+        self.stopped.set(true);
         Ok(())
     }
 
     fn service_running(&self) -> Result<bool> {
-        Ok(true)
+        Ok(!self.stopped.get())
     }
 
     fn run_as(
@@ -247,6 +299,47 @@ pub fn run_as(account: &Account, env: &[(String, String)], program: &Path, args:
     })
 }
 
+/// True while `kill(pid, 0)` does not report ESRCH.
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the pid exists.
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Polls until `alive` reports the process is gone, or `deadline` elapses.
+pub(crate) fn wait_pid_gone(pid: u32, deadline: Duration, poll: Duration, alive: impl Fn(u32) -> bool) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if !alive(pid) {
+            return Ok(());
+        }
+        if started.elapsed() >= deadline {
+            bail!("stop_failed: process {pid} was still running after {deadline:?}");
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Records the PID, runs `bootout`, then waits until that PID is gone. Used by
+/// the macOS adapter and by tests whose fake bootout returns while the process
+/// is still alive.
+pub(crate) fn bootout_and_wait_pid(
+    pid: Option<u32>,
+    bootout: impl FnOnce() -> Result<()>,
+    deadline: Duration,
+    poll: Duration,
+    alive: impl Fn(u32) -> bool,
+) -> Result<()> {
+    bootout()?;
+    if let Some(pid) = pid {
+        wait_pid_gone(pid, deadline, poll, alive)?;
+    }
+    Ok(())
+}
+
 fn parse_instance(text: &str, macos: bool) -> Option<(u32, u64)> {
     let value = |name: &str| {
         text.lines().find_map(|line| {
@@ -301,5 +394,39 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(free_service_uid(&full).is_err());
+    }
+
+    #[test]
+    fn bootout_waits_for_the_recorded_pid_after_the_job_is_unloaded() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let polls = AtomicU32::new(0);
+        bootout_and_wait_pid(
+            Some(4242),
+            || Ok(()),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            |_| {
+                let n = polls.fetch_add(1, Ordering::SeqCst);
+                n < 3
+            },
+        )
+        .unwrap();
+        assert!(
+            polls.load(Ordering::SeqCst) >= 4,
+            "must poll until ESRCH, not return at bootout"
+        );
+    }
+
+    #[test]
+    fn a_pid_that_never_exits_fails_the_quiesce() {
+        let error = bootout_and_wait_pid(
+            Some(7),
+            || Ok(()),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stop_failed"), "{error:#}");
     }
 }

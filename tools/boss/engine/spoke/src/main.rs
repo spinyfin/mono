@@ -9,6 +9,7 @@ mod commands {
     use boss_protocol_spoke::v1::{CommandResult, ResultCode, Stamp, command};
     use boss_spoke_journal::Fault;
     use boss_spoke_outbound::SharedJournal;
+    use std::path::Path;
 
     pub struct JournalExecutions(
         pub SharedJournal,
@@ -72,6 +73,7 @@ mod commands {
         captures: std::sync::Arc<boss_spoke_ingress::capture::Captures>,
         stamp: impl Fn() -> Result<Stamp>,
         gateway: &boss_spoke_worker_api::Gateway,
+        execution: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -98,10 +100,23 @@ mod commands {
                 continue;
             };
             let observed = stamp()?;
+            let execution_admitted = execution.load(std::sync::atomic::Ordering::Relaxed);
             let result = match &command.body {
                 Some(command::Body::WorkerReply(_) | command::Body::ProposalDecision(_)) => {
                     boss_spoke_ingress::apply_gateway_command(gateway, &command)
                 }
+                Some(
+                    command::Body::Spawn(_)
+                    | command::Body::Adopt(_)
+                    | command::Body::Deliver(_)
+                    | command::Body::Stop(_)
+                    | command::Body::Workspace(_),
+                ) if !execution_admitted => CommandResult {
+                    command_id: command.command_id.clone(),
+                    code: ResultCode::Rejected.into(),
+                    reason: "management-only session; execution is not admitted".into(),
+                    value: None,
+                },
                 Some(command::Body::Workspace(_)) => {
                     executor.execute(&command, interrupted, observed.wall_unix_ms).await
                 }
@@ -137,6 +152,9 @@ mod commands {
                     reason: "tmux unavailable".into(),
                     value: None,
                 },
+                Some(command::Body::Upgrade(upgrade)) => {
+                    apply_upgrade(&gateway.state_dir, &command.command_id, upgrade)
+                }
                 _ => CommandResult {
                     command_id: command.command_id.clone(),
                     code: ResultCode::Rejected.into(),
@@ -156,6 +174,56 @@ mod commands {
                     Err(error) => return Err(error),
                 };
             }
+        }
+    }
+
+    fn helper_is_busy() -> bool {
+        let Some(config) = std::env::var_os("BOSS_SPOKE_INSTALL_CONFIG") else {
+            return false;
+        };
+        let etc = std::path::Path::new(&config).parent();
+        etc.is_some_and(|etc| etc.join("update-claimed.json").is_file() || etc.join("upgrade-active").is_file())
+    }
+
+    fn apply_upgrade(state_dir: &Path, command_id: &str, upgrade: &boss_protocol_spoke::v1::Upgrade) -> CommandResult {
+        let request = serde_json::json!({
+            "schema": 1,
+            "command_id": command_id,
+            "release_id": upgrade.release_id,
+            "manifest_url": upgrade.manifest_url,
+            "manifest_sha256": upgrade.manifest_sha256.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        });
+        let dir = state_dir.join("update-request");
+        if helper_is_busy() {
+            return CommandResult {
+                command_id: command_id.into(),
+                code: ResultCode::Rejected.into(),
+                reason: "upgrade_busy: another update request is already pending".into(),
+                value: None,
+            };
+        }
+        let written = serde_json::to_vec_pretty(&request)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| boss_spoke_ingress::update_request::publish(&dir, command_id, &bytes));
+        match written {
+            Ok(_) => CommandResult {
+                command_id: command_id.into(),
+                code: ResultCode::Ok.into(),
+                reason: String::new(),
+                value: None,
+            },
+            Err(error) if error.to_string().contains("upgrade_busy") => CommandResult {
+                command_id: command_id.into(),
+                code: ResultCode::Rejected.into(),
+                reason: "upgrade_busy: another update request is already pending".into(),
+                value: None,
+            },
+            Err(error) => CommandResult {
+                command_id: command_id.into(),
+                code: ResultCode::Rejected.into(),
+                reason: format!("cannot write update request: {error:#}"),
+                value: None,
+            },
         }
     }
 
@@ -240,15 +308,96 @@ mod host {
 use anyhow::Result;
 use boss_protocol_spoke::v1::{Capacity, Inventory, Record, record};
 use boss_spoke_journal::{Admission, Fault, Journal, Limits};
-use boss_spoke_outbound::SharedJournal;
+use boss_spoke_outbound::{SessionObserver, SharedJournal};
 use clap::Parser;
 use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::watch;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+struct HealthFlags {
+    lock_ok: AtomicBool,
+    journal_ok: AtomicBool,
+    inventory_ok: AtomicBool,
+    handshake_ok: AtomicBool,
+}
+
+struct HealthAttempt {
+    release_id: String,
+    nonce: String,
+}
+
+struct HealthWatch {
+    inner: Arc<boss_spoke_ingress::capture::Captures>,
+    path: PathBuf,
+    flags: HealthFlags,
+    execution: AtomicBool,
+    attempt: HealthAttempt,
+}
+
+impl HealthWatch {
+    fn new(inner: Arc<boss_spoke_ingress::capture::Captures>, path: PathBuf) -> Self {
+        let (release_id, nonce) = attempt_identity();
+        Self {
+            inner,
+            path,
+            flags: HealthFlags {
+                lock_ok: AtomicBool::new(false),
+                journal_ok: AtomicBool::new(false),
+                inventory_ok: AtomicBool::new(false),
+                handshake_ok: AtomicBool::new(false),
+            },
+            execution: AtomicBool::new(false),
+            attempt: HealthAttempt { release_id, nonce },
+        }
+    }
+
+    fn mark_lock_and_journal(&self) {
+        self.flags.lock_ok.store(true, Ordering::Relaxed);
+        self.flags.journal_ok.store(true, Ordering::Relaxed);
+        self.write();
+    }
+
+    fn mark_inventory(&self) {
+        self.flags.inventory_ok.store(true, Ordering::Relaxed);
+        self.write();
+    }
+
+    fn write(&self) {
+        let body = serde_json::json!({
+            "lock_ok": self.flags.lock_ok.load(Ordering::Relaxed),
+            "journal_ok": self.flags.journal_ok.load(Ordering::Relaxed),
+            "inventory_ok": self.flags.inventory_ok.load(Ordering::Relaxed),
+            "handshake_ok": self.flags.handshake_ok.load(Ordering::Relaxed),
+            "release_id": self.attempt.release_id,
+            "pid": std::process::id(),
+            "nonce": self.attempt.nonce,
+        });
+        let tmp = self.path.with_extension("json.tmp");
+        if std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default()).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.path);
+        }
+    }
+}
+
+impl SessionObserver for HealthWatch {
+    fn connected(&self, pane_capture: bool, received_commands: u64, execution: bool) {
+        self.inner.connected(pane_capture, received_commands, execution);
+        self.execution.store(execution, Ordering::Relaxed);
+        self.flags.handshake_ok.store(true, Ordering::Relaxed);
+        self.write();
+    }
+
+    fn disconnected(&self) {
+        self.inner.disconnected();
+    }
+}
 
 /// How often host readiness is re-checked. The first check runs at startup.
 const PREFLIGHT_INTERVAL: Duration = Duration::from_secs(300);
@@ -374,6 +523,11 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         .build();
     let panes = tmux.clone().map(boss_host_execution::capture::TmuxPanes);
     let captures = Arc::new(boss_spoke_ingress::capture::Captures::default());
+    let health = Arc::new(HealthWatch::new(
+        Arc::clone(&captures),
+        args.state_dir.join("update-health.json"),
+    ));
+    health.mark_lock_and_journal();
     let supervisor = tmux.map(|tmux| boss_host_execution::worker::Supervisor {
         cube: cube.clone(),
         tmux,
@@ -390,10 +544,10 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         brief_budget: boss_host_execution::worker::BRIEF_DELIVERY_BUDGET,
     });
     tokio::select! {
-        result = boss_spoke_outbound::run_with_observer(Arc::clone(&journal), endpoint, stamp, true, captures.as_ref()) => result,
-        result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp, &gateway) => result,
+        result = boss_spoke_outbound::run_with_observer(Arc::clone(&journal), endpoint, stamp, true, health.as_ref()) => result,
+        result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp, &gateway, &health.execution) => result,
         result = capture_loop(Arc::clone(&journal), Arc::clone(&captures), panes, stamp) => result,
-        result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report) => result,
+        result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report, health.as_ref()) => result,
         result = preflight_loop(readiness, failures, first_report_sent) => result,
         result = commands::heartbeat(cube, executions) => result,
         result = boss_spoke_ingress::hooks::serve(hooks, Arc::clone(&journal), stamp) => result,
@@ -443,6 +597,64 @@ async fn preflight_loop(
     }
 }
 
+fn install_status_paths() -> (PathBuf, PathBuf) {
+    let config = PathBuf::from(
+        std::env::var("BOSS_SPOKE_INSTALL_CONFIG").unwrap_or_else(|_| "/etc/boss-spoke/install.json".into()),
+    );
+    let status = config
+        .parent()
+        .unwrap_or(Path::new("/etc/boss-spoke"))
+        .join("upgrade-status.json");
+    (config, status)
+}
+
+/// The release this process is running, from where its executable lives; and
+/// the nonce of the helper's current restart attempt. The helper's attempt file
+/// supplies only the nonce: a binary that the service manager started from the
+/// wrong release cannot claim the release the helper expected.
+fn attempt_identity() -> (String, String) {
+    let (config, _) = install_status_paths();
+    let attempt = config
+        .parent()
+        .unwrap_or(Path::new("/etc/boss-spoke"))
+        .join("update-attempt.json");
+    let nonce = std::fs::read(&attempt)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("nonce")?.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    (running_release(&config), nonce)
+}
+
+fn running_release(config: &Path) -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| boss_spoke_ingress::update_request::release_of_executable(&exe))
+        .unwrap_or_else(|| {
+            // Not run from a release directory (a development build): fall back
+            // to what was installed.
+            std::fs::read(config)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| value.get("release_id")?.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        })
+}
+
+fn reported_release(config: &Path, status: &Path) -> (String, String, String, String) {
+    let running = running_release(config);
+    let parsed = std::fs::read(status)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get(name)?.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    (running, field("command_id"), field("result"), field("error"))
+}
+
 async fn produce(
     journal: &SharedJournal,
     root: &std::path::Path,
@@ -450,6 +662,7 @@ async fn produce(
     tmux_ready: bool,
     preflights: watch::Receiver<Vec<String>>,
     first_report: tokio::sync::oneshot::Sender<()>,
+    health: &HealthWatch,
 ) -> Result<()> {
     let mut first_report = Some(first_report);
     let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -467,6 +680,9 @@ async fn produce(
             // even if a later check finds tmux.
             failed_preflights.push("tmux unavailable".into());
         }
+        let (config, status) = install_status_paths();
+        let (release_id, last_upgrade_command_id, last_upgrade_result, last_upgrade_error) =
+            reported_release(&config, &status);
         let capacity = Capacity {
             generation: journal.record_bounds()?.1 + 1,
             free_disk_bytes: fs4::available_space(root)?,
@@ -477,6 +693,10 @@ async fn produce(
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
                 failed_preflights,
+                release_id,
+                last_upgrade_command_id,
+                last_upgrade_result,
+                last_upgrade_error,
                 ..Default::default()
             }),
             ..Default::default()
@@ -492,6 +712,8 @@ async fn produce(
             } else {
                 return Err(error);
             }
+        } else {
+            health.mark_inventory();
         }
         if let Some(first_report) = first_report.take() {
             let _ = first_report.send(());

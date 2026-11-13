@@ -129,6 +129,7 @@ mod session {
         codec::{RawCodec, Received, record_frame},
         contracts, executor_contracts, hello, locked, network, status,
     };
+    use boss_protocol_spoke::negotiate::{self, Contracts, Rejection, reject_code};
 
     const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -190,6 +191,80 @@ mod session {
         external_executor: bool,
         observer: &impl super::SessionObserver,
     ) -> Result<()> {
+        let mut offered = if external_executor {
+            executor_contracts()
+        } else {
+            contracts()
+        };
+        loop {
+            match connect_offered(
+                journal,
+                endpoint.clone(),
+                nonce,
+                stamp,
+                external_executor,
+                observer,
+                &offered,
+            )
+            .await
+            {
+                Err(error)
+                    if error.downcast_ref::<ContractFallback>().is_some()
+                        && offered
+                            .required
+                            .iter()
+                            .any(|name| name == negotiate::feature::EXECUTION) =>
+                {
+                    tracing::warn!(error = %error, "execution contract refused; retrying management-only");
+                    offered = contracts();
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("execution contract refused: {0}")]
+    struct ContractFallback(String);
+
+    fn management_fallback(reason: impl std::fmt::Display) -> anyhow::Error {
+        ContractFallback(reason.to_string()).into()
+    }
+
+    fn confirm_welcome(offered: &Contracts, welcome: &v1::Welcome) -> Result<negotiate::Selection> {
+        match offered.confirm(welcome) {
+            Ok(selection) => Ok(selection),
+            Err(error) => match contracts().confirm(welcome) {
+                Ok(selection)
+                    if offered
+                        .required
+                        .iter()
+                        .any(|name| name == negotiate::feature::EXECUTION) =>
+                {
+                    tracing::warn!(error = %error, "hub selected management contracts; execution not admitted");
+                    Ok(selection)
+                }
+                _ => Err(error.into()),
+            },
+        }
+    }
+
+    fn reject_is_contract_mismatch(reject: &v1::Reject) -> bool {
+        matches!(
+            reject.code.as_str(),
+            reject_code::NO_COMMON_EPOCH | reject_code::MISSING_REQUIRED_FEATURE
+        )
+    }
+
+    async fn connect_offered(
+        journal: &SharedJournal,
+        endpoint: Endpoint,
+        nonce: &[u8],
+        stamp: &impl Fn() -> Result<v1::Stamp>,
+        external_executor: bool,
+        observer: &impl super::SessionObserver,
+        selected_contracts: &Contracts,
+    ) -> Result<()> {
         ensure!(
             endpoint.uri().scheme_str() == Some("https"),
             "spoke requires mTLS HTTPS"
@@ -203,13 +278,10 @@ mod session {
             .max_encoding_message_size(MAX_FRAME_BYTES as usize);
         grpc.ready().await.map_err(network)?;
         let (tx, rx) = mpsc::channel(2);
-        let selected_contracts = if external_executor {
-            executor_contracts()
-        } else {
-            contracts()
-        };
         let mut hello = hello(&*locked(journal)?, &stamp()?.boot_id, nonce)?;
         hello.features = selected_contracts.features.clone();
+        hello.min_epoch = selected_contracts.min_epoch;
+        hello.max_epoch = selected_contracts.max_epoch;
         send(
             &tx,
             control(spoke_frame::Body::Hello(hello.clone())),
@@ -228,12 +300,38 @@ mod session {
         let first = receive(&mut inbound).await?;
         let welcome = match first.frame.body {
             Some(hub_frame::Body::Welcome(welcome)) => welcome,
+            Some(hub_frame::Body::Reject(reject))
+                if selected_contracts
+                    .required
+                    .iter()
+                    .any(|name| name == negotiate::feature::EXECUTION)
+                    && reject_is_contract_mismatch(&reject) =>
+            {
+                return Err(management_fallback(format!("{}: {}", reject.code, reject.diagnostic)));
+            }
             Some(hub_frame::Body::Reject(reject)) => {
                 bail!("hub rejected spoke: {}: {}", reject.code, reject.diagnostic)
             }
             _ => bail!("expected Welcome as first hub frame"),
         };
-        let selection = selected_contracts.confirm(&welcome)?;
+        let selection = match confirm_welcome(selected_contracts, &welcome) {
+            Ok(selection) => selection,
+            Err(error)
+                if selected_contracts
+                    .required
+                    .iter()
+                    .any(|name| name == negotiate::feature::EXECUTION)
+                    && error.downcast_ref::<Rejection>().is_some_and(|rejection| {
+                        matches!(
+                            rejection,
+                            Rejection::NoCommonEpoch { .. } | Rejection::MissingRequired { .. }
+                        )
+                    }) =>
+            {
+                return Err(management_fallback(error));
+            }
+            Err(error) => return Err(error),
+        };
         ensure!(
             first.frame.connection_generation == welcome.connection_generation,
             "Welcome generation mismatch"
@@ -261,6 +359,7 @@ mod session {
         observer.connected(
             selection.has(boss_protocol_spoke::negotiate::feature::PANE_CAPTURE),
             through,
+            selection.has(boss_protocol_spoke::negotiate::feature::EXECUTION),
         );
         let limits = Limits::default().negotiated(welcome.max_frame_bytes, welcome.max_inflight_bytes);
         let frame_limit = limits.max_frame_bytes as usize;
@@ -420,11 +519,11 @@ use uuid::Uuid;
 /// Connection-scoped work expires when the transport ends. The command
 /// cursor fences work already admitted on a previous connection.
 pub trait SessionObserver: Send + Sync {
-    fn connected(&self, pane_capture: bool, received_commands: u64);
+    fn connected(&self, pane_capture: bool, received_commands: u64, execution: bool);
     fn disconnected(&self);
 }
 impl SessionObserver for () {
-    fn connected(&self, _: bool, _: u64) {}
+    fn connected(&self, _: bool, _: u64, _: bool) {}
     fn disconnected(&self) {}
 }
 
@@ -432,7 +531,7 @@ pub type SharedJournal = Arc<Mutex<Journal>>;
 pub use session::connect_once;
 
 pub fn contracts() -> Contracts {
-    boss_protocol_spoke::negotiate::journal_contracts()
+    boss_protocol_spoke::negotiate::management_contracts()
 }
 
 /// Journal contracts plus the executor-backed workspace/execution set.
@@ -545,11 +644,7 @@ pub(crate) fn status(error: tonic::Status) -> anyhow::Error {
 mod tests {
     use super::*;
     use boss_protocol_spoke::negotiate::{EXECUTOR_FEATURES, feature};
-
-    #[test]
-    fn journal_only_hello_uses_the_shared_journal_contracts() {
-        assert_eq!(contracts(), boss_protocol_spoke::negotiate::journal_contracts());
-    }
+    use boss_protocol_spoke::v1::{Cursor, Welcome};
 
     #[test]
     fn production_executor_negotiates_only_with_a_compatible_hub() {
@@ -634,5 +729,35 @@ mod tests {
                 .iter()
                 .any(|item| item.name == feature::WORKSPACE_RESET_RELEASE)
         );
+    }
+
+    #[test]
+    fn management_contracts_offer_upgrade_without_requiring_execution() {
+        let offered = contracts();
+        assert!(
+            offered
+                .features
+                .iter()
+                .any(|item| item.name == feature::UPGRADE && item.revision == 1)
+        );
+        assert!(!offered.required.iter().any(|name| name == feature::UPGRADE));
+        assert!(!offered.required.iter().any(|name| name == feature::EXECUTION));
+        let welcome = Welcome {
+            epoch: EPOCH,
+            features: offered.features.clone(),
+            hub_id: "hub".into(),
+            authority_generation: "authority".into(),
+            connection_generation: 1,
+            received_records: Some(Cursor {
+                journal_id: "journal".into(),
+                through: 0,
+            }),
+            command_journal_id: "commands".into(),
+            ..Default::default()
+        };
+        let selection = offered.confirm(&welcome).expect("journal plus upgrade is enough");
+        assert!(selection.has(feature::UPGRADE));
+        assert!(selection.has(feature::JOURNAL));
+        assert!(!selection.has(feature::EXECUTION));
     }
 }

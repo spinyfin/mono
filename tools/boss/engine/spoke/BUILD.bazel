@@ -3,6 +3,30 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
+# Isolated mTLS hub used by daemon session tests and by the packaged-daemon
+# upgrade suite, which must exercise a real management handshake.
+rust_library(
+    name = "test_hub",
+    testonly = True,
+    srcs = ["tests/hub.rs"],
+    crate_name = "boss_spoke_test_hub",
+    crate_root = "tests/hub.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    visibility = ["//tools/boss/spoke-package:__pkg__"],
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_binary(
     name = "boss-spoke",
     srcs = ["src/main.rs"],

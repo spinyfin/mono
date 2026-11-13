@@ -550,7 +550,7 @@ mod outbound_session {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Observer(AtomicUsize);
         impl SessionObserver for Observer {
-            fn connected(&self, capture: bool, _: u64) {
+            fn connected(&self, capture: bool, _: u64, _: bool) {
                 self.0.store(if capture { 2 } else { 1 }, Ordering::SeqCst);
             }
             fn disconnected(&self) {

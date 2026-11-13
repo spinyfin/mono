@@ -19,6 +19,14 @@ use crate::validate::{Validate, ValidationError};
 
 /// The only wire epoch defined so far.
 pub const EPOCH: u32 = 1;
+/// Handshake/envelope epoch for journal, inventory and Upgrade. Stays at 1
+/// when execution traffic later needs a new epoch, so an old spoke can still
+/// be told to upgrade.
+pub const MANAGEMENT_EPOCH: u32 = 1;
+/// Epoch required for workspace/execution traffic. Today it matches
+/// [`MANAGEMENT_EPOCH`]; bump it independently when those messages change
+/// incompatibly.
+pub const EXECUTION_EPOCH: u32 = 1;
 
 /// Feature contract names. A feature is a name plus a revision; an
 /// incompatible change gets a new revision, additive optional fields keep it.
@@ -81,8 +89,8 @@ pub const EXECUTOR_FEATURES: &[&str] = &[
 /// the executor Hello both start here so the journal revision cannot drift.
 pub fn journal_contracts() -> Contracts {
     Contracts {
-        min_epoch: EPOCH,
-        max_epoch: EPOCH,
+        min_epoch: MANAGEMENT_EPOCH,
+        max_epoch: MANAGEMENT_EPOCH,
         features: vec![Feature {
             name: feature::JOURNAL.into(),
             revision: 1,
@@ -91,10 +99,25 @@ pub fn journal_contracts() -> Contracts {
     }
 }
 
-/// Journal plus the executor-backed workspace/execution set. This is the
-/// production executor Hello.
-pub fn executor_contracts() -> Contracts {
+/// Journal plus optional Upgrade. A mixed-version hub can select this when
+/// execution features or epochs no longer overlap, so the host still receives
+/// an upgrade offer.
+pub fn management_contracts() -> Contracts {
     let mut contracts = journal_contracts();
+    contracts.features.push(Feature {
+        name: feature::UPGRADE.into(),
+        revision: 1,
+    });
+    contracts
+}
+
+/// Management contracts plus the executor-backed workspace/execution set.
+/// This is the production executor Hello: it offers Upgrade and every
+/// execution feature, with min epoch at [`MANAGEMENT_EPOCH`] so a hub that
+/// only shares the management epoch can still admit the spoke.
+pub fn executor_contracts() -> Contracts {
+    let mut contracts = management_contracts();
+    contracts.max_epoch = EXECUTION_EPOCH.max(MANAGEMENT_EPOCH);
     for &name in EXECUTOR_FEATURES {
         contracts.features.push(Feature {
             name: name.into(),
@@ -471,10 +494,42 @@ mod tests {
     }
 
     #[test]
+    fn management_contracts_offer_upgrade_without_requiring_execution() {
+        let offered = management_contracts();
+        assert_eq!(offered.min_epoch, MANAGEMENT_EPOCH);
+        assert_eq!(offered.max_epoch, MANAGEMENT_EPOCH);
+        assert!(
+            offered
+                .features
+                .iter()
+                .any(|item| item.name == feature::UPGRADE && item.revision == 1)
+        );
+        assert!(!offered.required.iter().any(|name| name == feature::UPGRADE));
+        assert!(!offered.required.iter().any(|name| name == feature::EXECUTION));
+        let welcome = Welcome {
+            epoch: MANAGEMENT_EPOCH,
+            features: offered.features.clone(),
+            hub_id: "hub".into(),
+            authority_generation: "authority".into(),
+            connection_generation: 1,
+            received_records: Some(crate::v1::Cursor {
+                journal_id: "journal".into(),
+                through: 0,
+            }),
+            command_journal_id: "commands".into(),
+            ..Default::default()
+        };
+        let selection = offered.confirm(&welcome).expect("journal plus upgrade is enough");
+        assert!(selection.has(feature::UPGRADE));
+        assert!(selection.has(feature::JOURNAL));
+        assert!(!selection.has(feature::EXECUTION));
+    }
+
+    #[test]
     fn journal_contracts_are_the_shared_journal_only_base() {
         let offered = journal_contracts();
-        assert_eq!(offered.min_epoch, EPOCH);
-        assert_eq!(offered.max_epoch, EPOCH);
+        assert_eq!(offered.min_epoch, MANAGEMENT_EPOCH);
+        assert_eq!(offered.max_epoch, MANAGEMENT_EPOCH);
         assert_eq!(
             offered.features,
             vec![Feature {
@@ -495,8 +550,14 @@ mod tests {
     #[test]
     fn executor_contracts_offer_the_executor_set_with_optional_names_optional() {
         let offered = executor_contracts();
-        assert_eq!(offered.min_epoch, EPOCH);
-        assert_eq!(offered.max_epoch, EPOCH);
+        assert_eq!(offered.min_epoch, MANAGEMENT_EPOCH);
+        assert_eq!(offered.max_epoch, EXECUTION_EPOCH.max(MANAGEMENT_EPOCH));
+        assert!(
+            offered
+                .features
+                .iter()
+                .any(|item| item.name == feature::UPGRADE && item.revision == 1)
+        );
         assert!(
             offered
                 .features

@@ -234,7 +234,7 @@ def _host_tmux_repository_impl(repository_ctx):
             repository_ctx.file(
                 "BUILD.bazel",
                 content = """\
-exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\", \"@@//tools/boss/engine/spoke:__pkg__\"])
+exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\", \"@@//tools/boss/engine/spoke:__pkg__\", \"@@//tools/boss/spoke-package:__pkg__\"])
 """,
             )
             return
@@ -249,7 +249,7 @@ exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\", 
     repository_ctx.file(
         "BUILD.bazel",
         content = """\
-exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\", \"@@//tools/boss/engine/spoke:__pkg__\"])
+exports_files([\"tmux\"], visibility = [\"@@//tools/boss/engine/core:__pkg__\", \"@@//tools/boss/engine/spoke:__pkg__\", \"@@//tools/boss/spoke-package:__pkg__\"])
 """,
     )
 

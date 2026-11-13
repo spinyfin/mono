@@ -1,0 +1,11 @@
+[Unit]
+Description=Boss spoke update request
+
+[Path]
+PathExists={{request}}
+PathExists={{claimed}}
+PathExists={{active}}
+MakeDirectory=false
+
+[Install]
+WantedBy=multi-user.target

@@ -83,7 +83,7 @@ pub struct Captures {
 }
 
 impl boss_spoke_outbound::SessionObserver for Captures {
-    fn connected(&self, pane_capture: bool, received_commands: u64) {
+    fn connected(&self, pane_capture: bool, received_commands: u64, _: bool) {
         let mut session = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.table().clear();
         *session = pane_capture.then_some(received_commands);
@@ -538,7 +538,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let journal = journal(root.path());
         let captures = Captures::default();
-        boss_spoke_outbound::SessionObserver::connected(&captures, true, 0);
+        boss_spoke_outbound::SessionObserver::connected(&captures, true, 0, true);
         let mut command = Command {
             sequence: 1,
             command_id: "c1".into(),
@@ -674,7 +674,7 @@ mod tests {
             ..Default::default()
         };
         let now = Instant::now();
-        captures.connected(true, 0);
+        captures.connected(true, 0, true);
         assert_eq!(
             captures
                 .command(&journal, &command, &subscribe("s", 120, 1000), 1, now)
@@ -692,14 +692,14 @@ mod tests {
         .await
         .unwrap();
         assert!(captured(&journal).is_empty());
-        captures.connected(true, 1);
+        captures.connected(true, 1, true);
         assert_eq!(
             captures
                 .command(&journal, &command, &subscribe("s", 120, 1000), 1, now)
                 .code,
             ResultCode::Rejected as i32
         );
-        captures.connected(false, 1);
+        captures.connected(false, 1, true);
         let command = Command { sequence: 2, ..command };
         assert_eq!(
             captures

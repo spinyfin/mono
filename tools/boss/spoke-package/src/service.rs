@@ -14,10 +14,16 @@ pub use boss_spoke_preflight::HOMES_ENV;
 use crate::manifest::is_token;
 
 pub const SYSTEMD_UNIT: &str = "boss-spoke.service";
+pub const SYSTEMD_UPDATE_SERVICE: &str = "boss-spoke-update.service";
+pub const SYSTEMD_UPDATE_PATH: &str = "boss-spoke-update.path";
 pub const LAUNCHD_LABEL: &str = "dev.boss.spoke";
+pub const LAUNCHD_UPDATE_LABEL: &str = "dev.boss.spoke.update";
 
 const SYSTEMD_TEMPLATE: &str = include_str!("../service/boss-spoke.service.in");
 const LAUNCHD_TEMPLATE: &str = include_str!("../service/dev.boss.spoke.plist.in");
+const SYSTEMD_UPDATE_TEMPLATE: &str = include_str!("../service/boss-spoke-update.service.in");
+const SYSTEMD_UPDATE_PATH_TEMPLATE: &str = include_str!("../service/boss-spoke-update.path.in");
+const LAUNCHD_UPDATE_TEMPLATE: &str = include_str!("../service/dev.boss.spoke.update.plist.in");
 
 /// Everything a service definition needs.
 #[derive(Debug, Clone, bon::Builder)]
@@ -149,6 +155,42 @@ impl Spec {
             ],
         )
     }
+}
+
+/// Root-run oneshot that applies a request dropped by the service user.
+pub fn render_update_systemd(installer: &Path, config: &Path) -> String {
+    fill(
+        SYSTEMD_UPDATE_TEMPLATE,
+        &[
+            ("installer", installer.display().to_string()),
+            ("config", config.display().to_string()),
+        ],
+    )
+}
+
+pub fn render_update_path(request: &Path, claimed: &Path, active: &Path) -> String {
+    fill(
+        SYSTEMD_UPDATE_PATH_TEMPLATE,
+        &[
+            ("request", request.display().to_string()),
+            ("claimed", claimed.display().to_string()),
+            ("active", active.display().to_string()),
+        ],
+    )
+}
+
+pub fn render_update_launchd(installer: &Path, config: &Path, request: &Path, claimed: &Path, active: &Path) -> String {
+    fill(
+        LAUNCHD_UPDATE_TEMPLATE,
+        &[
+            ("label", LAUNCHD_UPDATE_LABEL.to_owned()),
+            ("installer", xml(&installer.display().to_string())),
+            ("config", xml(&config.display().to_string())),
+            ("request", xml(&request.display().to_string())),
+            ("claimed", xml(&claimed.display().to_string())),
+            ("active", xml(&active.display().to_string())),
+        ],
+    )
 }
 
 /// An absolute path of plain components made of `[A-Za-z0-9._-]`.

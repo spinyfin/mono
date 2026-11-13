@@ -78,6 +78,64 @@ impl Layout {
         self.prefix().join("current")
     }
 
+    pub fn previous(&self) -> PathBuf {
+        self.prefix().join("previous")
+    }
+
+    pub fn request_dir(&self) -> PathBuf {
+        self.state_dir().join("update-request")
+    }
+
+    pub fn request_path(&self) -> PathBuf {
+        self.request_dir().join("request.json")
+    }
+
+    /// Installer-owned copy of the offer currently being applied. The helper
+    /// renames `request.json` here before it trusts the bytes, so a replacement
+    /// in the service-user directory cannot be unlinked as a side effect.
+    pub fn claimed_path(&self) -> PathBuf {
+        self.etc().join("update-claimed.json")
+    }
+
+    /// Present only while the helper has unfinished work. The path unit and
+    /// launchd KeepAlive watch it so a crashed helper is re-run without looping
+    /// on a terminal unresolved marker.
+    pub fn active_path(&self) -> PathBuf {
+        self.etc().join("upgrade-active")
+    }
+
+    pub fn status_path(&self) -> PathBuf {
+        self.etc().join("upgrade-status.json")
+    }
+
+    pub fn in_progress_path(&self) -> PathBuf {
+        self.etc().join("upgrade-in-progress.json")
+    }
+
+    pub fn health_path(&self) -> PathBuf {
+        self.state_dir().join("update-health.json")
+    }
+
+    pub fn attempt_path(&self) -> PathBuf {
+        self.etc().join("update-attempt.json")
+    }
+
+    pub fn helper_definition(&self) -> PathBuf {
+        if self.platform.is_macos() {
+            Path::new("/Library/LaunchDaemons").join(format!("{}.plist", service::LAUNCHD_UPDATE_LABEL))
+        } else {
+            Path::new("/etc/systemd/system").join(service::SYSTEMD_UPDATE_SERVICE)
+        }
+    }
+
+    pub fn helper_path_definition(&self) -> Option<PathBuf> {
+        if self.platform.is_macos() {
+            None
+        } else {
+            Some(Path::new("/etc/systemd/system").join(service::SYSTEMD_UPDATE_PATH))
+        }
+    }
+
     pub fn definition(&self) -> PathBuf {
         if self.platform.is_macos() {
             Path::new("/Library/LaunchDaemons").join(format!("{}.plist", service::LAUNCHD_LABEL))
@@ -90,7 +148,7 @@ impl Layout {
         self.etc().join("install.json")
     }
 
-    fn pinned_key_path(&self) -> PathBuf {
+    pub fn pinned_key_path(&self) -> PathBuf {
         self.etc().join("release-verify-key.pub")
     }
 
@@ -143,6 +201,11 @@ pub struct InstallRecord {
     pub user: String,
     pub host_id: String,
     pub hub_url: String,
+    /// HTTPS origin prefix later upgrades must fetch from. Empty on records
+    /// written before the updater; the next verified install fills it.
+    #[builder(default)]
+    #[serde(default)]
+    pub package_origin: String,
 }
 
 impl InstallRecord {
@@ -214,12 +277,17 @@ pub trait Host {
     /// the definition bytes on disk changed.
     fn service_registered(&self) -> Result<bool>;
     fn restart_service(&self) -> Result<()>;
+    /// Stops the daemon without starting it again, so the journal has no writer.
+    fn stop_service(&self) -> Result<()>;
     fn service_running(&self) -> Result<bool>;
     /// PID and service-manager launch count, absent when no instance is running.
     fn service_instance(&self) -> Result<Option<(u32, u64)>>;
     /// Runs `program` as `account` with exactly `env` and nothing inherited.
     fn run_as(&self, account: &Account, env: &[(String, String)], program: &Path, args: &[String])
     -> Result<RunOutput>;
+    /// Records that `logical` is owned by the service account. Tests use this
+    /// to prove containment; production hosts ignore it.
+    fn note_handoff(&self, _logical: &Path) {}
 }
 
 /// How long to wait for a restarted service to prove itself.
@@ -289,12 +357,16 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     );
 
     // A host's journal is keyed by its id; changing it would strand the journal.
-    if let Some(existing) = InstallRecord::load(&layout.on_disk(&layout.config_path()))? {
+    let existing = InstallRecord::load(&layout.on_disk(&layout.config_path()))?;
+    if let Some(existing) = &existing {
         ensure!(
             existing.host_id == request.host_id,
             "this host is installed as {}; a host id never changes because the journal belongs to it",
             existing.host_id
         );
+        if !existing.package_origin.is_empty() {
+            manifest::require_origin(&verified.manifest.package.url, &existing.package_origin)?;
+        }
     }
 
     // Nothing is installed before this point.
@@ -312,7 +384,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         write_logical(layout, &layout.pinned_key_path(), key.to_text().as_bytes(), 0o644)?;
         report.changed.push("release key pinned");
     }
-    if ensure_state(layout, &account)? {
+    if ensure_state(host, layout, &account)? {
         report.changed.push("service state directories");
     }
     if install_release(layout, &release_id, request.package, &verified.manifest.package.sha256)? {
@@ -345,9 +417,14 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         .context("the credentials directory was replaced after it was verified")?;
     secure_fs::verify_user_dir(&credentials_dir, &account, true, "credentials")?;
     let trust_changed = secure_fs::write_file_at(&credentials_dir, "ca.pem", request.hub_ca, 0o600, Some(&account))?;
+    host.note_handoff(&credentials.join("ca.pem"));
     if trust_changed {
         report.changed.push("hub trust installed");
     }
+    let package_origin = match &existing {
+        Some(existing) if !existing.package_origin.is_empty() => existing.package_origin.clone(),
+        _ => manifest::pinned_origin(&verified.manifest.package.url)?,
+    };
     let record = InstallRecord::builder()
         .schema(1)
         .release_id(release_id.clone())
@@ -355,6 +432,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         .user(layout.user.clone())
         .host_id(request.host_id)
         .hub_url(request.hub_url)
+        .package_origin(package_origin)
         .build();
     let mut record_bytes = serde_json::to_vec_pretty(&record)?;
     record_bytes.push(b'\n');
@@ -390,6 +468,10 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
     if definition_changed {
         report.changed.push("service definition");
     }
+    let helper_changed = install_update_helper(layout)?;
+    if helper_changed {
+        report.changed.push("update helper");
+    }
     let registration_pending = match secure_fs::read_file_at(&etc, "definition-registered") {
         Ok((bytes, metadata)) => {
             secure_fs::verify_installer_file(&metadata, "definition registration record")?;
@@ -398,7 +480,7 @@ pub fn install(host: &dyn Host, request: &Request<'_>) -> Result<Report> {
         Err(error) if secure_fs::is_not_found(&error) => true,
         Err(error) => return Err(error),
     };
-    if registration_pending || definition_changed || !host.service_registered()? {
+    if registration_pending || definition_changed || helper_changed || !host.service_registered()? {
         host.register_service(&layout.definition())?;
         write_logical(
             layout,
@@ -481,7 +563,7 @@ fn ensure_root_dir(layout: &Layout, logical: &Path) -> Result<bool> {
 /// The service user's home, then its owner-only spoke state, credential and
 /// driver-home directories. An existing directory is verified, never repaired:
 /// the service user controls these paths, so root must not chown or chmod them.
-fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
+fn ensure_state(host: &dyn Host, layout: &Layout, account: &Account) -> Result<bool> {
     let home = layout.home();
     let parent = home.parent().context("home has no parent")?;
     let parent_dir = {
@@ -493,15 +575,18 @@ fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
         .and_then(|name| name.to_str())
         .context("home is not a plain name")?;
     let (home_dir, mut changed) = secure_fs::ensure_user_dir_at(&parent_dir, home_name, account, false)?;
+    host.note_handoff(&home);
     let state_path = layout.state_dir();
     let state_name = state_path
         .file_name()
         .and_then(|name| name.to_str())
         .context("state directory is not a plain name")?;
     let (state_dir, state_created) = secure_fs::ensure_user_dir_at(&home_dir, state_name, account, true)?;
+    host.note_handoff(&state_path);
     changed |= state_created;
-    for name in ["credentials", "homes"] {
+    for name in ["credentials", "homes", "update-request"] {
         let (_, created) = secure_fs::ensure_user_dir_at(&state_dir, name, account, true)?;
+        host.note_handoff(&state_path.join(name));
         changed |= created;
     }
     Ok(changed)
@@ -510,7 +595,180 @@ fn ensure_state(layout: &Layout, account: &Account) -> Result<bool> {
 /// Writes `bytes` into an installer-owned directory walked from the layout
 /// base. The parent is re-checked (owner, no group/other write, not a symlink)
 /// before the file is created.
-fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32) -> Result<bool> {
+const SERVICE_FILE_MAX: u64 = 64 * 1024;
+
+pub(crate) fn read_service_file(layout: &Layout, logical: &Path, account: &Account) -> Result<Option<Vec<u8>>> {
+    let parent = logical.parent().context("path has no parent")?;
+    let name = logical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("path has no name")?;
+    let dir = match secure_fs::open_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match secure_fs::read_file_at_capped(&dir, name, SERVICE_FILE_MAX) {
+        Ok((bytes, metadata)) => {
+            ensure!(
+                metadata.st_uid == account.uid,
+                "{} is not owned by the service user",
+                logical.display()
+            );
+            Ok(Some(bytes))
+        }
+        Err(error) if secure_fs::is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Renames `request.json` into the installer-owned claimed location and returns
+/// its bytes. A file already sitting at the claimed path (a helper that crashed
+/// after claiming) is used as-is. A replacement that appears at the original
+/// name after the rename is left for the next helper run.
+pub(crate) fn claim_request(layout: &Layout) -> Result<Option<Vec<u8>>> {
+    let claimed = layout.claimed_path();
+    let claimed_name = claimed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("claimed path has no name")?;
+    let claimed_parent = claimed.parent().context("claimed path has no parent")?;
+    ensure_root_dir(layout, claimed_parent)?;
+    let dest = secure_fs::open_installer_dir(layout.base(), claimed_parent)?;
+    secure_fs::verify_installer_dir(&dest, &claimed_parent.display().to_string())?;
+
+    let request = layout.request_path();
+    let request_name = request
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("request path has no name")?;
+    let request_parent = request.parent().context("request path has no parent")?;
+    if let Ok(src) = secure_fs::open_dir(layout.base(), request_parent) {
+        match secure_fs::rename_between(&src, request_name, &dest, claimed_name) {
+            Ok(()) => {}
+            Err(error) if secure_fs::is_not_found(&error) => {}
+            Err(error) if is_cross_device(&error) => {
+                copy_request_then_unlink(layout, &src, request_name, &dest, claimed_name)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match secure_fs::read_file_at_capped(&dest, claimed_name, SERVICE_FILE_MAX) {
+        Ok((bytes, metadata)) => {
+            ensure!(
+                metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+                "claimed request must be a regular file"
+            );
+            Ok(Some(bytes))
+        }
+        Err(error) if secure_fs::is_not_found(&error) => Ok(None),
+        Err(error) => {
+            let _ = secure_fs::unlink_file_at(&dest, claimed_name);
+            Err(error)
+        }
+    }
+}
+
+fn copy_request_then_unlink(
+    layout: &Layout,
+    src: &secure_fs::DirFd,
+    request_name: &str,
+    dest: &secure_fs::DirFd,
+    claimed_name: &str,
+) -> Result<()> {
+    // Same-volume `renameat` is the atomic claim. This path is only EXDEV:
+    // copy the inode we opened, then unlink that inode only. A replacement
+    // with a different inode is left for the next helper run.
+    let _ = layout;
+    let (fd, metadata) = match secure_fs::open_regular_at(src, request_name) {
+        Ok(value) => value,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let bytes = secure_fs::read_capped(std::fs::File::from(fd), SERVICE_FILE_MAX)?;
+    secure_fs::write_file_at(dest, claimed_name, &bytes, 0o644, None)?;
+    secure_fs::unlink_if_same(src, request_name, &metadata)
+}
+
+fn is_cross_device(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|cause| cause.raw_os_error() == Some(libc::EXDEV))
+}
+
+pub(crate) fn clear_claimed(layout: &Layout) -> Result<()> {
+    let path = layout.claimed_path();
+    let parent = path.parent().context("claimed path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("claimed path has no name")?;
+    let dir = match secure_fs::open_installer_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    secure_fs::unlink_file_at(&dir, name)
+}
+
+pub(crate) fn write_active(layout: &Layout) -> Result<()> {
+    write_logical(layout, &layout.active_path(), b"1\n", 0o644)?;
+    Ok(())
+}
+
+pub(crate) fn clear_active(layout: &Layout) -> Result<()> {
+    let path = layout.on_disk(&layout.active_path());
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn unlink_service_file(layout: &Layout, logical: &Path) -> Result<()> {
+    let parent = logical.parent().context("path has no parent")?;
+    let name = logical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("path has no name")?;
+    let dir = match secure_fs::open_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    secure_fs::unlink_file_at(&dir, name)
+}
+
+/// Locates the service user's journal through the verified state directory.
+/// Root never opens the database; it only checks ownership and size so the
+/// unprivileged inspector can be pointed at a real file.
+pub(crate) fn journal_sqlite_path(layout: &Layout, account: &Account) -> Result<Option<PathBuf>> {
+    let logical = layout.state_dir().join("journal.db");
+    let parent = logical.parent().context("journal has no parent")?;
+    let dir = match secure_fs::open_dir(layout.base(), parent) {
+        Ok(dir) => dir,
+        Err(error) if secure_fs::is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match secure_fs::open_regular_at(&dir, "journal.db") {
+        Ok((_, metadata)) => {
+            ensure!(
+                metadata.st_uid == account.uid,
+                "journal.db is not owned by the service user"
+            );
+            ensure!(
+                metadata.st_size >= 100,
+                "journal.db is too short to be a SQLite database"
+            );
+            Ok(Some(layout.on_disk(&logical)))
+        }
+        Err(error) if secure_fs::is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32) -> Result<bool> {
     let parent = logical.parent().context("destination has no parent")?;
     let name = logical
         .file_name()
@@ -524,7 +782,7 @@ fn write_logical(layout: &Layout, logical: &Path, bytes: &[u8], mode: u32) -> Re
 /// Unpacks into a staging directory next to the final one and renames it into
 /// place, so a release directory is either absent or complete. A release id
 /// names one set of bytes forever.
-fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &str) -> Result<bool> {
+pub(crate) fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &str) -> Result<bool> {
     let target = layout.on_disk(&layout.release_dir(release_id));
     let releases_logical = layout
         .release_dir(release_id)
@@ -550,20 +808,87 @@ fn install_release(layout: &Layout, release_id: &str, package: &[u8], digest: &s
 }
 
 /// Points `current` at the release with an atomic rename of a relative link.
-fn point_current(layout: &Layout, release_id: &str) -> Result<bool> {
-    let link = layout.on_disk(&layout.current());
+pub(crate) fn point_current(layout: &Layout, release_id: &str) -> Result<bool> {
+    point_link(layout, &layout.current(), ".current.new", release_id)
+}
+
+pub(crate) fn point_previous(layout: &Layout, release_id: &str) -> Result<bool> {
+    point_link(layout, &layout.previous(), ".previous.new", release_id)
+}
+
+pub(crate) fn current_release(layout: &Layout) -> Option<String> {
+    release_of(&layout.on_disk(&layout.current()))
+}
+
+fn release_of(link: &Path) -> Option<String> {
+    fs::read_link(link)
+        .ok()
+        .and_then(|target| target.file_name().map(|name| name.to_string_lossy().into_owned()))
+}
+
+fn point_link(layout: &Layout, logical: &Path, temp_name: &str, release_id: &str) -> Result<bool> {
+    let link = layout.on_disk(logical);
     let target = Path::new("releases").join(release_id);
     if fs::read_link(&link).is_ok_and(|existing| existing == target) {
         return Ok(false);
     }
-    let temp = link.with_file_name(".current.new");
+    let temp = link.with_file_name(temp_name);
     let _ = fs::remove_file(&temp);
     symlink(&target, &temp)?;
     fs::rename(&temp, &link)?;
     Ok(true)
 }
 
-fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()> {
+pub(crate) fn write_status(layout: &Layout, bytes: &[u8]) -> Result<bool> {
+    write_logical(layout, &layout.status_path(), bytes, 0o644)
+}
+
+pub(crate) fn write_in_progress(layout: &Layout, bytes: &[u8]) -> Result<bool> {
+    write_logical(layout, &layout.in_progress_path(), bytes, 0o644)
+}
+
+pub(crate) fn clear_in_progress(layout: &Layout) -> Result<()> {
+    let path = layout.on_disk(&layout.in_progress_path());
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_update_helper(layout: &Layout) -> Result<bool> {
+    let installer = layout.current().join(INSTALLER_BINARY);
+    let mut changed = false;
+    if layout.platform.is_macos() {
+        let body = service::render_update_launchd(
+            &installer,
+            &layout.config_path(),
+            &layout.request_path(),
+            &layout.claimed_path(),
+            &layout.active_path(),
+        );
+        changed |= write_logical(layout, &layout.helper_definition(), body.as_bytes(), 0o644)?;
+    } else {
+        let service_body = service::render_update_systemd(&installer, &layout.config_path());
+        changed |= write_logical(layout, &layout.helper_definition(), service_body.as_bytes(), 0o644)?;
+        let path_body =
+            service::render_update_path(&layout.request_path(), &layout.claimed_path(), &layout.active_path());
+        changed |= write_logical(
+            layout,
+            &layout.helper_path_definition().expect("linux helper path unit"),
+            path_body.as_bytes(),
+            0o644,
+        )?;
+    }
+    Ok(changed)
+}
+
+pub(crate) fn resolve_pinned_key(layout: &Layout) -> Result<crate::manifest::TrustedKey> {
+    let (key, _) = resolve_trust(layout, None)?;
+    Ok(key)
+}
+
+pub(crate) fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()> {
     let started = Instant::now();
     loop {
         if let Some(instance) = host.service_instance()? {
@@ -791,12 +1116,70 @@ mod secure_fs {
     }
 
     pub fn read_file_at(dir: &DirFd, name: &str) -> Result<(Vec<u8>, libc::stat)> {
-        let fd = open_at(&dir.0, name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0)?;
+        read_file_at_capped(dir, name, 1024 * 1024)
+    }
+
+    pub fn read_file_at_capped(dir: &DirFd, name: &str, max_bytes: u64) -> Result<(Vec<u8>, libc::stat)> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let fd = open_at(&dir.0, name, flags, 0)?;
         let metadata = fstat(fd.as_raw_fd())?;
-        let mut file = File::from(fd);
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        ensure!(
+            metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "{name} must be a regular file, not a symlink, fifo or device"
+        );
+        ensure!(
+            metadata.st_size as u64 <= max_bytes,
+            "{name} is larger than {max_bytes} bytes"
+        );
+        let file = File::from(fd);
+        let bytes = read_capped(file, max_bytes).with_context(|| format!("cannot read {name}"))?;
         Ok((bytes, metadata))
+    }
+
+    /// Reads at most `max_bytes`; one byte more is an error, so a file that
+    /// grows after its `fstat` still cannot exceed the cap.
+    pub fn read_capped(reader: impl Read, max_bytes: u64) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        reader.take(max_bytes.saturating_add(1)).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 <= max_bytes, "file is larger than {max_bytes} bytes");
+        Ok(bytes)
+    }
+
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in `dir`.
+    pub fn stat_at(dir: &DirFd, name: &str) -> Result<libc::stat> {
+        let c = cstr(name)?;
+        let mut metadata = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatat(dir.0.as_raw_fd(), c.as_ptr(), &mut metadata, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("cannot stat {name}"));
+        }
+        Ok(metadata)
+    }
+
+    /// Unlinks `name` through `dir` only while it is still the object that was
+    /// examined (same device and inode). A replacement is left alone.
+    pub fn unlink_if_same(dir: &DirFd, name: &str, examined: &libc::stat) -> Result<()> {
+        match stat_at(dir, name) {
+            Ok(now) if now.st_dev == examined.st_dev && now.st_ino == examined.st_ino => unlink_at(dir, name),
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn unlink_file_at(dir: &DirFd, name: &str) -> Result<()> {
+        unlink_at(dir, name)
+    }
+
+    pub fn open_regular_at(dir: &DirFd, name: &str) -> Result<(OwnedFd, libc::stat)> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let fd = open_at(&dir.0, name, flags, 0)?;
+        let metadata = fstat(fd.as_raw_fd())?;
+        ensure!(
+            metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "{name} must be a regular file, not a symlink, fifo or device"
+        );
+        Ok((fd, metadata))
     }
 
     pub fn verify_installer_file(metadata: &libc::stat, what: &str) -> Result<()> {
@@ -886,11 +1269,23 @@ mod secure_fs {
     }
 
     fn rename_at(dir: &DirFd, from: &str, to: &str) -> Result<()> {
+        rename_between(dir, from, dir, to)
+    }
+
+    /// Atomic directory-entry move between two already-opened directories.
+    pub fn rename_between(from_dir: &DirFd, from: &str, to_dir: &DirFd, to: &str) -> Result<()> {
         let from_c = cstr(from)?;
         let to_c = cstr(to)?;
-        let rc = unsafe { libc::renameat(dir.0.as_raw_fd(), from_c.as_ptr(), dir.0.as_raw_fd(), to_c.as_ptr()) };
+        let rc = unsafe {
+            libc::renameat(
+                from_dir.0.as_raw_fd(),
+                from_c.as_ptr(),
+                to_dir.0.as_raw_fd(),
+                to_c.as_ptr(),
+            )
+        };
         if rc != 0 {
-            return Err(io::Error::last_os_error()).with_context(|| format!("cannot replace {to}"));
+            return Err(io::Error::last_os_error()).with_context(|| format!("cannot claim {from} as {to}"));
         }
         Ok(())
     }
@@ -933,5 +1328,101 @@ mod secure_fs {
                 .chain()
                 .filter_map(|cause| cause.downcast_ref::<io::Error>())
                 .any(|cause| cause.raw_os_error() == Some(libc::ELOOP))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use super::secure_fs;
+
+    struct Endless;
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn claiming_a_request_leaves_a_replacement_untouched() {
+        use super::{Layout, claim_request, clear_claimed};
+        use crate::manifest::Platform;
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            platform: Platform::LinuxAmd64,
+            user: "boss-worker".into(),
+            root: Some(root.path().to_path_buf()),
+        };
+        let request = layout.on_disk(&layout.request_path());
+        std::fs::create_dir_all(request.parent().unwrap()).unwrap();
+        std::fs::write(&request, b"{\"command_id\":\"a\"}").unwrap();
+        let claimed = claim_request(&layout).unwrap().unwrap();
+        assert_eq!(claimed, b"{\"command_id\":\"a\"}");
+        assert!(!request.exists(), "the original name is gone after the claim");
+        std::fs::write(&request, b"{\"command_id\":\"b\"}").unwrap();
+        clear_claimed(&layout).unwrap();
+        assert_eq!(
+            std::fs::read(&request).unwrap(),
+            b"{\"command_id\":\"b\"}",
+            "a replacement published after the claim must not be unlinked"
+        );
+    }
+
+    #[test]
+    fn a_claimed_unreadable_object_is_removed_without_touching_a_new_request() {
+        use super::{Layout, claim_request};
+        use crate::manifest::Platform;
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            platform: Platform::LinuxAmd64,
+            user: "boss-worker".into(),
+            root: Some(root.path().to_path_buf()),
+        };
+        let request = layout.on_disk(&layout.request_path());
+        std::fs::create_dir_all(request.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &request).unwrap();
+        let result = claim_request(&layout);
+        assert!(
+            result.is_err(),
+            "a symlink must not be accepted as a request: {result:?}"
+        );
+        assert!(
+            !layout.on_disk(&layout.claimed_path()).exists(),
+            "the unreadable claimed object is removed"
+        );
+        std::fs::write(&request, b"{\"command_id\":\"new\"}").unwrap();
+        assert_eq!(
+            std::fs::read(&request).unwrap(),
+            b"{\"command_id\":\"new\"}",
+            "a request published after the failed claim must remain"
+        );
+    }
+
+    #[test]
+    fn unlink_if_same_leaves_a_replaced_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = secure_fs::DirFd::open(root.path(), true).unwrap();
+        std::fs::write(root.path().join("request.json"), b"old").unwrap();
+        let examined = secure_fs::stat_at(&dir, "request.json").unwrap();
+        std::fs::remove_file(root.path().join("request.json")).unwrap();
+        std::fs::write(root.path().join("request.json"), b"new").unwrap();
+        secure_fs::unlink_if_same(&dir, "request.json", &examined).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("request.json")).unwrap(),
+            b"new",
+            "a replacement published between examine and unlink must remain"
+        );
+    }
+
+    #[test]
+    fn a_file_that_keeps_growing_is_cut_off_at_the_cap() {
+        let bytes = secure_fs::read_capped(&b"0123456789"[..], 10).unwrap();
+        assert_eq!(bytes.len(), 10);
+        assert!(secure_fs::read_capped(&b"0123456789a"[..], 10).is_err());
+        // The reader is never drained past cap + 1, whatever it claims to hold.
+        assert!(secure_fs::read_capped(Endless, 64 * 1024).is_err());
     }
 }

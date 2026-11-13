@@ -169,6 +169,31 @@ fn production_spoke_offers_launch_inputs_as_optional_only() {
 }
 
 #[tokio::test]
+async fn management_contract_admits_upgrade_when_execution_features_are_absent() {
+    let fx = Fixture::with_contracts(boss_spoke_outbound::contracts()).await;
+    let mut hello = hello();
+    hello.features = boss_spoke_outbound::contracts().features;
+    let mut peer = fx.connect(hello).await.unwrap();
+    let welcome = peer.welcome().await;
+    assert!(welcome.features.iter().any(|f| f.name == "upgrade" && f.revision == 1));
+    assert!(!welcome.features.iter().any(|f| f.name == "execution"));
+    let mut upgrade = command("upgrade");
+    upgrade.run = None;
+    upgrade.body = Some(command::Body::Upgrade(Upgrade {
+        release_id: "1.0.2".into(),
+        manifest_url: "https://github.com/spinyfin/mono/releases/download/x/manifest.json".into(),
+        manifest_sha256: vec![0xab; 32],
+    }));
+    let manager = fx.manager.clone();
+    let waiting = tokio::spawn(async move { manager.command("host", CommandAdmission::Start, upgrade, STEP).await });
+    peer.next()
+        .await
+        .expect("upgrade is delivered without execution features");
+    waiting.abort();
+    assert_eq!(fx.store.outbox.lock().unwrap().commands.len(), 1);
+}
+
+#[tokio::test]
 async fn old_peer_refuses_reset_submission_and_skips_reset_replay_without_losing_controls() {
     use boss_protocol_spoke::negotiate::feature;
     use boss_spoke_stream::store::CommandOutbox;

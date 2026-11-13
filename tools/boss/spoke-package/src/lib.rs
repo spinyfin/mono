@@ -12,6 +12,7 @@ pub mod install;
 pub mod manifest;
 pub mod service;
 pub mod system;
+pub mod update;
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;

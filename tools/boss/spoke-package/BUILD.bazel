@@ -18,7 +18,10 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = ["//tools/boss/engine/spoke-preflight"] + all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/spoke-preflight",
+        "//tools/boss/http_retry",
+    ] + all_crate_deps(normal = True),
 )
 
 # Run on the worker host by the person installing; also bundled into each
@@ -33,6 +36,74 @@ rust_binary(
         ":spoke-package",
         "//tools/boss/engine/spoke-preflight",
     ] + all_crate_deps(normal = True),
+)
+
+# Privileged update helper: fetch/verify/switch/rollback against a staging root.
+# size = "small" / timeout = "moderate": each case unpacks a package through
+# the real installer as a subprocess, same as install_test.
+rust_test(
+    name = "update_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/update.rs"],
+    # Live tmux is optional: Linux bazel-any agents get host_tmux's
+    # exit-127 stub, and update_test skips session-survival asserts there.
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+        "TMUX_BIN": "$(rootpath @host_tmux//:tmux)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke:test_hub",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Live tmux pane survival against a real packaged daemon. Tagged manual: the
+# bazel-any Linux queue is not guaranteed to have a host tmux, and skipping
+# would report a pass. Hosts that run this target must have a real tmux.
+rust_test(
+    name = "update_tmux_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = ["tests/update.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+        "TMUX_BIN": "$(rootpath @host_tmux//:tmux)",
+        "BOSS_REQUIRE_TMUX": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    tags = ["manual"],
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke:test_hub",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 # Signature, digest, platform and archive-safety checks.

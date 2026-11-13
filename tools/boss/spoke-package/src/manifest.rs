@@ -14,6 +14,11 @@ use sha2::{Digest, Sha256};
 
 pub const SCHEMA: u32 = 1;
 
+/// Oldest journal `user_version` this release can open. Keep in lockstep with
+/// `boss_spoke_journal::OLDEST_READABLE`. A host whose journal is older than
+/// this is refused before `current` switches.
+pub const OLDEST_JOURNAL_VERSION: u32 = 1;
+
 /// Why a release was refused. [`Error::code`] is the stable, machine-readable
 /// cause.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -28,6 +33,10 @@ pub enum Error {
     DigestMismatch(String),
     #[error("origin_not_https: package url {0:?} is not an https URL")]
     OriginNotHttps(String),
+    #[error("unapproved_origin: {url} is not under the pinned origin {origin}")]
+    UnapprovedOrigin { url: String, origin: String },
+    #[error("journal_incompatible: this release reads journal v{oldest}+; the host is at v{current}")]
+    JournalIncompatible { oldest: u32, current: u32 },
     #[error("unsupported_host: {0}")]
     UnsupportedHost(String),
     #[error("key_invalid: {0}")]
@@ -42,6 +51,8 @@ impl Error {
             Self::PlatformMismatch { .. } => "platform_mismatch",
             Self::DigestMismatch(_) => "digest_mismatch",
             Self::OriginNotHttps(_) => "origin_not_https",
+            Self::UnapprovedOrigin { .. } => "unapproved_origin",
+            Self::JournalIncompatible { .. } => "journal_incompatible",
             Self::UnsupportedHost(_) => "unsupported_host",
             Self::Key(_) => "key_invalid",
         }
@@ -88,7 +99,8 @@ impl Platform {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: u32,
@@ -100,6 +112,15 @@ pub struct Manifest {
     /// check the bootstrap binary with a stock `sha256sum` after verifying the
     /// manifest signature.
     pub installer: Package,
+    /// Oldest journal schema this release can read. Missing on schema-1
+    /// manifests written before the updater; treated as [`OLDEST_JOURNAL_VERSION`].
+    #[serde(default = "default_oldest_journal")]
+    #[builder(default = OLDEST_JOURNAL_VERSION)]
+    pub oldest_journal_version: u32,
+}
+
+fn default_oldest_journal() -> u32 {
+    OLDEST_JOURNAL_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +168,7 @@ impl Manifest {
                 sha256: sha256_hex(installer),
                 size: installer.len() as u64,
             },
+            oldest_journal_version: OLDEST_JOURNAL_VERSION,
         }
     }
 
@@ -185,7 +207,226 @@ impl Manifest {
         if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return malformed("package.sha256 must be 64 lowercase hex digits");
         }
+        if self.oldest_journal_version == 0 {
+            return malformed("oldest_journal_version must be at least 1");
+        }
         Platform::parse(&self.platform)
+    }
+}
+
+/// Scheme, host, and the path through a `releases` component when present.
+/// `https://github.com/spinyfin/mono/releases/download/tag/file` pins
+/// `https://github.com/spinyfin/mono/releases`.
+pub fn pinned_origin(package_url: &str) -> Result<String, Error> {
+    let parsed = parse_release_url(package_url)?;
+    let host = parsed.host_str().unwrap_or_default();
+    let mut kept = Vec::new();
+    for part in parsed.path_segments().into_iter().flatten() {
+        if part.is_empty() {
+            continue;
+        }
+        kept.push(part);
+        if part == "releases" {
+            break;
+        }
+    }
+    if !kept.contains(&"releases") {
+        kept.clear();
+    }
+    if kept.is_empty() {
+        Ok(format!("https://{host}"))
+    } else {
+        Ok(format!("https://{host}/{}", kept.join("/")))
+    }
+}
+
+/// An offered URL is usable only when it is HTTPS under the pinned origin prefix.
+pub fn origin_allowed(url: &str, pinned: &str) -> bool {
+    match (parse_release_url(url), parse_release_url(pinned)) {
+        (Ok(url), Ok(pinned)) => origin_matches(&url, &pinned),
+        _ => false,
+    }
+}
+
+pub fn require_origin(url: &str, pinned: &str) -> Result<(), Error> {
+    let parsed = parse_release_url(url)?;
+    let pin = parse_release_url(pinned)?;
+    if origin_matches(&parsed, &pin) {
+        Ok(())
+    } else {
+        Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: pinned.to_owned(),
+        })
+    }
+}
+
+/// Absolute HTTPS URL with no userinfo, query, fragment or dot-segments.
+pub fn parse_release_url(url: &str) -> Result<url::Url, Error> {
+    if url_has_dot_segment(url) {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "dot-segment".into(),
+        });
+    }
+    let parsed = url::Url::parse(url).map_err(|error| Error::Malformed(error.to_string()))?;
+    if parsed.scheme() != "https" {
+        return Err(Error::OriginNotHttps(url.to_owned()));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "userinfo".into(),
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "query-or-fragment".into(),
+        });
+    }
+    if parsed.host_str().is_none_or(|host| host.is_empty()) {
+        return Err(Error::OriginNotHttps(url.to_owned()));
+    }
+    for segment in parsed.path_segments().into_iter().flatten() {
+        if segment == "." || segment == ".." {
+            return Err(Error::UnapprovedOrigin {
+                url: url.to_owned(),
+                origin: "dot-segment".into(),
+            });
+        }
+    }
+    Ok(parsed)
+}
+
+/// Redirect target syntax: absolute HTTPS, no userinfo, fragment or
+/// dot-segments. Unlike an offered URL it may carry a query, because release
+/// CDNs sign their download URLs with query parameters.
+fn parse_redirect_url(url: &str) -> Result<url::Url, Error> {
+    if url_has_dot_segment(url) {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "dot-segment".into(),
+        });
+    }
+    let parsed = url::Url::parse(url).map_err(|error| Error::Malformed(error.to_string()))?;
+    if parsed.scheme() != "https" {
+        return Err(Error::OriginNotHttps(url.to_owned()));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "userinfo".into(),
+        });
+    }
+    if parsed.fragment().is_some() {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "fragment".into(),
+        });
+    }
+    if parsed.host_str().is_none_or(|host| host.is_empty()) {
+        return Err(Error::OriginNotHttps(url.to_owned()));
+    }
+    if parsed
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(Error::UnapprovedOrigin {
+            url: url.to_owned(),
+            origin: "dot-segment".into(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Resolve a redirect hop against the same origin pin as the original request.
+/// A GitHub release pin may hop onto the GitHub release-asset CDN, whose
+/// signed download URLs carry a query string; offered manifest and package
+/// URLs still may not.
+pub fn redirect_hop(current: &str, location: &str, pinned: &str) -> Result<String, Error> {
+    let current = parse_redirect_url(current)?;
+    let joined = current
+        .join(location)
+        .map_err(|error| Error::Malformed(error.to_string()))?;
+    let joined = parse_redirect_url(joined.as_str())?;
+    let pin = parse_release_url(pinned)?;
+    if origin_matches(&joined, &pin) || github_release_cdn(&current, &joined) {
+        Ok(joined.to_string())
+    } else {
+        Err(Error::UnapprovedOrigin {
+            url: joined.to_string(),
+            origin: pinned.to_owned(),
+        })
+    }
+}
+
+fn github_release_cdn(from: &url::Url, to: &url::Url) -> bool {
+    let from_host = from.host_str().unwrap_or_default();
+    let to_host = to.host_str().unwrap_or_default();
+    let github = from_host == "github.com" || from_host.ends_with(".github.com");
+    let cdn = matches!(
+        to_host,
+        "objects.githubusercontent.com"
+            | "release-assets.githubusercontent.com"
+            | "github-releases.githubusercontent.com"
+    ) || to_host.ends_with(".githubusercontent.com");
+    github && cdn
+}
+
+fn origin_matches(url: &url::Url, pinned: &url::Url) -> bool {
+    if url.scheme() != "https" || pinned.scheme() != "https" {
+        return false;
+    }
+    if url.host_str() != pinned.host_str() || url.port_or_known_default() != pinned.port_or_known_default() {
+        return false;
+    }
+    let url_path = path_without_slash(url);
+    let pinned_path = path_without_slash(pinned);
+    url_path == pinned_path || url_path.starts_with(&format!("{pinned_path}/"))
+}
+
+fn path_without_slash(url: &url::Url) -> String {
+    url.path().trim_end_matches('/').to_owned()
+}
+
+fn url_has_dot_segment(url: &str) -> bool {
+    let path = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let path = path.split_once('/').map(|(_, path)| path).unwrap_or("");
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    path.split('/').any(|segment| {
+        let decoded = percent_decode_segment(segment);
+        decoded == "." || decoded == ".."
+    })
+}
+
+fn percent_decode_segment(segment: &str) -> String {
+    let mut out = String::new();
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2]))
+        {
+            out.push(char::from((hi << 4) | lo));
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
