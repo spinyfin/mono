@@ -73,17 +73,23 @@ mod commands {
         captures: std::sync::Arc<boss_spoke_ingress::capture::Captures>,
         stamp: impl Fn() -> Result<Stamp>,
         gateway: &boss_spoke_worker_api::Gateway,
-        execution: &std::sync::atomic::AtomicBool,
+        execution: &std::sync::atomic::AtomicU8,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_sweep: Option<std::time::Instant> = None;
         loop {
             interval.tick().await;
-            let pending = journal
-                .lock()
-                .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
-                .begin_pending()?;
+            // Wait for Welcome before consuming durable commands.
+            let admission = execution.load(std::sync::atomic::Ordering::Relaxed);
+            let pending = if admission == 0 {
+                None
+            } else {
+                journal
+                    .lock()
+                    .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
+                    .begin_pending()?
+            };
             let Some((command, interrupted)) = pending else {
                 // Idle: look for workers that finished since the last look. This
                 // runs on the command loop, so it never races a command, and it
@@ -100,7 +106,7 @@ mod commands {
                 continue;
             };
             let observed = stamp()?;
-            let execution_admitted = execution.load(std::sync::atomic::Ordering::Relaxed);
+            let execution_admitted = admission == 2;
             let result = match &command.body {
                 Some(command::Body::WorkerReply(_) | command::Body::ProposalDecision(_)) => {
                     boss_spoke_ingress::apply_gateway_command(gateway, &command)
@@ -162,6 +168,11 @@ mod commands {
                     value: None,
                 },
             };
+            // An interrupted effect may already have happened.
+            let mut result = result;
+            if interrupted && result.code == ResultCode::Rejected as i32 {
+                result.code = ResultCode::OutcomeUncertain.into();
+            }
             let observed = stamp()?;
             loop {
                 let completed = journal
@@ -178,10 +189,8 @@ mod commands {
     }
 
     fn helper_is_busy() -> bool {
-        let Some(config) = std::env::var_os("BOSS_SPOKE_INSTALL_CONFIG") else {
-            return false;
-        };
-        let etc = std::path::Path::new(&config).parent();
+        let (config, _) = super::install_status_paths();
+        let etc = config.parent();
         etc.is_some_and(|etc| etc.join("update-claimed.json").is_file() || etc.join("upgrade-active").is_file())
     }
 
@@ -314,7 +323,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -337,7 +346,8 @@ struct HealthWatch {
     inner: Arc<boss_spoke_ingress::capture::Captures>,
     path: PathBuf,
     flags: HealthFlags,
-    execution: AtomicBool,
+    // 0: awaiting the first Welcome; 1: management only; 2: execution admitted.
+    execution: AtomicU8,
     attempt: HealthAttempt,
 }
 
@@ -353,7 +363,7 @@ impl HealthWatch {
                 inventory_ok: AtomicBool::new(false),
                 handshake_ok: AtomicBool::new(false),
             },
-            execution: AtomicBool::new(false),
+            execution: AtomicU8::new(0),
             attempt: HealthAttempt { release_id, nonce },
         }
     }
@@ -389,7 +399,7 @@ impl HealthWatch {
 impl SessionObserver for HealthWatch {
     fn connected(&self, pane_capture: bool, received_commands: u64, execution: bool) {
         self.inner.connected(pane_capture, received_commands, execution);
-        self.execution.store(execution, Ordering::Relaxed);
+        self.execution.store(if execution { 2 } else { 1 }, Ordering::Relaxed);
         self.flags.handshake_ok.store(true, Ordering::Relaxed);
         self.write();
     }
@@ -598,14 +608,9 @@ async fn preflight_loop(
 }
 
 fn install_status_paths() -> (PathBuf, PathBuf) {
-    let config = PathBuf::from(
-        std::env::var("BOSS_SPOKE_INSTALL_CONFIG").unwrap_or_else(|_| "/etc/boss-spoke/install.json".into()),
-    );
-    let status = config
-        .parent()
-        .unwrap_or(Path::new("/etc/boss-spoke"))
-        .join("upgrade-status.json");
-    (config, status)
+    boss_spoke_ingress::update_request::install_status_paths(
+        std::env::var_os("BOSS_SPOKE_INSTALL_CONFIG").map(PathBuf::from),
+    )
 }
 
 /// The release this process is running, from where its executable lives; and
@@ -641,7 +646,7 @@ fn running_release(config: &Path) -> String {
         })
 }
 
-fn reported_release(config: &Path, status: &Path) -> (String, String, String, String) {
+fn reported_release(config: &Path, status: &Path) -> Inventory {
     let running = running_release(config);
     let parsed = std::fs::read(status)
         .ok()
@@ -652,7 +657,16 @@ fn reported_release(config: &Path, status: &Path) -> (String, String, String, St
             .and_then(|value| value.get(name)?.as_str().map(str::to_owned))
             .unwrap_or_default()
     };
-    (running, field("command_id"), field("result"), field("error"))
+    Inventory {
+        release_id: running,
+        last_upgrade_command_id: field("command_id"),
+        last_upgrade_result: field("result"),
+        last_upgrade_error: field("error"),
+        unresolved_upgrade_result: field("unresolved_result"),
+        unresolved_upgrade_error: field("unresolved_error"),
+        unresolved_upgrade_release_id: field("unresolved_release_id"),
+        ..Default::default()
+    }
 }
 
 async fn produce(
@@ -681,8 +695,7 @@ async fn produce(
             failed_preflights.push("tmux unavailable".into());
         }
         let (config, status) = install_status_paths();
-        let (release_id, last_upgrade_command_id, last_upgrade_result, last_upgrade_error) =
-            reported_release(&config, &status);
+        let release = reported_release(&config, &status);
         let capacity = Capacity {
             generation: journal.record_bounds()?.1 + 1,
             free_disk_bytes: fs4::available_space(root)?,
@@ -693,11 +706,7 @@ async fn produce(
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
                 failed_preflights,
-                release_id,
-                last_upgrade_command_id,
-                last_upgrade_result,
-                last_upgrade_error,
-                ..Default::default()
+                ..release
             }),
             ..Default::default()
         };

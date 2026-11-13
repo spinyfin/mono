@@ -648,7 +648,7 @@ pub(crate) fn claim_request(layout: &Layout) -> Result<Option<Vec<u8>>> {
             Ok(()) => {}
             Err(error) if secure_fs::is_not_found(&error) => {}
             Err(error) if is_cross_device(&error) => {
-                copy_request_then_unlink(layout, &src, request_name, &dest, claimed_name)?;
+                copy_request_then_unlink(&src, request_name, &dest, claimed_name)?;
             }
             Err(error) => return Err(error),
         }
@@ -670,7 +670,6 @@ pub(crate) fn claim_request(layout: &Layout) -> Result<Option<Vec<u8>>> {
 }
 
 fn copy_request_then_unlink(
-    layout: &Layout,
     src: &secure_fs::DirFd,
     request_name: &str,
     dest: &secure_fs::DirFd,
@@ -679,7 +678,6 @@ fn copy_request_then_unlink(
     // Same-volume `renameat` is the atomic claim. This path is only EXDEV:
     // copy the inode we opened, then unlink that inode only. A replacement
     // with a different inode is left for the next helper run.
-    let _ = layout;
     let (fd, metadata) = match secure_fs::open_regular_at(src, request_name) {
         Ok(value) => value,
         Err(error) if secure_fs::is_not_found(&error) => return Ok(()),
@@ -856,8 +854,17 @@ pub(crate) fn clear_in_progress(layout: &Layout) -> Result<()> {
     }
 }
 
+/// Copy only an installed or committed release into the recovery entrypoint.
+/// Atomic replacement leaves an already-running helper on its old inode.
+pub(crate) fn refresh_update_helper(layout: &Layout) -> Result<bool> {
+    let bytes = fs::read(layout.on_disk(&layout.current().join(INSTALLER_BINARY)))?;
+    write_logical(layout, &layout.prefix().join("update-helper"), &bytes, 0o755)
+}
+
 fn install_update_helper(layout: &Layout) -> Result<bool> {
-    let installer = layout.current().join(INSTALLER_BINARY);
+    let installer = layout.prefix().join("update-helper");
+    refresh_update_helper(layout)?;
+    // Replacing the stable executable does not change service registration.
     let mut changed = false;
     if layout.platform.is_macos() {
         let body = service::render_update_launchd(

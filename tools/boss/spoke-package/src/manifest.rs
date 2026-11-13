@@ -14,9 +14,9 @@ use sha2::{Digest, Sha256};
 
 pub const SCHEMA: u32 = 1;
 
-/// Oldest journal `user_version` this release can open. Keep in lockstep with
-/// `boss_spoke_journal::OLDEST_READABLE`. A host whose journal is older than
-/// this is refused before `current` switches.
+/// Oldest existing journal version this release can open. Keep aligned with
+/// spoke-journal/src/schema.rs::migrate, which upgrades versions 0–6.
+/// Version 0 is a new database; existing journals start at version 1.
 pub const OLDEST_JOURNAL_VERSION: u32 = 1;
 
 /// Why a release was refused. [`Error::code`] is the stable, machine-readable
