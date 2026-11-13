@@ -28,6 +28,17 @@ Never ask a worker or agent to launch the installed `/Applications/Boss.app`, `o
 - Pre-push lint is `checkleft run` with no flags. Do not brief `checkleft --all` outside CI or a change to checkleft itself.
 - Root `CHECKS.yaml` forbids Boss work-item id shapes in PR text, commit messages, and changed source lines. Describe work by subject in briefs so workers do not echo an id into a PR.
 
+## Sizing rows against the 30-file limit
+
+Root `CHECKS.yaml` enforces `change/file-count` at 30 changed files per PR. Size rows so the expected PR fits under it with margin (aim for 25 or fewer); a bypass is never the plan of record for a row. Estimate the file count from what a change costs in this codebase, not from how many deliverables the row lists, before filing it or materialising a design's rows:
+
+- **New RPC verb or event variant:** ~12-15 files, about 8 of them one-line edits in exhaustive matches and allowlists (`client/src/replay.rs`, `engine/app/src/app/dispatch.rs`, `app/frontend_event_kind.rs`, `app/read_admission/lane.rs`, `worker-policy/src/policy.rs`, `worker-policy/src/sanitize.rs`, the tier-matrix tests).
+- **New column or migration:** 4 fixed files (the migration module, `work-db/src/schema_init.rs`, `schema_migration_registry.rs`, `lib.rs`) plus one per work-db module that writes the column (22 in one recent PR).
+- **New crate:** 5 fixed files (`BUILD.bazel`, `Cargo.toml`, the root `Cargo.toml` members, `Cargo.lock`, `MODULE.bazel.lock`) plus 2-3 per consumer and a visibility line per dependency.
+- **A minimal persisted-and-exposed field:** ~15-20 files; ~25 when it needs a new crate.
+
+Natural split seams for Boss work, each its own row with a dependency edge: (a) storage plus migration; (b) protocol type plus engine verb/handler; (c) consumers (CLI, app). A new crate lands on its own first, with its build plumbing and a minimal surface, before anything depends on it. A row whose estimate exceeds roughly 25 files by these costs is split before it is filed. A review revision that would grow a PR past the limit is a signal the row was sized too large; it is not grounds to approve a bypass after the fact.
+
 ## Limits, throttles and timeouts
 
 - **A brief that introduces or changes a limit, throttle, cap, admission control, timeout or deadline must require measuring real traffic first.** The worker records the actual load the limit will see, including the worst normal moments (app and engine cold start, reconnect after a drop, a full-board refresh, a busy CLI session), and sets the limit with a generous buffer around that measured normal behaviour (well above the observed peaks, not just above the average), stating the measured peak and the chosen margin. The PR shows the measurements and proves normal startup and reconnect never trip it. It must also say what callers do when the limit fires: a retryable rejection has to be retried by every caller, never surfaced as an error dialog. Reject a PR that picks limits without measurements. (On 2026-10-11 a read-admission limiter shipped with deadlines that a normal cold start exceeded about 290 times in its first minute, and the app showed a modal for each rejection, making Boss unusable until the change was reverted.)
