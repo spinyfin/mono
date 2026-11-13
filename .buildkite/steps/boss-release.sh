@@ -130,12 +130,10 @@ bin/release publish --config "${CONFIG}" --tag "${TAG}"
 # signing key is not registered so a missing spoke pipeline cannot block
 # the Boss publish; the hub then shows unpublished.
 VERSION="${TAG#"boss-v"}"
-SPOKE_KEY="$(_read_secret BOSS_SPOKE_RELEASE_SIGNING_KEY)"
-if [[ -z "${SPOKE_KEY}" ]]; then
+if [[ -z "$(_read_secret BOSS_SPOKE_RELEASE_SIGNING_KEY)" ]]; then
   echo "[boss-release] BOSS_SPOKE_RELEASE_SIGNING_KEY is not set; spoke packages stay unpublished"
 else
   log "[boss-release] preparing spoke packages for ${VERSION}"
-  export BOSS_SPOKE_RELEASE_SIGNING_KEY="${SPOKE_KEY}"
   export RELEASE_PIN_VERSION="${VERSION}"
   export RELEASE_PIN_SHA
   RELEASE_PIN_SHA="$(git rev-parse HEAD)"

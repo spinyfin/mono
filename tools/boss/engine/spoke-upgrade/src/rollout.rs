@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use boss_protocol_spoke::{
@@ -28,8 +28,22 @@ struct UpgradeBounds {
     /// Last connected sample in this controller session. Not persisted: a
     /// restart or reconnect starts a new baseline so hub downtime is not
     /// charged as connected upgrade time.
-    progress_sample: Mutex<Option<(String, i64)>>,
+    progress_sample: Mutex<Option<ProgressSample>>,
+    /// Suspend-excluding monotonic time since the controller started.
+    clock: Arc<dyn Fn() -> Duration + Send + Sync>,
 }
+
+/// Where connected-time accounting last left off for one connection.
+struct ProgressSample {
+    host_id: String,
+    /// The stream's connection generation; a reconnect starts a new baseline.
+    generation: u64,
+    at: Duration,
+}
+
+/// Prefix of the halt reason recorded when a release change carries an
+/// unresolved upgrade command over to the new desired release.
+const CARRIED_HALT_PREFIX: &str = "previous upgrade ";
 
 pub struct UpgradeController {
     db: WorkDb,
@@ -55,6 +69,10 @@ impl UpgradeController {
                 command_deadline: COMMAND_DEADLINE,
                 upgrade_timeout: UPGRADE_TIMEOUT,
                 progress_sample: Mutex::new(None),
+                clock: {
+                    let start = Instant::now();
+                    Arc::new(move || start.elapsed())
+                },
             },
         }
     }
@@ -66,6 +84,13 @@ impl UpgradeController {
 
     pub fn with_upgrade_timeout(mut self, timeout: Duration) -> Self {
         self.bounds.upgrade_timeout = timeout;
+        self
+    }
+
+    /// Replace the connected-time clock. It must be monotonic and exclude time
+    /// the hub was suspended; tests inject a controllable one.
+    pub fn with_clock(mut self, clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
+        self.bounds.clock = Arc::new(clock);
         self
     }
 
@@ -96,7 +121,7 @@ impl UpgradeController {
                 }
             }
         };
-        if rollout.halted && rollout.desired_release == self.desired_release {
+        if rollout.halted && rollout.desired_release == self.desired_release && !carried_halt(&rollout) {
             return Ok(());
         }
         if let Some(host_id) = rollout.in_flight_host_id.clone() {
@@ -136,12 +161,17 @@ impl UpgradeController {
         let mut rollout = existing.unwrap_or_else(|| SpokeUpgradeRollout::for_release(&self.desired_release, false));
         if rollout.desired_release != self.desired_release {
             if rollout.in_flight_host_id.is_some() {
+                // The earlier command may still be running, so the gate stays
+                // closed and the stall is surfaced rather than silently erased.
                 rollout.desired_release = self.desired_release.clone();
-                rollout.halted = false;
-                rollout.halt_host_id = None;
-                rollout.halt_reason = None;
-                rollout.halt_at = None;
-                rollout.halt_command_id = None;
+                rollout.halted = true;
+                rollout.halt_host_id = rollout.in_flight_host_id.clone();
+                rollout.halt_reason = Some(format!(
+                    "{CARRIED_HALT_PREFIX}{} unresolved",
+                    rollout.in_flight_command_id.as_deref().unwrap_or("command")
+                ));
+                rollout.halt_at = Some(unix_epoch_secs_string());
+                rollout.halt_command_id = rollout.in_flight_command_id.clone();
             } else {
                 let published_platforms = rollout.published_platforms.clone();
                 rollout = SpokeUpgradeRollout::for_release(&self.desired_release, rollout.packages_published);
@@ -176,6 +206,10 @@ impl UpgradeController {
             },
             None => None,
         };
+        // A durable result that is neither OK nor REJECTED leaves the command's
+        // fate unknown: keep the gate closed but still read helper evidence and
+        // charge the timeout.
+        let mut uncertain = false;
         if let Some(result) = durable_result.as_ref() {
             match result.code {
                 code if code == ResultCode::Ok as i32 => {}
@@ -187,7 +221,7 @@ impl UpgradeController {
                     };
                     return Ok(InFlight::Failed(reason));
                 }
-                _ => return Ok(InFlight::Unresolved),
+                _ => uncertain = true,
             }
         }
         let command_id = rollout.in_flight_command_id.clone();
@@ -223,7 +257,7 @@ impl UpgradeController {
                                 }));
                             }
                             if result.code != ResultCode::Ok as i32 {
-                                return Ok(InFlight::Unresolved);
+                                uncertain = true;
                             }
                         }
                         Err(CommandOutcome::Unavailable)
@@ -234,7 +268,7 @@ impl UpgradeController {
                             return Ok(InFlight::Wait);
                         }
                         Err(CommandOutcome::OutcomeUncertain) | Err(CommandOutcome::ResetReleaseUnsupported) => {
-                            return Ok(InFlight::Unresolved);
+                            uncertain = true;
                         }
                     }
                 } else if catalog.packages.is_empty() {
@@ -255,38 +289,50 @@ impl UpgradeController {
             }
             return Ok(InFlight::Unresolved);
         }
-        Ok(InFlight::Wait)
+        Ok(if uncertain {
+            InFlight::Unresolved
+        } else {
+            InFlight::Wait
+        })
     }
 
     async fn note_connected_progress(&self, rollout: &mut SpokeUpgradeRollout, host_id: &str) -> Result<()> {
-        let connected = self.streams.connected_hosts().await.iter().any(|id| id == host_id);
-        let now = unix_epoch_secs_string();
-        let now_secs: i64 = now.parse().unwrap_or(0);
+        let generation = self.streams.connection_generation(host_id).await;
+        let now = (self.bounds.clock)();
         let mut sample = self
             .bounds
             .progress_sample
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if connected {
-            if let Some((sampled_host, last_secs)) = sample.as_ref()
-                && sampled_host == host_id
+        if let Some(generation) = generation {
+            let mut baseline = now;
+            if let Some(last) = sample.as_ref()
+                && last.host_id == host_id
+                && last.generation == generation
             {
-                let gap = (now_secs - last_secs).max(0);
-                if gap > 0 && gap <= MAX_CONNECTED_SAMPLE_GAP_SECS {
-                    rollout.in_flight_connected_secs = rollout.in_flight_connected_secs.saturating_add(gap);
+                let gap = now.saturating_sub(last.at);
+                baseline = last.at;
+                if gap.as_secs() as i64 > MAX_CONNECTED_SAMPLE_GAP_SECS {
+                    // A missed interval, not connected upgrade time.
+                    baseline = now;
+                } else if gap.as_secs() > 0 {
+                    rollout.in_flight_connected_secs =
+                        rollout.in_flight_connected_secs.saturating_add(gap.as_secs() as i64);
+                    baseline = last.at + Duration::from_secs(gap.as_secs());
                 }
             }
-            *sample = Some((host_id.to_owned(), now_secs));
-            rollout.in_flight_last_progress_at = Some(now);
-            drop(sample);
-            self.persist(rollout)?;
+            *sample = Some(ProgressSample {
+                host_id: host_id.to_owned(),
+                generation,
+                at: baseline,
+            });
+            rollout.in_flight_last_progress_at = Some(unix_epoch_secs_string());
         } else {
             *sample = None;
             rollout.in_flight_last_progress_at = None;
-            drop(sample);
-            self.persist(rollout)?;
         }
-        Ok(())
+        drop(sample);
+        self.persist(rollout)
     }
 
     fn timed_out(&self, rollout: &SpokeUpgradeRollout) -> bool {
@@ -382,6 +428,7 @@ impl UpgradeController {
             })),
             ..Default::default()
         };
+        self.db.clear_upgrade_command_outcome(host_id)?;
         rollout.in_flight_host_id = Some(host_id.to_owned());
         rollout.in_flight_command_id = Some(command_id);
         rollout.in_flight_release = Some(self.desired_release.clone());
@@ -464,6 +511,13 @@ impl UpgradeController {
     }
 
     fn clear_in_flight(&self, rollout: &mut SpokeUpgradeRollout) -> Result<()> {
+        if carried_halt(rollout) {
+            rollout.halted = false;
+            rollout.halt_host_id = None;
+            rollout.halt_reason = None;
+            rollout.halt_at = None;
+            rollout.halt_command_id = None;
+        }
         rollout.in_flight_host_id = None;
         rollout.in_flight_command_id = None;
         rollout.in_flight_release = None;
@@ -479,6 +533,14 @@ impl UpgradeController {
         stored.updated_at = unix_epoch_secs_string();
         self.db.save_spoke_upgrade_rollout(&stored)
     }
+}
+
+fn carried_halt(rollout: &SpokeUpgradeRollout) -> bool {
+    rollout.halted
+        && rollout
+            .halt_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(CARRIED_HALT_PREFIX))
 }
 
 enum InFlight {

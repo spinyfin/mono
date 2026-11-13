@@ -173,6 +173,15 @@ impl StreamManager {
         Some(connection.session.selection.has(feature))
     }
 
+    /// Connection generation of `host_id`'s active connection, `None` when it
+    /// is not connected. A different value means the spoke reconnected.
+    pub async fn connection_generation(&self, host_id: &str) -> Option<u64> {
+        let host = self.0.hosts.lock().await.get(host_id).cloned()?;
+        let guard = host.lock().await;
+        let connection = guard.as_ref().filter(|c| c.active.load(Ordering::Acquire))?;
+        Some(connection.session.generation)
+    }
+
     /// Host ids with an active connection, sorted. Used by sequential upgrade
     /// so an offline host is offered when it next appears here.
     pub async fn connected_hosts(&self) -> Vec<String> {

@@ -160,6 +160,10 @@ fn prepare_with_pin(
             .iter()
             .find(|release| release.tag_name == tag && release.draft)
         {
+            if trigger == Trigger::Schedule && !resume_draft {
+                eprintln!("release skipped: {tag} is a draft at {expected_sha}; scheduled runs do not resume drafts");
+                return Ok(PrepareOutcome::Skipped);
+            }
             let draft_sha = resolve_tag_sha(runner, config, Some(draft))?;
             if draft_sha.as_deref() != Some(expected_sha) {
                 bail!(
@@ -1347,6 +1351,32 @@ source = "github-generated"
         ]);
         let outcome =
             prepare_with_pin(&runner, &config, "ui", Some("job-1"), false, Some("1.0.5"), None).expect("prepare");
+        assert_eq!(outcome, PrepareOutcome::Skipped);
+    }
+
+    #[test]
+    fn scheduled_pinned_prepare_does_not_resume_a_matching_draft() {
+        let root = tempdir().expect("repo root");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            success(""),
+            repo_root_response(root.path()),
+            success(r#"[{"tag_name":"demo-v1.0.42","draft":true},{"tag_name":"demo-v1.0.5","draft":false}]"#),
+            success("wanted\trefs/tags/demo-v1.0.42\nsha\trefs/tags/demo-v1.0.5\n"),
+            success("wanted\n"),
+            success("publishedsha\n"),
+            success("wanted\n"),
+        ]);
+        let outcome = prepare_with_pin(
+            &runner,
+            &config,
+            "schedule",
+            Some("job-1"),
+            false,
+            Some("1.0.42"),
+            Some("wanted"),
+        )
+        .expect("prepare");
         assert_eq!(outcome, PrepareOutcome::Skipped);
     }
 

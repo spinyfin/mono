@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use boss_host_enrollment::HostCredentials;
@@ -7,6 +8,7 @@ use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
 use boss_protocol_spoke::v1::spoke_hub_client::SpokeHubClient;
 use boss_protocol_spoke::v1::{self, EnrollRequest, ResultCode, spoke_frame};
 use boss_spoke_hub::HubStream;
+use boss_spoke_stream::store::{CommandAdmission, CommandJournal, CommandOutbox, PendingCommand, StoreError};
 use boss_spoke_upgrade::{UpgradeController, decode_sha256, upgrade_command_id};
 use boss_work_db::{HostUpgradeState, WorkDb};
 use tokio::sync::mpsc;
@@ -29,13 +31,73 @@ impl Running {
     }
 }
 
+/// Fault switch for outbox reads, wrapped around the real outbox by the test.
+#[derive(Default)]
+struct ReadFaults(std::sync::atomic::AtomicBool);
+
+impl ReadFaults {
+    fn fail(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct FlakyOutbox {
+    inner: Arc<dyn CommandOutbox>,
+    faults: Arc<ReadFaults>,
+}
+
+#[tonic::async_trait]
+impl CommandOutbox for FlakyOutbox {
+    async fn resume(&self, host: &str, receipt: Option<&v1::Cursor>) -> Result<CommandJournal, StoreError> {
+        self.inner.resume(host, receipt).await
+    }
+    async fn append(
+        &self,
+        host: &str,
+        admission: CommandAdmission,
+        command: v1::Command,
+    ) -> Result<v1::Command, StoreError> {
+        self.inner.append(host, admission, command).await
+    }
+    async fn next(&self, host: &str, after: u64) -> Result<Option<PendingCommand>, StoreError> {
+        self.inner.next(host, after).await
+    }
+    async fn reject(&self, host: &str, sequence: u64, reason: &str) -> Result<v1::CommandResult, StoreError> {
+        self.inner.reject(host, sequence, reason).await
+    }
+    async fn receipt(&self, host: &str, receipt: &v1::Cursor) -> Result<(), StoreError> {
+        self.inner.receipt(host, receipt).await
+    }
+    async fn command(&self, host: &str, command_id: &str) -> Result<Option<v1::Command>, StoreError> {
+        if self.faults.0.load(Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.command(host, command_id).await
+    }
+    async fn completed(&self, host: &str, command_id: &str) -> Result<Option<v1::CommandResult>, StoreError> {
+        if self.faults.0.load(Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.completed(host, command_id).await
+    }
+}
+
 async fn start(db: WorkDb, credentials: Arc<HostCredentials>) -> Running {
+    start_with_outbox(db, credentials, None).await
+}
+
+async fn start_with_outbox(db: WorkDb, credentials: Arc<HostCredentials>, faults: Option<Arc<ReadFaults>>) -> Running {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let pki = ServerPki::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let identity = pki.identity();
-    let stream = hub_stream(db, credentials);
+    let stream = match faults {
+        None => hub_stream(db, credentials),
+        Some(faults) => HubStream::with_outbox(hub_config(), credentials, db, move |inner| {
+            Arc::new(FlakyOutbox { inner, faults })
+        }),
+    };
     let serving = stream.clone();
     let task = tokio::spawn(async move {
         let _ = serving.serve(listener, identity).await;
@@ -87,6 +149,11 @@ async fn connect(channel: Channel, hello: v1::Hello) -> Peer {
 }
 
 async fn enroll_and_connect(hub: &Running, credentials: &HostCredentials, host_id: &str) -> Peer {
+    let identity = enroll_identity(hub, credentials, host_id).await;
+    connect(dial(hub, identity).await, hello(host_id)).await
+}
+
+async fn enroll_identity(hub: &Running, credentials: &HostCredentials, host_id: &str) -> tonic::transport::Identity {
     credentials.authorize_host(host_id, "test").expect("authorize");
     let grant = credentials.issue_enrollment_token(host_id, "job").expect("token");
     let spoke = Spoke::new();
@@ -114,7 +181,7 @@ async fn enroll_and_connect(hub: &Running, credentials: &HostCredentials, host_i
         .await
         .expect("enroll")
         .into_inner();
-    connect(dial(hub, spoke.identity(&cert)).await, hello(host_id)).await
+    spoke.identity(&cert)
 }
 
 fn rollout(db: &WorkDb, hub: &Running, catalog: Option<boss_spoke_upgrade::SpokePackageCatalog>) -> UpgradeController {
@@ -567,6 +634,12 @@ async fn desired_release_change_keeps_a_timed_out_command_outstanding() {
         outstanding.in_flight_command_id.as_deref(),
         Some("upgrade-edge-a-1.0.9")
     );
+    assert!(outstanding.halted);
+    assert_eq!(outstanding.halt_host_id.as_deref(), Some("edge-a"));
+    assert_eq!(
+        outstanding.halt_reason.as_deref(),
+        Some("previous upgrade upgrade-edge-a-1.0.9 unresolved")
+    );
 
     hub.stop().await;
 }
@@ -616,6 +689,12 @@ async fn desired_release_change_keeps_an_uncertain_command_outstanding() {
     assert_eq!(
         outstanding.in_flight_command_id.as_deref(),
         Some("upgrade-edge-a-1.0.9")
+    );
+    assert!(outstanding.halted);
+    assert_eq!(outstanding.halt_host_id.as_deref(), Some("edge-a"));
+    assert_eq!(
+        outstanding.halt_reason.as_deref(),
+        Some("previous upgrade upgrade-edge-a-1.0.9 unresolved")
     );
 
     hub.stop().await;
@@ -680,7 +759,8 @@ async fn hub_refusal_survives_later_capacity_reports_and_ticks() {
 async fn outbox_read_errors_do_not_clear_in_flight_or_offer_another_host() {
     let fx = Credentials::new();
     let (_dir, db) = work_db();
-    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let reads = Arc::new(ReadFaults::default());
+    let hub = start_with_outbox(db.clone(), fx.credentials.clone(), Some(Arc::clone(&reads))).await;
     let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
     let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
     first.report_inventory("1.0.1", "", "", "").await;
@@ -688,7 +768,7 @@ async fn outbox_read_errors_do_not_clear_in_flight_or_offer_another_host() {
 
     let controller = shared(rollout(&db, &hub, Some(published_catalog())));
     tick_offer(&controller, &mut first).await;
-    hub.stream.outbox().inject_read_failures(true);
+    reads.fail();
     drop(first);
     tokio::time::sleep(Duration::from_millis(800)).await;
     tick(&controller).await;
@@ -746,6 +826,213 @@ async fn stale_persisted_progress_does_not_count_as_connected_time() {
         settled.in_flight_command_id.as_deref(),
         Some(command.command_id.as_str())
     );
+
+    hub.stop().await;
+}
+
+fn controller_with(
+    db: &WorkDb,
+    hub: &Running,
+    desired: &str,
+    catalog: boss_spoke_upgrade::SpokePackageCatalog,
+) -> UpgradeController {
+    UpgradeController::new(
+        db.clone(),
+        hub.stream.manager().clone(),
+        desired,
+        Arc::new(boss_spoke_upgrade::StaticCatalog(Some(catalog))),
+    )
+}
+
+fn next_catalog() -> boss_spoke_upgrade::SpokePackageCatalog {
+    let mut catalog = published_catalog();
+    catalog.release_id = "1.0.10".into();
+    catalog
+}
+
+/// Offer to `first`, then durably commit an OUTCOME_UNCERTAIN result for it.
+async fn offer_with_durable_uncertain_result(controller: &Arc<UpgradeController>, first: &mut Peer) -> v1::Command {
+    let ticking = {
+        let controller = Arc::clone(controller);
+        tokio::spawn(async move { controller.tick().await })
+    };
+    let command = first.take_command().await;
+    ticking.await.expect("join").expect("tick");
+    first
+        .send_record(result_record(
+            first.next_sequence,
+            &command.command_id,
+            ResultCode::OutcomeUncertain,
+            "",
+        ))
+        .await;
+    first.next_sequence += 1;
+    command
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_uncertain_result_is_settled_by_matching_helper_success() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
+    first.report_inventory("1.0.1", "", "", "").await;
+    second.report_inventory("1.0.1", "", "", "").await;
+
+    let controller = shared(
+        controller_with(&db, &hub, DESIRED, published_catalog()).with_command_deadline(Duration::from_millis(80)),
+    );
+    let command = offer_with_durable_uncertain_result(&controller, &mut first).await;
+    tick(&controller).await;
+    second.expect_no_command().await;
+    assert_eq!(
+        db.spoke_upgrade_rollout()
+            .unwrap()
+            .unwrap()
+            .in_flight_host_id
+            .as_deref(),
+        Some("edge-a")
+    );
+
+    first.report_inventory(DESIRED, "ok", "", &command.command_id).await;
+    let offered = tick_offer(&controller, &mut second).await;
+    assert_eq!(offered.command_id, upgrade_command_id("edge-b", DESIRED));
+    assert!(!db.spoke_upgrade_rollout().unwrap().unwrap().halted);
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_uncertain_result_without_helper_evidence_times_out() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    first.report_inventory("1.0.1", "", "", "").await;
+
+    let controller = shared(
+        controller_with(&db, &hub, DESIRED, published_catalog())
+            .with_command_deadline(Duration::from_millis(80))
+            .with_upgrade_timeout(Duration::ZERO),
+    );
+    offer_with_durable_uncertain_result(&controller, &mut first).await;
+    tick(&controller).await;
+    let row = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert!(row.halted);
+    assert_eq!(row.halt_reason.as_deref(), Some("upgrade_timeout"));
+    let view = db.host_upgrade_view("edge-a").unwrap().unwrap();
+    assert_eq!(view.state, HostUpgradeState::Failed);
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_uncertain_result_holds_the_gate_across_a_release_change() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
+    first.report_inventory("1.0.1", "", "", "").await;
+    second.report_inventory("1.0.1", "", "", "").await;
+
+    let initial = shared(
+        controller_with(&db, &hub, DESIRED, published_catalog()).with_command_deadline(Duration::from_millis(80)),
+    );
+    let command = offer_with_durable_uncertain_result(&initial, &mut first).await;
+
+    let next =
+        shared(controller_with(&db, &hub, "1.0.10", next_catalog()).with_command_deadline(Duration::from_millis(80)));
+    tick(&next).await;
+    second.expect_no_command().await;
+    let held = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert_eq!(held.in_flight_host_id.as_deref(), Some("edge-a"));
+    assert!(held.halted, "the stall must be surfaced");
+    assert_eq!(
+        held.halt_reason.as_deref(),
+        Some("previous upgrade upgrade-edge-a-1.0.9 unresolved")
+    );
+    assert_eq!(
+        db.host_upgrade_view("edge-a").unwrap().unwrap().state,
+        HostUpgradeState::Failed
+    );
+    tick(&next).await;
+    second.expect_no_command().await;
+
+    first.report_inventory(DESIRED, "ok", "", &command.command_id).await;
+    tick(&next).await;
+    let settled = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert!(!settled.halted);
+    assert_ne!(
+        settled.in_flight_command_id.as_deref(),
+        Some(command.command_id.as_str())
+    );
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn suspension_and_reconnect_are_not_charged_and_success_wins() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let identity = enroll_identity(&hub, &fx.credentials, "edge-a").await;
+    let mut first = connect(dial(&hub, identity.clone()).await, hello("edge-a")).await;
+    first.report_inventory("1.0.1", "", "", "").await;
+
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = Arc::clone(&now);
+    let controller = shared(
+        controller_with(&db, &hub, DESIRED, published_catalog())
+            .with_upgrade_timeout(Duration::from_secs(30))
+            .with_clock(move || Duration::from_secs(clock.load(Ordering::SeqCst))),
+    );
+    let command = tick_offer(&controller, &mut first).await;
+    tick(&controller).await;
+    let charged = |db: &WorkDb| db.spoke_upgrade_rollout().unwrap().unwrap().in_flight_connected_secs;
+    assert_eq!(charged(&db), 0);
+
+    now.store(10, Ordering::SeqCst);
+    tick(&controller).await;
+    assert_eq!(charged(&db), 10);
+
+    // The hub was suspended for a long time between ticks: not charged.
+    now.store(1_000, Ordering::SeqCst);
+    tick(&controller).await;
+    assert_eq!(charged(&db), 10);
+    assert!(!db.spoke_upgrade_rollout().unwrap().unwrap().halted);
+
+    // A reconnect between two ticks starts a new baseline.
+    let last_record = first.next_sequence - 1;
+    drop(first);
+    let mut reconnected = connect(
+        dial(&hub, identity).await,
+        v1::Hello {
+            last_record,
+            ..hello("edge-a")
+        },
+    )
+    .await;
+    reconnected.next_sequence = last_record + 1;
+    // The hub replays the unacknowledged upgrade command on the new stream.
+    assert_eq!(reconnected.take_command().await.command_id, command.command_id);
+    now.store(1_010, Ordering::SeqCst);
+    tick(&controller).await;
+    assert_eq!(charged(&db), 10);
+    now.store(1_020, Ordering::SeqCst);
+    tick(&controller).await;
+    assert_eq!(charged(&db), 20);
+
+    // Matching success wins over the timeout even once the budget is spent.
+    now.store(1_030, Ordering::SeqCst);
+    reconnected
+        .report_inventory(DESIRED, "ok", "", &command.command_id)
+        .await;
+    tick(&controller).await;
+    let settled = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert!(!settled.halted);
+    assert!(settled.in_flight_host_id.is_none());
 
     hub.stop().await;
 }

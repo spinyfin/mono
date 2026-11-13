@@ -12,9 +12,9 @@
 # stores the release signing key. See tools/boss/spoke-package/README.md.
 #
 # Trigger model: a Boss release pins spoke packages to that Boss version and
-# source commit. A scheduled run only resumes a draft whose tag SHA matches
-# that commit; it does not cut a new spoke release from HEAD. Manual UI/API
-# builds may create the pinned draft at that SHA. Do not wire it to build on push.
+# source commit. Scheduled runs never cut a spoke release from HEAD and never
+# resume a draft, so they cannot race a build already filling one. Manual UI/API
+# builds create or resume the pinned draft at that SHA. Do not wire it to build on push.
 #
 # Structure: a static `prepare` step (skip logic, version, tag, DRAFT GitHub
 # Release) uploads .buildkite/pipeline-spoke-release-builds.yml only when a

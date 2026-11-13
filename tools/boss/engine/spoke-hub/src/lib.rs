@@ -18,7 +18,7 @@ mod store;
 use std::sync::Arc;
 
 use boss_host_enrollment::HostCredentials;
-use boss_spoke_stream::{Config, StreamManager};
+use boss_spoke_stream::{Config, StreamManager, store::CommandOutbox};
 use boss_work_db::WorkDb;
 use tokio::sync::Notify;
 
@@ -33,7 +33,6 @@ pub struct HubStream {
     credentials: Arc<HostCredentials>,
     /// Notified after each committed record; the projector's prompt to apply it.
     projection_wake: Arc<Notify>,
-    outbox: Arc<store::WorkDbOutbox>,
 }
 
 impl HubStream {
@@ -41,15 +40,25 @@ impl HubStream {
     /// manager. The caller supplies the hub identity in `config`; nothing here
     /// binds a socket.
     pub fn new(config: Config, credentials: Arc<HostCredentials>, db: WorkDb) -> Self {
+        Self::with_outbox(config, credentials, db, |outbox| outbox)
+    }
+
+    /// Like [`HubStream::new`], with `decorate` wrapping the durable command
+    /// outbox before the stream manager uses it.
+    pub fn with_outbox(
+        config: Config,
+        credentials: Arc<HostCredentials>,
+        db: WorkDb,
+        decorate: impl FnOnce(Arc<dyn CommandOutbox>) -> Arc<dyn CommandOutbox>,
+    ) -> Self {
         let projection_wake = Arc::new(Notify::new());
         let sink = Arc::new(WorkDbSink::with_wake(db.clone(), Arc::clone(&projection_wake)));
-        let outbox = Arc::new(WorkDbOutbox::new(db));
-        let manager = StreamManager::new(config, credentials.clone(), sink, outbox.clone());
+        let outbox = decorate(Arc::new(WorkDbOutbox::new(db)));
+        let manager = StreamManager::new(config, credentials.clone(), sink, outbox);
         Self {
             manager,
             credentials,
             projection_wake,
-            outbox,
         }
     }
 
@@ -94,11 +103,6 @@ impl HubStream {
     /// The stream manager serving connected spokes.
     pub fn manager(&self) -> &StreamManager {
         &self.manager
-    }
-
-    /// Durable outbox backing this stream. Tests inject read failures here.
-    pub fn outbox(&self) -> &WorkDbOutbox {
-        &self.outbox
     }
 
     /// The credential authority sharing this listener.

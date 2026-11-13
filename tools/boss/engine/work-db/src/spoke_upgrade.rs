@@ -536,6 +536,18 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Forget the hub-side outcome of an earlier attempt when a new upgrade is
+    /// offered, so a stale refusal never masks the newer attempt's result.
+    pub fn clear_upgrade_command_outcome(&self, host_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE host_upgrade_status SET hub_upgrade_command_id = '', hub_upgrade_result = '',
+                hub_upgrade_error = '', hub_upgrade_at = NULL WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        Ok(())
+    }
+
     /// Listing overlay for one host. `None` when the host has never spoken
     /// inventory and is not the in-flight or halted host of the current rollout.
     pub fn host_upgrade_view(&self, host_id: &str) -> Result<Option<HostUpgradeView>> {
@@ -756,5 +768,26 @@ mod tests {
         assert_eq!(after_desired.last_upgrade_result.as_deref(), Some("refused"));
         assert_eq!(after_desired.last_upgrade_error.as_deref(), Some("upgrade_busy"));
         assert_eq!(after_desired.last_upgrade_at, stamped);
+    }
+
+    #[test]
+    fn newer_helper_attempt_is_not_masked_by_an_older_hub_refusal() {
+        let db = db();
+        db.record_host_inventory("edge", &inventory("1.0.1", "linux", "x86_64", "", "", ""))
+            .unwrap();
+        db.record_upgrade_command_outcome("edge", "upgrade-edge-1.0.2", "refused", "upgrade_busy")
+            .unwrap();
+        // Offering release B supersedes the refusal of release A.
+        db.clear_upgrade_command_outcome("edge").unwrap();
+        db.record_host_inventory(
+            "edge",
+            &inventory("1.0.3", "linux", "x86_64", "upgrade-edge-1.0.3", "ok", ""),
+        )
+        .unwrap();
+        db.save_spoke_upgrade_rollout(&SpokeUpgradeRollout::for_release("1.0.4", true))
+            .unwrap();
+        let view = db.host_upgrade_view("edge").unwrap().unwrap();
+        assert_eq!(view.last_upgrade_result.as_deref(), Some("ok"));
+        assert_eq!(view.last_upgrade_error, None);
     }
 }
