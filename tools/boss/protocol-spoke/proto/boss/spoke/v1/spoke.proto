@@ -198,13 +198,17 @@ message Inventory {
   string tmux_version = 5;
   uint32 configured_slots = 6;
   repeated string failed_preflights = 7;
-  // Running release id from the install record. Empty when the daemon has no
-  // install record (tests, or a host that is not yet packaged).
+  // Release containing the running executable (releases/<id>); development
+  // builds fall back to the install record. Empty when neither is known.
   string release_id = 8;
   // Last helper attempt, copied from the root-owned status file.
   string last_upgrade_command_id = 9;
   string last_upgrade_result = 10;
   string last_upgrade_error = 11;
+  // Unresolved rollback/restore survives later refused offers. Empty if none.
+  string unresolved_upgrade_result = 12;
+  string unresolved_upgrade_error = 13;
+  string unresolved_upgrade_release_id = 14;
 }
 message InventorySnapshot {
   repeated RunObservation runs = 1;

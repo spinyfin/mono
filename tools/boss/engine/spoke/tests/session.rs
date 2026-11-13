@@ -1,4 +1,5 @@
 mod hub;
+mod upgrade_recovery;
 use boss_protocol_spoke::v1::{self, command, hub_frame, record, spoke_frame};
 use boss_spoke_journal::{Journal, Limits};
 use hub::Fixture;
@@ -213,8 +214,11 @@ async fn actual_daemon_applies_an_upgrade_offer_and_reports_the_running_release(
             "schema": 1,
             "command_id": "prev",
             "release_id": "1.0.1",
-            "result": "ok",
-            "error": "",
+            "result": "refused",
+            "error": "unresolved_rollback",
+            "unresolved_result": "rollback_failed",
+            "unresolved_error": "previous did not restart",
+            "unresolved_release_id": "1.0.2",
             "running_release_id": "1.0.1"
         })
         .to_string(),
@@ -236,7 +240,10 @@ async fn actual_daemon_applies_an_upgrade_offer_and_reports_the_running_release(
             {
                 assert_eq!(inventory.release_id, "1.0.1");
                 assert_eq!(inventory.last_upgrade_command_id, "prev");
-                assert_eq!(inventory.last_upgrade_result, "ok");
+                assert_eq!(inventory.last_upgrade_result, "refused");
+                assert_eq!(inventory.unresolved_upgrade_result, "rollback_failed");
+                assert_eq!(inventory.unresolved_upgrade_error, "previous did not restart");
+                assert_eq!(inventory.unresolved_upgrade_release_id, "1.0.2");
                 break;
             }
         }

@@ -1615,6 +1615,24 @@ pub mod update_request {
 
     use anyhow::{Context, Result, bail};
 
+    /// Shared config/status location, including the provisioned-host default.
+    pub fn install_status_paths(config: Option<PathBuf>) -> (PathBuf, PathBuf) {
+        let config = config.unwrap_or_else(|| PathBuf::from("/etc/boss-spoke/install.json"));
+        let status = config
+            .parent()
+            .unwrap_or(Path::new("/etc/boss-spoke"))
+            .join("upgrade-status.json");
+        (config, status)
+    }
+
+    #[test]
+    fn default_install_paths_include_the_helpers_busy_directory() {
+        let (config, status) = install_status_paths(None);
+        assert_eq!(config, Path::new("/etc/boss-spoke/install.json"));
+        assert_eq!(status, Path::new("/etc/boss-spoke/upgrade-status.json"));
+        assert_eq!(config.parent().unwrap(), Path::new("/etc/boss-spoke"));
+    }
+
     pub const REQUEST_FILE: &str = "request.json";
 
     #[derive(Debug, PartialEq, Eq)]

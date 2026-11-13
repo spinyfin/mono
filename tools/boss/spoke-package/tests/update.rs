@@ -1917,3 +1917,104 @@ fn a_worker_tmux_session_survives_a_real_daemon_upgrade() {
     );
     let _ = tmux(&["kill-server"]);
 }
+
+#[test]
+fn an_idle_run_removes_a_stale_active_flag() {
+    let fixture = Fixture::new();
+    fixture.install(&release("1.0.1")).unwrap();
+    let layout = fixture.layout();
+    fs::write(fixture.at(layout.active_path()), b"").unwrap();
+    let status = update::apply(&Apply {
+        host: &fixture.host,
+        layout: &layout,
+        fetcher: &MapFetcher { files: HashMap::new() },
+        probe: &AlwaysReady,
+        health: INSTANT,
+        inspector: &inspector(),
+        crash: None,
+        unwind_crash: false,
+        fail: None,
+    })
+    .unwrap();
+    assert_eq!(status.result, "idle");
+    assert!(!fixture.at(layout.active_path()).exists());
+}
+
+#[test]
+fn an_error_before_the_marker_clears_the_claim_and_active_flag() {
+    let fixture = Fixture::new();
+    fixture.install(&release("1.0.1")).unwrap();
+    fixture.host.flags.user_exists.set(false);
+    let (request, fetcher) = offer(&release("1.0.2"));
+    assert!(apply(&fixture, &request, &fetcher, &AlwaysReady).is_err());
+    assert!(!fixture.at(fixture.layout().active_path()).exists());
+    assert!(!fixture.at(fixture.layout().claimed_path()).exists());
+}
+
+#[test]
+fn recovery_helper_stays_on_the_committed_release_until_health_succeeds() {
+    let fixture = Fixture::new();
+    fixture.install(&release("1.0.1")).unwrap();
+    fixture.enroll();
+    let helper = fixture.at(fixture.layout().prefix().join("update-helper"));
+    let original = fs::read(&helper).unwrap();
+    let definition = fs::read_to_string(fixture.at(fixture.layout().helper_definition())).unwrap();
+    assert!(definition.contains("/update-helper"));
+    assert!(!definition.contains("/current/bin/boss-spoke-package"));
+    let (request, fetcher) = offer(&release("1.0.2"));
+    write_request_and_map(&fixture, &request, &fetcher);
+    let crashed = helper_command(&fixture)
+        .env("BOSS_SPOKE_UPDATE_CRASH", "after_switch")
+        .output()
+        .unwrap();
+    assert!(!crashed.status.success());
+    assert_eq!(fs::read(&helper).unwrap(), original);
+    // Recovery runs the stable entrypoint even if the candidate installer cannot run.
+    fs::write(
+        fixture.at(fixture.layout().current().join("bin/boss-spoke-package")),
+        b"broken",
+    )
+    .unwrap();
+    let mut recovery = helper_command(&fixture);
+    recovery = {
+        let mut stable = std::process::Command::new(&helper);
+        stable.args(recovery.get_args());
+        stable
+    };
+    let output = recovery.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fixture.current(), Path::new("releases/1.0.1"));
+    assert_eq!(fs::read(&helper).unwrap(), original);
+    let (request, fetcher) = offer(&release("1.0.3"));
+    assert_eq!(apply(&fixture, &request, &fetcher, &AlwaysReady).unwrap().result, "ok");
+    assert_ne!(fs::read(&helper).unwrap(), original);
+}
+
+#[test]
+fn sigterm_during_candidate_health_finishes_rollback() {
+    let fixture = Fixture::new();
+    fixture.install(&release("1.0.1")).unwrap();
+    fixture.enroll();
+    let (request, fetcher) = offer(&release("1.0.2"));
+    write_request_and_map(&fixture, &request, &fetcher);
+    let mut child = helper_command(&fixture)
+        .env("BOSS_SPOKE_UPDATE_PROBE", "only_installed")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if in_progress_phase(&fixture).as_deref() == Some("switched") {
+            // SAFETY: this is the helper child owned by this test.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+            break;
+        }
+        assert!(child.try_wait().unwrap().is_none(), "helper exited before signal");
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(child.wait().unwrap().success());
+    let status = status_file(&fixture);
+    assert_eq!(status.result, "rolled_back", "{}", status.error);
+    assert!(status.error.contains("terminated"), "{}", status.error);
+    assert_eq!(fixture.current(), Path::new("releases/1.0.1"));
+}

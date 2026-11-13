@@ -341,6 +341,26 @@ fn begin_helper_run() {
     STARTED.with(|started| started.set(Some(Instant::now())));
 }
 
+#[derive(Clone, Copy)]
+enum Cancellation {
+    Forward,
+    // Two bounded waits (stop and health) fit within the 120-second stop timeout.
+    // Forward cancellation cannot consume this recovery allowance.
+    Revert(Instant),
+}
+
+impl Cancellation {
+    fn check(self) -> Result<()> {
+        match self {
+            Self::Forward => check_interrupt(),
+            Self::Revert(started) => {
+                ensure!(started.elapsed() < Duration::from_secs(45), "revert deadline exhausted");
+                Ok(())
+            }
+        }
+    }
+}
+
 fn check_interrupt() -> Result<()> {
     ensure!(!TERMINATE.load(Ordering::SeqCst), "terminated");
     STARTED.with(|started| {
@@ -357,6 +377,7 @@ pub fn apply(ctx: &Apply<'_>) -> Result<Status> {
     let request = match load_request(ctx) {
         Ok(Some(request)) => request,
         Ok(None) => {
+            clear_active(ctx.layout)?;
             return Ok(outstanding.map_or_else(
                 || status_for(ctx.layout, "", "", "idle", ""),
                 |outstanding| outstanding.status,
@@ -383,7 +404,10 @@ pub fn apply(ctx: &Apply<'_>) -> Result<Status> {
             );
             let _ = write_status_file(ctx.layout, &status);
             if !marker_blocks_cleanup(ctx.layout) {
-                let _ = remove_request(ctx.layout);
+                remove_request(ctx.layout)?;
+                if read_marker(ctx.layout).is_none() {
+                    clear_active(ctx.layout)?;
+                }
             }
             Err(error)
         }
@@ -611,7 +635,7 @@ fn apply_request(ctx: &Apply<'_>, request: &Request, outstanding: Option<&Outsta
             return rollback(ctx, ids, nonce, &format!("restart failed: {error:#}"));
         }
         crash(ctx, "after_restart")?;
-        if let Err(error) = wait_switched(ctx, to, nonce) {
+        if let Err(error) = wait_switched(ctx, to, nonce, Cancellation::Forward) {
             return rollback(ctx, ids, nonce, &error.to_string());
         }
     }
@@ -634,7 +658,7 @@ fn apply_request(ctx: &Apply<'_>, request: &Request, outstanding: Option<&Outsta
 /// the caller puts the daemon back.
 fn switch(ctx: &Apply<'_>, candidate: &Candidate<'_>) -> Result<Gate> {
     if candidate.enrolled {
-        stop_and_quiesce(ctx)?;
+        stop_and_quiesce(ctx, Cancellation::Forward)?;
         crash(ctx, "after_stop")?;
     }
     check_interrupt()?;
@@ -697,12 +721,12 @@ fn switch(ctx: &Apply<'_>, candidate: &Candidate<'_>) -> Result<Gate> {
 
 /// Stops the daemon and waits until the service manager reports no running
 /// instance, so the journal has no writer and nothing can relaunch one.
-fn stop_and_quiesce(ctx: &Apply<'_>) -> Result<()> {
-    check_interrupt()?;
+fn stop_and_quiesce(ctx: &Apply<'_>, cancellation: Cancellation) -> Result<()> {
+    cancellation.check()?;
     ctx.host.stop_service().context("stop failed")?;
     let started = Instant::now();
     loop {
-        check_interrupt()?;
+        cancellation.check()?;
         if ctx.host.service_instance()?.is_none() {
             return Ok(());
         }
@@ -787,7 +811,7 @@ fn restore_service(ctx: &Apply<'_>, ids: SwitchIds<'_>, outcome: Status) -> Resu
         .host
         .restart_service()
         .map_err(|error| anyhow::anyhow!("restart failed: {error:#}"))
-        .and_then(|()| wait_switched(ctx, restart, &nonce));
+        .and_then(|()| wait_switched(ctx, restart, &nonce, Cancellation::Revert(Instant::now())));
     let status = match healthy {
         Ok(()) => {
             let mut status = outcome;
@@ -856,11 +880,11 @@ fn commit(ctx: &Apply<'_>, record: &InstallRecord, ids: SwitchIds<'_>, nonce: &s
     finish(ctx, status)
 }
 
-fn wait_switched(ctx: &Apply<'_>, release_id: &str, nonce: &str) -> Result<()> {
+fn wait_switched(ctx: &Apply<'_>, release_id: &str, nonce: &str, cancellation: Cancellation) -> Result<()> {
     let started = Instant::now();
     let mut seen: Option<(u32, u64, Instant)> = None;
     loop {
-        check_interrupt()?;
+        cancellation.check()?;
         let instance = ctx.host.service_instance()?;
         if let Some(current) = instance {
             let ready = ctx.probe.ready(release_id, current.0, nonce)?;
@@ -930,7 +954,7 @@ fn rollback(ctx: &Apply<'_>, ids: SwitchIds<'_>, forward_nonce: &str, error: &st
         );
     }
     let _ = write_active(ctx.layout);
-    if let Err(fail) = stop_and_quiesce(ctx) {
+    if let Err(fail) = stop_and_quiesce(ctx, Cancellation::Revert(Instant::now())) {
         let _ = restart_best(ctx, to, &nonce);
         return unresolved_keep(
             ctx,
@@ -1010,7 +1034,7 @@ fn rollback(ctx: &Apply<'_>, ids: SwitchIds<'_>, forward_nonce: &str, error: &st
         .host
         .restart_service()
         .map_err(|error| anyhow::anyhow!("restart failed: {error:#}"))
-        .and_then(|()| wait_switched(ctx, from, &nonce));
+        .and_then(|()| wait_switched(ctx, from, &nonce, Cancellation::Revert(Instant::now())));
     if let Err(failure) = restored {
         let _ = write_marker(
             ctx.layout,
@@ -1054,7 +1078,7 @@ fn rollback(ctx: &Apply<'_>, ids: SwitchIds<'_>, forward_nonce: &str, error: &st
 fn restart_best(ctx: &Apply<'_>, release_id: &str, nonce: &str) -> Result<()> {
     let _ = prepare_attempt(ctx, release_id, nonce);
     ctx.host.restart_service()?;
-    let _ = wait_switched(ctx, release_id, nonce);
+    let _ = wait_switched(ctx, release_id, nonce, Cancellation::Revert(Instant::now()));
     Ok(())
 }
 
@@ -1431,6 +1455,7 @@ fn persist_record(layout: &Layout, record: &InstallRecord, release_id: &str) -> 
     let mut bytes = serde_json::to_vec_pretty(&updated)?;
     bytes.push(b'\n');
     install::write_logical(layout, &layout.config_path(), &bytes, 0o644)?;
+    install::refresh_update_helper(layout)?;
     Ok(())
 }
 
@@ -1540,6 +1565,23 @@ fn service_account_from_record(ctx: &Apply<'_>) -> Result<Account> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revert_waits_ignore_termination_and_an_exhausted_forward_budget() {
+        begin_helper_run();
+        STARTED.with(|started| started.set(Some(Instant::now() - HELPER_BUDGET)));
+        assert!(Cancellation::Forward.check().is_err());
+        assert!(Cancellation::Revert(Instant::now()).check().is_ok());
+        request_terminate();
+        assert!(Cancellation::Forward.check().is_err());
+        assert!(Cancellation::Revert(Instant::now()).check().is_ok());
+        assert!(
+            Cancellation::Revert(Instant::now() - Duration::from_secs(45))
+                .check()
+                .is_err()
+        );
+        begin_helper_run();
+    }
 
     #[test]
     fn an_oversized_declared_length_is_refused_before_any_body_is_read() {
