@@ -30,6 +30,12 @@ pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_CAPTURE_INTERVAL_MS: u32 = 5_000;
 pub const DEFAULT_CAPTURE_TTL_SECONDS: u32 = 30;
 
+/// Unchanged pane text is not re-appended until this many seconds have passed,
+/// so an idle pane does not fill the hub's ingress quota. A viewer's stale
+/// threshold must exceed this plus [`DEFAULT_CAPTURE_INTERVAL_MS`] and a
+/// renewal slack, or a healthy idle pane is marked stale between keep-alives.
+pub const CAPTURE_KEEP_ALIVE_SECONDS: u32 = 60;
+
 /// A spoke raises a faster cadence to this and lowers a slower one to the max.
 pub const MIN_CAPTURE_INTERVAL_MS: u32 = 1_000;
 pub const MAX_CAPTURE_INTERVAL_MS: u32 = 60_000;

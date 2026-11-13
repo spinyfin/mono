@@ -113,6 +113,12 @@ struct WorkerLiveState {
 
     var isLocalMember: Bool { hostId == Self.localHostId }
 
+    /// The engine named a host that is not this machine. A missing `hostId` is
+    /// a local run (spawns outside the dispatch path, older engines) and must
+    /// not be listed as remote — selecting one would subscribe a pane topic
+    /// the engine answers Unsupported for.
+    var isSpokeHosted: Bool { hostId.map { $0 != Self.localHostId } ?? false }
+
     init(
         name: String? = nil,
         slotId: Int,
