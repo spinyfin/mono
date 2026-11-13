@@ -220,8 +220,9 @@ impl WorkDb {
     /// `boss_engine::host_scheduling::select_host` already excludes disabled
     /// hosts, so the very next dispatch attempt for any queued execution
     /// naturally falls back to a different (e.g. `local`) host instead of
-    /// re-selecting the broken one. A host on a spoke transport is never
-    /// auto-disabled: its failures stay diagnostic.
+    /// re-selecting the broken one. A host on the ready spoke transport is
+    /// never auto-disabled: its failures stay diagnostic. A `spoke_pending`
+    /// host still launches over SSH and is treated like a legacy host.
     pub fn record_host_dispatch_failure(&self, id: &str, error_text: &str) -> Result<HostHealthOutcome> {
         let conn = self.connect()?;
         let now = now_epoch_string();

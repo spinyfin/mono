@@ -927,9 +927,11 @@ async fn auto_reaps_offline_host_execution_without_cube_confirmation() {
     assert_eq!(reap_event.details["host_offline"], true);
 }
 
-/// A disabled host on a spoke transport is not offline: dispatch enablement is
-/// independent of reachability, so a silent worker on it keeps the
-/// confirm-dead gate and is never reaped on silence alone.
+/// A disabled host on the ready spoke transport is not offline: dispatch
+/// enablement is independent of reachability, so a silent worker on it keeps
+/// the confirm-dead gate and is never reaped on silence alone. A
+/// `spoke_pending` host still launches over SSH and is treated like a legacy
+/// host.
 #[tokio::test]
 async fn disabled_spoke_host_execution_keeps_the_cube_confirmation_gate() {
     let (_dir, db) = open_db_arc();
