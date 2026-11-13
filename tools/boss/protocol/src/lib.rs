@@ -42,7 +42,9 @@ pub use planner::{
     ProposedMergeOrderHint, ProposedTask, TaskBrief, planner_output_schema,
 };
 pub use queued_dispatch::*;
-pub use request_contract::{AdmissionLane, ReplayContract, RequestContract, request_contract};
+pub use request_contract::{
+    AdmissionLane, ProgressionAccess, ReplayContract, RequestContract, WorkerAccess, WorkerRedirect, request_contract,
+};
 pub use tmux_worker_status::*;
 pub use types::*;
 pub use wire::*;

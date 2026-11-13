@@ -306,7 +306,28 @@ fn mutating_taxonomy_verbs_are_denied_and_name_a_proposal_verb() {
         patch: Box::new(WorkItemPatch::default()),
     });
     assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
-    assert!(denial.use_instead.is_some());
+    assert_eq!(
+        denial.use_instead.as_deref(),
+        Some("boss propose (pr-created, effort-escalation, blocked, ...)")
+    );
+
+    let denial = assert_denied(FrontendRequest::UpdateWorkItem {
+        id: "task_1".into(),
+        patch: Box::new(WorkItemPatch {
+            pr_url: Some("https://example/pr/1".into()),
+            ..WorkItemPatch::default()
+        }),
+    });
+    assert_eq!(denial.use_instead.as_deref(), Some("boss propose pr-created"));
+
+    let denial = assert_denied(FrontendRequest::UpdateWorkItem {
+        id: "task_1".into(),
+        patch: Box::new(WorkItemPatch {
+            effort_level: Some("large".into()),
+            ..WorkItemPatch::default()
+        }),
+    });
+    assert_eq!(denial.use_instead.as_deref(), Some("boss propose effort-escalation"));
 }
 
 #[test]

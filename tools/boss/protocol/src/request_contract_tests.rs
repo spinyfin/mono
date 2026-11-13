@@ -1,8 +1,16 @@
 use super::*;
-use crate::{CreateChoreInput, CreateInvestigationInput, CreateProjectInput, CreateTaskInput, ProposalKind};
+use crate::{
+    CreateChoreInput, CreateInvestigationInput, CreateProjectInput, CreateTaskInput, ProposalKind, WorkItemPatch,
+};
 
-fn contract(replay: ReplayContract, admission: AdmissionLane) -> RequestContract {
-    RequestContract { replay, admission }
+fn replay_admission(request: &FrontendRequest) -> (ReplayContract, AdmissionLane) {
+    let contract = request_contract(request);
+    (contract.replay, contract.admission)
+}
+
+fn worker_progression(request: &FrontendRequest) -> (WorkerAccess, ProgressionAccess) {
+    let contract = request_contract(request);
+    (contract.worker, contract.progression)
 }
 
 fn task(force: bool) -> FrontendRequest {
@@ -62,12 +70,12 @@ fn live_lane_is_exactly_the_audited_local_only_set() {
         .iter()
         .map(|request| format!("{request:?}").split([' ', '{']).next().unwrap().to_owned())
         .collect();
-    let classified: std::collections::BTreeSet<_> = LIVE_VARIANTS.iter().map(|name| name.to_string()).collect();
+    let classified: std::collections::BTreeSet<_> = live_variants().map(|name| name.to_string()).collect();
     assert_eq!(classified, audited);
     for request in audited_live_requests() {
         assert_eq!(
-            request_contract(&request),
-            contract(ReplayContract::Always, AdmissionLane::Live),
+            replay_admission(&request),
+            (ReplayContract::Always, AdmissionLane::Live),
             "{request:?}"
         );
     }
@@ -115,8 +123,8 @@ fn reads_are_replayable_and_use_the_bulk_lane() {
         },
     ] {
         assert_eq!(
-            request_contract(&request),
-            contract(ReplayContract::Always, AdmissionLane::Bulk),
+            replay_admission(&request),
+            (ReplayContract::Always, AdmissionLane::Bulk),
             "{request:?}"
         );
     }
@@ -137,8 +145,8 @@ fn setters_and_keyed_writes_are_replayable_but_ordered() {
     };
     for request in [proposal, setter] {
         assert_eq!(
-            request_contract(&request),
-            contract(ReplayContract::Always, AdmissionLane::Ordered),
+            replay_admission(&request),
+            (ReplayContract::Always, AdmissionLane::Ordered),
             "{request:?}"
         );
     }
@@ -146,14 +154,22 @@ fn setters_and_keyed_writes_are_replayable_but_ordered() {
 
 #[test]
 fn handoff_redelivery_is_not_replayable() {
+    let handoff = |redeliver| FrontendRequest::GetCoordinatorHandoff { redeliver };
     assert_eq!(
-        request_contract(&FrontendRequest::GetCoordinatorHandoff { redeliver: false }),
-        contract(ReplayContract::Always, AdmissionLane::Bulk)
+        replay_admission(&handoff(false)),
+        (ReplayContract::Always, AdmissionLane::Bulk)
     );
     assert_eq!(
-        request_contract(&FrontendRequest::GetCoordinatorHandoff { redeliver: true }),
-        contract(ReplayContract::Never, AdmissionLane::Bulk)
+        replay_admission(&handoff(true)),
+        (ReplayContract::Never, AdmissionLane::Bulk)
     );
+    for redeliver in [false, true] {
+        assert_eq!(
+            worker_progression(&handoff(redeliver)),
+            (WorkerAccess::Coordinator, ProgressionAccess::Deny),
+            "redeliver={redeliver}"
+        );
+    }
 }
 
 #[test]
@@ -163,26 +179,42 @@ fn pr_status_refresh_leaves_the_bulk_lane_but_stays_replayable() {
         refresh,
     };
     assert_eq!(
-        request_contract(&status(false)),
-        contract(ReplayContract::Always, AdmissionLane::Bulk)
+        replay_admission(&status(false)),
+        (ReplayContract::Always, AdmissionLane::Bulk)
     );
     assert_eq!(
-        request_contract(&status(true)),
-        contract(ReplayContract::Always, AdmissionLane::Ordered)
+        replay_admission(&status(true)),
+        (ReplayContract::Always, AdmissionLane::Ordered)
     );
+    for refresh in [false, true] {
+        assert_eq!(
+            worker_progression(&status(refresh)),
+            (WorkerAccess::Allow, ProgressionAccess::Allow),
+            "refresh={refresh}"
+        );
+    }
 }
 
 #[test]
 fn guarded_creates_depend_on_force_duplicate() {
     for build in [task, chore, investigation] {
         assert_eq!(
-            request_contract(&build(false)),
-            contract(ReplayContract::DuplicateGuarded, AdmissionLane::Ordered)
+            replay_admission(&build(false)),
+            (ReplayContract::DuplicateGuarded, AdmissionLane::Ordered)
         );
         assert_eq!(
-            request_contract(&build(true)),
-            contract(ReplayContract::Never, AdmissionLane::Ordered)
+            replay_admission(&build(true)),
+            (ReplayContract::Never, AdmissionLane::Ordered)
         );
+        for force in [false, true] {
+            assert_eq!(
+                worker_progression(&build(force)),
+                (
+                    WorkerAccess::Redirect(WorkerRedirect::FollowupTask),
+                    ProgressionAccess::Deny
+                ),
+            );
+        }
     }
 }
 
@@ -193,8 +225,8 @@ fn unguarded_writes_are_never_replayed_and_stay_ordered() {
     };
     for request in [project, FrontendRequest::Shutdown { token: "t".into() }] {
         assert_eq!(
-            request_contract(&request),
-            contract(ReplayContract::Never, AdmissionLane::Ordered),
+            replay_admission(&request),
+            (ReplayContract::Never, AdmissionLane::Ordered),
             "{request:?}"
         );
     }
@@ -205,13 +237,71 @@ fn non_read_lane_requests_that_are_not_writes_keep_their_lane() {
     // Read-shaped requests that run on the ordered lane or are bulk but not
     // replayable: classified by what they do, not by their name.
     assert_eq!(
-        request_contract(&FrontendRequest::ListCriticalPriorityRequests),
-        contract(ReplayContract::Always, AdmissionLane::Ordered)
+        replay_admission(&FrontendRequest::ListCriticalPriorityRequests),
+        (ReplayContract::Always, AdmissionLane::Ordered)
     );
     assert_eq!(
-        request_contract(&FrontendRequest::EvaluateDispatchAdmission {
+        replay_admission(&FrontendRequest::EvaluateDispatchAdmission {
             work_item_id: "p".into()
         }),
-        contract(ReplayContract::Never, AdmissionLane::Bulk)
+        (ReplayContract::Never, AdmissionLane::Bulk)
+    );
+}
+
+#[test]
+fn worker_allow_does_not_imply_progression_allow() {
+    assert_eq!(
+        worker_progression(&FrontendRequest::ListProducts),
+        (WorkerAccess::Allow, ProgressionAccess::Allow)
+    );
+    assert_eq!(
+        worker_progression(&FrontendRequest::GetEngineVersion),
+        (WorkerAccess::Allow, ProgressionAccess::Allow)
+    );
+    assert_eq!(
+        worker_progression(&FrontendRequest::GetEngineHealth),
+        (WorkerAccess::Runtime, ProgressionAccess::Deny)
+    );
+    assert_eq!(
+        worker_progression(&FrontendRequest::CreateAutomationTask {
+            automation_id: "auto_1".into(),
+            name: "Fix".into(),
+            description: None,
+            target_files: vec![],
+            target_symbols: vec![],
+        }),
+        (WorkerAccess::Allow, ProgressionAccess::Deny)
+    );
+}
+
+#[test]
+fn update_work_item_redirect_follows_the_patch() {
+    let request = |patch: WorkItemPatch| FrontendRequest::UpdateWorkItem {
+        id: "task_1".into(),
+        patch: Box::new(patch),
+    };
+    assert_eq!(
+        request_contract(&request(WorkItemPatch::default())).worker,
+        WorkerAccess::Redirect(WorkerRedirect::General)
+    );
+    assert_eq!(
+        request_contract(&request(WorkItemPatch {
+            pr_url: Some("https://example/pr/1".into()),
+            ..WorkItemPatch::default()
+        }))
+        .worker,
+        WorkerAccess::Redirect(WorkerRedirect::PrCreated)
+    );
+    assert_eq!(
+        request_contract(&request(WorkItemPatch {
+            effort_level: Some("large".into()),
+            ..WorkItemPatch::default()
+        }))
+        .worker,
+        WorkerAccess::Redirect(WorkerRedirect::EffortEscalation)
+    );
+    assert_eq!(
+        worker_progression(&request(WorkItemPatch::default())),
+        (WorkerAccess::Redirect(WorkerRedirect::General), ProgressionAccess::Deny)
     );
 }

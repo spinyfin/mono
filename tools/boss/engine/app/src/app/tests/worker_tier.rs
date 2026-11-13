@@ -1023,3 +1023,80 @@ async fn parking_an_in_review_item_does_not_force_release_a_live_execution() {
         assert_eq!(after.cube_lease_id, lease_before);
     }
 }
+
+/// A classified worker connection still allows taxonomy reads and still
+/// refuses taxonomy writes with the same redirect. The contract table must
+/// not change what the authenticated-connection gate returns.
+#[test]
+fn worker_connection_keeps_taxonomy_reads_and_redirects_taxonomy_writes() {
+    let (server_state, _dir) = enforcing_state("exec_abc");
+    let class = server_state.classify_peer(Some(self_pid()));
+    assert!(class.is_worker());
+    assert!(
+        server_state
+            .worker_tier_denial(&class, &FrontendRequest::ListProducts)
+            .is_none()
+    );
+    let denial = server_state
+        .worker_tier_denial(
+            &class,
+            &FrontendRequest::CreateTask {
+                input: boss_protocol::CreateTaskInput::builder()
+                    .product_id("prod_1")
+                    .project_id("proj_1")
+                    .name("Something")
+                    .build(),
+            },
+        )
+        .expect("CreateTask must stay denied at worker tier");
+    assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
+    assert_eq!(denial.use_instead.as_deref(), Some("boss propose followup-task"));
+}
+
+/// Progression stays a narrower surface than worker: a sanctioned worker write
+/// is still refused, and a taxonomy read still passes, without trusting a
+/// tier in the request payload.
+#[test]
+fn progression_connection_allows_reads_and_denies_worker_only_writes() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let item = boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id, "Stuck");
+    let execution = state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(&item.id)
+                .kind(boss_protocol::ExecutionKind::TaskImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let parent = boss_engine_runtime::worker_registry::parent_pid(self_pid())
+        .unwrap()
+        .unwrap();
+    state
+        .worker_registry
+        .register_progression(parent, &execution.id, &state.work_db)
+        .unwrap();
+    let class = state.classify_peer(Some(self_pid()));
+    assert!(class.is_progression());
+    assert!(
+        state
+            .worker_tier_denial(&class, &FrontendRequest::GetWorkItem { id: item.id.clone() })
+            .is_none()
+    );
+    let denial = state
+        .worker_tier_denial(
+            &class,
+            &FrontendRequest::CreateAutomationTask {
+                automation_id: "auto_1".into(),
+                name: "Fix".into(),
+                description: None,
+                target_files: vec![],
+                target_symbols: vec![],
+            },
+        )
+        .expect("CreateAutomationTask must stay denied at progression tier");
+    assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope);
+    assert!(denial.use_instead.is_none());
+}

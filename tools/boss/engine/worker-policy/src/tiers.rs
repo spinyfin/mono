@@ -52,8 +52,8 @@ use crate::WorkerVerbDecision;
 ///   dispatch path.
 /// - `Progression`: a classification like `Worker`, for a progression
 ///   session (an agent that unblocks stuck work). Its verb surface is
-///   deny-by-default and smaller than a worker's (see
-///   [`PROGRESSION_ALLOWED_VERBS`](crate::PROGRESSION_ALLOWED_VERBS)), and it is
+///   deny-by-default and smaller than a worker's (each request names an
+///   independent progression decision on the request contract), and it is
 ///   enforced regardless of the `worker_rpc_tier` flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcTier {

@@ -11,19 +11,19 @@
 //!
 //! ## Why this is a crate and not a module
 //!
-//! The policy table is the security-relevant part of the mediation design and
-//! it wants a fast, isolated test loop: 171 verbs, each of which has to be
-//! deliberately classified. Keeping it out of `boss-engine`'s
-//! rebuild/retest scope means changing an allow/deny decision recompiles a
-//! small leaf crate, mirroring the `proposal-validation` split from the
-//! previous task in this project.
+//! The policy translation is the security-relevant part of the mediation
+//! design and it wants a fast, isolated test loop. Per-request allow/deny
+//! lives on [`boss_protocol::request_contract`]; this crate turns those
+//! values into denial objects and sanitizes outbound rows. Keeping it out of
+//! `boss-engine`'s rebuild/retest scope means changing a sanitizer or denial
+//! constructor recompiles a small leaf crate, as with the
+//! `proposal-validation` crate.
 //!
 //! ## The two halves
 //!
-//! - [`policy`] — [`verb_decision`], a tier-keyed, deny-by-default classification
-//!   of every [`FrontendRequest`]. Deliberately an exhaustive `match` with no
-//!   wildcard arm: a newly added verb fails to compile here until someone
-//!   decides whether workers may call it. That compile error is the point.
+//! - [`policy`] — [`verb_decision`], a tier-keyed translation of the request
+//!   contract. A newly added verb fails to compile on the contract match
+//!   until someone classifies worker and progression access for it.
 //! - [`proposal_kind_decision`] — an exhaustive second gate on proposal kinds.
 //!   Progression permits reads and proposal submission, but every kind stays
 //!   closed until its scoped mutation handler is implemented.
@@ -43,6 +43,6 @@ mod tests;
 #[cfg(test)]
 mod tier_matrix_tests;
 
-pub use policy::{PROGRESSION_ALLOWED_VERBS, WorkerVerbDecision, variant_name, verb_decision, worker_verb_decision};
+pub use policy::{WorkerVerbDecision, variant_name, verb_decision, worker_verb_decision};
 pub use sanitize::{SANITIZED_EXECUTION_FIELDS, sanitize_event_for_worker};
 pub use tiers::{RpcTier, proposal_kind_decision};

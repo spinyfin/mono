@@ -10,8 +10,9 @@ fn req(value: serde_json::Value) -> FrontendRequest {
     serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("fixture {value} is not a FrontendRequest: {e}"))
 }
 
-/// One request per verb in [`PROGRESSION_ALLOWED_VERBS`]. A new `Allow` for
-/// progression must add a row here and a name there, so it shows as a diff.
+/// One request per verb progression may call. A new progression Allow must add
+/// a row here, so it shows as a diff; the fixtures are the independent expected
+/// set, not a copy of the contract.
 fn progression_allowed_fixtures() -> Vec<FrontendRequest> {
     vec![
         req(json!({"type": "comments_banner_state", "artifact_kind": "task", "artifact_id": "t"})),
@@ -169,12 +170,11 @@ fn sanctioned_writes_are_allowed_to_workers_and_denied_to_progression() {
 fn progression_allow_set_is_exactly_the_pinned_table() {
     let fixtures = progression_allowed_fixtures();
     let fixture_verbs: BTreeSet<String> = fixtures.iter().map(variant_name).collect();
-    let table: BTreeSet<String> = PROGRESSION_ALLOWED_VERBS.iter().map(|v| (*v).to_owned()).collect();
     assert_eq!(
-        fixture_verbs, table,
-        "fixtures and PROGRESSION_ALLOWED_VERBS must match"
+        fixture_verbs.len(),
+        fixtures.len(),
+        "progression fixtures must not duplicate a verb"
     );
-    assert_eq!(table.len(), PROGRESSION_ALLOWED_VERBS.len(), "no duplicate entries");
     for request in &fixtures {
         let verb = variant_name(request);
         assert!(
@@ -292,22 +292,104 @@ fn synthesize(variant: &str) -> Result<FrontendRequest, String> {
     Err(format!("{variant}: synthesis did not converge"))
 }
 
-/// Every verb the exhaustive worker match names. The match has no wildcard arm,
-/// so it lists the whole `FrontendRequest` vocabulary: a new variant fails to
-/// compile until classified, and then shows up here and needs no edit.
+/// Every verb the exhaustive request-contract match names. The match has no
+/// wildcard arm, so it lists the whole `FrontendRequest` vocabulary: a new
+/// variant fails to compile until classified, and then shows up here.
 fn classified_verbs() -> BTreeSet<String> {
-    let source = include_str!("policy.rs");
-    let body = source
-        .split("fn worker_decision(")
-        .nth(1)
-        .and_then(|rest| rest.split("\n}\n").next())
-        .expect("worker_decision body");
-    body.split("FrontendRequest::")
-        .skip(1)
-        .filter_map(|rest| rest.split(|c: char| !c.is_alphanumeric()).next())
-        .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
-        .map(str::to_owned)
-        .collect()
+    let source = include_str!(env!("BOSS_REQUEST_CONTRACT_RS"));
+    let mut names = BTreeSet::new();
+    for rest in source.split("R::").skip(1) {
+        if let Some(name) = rest
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    // Live variants are listed as bare identifiers in the live macros, then
+    // expanded to `R::$live` by `live_pattern`. Scan those lists so a live
+    // verb cannot drop out of the vocabulary check.
+    for block in source.split("$callback! {").skip(1) {
+        for line in block.lines() {
+            let line = line.trim();
+            if line.starts_with('}') {
+                break;
+            }
+            if let Some(name) = line
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
+            {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Independent denial expectations: literal command strings deliberately avoid
+/// the contract's redirect enum and command mapping. An empty UpdateWorkItem
+/// patch is synthesized by the matrix; payload-specific redirects are pinned
+/// separately in tests.rs.
+fn taxonomy_denial_fixtures() -> Vec<(&'static str, WorkerTierDenialReason, Option<&'static str>)> {
+    use WorkerTierDenialReason::MutatingTaxonomy;
+    vec![
+        ("CreateTask", MutatingTaxonomy, Some("boss propose followup-task")),
+        ("CreateChore", MutatingTaxonomy, Some("boss propose followup-task")),
+        (
+            "CreateInvestigation",
+            MutatingTaxonomy,
+            Some("boss propose followup-task"),
+        ),
+        ("CreateManyTasks", MutatingTaxonomy, Some("boss propose followup-task")),
+        ("CreateManyChores", MutatingTaxonomy, Some("boss propose followup-task")),
+        ("CreateAttention", MutatingTaxonomy, Some("boss propose attention")),
+        ("CreateAttentionItem", MutatingTaxonomy, Some("boss propose attention")),
+        (
+            "AcceptDeferredScopeAttention",
+            MutatingTaxonomy,
+            Some("boss propose deferred-scope"),
+        ),
+        (
+            "CreateTaskFromDeferredScopeAttention",
+            MutatingTaxonomy,
+            Some("boss propose deferred-scope"),
+        ),
+        (
+            "RecordEffortEscalation",
+            MutatingTaxonomy,
+            Some("boss propose effort-escalation"),
+        ),
+        (
+            "UpdateWorkItem",
+            MutatingTaxonomy,
+            Some("boss propose (pr-created, effort-escalation, blocked, ...)"),
+        ),
+        ("ActionAttentionGroup", MutatingTaxonomy, None),
+        ("AddDependency", MutatingTaxonomy, None),
+        ("AnswerAttention", MutatingTaxonomy, None),
+        ("CreateProduct", MutatingTaxonomy, None),
+        ("CreateProject", MutatingTaxonomy, None),
+        ("CreateRevision", MutatingTaxonomy, None),
+        ("DeleteWorkItem", MutatingTaxonomy, None),
+        ("DismissAttention", MutatingTaxonomy, None),
+        ("LinkWorkItemExternalRef", MutatingTaxonomy, None),
+        ("ListCriticalPriorityRequests", MutatingTaxonomy, None),
+        ("MoveWorkItemOnBoard", MutatingTaxonomy, None),
+        ("ParkWorkItem", MutatingTaxonomy, None),
+        ("RemoveDependency", MutatingTaxonomy, None),
+        ("ReorderProjectTasks", MutatingTaxonomy, None),
+        ("RequestCriticalPriority", MutatingTaxonomy, None),
+        ("ResolveCriticalPriorityRequest", MutatingTaxonomy, None),
+        ("RestoreWorkItem", MutatingTaxonomy, None),
+        ("SetProductDefaultDriver", MutatingTaxonomy, None),
+        ("SetProductDefaultModel", MutatingTaxonomy, None),
+        ("SetProductEditorialRules", MutatingTaxonomy, None),
+        ("SetProductExternalTracker", MutatingTaxonomy, None),
+        ("SetProductMergeMechanism", MutatingTaxonomy, None),
+        ("UnlinkWorkItemExternalRef", MutatingTaxonomy, None),
+    ]
 }
 
 #[test]
@@ -319,10 +401,11 @@ fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
         classified.len()
     );
 
-    // Expected decisions, spelled out per tier. Workers are allowed exactly the
-    // progression table plus the sanctioned writes; progression is allowed
-    // exactly the table. Everything else is denied to both: deny is the default.
-    let progression_allowed: BTreeSet<String> = PROGRESSION_ALLOWED_VERBS.iter().map(|v| (*v).to_owned()).collect();
+    // Expected decisions, spelled out per tier from independently authored
+    // fixtures. Workers are allowed exactly the progression fixtures plus the
+    // sanctioned writes; progression is allowed exactly the fixtures.
+    // Everything else is denied to both: deny is the default.
+    let progression_allowed: BTreeSet<String> = progression_allowed_fixtures().iter().map(variant_name).collect();
     let sanctioned: BTreeSet<String> = sanctioned_write_fixtures().iter().map(variant_name).collect();
     let worker_allowed: BTreeSet<String> = progression_allowed.union(&sanctioned).cloned().collect();
     for verb in worker_allowed.iter() {
@@ -332,6 +415,12 @@ fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
         );
     }
 
+    let denials = taxonomy_denial_fixtures();
+    let denial_verbs: BTreeSet<_> = denials.iter().map(|(verb, _, _)| *verb).collect();
+    assert_eq!(denial_verbs.len(), denials.len(), "duplicate denial fixture");
+    for verb in &denial_verbs {
+        assert!(classified.contains(*verb), "unknown denial fixture: {verb}");
+    }
     let mut fixtures = BTreeSet::new();
     let mut unsynthesised = Vec::new();
     for verb in &classified {
@@ -351,6 +440,18 @@ fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
             progression_allowed.contains(verb),
             "{verb} / Progression"
         );
+        if let Some((_, reason, use_instead)) = denials.iter().find(|(name, _, _)| *name == verb) {
+            let denial = worker.denial().expect("taxonomy verb must be denied");
+            assert_eq!(&denial.reason, reason, "{verb} / Worker reason");
+            assert_eq!(denial.use_instead.as_deref(), *use_instead, "{verb} / Worker redirect");
+        } else if let Some(denial) = worker.denial() {
+            assert_ne!(
+                denial.reason,
+                WorkerTierDenialReason::MutatingTaxonomy,
+                "{verb} missing taxonomy fixture"
+            );
+            assert_eq!(denial.use_instead, None, "{verb} unexpected redirect");
+        }
         if !progression.is_allowed() {
             let denial = progression.denial().expect("denied");
             assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope, "{verb}");
