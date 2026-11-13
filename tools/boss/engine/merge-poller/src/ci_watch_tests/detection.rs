@@ -170,7 +170,7 @@ async fn stale_pending_conflict_on_mergeable_pr_does_not_suppress_ci_fix() {
             .unwrap()
             .map(|a| a.id),
         Some(stale.id.clone()),
-        "the leftover pending row is what CI-watch used to treat as live",
+        "the leftover pending row is the active conflict attempt before CI-watch runs",
     );
     assert_eq!(chore_state(&db, &chore).0, TaskStatus::InReview);
 
@@ -191,11 +191,10 @@ async fn stale_pending_conflict_on_mergeable_pr_does_not_suppress_ci_fix() {
 
     let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
     assert_eq!(stale_row.status, "abandoned");
-    assert!(
-        stale_row.failure_reason.as_deref() == Some("superseded_by_newer_attempt")
-            || stale_row.failure_reason.as_deref() == Some("pr_mergeable_attempt_stale"),
-        "stale attempt must be abandoned with a recorded reason, got {:?}",
-        stale_row.failure_reason,
+    assert_eq!(
+        stale_row.failure_reason.as_deref(),
+        Some("superseded_by_newer_attempt"),
+        "a leftover pending row next to a later succeeded attempt is superseded",
     );
     assert!(db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none());
 
@@ -254,6 +253,288 @@ async fn detection_defers_when_active_rebase_attempt_exists() {
     )
     .await;
     assert!(!flipped, "active rebase attempt must pre-empt CI flow");
+}
+
+fn insert_rebase_row(db_path: &std::path::Path, id: &str, pr: &str, status: &str) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rebase_attempts (
+             id                TEXT PRIMARY KEY,
+             dependent_pr_url  TEXT NOT NULL,
+             status            TEXT NOT NULL
+         )",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO rebase_attempts (id, dependent_pr_url, status)
+          VALUES (?1, ?2, ?3)",
+        rusqlite::params![id, pr, status],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pending_rebase_on_clean_pr_does_not_preempt_ci() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/43";
+    let (product, chore) = make_in_review(&db, "C-pending-rebase-clean", pr);
+    insert_rebase_row(&db_path, "reb_pending", pr, "pending");
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-1"),
+        &one_failure(),
+    )
+    .await;
+    assert!(
+        flipped,
+        "a leftover pending rebase row on a mergeable PR must not pre-empt CI"
+    );
+}
+
+#[tokio::test]
+async fn pending_conflict_on_unknown_mergeability_still_defers() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/44";
+    let (product, chore) = make_in_review(&db, "C-pending-unknown", pr);
+    let attempt = insert_conflict_attempt(&db, &product, &chore, pr, 44, "base-1", "head-1");
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_unknown_mergeability(pr, "head-1"),
+        &one_failure(),
+    )
+    .await;
+    assert!(
+        !flipped,
+        "a pending conflict row still pre-empts CI while mergeability is unknown"
+    );
+    assert_eq!(
+        db.get_conflict_resolution(&attempt.id).unwrap().unwrap().status,
+        "pending",
+        "a bare pending row is not stale while mergeability is unknown"
+    );
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn superseded_pending_conflict_on_unknown_mergeability_does_not_suppress_ci_fix() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/45";
+    let (product, chore) = make_in_review(&db, "C-superseded-unknown", pr);
+
+    let stale = insert_conflict_attempt(&db, &product, &chore, pr, 45, "base-1", "head-old");
+    let later = insert_conflict_attempt(&db, &product, &chore, pr, 45, "base-1", "head-new");
+    db.mark_conflict_resolution_succeeded(&later.id, None).unwrap().unwrap();
+    replant_pending(&db_path, &stale.id, "base-1");
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_unknown_mergeability(pr, "head-fail"),
+        &one_failure(),
+    )
+    .await;
+    assert!(
+        flipped,
+        "a superseded pending row must be retired even while mergeability is unknown"
+    );
+    let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
+    assert_eq!(stale_row.status, "abandoned");
+    assert_eq!(stale_row.failure_reason.as_deref(), Some("superseded_by_newer_attempt"));
+}
+
+#[tokio::test]
+async fn mechanical_rung_conflict_preempts_ci_on_mergeable_pr() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/46";
+    let (product, chore) = make_in_review(&db, "C-mech-rung", pr);
+    let attempt = insert_conflict_attempt(&db, &product, &chore, pr, 46, "base-1", "head-1");
+    db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "lease-1", "ws-1")
+        .unwrap()
+        .unwrap();
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-1"),
+        &one_failure(),
+    )
+    .await;
+    assert!(!flipped, "an in-flight mechanical rung is a live conflict writer");
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+    assert_eq!(
+        db.get_conflict_resolution(&attempt.id).unwrap().unwrap().status,
+        "pending"
+    );
+}
+
+#[tokio::test]
+async fn pending_conflict_with_queued_revision_preempts_ci() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/47";
+    let (product, chore) = make_in_review(&db, "C-queued-rev", pr);
+    let attempt = insert_conflict_attempt(&db, &product, &chore, pr, 47, "base-1", "head-1");
+    let revision = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(chore.clone())
+                .description("Resolve merge conflict against main")
+                .created_via(format!("merge-conflict:{}", attempt.id))
+                .build(),
+            &fix_checker(),
+        )
+        .unwrap();
+    db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)
+        .unwrap()
+        .unwrap();
+    db.create_execution(
+        crate::work::CreateExecutionInput::builder()
+            .work_item_id(revision.id.clone())
+            .kind(crate::work::ExecutionKind::RevisionImplementation)
+            .status(crate::work::ExecutionStatus::Ready)
+            .build(),
+    )
+    .unwrap();
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-1"),
+        &one_failure(),
+    )
+    .await;
+    assert!(!flipped, "a pending conflict attempt with a queued revision is live");
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn in_flight_ci_fix_revision_logs_blocking_attempt_id() {
+    let logs = log_capture::install();
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/48";
+    let (product, chore) = make_in_review(&db, "C-inflight-log", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    assert!(
+        on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await
+    );
+    let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    let revision_id = attempt.revision_task_id.clone().expect("revision");
+    db.mark_ci_remediation_succeeded(&attempt.id, Some("head-1"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.has_in_flight_ci_fix_revision(&chore).unwrap(),
+        "the CI-fix revision is still a live writer after the ledger row succeeds"
+    );
+
+    logs.lock().clear();
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-2"),
+        &one_failure(),
+    )
+    .await;
+    assert!(!flipped, "an in-flight CI-fix revision must defer a new attempt");
+    let text = String::from_utf8(logs.lock().clone()).unwrap();
+    assert!(
+        text.contains("gate=\"in_flight_ci_fix_revision\"") || text.contains("in_flight_ci_fix_revision"),
+        "deferral must name the gate: {text}"
+    );
+    assert!(
+        text.contains(&attempt.id),
+        "deferral must name the blocking remediation attempt: {text}"
+    );
+    assert!(
+        text.contains(&revision_id),
+        "deferral must name the blocking revision: {text}"
+    );
+}
+
+#[tokio::test]
+async fn in_flight_ci_fix_revision_logs_when_no_ledger_row() {
+    let logs = log_capture::install();
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/49";
+    let (product, chore) = make_in_review(&db, "C-inflight-no-ledger", pr);
+    let conn = db.connect().unwrap();
+    let revision_id = "task_cifix_no_ledger";
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Fix failing CI on PR', '', 'active', '1700000000', '1700000000', 0, ?3, ?4)",
+        rusqlite::params![
+            revision_id,
+            product,
+            format!("{}rem_missing", boss_protocol::CREATED_VIA_CI_FIX_PREFIX),
+            chore
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    logs.lock().clear();
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-1"),
+        &one_failure(),
+    )
+    .await;
+    assert!(!flipped);
+    let text = String::from_utf8(logs.lock().clone()).unwrap();
+    assert!(
+        text.contains("in_flight_ci_fix_revision"),
+        "deferral must name the gate: {text}"
+    );
+    assert!(
+        text.contains(revision_id),
+        "deferral must name the blocking revision: {text}"
+    );
+    assert!(
+        text.contains("ledger_row") && text.contains("none"),
+        "deferral must state that no ledger row exists: {text}"
+    );
 }
 
 #[tokio::test]

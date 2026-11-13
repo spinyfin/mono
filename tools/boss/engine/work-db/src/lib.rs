@@ -26,6 +26,17 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CHORE_LIKE_KINDS_SQL: &str =
     "'chore', 'project_task', 'design', 'investigation', 'followup', 'design_postmortem'";
 
+/// A live engine-triggered CI-fix revision, plus its `ci_remediations`
+/// ledger row when one exists (including a terminal ledger row whose
+/// revision worker is still in flight).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightCiFixRevision {
+    pub revision_id: String,
+    /// `ci_remediations.id` linked to this revision, or `None` when the
+    /// live revision has no ledger row.
+    pub remediation_attempt_id: Option<String>,
+}
+
 /// SQL boolean: `{alias}` is a live writer for the revision chain-tail gate,
 /// [`WorkDb::has_in_flight_ci_fix_revision`], and same-chain revision
 /// gating in [`crate::work_dependencies::gating_prereqs_for`].

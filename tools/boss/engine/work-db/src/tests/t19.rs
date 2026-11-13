@@ -204,3 +204,43 @@ fn has_in_flight_ci_fix_revision_false_for_dead_halt_without_live_execution() {
         "the same halt still counts as in flight while a non-terminal execution is attached",
     );
 }
+
+/// The in-flight lookup returns the live revision and its ledger row even
+/// after that ledger row is already terminal.
+#[test]
+fn in_flight_ci_fix_revision_returns_terminal_ledger_id() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "cifix-ids");
+    let chore = make_chore_root(&db, &product_id, "ids-rev");
+    let (rem_id, revision_id) =
+        setup_ci_fix_revision(&db, &product_id, &chore, "https://github.com/foo/bar/pull/19", 19);
+    db.mark_ci_remediation_succeeded(&rem_id, Some("head-after"))
+        .unwrap()
+        .unwrap();
+
+    let in_flight = db
+        .in_flight_ci_fix_revision(&chore)
+        .unwrap()
+        .expect("the revision is still a live writer");
+    assert_eq!(in_flight.revision_id, revision_id);
+    assert_eq!(in_flight.remediation_attempt_id.as_deref(), Some(rem_id.as_str()));
+}
+
+/// A live CI-fix revision with no `ci_remediations` row reports no ledger id.
+#[test]
+fn in_flight_ci_fix_revision_none_ledger_when_no_row() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "cifix-no-ledger");
+    let chore = make_chore_root(&db, &product_id, "no-ledger-rev");
+    let revision = insert_ci_fix_revision_row(&db, &product_id, &chore, "rem_missing");
+
+    let in_flight = db
+        .in_flight_ci_fix_revision(&chore)
+        .unwrap()
+        .expect("the revision is in flight");
+    assert_eq!(in_flight.revision_id, revision);
+    assert!(
+        in_flight.remediation_attempt_id.is_none(),
+        "no ledger row exists for this revision"
+    );
+}

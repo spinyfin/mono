@@ -10,7 +10,9 @@ pub(super) use tempfile::tempdir;
 pub(super) use super::super::*;
 pub(super) use crate::test_support::*;
 pub(super) use crate::work::{TaskStatus, WorkDb, WorkItem, WorkItemPatch};
-pub(super) use crate::{CiProvider, OpenPrCiStatus, OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
+pub(super) use crate::{
+    CiProvider, OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleProbe, PrLifecycleState,
+};
 
 pub(super) fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
     let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
@@ -43,6 +45,22 @@ pub(super) fn probe(pr_url: &str, head_sha: &str) -> PrLifecycleProbe {
                 failures: one_failure(),
             },
             ..OpenPrStatus::clean()
+        }))
+        .base_ref_oid("base-1")
+        .head_ref_oid(head_sha.to_owned())
+        .labels(Vec::new())
+        .review(crate::PrReviewState::Unknown)
+        .build()
+}
+
+pub(super) fn probe_unknown_mergeability(pr_url: &str, head_sha: &str) -> PrLifecycleProbe {
+    PrLifecycleProbe::builder()
+        .url(pr_url.to_owned())
+        .state(PrLifecycleState::Open(OpenPrStatus {
+            ci: OpenPrCiStatus::Failing {
+                failures: one_failure(),
+            },
+            mergeability: OpenPrMergeability::Unknown,
         }))
         .base_ref_oid("base-1")
         .head_ref_oid(head_sha.to_owned())

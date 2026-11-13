@@ -45,8 +45,8 @@ use serde::Serialize;
 use crate::blocking_signal::{self, SignalKind};
 use crate::work::{
     ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
-    ClearResolvedSignal, CreateExecutionInput, PendingMergeCheck, PrStateChecker, SignalRetirement,
-    StrandedCiRemediationAttempt, WorkDb,
+    ClearResolvedSignal, CreateExecutionInput, InFlightCiFixRevision, PendingMergeCheck, PrStateChecker,
+    SignalRetirement, StrandedCiRemediationAttempt, WorkDb,
 };
 use crate::{
     OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out,
@@ -98,6 +98,28 @@ fn log_ci_failure_deferred(candidate: &PendingMergeCheck, gate: &'static str, at
         attempt_id = attempt_id.unwrap_or(""),
         "ci_watch: deferring ci_failure handling",
     );
+}
+
+fn log_in_flight_ci_fix_deferred(candidate: &PendingMergeCheck, in_flight: &InFlightCiFixRevision) {
+    match in_flight.remediation_attempt_id.as_deref() {
+        Some(attempt_id) => tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            gate = "in_flight_ci_fix_revision",
+            attempt_id,
+            revision_id = %in_flight.revision_id,
+            "ci_watch: deferring ci_failure handling",
+        ),
+        None => tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            gate = "in_flight_ci_fix_revision",
+            attempt_id = "",
+            revision_id = %in_flight.revision_id,
+            ledger_row = "none",
+            "ci_watch: deferring ci_failure handling",
+        ),
+    }
 }
 
 fn probe_mergeability_clean(probe: &PrLifecycleProbe) -> bool {
@@ -411,10 +433,10 @@ pub async fn on_ci_failure_detected(
     // auto-rebase attempt owns the slot. A leftover `pending` conflict
     // row on a mergeable PR does not — retire it (so upgrade leftover
     // rows are cleaned without a DB edit) and continue into CI handling.
+    // Superseded pending rows retire even when mergeability is Unknown;
+    // bare pending rows retire only on a clean PR.
     let mergeability_clean = probe_mergeability_clean(probe);
-    if mergeability_clean
-        && let Err(err) = work_db.retire_stale_pending_conflict_attempts(&candidate.work_item_id, true)
-    {
+    if let Err(err) = work_db.retire_stale_pending_conflict_attempts(&candidate.work_item_id, mergeability_clean) {
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
@@ -525,12 +547,12 @@ pub async fn on_ci_failure_detected(
     // not pushed a fix commit. Without this guard, a new revision can spawn
     // concurrently with the prior one, wasting the attempt budget and racing
     // the same PR branch (PR #1404).
-    match work_db.has_in_flight_ci_fix_revision(&candidate.work_item_id) {
-        Ok(true) => {
-            log_ci_failure_deferred(candidate, "in_flight_ci_fix_revision", None);
+    match work_db.in_flight_ci_fix_revision(&candidate.work_item_id) {
+        Ok(Some(in_flight)) => {
+            log_in_flight_ci_fix_deferred(candidate, &in_flight);
             return false;
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,

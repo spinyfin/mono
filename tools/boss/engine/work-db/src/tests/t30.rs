@@ -557,3 +557,91 @@ fn retire_stale_pending_leaves_a_running_attempt() {
             .unwrap()
     );
 }
+
+/// Pin `created_at` so ordering assertions do not depend on wall-clock
+/// resolution. Equal-length numeric strings preserve `created_at` order.
+fn set_created_at(db: &WorkDb, attempt_id: &str, created_at: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE conflict_resolutions SET created_at = ?2 WHERE id = ?1",
+            params![attempt_id, created_at],
+        )
+        .unwrap();
+}
+
+/// An older attempt becoming terminal must not abandon a newer pending row.
+#[test]
+fn older_attempt_terminal_leaves_newer_pending() {
+    let (db, product, chore) = seed_product_and_chore("older-terminal-keeps-newer");
+    let older = insert_attempt(&db, &product, &chore, "base-old");
+    let newer = insert_attempt(&db, &product, &chore, "base-new");
+    set_created_at(&db, &older.id, "1700000001");
+    set_created_at(&db, &newer.id, "1700000002");
+    replant_pending(&db, &older.id, "base-old");
+
+    db.mark_conflict_resolution_failed(&older.id, "test_older_failed")
+        .unwrap()
+        .expect("older attempt was pending");
+
+    let older_row = db.get_conflict_resolution(&older.id).unwrap().unwrap();
+    assert_eq!(older_row.status, "failed");
+    let newer_row = db.get_conflict_resolution(&newer.id).unwrap().unwrap();
+    assert_eq!(
+        newer_row.status, "pending",
+        "a newer pending attempt must survive an older attempt's terminal transition"
+    );
+}
+
+/// A pending attempt executing an inline mechanical rung is a live branch
+/// writer: a later attempt becoming terminal must not abandon it.
+#[test]
+fn terminal_transition_leaves_pending_mechanical_rung() {
+    let (db, product, chore) = seed_product_and_chore("terminal-keeps-mechanical");
+    let live = insert_attempt(&db, &product, &chore, "base-live");
+    db.stamp_conflict_resolution_mechanical_rung(&live.id, 1, "lease-1", "ws-1")
+        .unwrap()
+        .unwrap();
+    let later = insert_attempt(&db, &product, &chore, "base-later");
+    assert_eq!(
+        db.get_conflict_resolution(&live.id).unwrap().unwrap().status,
+        "pending",
+        "insert of a later attempt must not retire a mechanical-rung pending row"
+    );
+
+    db.mark_conflict_resolution_succeeded(&later.id, None)
+        .unwrap()
+        .expect("later attempt was pending");
+
+    let live_row = db.get_conflict_resolution(&live.id).unwrap().unwrap();
+    assert_eq!(live_row.status, "pending");
+    assert_eq!(live_row.mechanical_rung_in_flight, Some(1));
+}
+
+/// A pending attempt that has become a live writer (mechanical rung or a
+/// stamped revision) is not retired by the mergeable-PR sweep.
+#[test]
+fn retire_stale_pending_leaves_attempt_that_became_live() {
+    let (db, product, chore) = seed_product_and_chore("retire-became-live");
+    let mechanical = insert_attempt(&db, &product, &chore, "base-mech");
+    db.stamp_conflict_resolution_mechanical_rung(&mechanical.id, 0, "lease-m", "ws-m")
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.retire_stale_pending_conflict_attempts(&chore, true).unwrap(), 0);
+    assert_eq!(
+        db.get_conflict_resolution(&mechanical.id).unwrap().unwrap().status,
+        "pending"
+    );
+
+    let (db, product, chore) = seed_product_and_chore("retire-became-live-rev");
+    let with_revision = insert_attempt(&db, &product, &chore, "base-rev");
+    let revision = insert_revision_row(&db, &product, &chore);
+    db.set_conflict_resolution_revision_task_id(&with_revision.id, &revision)
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.retire_stale_pending_conflict_attempts(&chore, true).unwrap(), 0);
+    assert_eq!(
+        db.get_conflict_resolution(&with_revision.id).unwrap().unwrap().status,
+        "pending"
+    );
+}
