@@ -1602,9 +1602,19 @@ name = "boss-protocol"
 version = "0.1.0"
 dependencies = [
  "bon",
+ "boss-protocol-macros",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "boss-protocol-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

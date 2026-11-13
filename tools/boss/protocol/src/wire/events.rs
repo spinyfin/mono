@@ -6,28 +6,25 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Every payload must explicitly select reviewed pass-through or a typed hook.
+// Revisit worker exposure whenever a payload changes; passthrough is not a
+// permanent exemption for future fields. Transformations live in worker-policy.
+#[derive(Debug, Clone, Serialize, Deserialize, boss_protocol_macros::EventTraversal)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendEvent {
-    CriticalPriorityRequests {
-        requests: Vec<serde_json::Value>,
-    },
-    CriticalPriorityRequested {
-        id: String,
-    },
-    CriticalPriorityResolved {
-        id: String,
-    },
-    Hello {
-        session_id: String,
-    },
-    Subscribed {
-        topics: Vec<String>,
-        current_revision: u64,
-    },
-    Unsubscribed {
-        topics: Vec<String>,
-    },
+    #[worker(passthrough)]
+    CriticalPriorityRequests { requests: Vec<serde_json::Value> },
+    #[worker(passthrough)]
+    CriticalPriorityRequested { id: String },
+    #[worker(passthrough)]
+    CriticalPriorityResolved { id: String },
+    #[worker(passthrough)]
+    Hello { session_id: String },
+    #[worker(passthrough)]
+    Subscribed { topics: Vec<String>, current_revision: u64 },
+    #[worker(passthrough)]
+    Unsubscribed { topics: Vec<String> },
+    #[worker(passthrough)]
     TopicEvent {
         topic: String,
         revision: u64,
@@ -35,30 +32,25 @@ pub enum FrontendEvent {
         origin_request_id: Option<String>,
         event: TopicEventPayload,
     },
-    ProductsList {
-        products: Vec<Product>,
-    },
-    ProjectsList {
-        product_id: String,
-        projects: Vec<Project>,
-    },
+    #[worker(passthrough)]
+    ProductsList { products: Vec<Product> },
+    #[worker(passthrough)]
+    ProjectsList { product_id: String, projects: Vec<Project> },
+    #[worker(passthrough)]
     TasksList {
         product_id: String,
         project_id: Option<String>,
         tasks: Vec<Task>,
     },
-    ChoresList {
-        product_id: String,
-        chores: Vec<Task>,
-    },
-    RevisionsList {
-        product_id: String,
-        revisions: Vec<Task>,
-    },
+    #[worker(passthrough)]
+    ChoresList { product_id: String, chores: Vec<Task> },
+    #[worker(passthrough)]
+    RevisionsList { product_id: String, revisions: Vec<Task> },
     /// Reply for [`FrontendRequest::GetWorkRuntimePatch`]: the named cards
     /// (and their revision-chain relatives) re-read without a board
     /// assembly. `absent` lists requested ids that are not live cards of
     /// `product_id`; a consumer treats any as a structural change.
+    #[worker(passthrough)]
     WorkRuntimePatch {
         product_id: String,
         items: Vec<WorkRuntimePatchItem>,
@@ -74,6 +66,7 @@ pub enum FrontendEvent {
     /// events (a `population_timing` segment such as `db.tasks`); `items`
     /// and `bytes` are set once known (items from the task/chore query on,
     /// bytes on [`BoardPopulationPhase::Done`]).
+    #[worker(passthrough)]
     BoardPopulationProgress {
         product_id: String,
         phase: crate::BoardPopulationPhase,
@@ -86,9 +79,11 @@ pub enum FrontendEvent {
         bytes: Option<u64>,
     },
     /// Ordered board update, independent of global topic revisions.
+    #[worker(transform = work_tree_update)]
     WorkTreeUpdate {
         update: crate::work_tree_delta::WorkTreeUpdate,
     },
+    #[worker(transform = work_tree)]
     WorkTree {
         product: Product,
         projects: Vec<Project>,
@@ -109,22 +104,21 @@ pub enum FrontendEvent {
         #[serde(default)]
         planner_runs: Vec<crate::PlannerRunSummary>,
     },
-    WorkItemResult {
-        item: WorkItem,
-    },
+    #[worker(passthrough)]
+    WorkItemResult { item: WorkItem },
     /// Reply for [`FrontendRequest::FindWorkItemsByPr`]. `matches` carries
     /// one entry per work item whose `pr_url` resolves to `pr_number`
     /// (across all kinds and products); each entry bundles the revisions
     /// in that PR's chain. An empty `matches` means no work item is bound
     /// to the PR; more than one entry means the PR number is ambiguous
     /// across repos.
+    #[worker(passthrough)]
     WorkItemsByPrResult {
         pr_number: i64,
         matches: Vec<PrWorkItemMatch>,
     },
-    WorkItemCreated {
-        item: WorkItem,
-    },
+    #[worker(passthrough)]
+    WorkItemCreated { item: WorkItem },
     /// Response to a batch create (`CreateManyTasks` /
     /// `CreateManyChores`). Carries every row inserted by the batch in
     /// the order the caller submitted them. Per-item subscribers can
@@ -132,32 +126,31 @@ pub enum FrontendEvent {
     /// `WorkItemCreated` event — the engine also publishes the usual
     /// `work_invalidated` topic event covering the full id list, so
     /// kanban consumers reload once.
-    WorkItemsCreated {
-        items: Vec<WorkItem>,
-    },
-    WorkItemUpdated {
-        item: WorkItem,
-    },
+    #[worker(passthrough)]
+    WorkItemsCreated { items: Vec<WorkItem> },
+    #[worker(passthrough)]
+    WorkItemUpdated { item: WorkItem },
     /// Full open-decision snapshot on the global `work.decisions` topic.
     /// Sent at subscription and whenever the set or its display text changes.
+    #[worker(passthrough)]
     OperatorDecisionSnapshot {
         questions: Vec<super::OperatorDecisionNotification>,
     },
+    #[worker(passthrough)]
     OperatorQuestionsList {
         questions: Vec<crate::OperatorQuestionRecord>,
     },
     /// Reply for [`FrontendRequest::ListTaskFieldAudit`].
+    #[worker(passthrough)]
     TaskFieldAuditList {
         work_item_id: String,
         rows: Vec<crate::TaskFieldAuditRow>,
     },
-    OperatorQuestionError {
-        error: crate::OperatorQuestionError,
-    },
-    ProjectTasksReordered {
-        project_id: String,
-        task_ids: Vec<String>,
-    },
+    #[worker(passthrough)]
+    OperatorQuestionError { error: crate::OperatorQuestionError },
+    #[worker(passthrough)]
+    ProjectTasksReordered { project_id: String, task_ids: Vec<String> },
+    #[worker(transform = executions_list)]
     ExecutionsList {
         work_item_id: Option<String>,
         executions: Vec<WorkExecution>,
@@ -166,22 +159,17 @@ pub enum FrontendEvent {
     /// engine's view of the currently dispatched (or most-recent)
     /// execution and run for one work item. Fields are `None` when no
     /// execution exists yet.
-    TaskRuntimeResult {
-        runtime: TaskRuntime,
-    },
-    ExecutionResult {
-        execution: WorkExecution,
-    },
-    ExecutionCreated {
-        execution: WorkExecution,
-    },
-    ExecutionRequested {
-        execution: WorkExecution,
-    },
+    #[worker(passthrough)]
+    TaskRuntimeResult { runtime: TaskRuntime },
+    #[worker(transform = execution_result)]
+    ExecutionResult { execution: WorkExecution },
+    #[worker(transform = execution_created)]
+    ExecutionCreated { execution: WorkExecution },
+    #[worker(transform = execution_requested)]
+    ExecutionRequested { execution: WorkExecution },
     /// Reply for [`FrontendRequest::EvaluateDispatchAdmission`].
-    DispatchAdmissionEvaluated {
-        admission: DispatchAdmission,
-    },
+    #[worker(passthrough)]
+    DispatchAdmissionEvaluated { admission: DispatchAdmission },
     /// Reply for [`FrontendRequest::TriggerPrReview`]. Carries the
     /// freshly-enqueued (or reused, if one was already queued) `pr_review`
     /// execution, the work item it targets, and the PR URL under review.
@@ -194,6 +182,7 @@ pub enum FrontendEvent {
     /// one leaf `execution` holds), and `already_active` is `true` when an
     /// active batch already covered this head and nothing new was started.
     /// All four are absent/empty for the flag-off legacy path.
+    #[worker(transform = pr_review_triggered)]
     PrReviewTriggered {
         execution: WorkExecution,
         work_item_id: String,
@@ -207,40 +196,34 @@ pub enum FrontendEvent {
         #[serde(default)]
         already_active: bool,
     },
-    RunsList {
-        execution_id: String,
-        runs: Vec<WorkRun>,
-    },
-    RunResult {
-        run: WorkRun,
-    },
-    RunCreated {
-        run: WorkRun,
-    },
+    #[worker(transform = runs_list)]
+    RunsList { execution_id: String, runs: Vec<WorkRun> },
+    #[worker(transform = run_result)]
+    RunResult { run: WorkRun },
+    #[worker(transform = run_created)]
+    RunCreated { run: WorkRun },
+    #[worker(passthrough)]
     AttentionItemsList {
         execution_id: String,
         items: Vec<WorkAttentionItem>,
     },
-    AttentionItemResult {
-        item: WorkAttentionItem,
-    },
-    AttentionItemCreated {
-        item: WorkAttentionItem,
-    },
+    #[worker(passthrough)]
+    AttentionItemResult { item: WorkAttentionItem },
+    #[worker(passthrough)]
+    AttentionItemCreated { item: WorkAttentionItem },
+    #[worker(passthrough)]
     AttentionItemsForWorkItemList {
         work_item_id: String,
         items: Vec<WorkAttentionItem>,
     },
-    AttentionItemUpdated {
-        item: WorkAttentionItem,
-    },
+    #[worker(passthrough)]
+    AttentionItemUpdated { item: WorkAttentionItem },
     /// `task` is the followup filed from the source `deferred_scope` item.
     /// Boxed: an inline `Task` here would make this variant far larger than
     /// its siblings (clippy::large_enum_variant) — serializes identically.
-    AttentionItemConverted {
-        item: WorkAttentionItem,
-        task: Box<Task>,
-    },
+    #[worker(passthrough)]
+    AttentionItemConverted { item: WorkAttentionItem, task: Box<Task> },
+    #[worker(passthrough)]
     DeferredScopeAttentionsList {
         product_id: String,
         items: Vec<DeferredScopeAttention>,
@@ -250,6 +233,7 @@ pub enum FrontendEvent {
     /// across groups (the client buckets them by `Attention::group_id`)
     /// so the Notifications window can render inline answer controls
     /// without a follow-up round-trip per group.
+    #[worker(passthrough)]
     AttentionGroupsList {
         product_id: String,
         groups: Vec<AttentionGroup>,
@@ -258,6 +242,7 @@ pub enum FrontendEvent {
     },
     /// Reply for [`FrontendRequest::GetAttentionGroup`]. `members` are
     /// the group's rows in display order.
+    #[worker(passthrough)]
     AttentionGroupResult {
         group: AttentionGroup,
         #[serde(default)]
@@ -266,6 +251,7 @@ pub enum FrontendEvent {
     /// Reply for [`FrontendRequest::CreateAttention`]. Also pushed as a
     /// live-update event on the owning product's work-tree topic so the
     /// Notifications window and doc viewer update without polling.
+    #[worker(passthrough)]
     AttentionCreated {
         attention: Attention,
         group: AttentionGroup,
@@ -274,6 +260,7 @@ pub enum FrontendEvent {
     /// changes (e.g. after [`FrontendRequest::AnswerAttention`] or
     /// [`FrontendRequest::DismissAttention`]). `members` carries the
     /// group's refreshed rows so the UI reflects the new answer states.
+    #[worker(passthrough)]
     AttentionGroupUpdated {
         group: AttentionGroup,
         #[serde(default)]
@@ -283,6 +270,7 @@ pub enum FrontendEvent {
     /// Carries the group in its terminal `actioned` state plus the
     /// produced artifact reference so the UI can render a jump link.
     /// `members` are the group's now-terminal rows.
+    #[worker(passthrough)]
     AttentionGroupActioned {
         group: AttentionGroup,
         #[serde(default)]
@@ -290,27 +278,26 @@ pub enum FrontendEvent {
     },
     /// Reply to [`FrontendRequest::ListAttentionMerges`]. `merges` are the
     /// `attention_merges` rows recorded against `attention_id`, chronological.
+    #[worker(passthrough)]
     AttentionMergesList {
         attention_id: String,
         merges: Vec<AttentionMerge>,
     },
-    WorkItemDeleted {
-        id: String,
-    },
+    #[worker(passthrough)]
+    WorkItemDeleted { id: String },
     /// Reply to [`FrontendRequest::RestoreWorkItem`]. Carries the
     /// now-live work item so the CLI can echo its friendly id / name.
-    WorkItemRestored {
-        item: WorkItem,
-    },
-    WorkError {
-        message: String,
-    },
+    #[worker(passthrough)]
+    WorkItemRestored { item: WorkItem },
+    #[worker(passthrough)]
+    WorkError { message: String },
     /// Returned instead of `WorkError` when a create is rejected because
     /// a non-deleted task/chore in the same product has an identical name
     /// and was created within the last 60 seconds. Carries enough info for
     /// the CLI to display a helpful message and for `--json` consumers to
     /// act on the existing row. Pass `force_duplicate: true` in the input
     /// to bypass the guard and insert unconditionally.
+    #[worker(passthrough)]
     WorkItemDuplicateBlocked {
         /// Primary id of the existing row that triggered the guard.
         existing_id: String,
@@ -321,11 +308,11 @@ pub enum FrontendEvent {
         /// Seconds elapsed since the existing row was created.
         age_secs: i64,
     },
-    Error {
-        message: String,
-    },
+    #[worker(passthrough)]
+    Error { message: String },
     /// Engine confirms the calling session is now the registered app
     /// session, and any prior registration was invalidated.
+    #[worker(passthrough)]
     AppSessionRegistered,
     /// Engine's live pool-size configuration, pushed to the macOS app
     /// immediately after [`FrontendEvent::AppSessionRegistered`] so the
@@ -334,6 +321,7 @@ pub enum FrontendEvent {
     /// of truth; the app must configure itself from this on every
     /// connection rather than relying on independently-maintained
     /// hardcoded counts that drift when pool sizes change.
+    #[worker(passthrough)]
     EnginePoolConfig {
         worker_slots: u8,
         automation_slots: u8,
@@ -356,6 +344,7 @@ pub enum FrontendEvent {
     /// [`ProbeDeliveryExpectation::is_best_effort`] on `expected_delivery`
     /// and surface the caveat, because a caller told only "accepted" for a
     /// best-effort probe will assume the text landed.
+    #[worker(passthrough)]
     ProbeQueued {
         run_id: String,
         probe_id: String,
@@ -389,12 +378,11 @@ pub enum FrontendEvent {
     /// Clients must treat this as a failure — a non-zero exit for a CLI. An
     /// accepted-but-undeliverable probe is indistinguishable from one about
     /// to arrive, so a refusal must be reported as a refusal.
-    ProbeRefused {
-        run_id: String,
-        reason: String,
-    },
+    #[worker(passthrough)]
+    ProbeRefused { run_id: String, reason: String },
     /// Current delivery state of the probe named by `probe_id`, answering
     /// [`FrontendRequest::ProbeStatus`].
+    #[worker(passthrough)]
     ProbeStatusResult {
         run_id: String,
         probe_id: String,
@@ -425,6 +413,7 @@ pub enum FrontendEvent {
     /// `probe_id` matches the value [`FrontendEvent::ProbeQueued`]
     /// returned for the originating [`FrontendRequest::ProbeRun`]
     /// call. Pushed on the [`probe_topic`] for `run_id`.
+    #[worker(passthrough)]
     ProbeReplied {
         run_id: String,
         probe_id: String,
@@ -449,6 +438,7 @@ pub enum FrontendEvent {
     /// done about the in-flight turn to get there, and `interrupt_attempts`
     /// how many of the driver's declared attempts were spent — `0` when no
     /// gesture was sent at all.
+    #[worker(passthrough)]
     ProbeDelivered {
         run_id: String,
         probe_id: String,
@@ -476,6 +466,7 @@ pub enum FrontendEvent {
     /// Push: a mid-turn probe write could not be confirmed delivered.
     /// NOT proof of loss — left `Unconfirmed` (not auto-re-queued, to
     /// avoid duplicate delivery); the observer decides on redelivery.
+    #[worker(passthrough)]
     ProbeDeliveryEscalated {
         run_id: String,
         probe_id: String,
@@ -485,12 +476,12 @@ pub enum FrontendEvent {
     /// been kicked off and (if applicable) the cube workspace lease
     /// released. The reply does not wait for the tmux session
     /// teardown to finish; teardown is asynchronous.
-    RunStopped {
-        run_id: String,
-    },
+    #[worker(passthrough)]
+    RunStopped { run_id: String },
     /// Engine acknowledges a [`FrontendRequest::HoldRun`] — the run is
     /// now exempt from the idle-park and auto-reap sweeps. `reason`
     /// echoes back whatever the caller supplied, if any.
+    #[worker(passthrough)]
     RunHeld {
         run_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -499,24 +490,22 @@ pub enum FrontendEvent {
     /// Engine acknowledges a [`FrontendRequest::ReleaseHoldRun`] — the
     /// idle-park/auto-reap sweeps' normal behavior is restored for the
     /// run.
-    RunHoldReleased {
-        run_id: String,
-    },
+    #[worker(passthrough)]
+    RunHoldReleased { run_id: String },
     /// Engine acknowledges a focus request — the worker pane has
     /// been raised in the macOS app. Carries the resolved `slot_id`
     /// so the caller (e.g. `bossctl agents focus`) can confirm which
     /// slot was raised when the agent reference was a crew name or
     /// run id.
-    WorkerPaneFocused {
-        run_id: String,
-        slot_id: u8,
-    },
+    #[worker(passthrough)]
+    WorkerPaneFocused { run_id: String, slot_id: u8 },
     /// Engine acknowledges a `SendInputToWorker` request — the text
     /// has been written into the worker pane via the same surface a
     /// user-typed keystroke takes. Carries the resolved `slot_id` so
     /// the caller (e.g. `bossctl agents send`) can confirm which
     /// pane was targeted when the agent reference was a crew name
     /// or run id.
+    #[worker(passthrough)]
     WorkerInputSent {
         run_id: String,
         slot_id: u8,
@@ -529,14 +518,13 @@ pub enum FrontendEvent {
     /// resolved `slot_id` so the caller can confirm which slot was
     /// interrupted when the agent reference was a crew name or run
     /// id.
-    WorkerPaneInterrupted {
-        run_id: String,
-        slot_id: u8,
-    },
+    #[worker(passthrough)]
+    WorkerPaneInterrupted { run_id: String, slot_id: u8 },
     /// Engine asks the registered app session to perform a pane
     /// operation. The app must reply with a
     /// [`FrontendRequest::EngineResponse`] carrying the same
     /// `request_id`.
+    #[worker(passthrough)]
     EngineRequest {
         request_id: String,
         request: EngineToAppRequest,
@@ -546,6 +534,7 @@ pub enum FrontendEvent {
     /// and the body of pushes on the `worker.live_states` topic. The
     /// list is the entire snapshot, not a delta — receivers can
     /// blindly replace their local map.
+    #[worker(passthrough)]
     WorkerLiveStatesList {
         states: Vec<LiveWorkerState>,
         /// Board payload keyed by owning work-item id. Replaces the entire
@@ -561,36 +550,30 @@ pub enum FrontendEvent {
     /// On-demand tmux evidence for the current live-worker snapshot. Kept
     /// separate from [`Self::WorkerLiveStatesList`] so hook broadcasts do not
     /// run external tmux probes.
-    TmuxWorkerStatusesList {
-        statuses: Vec<TmuxWorkerStatus>,
-    },
+    #[worker(passthrough)]
+    TmuxWorkerStatusesList { statuses: Vec<TmuxWorkerStatus> },
     /// Engine confirms an execution has been cancelled. The cancelled
     /// row's status is now `cancelled`; resource teardown (pane
     /// release, cube workspace release) is asynchronous.
-    ExecutionCancelled {
-        execution: WorkExecution,
-    },
+    #[worker(transform = execution_cancelled)]
+    ExecutionCancelled { execution: WorkExecution },
     /// Engine confirms a manual orphan reap. The execution row is now
     /// in the terminal `orphaned` status; its cube workspace lease has
     /// intentionally been left intact so a fresh execution can resume
     /// against the same branch.
-    RunReaped {
-        run_id: String,
-        execution: WorkExecution,
-    },
+    #[worker(transform = run_reaped)]
+    RunReaped { run_id: String, execution: WorkExecution },
     /// Engine acknowledges a [`FrontendRequest::RetirePane`] — the
     /// husk pane in `slot_id` has been instructed to tear down (or the
     /// app reported the slot as already unknown/idle) and any
     /// lingering engine-side bookkeeping for the slot has been
     /// cleared.
-    PaneRetired {
-        slot_id: u8,
-    },
+    #[worker(passthrough)]
+    PaneRetired { slot_id: u8 },
     /// Reply to [`FrontendRequest::ListHostedPaneStatuses`]. Empty when
     /// the app hosts no panes at all.
-    HostedPaneStatusList {
-        panes: Vec<HostedPaneStatus>,
-    },
+    #[worker(passthrough)]
+    HostedPaneStatusList { panes: Vec<HostedPaneStatus> },
     /// Trailing transcript chunk for a run. `lines` are the raw JSONL
     /// lines the engine read off the recorded transcript path
     /// (newest-last), verbatim in the producing driver's own dialect —
@@ -600,6 +583,7 @@ pub enum FrontendEvent {
     /// is set when the file had more lines than were returned. `driver` is
     /// the slug that governed the run (e.g. `"claude"`, `"codex"`,
     /// `"grok"`), or `None` when it could not be resolved.
+    #[worker(passthrough)]
     RunTranscriptTail {
         run_id: String,
         transcript_path: String,
@@ -612,6 +596,7 @@ pub enum FrontendEvent {
     /// is still running; `complete` is the inverse. The app renders
     /// segments lazily — one segment at a time — to avoid building a
     /// full MarkdownUI AST for the entire document.
+    #[worker(passthrough)]
     ExecutionTranscriptResult {
         execution_id: String,
         segments: Vec<TranscriptSegment>,
@@ -624,30 +609,26 @@ pub enum FrontendEvent {
     /// worker may never have started a Claude Code session, the JSONL
     /// was rotated or GC'd, or no `transcript_path` row was ever
     /// recorded. `reason` is a human-readable explanation.
-    ExecutionTranscriptUnavailable {
-        execution_id: String,
-        reason: String,
-    },
+    #[worker(passthrough)]
+    ExecutionTranscriptUnavailable { execution_id: String, reason: String },
     /// Snapshot of the cube workspace pool. The engine proxies
     /// `cube --json workspace list`; each entry corresponds to one
     /// workspace cube knows about, annotated (when the engine has
     /// matching state) with the execution id currently leasing it.
-    WorkspacePoolSummaryResult {
-        workspaces: Vec<WorkspacePoolEntry>,
-    },
+    #[worker(passthrough)]
+    WorkspacePoolSummaryResult { workspaces: Vec<WorkspacePoolEntry> },
     /// Snapshot of every engine worker pool's own claim bookkeeping,
     /// as requested by [`FrontendRequest::WorkerPoolSummary`].
-    WorkerPoolSummaryResult {
-        pools: Vec<WorkerPoolEntry>,
-    },
+    #[worker(passthrough)]
+    WorkerPoolSummaryResult { pools: Vec<WorkerPoolEntry> },
     /// Engine confirms a dependency edge has been added. Returns the
     /// row that was inserted (or the existing row if the call was an
     /// idempotent re-add).
-    DependencyAdded {
-        edge: WorkItemDependency,
-    },
+    #[worker(passthrough)]
+    DependencyAdded { edge: WorkItemDependency },
     /// Engine confirms a dependency edge has been removed (or that no
     /// matching edge existed to begin with — also a success).
+    #[worker(passthrough)]
     DependencyRemoved {
         dependent_id: String,
         prerequisite_id: String,
@@ -656,54 +637,47 @@ pub enum FrontendEvent {
     },
     /// Edge listing for a single work item, with prerequisites and
     /// dependents in two parallel lists.
-    DependencyList {
-        view: WorkItemDependencyView,
-    },
+    #[worker(passthrough)]
+    DependencyList { view: WorkItemDependencyView },
     /// Resolved edge listing — same shape as
     /// [`Self::DependencyList`] but each side carries the peer's
     /// status and name already joined in.
-    DependencyDetail {
-        detail: WorkItemDependencyDetail,
-    },
+    #[worker(passthrough)]
+    DependencyDetail { detail: WorkItemDependencyDetail },
     /// Response to [`FrontendRequest::SetLiveStatusEnabled`]. Carries
     /// the resulting enabled flag for the slot so the caller can
     /// distinguish "applied" from "already in that state" if it
     /// wants.
-    LiveStatusEnabledSet {
-        slot_id: u8,
-        enabled: bool,
-    },
+    #[worker(passthrough)]
+    LiveStatusEnabledSet { slot_id: u8, enabled: bool },
     /// Snapshot of which slots currently have the live-status
     /// summarizer disabled. The UI uses this to render the toggle
     /// state on the Agents-tab worker row.
-    LiveStatusDisabledSlotsList {
-        slot_ids: Vec<u8>,
-    },
+    #[worker(passthrough)]
+    LiveStatusDisabledSlotsList { slot_ids: Vec<u8> },
     /// One-shot diagnostic snapshot of the live-status pipeline, in
     /// response to [`FrontendRequest::DebugLiveStatusPipeline`]. The
     /// full shape is documented on [`crate::LiveStatusDebugReport`].
-    LiveStatusDebugReportEvent {
-        report: crate::LiveStatusDebugReport,
-    },
+    #[worker(passthrough)]
+    LiveStatusDebugReportEvent { report: crate::LiveStatusDebugReport },
     /// Response to [`FrontendRequest::ResolveProjectDesignDoc`]: the
     /// resolved pointer state for a single project. Carried inline
     /// (not flattened) so the kanban can deserialise straight into a
     /// `ResolveProjectDesignDocOutput` without going through the
     /// envelope.
-    ProjectDesignDocResolved {
-        output: ResolveProjectDesignDocOutput,
-    },
+    #[worker(passthrough)]
+    ProjectDesignDocResolved { output: ResolveProjectDesignDocOutput },
     /// Response to [`FrontendRequest::ResolveExecutionLabels`]: one
     /// [`crate::ExecutionWorkLabel`] per requested execution id, in request
     /// order.
-    ExecutionLabelsResolved {
-        labels: Vec<crate::ExecutionWorkLabel>,
-    },
+    #[worker(passthrough)]
+    ExecutionLabelsResolved { labels: Vec<crate::ExecutionWorkLabel> },
     /// Response to [`FrontendRequest::ListProductDesignDocs`]: the
     /// markdown listing at HEAD of the product's repo, or the
     /// classified reason there isn't one. `product_id` is echoed so a
     /// client that switched products mid-flight can discard a reply
     /// for the product it is no longer showing.
+    #[worker(passthrough)]
     ProductDesignDocsList {
         product_id: String,
         state: DesignDocTreeState,
@@ -713,6 +687,7 @@ pub enum FrontendEvent {
     /// `(repo, path, ref)` triple is echoed so the reader pane can
     /// confirm the reply matches the document it is currently showing
     /// and drop a late reply for a previous selection.
+    #[worker(passthrough)]
     ProductDesignDocContent {
         repo_remote_url: String,
         path: String,
@@ -724,28 +699,23 @@ pub enum FrontendEvent {
     /// post-update `conflict_resolutions` row. Carries the full row
     /// so the CLI can pretty-print "attempt foo flipped to failed,
     /// reason bar" without a follow-up `get`.
-    ConflictResolutionMarkedFailed {
-        attempt: ConflictResolution,
-    },
+    #[worker(passthrough)]
+    ConflictResolutionMarkedFailed { attempt: ConflictResolution },
     /// Response to [`FrontendRequest::ClassifyCiRemediation`]: the
     /// `ci_remediations` row after the `triage_class` column has been
     /// stamped.
-    CiRemediationClassified {
-        attempt: CiRemediation,
-    },
+    #[worker(passthrough)]
+    CiRemediationClassified { attempt: CiRemediation },
     /// Response to [`FrontendRequest::MarkCiRemediationFailed`]: the
     /// row after the flip to `failed`.
-    CiRemediationMarkedFailed {
-        attempt: CiRemediation,
-    },
+    #[worker(passthrough)]
+    CiRemediationMarkedFailed { attempt: CiRemediation },
     /// Response to [`FrontendRequest::MarkCiRemediationRetriggered`]:
     /// the row after the engine logged the retrigger. `new_id` echoes
     /// the provider id the worker passed in for the CLI's "marker
     /// recorded" line.
-    CiRemediationRetriggered {
-        attempt: CiRemediation,
-        new_id: String,
-    },
+    #[worker(passthrough)]
+    CiRemediationRetriggered { attempt: CiRemediation, new_id: String },
     /// HONORED response to
     /// [`FrontendRequest::MarkCiRemediationSucceededViaRebase`]: the
     /// engine independently re-probed live CI and verified every
@@ -754,6 +724,7 @@ pub enum FrontendEvent {
     /// decremented `tasks.ci_attempts_used` — `false` when the attempt
     /// was a `retrigger` (which didn't consume budget to begin with) or
     /// when the row was already terminal (idempotent echo).
+    #[worker(passthrough)]
     CiRemediationSucceededViaRebase {
         attempt: CiRemediation,
         budget_refunded: bool,
@@ -766,8 +737,9 @@ pub enum FrontendEvent {
     /// still-pending, PR closed). The attempt row is untouched and
     /// stays actionable — no budget refund, no `CiRemediationSucceeded`
     /// event. The CLI surfaces this as a non-zero exit so the receipt is
-    /// an honest pass/fail (T2764 postmortem: a worker calling this verb
+    /// an honest pass/fail (a worker calling this verb
     /// before CI has settled must get a rejection, not a recorded lie).
+    #[worker(passthrough)]
     CiRemediationSucceededViaRebaseRejected {
         attempt_id: String,
         work_item_id: String,
@@ -784,6 +756,7 @@ pub enum FrontendEvent {
     /// loop. `observed_sha` echoes what the worker reported, so the
     /// CLI can note when the head advanced and the engine re-validated
     /// against the new SHA.
+    #[worker(passthrough)]
     CiRemediationNoopValidated {
         attempt: CiRemediation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -799,6 +772,7 @@ pub enum FrontendEvent {
     /// stays actionable — the worker has not escaped the failure. The
     /// CLI surfaces this as a non-zero exit so the receipt is an
     /// honest pass/fail.
+    #[worker(passthrough)]
     CiRemediationNoopRejected {
         attempt_id: String,
         work_item_id: String,
@@ -811,35 +785,31 @@ pub enum FrontendEvent {
     },
     /// Response to [`FrontendRequest::ListConflictResolutions`]: the
     /// filtered set of rows, ordered freshest-first.
-    ConflictResolutionsList {
-        attempts: Vec<ConflictResolution>,
-    },
+    #[worker(passthrough)]
+    ConflictResolutionsList { attempts: Vec<ConflictResolution> },
     /// Response to [`FrontendRequest::GetConflictHotspots`].
-    ConflictHotspots {
-        report: ConflictHotspotReport,
-    },
+    #[worker(passthrough)]
+    ConflictHotspots { report: ConflictHotspotReport },
     /// Response to [`FrontendRequest::GetConflictResolution`]: a single
     /// row by id.
-    ConflictResolution {
-        attempt: ConflictResolution,
-    },
+    #[worker(passthrough)]
+    ConflictResolution { attempt: ConflictResolution },
     /// Response to [`FrontendRequest::RetryConflictResolution`]: the
     /// row after the reset to `pending`. The engine has already
     /// re-flipped the parent work item back to `blocked:
     /// merge_conflict` so the dispatcher can pick up the new attempt.
-    ConflictResolutionRetried {
-        attempt: ConflictResolution,
-    },
+    #[worker(passthrough)]
+    ConflictResolutionRetried { attempt: ConflictResolution },
     /// Response to [`FrontendRequest::AbandonConflictResolution`]: the
     /// row after the flip to `abandoned`.
-    ConflictResolutionMarkedAbandoned {
-        attempt: ConflictResolution,
-    },
+    #[worker(passthrough)]
+    ConflictResolutionMarkedAbandoned { attempt: ConflictResolution },
     /// Activity-feed push: a fresh conflict-resolution attempt has been
     /// created for an in-review PR and a worker is about to take over
     /// (Phase 4 / design Q8). Broadcast on the parent product's
     /// work-tree topic so the macOS app can render an activity-feed
     /// entry without having to poll.
+    #[worker(passthrough)]
     ConflictResolutionStarted {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -852,6 +822,7 @@ pub enum FrontendEvent {
     /// parent has been flipped from `blocked: merge_conflict` back to
     /// `in_review`; the attempt row is `succeeded`; the worker's cube
     /// workspace lease has been released (if not already).
+    #[worker(passthrough)]
     ConflictResolutionSucceeded {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -865,6 +836,7 @@ pub enum FrontendEvent {
     /// catch-all (`no_push_no_stop_condition`) fires, or any other
     /// terminal-failure transition. The parent remains `blocked:
     /// merge_conflict`; the user is the next actor.
+    #[worker(passthrough)]
     ConflictResolutionFailed {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -878,6 +850,7 @@ pub enum FrontendEvent {
     /// away on purpose (PR closed, parent merged externally, manual
     /// override). The parent has typically already moved out of
     /// `blocked: merge_conflict` by some other path.
+    #[worker(passthrough)]
     ConflictResolutionAbandoned {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -886,7 +859,7 @@ pub enum FrontendEvent {
         pr_url: String,
         failure_reason: String,
     },
-    /// Advisory push (Layer 4 / T11, `stacked-pr-auto-structuring`): two
+    /// Advisory push for automatic PR stacking: two
     /// *in-flight* PR branches are predicted to conflict with each other —
     /// their changed-file sets overlap on non-mechanical files — so the
     /// engine offers to restack the newer PR (`dependent`) on top of the
@@ -897,6 +870,7 @@ pub enum FrontendEvent {
     /// flow, which is designed but not yet shipped). `base` is the PR with
     /// the lower number (the older, likelier-to-merge-first branch);
     /// `dependent` is the higher-numbered one that would rebase onto it.
+    #[worker(passthrough)]
     StackProposalOffered {
         product_id: String,
         base_pr_url: String,
@@ -909,6 +883,7 @@ pub enum FrontendEvent {
     /// created for an in-review PR (design §"CI worker spawn",
     /// Phase 8 #22). `attempt_kind` is `"fix"` or `"retrigger"` —
     /// the engine's pre-spawn triage decision.
+    #[worker(passthrough)]
     CiRemediationStarted {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -921,6 +896,7 @@ pub enum FrontendEvent {
     /// CI clean and retired the remediation attempt. The parent has
     /// been flipped from `blocked: ci_failure` back to `in_review`;
     /// the attempt row is `succeeded`.
+    #[worker(passthrough)]
     CiRemediationSucceeded {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -935,6 +911,7 @@ pub enum FrontendEvent {
     /// path). Distinct from `CiRemediationSucceeded` because the
     /// clearance was NOT driven by an auto-fix: the UI should clear the
     /// `ci failing` badge but must NOT set the `ci auto-fixed` badge.
+    #[worker(passthrough)]
     CiFailureCleared {
         product_id: String,
         work_item_id: String,
@@ -944,6 +921,7 @@ pub enum FrontendEvent {
     /// `failed`. Emitted when the worker calls
     /// `boss engine ci mark-failed` or when the completion path's
     /// catch-all fires. The parent remains `blocked: ci_failure`.
+    #[worker(passthrough)]
     CiRemediationFailed {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -955,6 +933,7 @@ pub enum FrontendEvent {
     /// Activity-feed push: a CI-remediation attempt was abandoned
     /// (engine declined to spawn — opt-out, suppression, or
     /// budget-related path).
+    #[worker(passthrough)]
     CiRemediationAbandoned {
         attempt: EngineAttemptListEntry,
         product_id: String,
@@ -967,6 +946,7 @@ pub enum FrontendEvent {
     /// PR's CI. The parent is now `blocked: ci_failure_exhausted` and
     /// the user is the next actor — typically via
     /// `boss engine ci retry <work-item-id>`.
+    #[worker(passthrough)]
     CiRemediationExhausted {
         product_id: String,
         work_item_id: String,
@@ -986,6 +966,7 @@ pub enum FrontendEvent {
     /// from `CiRemediationSucceeded` (CI is not yet green) and from
     /// `CiRemediationFailed` (the worker did not give up — it deflected to
     /// infra).
+    #[worker(passthrough)]
     CiRemediationFlakyRetriggered {
         product_id: String,
         work_item_id: String,
@@ -1002,6 +983,7 @@ pub enum FrontendEvent {
     /// observed duration. Emitted at most once per bucket per
     /// `(work_item_id, head_sha)` pair so the UI / log doesn't churn
     /// on every poll.
+    #[worker(passthrough)]
     CiNeverStartsAlert {
         product_id: String,
         work_item_id: String,
@@ -1014,40 +996,33 @@ pub enum FrontendEvent {
     /// the per-marker under-classification analysis for one
     /// product. Read-only snapshot; the engine recomputes from
     /// scratch each call.
-    EffortAuditReport {
-        report: crate::EffortAuditReport,
-    },
+    #[worker(passthrough)]
+    EffortAuditReport { report: crate::EffortAuditReport },
     /// Response to [`FrontendRequest::RecordEffortEscalation`].
     /// Carries the inserted row with engine-assigned `id` and
     /// `created_at`.
-    EffortEscalationRecorded {
-        event: crate::EffortEscalation,
-    },
+    #[worker(passthrough)]
+    EffortEscalationRecorded { event: crate::EffortEscalation },
     /// Response to [`FrontendRequest::GetStuckReport`].
-    StuckReport {
-        report: crate::StuckReport,
-    },
+    #[worker(passthrough)]
+    StuckReport { report: crate::StuckReport },
 
     /// Response to [`FrontendRequest::GetWorkItemCostReport`].
-    WorkItemCostReport {
-        report: crate::TaskCostReport,
-    },
+    #[worker(passthrough)]
+    WorkItemCostReport { report: crate::TaskCostReport },
     /// Response to [`FrontendRequest::GetCostWindowReport`].
-    CostWindowReport {
-        report: crate::WindowCostReport,
-    },
-    CodexSolPercentage {
-        percentage: u8,
-    },
-    SolComparisonReport {
-        report: crate::SolComparisonReport,
-    },
+    #[worker(passthrough)]
+    CostWindowReport { report: crate::WindowCostReport },
+    #[worker(passthrough)]
+    CodexSolPercentage { percentage: u8 },
+    #[worker(passthrough)]
+    SolComparisonReport { report: crate::SolComparisonReport },
     /// Response to [`FrontendRequest::GetTopCostConsumers`].
-    TopCostConsumers {
-        report: crate::TopCostReport,
-    },
+    #[worker(passthrough)]
+    TopCostConsumers { report: crate::TopCostReport },
     /// Response to [`FrontendRequest::ListPlannerRuns`]: every
     /// `planner_runs` audit row for the project, newest first.
+    #[worker(passthrough)]
     PlannerRunsList {
         project_id: String,
         runs: Vec<crate::PlannerRun>,
@@ -1059,6 +1034,7 @@ pub enum FrontendEvent {
     /// event). `message` is a human-readable summary. `proposal` carries
     /// the full task-graph proposal only when the plan produced a valid
     /// one — a real `staged` apply or a successful dry-run preview.
+    #[worker(passthrough)]
     PlanProjectResult {
         project_id: String,
         outcome: String,
@@ -1075,21 +1051,18 @@ pub enum FrontendEvent {
         proposal: Option<crate::PlannerOutput>,
     },
     /// Response to [`FrontendRequest::StartProjectPostmortem`].
-    ProjectPostmortemResult {
-        task: Task,
-        created: bool,
-    },
+    #[worker(passthrough)]
+    ProjectPostmortemResult { task: Task, created: bool },
     /// Response to [`FrontendRequest::ReleaseProject`].
+    #[worker(passthrough)]
     ReleaseProjectResult {
         project_id: String,
         run_id: String,
         released: usize,
     },
     /// Spoke-local receipt or revisioned cached read. Never implies hub acceptance.
-    WorkerGatewayResult {
-        status: String,
-        value: serde_json::Value,
-    },
+    #[worker(passthrough)]
+    WorkerGatewayResult { status: String, value: serde_json::Value },
     /// Success reply to [`FrontendRequest::SubmitProposal`]: the row is
     /// durable. `proposal` is the persisted `worker_proposals` row —
     /// engine-assigned `id` (`prp_…`), the canonicalised `payload_json`, and
@@ -1104,6 +1077,7 @@ pub enum FrontendEvent {
     ///
     /// Every row lands in `state: proposed` today: the apply pipeline is a
     /// later task, so nothing observes these rows yet.
+    #[worker(passthrough)]
     ProposalSubmitted {
         proposal: WorkerProposal,
         already_submitted: bool,
@@ -1121,9 +1095,8 @@ pub enum FrontendEvent {
     /// vocabulary is the same one (the attribution codes are literally
     /// identical, since both verbs resolve the caller from the socket peer),
     /// and a worker that has learned to read one has learned to read both.
-    ProposalRejected {
-        error: ProposalSubmissionError,
-    },
+    #[worker(passthrough)]
+    ProposalRejected { error: ProposalSubmissionError },
     /// Refusal reply to *any* [`FrontendRequest`] that a worker-tier
     /// connection is not permitted to call. Sent instead of executing the
     /// verb, from a gate that runs before dispatch — so no handler ever sees
@@ -1134,13 +1107,13 @@ pub enum FrontendEvent {
     /// verb to call instead (usually a `boss propose …`), which is the whole
     /// point of converting the mediation policy from prompt-enforced to
     /// engine-enforced.
-    WorkerTierDenied {
-        denial: WorkerTierDenial,
-    },
+    #[worker(passthrough)]
+    WorkerTierDenied { denial: WorkerTierDenial },
     /// Response to [`FrontendRequest::ListProposals`]: every proposal filed
     /// against `work_item_id` across all its executions, newest first, with
     /// dispositions attached. `work_item_id` echoes the scope the engine
     /// derived from the caller's attributed execution.
+    #[worker(passthrough)]
     ProposalsList {
         work_item_id: String,
         proposals: Vec<WorkerProposal>,
@@ -1158,6 +1131,7 @@ pub enum FrontendEvent {
     /// or failed to bind, which is exactly when a caller must **not** invent
     /// a URL — the image is stored and inspectable via `bossctl attachments`,
     /// but there is no local gallery link to follow until the surface binds.
+    #[worker(passthrough)]
     AttachmentStored {
         attachment: WorkAttachment,
         already_stored: bool,
@@ -1174,6 +1148,7 @@ pub enum FrontendEvent {
     /// worker-tier reply — the app tier reads attachment bytes directly off
     /// disk and always sends `None` here, deliberately never minting a
     /// loopback URL for the app to follow.
+    #[worker(passthrough)]
     AttachmentsList {
         work_item_id: String,
         attachments: Vec<WorkAttachment>,
@@ -1185,20 +1160,17 @@ pub enum FrontendEvent {
     /// attributed execution. Boxed: an inline `WorkerContextBundle` here
     /// would make this variant far larger than its siblings
     /// (clippy::large_enum_variant) — serializes identically.
-    WorkerContextResult {
-        bundle: Box<WorkerContextBundle>,
-    },
+    #[worker(passthrough)]
+    WorkerContextResult { bundle: Box<WorkerContextBundle> },
     /// Reply for [`FrontendRequest::GetPrStatus`]: the caller's own PR's
     /// mergeability as Boss last observed it (or, with `refresh: true` and
     /// budget available, a fresh on-demand probe).
-    PrStatusResult {
-        status: PrStatusView,
-    },
+    #[worker(passthrough)]
+    PrStatusResult { status: PrStatusView },
     /// Reply for [`FrontendRequest::GetPrBody`]: the caller's own PR's body
     /// as Boss snapshotted it at the start of this execution's run.
-    PrBodyResult {
-        body: PrBodyView,
-    },
+    #[worker(passthrough)]
+    PrBodyResult { body: PrBodyView },
     /// Reply for [`FrontendRequest::GetCoordinatorHandoff`]. `handoff` is
     /// `None` only when no coordinator session has ever written one; a
     /// stored-but-undecodable handoff is reported as `WorkError` instead.
@@ -1206,6 +1178,7 @@ pub enum FrontendEvent {
     /// coordinator ancestry who explicitly asks the engine to redeliver
     /// the handoff write credential to the main session's inbox; it
     /// reports whether that redelivery was accepted or which step failed.
+    #[worker(passthrough)]
     CoordinatorHandoffResult {
         handoff: Option<CoordinatorHandoffView>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1213,19 +1186,18 @@ pub enum FrontendEvent {
     },
     /// Reply for [`FrontendRequest::SetCoordinatorHandoff`]: the handoff
     /// as persisted, stamped with the write time and writer session.
-    CoordinatorHandoffSet {
-        handoff: CoordinatorHandoffView,
-    },
+    #[worker(passthrough)]
+    CoordinatorHandoffSet { handoff: CoordinatorHandoffView },
     /// Reply for [`FrontendRequest::ListCoordinatorGuidance`]: one entry
     /// per product asked about, each carrying the explicit state of its
     /// `BOSS_COORDINATOR.md` and the commit sha it was resolved at.
-    CoordinatorGuidanceList {
-        guidance: Vec<CoordinatorGuidanceView>,
-    },
+    #[worker(passthrough)]
+    CoordinatorGuidanceList { guidance: Vec<CoordinatorGuidanceView> },
     /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
     /// carries the ids of tasks soft-deleted; `preserved` carries the
     /// tasks that already had an execution (released and dispatched)
     /// and were left alone.
+    #[worker(passthrough)]
     UnpopulateProjectResult {
         project_id: String,
         run_id: String,
@@ -1236,18 +1208,15 @@ pub enum FrontendEvent {
     /// of every registered engine feature flag plus its current
     /// effective value. Order is registry order so the debug pane
     /// renders flags in a stable, predictable sequence.
-    FeatureFlagsList {
-        flags: Vec<FeatureFlagSnapshot>,
-    },
+    #[worker(passthrough)]
+    FeatureFlagsList { flags: Vec<FeatureFlagSnapshot> },
     /// Response to [`FrontendRequest::SetFeatureFlag`]: the engine has
     /// updated and persisted the named flag to `enabled`. Receiving
     /// this event is the debug pane's "reload confirmed" signal — the
     /// new value is in effect immediately for all subsequent
     /// consumer-side checks.
-    FeatureFlagSet {
-        name: String,
-        enabled: bool,
-    },
+    #[worker(passthrough)]
+    FeatureFlagSet { name: String, enabled: bool },
     /// Response to [`FrontendRequest::GetEngineVersion`]: identifies
     /// the running engine binary. `binary_fingerprint` is the most
     /// reliable signal — it is a truncated SHA-256 of the engine
@@ -1260,6 +1229,7 @@ pub enum FrontendEvent {
     /// or `"unknown"` if unstamped). `git_sha` and `build_time` are
     /// included for human-readable logging; they may be "unknown"
     /// in Cargo (non-Bazel) builds.
+    #[worker(passthrough)]
     EngineVersionResult {
         version: String,
         git_sha: String,
@@ -1270,17 +1240,16 @@ pub enum FrontendEvent {
     /// current user-visible configuration health. Empty `issues` means
     /// the engine is healthy; a non-empty list is the UI's signal to
     /// render the banner / settings-pane warning.
-    EngineHealthResult {
-        report: EngineHealthReport,
-    },
+    #[worker(passthrough)]
+    EngineHealthResult { report: EngineHealthReport },
     /// Response to [`FrontendRequest::GetSettings`]: a snapshot of every
     /// registered per-installation setting and its current value.
-    SettingsList {
-        settings: Vec<SettingSnapshot>,
-    },
+    #[worker(passthrough)]
+    SettingsList { settings: Vec<SettingSnapshot> },
     /// Response to [`FrontendRequest::GetOffsiteBackup`] and
     /// [`FrontendRequest::SetOffsiteBackup`]: the persisted off-machine
     /// backup configuration.
+    #[worker(passthrough)]
     OffsiteBackupSettings {
         #[serde(flatten)]
         settings: OffsiteBackupSettings,
@@ -1288,16 +1257,15 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::SetSetting`]: the engine has
     /// persisted the new value. The macOS Settings window uses this as
     /// the "saved" signal to commit the toggle state.
-    SettingSet {
-        key: String,
-        enabled: bool,
-    },
+    #[worker(passthrough)]
+    SettingSet { key: String, enabled: bool },
     /// Response to [`FrontendRequest::GetSelectedProduct`]: what the
     /// engine knows about the Boss UI's product chooser, including the
     /// specific reason when it knows nothing. Flattened, so the JSON is
     /// `{"type":"selected_product_result","status":"selected",…}` —
     /// `status` is the field a caller branches on, never an inferred
     /// default.
+    #[worker(passthrough)]
     SelectedProductResult {
         #[serde(flatten)]
         state: SelectedProductState,
@@ -1308,50 +1276,44 @@ pub enum FrontendEvent {
     /// selection it already had. The app ignores this event; it exists
     /// so the report is not silently swallowed and so tests can assert
     /// the rejection.
-    SelectedProductReported {
-        accepted: bool,
-    },
+    #[worker(passthrough)]
+    SelectedProductReported { accepted: bool },
     /// Response to [`FrontendRequest::ListHosts`]: every registered
     /// host (including `local`) with its capabilities.
-    HostsList {
-        hosts: Vec<HostSnapshot>,
-    },
+    #[worker(passthrough)]
+    HostsList { hosts: Vec<HostSnapshot> },
     /// Response to [`FrontendRequest::GetHost`] or
     /// [`FrontendRequest::AddHost`]: one host with all capabilities.
-    HostResult {
-        host: HostSnapshot,
-    },
+    #[worker(passthrough)]
+    HostResult { host: HostSnapshot },
     /// Response to [`FrontendRequest::SetHostEnabled`],
     /// [`FrontendRequest::AddHostTag`], or
     /// [`FrontendRequest::RemoveHostTag`]: the updated host snapshot.
-    HostUpdated {
-        host: HostSnapshot,
-    },
+    #[worker(passthrough)]
+    HostUpdated { host: HostSnapshot },
     /// Response to [`FrontendRequest::RemoveHost`]: the host has been
     /// deleted. `id` is the id that was removed.
-    HostRemoved {
-        id: String,
-    },
+    #[worker(passthrough)]
+    HostRemoved { id: String },
     /// Response to [`FrontendRequest::MetricsShowLive`]: the
     /// in-memory snapshot for `name`. `entry` is `None` when no
     /// counter or gauge with that name is registered in the current
     /// engine binary.
-    MetricsShowLiveResult {
-        entry: Option<MetricLiveEntry>,
-    },
+    #[worker(passthrough)]
+    MetricsShowLiveResult { entry: Option<MetricLiveEntry> },
     /// Response to [`FrontendRequest::MetricsListLive`]: every
     /// registered counter and gauge as a flat list, sorted by name.
     /// Stale entries (rehydrated from `state.db` but no matching
     /// handle in the current binary) are included so the debug pane
     /// can surface historical values. Counters and gauges are
     /// interleaved in name order — the `kind` field distinguishes them.
-    MetricsListLiveResult {
-        entries: Vec<MetricLiveEntry>,
-    },
+    #[worker(passthrough)]
+    MetricsListLiveResult { entries: Vec<MetricLiveEntry> },
     /// Response to [`FrontendRequest::MetricsReset`]. Reports how
     /// many counters and gauges were zeroed so the caller can print a
     /// meaningful confirmation. `name = None` means "all" was
     /// requested.
+    #[worker(passthrough)]
     MetricsResetDone {
         name: Option<String>,
         counters_reset: u64,
@@ -1362,9 +1324,8 @@ pub enum FrontendEvent {
     /// poller; `false` when the kick was dropped because the engine
     /// has not yet started the poller (race at startup — treat as a
     /// no-op).
-    PrReconcilersKicked {
-        kicked: bool,
-    },
+    #[worker(passthrough)]
+    PrReconcilersKicked { kicked: bool },
     /// Response to [`FrontendRequest::SetDispatchConcurrency`] and
     /// [`FrontendRequest::GetDispatchConcurrency`]. `limit` is the current
     /// effective interactive-pool concurrency cap; `max` is the hard
@@ -1372,6 +1333,7 @@ pub enum FrontendEvent {
     /// `clamped_from` is `Some(requested)` when the most recent `Set` call
     /// asked for more than `max` and got rounded down; always `None` on a
     /// `Get` or an unclamped `Set`.
+    #[worker(passthrough)]
     DispatchConcurrencyResult {
         limit: usize,
         max: usize,
@@ -1381,24 +1343,22 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::SetDriverTrafficSplit`] and
     /// [`FrontendRequest::GetDriverTrafficSplit`]. `split` is the current
     /// effective allocation; its four shares always sum to exactly 100.
-    DriverTrafficSplitResult {
-        split: DriverTrafficSplit,
-    },
+    #[worker(passthrough)]
+    DriverTrafficSplitResult { split: DriverTrafficSplit },
     /// Response to [`FrontendRequest::GetDriverQuotaUsage`]. Carries one
     /// entry per implemented driver — each either a provider-reported
     /// figure or a typed failure, never a blank that reads as headroom.
-    DriverQuotaUsageResult {
-        snapshot: DriverQuotaSnapshot,
-    },
+    #[worker(passthrough)]
+    DriverQuotaUsageResult { snapshot: DriverQuotaSnapshot },
     /// Response to [`FrontendRequest::GetDispatchFocus`] and
     /// [`FrontendRequest::UpdateDispatchFocus`]: the focus set as it stands
     /// after the request, and how many ready executions it is holding.
-    DispatchFocusResult {
-        focus: DispatchFocusState,
-    },
+    #[worker(passthrough)]
+    DispatchFocusResult { focus: DispatchFocusState },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state
     /// and, when paused, the epoch-seconds timestamp at which it was set.
+    #[worker(passthrough)]
     DispatchStateResult {
         paused: bool,
         /// Epoch seconds when dispatch was paused. `None` when `paused = false`.
@@ -1431,6 +1391,7 @@ pub enum FrontendEvent {
     /// timestamp at which it was set. Independent of
     /// [`FrontendEvent::DispatchStateResult`] — see
     /// [`FrontendRequest::SetAutomationPaused`] for the scope.
+    #[worker(passthrough)]
     AutomationStateResult {
         paused: bool,
         /// Epoch seconds when automation was paused. `None` when `paused = false`.
@@ -1448,19 +1409,16 @@ pub enum FrontendEvent {
     /// for the named product. The pass runs synchronously; this event
     /// is the "pass started" confirmation rather than a streaming
     /// progress push.
-    ExternalTrackerSyncStarted {
-        product_id: String,
-    },
+    #[worker(passthrough)]
+    ExternalTrackerSyncStarted { product_id: String },
     /// Response to [`FrontendRequest::ListCiRemediations`]: the
     /// filtered set of `ci_remediations` rows, ordered freshest-first.
-    CiRemediationsList {
-        attempts: Vec<CiRemediation>,
-    },
+    #[worker(passthrough)]
+    CiRemediationsList { attempts: Vec<CiRemediation> },
     /// Response to [`FrontendRequest::GetCiRemediation`]: a single
     /// `ci_remediations` row by id.
-    CiRemediation {
-        attempt: CiRemediation,
-    },
+    #[worker(passthrough)]
+    CiRemediation { attempt: CiRemediation },
     /// Response to [`FrontendRequest::RetryCiRemediation`]: the parent
     /// work item's CI budget after the retry path ran. Echoes the
     /// `work_item_id` the engine resolved (so a caller that passed an
@@ -1469,6 +1427,7 @@ pub enum FrontendEvent {
     /// the time of the call (and is now back at `in_review`); `false`
     /// means the parent wasn't exhausted and the retry was a counter
     /// reset only.
+    #[worker(passthrough)]
     CiRemediationRetryDone {
         work_item_id: String,
         budget: CiBudgetSnapshot,
@@ -1476,18 +1435,15 @@ pub enum FrontendEvent {
     },
     /// Response to [`FrontendRequest::AbandonCiRemediation`]: the row
     /// after the flip to `abandoned`.
-    CiRemediationMarkedAbandoned {
-        attempt: CiRemediation,
-    },
+    #[worker(passthrough)]
+    CiRemediationMarkedAbandoned { attempt: CiRemediation },
     /// Response to [`FrontendRequest::GetCiBudget`].
-    CiBudget {
-        budget: CiBudgetSnapshot,
-    },
+    #[worker(passthrough)]
+    CiBudget { budget: CiBudgetSnapshot },
     /// Response to [`FrontendRequest::SetCiBudget`]: the post-update
     /// snapshot of the work item's CI budget.
-    CiBudgetUpdated {
-        budget: CiBudgetSnapshot,
-    },
+    #[worker(passthrough)]
+    CiBudgetUpdated { budget: CiBudgetSnapshot },
     /// Response to [`FrontendRequest::ListEngineAttempts`]: the
     /// projected and merged row set, ordered freshest-first across the
     /// three attempt subsystems.
@@ -1502,6 +1458,7 @@ pub enum FrontendEvent {
     /// length verbatim rather than a second field that could desync.
     /// See
     /// `background-task-visibility-toolbar-affordance-for-engine-background-work.md`.
+    #[worker(passthrough)]
     EngineAttemptsList {
         attempts: Vec<EngineAttemptListEntry>,
         #[serde(default)]
@@ -1511,26 +1468,26 @@ pub enum FrontendEvent {
     /// switched to the kanban, scrolled the target card into view, and
     /// started its transient highlight. Carries the resolved canonical
     /// `id` so `bossctl reveal` can confirm which item was highlighted.
-    WorkItemRevealed {
-        id: String,
-    },
+    #[worker(passthrough)]
+    WorkItemRevealed { id: String },
     /// Engine acknowledges an open-document request — the macOS app
     /// has opened (or focused an already-open window for) the
     /// document renderer for `path`. Response to
     /// [`FrontendRequest::OpenDocument`].
-    DocumentOpened {
-        path: String,
-    },
+    #[worker(passthrough)]
+    DocumentOpened { path: String },
     /// Response to [`FrontendRequest::Shutdown`] when the supplied
     /// token matched the engine's. The engine sends this immediately
     /// before starting graceful shutdown so the caller has a
     /// well-defined "accepted, you should now wait for the socket to
     /// close" signal.
+    #[worker(passthrough)]
     ShutdownAccepted,
     /// Response to [`FrontendRequest::RecreateCoordinator`] once the
     /// replacement coordinator session exists. Carries the request's id so
     /// the app can settle its in-flight/retry ledger; the attachment itself
     /// is a separate engine->app request.
+    #[worker(passthrough)]
     CoordinatorRecreated,
     /// Response to [`FrontendRequest::Shutdown`] when the supplied
     /// token did not match. The engine logs an audit record and keeps
@@ -1538,16 +1495,14 @@ pub enum FrontendEvent {
     /// (`token_mismatch`, `token_missing`) so callers can distinguish
     /// auth failures from unrelated socket errors without parsing a
     /// human string.
-    ShutdownRejected {
-        reason: String,
-    },
+    #[worker(passthrough)]
+    ShutdownRejected { reason: String },
     /// Pushed whenever the GitHub OAuth auth state changes — in
     /// response to [`FrontendRequest::GitHubAuthStatus`] and
     /// proactively as the device-flow poll loop advances. The UI
     /// renders whatever state the engine pushes without polling.
-    GitHubAuthState {
-        state: GitHubAuthStateDto,
-    },
+    #[worker(passthrough)]
+    GitHubAuthState { state: GitHubAuthStateDto },
 
     /// Reply to [`FrontendRequest::TrunkSetToken`] / [`FrontendRequest::TrunkStatus`].
     /// `source` is `"env"` / `"keychain"` when `configured` is `true`, `None`
@@ -1555,6 +1510,7 @@ pub enum FrontendEvent {
     /// `None` when no token is configured, or when there is no
     /// `trunk_queue`-mechanism product yet to probe against (`note` explains
     /// which).
+    #[worker(passthrough)]
     TrunkStatus {
         configured: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1568,12 +1524,12 @@ pub enum FrontendEvent {
     // --- Comments in the markdown viewer (Phase 2) replies. ---
     /// Reply to `comments_create` / `comments_dismiss` /
     /// `comments_set_status` / `comments_update_anchor` / `comments_post_answer`.
-    CommentResult {
-        comment: WorkComment,
-    },
+    #[worker(passthrough)]
+    CommentResult { comment: WorkComment },
     /// Reply to [`FrontendRequest::CommentsGet`]: one comment with its
     /// thread entries and full answer-agent-run history (the shape
     /// `boss comment show` / `bossctl comments show` print).
+    #[worker(passthrough)]
     CommentsGetResult {
         comment: WorkComment,
         thread_entries: Vec<CommentThreadEntry>,
@@ -1582,12 +1538,14 @@ pub enum FrontendEvent {
     /// Reply to `comments_list`. Each comment carries its thread entries and
     /// whether an answer-agent run is currently in flight for it — design
     /// `comment-triggered-document-revisions.md` §"UI / thread behavior".
+    #[worker(passthrough)]
     CommentsList {
         artifact_kind: String,
         artifact_id: String,
         comments: Vec<CommentWithThread>,
     },
     /// Reply to `comments_banner_state`.
+    #[worker(passthrough)]
     CommentsBannerState {
         artifact_kind: String,
         artifact_id: String,
@@ -1596,17 +1554,18 @@ pub enum FrontendEvent {
     },
     /// Reply to `comments_resolve`: each active comment paired with its
     /// resolution against the supplied plain text.
+    #[worker(passthrough)]
     CommentsResolved {
         artifact_kind: String,
         artifact_id: String,
         comments: Vec<ResolvedComment>,
     },
     /// Reply to `CommentsReviseDoc`.
-    CommentsReviseDocResult {
-        outcome: ReviseDocOutcome,
-    },
+    #[worker(passthrough)]
+    CommentsReviseDocResult { outcome: ReviseDocOutcome },
     /// Reply to [`FrontendRequest::ListAnswerAgentRuns`]: every
     /// `answer_agent_runs` row for `comment_id`, oldest first.
+    #[worker(passthrough)]
     AnswerAgentRunsList {
         comment_id: String,
         answer_agent_runs: Vec<AnswerAgentRun>,
@@ -1617,6 +1576,7 @@ pub enum FrontendEvent {
     /// terminal window rooted at `workspace_path` and send
     /// [`FrontendRequest::ReleaseReviewTerminal`] with `lease_id` when
     /// the window closes to avoid leaking the lease.
+    #[worker(passthrough)]
     ReviewTerminalReady {
         work_item_id: String,
         workspace_path: String,
@@ -1625,15 +1585,15 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::GetReviewGuideSummary`]. `None` when
     /// no comparison has been captured for this root task yet — distinct
     /// from an unknown/deleted root task, which replies `WorkError`.
-    ReviewGuideSummary {
-        summary: Option<ReviewGuideSummary>,
-    },
+    #[worker(passthrough)]
+    ReviewGuideSummary { summary: Option<ReviewGuideSummary> },
     /// Response to [`FrontendRequest::GetReviewGuideContent`]. `content` is
     /// `None` when `version_id` does not resolve to a stored version.
     /// `version_id` is echoed from the request (even on a `None` result) so
     /// the client can drop a reply for a version it has since navigated
     /// away from — its own response-identity guard — rather than
     /// misapplying a stale "not found" to whatever it is showing now.
+    #[worker(passthrough)]
     ReviewGuideContent {
         version_id: String,
         content: Option<ReviewGuideVersion>,
@@ -1642,6 +1602,7 @@ pub enum FrontendEvent {
     /// is `true` when the supplied idempotency token matched an existing
     /// attempt rather than creating a new one — mirrors
     /// [`Self::ProposalSubmitted`]'s `already_submitted`.
+    #[worker(passthrough)]
     ReviewGuideRetryQueued {
         /// Echoed from the request so the client can clear its own
         /// per-task "retry in flight" guard without having to resolve a
@@ -1656,6 +1617,7 @@ pub enum FrontendEvent {
     /// terminal window rooted there. There is no matching "release"
     /// request — the lease belongs to the running worker, not to this
     /// terminal window, so it is left untouched when the window closes.
+    #[worker(passthrough)]
     LiveWorkspaceTerminalReady {
         work_item_id: String,
         workspace_path: String,
@@ -1663,6 +1625,7 @@ pub enum FrontendEvent {
     /// No merge was initiated. Resend with these revisions only after
     /// explicit confirmation that merging should proceed while fixes are
     /// outstanding.
+    #[worker(passthrough)]
     MergeConfirmationRequired {
         work_item_id: String,
         revisions: Vec<crate::OpenMergeRevision>,
@@ -1679,6 +1642,7 @@ pub enum FrontendEvent {
     /// not this event. The PR-reconciler is kicked on the engine side so the
     /// kanban state refreshes promptly without waiting for the next periodic
     /// sweep.
+    #[worker(passthrough)]
     MergeWhenReadyAccepted {
         work_item_id: String,
         pr_url: String,
@@ -1687,6 +1651,7 @@ pub enum FrontendEvent {
 
     // --- Automation replies ---
     /// Response to [`FrontendRequest::CreateAutomation`].
+    #[worker(passthrough)]
     AutomationCreated {
         automation: Automation,
         /// Current open-task count for the automation, so the app need not follow up with `get_automation_open_task_count`.
@@ -1700,6 +1665,7 @@ pub enum FrontendEvent {
         last_run: Option<AutomationRun>,
     },
     /// Response to [`FrontendRequest::ListAutomations`].
+    #[worker(passthrough)]
     AutomationsList {
         product_id: String,
         automations: Vec<Automation>,
@@ -1717,6 +1683,7 @@ pub enum FrontendEvent {
         last_runs: std::collections::HashMap<String, AutomationRun>,
     },
     /// Response to [`FrontendRequest::GetAutomation`].
+    #[worker(passthrough)]
     AutomationResult {
         automation: Automation,
         /// Current open-task count for the automation, so the app need not follow up with `get_automation_open_task_count`.
@@ -1732,6 +1699,7 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::UpdateAutomation`],
     /// [`FrontendRequest::EnableAutomation`], or
     /// [`FrontendRequest::DisableAutomation`].
+    #[worker(passthrough)]
     AutomationUpdated {
         automation: Automation,
         /// Current open-task count for the automation, so the app need not follow up with `get_automation_open_task_count`.
@@ -1745,23 +1713,20 @@ pub enum FrontendEvent {
         last_run: Option<AutomationRun>,
     },
     /// Response to [`FrontendRequest::DeleteAutomation`].
-    AutomationDeleted {
-        automation_id: String,
-    },
+    #[worker(passthrough)]
+    AutomationDeleted { automation_id: String },
     /// Response to [`FrontendRequest::GetAutomationOpenTaskCount`].
-    AutomationOpenTaskCount {
-        automation_id: String,
-        count: i64,
-    },
+    #[worker(passthrough)]
+    AutomationOpenTaskCount { automation_id: String, count: i64 },
     /// Snapshot of an `automation_runs` row. Used to surface individual
     /// run records over the wire (e.g. for future CLI `boss automation runs`).
-    AutomationRunResult {
-        run: AutomationRun,
-    },
+    #[worker(passthrough)]
+    AutomationRunResult { run: AutomationRun },
 
     // --- Editorial controls replies ---
     /// Response to [`FrontendRequest::ListEditorialActions`]: the audit
     /// rows for the product, ordered freshest-first.
+    #[worker(passthrough)]
     EditorialActionsList {
         product_id: String,
         actions: Vec<EditorialAction>,
@@ -1772,6 +1737,7 @@ pub enum FrontendEvent {
     /// lists human-readable descriptions of every triggered rule.
     /// `rewritten_body` is present (and differs from the input) when
     /// `decision == "rewrite"`.
+    #[worker(passthrough)]
     EditorialRulesEvaluated {
         product_id: String,
         decision: String,
@@ -1780,74 +1746,66 @@ pub enum FrontendEvent {
         rewritten_body: Option<String>,
     },
     /// Response to [`FrontendRequest::ListAutomationRuns`].
+    #[worker(passthrough)]
     AutomationRunsList {
         automation_id: String,
         runs: Vec<AutomationRun>,
     },
     /// Response to [`FrontendRequest::ListAutomationDedupSuppressions`].
+    #[worker(passthrough)]
     AutomationDedupSuppressionsList {
         automation_id: String,
         suppressions: Vec<AutomationDedupSuppression>,
     },
     /// Response to [`FrontendRequest::ListAutomationTasks`].
-    AutomationTasksList {
-        automation_id: String,
-        tasks: Vec<Task>,
-    },
+    #[worker(passthrough)]
+    AutomationTasksList { automation_id: String, tasks: Vec<Task> },
     /// Response to [`FrontendRequest::RunAutomation`] when the fire was
     /// accepted and enqueued.
-    AutomationRunEnqueued {
-        automation_id: String,
-    },
+    #[worker(passthrough)]
+    AutomationRunEnqueued { automation_id: String },
 
     // --- Product decision records (T-B2-decision) ---
     /// Response to [`FrontendRequest::CreateDecision`].
-    DecisionCreated {
-        decision: Decision,
-    },
+    #[worker(passthrough)]
+    DecisionCreated { decision: Decision },
     /// Response to [`FrontendRequest::GetDecision`].
-    DecisionResult {
-        decision: Decision,
-    },
+    #[worker(passthrough)]
+    DecisionResult { decision: Decision },
     /// Response to [`FrontendRequest::ListDecisions`].
+    #[worker(passthrough)]
     DecisionsList {
         product_id: String,
         decisions: Vec<Decision>,
     },
     /// Response to [`FrontendRequest::RevokeDecision`] or
     /// [`FrontendRequest::SupersedeDecision`].
-    DecisionUpdated {
-        decision: Decision,
-    },
+    #[worker(passthrough)]
+    DecisionUpdated { decision: Decision },
 
     // --- Ideas ---
     /// Response to [`FrontendRequest::CreateIdea`].
-    IdeaCreated {
-        idea: Idea,
-    },
+    #[worker(passthrough)]
+    IdeaCreated { idea: Idea },
     /// Response to [`FrontendRequest::GetIdea`].
-    IdeaResult {
-        idea: Idea,
-    },
+    #[worker(passthrough)]
+    IdeaResult { idea: Idea },
     /// Response to [`FrontendRequest::ListIdeas`].
-    IdeasList {
-        product_id: String,
-        ideas: Vec<Idea>,
-    },
+    #[worker(passthrough)]
+    IdeasList { product_id: String, ideas: Vec<Idea> },
     /// Response to [`FrontendRequest::UpdateIdea`].
-    IdeaUpdated {
-        idea: Idea,
-    },
+    #[worker(passthrough)]
+    IdeaUpdated { idea: Idea },
     /// Response to [`FrontendRequest::DeleteIdea`].
-    IdeaDeleted {
-        idea_id: String,
-    },
+    #[worker(passthrough)]
+    IdeaDeleted { idea_id: String },
     /// Response to [`FrontendRequest::GraduateIdea`]. Exactly one of
     /// `chore` / `project` is `Some`, matching the request's `target`.
     /// Boxed: an inline `Task` / `Project` here would make this variant far
     /// larger than its siblings (clippy::large_enum_variant) — serializes
     /// identically. See [`FrontendEvent::AttentionItemConverted`] for the
     /// same pattern.
+    #[worker(passthrough)]
     IdeaGraduated {
         idea: Idea,
         #[serde(default, skip_serializing_if = "Option::is_none")]

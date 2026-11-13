@@ -27,7 +27,10 @@
 //! `host_id` to `WorkExecution`, that test fails and this module has to grow
 //! a line — which is the outcome we want, rather than a silent leak.
 
-use boss_protocol::{FrontendEvent, WorkExecution, WorkRun};
+use boss_protocol::{
+    Attention, AttentionGroup, FrontendEvent, FrontendEventWorkerVisitor, Idea, PlannerRunSummary, Product, Project,
+    Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItemDependency, WorkRun, work_tree_delta::WorkTreeUpdate,
+};
 
 /// The JSON keys that must never appear in an execution or run row sent to a
 /// worker. Asserted against serialized rows in this crate's tests, so a
@@ -65,317 +68,150 @@ fn sanitize_run(mut run: WorkRun) -> WorkRun {
     run
 }
 
-/// Sanitize one outbound event for a worker-tier connection.
-///
-/// This is a `match` with **no wildcard arm**, mirroring the discipline
-/// [`worker_verb_decision`](crate::worker_verb_decision) uses on the request
-/// side: every `FrontendEvent` variant is named explicitly, either in the
-/// run/execution-carrying arms above or in the single pass-through arm below.
-/// A variant added to `FrontendEvent` tomorrow will not compile until someone
-/// decides which bucket it belongs in — the same compile-error-as-review-
-/// prompt property the crate doc claims for the boundary as a whole. The
-/// pass-through arm covers variants that either carry no rows straddling the
-/// boundary, or are replies to verbs a worker cannot call in the first place
-/// (belt-and-braces — the verb gate already stopped those).
+/// Sanitize one outbound event at the shared response/push write boundary.
+/// Every event declaration explicitly selects pass-through or a required hook;
+/// the generated traversal only moves typed payloads, while policy stays here.
 pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
-    match event {
-        FrontendEvent::WorkTreeUpdate { mut update } => {
-            if let Some(changes) = update.changes.as_object_mut() {
-                if update.base_sequence.is_none() {
-                    changes.insert("ideas".into(), serde_json::json!([]));
-                } else {
-                    changes.remove("ideas");
-                }
+    event.map_for_worker(&mut WorkerSanitizer)
+}
+
+struct WorkerSanitizer;
+
+impl FrontendEventWorkerVisitor for WorkerSanitizer {
+    fn work_tree_update(&mut self, (mut update,): (WorkTreeUpdate,)) -> (WorkTreeUpdate,) {
+        if let Some(changes) = update.changes.as_object_mut() {
+            if update.base_sequence.is_none() {
+                changes.insert("ideas".into(), serde_json::json!([]));
+            } else {
+                changes.remove("ideas");
             }
-            FrontendEvent::WorkTreeUpdate { update }
         }
-        FrontendEvent::ExecutionResult { execution } => FrontendEvent::ExecutionResult {
-            execution: sanitize_execution(execution),
-        },
-        FrontendEvent::ExecutionsList {
-            work_item_id,
-            executions,
-        } => FrontendEvent::ExecutionsList {
-            work_item_id,
-            executions: executions.into_iter().map(sanitize_execution).collect(),
-        },
-        FrontendEvent::ExecutionCreated { execution } => FrontendEvent::ExecutionCreated {
-            execution: sanitize_execution(execution),
-        },
-        FrontendEvent::ExecutionRequested { execution } => FrontendEvent::ExecutionRequested {
-            execution: sanitize_execution(execution),
-        },
-        FrontendEvent::ExecutionCancelled { execution } => FrontendEvent::ExecutionCancelled {
-            execution: sanitize_execution(execution),
-        },
-        FrontendEvent::PrReviewTriggered {
-            execution,
+        (update,)
+    }
+
+    fn execution_result(&mut self, (execution,): (WorkExecution,)) -> (WorkExecution,) {
+        (sanitize_execution(execution),)
+    }
+
+    fn executions_list(
+        &mut self,
+        (work_item_id, executions): (Option<String>, Vec<WorkExecution>),
+    ) -> (Option<String>, Vec<WorkExecution>) {
+        (work_item_id, executions.into_iter().map(sanitize_execution).collect())
+    }
+
+    fn execution_created(&mut self, (execution,): (WorkExecution,)) -> (WorkExecution,) {
+        (sanitize_execution(execution),)
+    }
+
+    fn execution_requested(&mut self, (execution,): (WorkExecution,)) -> (WorkExecution,) {
+        (sanitize_execution(execution),)
+    }
+
+    fn execution_cancelled(&mut self, (execution,): (WorkExecution,)) -> (WorkExecution,) {
+        (sanitize_execution(execution),)
+    }
+
+    fn pr_review_triggered(
+        &mut self,
+        (execution, work_item_id, pr_url, batch_id, batch_generation, batch_execution_ids, already_active): (
+            WorkExecution,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Vec<String>,
+            bool,
+        ),
+    ) -> (
+        WorkExecution,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Vec<String>,
+        bool,
+    ) {
+        (
+            sanitize_execution(execution),
             work_item_id,
             pr_url,
             batch_id,
             batch_generation,
             batch_execution_ids,
             already_active,
-        } => FrontendEvent::PrReviewTriggered {
-            execution: sanitize_execution(execution),
-            work_item_id,
-            pr_url,
-            batch_id,
-            batch_generation,
-            batch_execution_ids,
-            already_active,
-        },
-        FrontendEvent::RunReaped { run_id, execution } => FrontendEvent::RunReaped {
-            run_id,
-            execution: sanitize_execution(execution),
-        },
-        FrontendEvent::RunResult { run } => FrontendEvent::RunResult { run: sanitize_run(run) },
-        FrontendEvent::RunCreated { run } => FrontendEvent::RunCreated { run: sanitize_run(run) },
-        FrontendEvent::RunsList { execution_id, runs } => FrontendEvent::RunsList {
-            execution_id,
-            runs: runs.into_iter().map(sanitize_run).collect(),
-        },
-        // `GetWorkTree` is an allowed taxonomy read, but `ideas` is a
-        // coordinator-only authoring surface (full markdown bodies). A
-        // worker never needs another draft; strip the field so the
-        // worktree cannot leak idea state past the verb gate.
-        FrontendEvent::WorkTree {
+        )
+    }
+
+    fn run_reaped(&mut self, (run_id, execution): (String, WorkExecution)) -> (String, WorkExecution) {
+        (run_id, sanitize_execution(execution))
+    }
+
+    fn run_result(&mut self, (run,): (WorkRun,)) -> (WorkRun,) {
+        (sanitize_run(run),)
+    }
+
+    fn run_created(&mut self, (run,): (WorkRun,)) -> (WorkRun,) {
+        (sanitize_run(run),)
+    }
+
+    fn runs_list(&mut self, (execution_id, runs): (String, Vec<WorkRun>)) -> (String, Vec<WorkRun>) {
+        (execution_id, runs.into_iter().map(sanitize_run).collect())
+    }
+
+    fn work_tree(
+        &mut self,
+        (
             product,
             projects,
             tasks,
             chores,
             task_runtimes,
             dependencies,
-            ideas: _,
+            _ideas,
             attention_items,
             attention_groups,
             attention_members,
             planner_runs,
-        } => FrontendEvent::WorkTree {
+        ): (
+            Product,
+            Vec<Project>,
+            Vec<Task>,
+            Vec<Task>,
+            Vec<TaskRuntime>,
+            Vec<WorkItemDependency>,
+            Vec<Idea>,
+            Vec<WorkAttentionItem>,
+            Vec<AttentionGroup>,
+            Vec<Attention>,
+            Vec<PlannerRunSummary>,
+        ),
+    ) -> (
+        Product,
+        Vec<Project>,
+        Vec<Task>,
+        Vec<Task>,
+        Vec<TaskRuntime>,
+        Vec<WorkItemDependency>,
+        Vec<Idea>,
+        Vec<WorkAttentionItem>,
+        Vec<AttentionGroup>,
+        Vec<Attention>,
+        Vec<PlannerRunSummary>,
+    ) {
+        // GetWorkTree is a taxonomy read, but idea bodies are coordinator-only.
+        (
             product,
             projects,
             tasks,
             chores,
             task_runtimes,
             dependencies,
-            ideas: vec![],
+            vec![],
             attention_items,
             attention_groups,
             attention_members,
             planner_runs,
-        },
-        passthrough @ (FrontendEvent::CriticalPriorityRequested { .. }
-        | FrontendEvent::CriticalPriorityResolved { .. }
-        | FrontendEvent::CriticalPriorityRequests { .. }
-        | FrontendEvent::Hello { .. }
-        | FrontendEvent::Subscribed { .. }
-        | FrontendEvent::Unsubscribed { .. }
-        | FrontendEvent::TopicEvent { .. }
-        | FrontendEvent::ProductsList { .. }
-        | FrontendEvent::ProjectsList { .. }
-        | FrontendEvent::TasksList { .. }
-        | FrontendEvent::ChoresList { .. }
-        | FrontendEvent::RevisionsList { .. }
-        | FrontendEvent::WorkItemResult { .. }
-        | FrontendEvent::WorkRuntimePatch { .. }
-        | FrontendEvent::WorkItemsByPrResult { .. }
-        | FrontendEvent::WorkItemCreated { .. }
-        | FrontendEvent::WorkItemsCreated { .. }
-        | FrontendEvent::WorkItemUpdated { .. }
-        | FrontendEvent::ProjectTasksReordered { .. }
-        | FrontendEvent::TaskRuntimeResult { .. }
-        | FrontendEvent::AttentionItemsList { .. }
-        | FrontendEvent::AttentionItemResult { .. }
-        | FrontendEvent::AttentionItemCreated { .. }
-        | FrontendEvent::AttentionItemsForWorkItemList { .. }
-        | FrontendEvent::AttentionItemUpdated { .. }
-        | FrontendEvent::AttentionItemConverted { .. }
-        | FrontendEvent::DeferredScopeAttentionsList { .. }
-        | FrontendEvent::AttentionGroupsList { .. }
-        | FrontendEvent::AttentionGroupResult { .. }
-        | FrontendEvent::AttentionCreated { .. }
-        | FrontendEvent::AttentionGroupUpdated { .. }
-        | FrontendEvent::AttentionGroupActioned { .. }
-        | FrontendEvent::AttentionMergesList { .. }
-        | FrontendEvent::WorkItemDeleted { .. }
-        | FrontendEvent::WorkItemRestored { .. }
-        | FrontendEvent::WorkError { .. }
-        | FrontendEvent::WorkItemDuplicateBlocked { .. }
-        | FrontendEvent::Error { .. }
-        | FrontendEvent::AppSessionRegistered
-        | FrontendEvent::EnginePoolConfig { .. }
-        | FrontendEvent::ProbeQueued { .. }
-        | FrontendEvent::ProbeDelivered { .. }
-        | FrontendEvent::ProbeRefused { .. }
-        | FrontendEvent::ProbeStatusResult { .. }
-        | FrontendEvent::ProbeReplied { .. }
-        | FrontendEvent::ProbeDeliveryEscalated { .. }
-        | FrontendEvent::RunStopped { .. }
-        | FrontendEvent::WorkerPaneFocused { .. }
-        | FrontendEvent::WorkerInputSent { .. }
-        | FrontendEvent::WorkerPaneInterrupted { .. }
-        | FrontendEvent::EngineRequest { .. }
-        | FrontendEvent::WorkerLiveStatesList { .. }
-        | FrontendEvent::TmuxWorkerStatusesList { .. }
-        | FrontendEvent::PaneRetired { .. }
-        | FrontendEvent::HostedPaneStatusList { .. }
-        | FrontendEvent::RunTranscriptTail { .. }
-        | FrontendEvent::ExecutionTranscriptResult { .. }
-        | FrontendEvent::ExecutionTranscriptUnavailable { .. }
-        | FrontendEvent::WorkspacePoolSummaryResult { .. }
-        | FrontendEvent::WorkerPoolSummaryResult { .. }
-        | FrontendEvent::DependencyAdded { .. }
-        | FrontendEvent::DependencyRemoved { .. }
-        | FrontendEvent::DependencyList { .. }
-        | FrontendEvent::DependencyDetail { .. }
-        | FrontendEvent::LiveStatusEnabledSet { .. }
-        | FrontendEvent::LiveStatusDisabledSlotsList { .. }
-        | FrontendEvent::LiveStatusDebugReportEvent { .. }
-        | FrontendEvent::ProjectDesignDocResolved { .. }
-        | FrontendEvent::ExecutionLabelsResolved { .. }
-        // Markdown read out of a product's own GitHub repo. Carries no
-        // run/execution rows, so nothing straddles the boundary — the
-        // paths and bodies in here are public-to-the-worker repo content
-        // it could read with `gh` directly.
-        | FrontendEvent::ProductDesignDocsList { .. }
-        | FrontendEvent::ProductDesignDocContent { .. }
-        | FrontendEvent::ConflictResolutionMarkedFailed { .. }
-        | FrontendEvent::CiRemediationClassified { .. }
-        | FrontendEvent::CiRemediationMarkedFailed { .. }
-        | FrontendEvent::CiRemediationRetriggered { .. }
-        | FrontendEvent::CiRemediationSucceededViaRebase { .. }
-        | FrontendEvent::CiRemediationSucceededViaRebaseRejected { .. }
-        | FrontendEvent::CiRemediationNoopValidated { .. }
-        | FrontendEvent::CiRemediationNoopRejected { .. }
-        | FrontendEvent::ConflictResolutionsList { .. }
-        | FrontendEvent::ConflictHotspots { .. }
-        | FrontendEvent::ConflictResolution { .. }
-        | FrontendEvent::ConflictResolutionRetried { .. }
-        | FrontendEvent::ConflictResolutionMarkedAbandoned { .. }
-        | FrontendEvent::ConflictResolutionStarted { .. }
-        | FrontendEvent::ConflictResolutionSucceeded { .. }
-        | FrontendEvent::ConflictResolutionFailed { .. }
-        | FrontendEvent::ConflictResolutionAbandoned { .. }
-        | FrontendEvent::StackProposalOffered { .. }
-        | FrontendEvent::CiRemediationStarted { .. }
-        | FrontendEvent::CiRemediationSucceeded { .. }
-        | FrontendEvent::CiFailureCleared { .. }
-        | FrontendEvent::CiRemediationFailed { .. }
-        | FrontendEvent::CiRemediationAbandoned { .. }
-        | FrontendEvent::CiRemediationExhausted { .. }
-        | FrontendEvent::CiRemediationFlakyRetriggered { .. }
-        | FrontendEvent::CiNeverStartsAlert { .. }
-        | FrontendEvent::EffortAuditReport { .. }
-        | FrontendEvent::EffortEscalationRecorded { .. }
-        | FrontendEvent::StuckReport { .. }
-        | FrontendEvent::WorkItemCostReport { .. }
-        | FrontendEvent::CostWindowReport { .. }
-        | FrontendEvent::TopCostConsumers { .. }
-        | FrontendEvent::PlannerRunsList { .. }
-        | FrontendEvent::PlanProjectResult { .. }
-        | FrontendEvent::ReleaseProjectResult { .. }
-        | FrontendEvent::ProjectPostmortemResult { .. }
-        | FrontendEvent::WorkerGatewayResult { .. }
-        | FrontendEvent::ProposalSubmitted { .. }
-        | FrontendEvent::ProposalRejected { .. }
-        | FrontendEvent::WorkerTierDenied { .. }
-        | FrontendEvent::ProposalsList { .. }
-        // `WorkAttachment` carries no runtime-half columns at all — its only
-        // path-shaped field is `source_name`, a basename the worker itself
-        // supplied. Nothing to strip.
-        | FrontendEvent::AttachmentStored { .. }
-        | FrontendEvent::AttachmentsList { .. }
-        | FrontendEvent::WorkerContextResult { .. }
-        | FrontendEvent::PrStatusResult { .. }
-        | FrontendEvent::PrBodyResult { .. }
-        | FrontendEvent::CoordinatorHandoffResult { .. }
-        | FrontendEvent::CoordinatorHandoffSet { .. }
-        | FrontendEvent::CoordinatorGuidanceList { .. }
-        | FrontendEvent::UnpopulateProjectResult { .. }
-        | FrontendEvent::FeatureFlagsList { .. }
-        | FrontendEvent::FeatureFlagSet { .. }
-        | FrontendEvent::EngineVersionResult { .. }
-        | FrontendEvent::EngineHealthResult { .. }
-        | FrontendEvent::BoardPopulationProgress { .. }
-        | FrontendEvent::SettingsList { .. }
-        | FrontendEvent::SettingSet { .. }
-        | FrontendEvent::OffsiteBackupSettings { .. }
-        | FrontendEvent::SelectedProductResult { .. }
-        | FrontendEvent::SelectedProductReported { .. }
-        | FrontendEvent::HostsList { .. }
-        | FrontendEvent::HostResult { .. }
-        | FrontendEvent::HostUpdated { .. }
-        | FrontendEvent::HostRemoved { .. }
-        | FrontendEvent::MetricsShowLiveResult { .. }
-        | FrontendEvent::MetricsListLiveResult { .. }
-        | FrontendEvent::MetricsResetDone { .. }
-        | FrontendEvent::PrReconcilersKicked { .. }
-        | FrontendEvent::DispatchConcurrencyResult { .. }
-        | FrontendEvent::DispatchFocusResult { .. }
-        | FrontendEvent::DriverQuotaUsageResult { .. }
-        | FrontendEvent::DriverTrafficSplitResult { .. }
-        | FrontendEvent::CodexSolPercentage { .. }
-        | FrontendEvent::SolComparisonReport { .. }
-        | FrontendEvent::DispatchStateResult { .. }
-        | FrontendEvent::AutomationStateResult { .. }
-        | FrontendEvent::ExternalTrackerSyncStarted { .. }
-        | FrontendEvent::CiRemediationsList { .. }
-        | FrontendEvent::CiRemediation { .. }
-        | FrontendEvent::CiRemediationRetryDone { .. }
-        | FrontendEvent::CiRemediationMarkedAbandoned { .. }
-        | FrontendEvent::CiBudget { .. }
-        | FrontendEvent::CiBudgetUpdated { .. }
-        | FrontendEvent::EngineAttemptsList { .. }
-        | FrontendEvent::WorkItemRevealed { .. }
-        | FrontendEvent::DocumentOpened { .. }
-        | FrontendEvent::ShutdownAccepted
-        | FrontendEvent::CoordinatorRecreated
-        | FrontendEvent::ShutdownRejected { .. }
-        | FrontendEvent::GitHubAuthState { .. }
-        | FrontendEvent::TrunkStatus { .. }
-        | FrontendEvent::CommentResult { .. }
-        | FrontendEvent::CommentsGetResult { .. }
-        | FrontendEvent::CommentsList { .. }
-        | FrontendEvent::CommentsBannerState { .. }
-        | FrontendEvent::CommentsResolved { .. }
-        | FrontendEvent::CommentsReviseDocResult { .. }
-        | FrontendEvent::AnswerAgentRunsList { .. }
-        | FrontendEvent::ReviewGuideSummary { .. }
-        | FrontendEvent::ReviewGuideContent { .. }
-        | FrontendEvent::ReviewGuideRetryQueued { .. }
-        | FrontendEvent::ReviewTerminalReady { .. }
-        | FrontendEvent::LiveWorkspaceTerminalReady { .. }
-        | FrontendEvent::MergeConfirmationRequired { .. }
-        | FrontendEvent::MergeWhenReadyAccepted { .. }
-        | FrontendEvent::AutomationCreated { .. }
-        | FrontendEvent::AutomationsList { .. }
-        | FrontendEvent::AutomationResult { .. }
-        | FrontendEvent::AutomationUpdated { .. }
-        | FrontendEvent::AutomationDeleted { .. }
-        | FrontendEvent::AutomationOpenTaskCount { .. }
-        | FrontendEvent::AutomationRunResult { .. }
-        | FrontendEvent::EditorialActionsList { .. }
-        | FrontendEvent::EditorialRulesEvaluated { .. }
-        | FrontendEvent::AutomationRunsList { .. }
-        | FrontendEvent::AutomationDedupSuppressionsList { .. }
-        | FrontendEvent::AutomationTasksList { .. }
-        | FrontendEvent::AutomationRunEnqueued { .. }
-        | FrontendEvent::RunHeld { .. }
-        | FrontendEvent::RunHoldReleased { .. }
-        | FrontendEvent::DecisionCreated { .. }
-        | FrontendEvent::DecisionResult { .. }
-        | FrontendEvent::DecisionsList { .. }
-        | FrontendEvent::DecisionUpdated { .. }
-        | FrontendEvent::IdeaCreated { .. }
-        | FrontendEvent::IdeaResult { .. }
-        | FrontendEvent::IdeasList { .. }
-        | FrontendEvent::IdeaUpdated { .. }
-        | FrontendEvent::IdeaDeleted { .. }
-        | FrontendEvent::IdeaGraduated { .. }
-        | FrontendEvent::OperatorDecisionSnapshot { .. }
-        | FrontendEvent::OperatorQuestionsList { .. }
-        | FrontendEvent::TaskFieldAuditList { .. }
-        | FrontendEvent::OperatorQuestionError { .. }
-        | FrontendEvent::DispatchAdmissionEvaluated { .. }) => passthrough,
+        )
     }
 }

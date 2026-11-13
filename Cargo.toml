@@ -85,6 +85,7 @@ members = [
   "tools/boss/engine/worker-policy",
   "tools/boss/log-files",
   "tools/boss/protocol",
+  "tools/boss/protocol-macros",
   "tools/boss/protocol-spoke",
   "tools/boss/shell-quote",
   "tools/boss/spoke-credentials",

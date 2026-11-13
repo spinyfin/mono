@@ -574,6 +574,17 @@ async fn run_rows_reaching_a_worker_have_their_transcript_path_stripped() {
     assert_eq!(runs[0]["id"], run.id);
     assert_eq!(runs[0]["execution_id"], execution.id);
 
+    let get_request = serde_json::json!({
+        "request_id": "get-run",
+        "payload": { "type": "get_run", "id": run.id },
+    })
+    .to_string();
+    let single = round_trip(server_state.clone(), Some(self_pid()), &get_request).await;
+    assert_eq!(single["request_id"], "get-run");
+    assert_eq!(single["payload"]["type"], "run_result");
+    assert_eq!(single["payload"]["run"]["id"], run.id);
+    assert!(single["payload"]["run"]["transcript_path"].is_null());
+
     // As a non-worker (no peer pid resolvable to a worker): unchanged. This
     // is what makes the previous assertion meaningful rather than a property
     // of the row never having had a path.
@@ -598,6 +609,147 @@ async fn run_rows_reaching_a_worker_have_their_transcript_path_stripped() {
         run.transcript_path.as_deref(),
         "with worker_rpc_tier off, sanitization must be off too",
     );
+}
+
+async fn read_worker_frame(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> serde_json::Value {
+    let mut line = String::new();
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(10), reader.read_line(&mut line))
+        .await
+        .expect("outbound frame deadline")
+        .unwrap();
+    assert_ne!(bytes, 0, "connection closed before the expected frame");
+    serde_json::from_str(&line).unwrap()
+}
+
+#[tokio::test]
+async fn subscribed_worker_pushes_use_the_same_sanitizer_and_live_flag_as_responses() {
+    let (state, _dir) = enforcing_state("exec_1");
+    let (engine_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+    let connection = tokio::spawn(handle_frontend_connection(engine_side, state.clone(), Some(self_pid())));
+    let (read_half, mut write_half) = client_side.into_split();
+    let mut reader = BufReader::new(read_half);
+    assert_eq!(read_worker_frame(&mut reader).await["payload"]["type"], "hello");
+
+    let subscribe =
+        b"{\"request_id\":\"subscribe\",\"payload\":{\"type\":\"subscribe\",\"topics\":[\"work.product.prod_1\"]}}\n";
+    write_half.write_all(subscribe).await.unwrap();
+    assert_eq!(
+        read_worker_frame(&mut reader).await["payload"]["type"],
+        "worker_tier_denied"
+    );
+    // Subscriptions are deliberately closed to workers under enforcement.
+    // Subscribe with the existing kill switch off, then enable it on the same
+    // authenticated connection to exercise queued pushes at the writer boundary.
+    state.feature_flags.set("worker_rpc_tier", false).unwrap();
+    write_half.write_all(subscribe).await.unwrap();
+    let subscribed = read_worker_frame(&mut reader).await;
+    assert_eq!(subscribed["request_id"], "subscribe");
+    assert_eq!(subscribed["payload"]["type"], "subscribed");
+    assert_eq!(
+        subscribed["payload"]["topics"],
+        serde_json::json!(["work.product.prod_1"])
+    );
+
+    let run = boss_protocol::WorkRun::builder()
+        .id("run_1")
+        .execution_id("exec_1")
+        .agent_id("agent_1")
+        .created_at("1700000000")
+        .status("active")
+        .transcript_path("/private/transcript")
+        .artifacts_path("/private/artifacts")
+        .build();
+    let events = [
+        FrontendEvent::RunCreated { run },
+        FrontendEvent::WorkTreeUpdate {
+            update: boss_protocol::work_tree_delta::WorkTreeUpdate {
+                product_id: "prod_1".into(),
+                sequence: 1,
+                base_sequence: None,
+                changes: serde_json::json!({"ideas": [{"body": "private draft"}], "tasks": [{"id": "task_1"}]}),
+            },
+        },
+        FrontendEvent::WorkTreeUpdate {
+            update: boss_protocol::work_tree_delta::WorkTreeUpdate {
+                product_id: "prod_1".into(),
+                sequence: 2,
+                base_sequence: Some(1),
+                changes: serde_json::json!({"ideas": [{"body": "private draft"}], "tasks": [{"id": "task_1"}]}),
+            },
+        },
+    ];
+    for enforced in [true, false] {
+        state.feature_flags.set("worker_rpc_tier", enforced).unwrap();
+        for event in &events {
+            let mut expected = serde_json::to_value(event).unwrap();
+            if enforced {
+                if let Some(run) = expected.get_mut("run") {
+                    run["transcript_path"] = serde_json::Value::Null;
+                    run["artifacts_path"] = serde_json::Value::Null;
+                } else if expected["update"]["base_sequence"].is_null() {
+                    expected["update"]["changes"]["ideas"] = serde_json::json!([]);
+                } else {
+                    expected["update"]["changes"].as_object_mut().unwrap().remove("ideas");
+                }
+            }
+            state
+                .topic_broker
+                .publish("work.product.prod_1", FrontendEventEnvelope::push(event.clone()))
+                .await;
+            let pushed = read_worker_frame(&mut reader).await;
+            assert!(pushed["request_id"].is_null());
+            assert_eq!(pushed["payload"], expected);
+        }
+    }
+    drop(write_half);
+    connection.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn work_tree_response_filters_private_drafts_only_for_workers() {
+    let (state, _dir) = enforcing_state("exec_1");
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let idea = state
+        .work_db
+        .create_idea(
+            boss_protocol::CreateIdeaInput::builder()
+                .product_id(&product.id)
+                .name("Private draft")
+                .body("private body")
+                .build(),
+        )
+        .unwrap();
+    let mut responses = Vec::new();
+    for worker in [true, false] {
+        if !worker {
+            state.worker_registry.unregister(self_pid());
+        }
+        let (engine_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let connection = tokio::spawn(handle_frontend_connection(engine_side, state.clone(), Some(self_pid())));
+        let (read_half, mut write_half) = client_side.into_split();
+        let mut reader = BufReader::new(read_half);
+        assert_eq!(read_worker_frame(&mut reader).await["payload"]["type"], "hello");
+        let request = serde_json::json!({"request_id": "tree", "payload": {
+            "type": "get_work_tree", "product_id": product.id,
+        }});
+        write_half.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+        loop {
+            let response = read_worker_frame(&mut reader).await;
+            if response["request_id"] == "tree" {
+                assert_eq!(response["payload"]["type"], "work_tree");
+                assert_eq!(response["payload"]["product"]["id"], product.id);
+                responses.push(response["payload"].clone());
+                break;
+            }
+        }
+        drop(write_half);
+        connection.await.unwrap().unwrap();
+    }
+    assert_eq!(responses[0]["ideas"], serde_json::json!([]));
+    assert_eq!(responses[1]["ideas"][0]["id"], idea.id);
+    assert_eq!(responses[1]["ideas"][0]["body"], "private body");
+    responses[1]["ideas"] = serde_json::json!([]);
+    assert_eq!(responses[0], responses[1], "all other board fields survive");
 }
 
 /// A worker classified for one execution must not be able to read another
