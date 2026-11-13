@@ -185,7 +185,7 @@ fn attempt_number_counts_a_transient_failure_before_start_failures() {
 }
 
 #[test]
-fn retry_sequence_excludes_old_cycles_siblings_and_duplicate_attention_evidence() {
+fn retry_sequence_excludes_old_cycles_and_siblings() {
     let db = db();
     let product = create_test_product(&db);
     let (item, old) = ready_chore(&db, &product.id, "bounded history");
@@ -215,14 +215,6 @@ fn retry_sequence_excludes_old_cycles_siblings_and_duplicate_attention_evidence(
         .start_execution_run(&current.id, "worker", "repo", "lease", "ws", "/tmp/bounded-history")
         .unwrap();
     db.mark_execution_orphaned(&current.id, "current run failed").unwrap();
-    db.connect()
-        .unwrap()
-        .execute(
-            "INSERT INTO work_attention_items(id, execution_id, kind, status, title, body_markdown, created_at)
-         VALUES ('history_attention', ?1, 'hung_worker', 'resolved', 'Hung worker', 'extra evidence', '2000')",
-            [&current.id],
-        )
-        .unwrap();
     db.request_resume_execution(
         &current.id,
         1,
@@ -249,7 +241,7 @@ fn retry_sequence_excludes_old_cycles_siblings_and_duplicate_attention_evidence(
 }
 
 #[test]
-fn repeated_resumes_keep_distinct_attempts_without_borrowing_attention() {
+fn repeated_resumes_keep_distinct_attempts() {
     let db = db();
     let product = create_test_product(&db);
     let (item, mut execution) = ready_chore(&db, &product.id, "repeated resumes");
@@ -272,17 +264,38 @@ fn repeated_resumes_keep_distinct_attempts_without_borrowing_attention() {
             .collect::<Vec<_>>(),
         ["pane absent", "driver stalled", "pane absent"]
     );
-    let conn = db.connect().unwrap();
-    conn.execute(
-        "INSERT INTO work_attention_items(id, execution_id, kind, status, title, body_markdown, created_at)
-        VALUES ('unrelated_history', ?1, 'hung_worker', 'open', 'Hung worker', 'belongs to another execution', '3000')",
-        [&execution.id],
-    )
-    .unwrap();
-    drop(conn);
+}
+
+#[test]
+fn review_batch_siblings_are_not_earlier_attempts() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (item, first) = ready_chore(&db, &product.id, "review siblings");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'pr_review' WHERE id = ?1",
+            [&first.id],
+        )
+        .unwrap();
+    db.mark_execution_orphaned(&first.id, "sibling reviewer died").unwrap();
+    let second = pending(&db, &item.id, ExecutionKind::PrReview, ExecutionStatus::Ready);
+    let third = pending(&db, &item.id, ExecutionKind::PrReview, ExecutionStatus::Ready);
+    db.mark_execution_orphaned(&second.id, "other sibling died").unwrap();
+    db.record_pre_start_failure(&third.id, "worker", None, "lease failed", &[Duration::from_secs(3600)])
+        .unwrap();
+    let wait = wait_of(&db, &product.id, &item.id);
     assert_eq!(
-        wait_of(&db, &product.id, &item.id).dispatch_failures,
         wait.dispatch_failures
+            .iter()
+            .map(|f| f.error_text.as_str())
+            .collect::<Vec<_>>(),
+        ["lease failed"],
+        "only the member's own start failures are listed"
+    );
+    assert_eq!(
+        wait.dispatch_wait_label.as_deref(),
+        Some("Retrying after error (attempt 2)")
     );
 }
 

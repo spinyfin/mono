@@ -34,7 +34,8 @@ pub(super) struct DispatchWait {
     pub failures: Vec<DispatchFailureAttempt>,
     /// The projection consulted state the item's own execution rows do not
     /// version: another work item (dependency gating, project order, a
-    /// chain-hold blocker) or the item's task row. Such a result is recomputed
+    /// chain-hold blocker), the item's task row, or failure history (earlier
+    /// executions and their start-failure events). Such a result is recomputed
     /// on every read and never retained by the board runtime cache.
     pub reads_other_items: bool,
 }
@@ -228,7 +229,7 @@ fn not_before_wait(conn: &Connection, execution: &WorkExecution) -> Result<Dispa
         |row| row.get(0),
     )?;
     if source.as_deref() == Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF) {
-        let failures = collect_dispatch_failures(conn, &execution.work_item_id, &execution.id)?;
+        let failures = collect_dispatch_failures(conn, execution)?;
         // The upcoming attempt follows the same sequence the history lists; the
         // row counters only cover legacy rows whose history is incomplete.
         let legacy_count = execution.pre_start_failure_count.max(execution.transient_failure_count) as usize;
@@ -263,16 +264,17 @@ fn nonempty_text(value: Option<String>) -> Option<String> {
 }
 
 /// One entry per failed start or failed execution in the current retry sequence.
-fn collect_dispatch_failures(
-    conn: &Connection,
-    work_item_id: &str,
-    current_execution_id: &str,
-) -> Result<Vec<DispatchFailureAttempt>> {
+fn collect_dispatch_failures(conn: &Connection, execution: &WorkExecution) -> Result<Vec<DispatchFailureAttempt>> {
+    let work_item_id = execution.work_item_id.as_str();
+    let current_execution_id = execution.id.as_str();
+    // Read-only kinds (PR review batch members) share a work item, so another
+    // member's failures are siblings, never earlier attempts of this one.
+    let own_history_only = execution.kind.never_writes_pr_branch();
     let mut stmt = conn.prepare_cached(
         "SELECT e.id, e.last_error, e.finished_at, e.created_at, r.error_text, r.finished_at
          FROM work_executions e
          LEFT JOIN work_runs r ON r.id = (
-             SELECT id FROM work_runs WHERE execution_id = e.id ORDER BY rowid DESC LIMIT 1)
+             SELECT id FROM work_runs WHERE execution_id = e.id ORDER BY created_at DESC, id DESC LIMIT 1)
          WHERE e.work_item_id = ?1
            AND e.kind = (SELECT kind FROM work_executions WHERE id = ?2)
            AND e.rowid <= (SELECT rowid FROM work_executions WHERE id = ?2)
@@ -281,10 +283,11 @@ fn collect_dispatch_failures(
                  AND done.rowid < (SELECT rowid FROM work_executions WHERE id = ?2)
                  AND done.status NOT IN ('failed', 'orphaned') AND done.finished_at IS NOT NULL), 0)
            AND (e.status IN ('failed', 'orphaned') OR e.id = ?2)
+           AND (?3 = 0 OR e.id = ?2)
          ORDER BY e.rowid",
     )?;
     let rows = stmt
-        .query_map(params![work_item_id, current_execution_id], |row| {
+        .query_map(params![work_item_id, current_execution_id, own_history_only], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -312,29 +315,11 @@ fn collect_dispatch_failures(
         if id == current_execution_id {
             continue;
         }
-        let attention: Option<(String, String)> = conn
-            .query_row(
-                "SELECT COALESCE(NULLIF(TRIM(body_markdown), ''), title), created_at
-             FROM work_attention_items WHERE execution_id = ?1 AND kind IN ('hung_worker', 'stale_worker')
-             ORDER BY rowid DESC LIMIT 1",
-                [&id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let error = nonempty_text(run_error)
-            .or_else(|| nonempty_text(last_error))
-            .or_else(|| {
-                attention
-                    .as_ref()
-                    .and_then(|(body, _)| nonempty_text(Some(body.clone())))
-            });
+        let error = nonempty_text(run_error).or_else(|| nonempty_text(last_error));
         if let Some(error_text) = error {
             failures.push(DispatchFailureAttempt {
                 error_text,
-                happened_at: finished
-                    .or(run_finished)
-                    .or_else(|| attention.map(|(_, time)| time))
-                    .unwrap_or(created),
+                happened_at: finished.or(run_finished).unwrap_or(created),
             });
         }
     }
