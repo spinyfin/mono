@@ -588,8 +588,8 @@ mod tests {
     // ─── the sweep ───────────────────────────────────────────────────────────
 
     /// A spoke host that is disabled and silent for longer than the attention
-    /// horizon keeps its run, assignment and lease; the operator sees one
-    /// attention item, which clears when the host answers a fresh challenge.
+    /// horizon keeps its run, assignment and lease; one attention
+    /// item is raised, and it clears when the host answers a fresh challenge.
     #[tokio::test]
     async fn silence_and_disable_preserve_spoke_runs_and_leases_with_deduplicated_attention() {
         let (_dir, db) = open_db();
@@ -639,10 +639,122 @@ mod tests {
         assert!(!db.get_host("spoke").unwrap().unwrap().enabled);
         assert_eq!(db.get_execution(&exec).unwrap().status, ExecutionStatus::Running);
 
-        // Removal is the operator's recovery decision and still drains.
+        // Explicit removal authorizes recovery, so it still drains.
         db.remove_host("spoke").unwrap();
         assert_eq!(run_one_pass(&db, &cube, &events).await.reaped, 1);
         assert_eq!(db.get_execution(&exec).unwrap().status, ExecutionStatus::Orphaned);
+    }
+
+    fn eligibility_coordinator(db: &Arc<WorkDb>) -> ExecutionCoordinator {
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCube::default()),
+            Arc::new(NoopRunner),
+        )
+    }
+
+    /// A host whose readiness is unproven still launches new work over SSH, so
+    /// it keeps pool-size accounting of work runs rather than the spoke budget;
+    /// a ready spoke host with no fresh report has no budget and admits nothing.
+    #[test]
+    fn only_ready_spoke_hosts_are_scheduled_by_budget() {
+        let (_dir, db) = open_db();
+        let db = Arc::new(db);
+        let product = create_product(&db);
+        let work = create_test_chore(&db, &product, "placement").id;
+        for (host, transport) in [
+            ("pending", boss_work_db::HostTransport::SpokePending),
+            ("ready", boss_work_db::HostTransport::SpokeReady),
+        ] {
+            add_remote_host(&db, host);
+            db.set_host_transport(host, transport).unwrap();
+            db.connect()
+                .unwrap()
+                .execute(
+                    "INSERT OR IGNORE INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
+                    [host],
+                )
+                .unwrap();
+        }
+        let coordinator = eligibility_coordinator(&db);
+        coordinator
+            .validate_requested_host_for_test(&work, "pending")
+            .expect("a pending host with free pool seats is eligible");
+        coordinator
+            .validate_requested_host_for_test(&work, "ready")
+            .expect_err("a ready host without a fresh report has no budget");
+    }
+
+    /// A run on a spoke host with no post-upgrade connection has no capacity
+    /// row. Tracking starts when the reconciler first sees it.
+    #[tokio::test]
+    async fn a_host_that_never_reconnects_still_raises_unreachable_attention() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        add_remote_host(&db, "spoke");
+        db.set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
+            .unwrap();
+        let wi = create_test_chore(&db, &product, "orphan of an upgrade").id;
+        let exec = ready_execution(&db, &wi);
+        db.reserve_spoke_assignment(&exec, "spoke").unwrap();
+        let now = boss_engine_utils::epoch_time::now_epoch_ms() as i64;
+        db.reconcile_unreachable_hosts(now).unwrap();
+        assert!(
+            db.list_open_attention_items_of_kind("host_unreachable")
+                .unwrap()
+                .is_empty()
+        );
+        db.reconcile_unreachable_hosts(now + boss_work_db::HOST_UNREACHABLE_ATTENTION_MS + 1)
+            .unwrap();
+        db.reconcile_unreachable_hosts(now + boss_work_db::HOST_UNREACHABLE_ATTENTION_MS + 2)
+            .unwrap();
+        assert_eq!(
+            db.list_open_attention_items_of_kind("host_unreachable").unwrap().len(),
+            1
+        );
+    }
+
+    /// Removing a silent host drains its run; the attention raised for the
+    /// silence must clear with it, since the host will never answer again.
+    #[tokio::test]
+    async fn removing_a_silent_host_clears_its_unreachable_attention() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        add_remote_host(&db, "spoke");
+        db.set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
+            .unwrap();
+        let wi = create_test_chore(&db, &product, "silent worker").id;
+        let exec = ready_execution(&db, &wi);
+        let assignment = db.reserve_spoke_assignment(&exec, "spoke").unwrap();
+        db.bind_spoke_lease(
+            &exec,
+            assignment.assignment_generation,
+            "workspace",
+            "lease",
+            "/tmp/workspace",
+        )
+        .unwrap();
+        db.start_execution_run_on_host(&exec, "worker", "repo", "lease", "workspace", "/tmp/workspace", "spoke")
+            .unwrap();
+        let now = boss_engine_utils::epoch_time::now_epoch_ms() as i64;
+        db.open_host_capacity("spoke", 1, 0, now - boss_work_db::HOST_UNREACHABLE_ATTENTION_MS - 1)
+            .unwrap();
+        db.reconcile_unreachable_hosts(now).unwrap();
+        assert_eq!(
+            db.list_open_attention_items_of_kind("host_unreachable").unwrap().len(),
+            1
+        );
+        db.remove_host("spoke").unwrap();
+        let cube = FakeCube::default();
+        let events = RecordingDispatchEventSink::new();
+        assert_eq!(run_one_pass(&db, &cube, &events).await.reaped, 1);
+        db.reconcile_unreachable_hosts(now).unwrap();
+        assert!(
+            db.list_open_attention_items_of_kind("host_unreachable")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The core drain: two non-terminal executions bound to a disabled host
