@@ -560,6 +560,51 @@ async fn a_pane_exit_is_kept_with_its_exit_code_and_the_newest_observation_wins(
 }
 
 #[tokio::test]
+async fn a_busy_cursor_commit_retries_only_the_commit_and_does_not_reapply_the_event() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&tool_record(1, &run)).await;
+    let applier = Applier::default();
+    // A real database error on the cursor write: triggers abort every cursor
+    // write, so the production error classification and retry arm run.
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_cursor BEFORE UPDATE ON spoke_projection
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END;
+             CREATE TRIGGER fail_cursor_insert BEFORE INSERT ON spoke_projection
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+        )
+        .unwrap();
+    let projector = projector(&db, &applier, &Arc::new(Sender::default()), Arc::new(Notify::new()));
+    let drain = tokio::spawn({
+        let projector = projector.clone();
+        async move { projector.drain().await }
+    });
+    eventually("the event to be applied", || {
+        !applier.log(|l| l.events.clone()).is_empty()
+    })
+    .await;
+    // Let several failed commit attempts go by; each would re-apply the event
+    // if the retry covered the whole record.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(applied(&db), 0, "the failing cursor commit has not advanced");
+    db.connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_cursor; DROP TRIGGER fail_cursor_insert;")
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(
+        applier.log(|l| l.events.clone()),
+        ["1#pre_tool_use"],
+        "a transient cursor-commit failure must not re-run the event applier"
+    );
+    assert_eq!(applied(&db), 1);
+}
+
+#[tokio::test]
 async fn a_record_that_cannot_be_applied_yet_holds_the_cursor_and_the_order() {
     let world = World::new();
     let db = world.open();

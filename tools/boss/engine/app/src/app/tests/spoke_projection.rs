@@ -623,6 +623,35 @@ async fn a_run_scoped_write_is_applied_through_the_local_handler() {
 }
 
 #[tokio::test]
+async fn a_producer_write_cannot_claim_another_execution_via_run_id() {
+    let mut fx = delivered_with_a_resolvable_pr();
+    let mut payload = boss_protocol_spoke::proposal::conflict_producer_body(
+        "exec_someone_else",
+        "feature",
+        "main",
+        vec!["src/lib.rs".into()],
+    );
+    payload["run_id"] = json!(fx.execution_id);
+    fx.receive_run_write(
+        boss_protocol_spoke::proposal::CONFLICT_PRODUCER,
+        "producer-spoof",
+        payload,
+    );
+    fx.projector().drain().await;
+    let decisions = fx.wire.decisions();
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0].code, ResultCode::Rejected as i32);
+    assert!(
+        fx.state
+            .work_db
+            .latest_conflict_resolution_for_work_item(&fx.work_item_id)
+            .unwrap()
+            .is_none(),
+        "a spoofed run_id must not record a producer conflict"
+    );
+}
+
+#[tokio::test]
 async fn a_run_scoped_write_for_another_runs_attempt_is_refused() {
     let mut fx = delivered_with_a_resolvable_pr();
     fx.receive_run_write(
@@ -1390,6 +1419,57 @@ async fn a_reporting_member_is_finalized_when_the_hub_restarts_before_its_decisi
     fx.projector().drain().await;
     assert_eq!(fx.wire.decisions().len(), 1);
     eventually("the restarted hub to finalize the member", || is_terminal(&fx)).await;
+}
+
+#[tokio::test]
+async fn a_refused_settlement_does_not_finalize_an_accepted_member_but_an_accepted_one_does() {
+    use boss_engine_runtime::hub::projection::{DecisionSettled, Settlement};
+    let (mut fx, batch) = review_member_on_a_spoke();
+    fx.receive_proposal(
+        "report-1",
+        ProposalKind::ReviewReport,
+        v1::ProposalKind::ReviewReport,
+        review_report_payload(&batch, "head-sha"),
+    );
+    fx.wire.unreachable.store(true, Ordering::SeqCst);
+    fx.projector().drain().await;
+    assert!(!is_terminal(&fx));
+    let effect_key = fx
+        .state
+        .work_db
+        .pending_spoke_effects(10)
+        .unwrap()
+        .into_iter()
+        .find(|effect| effect.kind == "proposal_decision")
+        .expect("the accepted proposal owes a decision")
+        .key;
+
+    // A fresh applier holds no submission, as after a restart or when another
+    // generation's refusal settles under a colliding key.
+    let applier = crate::app::spoke_projection::applier(&fx.state);
+    let settle = |code: v1::ResultCode| {
+        let (applier, effect_key, execution_id) = (applier.clone(), effect_key.clone(), fx.execution_id.clone());
+        async move {
+            applier
+                .decision_settled(&DecisionSettled {
+                    effect_key: &effect_key,
+                    execution_id: &execution_id,
+                    proposal_id: "report-1",
+                    settlement: Settlement::Delivered,
+                    code: code as i32,
+                })
+                .await;
+        }
+    };
+    settle(v1::ResultCode::Rejected).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !is_terminal(&fx),
+        "a refused settlement must not finish an accepted proposal"
+    );
+
+    settle(v1::ResultCode::Ok).await;
+    eventually("the accepted settlement to finalize the member", || is_terminal(&fx)).await;
 }
 
 #[tokio::test]

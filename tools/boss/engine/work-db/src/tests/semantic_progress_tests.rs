@@ -95,6 +95,25 @@ fn session_start_does_not_coerce_legacy_null_to_idle() {
 }
 
 #[test]
+fn a_future_observed_time_does_not_pin_the_checkpoint_ahead_of_now() {
+    let db = WorkDb::open(temp_db_path("semantic-progress-future")).unwrap();
+    let execution_id = started_execution(&db);
+    let future_ms = (boss_engine_utils::epoch_time::now_epoch_secs() + 3_600) * 1000;
+    db.record_semantic_progress_observed(&execution_id, &pre_tool(), Some(future_ms))
+        .unwrap();
+    let checkpoint = db
+        .get_run_semantic_progress_checkpoint(&execution_id)
+        .unwrap()
+        .expect("observed progress");
+    let ceiling = boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs() + 2);
+    assert!(
+        checkpoint.progress_at <= ceiling,
+        "a future spoke stamp must clamp to hub now, got {} > {ceiling}",
+        checkpoint.progress_at
+    );
+}
+
+#[test]
 fn record_semantic_progress_returns_false_when_the_execution_has_no_run_row() {
     let db = WorkDb::open(temp_db_path("semantic-progress-missing-run")).unwrap();
     let recorded = db.record_semantic_progress("exec_missing", &pre_tool()).unwrap();

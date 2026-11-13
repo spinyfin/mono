@@ -23,6 +23,46 @@ pub(crate) fn comment_thread_entry_columns() -> &'static str {
     "id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at"
 }
 
+/// Append a thread entry on an already-open connection. Shared by
+/// [`WorkDb::create_comment_thread_entry`] and by
+/// [`WorkDb::apply_answer_agent_reply`]'s reply transaction, including the
+/// `entry_kind` validation the reply path must not drop.
+pub(crate) fn insert_comment_thread_entry_on(
+    conn: &Connection,
+    comment_id: &str,
+    entry_kind: &str,
+    author: &str,
+    body: &str,
+    revise_task_id: Option<&str>,
+    answer_agent_run_id: Option<&str>,
+) -> Result<CommentThreadEntry> {
+    match entry_kind {
+        boss_protocol::THREAD_ENTRY_KIND_ANSWER | boss_protocol::THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP => {}
+        other => bail!("invalid comment thread entry_kind: {other}"),
+    }
+    let id = next_id("cte");
+    let now = now_string();
+    conn.execute(
+        "INSERT INTO comment_thread_entries \
+         (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            id,
+            comment_id,
+            entry_kind,
+            author,
+            body,
+            revise_task_id,
+            answer_agent_run_id,
+            now
+        ],
+    )?;
+    let cols = comment_thread_entry_columns();
+    let sql = format!("SELECT {cols} FROM comment_thread_entries WHERE id = ?1");
+    conn.query_row(&sql, [&id], map_comment_thread_entry)
+        .map_err(Into::into)
+}
+
 /// List a comment's thread entries in chronological order, excluding retired
 /// `nudge` rows, on an already-open connection. Shared by
 /// [`WorkDb::list_comment_thread_entries`] — every reader (the app, `bossctl`,
@@ -61,32 +101,16 @@ impl WorkDb {
         revise_task_id: Option<&str>,
         answer_agent_run_id: Option<&str>,
     ) -> Result<CommentThreadEntry> {
-        match entry_kind {
-            boss_protocol::THREAD_ENTRY_KIND_ANSWER | boss_protocol::THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP => {}
-            other => bail!("invalid comment thread entry_kind: {other}"),
-        }
         let conn = self.connect()?;
-        let id = next_id("cte");
-        let now = now_string();
-        conn.execute(
-            "INSERT INTO comment_thread_entries \
-             (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                id,
-                comment_id,
-                entry_kind,
-                author,
-                body,
-                revise_task_id,
-                answer_agent_run_id,
-                now
-            ],
-        )?;
-        let cols = comment_thread_entry_columns();
-        let sql = format!("SELECT {cols} FROM comment_thread_entries WHERE id = ?1");
-        conn.query_row(&sql, [&id], map_comment_thread_entry)
-            .map_err(Into::into)
+        insert_comment_thread_entry_on(
+            &conn,
+            comment_id,
+            entry_kind,
+            author,
+            body,
+            revise_task_id,
+            answer_agent_run_id,
+        )
     }
 
     /// List a comment's thread entries in chronological order, excluding

@@ -606,6 +606,14 @@ impl WorkDb {
              ON CONFLICT(host_id) DO UPDATE SET applied = excluded.applied",
             params![host_id, journal_id, sequence as i64],
         )?;
+        // Capture tombstones (empty frames) have no further use once the
+        // cursor has passed them. They are outside the ingress quota, so
+        // nothing else would delete them.
+        tx.execute(
+            "DELETE FROM spoke_ingress
+              WHERE host_id = ?1 AND journal_id = ?2 AND sequence = ?3 AND LENGTH(frame) = 0",
+            params![host_id, journal_id, sequence as i64],
+        )?;
         tx.commit()?;
         Ok(SpokeAdvance::Advanced { recorded, duplicates })
     }
@@ -1241,6 +1249,76 @@ mod tests {
             db.spoke_ingress_frame("host-a", 4).unwrap().as_deref(),
             Some(&b"frame-4"[..])
         );
+    }
+
+    #[test]
+    fn advancing_the_cursor_deletes_passed_capture_tombstones() {
+        let db = db();
+        let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
+        db.commit_spoke_record(
+            SpokeIngressCommit::builder()
+                .host_id("host-a")
+                .generation(admission.generation)
+                .journal_id(&admission.journal_id)
+                .sequence(1)
+                .frame(b"kept")
+                .epoch(1)
+                .features("execution=1")
+                .observed_at_ms(1)
+                .runs(&[])
+                .build(),
+        )
+        .unwrap();
+        db.commit_spoke_record(
+            SpokeIngressCommit::builder()
+                .host_id("host-a")
+                .generation(admission.generation)
+                .journal_id(&admission.journal_id)
+                .sequence(2)
+                .frame(b"capture")
+                .epoch(1)
+                .features("execution=1")
+                .observed_at_ms(1)
+                .runs(&[])
+                .retain(false)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(db.spoke_ingress_frame("host-a", 2).unwrap().as_deref(), Some(&b""[..]));
+        db.advance_spoke_projection("host-a", "journal", 1, &[]).unwrap();
+        assert_eq!(
+            db.spoke_ingress_frame("host-a", 2).unwrap().as_deref(),
+            Some(&b""[..]),
+            "a tombstone ahead of the cursor is kept so projection can skip it"
+        );
+        db.advance_spoke_projection("host-a", "journal", 2, &[]).unwrap();
+        assert!(
+            db.spoke_ingress_frame("host-a", 2).unwrap().is_none(),
+            "a passed tombstone is deleted"
+        );
+        assert_eq!(
+            db.spoke_ingress_frame("host-a", 1).unwrap().as_deref(),
+            Some(&b"kept"[..]),
+            "retained frames stay until a later consumer prunes them"
+        );
+        // A retransmitted unretained capture at a deleted tombstone is already
+        // receipted and does not recreate the row.
+        db.commit_spoke_record(
+            SpokeIngressCommit::builder()
+                .host_id("host-a")
+                .generation(admission.generation)
+                .journal_id(&admission.journal_id)
+                .sequence(2)
+                .frame(b"capture")
+                .epoch(1)
+                .features("execution=1")
+                .observed_at_ms(1)
+                .runs(&[])
+                .retain(false)
+                .build(),
+        )
+        .unwrap();
+        assert!(db.spoke_ingress_frame("host-a", 2).unwrap().is_none());
     }
 
     fn sqlite_failure(code: i32) -> anyhow::Error {

@@ -1818,7 +1818,7 @@ impl LiveWorkerStateRegistry {
     pub fn apply_hook_event(&self, slot_id: u8, origin: HookOrigin, event: &WorkerEvent) -> HookApplied {
         let ingress_seq = origin.ingress_seq;
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let now = current_iso8601();
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
         // The wire state and the per-slot bookkeeping this arm reads and
         // writes now live in one entry, so a single lookup reaches both;
         // `SlotEntry`'s fields split-borrow without a second map access.
@@ -1872,12 +1872,15 @@ impl LiveWorkerStateRegistry {
         // A replayed hook carries the time the host saw it. Both the display
         // stamp and the liveness checkpoint use that time, so draining a
         // backlog after an outage does not make a worker that died during the
-        // outage look freshly active.
-        let observed_at = origin
+        // outage look freshly active. A spoke clock ahead of the hub is
+        // clamped to now: the checkpoint is monotonic and must not be pinned
+        // in the future.
+        let event_secs = origin
             .observed_at_ms
             .filter(|ms| *ms > 0)
-            .map(|ms| iso8601_utc(ms.div_euclid(1000)));
-        let event_time = observed_at.unwrap_or_else(|| now.clone());
+            .map(|ms| ms.div_euclid(1000).min(now_secs))
+            .unwrap_or(now_secs);
+        let event_time = iso8601_utc(event_secs);
         state.last_event_at = Some(event_time.clone());
         // Driver-originated only: this method is the hook/JSONL ingress.
         // Engine-synthesized display stamps (`mark_stalled_spawns`,

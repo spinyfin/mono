@@ -180,10 +180,14 @@ impl WorkDb {
 }
 
 /// The checkpoint time for an event: when it was observed, else now.
+/// A spoke clock that runs ahead of the hub must not pin the monotonic
+/// checkpoint in the future, or hung-worker and stale-worker sweeps would
+/// treat a dead worker as fresh for the skew.
 fn progress_time(observed_at_ms: Option<i64>) -> String {
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let secs = observed_at_ms
         .filter(|ms| *ms > 0)
-        .map(|ms| ms.div_euclid(1000))
-        .unwrap_or_else(boss_engine_utils::epoch_time::now_epoch_secs);
+        .map(|ms| ms.div_euclid(1000).min(now))
+        .unwrap_or(now);
     boss_engine_utils::iso8601::format_epoch_iso8601(secs)
 }

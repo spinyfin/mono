@@ -1532,6 +1532,35 @@ fn applied(reg: &LiveWorkerStateRegistry, seq: u64, event: &WorkerEvent, from_su
     )
 }
 
+#[test]
+fn a_spoke_clock_ahead_of_the_hub_does_not_pin_last_event_at_in_the_future() {
+    let reg = LiveWorkerStateRegistry::new();
+    reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let future_ms = (now + 3_600) * 1000;
+    reg.apply_hook_event(
+        1,
+        HookOrigin {
+            ingress_seq: Some(1),
+            from_subagent: false,
+            observed_at_ms: Some(future_ms),
+        },
+        &pre_tool("Bash"),
+    );
+    let last = reg.get(1).unwrap().last_event_at.expect("activity time");
+    let ceiling = iso8601_utc(now + 2);
+    assert!(
+        last <= ceiling,
+        "a future spoke stamp must clamp to hub now, got {last} > {ceiling}"
+    );
+    let checkpoint = reg.semantic_progress_for_slot(1).unwrap();
+    assert!(
+        checkpoint.progress_at <= ceiling,
+        "the monotonic checkpoint must not be pinned in the future, got {}",
+        checkpoint.progress_at
+    );
+}
+
 fn notification_event() -> WorkerEvent {
     WorkerEvent::Notification {
         session_id: "s".into(),
