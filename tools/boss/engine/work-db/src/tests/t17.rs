@@ -291,13 +291,18 @@ fn queued_wait_pre_start_failure_backoff_carries_retry_and_not_before() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET dispatch_not_before = ?2, pre_start_failure_count = 1 WHERE id = ?1",
+            "UPDATE work_executions SET dispatch_not_before = ?2, dispatch_not_before_source = 'failure_backoff', pre_start_failure_count = 1 WHERE id = ?1",
             params![execution.id, future],
         )
         .unwrap();
     let runtime = db.get_task_runtime(&chore_id).unwrap();
     assert_eq!(runtime.dispatch_retry_at.as_deref(), Some(future.as_str()));
     assert_eq!(runtime.dispatch_not_before.as_deref(), Some(future.as_str()));
+    assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some("failure_backoff"));
+    assert_eq!(
+        runtime.dispatch_wait_label.as_deref(),
+        Some("Retrying after error (attempt 2)")
+    );
 }
 
 #[test]

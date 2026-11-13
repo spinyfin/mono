@@ -395,6 +395,11 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
         conn.execute_batch("DROP TABLE task_status_audit; DROP TABLE task_status_audit_context;")
             .unwrap();
         if let Some(version) = version {
+            conn.execute_batch(
+                "DROP TABLE dispatch_start_failures;
+                 ALTER TABLE work_executions DROP COLUMN dispatch_not_before_source;",
+            )
+            .unwrap();
             if version < 60 {
                 // Schema 60's columns were dropped by a later migration, so an
                 // upgraded database no longer has them to remove.

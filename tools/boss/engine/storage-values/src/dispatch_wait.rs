@@ -73,6 +73,16 @@ pub const DISPATCH_WAIT_REASON_PROJECT_ORDER: &str = "project_order";
 /// The row is `ready` but its `dispatch_not_before` deadline is still ahead.
 pub const DISPATCH_WAIT_REASON_NOT_BEFORE: &str = "not_before";
 
+/// The row is `ready` behind a `dispatch_not_before` stamped after a
+/// pre-start or transient failure. Distinct from [`DISPATCH_WAIT_REASON_NOT_BEFORE`]
+/// (a scheduled delay that is not a failure).
+pub const DISPATCH_WAIT_REASON_FAILURE_BACKOFF: &str = "failure_backoff";
+
+/// The row is `ready` behind a `dispatch_not_before` while a spoke host has
+/// not yet said whether it granted the workspace lease. Not a failure: the
+/// retry budget is untouched.
+pub const DISPATCH_WAIT_REASON_HOST_LEASE_PARK: &str = "host_lease_park";
+
 /// The row is about to be dispatched: either it is `ready` and no scheduler
 /// pass has held it, or it is a queued card whose latest execution was
 /// abandoned before a worker started and the reconciler will mint a
@@ -221,6 +231,11 @@ pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
         DISPATCH_WAIT_REASON_NOT_BEFORE,
         "held until its scheduled dispatch time",
     ),
+    (DISPATCH_WAIT_REASON_FAILURE_BACKOFF, "retrying after error"),
+    (
+        DISPATCH_WAIT_REASON_HOST_LEASE_PARK,
+        "waiting for the host to confirm the workspace lease",
+    ),
     (
         DISPATCH_WAIT_REASON_AWAITING_DISPATCH,
         "ready for the dispatcher's next pass",
@@ -308,6 +323,13 @@ pub fn dispatch_wait_phrase(reason: &str) -> String {
         ),
         None => reason.to_owned(),
     }
+}
+
+/// Card phrase for a failure-backoff wait. `attempt` is the upcoming
+/// attempt (failed count + 1), matching `Retrying after error (attempt 4)`
+/// when three attempts have already failed.
+pub fn failure_backoff_wait_label(attempt: i64) -> String {
+    format!("Retrying after error (attempt {attempt})")
 }
 
 /// User-visible interactive-cap hold text. Lease-pending slots are
@@ -429,5 +451,10 @@ mod tests {
         );
         assert!(phrase.contains("some_new_hold"), "{phrase}");
         assert!(!is_unlabelled_wait_code(DISPATCH_WAIT_REASON_FOCUS_MODE));
+    }
+
+    #[test]
+    fn failure_backoff_label_names_the_upcoming_attempt() {
+        assert_eq!(failure_backoff_wait_label(4), "Retrying after error (attempt 4)");
     }
 }

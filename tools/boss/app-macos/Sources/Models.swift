@@ -693,6 +693,9 @@ struct WorkTaskRuntime: Hashable {
     /// app never maps a wait code to text itself. Mirrors
     /// `TaskRuntime.dispatch_wait_label`.
     var dispatchWaitLabel: String? = nil
+    /// Failed attempts that produced a `failure_backoff` wait. Empty for
+    /// every other reason. Newest last. Mirrors `TaskRuntime.dispatch_failures`.
+    var dispatchFailures: [DispatchFailureAttempt] = []
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by

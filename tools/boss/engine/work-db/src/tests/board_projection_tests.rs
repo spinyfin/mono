@@ -150,7 +150,7 @@ fn board_projection_runtime_and_structural_sequence_matches_every_field() {
         assert!(matches!(check(&db, &product, &mut model, 100), Refresh::Incremental(_)));
     }
     // Deadlines must expire even without a write or invalidation.
-    db.connect().unwrap().execute("UPDATE work_executions SET status = 'ready', dispatch_not_before = '150', pre_start_failure_count = 1 WHERE id = ?1", [&execution.id]).unwrap();
+    db.connect().unwrap().execute("UPDATE work_executions SET status = 'ready', dispatch_not_before = '150', dispatch_not_before_source = 'failure_backoff', pre_start_failure_count = 1 WHERE id = ?1", [&execution.id]).unwrap();
     for now in [100, 149, 150, 151] {
         check(&db, &product, &mut model, now);
     }
@@ -576,7 +576,7 @@ fn board_projection_snapshot_preserves_cached_runtime_expiry() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET dispatch_not_before = '150', pre_start_failure_count = 1 WHERE id = ?1",
+            "UPDATE work_executions SET dispatch_not_before = '150', dispatch_not_before_source = 'not_before' WHERE id = ?1",
             [&execution.id],
         )
         .unwrap();
@@ -605,6 +605,8 @@ fn board_projection_upgrade_replaces_broad_triggers_and_preserves_watermark() {
             INSERT INTO board_changes(source) VALUES ('tasks');
         END;
         DROP TRIGGER board_changes_pr_review_guide_revision_heads_INSERT;
+        DROP TABLE dispatch_start_failures;
+        ALTER TABLE work_executions DROP COLUMN dispatch_not_before_source;
         DROP TABLE schema_migrations;
         INSERT OR REPLACE INTO metadata VALUES ('schema_version', '57');",
     )

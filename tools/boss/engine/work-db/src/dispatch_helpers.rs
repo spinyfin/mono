@@ -503,6 +503,7 @@ pub struct ComputedRuntime {
 /// - the chosen execution's latest `work_runs` row: insert, delete, or an
 ///   update of `status`, `execution_id` or `created_at`;
 /// - `dispatch_not_before` against `now`: `expires_at`;
+/// - failure history (start events, run errors and attention bodies): not cached;
 /// - dependency gating, project order and chain-hold blockers: not
 ///   versioned, `cacheable` is false.
 ///
@@ -571,7 +572,15 @@ pub(crate) fn compute_task_runtime(
                 Some((id, status)) => (Some(status), Some(id)),
                 None => (None, None),
             };
-            let dispatch_retry_at = dispatch_retry_at_for_execution(&execution, now);
+            // Only a failure backoff is a "retry"; a host-lease park or scheduled
+            // delay keeps its own wording even when an earlier start failed.
+            let dispatch_retry_at = if wait.reason.as_deref()
+                == Some(boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
+            {
+                dispatch_retry_at_for_execution(&execution, now)
+            } else {
+                None
+            };
             let dispatch_wait_since = if wait.reason.is_some()
                 && wait.reason == execution.dispatch_wait_reason
                 && execution.status == ExecutionStatus::Ready
@@ -609,6 +618,7 @@ pub(crate) fn compute_task_runtime(
         .maybe_dispatch_wait_since(dispatch_wait_since)
         .maybe_dispatch_not_before(wait.not_before)
         .maybe_dispatch_wait_blocker(wait.blocker)
+        .dispatch_failures(wait.failures)
         .build();
     Ok(ComputedRuntime {
         runtime,

@@ -32,8 +32,8 @@ impl WorkDb {
     /// large fraction of the fleet-wide `work_runs.transcript_path IS NULL`
     /// rows (and would have left the same hole in the per-run cost
     /// columns that share the hook-driven persist seam). Retry state is
-    /// already durable on the execution (`pre_start_failure_count` /
-    /// `dispatch_not_before`); the permanent-fail path still inserts one
+    /// recorded per attempt in `dispatch_start_failures`, with the retry count /
+    /// `dispatch_not_before` on the execution; the permanent-fail path still inserts one
     /// failed run so operators have a terminal history row.
     ///
     /// `retry_delays` controls how many retries are allowed and the delay
@@ -87,7 +87,7 @@ impl WorkDb {
              SET status = 'ready',
                  started_at = NULL,
                  finished_at = NULL,
-                 dispatch_not_before = ?2,
+                 dispatch_not_before = ?2, dispatch_not_before_source = 'host_lease_park',
                  last_error = ?3
              WHERE id = ?1
                AND status IN ('ready', 'claimed')",
@@ -222,6 +222,11 @@ impl WorkDb {
         // here would hide a cube-release failure from the leftover-lease sweep.
 
         let (outcome, run_id) = if new_count <= max_retries {
+            tx.execute(
+                "INSERT INTO dispatch_start_failures(id, execution_id, happened_at, error_text)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![next_id("failure"), execution_id, now, error_text],
+            )?;
             let delay = retry_delays[(new_count - 1) as usize];
             let dispatch_not_before =
                 (boss_engine_utils::epoch_time::now_epoch_secs() as u64 + delay.as_secs()).to_string();
@@ -232,7 +237,7 @@ impl WorkDb {
                      cube_repo_id = COALESCE(?3, cube_repo_id),
                      started_at = NULL,
                      finished_at = NULL,
-                     dispatch_not_before = ?4,
+                     dispatch_not_before = ?4, dispatch_not_before_source = 'failure_backoff',
                      last_error = ?5
                  WHERE id = ?1
                    AND status IN ('ready', 'claimed')",
@@ -361,6 +366,28 @@ fn resolved_positioning_pr_url(conn: &Connection, execution: &WorkExecution) -> 
     Ok(nonempty(
         get_chain_root_task(conn, &execution.work_item_id)?.and_then(|root| root.pr_url),
     ))
+}
+
+/// Install durable retry attempts and the source of each dispatch deadline.
+/// A failure already in backoff at upgrade has no recorded time, so its
+/// `happened_at` is the empty string ("time not recorded"), never the upgrade time.
+pub(super) fn migrate_dispatch_failure_history(conn: &Connection) -> Result<()> {
+    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_not_before_source TEXT;
+                    UPDATE work_executions SET dispatch_not_before_source = CASE
+                        WHEN last_error LIKE 'spoke lease unresolved; parked%' THEN 'host_lease_park'
+                        WHEN pre_start_failure_count > 0 OR transient_failure_count > 0 THEN 'failure_backoff'
+                        WHEN last_error IS NOT NULL THEN 'host_lease_park' ELSE 'not_before' END
+                    WHERE dispatch_not_before IS NOT NULL;
+                    CREATE TABLE dispatch_start_failures (
+                        id TEXT PRIMARY KEY, execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+                        happened_at TEXT NOT NULL, error_text TEXT NOT NULL);
+                    CREATE INDEX dispatch_start_failures_execution ON dispatch_start_failures(execution_id);
+                    INSERT INTO dispatch_start_failures(id, execution_id, happened_at, error_text)
+                        SELECT 'legacy_start_' || id, id, '', TRIM(last_error)
+                        FROM work_executions WHERE status IN ('ready', 'claimed')
+                          AND dispatch_not_before_source = 'failure_backoff'
+                          AND pre_start_failure_count > 0 AND TRIM(COALESCE(last_error, '')) != '';")?;
+    Ok(())
 }
 
 #[cfg(test)]

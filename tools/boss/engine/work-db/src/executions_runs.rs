@@ -137,9 +137,9 @@ impl WorkDb {
         tx.execute(
             "UPDATE work_executions
              SET status = 'orphaned',
-                 finished_at = COALESCE(finished_at, ?2)
+                 finished_at = COALESCE(finished_at, ?2), last_error = ?3
              WHERE id = ?1",
-            params![execution_id, now.as_str()],
+            params![execution_id, now.as_str(), reason],
         )?;
         // Stamp any still-active work_runs as orphaned so the run
         // history matches the execution status. result_summary holds
@@ -502,20 +502,29 @@ impl WorkDb {
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'orphaned',
-                     finished_at = COALESCE(finished_at, ?2)
+                     finished_at = COALESCE(finished_at, ?2),
+                     last_error = ?3
                  WHERE id = ?1",
-                params![dead_execution_id, now.as_str()],
+                params![dead_execution_id, now.as_str(), reason],
             )?;
             tx.execute(
                 "UPDATE work_runs
                  SET status = 'orphaned',
-                     result_summary = COALESCE(result_summary, ?3),
+                     error_text = COALESCE(NULLIF(TRIM(error_text), ''), ?3),
                      finished_at = COALESCE(finished_at, ?2)
-                 WHERE execution_id = ?1
-                   AND finished_at IS NULL",
+                 WHERE id = (SELECT id FROM work_runs WHERE execution_id = ?1 ORDER BY rowid DESC LIMIT 1)",
                 params![dead_execution_id, now.as_str(), reason],
             )?;
         }
+
+        tx.execute(
+            "UPDATE work_executions SET last_error = COALESCE(NULLIF(TRIM(last_error), ''),
+                (SELECT COALESCE(NULLIF(TRIM(body_markdown), ''), NULLIF(TRIM(title), ''))
+                 FROM work_attention_items WHERE execution_id = ?1 AND kind IN ('hung_worker', 'stale_worker')
+                 ORDER BY rowid DESC LIMIT 1), ?2)
+             WHERE id = ?1",
+            params![dead_execution_id, reason],
+        )?;
 
         // Another reconciler can settle the run while teardown is in flight.
         // Adopt the successor it created, but only the row that is genuinely
@@ -542,6 +551,10 @@ impl WorkDb {
                     tx.execute(
                         "UPDATE work_executions
                          SET transient_failure_count = MAX(transient_failure_count, ?2),
+                             dispatch_not_before_source = CASE
+                                 WHEN dispatch_not_before IS NULL
+                                      OR CAST(dispatch_not_before AS INTEGER) < ?3
+                                 THEN 'failure_backoff' ELSE dispatch_not_before_source END,
                              dispatch_not_before = CASE
                                  WHEN dispatch_not_before IS NULL
                                       OR CAST(dispatch_not_before AS INTEGER) < ?3
@@ -564,8 +577,8 @@ impl WorkDb {
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority,
                 created_at, started_at, finished_at, prefer_is_soft,
-                transient_failure_count, dispatch_not_before, branch_naming
-             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11)",
+                transient_failure_count, dispatch_not_before, branch_naming, dispatch_not_before_source
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, 'failure_backoff')",
             params![
                 new_id,
                 dead.work_item_id,
@@ -2082,16 +2095,16 @@ impl WorkDb {
                  error_text = COALESCE(?2, error_text),
                  result_summary = COALESCE(?2, result_summary),
                  finished_at = COALESCE(finished_at, ?3)
-             WHERE execution_id = ?1
-               AND finished_at IS NULL",
+             WHERE id = (SELECT id FROM work_runs WHERE execution_id = ?1 ORDER BY rowid DESC LIMIT 1)",
             params![execution_id, normalized_error, now],
         )?;
         tx.execute(
             "UPDATE work_executions
              SET status = 'failed',
-                 finished_at = ?2
+                 finished_at = ?2,
+                 last_error = COALESCE(?3, last_error)
              WHERE id = ?1",
-            params![execution_id, now],
+            params![execution_id, now, normalized_error],
         )?;
 
         let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;

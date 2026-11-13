@@ -71,7 +71,15 @@ final class QueuedWaitTests: XCTestCase {
             runtime(reason: "run_ended", label: "its last run ended; start it again to queue a new run",
                     status: "cancelled"),
             notBefore,
-            retrying
+            retrying,
+            {
+                var backoff = runtime(reason: "failure_backoff", label: "Retrying after error (attempt 4)")
+                backoff.dispatchNotBefore = "1900000000"
+                backoff.dispatchFailures = [
+                    DispatchFailureAttempt(errorText: "tmux session is absent", happenedAt: "1899998200")
+                ]
+                return backoff
+            }()
         ]
         for pending in runtimes {
             for nextUp in [false, true] {
@@ -101,14 +109,87 @@ final class QueuedWaitTests: XCTestCase {
         XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()), "Queued — \(label)")
     }
 
-    func testRetryBackoffWinsOverNotBeforeWhenBothAreSet() {
-        let now = Date()
-        let future = String(Int(now.timeIntervalSince1970) + 120)
-        var pending = runtime(reason: "not_before", label: "held until its scheduled dispatch time")
-        pending.dispatchNotBefore = future
-        pending.dispatchRetryAt = future
-        XCTAssertTrue(WorkCardLiveStatus.queuedLabel(runtime: pending, now: now)
-            .hasPrefix("Retrying dispatch — next attempt"))
+    /// A park after an earlier start failure may still carry a retry deadline
+    /// on the wire; the card names the wait the engine classified.
+    func testHostLeaseParkWithRetryDeadlineKeepsHostLeaseWording() throws {
+        let client = EngineClient(socketPath: "/tmp/queued-park-\(UUID().uuidString).sock")
+        let pending = try XCTUnwrap(client.parseTaskRuntime([
+            "work_item_id": "task_waiting", "execution_status": "ready",
+            "dispatch_wait_reason": "host_lease_park",
+            "dispatch_wait_label": "waiting for the host to confirm the workspace lease",
+            "dispatch_not_before": "1900000000",
+            "dispatch_retry_at": "1900000000",
+        ]))
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        XCTAssertEqual(
+            WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date(timeIntervalSince1970: 1_899_999_000)),
+            "Queued — waiting for the host to confirm the workspace lease — not before \(date.formatted(date: .abbreviated, time: .shortened))"
+        )
+    }
+
+    func testFailureBackoffUsesEngineLabelAndFormattedTime() throws {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        var pending = runtime(reason: "failure_backoff", label: "Retrying after error (attempt 4)")
+        pending.dispatchNotBefore = "1900000000"
+        pending.dispatchRetryAt = "1900000000"
+        pending.dispatchFailures = [
+            DispatchFailureAttempt(errorText: "cube lease failed", happenedAt: "1899990000"),
+            DispatchFailureAttempt(
+                errorText: "tmux session is absent from list-sessions", happenedAt: "1899998200"
+            ),
+        ]
+        XCTAssertEqual(
+            WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()),
+            "Retrying after error (attempt 4) — not before \(date.formatted(date: .abbreviated, time: .shortened))"
+        )
+        let model = ChatViewModel(socketPath: "/tmp/queued-backoff-\(UUID().uuidString).sock")
+        let waiting = task(status: "todo")
+        model.choresByProductID = ["product_test": [waiting]]
+        model.taskRuntimesByID = [waiting.id: pending]
+        let snapshot = snapshot(model, waiting)
+        XCTAssertEqual(
+            snapshot.liveStatus,
+            "Retrying after error (attempt 4) — not before \(date.formatted(date: .abbreviated, time: .shortened))"
+        )
+        XCTAssertEqual(snapshot.dispatchFailures.count, 2)
+        let row = try XCTUnwrap(WorkBoardCardLiveStatusRowSlice(snapshot: snapshot))
+        XCTAssertEqual(row.latestFailure?.errorText, "tmux session is absent from list-sessions")
+        XCTAssertEqual(row.failures.count, 2)
+    }
+
+    func testHostLeaseParkNamesTheHostWait() {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        var pending = runtime(
+            reason: "host_lease_park",
+            label: "waiting for the host to confirm the workspace lease"
+        )
+        pending.dispatchNotBefore = "1900000000"
+        XCTAssertEqual(
+            WorkCardLiveStatus.queuedLabel(runtime: pending, now: Date()),
+            "Queued — waiting for the host to confirm the workspace lease — not before \(date.formatted(date: .abbreviated, time: .shortened))"
+        )
+        XCTAssertTrue(pending.dispatchFailures.isEmpty)
+    }
+
+    func testPayloadParsesDispatchFailures() throws {
+        let client = EngineClient(socketPath: "/tmp/queued-failures-\(UUID().uuidString).sock")
+        let pending = try XCTUnwrap(client.parseTaskRuntime([
+            "work_item_id": "task_waiting", "execution_status": "ready",
+            "dispatch_wait_reason": "failure_backoff",
+            "dispatch_wait_label": "Retrying after error (attempt 4)",
+            "dispatch_not_before": "1900000000",
+            "dispatch_failures": [
+                ["error_text": "first failure", "happened_at": "1000"],
+                ["error_text": "tmux session is absent from list-sessions", "happened_at": "2000"],
+                ["error_text": "   ", "happened_at": "3000"],
+            ],
+        ]))
+        XCTAssertEqual(pending.dispatchFailures.map(\.errorText), [
+            "first failure", "tmux session is absent from list-sessions",
+        ])
+        XCTAssertEqual(pending.dispatchFailures.last?.happenedAt, "2000")
+        let bare = try XCTUnwrap(client.parseTaskRuntime(["work_item_id": "task_waiting"]))
+        XCTAssertTrue(bare.dispatchFailures.isEmpty)
     }
 
     func testProjectBlockerRendersWithProjectPrefix() throws {

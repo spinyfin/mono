@@ -15,18 +15,23 @@ use super::unscheduled_wait::{self, Candidate, ClassifyCost};
 use super::*;
 use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_AUTOSTART_OFF, DISPATCH_WAIT_REASON_AWAITING_DISPATCH, DISPATCH_WAIT_REASON_AWAITING_MERGE,
-    DISPATCH_WAIT_REASON_NOT_BEFORE, DISPATCH_WAIT_REASON_PROJECT_ORDER, DISPATCH_WAIT_REASON_UNCLASSIFIED,
-    DISPATCH_WAIT_REASON_WAITING_DEPENDENCY, UnexplainedWait, dispatch_wait_phrase, is_unlabelled_wait_code,
+    DISPATCH_WAIT_REASON_FAILURE_BACKOFF, DISPATCH_WAIT_REASON_HOST_LEASE_PARK, DISPATCH_WAIT_REASON_NOT_BEFORE,
+    DISPATCH_WAIT_REASON_PROJECT_ORDER, DISPATCH_WAIT_REASON_UNCLASSIFIED, DISPATCH_WAIT_REASON_WAITING_DEPENDENCY,
+    UnexplainedWait, dispatch_wait_phrase, failure_backoff_wait_label, is_unlabelled_wait_code,
 };
-use boss_protocol::DispatchWaitBlocker;
+use boss_protocol::{DispatchFailureAttempt, DispatchWaitBlocker};
 
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct DispatchWait {
     pub reason: Option<String>,
     /// The phrase for `reason`; set whenever `reason` is.
     pub label: Option<String>,
     pub not_before: Option<String>,
     pub blocker: Option<DispatchWaitBlocker>,
+    /// Failed attempts that produced a [`DISPATCH_WAIT_REASON_FAILURE_BACKOFF`]
+    /// wait. Empty for every other reason.
+    pub failures: Vec<DispatchFailureAttempt>,
     /// The projection consulted state the item's own execution rows do not
     /// version: another work item (dependency gating, project order, a
     /// chain-hold blocker) or the item's task row. Such a result is recomputed
@@ -153,7 +158,7 @@ fn for_ready(conn: &Connection, execution: &WorkExecution, now: i64) -> Result<D
         .and_then(|raw| raw.parse::<i64>().ok())
         .filter(|epoch| *epoch > now)
     {
-        let mut wait = DispatchWait::named(DISPATCH_WAIT_REASON_NOT_BEFORE);
+        let mut wait = not_before_wait(conn, execution)?;
         wait.not_before = Some(epoch.to_string());
         return Ok(wait);
     }
@@ -213,6 +218,127 @@ fn unheld(execution: &WorkExecution) -> DispatchWait {
     } else {
         DispatchWait::named(DISPATCH_WAIT_REASON_UNCLASSIFIED)
     }
+}
+
+/// Classify the current deadline by its writer.
+fn not_before_wait(conn: &Connection, execution: &WorkExecution) -> Result<DispatchWait> {
+    let source: Option<String> = conn.query_row(
+        "SELECT dispatch_not_before_source FROM work_executions WHERE id = ?1",
+        [&execution.id],
+        |row| row.get(0),
+    )?;
+    if source.as_deref() == Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF) {
+        let failures = collect_dispatch_failures(conn, &execution.work_item_id, &execution.id)?;
+        // The upcoming attempt follows the same sequence the history lists; the
+        // row counters only cover legacy rows whose history is incomplete.
+        let legacy_count = execution.pre_start_failure_count.max(execution.transient_failure_count) as usize;
+        return Ok(DispatchWait::builder()
+            .reason(DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
+            .label(failure_backoff_wait_label(
+                (failures.len().max(legacy_count) + 1) as i64,
+            ))
+            .failures(failures)
+            // Failure details have no runtime epoch triggers.
+            .reads_other_items(true)
+            .build());
+    }
+    Ok(DispatchWait::named(
+        if source.as_deref() == Some(DISPATCH_WAIT_REASON_HOST_LEASE_PARK) {
+            DISPATCH_WAIT_REASON_HOST_LEASE_PARK
+        } else {
+            DISPATCH_WAIT_REASON_NOT_BEFORE
+        },
+    ))
+}
+
+fn nonempty_text(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+/// One entry per failed start or failed execution in the current retry sequence.
+fn collect_dispatch_failures(
+    conn: &Connection,
+    work_item_id: &str,
+    current_execution_id: &str,
+) -> Result<Vec<DispatchFailureAttempt>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.id, e.last_error, e.finished_at, e.created_at, r.error_text, r.finished_at
+         FROM work_executions e
+         LEFT JOIN work_runs r ON r.id = (
+             SELECT id FROM work_runs WHERE execution_id = e.id ORDER BY rowid DESC LIMIT 1)
+         WHERE e.work_item_id = ?1
+           AND e.kind = (SELECT kind FROM work_executions WHERE id = ?2)
+           AND e.rowid <= (SELECT rowid FROM work_executions WHERE id = ?2)
+           AND e.rowid > COALESCE((SELECT MAX(done.rowid) FROM work_executions done
+               WHERE done.work_item_id = ?1 AND done.kind = e.kind
+                 AND done.rowid < (SELECT rowid FROM work_executions WHERE id = ?2)
+                 AND done.status NOT IN ('failed', 'orphaned') AND done.finished_at IS NOT NULL), 0)
+           AND (e.status IN ('failed', 'orphaned') OR e.id = ?2)
+         ORDER BY e.rowid",
+    )?;
+    let rows = stmt
+        .query_map(params![work_item_id, current_execution_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut failures = Vec::new();
+    for (id, last_error, finished, created, run_error, run_finished) in rows {
+        let mut starts = conn.prepare_cached(
+            "SELECT error_text, happened_at FROM dispatch_start_failures WHERE execution_id = ?1 ORDER BY rowid",
+        )?;
+        let recorded = starts
+            .query_map([&id], |row| {
+                Ok(DispatchFailureAttempt {
+                    error_text: row.get(0)?,
+                    happened_at: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        failures.extend(recorded);
+        if id == current_execution_id {
+            continue;
+        }
+        let attention: Option<(String, String)> = conn
+            .query_row(
+                "SELECT COALESCE(NULLIF(TRIM(body_markdown), ''), title), created_at
+             FROM work_attention_items WHERE execution_id = ?1 AND kind IN ('hung_worker', 'stale_worker')
+             ORDER BY rowid DESC LIMIT 1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let error = nonempty_text(run_error)
+            .or_else(|| nonempty_text(last_error))
+            .or_else(|| {
+                attention
+                    .as_ref()
+                    .and_then(|(body, _)| nonempty_text(Some(body.clone())))
+            });
+        if let Some(error_text) = error {
+            failures.push(DispatchFailureAttempt {
+                error_text,
+                happened_at: finished
+                    .or(run_finished)
+                    .or_else(|| attention.map(|(_, time)| time))
+                    .unwrap_or(created),
+            });
+        }
+    }
+    Ok(failures)
 }
 
 /// The earlier task of `task`'s project that the reconciler's ordinal chain

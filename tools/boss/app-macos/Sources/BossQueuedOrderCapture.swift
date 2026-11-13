@@ -45,12 +45,17 @@ enum BossQueuedOrderCapture {
         // `label` is the phrase the engine sends with each reason.
         func runtime(_ id: String, status: String = "ready", reason: String = "awaiting_dispatch",
                      label: String = "ready for the dispatcher's next pass",
-                     blocker: DispatchWaitBlocker? = nil) -> WorkTaskRuntime {
-            WorkTaskRuntime(
+                     blocker: DispatchWaitBlocker? = nil,
+                     notBefore: String? = nil,
+                     failures: [DispatchFailureAttempt] = []) -> WorkTaskRuntime {
+            var value = WorkTaskRuntime(
                 workItemID: id, executionStatus: status, runStatus: nil, executionID: "exec_\(id)",
                 dispatchRetryAt: nil, dispatchWaitReason: reason, dispatchWaitSince: nil,
                 dispatchWaitBlocker: blocker, dispatchWaitLabel: label
             )
+            value.dispatchNotBefore = notBefore
+            value.dispatchFailures = failures
+            return value
         }
 
         // Task creation order runs opposite to dispatch order, so the capture shows
@@ -68,6 +73,7 @@ enum BossQueuedOrderCapture {
             card("conflict", "Resolve merge conflict", age: 8, shortID: 108),
             card("ordered", "Second task of its project", age: 9, shortID: 109),
             card("unnamed", "Waiting with no reason the engine can name", age: 10, shortID: 110),
+            card("backoff", "Retry after hung worker", age: 11, shortID: 111),
         ]
         let blocker = DispatchWaitBlocker(workItemID: "coding", productID: product.id, shortID: 101)
         let runtimes = [
@@ -82,6 +88,22 @@ enum BossQueuedOrderCapture {
             // What a card shows when the engine could not classify its wait.
             runtime("unnamed", status: "waiting_dependency", reason: "unclassified",
                     label: "the engine has no reason recorded for this wait"),
+            runtime(
+                "backoff",
+                reason: "failure_backoff",
+                label: "Retrying after error (attempt 4)",
+                notBefore: "1900000000",
+                failures: [
+                    DispatchFailureAttempt(
+                        errorText: "Driver has made no observable progress while awaiting model output",
+                        happenedAt: "1899996400"
+                    ),
+                    DispatchFailureAttempt(
+                        errorText: "tmux session is absent from list-sessions",
+                        happenedAt: "1899998200"
+                    ),
+                ]
+            ),
         ]
         model.applyEventForTest(.workTree(
             product: product, projects: [], tasks: [], chores: rows,
@@ -99,7 +121,7 @@ enum BossQueuedOrderCapture {
         ))
         let captureWindow = NSWindow(
             // Tall enough for every queued card, down to the unnamed wait.
-            contentRect: NSRect(x: 0, y: 0, width: 1320, height: 1280),
+            contentRect: NSRect(x: 0, y: 0, width: 1320, height: 1480),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
         captureWindow.title = "Boss [agent capture]"

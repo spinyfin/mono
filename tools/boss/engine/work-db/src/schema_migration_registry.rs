@@ -274,6 +274,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: critical_requests::migrate,
         },
         Migration {
+            id: "20261113_0633_dispatch_failure_history".into(),
+            legacy_version: None,
+            apply: pre_start_failure::migrate_dispatch_failure_history,
+        },
+        Migration {
             id: execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID.into(),
             legacy_version: None,
             apply: execution_bookmarks::migrate_has_recovery_head,

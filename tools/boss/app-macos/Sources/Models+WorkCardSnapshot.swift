@@ -56,6 +56,7 @@ struct WorkCardSnapshotContext: Equatable {
     var runtime: WorkTaskRuntime? = nil
     var liveState: WorkerLiveState? = nil
     var dispatchWaitBlocker: DispatchWaitBlocker? = nil
+    var dispatchFailures: [DispatchFailureAttempt] = []
     /// Pre-resolved free-text live-status subtitle. Callers compute any
     /// time-relative phrasing (dispatch retry / wait-since) before
     /// building so the snapshot itself stays pure / Equatable-stable.
@@ -139,6 +140,7 @@ struct WorkCardSnapshot: Equatable {
     let assignedSlotId: Int?
     var assignedWorkerName: String? = nil
     let dispatchWaitBlocker: DispatchWaitBlocker?
+    let dispatchFailures: [DispatchFailureAttempt]
     let liveStatus: String?
     let liveStatusActivity: WorkerActivity?
     let liveStatusLastEventAt: String?
@@ -408,6 +410,7 @@ struct WorkCardSnapshot: Equatable {
             assignedSlotId: assignedSlotId,
             assignedWorkerName: assignedSlotId == nil ? nil : context.liveState?.displayName,
             dispatchWaitBlocker: context.dispatchWaitBlocker,
+            dispatchFailures: context.dispatchFailures,
             liveStatus: liveStatus,
             liveStatusActivity: liveStatusActivity,
             liveStatusLastEventAt: liveStatusLastEventAt,
