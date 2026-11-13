@@ -66,10 +66,7 @@ pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &S
     match scenario {
         Scenario::PullRequest { .. } | Scenario::PushToBranch { .. } => {
             if let Some(branch) = needed_ref.strip_prefix("origin/") {
-                let _ = Command::new("git")
-                    .args(["fetch", "origin", branch, "--no-tags"])
-                    .current_dir(&git_root)
-                    .output();
+                refresh_remote_tracking_ref(&git_root, branch);
                 info!(branch, "refreshed remote tracking ref before merge-base");
             }
         }
@@ -113,6 +110,19 @@ pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &S
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Refresh `refs/remotes/origin/<branch>` from the remote, best-effort.
+///
+/// A bare `git fetch origin <branch>` only updates `FETCH_HEAD` in a
+/// single-branch clone, leaving the tracking ref stale. An explicit refspec
+/// always updates the tracking ref.
+fn refresh_remote_tracking_ref(root: &Path, branch: &str) {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let _ = Command::new("git")
+        .args(["fetch", "--no-tags", "origin", &refspec])
+        .current_dir(root)
+        .output();
+}
 
 /// Resolve the git working directory to run shallow operations in.
 ///
@@ -376,6 +386,49 @@ mod tests {
     fn strip_origin_prefix_passes_through_bare_branch() {
         assert_eq!(strip_origin_prefix("main"), "main");
         assert_eq!(strip_origin_prefix("feature/foo"), "feature/foo");
+    }
+
+    fn rev_parse(root: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn refresh_moves_stale_tracking_ref_in_single_branch_clone() {
+        let remote_dir = tempdir().expect("tempdir remote");
+        let remote = remote_dir.path();
+        crate::test_git::init_repo_with_branch(remote, "main");
+        configure_git(remote);
+        commit_file(remote, "f.txt", "v0\n", "commit 0");
+
+        let clone_dir = tempdir().expect("tempdir clone");
+        let clone = clone_dir.path();
+        crate::test_git::init_repo_with_branch(clone, "main");
+        configure_git(clone);
+        git(clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        // Single-branch clone config, as produced by `git clone --single-branch`.
+        git(
+            clone,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/other:refs/remotes/origin/other",
+            ],
+        );
+        git(clone, &["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+        let stale = rev_parse(clone, "refs/remotes/origin/main");
+
+        commit_file(remote, "f.txt", "v1\n", "commit 1");
+        let tip = rev_parse(remote, "HEAD");
+        assert_ne!(stale, tip);
+
+        refresh_remote_tracking_ref(clone, "main");
+
+        assert_eq!(rev_parse(clone, "refs/remotes/origin/main"), tip);
     }
 
     // ── is_shallow ────────────────────────────────────────────────────────────
