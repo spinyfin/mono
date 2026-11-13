@@ -258,7 +258,7 @@ mod tests {
                     .run_id("run_1")
                     .kind("transcript")
                     .state(boss_work_db::CustodyState::Open)
-                    .path("transcript.jsonl")
+                    .path(format!("{}/spoke/run_1/transcript.jsonl", execution.id))
                     .materialized(5_u64)
                     .build(),
                 None,
