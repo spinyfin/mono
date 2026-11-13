@@ -7,33 +7,22 @@
 //! drop **after** (or possibly after) the request was written: the engine may have applied it before dying, and sending it
 //! again could apply it twice. [`replay_safety`] decides, per request, whether
 //! that second send is safe. The classification is an exhaustive `match`
-//! with no catch-all, so a new `FrontendRequest` variant does not compile
-//! until someone deliberately classifies it here; a variant a reviewer
-//! cannot show to be harmless to repeat belongs under
-//! [`ReplaySafety::Never`] (“outcome unknown, check state”).
+//! with no catch-all in the protocol's request contract, so a new
+//! `FrontendRequest` variant does not compile until someone deliberately
+//! classifies it there; a variant a reviewer cannot show to be harmless to
+//! repeat belongs under [`ReplaySafety::Never`] (“outcome unknown, check
+//! state”).
 //!
 //! ## The classes
 //!
-//! * **Always** — a second send is harmless.
-//!   * *Reads*: every `Get*` and `List*` request, plus the few read-only
-//!     verbs that do not follow that naming (`CommentsGet`, `CommentsList`,
-//!     `CommentsBannerState`, `TailRunTranscript`, `ExecutionTranscript`,
-//!     `FindWorkItemsByPr`, `WorkerPoolSummary`, `WorkspacePoolSummary`,
-//!     `TrunkStatus`, `GitHubAuthStatus`, `ProbeStatus`, `MetricsListLive`,
-//!     `MetricsShowLive`, `DebugLiveStatusPipeline`).
-//!   * *Declarative setters*: every `Set*` request writes an absolute value,
-//!     so repeating it leaves the same state.
-//!   * *Documented idempotent writes* (each is called out as idempotent in
-//!     its `FrontendRequest` doc comment): `AbandonCiRemediation`,
-//!     `AbandonConflictResolution`, `AddDependency`, `DisableAutomation`,
-//!     `EnableAutomation`, `MarkCiRemediationSucceededViaRebase`,
-//!     `ReleaseHoldRun`, `RestoreWorkItem`, `RetirePane`, `RevealWorkItem`,
-//!     `RevokeDecision`, `StopRun`.
-//!   * *Keyed by an engine-side idempotency key*: `SubmitProposal` (unique on
-//!     `(execution_id, idempotency_key)`, and the engine derives a key from
-//!     the payload when the caller gives none) and `SubmitAttachment` (unique
-//!     on `(execution_id, content_digest)`). A replay returns the original
-//!     row instead of making a second one.
+//! The per-request classification lives in
+//! [`boss_protocol::request_contract`], next to the engine's admission lanes,
+//! so both answers are given once per request. This module turns its
+//! [`ReplayContract`] into a window:
+//!
+//! * **Always** — a second send is harmless: reads, declarative setters,
+//!   documented idempotent writes, and writes keyed by an engine-side
+//!   idempotency key (`SubmitProposal`, `SubmitAttachment`).
 //! * **Within(window)** — protected by the engine's duplicate-create guard,
 //!   which refuses a same-named task/chore/investigation in the same product
 //!   created in the last [`DUPLICATE_GUARD_WINDOW`]. A replay inside the
@@ -44,19 +33,14 @@
 //!   while the original send is still inside the window (minus a safety
 //!   margin), re-checks that at the moment of each resend, caps the reconnect
 //!   wait to the remaining window, and otherwise reports “outcome unknown”.
-//!   Applies to `CreateTask`, `CreateChore` and `CreateInvestigation`,
-//!   and only when `force_duplicate` is false — with it set the guard is off.
-//! * **Never** — everything else: creates without a guard (`CreateProject`,
-//!   `CreateProduct`, `CreateRevision`, the `CreateMany*` batches,
-//!   `CreateExecution`, `RequestExecution`, …), state transitions
-//!   (`UpdateWorkItem`, `MoveWorkItemOnBoard`, `Mark*Failed`, …), fan-out
-//!   commands (`SendInputToWorker`, `RunAutomation`), `Shutdown`, and any
-//!   variant not listed above. A drop after send surfaces as
+//!   Applies to `CreateTask`, `CreateChore` and `CreateInvestigation`, and
+//!   only when `force_duplicate` is false — with it set the guard is off.
+//! * **Never** — everything else. A drop after send surfaces as
 //!   [`OutcomeUnknown`](crate::OutcomeUnknown) and is never retried.
 
 use std::time::Duration;
 
-use boss_protocol::FrontendRequest;
+use boss_protocol::{FrontendRequest, ReplayContract, request_contract};
 
 /// Mirror of the engine's `DUPLICATE_GUARD_WINDOW_SECS`
 /// (`engine/core/src/work.rs`). Duplicated rather than imported so the CLI
@@ -100,7 +84,7 @@ pub fn request_name(request: &FrontendRequest) -> String {
         .unwrap_or_else(|| "<unknown request>".to_owned())
 }
 
-/// Classify `request`; see the module docs for the full table.
+/// Classify `request`; see [`boss_protocol::request_contract`] for the full table.
 pub fn replay_safety(request: &FrontendRequest) -> ReplaySafety {
     replay_safety_with(request, DUPLICATE_GUARD_WINDOW)
 }
@@ -108,249 +92,12 @@ pub fn replay_safety(request: &FrontendRequest) -> ReplaySafety {
 /// [`replay_safety`] for an engine whose duplicate guard looks back
 /// `guard_window` (injectable so tests can shrink it).
 pub fn replay_safety_with(request: &FrontendRequest, guard_window: Duration) -> ReplaySafety {
-    let guarded = ReplaySafety::Within(guard_window - guard_window / DUPLICATE_GUARD_MARGIN_DIVISOR);
-    match request {
-        FrontendRequest::CreateTask { input } if !input.force_duplicate => guarded,
-        FrontendRequest::CreateChore { input } if !input.force_duplicate => guarded,
-        FrontendRequest::CreateInvestigation { input } if !input.force_duplicate => guarded,
-
-        FrontendRequest::AbandonCiRemediation { .. }
-        | FrontendRequest::AbandonConflictResolution { .. }
-        | FrontendRequest::AddDependency { .. }
-        | FrontendRequest::CommentsBannerState { .. }
-        | FrontendRequest::CommentsGet { .. }
-        | FrontendRequest::CommentsList { .. }
-        | FrontendRequest::DebugLiveStatusPipeline
-        | FrontendRequest::DisableAutomation { .. }
-        | FrontendRequest::EnableAutomation { .. }
-        | FrontendRequest::ExecutionTranscript { .. }
-        | FrontendRequest::FindWorkItemsByPr { .. }
-        | FrontendRequest::GetAttentionGroup { .. }
-        | FrontendRequest::GetAttentionItem { .. }
-        | FrontendRequest::GetAutomation { .. }
-        | FrontendRequest::GetAutomationOpenTaskCount { .. }
-        | FrontendRequest::GetAutomationState
-        | FrontendRequest::GetCiBudget { .. }
-        | FrontendRequest::GetCiRemediation { .. }
-        | FrontendRequest::GetConflictHotspots { .. }
-        | FrontendRequest::GetConflictResolution { .. }
-        | FrontendRequest::GetCoordinatorHandoff { redeliver: false }
-        | FrontendRequest::GetSolComparisonReport
-        | FrontendRequest::GetCostWindowReport { .. }
-        | FrontendRequest::GetDecision { .. }
-        | FrontendRequest::GetDispatchConcurrency
-        | FrontendRequest::GetDispatchFocus
-        | FrontendRequest::GetDispatchState
-        | FrontendRequest::GetDriverQuotaUsage { .. }
-        | FrontendRequest::GetCodexSolPercentage
-        | FrontendRequest::GetDriverTrafficSplit
-        | FrontendRequest::GetEngineHealth
-        | FrontendRequest::GetEnginePoolConfig
-        | FrontendRequest::GetEngineVersion
-        | FrontendRequest::GetExecution { .. }
-        | FrontendRequest::GetHost { .. }
-        | FrontendRequest::GetIdea { .. }
-        | FrontendRequest::GetOffsiteBackup
-        | FrontendRequest::GetPrBody { .. }
-        | FrontendRequest::GetProductDesignDoc { .. }
-        | FrontendRequest::GetPrStatus { .. }
-        | FrontendRequest::GetReviewGuideContent { .. }
-        | FrontendRequest::GetReviewGuideSummary { .. }
-        | FrontendRequest::GetRun { .. }
-        | FrontendRequest::GetSelectedProduct
-        | FrontendRequest::GetSettings
-        | FrontendRequest::GetTaskRuntime { .. }
-        | FrontendRequest::GetTopCostConsumers { .. }
-        | FrontendRequest::GetWorkerContext { .. }
-        | FrontendRequest::GetWorkItem { .. }
-        | FrontendRequest::GetWorkItemByShortId { .. }
-        | FrontendRequest::GetStuckReport { .. }
-        | FrontendRequest::GetWorkItemCostReport { .. }
-        | FrontendRequest::GetWorkRuntimePatch { .. }
-        | FrontendRequest::GetWorkTree { .. }
-        | FrontendRequest::GitHubAuthStatus
-        | FrontendRequest::ListAnswerAgentRuns { .. }
-        | FrontendRequest::ListAttachments { .. }
-        | FrontendRequest::ListAttachmentsForWorkItem { .. }
-        | FrontendRequest::ListAttentionGroups { .. }
-        | FrontendRequest::ListAttentionItems { .. }
-        | FrontendRequest::ListAttentionItemsForWorkItem { .. }
-        | FrontendRequest::ListAttentionMerges { .. }
-        | FrontendRequest::ListAutomationDedupSuppressions { .. }
-        | FrontendRequest::ListAutomationRuns { .. }
-        | FrontendRequest::ListAutomations { .. }
-        | FrontendRequest::ListAutomationTasks { .. }
-        | FrontendRequest::ListChores { .. }
-        | FrontendRequest::ListCiRemediations { .. }
-        | FrontendRequest::ListConflictResolutions { .. }
-        | FrontendRequest::ListCoordinatorGuidance { .. }
-        | FrontendRequest::ListDecisions { .. }
-        | FrontendRequest::ListDeferredScopeAttentions { .. }
-        | FrontendRequest::ListDependencies { .. }
-        | FrontendRequest::ListDependenciesDetailed { .. }
-        | FrontendRequest::ListEditorialActions { .. }
-        | FrontendRequest::ListEngineAttempts { .. }
-        | FrontendRequest::ListExecutions { .. }
-        | FrontendRequest::ListFeatureFlags
-        | FrontendRequest::ListHostedPaneStatuses
-        | FrontendRequest::ListHosts
-        | FrontendRequest::ListIdeas { .. }
-        | FrontendRequest::ListLiveStatusDisabledSlots
-        | FrontendRequest::ListCriticalPriorityRequests
-        | FrontendRequest::ListOperatorQuestions { .. }
-        | FrontendRequest::ListTaskFieldAudit { .. }
-        | FrontendRequest::ListPlannerRuns { .. }
-        | FrontendRequest::ListProductDesignDocs { .. }
-        | FrontendRequest::ListProducts
-        | FrontendRequest::ListProjects { .. }
-        | FrontendRequest::ListProposals { .. }
-        | FrontendRequest::ListRevisions { .. }
-        | FrontendRequest::ListRuns { .. }
-        | FrontendRequest::ListTasks { .. }
-        | FrontendRequest::ListTmuxWorkerStatuses
-        | FrontendRequest::ListWorkerLiveStates
-        | FrontendRequest::MarkCiRemediationSucceededViaRebase { .. }
-        | FrontendRequest::MetricsListLive
-        | FrontendRequest::MetricsShowLive { .. }
-        | FrontendRequest::ProbeStatus { .. }
-        | FrontendRequest::ReleaseHoldRun { .. }
-        | FrontendRequest::RestoreWorkItem { .. }
-        | FrontendRequest::RetirePane { .. }
-        | FrontendRequest::RevealWorkItem { .. }
-        | FrontendRequest::RevokeDecision { .. }
-        | FrontendRequest::SetAutomationPaused { .. }
-        | FrontendRequest::SetCiBudget { .. }
-        | FrontendRequest::SetCoordinatorHandoff { .. }
-        | FrontendRequest::SetDispatchConcurrency { .. }
-        | FrontendRequest::SetDispatchPaused { .. }
-        | FrontendRequest::UpdateDispatchFocus { .. }
-        | FrontendRequest::SetCodexSolPercentage { .. }
-        | FrontendRequest::SetDriverTrafficSplit { .. }
-        | FrontendRequest::SetFeatureFlag { .. }
-        | FrontendRequest::SetOffsiteBackup { .. }
-        | FrontendRequest::SetHostEnabled { .. }
-        | FrontendRequest::SetLiveStatusEnabled { .. }
-        | FrontendRequest::SetProductDefaultDriver { .. }
-        | FrontendRequest::SetProductDefaultModel { .. }
-        | FrontendRequest::SetProductEditorialRules { .. }
-        | FrontendRequest::SetProductExternalTracker { .. }
-        | FrontendRequest::SetProductMergeMechanism { .. }
-        | FrontendRequest::SetProjectDesignDoc { .. }
-        | FrontendRequest::SetSetting { .. }
-        | FrontendRequest::SetTaskDocPointer { .. }
-        | FrontendRequest::StopRun { .. }
-        | FrontendRequest::SubmitAttachment { .. }
-        | FrontendRequest::SubmitProposal { .. }
-        | FrontendRequest::TailRunTranscript { .. }
-        | FrontendRequest::TrunkStatus
-        | FrontendRequest::WorkerPoolSummary
-        | FrontendRequest::WorkspacePoolSummary => ReplaySafety::Always,
-
-        FrontendRequest::GetCoordinatorHandoff { redeliver: true }
-        | FrontendRequest::AcceptDeferredScopeAttention { .. }
-        | FrontendRequest::ActionAttentionGroup { .. }
-        | FrontendRequest::AddHost { .. }
-        | FrontendRequest::AddHostTag { .. }
-        | FrontendRequest::AnswerAttention { .. }
-        | FrontendRequest::AnswerOperatorQuestion { .. }
-        | FrontendRequest::AuditProductEffort { .. }
-        | FrontendRequest::CancelExecution { .. }
-        | FrontendRequest::ClassifyCiRemediation { .. }
-        | FrontendRequest::CommentsCreate { .. }
-        | FrontendRequest::CommentsDismiss { .. }
-        | FrontendRequest::CommentsPostAnswer { .. }
-        | FrontendRequest::CommentsPostFollowup { .. }
-        | FrontendRequest::CommentsRecordGuideOutcome { .. }
-        | FrontendRequest::CommentsResolve { .. }
-        | FrontendRequest::CommentsReviseDoc { .. }
-        | FrontendRequest::CommentsSetIntent { .. }
-        | FrontendRequest::CommentsSetStatus { .. }
-        | FrontendRequest::CommentsUpdateAnchor { .. }
-        | FrontendRequest::CreateAttention { .. }
-        | FrontendRequest::CreateAttentionItem { .. }
-        | FrontendRequest::CreateAutomation { .. }
-        | FrontendRequest::CreateAutomationTask { .. }
-        | FrontendRequest::CreateChore { .. }
-        | FrontendRequest::CreateDecision { .. }
-        | FrontendRequest::CreateExecution { .. }
-        | FrontendRequest::CreateIdea { .. }
-        | FrontendRequest::CreateInvestigation { .. }
-        | FrontendRequest::CreateManyChores { .. }
-        | FrontendRequest::CreateManyTasks { .. }
-        | FrontendRequest::CreateProduct { .. }
-        | FrontendRequest::CreateProject { .. }
-        | FrontendRequest::CreateRevision { .. }
-        | FrontendRequest::CreateRun { .. }
-        | FrontendRequest::CreateTask { .. }
-        | FrontendRequest::CreateTaskFromDeferredScopeAttention { .. }
-        | FrontendRequest::DeleteAutomation { .. }
-        | FrontendRequest::DeleteIdea { .. }
-        | FrontendRequest::DeleteWorkItem { .. }
-        | FrontendRequest::DismissAttention { .. }
-        | FrontendRequest::EngineResponse { .. }
-        | FrontendRequest::EvaluateDispatchAdmission { .. }
-        | FrontendRequest::EvaluateEditorialRules { .. }
-        | FrontendRequest::FocusWorkerPane { .. }
-        | FrontendRequest::GenerateReviewGuide { .. }
-        | FrontendRequest::GitHubAuthCancel
-        | FrontendRequest::GitHubAuthDisconnect
-        | FrontendRequest::GitHubAuthStart
-        | FrontendRequest::GraduateIdea { .. }
-        | FrontendRequest::HoldRun { .. }
-        | FrontendRequest::InterruptWorkerPane { .. }
-        | FrontendRequest::KickPrReconcilers
-        | FrontendRequest::LinkWorkItemExternalRef { .. }
-        | FrontendRequest::MarkCiRemediationFailed { .. }
-        | FrontendRequest::MarkCiRemediationNoop { .. }
-        | FrontendRequest::MarkCiRemediationRetriggered { .. }
-        | FrontendRequest::MarkConflictResolutionFailed { .. }
-        | FrontendRequest::MergeWhenReady { .. }
-        | FrontendRequest::MetricsReset { .. }
-        | FrontendRequest::MoveWorkItemOnBoard { .. }
-        | FrontendRequest::OpenDocument { .. }
-        | FrontendRequest::OpenLiveWorkspaceTerminal { .. }
-        | FrontendRequest::OpenReviewTerminal { .. }
-        | FrontendRequest::ParkWorkItem { .. }
-        | FrontendRequest::PlanProject { .. }
-        | FrontendRequest::ProbeRun { .. }
-        | FrontendRequest::ReapRun { .. }
-        | FrontendRequest::RecordEffortEscalation { .. }
-        | FrontendRequest::RecordProducerSideConflict { .. }
-        | FrontendRequest::RecreateCoordinator { .. }
-        | FrontendRequest::RegisterAppSession
-        | FrontendRequest::RegisterCapabilities { .. }
-        | FrontendRequest::ReleaseProject { .. }
-        | FrontendRequest::ReleaseReviewTerminal { .. }
-        | FrontendRequest::RemoveDependency { .. }
-        | FrontendRequest::RemoveHost { .. }
-        | FrontendRequest::RemoveHostTag { .. }
-        | FrontendRequest::ReorderProjectTasks { .. }
-        | FrontendRequest::ReportSelectedProduct { .. }
-        | FrontendRequest::RequestExecution { .. }
-        | FrontendRequest::RequestWorkerPaneAttach { .. }
-        | FrontendRequest::ResolveExecutionLabels { .. }
-        | FrontendRequest::ResolveProjectDesignDoc { .. }
-        | FrontendRequest::RetryCiRemediation { .. }
-        | FrontendRequest::RetryConflictResolution { .. }
-        | FrontendRequest::RetryReviewGuide { .. }
-        | FrontendRequest::RunAutomation { .. }
-        | FrontendRequest::SendInputToWorker { .. }
-        | FrontendRequest::Shutdown { .. }
-        | FrontendRequest::SpawnCapabilityRestored
-        | FrontendRequest::StartProjectPostmortem { .. }
-        | FrontendRequest::Subscribe { .. }
-        | FrontendRequest::SupersedeDecision { .. }
-        | FrontendRequest::SyncProductExternalTracker { .. }
-        | FrontendRequest::TriggerPrReview { .. }
-        | FrontendRequest::TrunkSetToken { .. }
-        | FrontendRequest::UnlinkWorkItemExternalRef { .. }
-        | FrontendRequest::UnpopulateProject { .. }
-        | FrontendRequest::Unsubscribe { .. }
-        | FrontendRequest::UpdateAutomation { .. }
-        | FrontendRequest::UpdateIdea { .. }
-        | FrontendRequest::RequestCriticalPriority { .. }
-        | FrontendRequest::ResolveCriticalPriorityRequest { .. }
-        | FrontendRequest::UpdateWorkItem { .. } => ReplaySafety::Never,
+    match request_contract(request).replay {
+        ReplayContract::Always => ReplaySafety::Always,
+        ReplayContract::DuplicateGuarded => {
+            ReplaySafety::Within(guard_window - guard_window / DUPLICATE_GUARD_MARGIN_DIVISOR)
+        }
+        ReplayContract::Never => ReplaySafety::Never,
     }
 }
 

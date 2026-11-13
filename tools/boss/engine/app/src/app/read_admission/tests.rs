@@ -123,40 +123,12 @@ fn omitted_and_network_reads_use_bulk() {
 }
 
 #[test]
-fn live_lane_is_exactly_the_audited_local_only_set() {
+fn live_lane_uses_the_audited_local_only_set() {
     use boss_protocol::FrontendRequest as R;
-    // Handlers that read local process state, local SQL, or the local cube
-    // socket only. Changing live membership requires this audit.
-    let live = [
-        R::GetEngineHealth,
-        R::GetEnginePoolConfig,
-        R::GetEngineVersion,
-        R::ListHostedPaneStatuses,
-        R::ListTmuxWorkerStatuses,
-        R::ListWorkerLiveStates,
-        R::MetricsListLive,
-        R::MetricsShowLive { name: "n".into() },
-        R::ProbeStatus { probe_id: "p".into() },
-        R::WorkerPoolSummary,
-        R::WorkspacePoolSummary,
-    ];
-    let audited: std::collections::BTreeSet<_> = live
-        .iter()
-        .map(|request| format!("{request:?}").split([' ', '{']).next().unwrap().to_owned())
-        .collect();
-    let classified: std::collections::BTreeSet<_> = lane::LIVE_VARIANTS.iter().map(|name| name.to_string()).collect();
-    assert_eq!(classified, audited);
-    for request in &live {
-        assert_eq!(read_lane(request), ReadLane::Live, "{request:?}");
-    }
-    // Network-bound reads must stay out of the live lane.
-    for request in [
-        R::TrunkStatus,
-        R::GitHubAuthStatus,
-        R::ListCoordinatorGuidance { product_id: None },
-    ] {
-        assert_ne!(read_lane(&request), ReadLane::Live, "{request:?}");
-    }
+    // Full Live membership is audited in `boss_protocol`'s request contract
+    // tests. This only checks that the engine consumes that contract.
+    assert_eq!(read_lane(&R::GetEngineHealth), ReadLane::Live);
+    assert_eq!(read_lane(&R::TrunkStatus), ReadLane::Bulk);
 }
 
 #[test]
