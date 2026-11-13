@@ -22,12 +22,20 @@ rust_library(
 rust_test(
     name = "worker-policy_test",
     size = "small",
+    compile_data = ["//tools/boss/protocol:src/request_contract.rs"],
     crate = ":worker-policy",
+    # rustc_env $(execpath) expansion requires these as declared
+    # prerequisites of the test rule; compile_data alone is not enough
+    # when `crate =` wraps the production library.
+    data = ["//tools/boss/protocol:src/request_contract.rs"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    rustc_env = {
+        "BOSS_REQUEST_CONTRACT_RS": "$(execpath //tools/boss/protocol:src/request_contract.rs)",
+    },
     deps = [
         "//tools/boss/protocol",
     ] + all_crate_deps(

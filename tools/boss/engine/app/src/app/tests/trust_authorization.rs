@@ -1,6 +1,7 @@
 #[cfg(target_os = "macos")]
 use super::super::process_signals::pid_is_alive;
 use super::*;
+use boss_protocol::WorkerTierDenialReason;
 
 #[test]
 fn authorize_user_tier_always_allowed() {
@@ -289,4 +290,145 @@ fn app_or_boss_rejects_worker_descendant_outside_app_subtree() {
         !server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
         "AppOrBoss must reject worker descendants even when they sit outside the app/Boss subtrees",
     );
+}
+
+fn self_pid() -> libc::pid_t {
+    std::process::id() as libc::pid_t
+}
+
+/// A classified worker connection still allows taxonomy reads and still
+/// refuses taxonomy writes with the same redirect. The contract table must
+/// not change what the authenticated-connection gate returns.
+#[test]
+fn worker_connection_keeps_taxonomy_reads_and_redirects_taxonomy_writes() {
+    let (server_state, _dir) = test_server_state();
+    server_state.worker_registry.register(self_pid(), "exec_abc".to_owned());
+    server_state
+        .feature_flags
+        .set("worker_rpc_tier", true)
+        .expect("worker_rpc_tier must be a registered flag");
+    let class = server_state.classify_peer(Some(self_pid()));
+    assert!(class.is_worker());
+    assert!(
+        server_state
+            .worker_tier_denial(&class, &FrontendRequest::ListProducts)
+            .is_none()
+    );
+    let denial = server_state
+        .worker_tier_denial(
+            &class,
+            &FrontendRequest::CreateTask {
+                input: boss_protocol::CreateTaskInput::builder()
+                    .product_id("prod_1")
+                    .project_id("proj_1")
+                    .name("Something")
+                    .build(),
+            },
+        )
+        .expect("CreateTask must stay denied at worker tier");
+    assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
+    assert_eq!(denial.use_instead.as_deref(), Some("boss propose followup-task"));
+}
+
+/// Progression stays a narrower surface than worker: a sanctioned worker write
+/// is still refused, and a taxonomy read still passes, without trusting a
+/// tier in the request payload.
+#[test]
+fn progression_connection_allows_reads_and_denies_worker_only_writes() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let item = boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id, "Stuck");
+    let execution = state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(&item.id)
+                .kind(boss_protocol::ExecutionKind::TaskImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let parent = boss_engine_runtime::worker_registry::parent_pid(self_pid())
+        .unwrap()
+        .unwrap();
+    state
+        .worker_registry
+        .register_progression(parent, &execution.id, &state.work_db)
+        .unwrap();
+    let class = state.classify_peer(Some(self_pid()));
+    assert!(class.is_progression());
+    assert!(
+        state
+            .worker_tier_denial(&class, &FrontendRequest::GetWorkItem { id: item.id.clone() })
+            .is_none()
+    );
+    let denial = state
+        .worker_tier_denial(
+            &class,
+            &FrontendRequest::CreateAutomationTask {
+                automation_id: "auto_1".into(),
+                name: "Fix".into(),
+                description: None,
+                target_files: vec![],
+                target_symbols: vec![],
+            },
+        )
+        .expect("CreateAutomationTask must stay denied at progression tier");
+    assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope);
+    assert!(denial.use_instead.is_none());
+}
+
+/// `GetRun` / `ListRuns` stay allowed as verbs and still scoped to the
+/// caller's own execution at the connection gate.
+#[test]
+fn worker_run_row_scope_stays_on_the_callers_execution() {
+    let (state, _dir) = test_server_state();
+    let db = &state.work_db;
+    let product = boss_engine_runtime::test_support::create_test_product(db);
+    let mine = boss_engine_runtime::test_support::create_test_chore(db, product.id.clone(), "Mine");
+    let mine_execution = boss_engine_runtime::test_support::create_ready_chore_execution(db, mine.id);
+    let other = boss_engine_runtime::test_support::create_test_chore(db, product.id, "Other");
+    let other_execution = boss_engine_runtime::test_support::create_ready_chore_execution(db, other.id);
+    let other_run = db
+        .create_run(
+            boss_protocol::CreateRunInput::builder()
+                .agent_id("agent_1")
+                .execution_id(other_execution.id.clone())
+                .build(),
+        )
+        .unwrap();
+    state.worker_registry.register(self_pid(), mine_execution.id.clone());
+    state
+        .feature_flags
+        .set("worker_rpc_tier", true)
+        .expect("worker_rpc_tier must be a registered flag");
+    let class = state.classify_peer(Some(self_pid()));
+    assert!(
+        state
+            .worker_row_scope_denial(
+                &class,
+                &FrontendRequest::ListRuns {
+                    execution_id: mine_execution.id.clone()
+                }
+            )
+            .is_none()
+    );
+    let denial = state
+        .worker_row_scope_denial(
+            &class,
+            &FrontendRequest::ListRuns {
+                execution_id: other_execution.id.clone(),
+            },
+        )
+        .expect("listing another execution's runs must stay denied");
+    assert_eq!(denial.reason, WorkerTierDenialReason::RuntimeIsolation);
+    let denial = state
+        .worker_row_scope_denial(
+            &class,
+            &FrontendRequest::GetRun {
+                id: other_run.id.clone(),
+            },
+        )
+        .expect("getting another execution's run must stay denied");
+    assert_eq!(denial.reason, WorkerTierDenialReason::RuntimeIsolation);
 }

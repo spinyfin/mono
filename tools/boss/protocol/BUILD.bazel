@@ -4,6 +4,13 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 exports_files(["Cargo.toml"])
 
+# Scanned by worker-policy's exhaustive-vocabulary test so a new classified
+# verb is exercised there without reading an undeclared checkout path.
+exports_files(
+    ["src/request_contract.rs"],
+    visibility = ["//tools/boss/engine/worker-policy:__pkg__"],
+)
+
 rust_library(
     name = "protocol",
     srcs = glob(["src/**/*.rs"]),

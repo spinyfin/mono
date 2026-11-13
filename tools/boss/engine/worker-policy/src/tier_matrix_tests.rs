@@ -10,8 +10,9 @@ fn req(value: serde_json::Value) -> FrontendRequest {
     serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("fixture {value} is not a FrontendRequest: {e}"))
 }
 
-/// One request per verb in [`PROGRESSION_ALLOWED_VERBS`]. A new `Allow` for
-/// progression must add a row here and a name there, so it shows as a diff.
+/// One request per verb progression may call. A new progression Allow must add
+/// a row here, so it shows as a diff; the fixtures are the independent expected
+/// set, not a copy of the contract.
 fn progression_allowed_fixtures() -> Vec<FrontendRequest> {
     vec![
         req(json!({"type": "comments_banner_state", "artifact_kind": "task", "artifact_id": "t"})),
@@ -169,12 +170,11 @@ fn sanctioned_writes_are_allowed_to_workers_and_denied_to_progression() {
 fn progression_allow_set_is_exactly_the_pinned_table() {
     let fixtures = progression_allowed_fixtures();
     let fixture_verbs: BTreeSet<String> = fixtures.iter().map(variant_name).collect();
-    let table: BTreeSet<String> = PROGRESSION_ALLOWED_VERBS.iter().map(|v| (*v).to_owned()).collect();
     assert_eq!(
-        fixture_verbs, table,
-        "fixtures and PROGRESSION_ALLOWED_VERBS must match"
+        fixture_verbs.len(),
+        fixtures.len(),
+        "progression fixtures must not duplicate a verb"
     );
-    assert_eq!(table.len(), PROGRESSION_ALLOWED_VERBS.len(), "no duplicate entries");
     for request in &fixtures {
         let verb = variant_name(request);
         assert!(
@@ -292,22 +292,40 @@ fn synthesize(variant: &str) -> Result<FrontendRequest, String> {
     Err(format!("{variant}: synthesis did not converge"))
 }
 
-/// Every verb the exhaustive worker match names. The match has no wildcard arm,
-/// so it lists the whole `FrontendRequest` vocabulary: a new variant fails to
-/// compile until classified, and then shows up here and needs no edit.
+/// Every verb the exhaustive request-contract match names. The match has no
+/// wildcard arm, so it lists the whole `FrontendRequest` vocabulary: a new
+/// variant fails to compile until classified, and then shows up here.
 fn classified_verbs() -> BTreeSet<String> {
-    let source = include_str!("policy.rs");
-    let body = source
-        .split("fn worker_decision(")
-        .nth(1)
-        .and_then(|rest| rest.split("\n}\n").next())
-        .expect("worker_decision body");
-    body.split("FrontendRequest::")
-        .skip(1)
-        .filter_map(|rest| rest.split(|c: char| !c.is_alphanumeric()).next())
-        .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
-        .map(str::to_owned)
-        .collect()
+    let source = include_str!(env!("BOSS_REQUEST_CONTRACT_RS"));
+    let mut names = BTreeSet::new();
+    for rest in source.split("R::").skip(1) {
+        if let Some(name) = rest
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    // Live variants are listed as bare identifiers in the live macros, then
+    // expanded to `R::$live` by `live_pattern`. Scan those lists so a live
+    // verb cannot drop out of the vocabulary check.
+    for block in source.split("$callback! {").skip(1) {
+        for line in block.lines() {
+            let line = line.trim();
+            if line.starts_with('}') {
+                break;
+            }
+            if let Some(name) = line
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
+            {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
 }
 
 #[test]
@@ -319,10 +337,11 @@ fn every_frontend_request_variant_has_an_explicit_decision_for_both_tiers() {
         classified.len()
     );
 
-    // Expected decisions, spelled out per tier. Workers are allowed exactly the
-    // progression table plus the sanctioned writes; progression is allowed
-    // exactly the table. Everything else is denied to both: deny is the default.
-    let progression_allowed: BTreeSet<String> = PROGRESSION_ALLOWED_VERBS.iter().map(|v| (*v).to_owned()).collect();
+    // Expected decisions, spelled out per tier from independently authored
+    // fixtures. Workers are allowed exactly the progression fixtures plus the
+    // sanctioned writes; progression is allowed exactly the fixtures.
+    // Everything else is denied to both: deny is the default.
+    let progression_allowed: BTreeSet<String> = progression_allowed_fixtures().iter().map(variant_name).collect();
     let sanctioned: BTreeSet<String> = sanctioned_write_fixtures().iter().map(variant_name).collect();
     let worker_allowed: BTreeSet<String> = progression_allowed.union(&sanctioned).cloned().collect();
     for verb in worker_allowed.iter() {
