@@ -1,7 +1,8 @@
 //! Pane text for the read-only remote pane viewer (design §2.8).
 //!
 //! A viewer sees a bounded text snapshot, never a terminal byte stream: the
-//! pane is read with a plain `capture-pane -p`, the token on the session is
+//! pane is read with a plain `capture-pane -p` (no `-S`, so only the visible
+//! screen; pane height is the line bound), the token on the session is
 //! checked first so a sibling or replacement session is never read, and the
 //! result is cut to the most recent lines that fit the subscriber's byte
 //! budget. Nothing here can write to the pane.
@@ -27,6 +28,12 @@ pub trait PaneSource: Send + Sync {
 }
 
 /// Reads panes from the spoke's private tmux server.
+///
+/// The read is the visible screen only (`Tmux::capture_pane`: `capture-pane -p`
+/// without `-S`). Scrollback is not included, so pane height bounds the line
+/// count; `bound_snapshot` then keeps the newest whole lines that fit the
+/// byte budget. Switching this to `capture_pane_with_history` would drop that
+/// line bound.
 pub struct TmuxPanes(pub Tmux);
 
 impl PaneSource for TmuxPanes {
@@ -36,6 +43,7 @@ impl PaneSource for TmuxPanes {
         match boss_tmux::probe_pane(&self.0, &target, spawn_token).await {
             PaneProbe::Absent | PaneProbe::ForeignToken => PaneRead::Gone,
             PaneProbe::Unreadable { stage, error } => PaneRead::Unreadable(format!("{stage}: {error:#}")),
+            // Visible screen only: `capture_pane`, not `capture_pane_with_history`.
             PaneProbe::Alive | PaneProbe::Dead { .. } => match self.0.capture_pane(&target).await {
                 Ok(text) => PaneRead::Text(text),
                 Err(error) => PaneRead::Unreadable(format!("capture: {error:#}")),
@@ -48,6 +56,9 @@ impl PaneSource for TmuxPanes {
 /// height with blank lines, which carry no information; when the text is still
 /// too long the *newest* lines are kept, starting on a line boundary. The flag
 /// says whether anything older was dropped.
+///
+/// `raw` is already the visible screen ([`TmuxPanes`] does not read scrollback),
+/// so pane height is the line bound before this byte cut.
 pub fn bound_snapshot(raw: &str, max_bytes: usize) -> (String, bool) {
     let mut text = raw.replace("\r\n", "\n");
     text.truncate(text.trim_end().len());

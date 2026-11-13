@@ -52,10 +52,10 @@ pub fn editorial_actions_topic(product_id: &str) -> String {
 pub const PANE_CAPTURE_TOPIC_PREFIX: &str = "pane_capture.";
 
 /// Per-run topic carrying [`crate::TopicEventPayload::WorkerPaneCapture`]
-/// text snapshots of a worker's pane. Subscribing is what asks the engine to
-/// capture: the engine keeps a short-lived capture alive on the worker's host
-/// only while a session is subscribed, and stops it when the last one leaves
-/// or disconnects. Grammar: `pane_capture.<run_id>`.
+/// text snapshots of a worker's pane. Grammar: `pane_capture.<run_id>`.
+/// Snapshots arrive only after the hub and executor negotiate pane-capture
+/// and engine session wiring maps this topic onto host capture calls; that
+/// wiring is separate from this protocol crate.
 pub fn pane_capture_topic(run_id: &str) -> String {
     format!("{PANE_CAPTURE_TOPIC_PREFIX}{run_id}")
 }
@@ -66,7 +66,3 @@ pub fn pane_capture_topic_run(topic: &str) -> Option<&str> {
         .strip_prefix(PANE_CAPTURE_TOPIC_PREFIX)
         .filter(|run| !run.is_empty())
 }
-
-/// Re-exported so `pub use topics::*` from [`crate::wire`] surfaces the
-/// capture state enum next to the topic builders.
-pub use super::topic_event_payload::PaneCaptureState;

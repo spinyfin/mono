@@ -42,6 +42,7 @@ rust_test(
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/host-execution",
         "//tools/boss/engine/recovery",
+        "//tools/boss/engine/spoke-outbound",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/work-db",

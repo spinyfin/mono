@@ -241,7 +241,19 @@ impl SpokeHostAdapter {
             let result = match sent {
                 Ok(result) => result,
                 Err(HostCallError::Uncertain { reason, .. }) => return Err(uncertain(reason, false)),
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    // A command that was never stored cannot have leased anything.
+                    if self.hub_command_unknown(&id).await? {
+                        return Err(error.into());
+                    }
+                    // Reached when the command is stored after send_stable's
+                    // NotSent re-check and before this lookup. send_stable maps a
+                    // stored-command NotSent to Uncertain (retries of an existing
+                    // id, and a store that happened during the send); this arm
+                    // covers the store that lands in that window, so the lease
+                    // stays in doubt and the retry budget is not spent.
+                    return Err(uncertain(error.to_string(), false));
+                }
             };
             let code = ResultCode::try_from(result.code).unwrap_or(ResultCode::ResultUnspecified);
             // A lease recovered after a lost reply is reported as uncertain because
@@ -280,7 +292,8 @@ impl SpokeHostAdapter {
             self.db(move |db| db.bind_spoke_lease(&execution, generation, &workspace, &lease_id, &path))
                 .await?;
             Ok(lease)
-        }.await;
+        }
+        .await;
         if !matches!(&outcome, Err(error) if error.chain().any(|cause| cause.is::<LeaseOutcomeUncertain>())) {
             self.set_doubt(&assignment, false).await?;
         }
@@ -395,6 +408,12 @@ impl SpokeHostAdapter {
         let (execution, generation) = (assignment.execution_id.clone(), assignment.assignment_generation);
         self.db(move |db| db.set_spoke_in_doubt(&execution, generation, in_doubt))
             .await
+    }
+
+    /// Whether no command with this id was ever stored for the host.
+    async fn hub_command_unknown(&self, id: &str) -> Result<bool> {
+        let (host, id) = (self.host_name().to_owned(), id.to_owned());
+        Ok(self.db(move |db| db.host_command_wire(&host, &id)).await?.is_none())
     }
 
     /// Whether this run has a spawn that may have started a worker. A spawn the

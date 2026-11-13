@@ -8,6 +8,7 @@
 //! that need a live stream therefore use a hub derived from first-release with
 //! those three names dropped from `required`. They do not add unimplemented
 //! features to Hello to make the handshake succeed.
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use boss_execution_contracts::{PaneCaptureOutcome, PaneCaptureRequest};
@@ -189,22 +190,33 @@ async fn ttls_are_translated_for_the_wire() {
 
 #[tokio::test]
 async fn the_spokes_answer_maps_to_an_outcome() {
-    for (code, expect) in [
+    let fx = hub_for_executor().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let code = Arc::new(Mutex::new(ResultCode::Ok));
+    let script_code = Arc::clone(&code);
+    let _peer = fx
+        .spoke_contracts(
+            Box::new(move |c| match &c.body {
+                Some(command::Body::Capture(_)) => Some(refused(c, *script_code.lock().unwrap(), "scripted")),
+                _ => standard(c),
+            }),
+            None,
+            0,
+            production_executor_hello(),
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    for (want, expect) in [
         (ResultCode::Ok, "accepted"),
         (ResultCode::Absent, "unreachable"),
         (ResultCode::Rejected, "refused"),
         (ResultCode::Unknown, "unreachable"),
     ] {
-        let fx = hub_for_executor().await;
-        fx.ready(HOST);
-        let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
-        let _peer = fx
-            .spoke_contracts(script(code), None, 0, production_executor_hello())
-            .await;
-        lease(&adapter).await;
-        spawn(&adapter).await.unwrap();
+        *code.lock().unwrap() = want;
         let outcome = adapter.capture_worker_pane("exec_1", &request(0, false)).await.unwrap();
-        if code == ResultCode::Absent {
+        if want == ResultCode::Absent {
             assert!(
                 matches!(&outcome, PaneCaptureOutcome::Unreachable(reason) if reason.contains("reports the worker has finished"))
             );
@@ -216,7 +228,7 @@ async fn the_spokes_answer_maps_to_an_outcome() {
             PaneCaptureOutcome::Unreachable(_) => "unreachable",
             PaneCaptureOutcome::Unsupported(_) => "unsupported",
         };
-        assert_eq!(got, expect, "{code:?}");
+        assert_eq!(got, expect, "{want:?}");
     }
 }
 

@@ -1896,8 +1896,9 @@ pub trait HostAdapter: Send + Sync {
 /// `ttl_seconds` asks for the host's default; the host clamps the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneCaptureRequest {
-    /// Names the subscription, so a renewal extends it rather than opening a
-    /// second one and a cancel ends exactly this viewer's.
+    /// Names the subscription on one host. A renewal or cancel with the same
+    /// id on that host updates or ends it. Reusing the id for another run on
+    /// the same host replaces the existing subscription.
     pub subscription_id: String,
     pub interval_ms: u32,
     pub max_bytes: u32,

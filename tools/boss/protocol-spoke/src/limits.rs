@@ -36,7 +36,8 @@ pub const MAX_CAPTURE_INTERVAL_MS: u32 = 60_000;
 
 /// The longest a capture subscription lives without a renewal; a longer request
 /// is lowered to it. A renewal is another `Capture` naming the same
-/// `subscription_id`.
+/// `subscription_id` on that host. The id is host-scoped: the same string on
+/// another run of that host replaces the existing subscription.
 pub const MAX_CAPTURE_TTL_SECONDS: u32 = 120;
 
 /// A `Capture` whose TTL is this or less ends its subscription at once, so a

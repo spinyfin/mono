@@ -536,6 +536,8 @@ message Gap {
   string reason = 4;
 }
 message Capture {
+  // Host-scoped: a later Capture with this id on another run of the same
+  // host replaces the existing subscription.
   string subscription_id = 1;
   uint32 interval_ms = 2;
   uint32 max_bytes = 3;
