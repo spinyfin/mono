@@ -1,7 +1,9 @@
 //! Host resource observations and the shared conservative worker admission policy.
 #[cfg(target_os = "linux")]
 use anyhow::Context;
-use anyhow::{Result, ensure};
+use anyhow::Result;
+#[cfg(target_os = "macos")]
+use anyhow::ensure;
 
 pub const WORKER_CPU_MILLIS: u64 = 1_000;
 pub const WORKER_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
