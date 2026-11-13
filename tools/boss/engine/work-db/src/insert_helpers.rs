@@ -196,7 +196,6 @@ pub fn insert_task_in_tx_as_actor_with_provenance(
         input.effort_matched_rule,
         input.effort_reasons,
     );
-    // Human-driven rows never autostart: no agent worker is meant to run.
     let priority = normalize_priority(input.priority.as_deref())?;
     super::critical_priority::authorize_priority_write(&priority, None, actor)?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "task");
@@ -218,6 +217,7 @@ pub fn insert_task_in_tx_as_actor_with_provenance(
             .description(description)
             .ordinal(ordinal)
             .created_at(&now)
+            // Human-driven rows never autostart: no agent worker is meant to run.
             .autostart(!input.human_driven && input.autostart)
             .deferred(input.deferred)
             .human_driven(input.human_driven)
@@ -351,7 +351,6 @@ fn insert_chore_with_project_in_tx_as_actor(
         input.effort_matched_rule,
         input.effort_reasons,
     );
-    // Human-driven rows never autostart: no agent worker is meant to run.
     let priority = normalize_priority(input.priority.as_deref())?;
     super::critical_priority::authorize_priority_write(&priority, None, actor)?;
     let kind_str = input.kind_override.as_ref().map(|k| k.as_str()).unwrap_or("chore");
@@ -378,6 +377,7 @@ fn insert_chore_with_project_in_tx_as_actor(
             .description(description)
             .maybe_ordinal(ordinal)
             .created_at(&now)
+            // Human-driven rows never autostart: no agent worker is meant to run.
             .autostart(!input.human_driven && input.autostart)
             .deferred(input.deferred)
             .human_driven(input.human_driven)
@@ -446,7 +446,6 @@ pub fn insert_investigation_in_tx_as_actor_with_provenance(
         input.effort_matched_rule,
         input.effort_reasons,
     );
-    // Human-driven rows never autostart: no agent worker is meant to run.
     let priority = normalize_priority(input.priority.as_deref())?;
     super::critical_priority::authorize_priority_write(&priority, None, actor)?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "investigation");
@@ -466,6 +465,7 @@ pub fn insert_investigation_in_tx_as_actor_with_provenance(
             .name(&input.name)
             .description(description)
             .created_at(&now)
+            // Human-driven rows never autostart: no agent worker is meant to run.
             .autostart(!input.human_driven && input.autostart)
             .deferred(input.deferred)
             .human_driven(input.human_driven)
