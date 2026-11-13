@@ -762,6 +762,10 @@ pub(super) async fn dispatch_live_worker_state(
     // are gated off so they don't emit a misleading "notify dropped — no
     // per-slot task" warn on every remote hook.
     let is_remote_slot = slot_id >= boss_engine_runtime::worker_registry::REMOTE_SLOT_BASE;
+    // A remote slot has a summarizer only when one was started for it: a spoke
+    // run's transcript is held on the hub, so it can be summarized like a local
+    // one. An SSH run's cannot, and its triggers stay off.
+    let summarizes = !is_remote_slot || server_state.live_status_manager.active_slot_ids().contains(&slot_id);
     // Driver-start verification, second attempt — deliberately AFTER slot
     // resolution as well as before it.
     //
@@ -845,7 +849,7 @@ pub(super) async fn dispatch_live_worker_state(
     // dispatcher recognising a Claude-shaped `Stop`. Checked ahead of the
     // match because the two are disjoint: no event is both a turn boundary
     // and a tool result.
-    if incoming.is_turn_boundary() && !is_remote_slot && !stale_event {
+    if incoming.is_turn_boundary() && summarizes && !stale_event {
         server_state.live_status_manager.notify(slot_id, Trigger::Stop);
     }
     if let boss_protocol::WorkerEvent::PostToolUse {
@@ -855,7 +859,7 @@ pub(super) async fn dispatch_live_worker_state(
         ..
     } = &incoming.event
     {
-        if !is_remote_slot && !stale_event {
+        if summarizes && !stale_event {
             server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
         // Primary-path PR URL capture. Every worker that opens a
@@ -1045,7 +1049,7 @@ pub(super) async fn dispatch_live_worker_state(
             }
         }
     }
-    if !is_remote_slot {
+    if summarizes {
         if let (Some(prior), Some(new)) = (prior_activity, new_activity) {
             if prior != new {
                 server_state
@@ -1150,6 +1154,15 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
             host = %host,
             "live_status: assigned virtual slot to remote worker (no local pane); activity tracks the forwarded hook stream",
         );
+        // A spoke run's transcript is materialized on the hub, so it gets the
+        // live summary a local worker has. Other remote runs have no file the
+        // summarizer could read.
+        if matches!(server_state.work_db.spoke_assignment_for_execution(run_id), Ok(Some(_)))
+            && let Ok(Some(slug)) = server_state.work_db.get_execution_driver_slug(run_id)
+            && let Ok(driver) = boss_engine_driver::DriverRegistry::default().require(&slug)
+        {
+            super::spoke_projection::start_summary_slot(server_state, slot_id, run_id, driver);
+        }
         server_state.broadcast_live_worker_states().await;
     }
     Some(slot_id)

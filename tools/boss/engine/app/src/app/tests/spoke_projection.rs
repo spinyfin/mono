@@ -2003,3 +2003,80 @@ async fn a_stall_write_that_fails_is_retried_until_engine_health_shows_it() {
         .unwrap();
     draining.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_stop_that_names_transcript_bytes_runs_against_the_hub_copy_of_them() {
+    use boss_engine_runtime::hub::projection::Custody;
+    use sha2::{Digest, Sha256};
+
+    let mut fx = delivered_with_a_resolvable_pr();
+    let line = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+    let mut stop = worker_event::to_wire(&boss_protocol::WorkerEvent::Stop {
+        session_id: "remote-session".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    if let Some(v1::worker_event::Event::Stop(turn)) = &mut stop.event {
+        turn.transcript_generation = "0-1".into();
+        turn.transcript_through = line.len() as u64;
+    }
+    // The spoke numbers the Stop at once; its bytes follow.
+    fx.receive(record::Body::Event(stop));
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 0,
+        data: line.to_vec(),
+        sha256: Sha256::digest(line).to_vec(),
+        eof: true,
+    }));
+    let custody = Arc::new(Custody::new(
+        fx.state.work_db.as_ref().clone(),
+        fx._dir.path().join("custody"),
+    ));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::builder()
+            .retry_initial(std::time::Duration::from_millis(5))
+            .retry_max(std::time::Duration::from_millis(20))
+            .watermark_poll(std::time::Duration::from_millis(5))
+            .build(),
+        custody.clone(),
+    )
+    .drain()
+    .await;
+
+    // The run is pointed at the hub's own copy, which is what the live summary,
+    // cost capture and completion open. The host's path never is.
+    let recorded = fx
+        .state
+        .work_db
+        .transcript_path_for_execution(&fx.execution_id)
+        .unwrap()
+        .expect("the run records its transcript");
+    assert!(
+        std::path::Path::new(&recorded).starts_with(custody.root()),
+        "{recorded} is not under the custody root"
+    );
+    assert_eq!(std::fs::read(&recorded).unwrap(), line);
+    assert_eq!(
+        fx.state
+            .work_db
+            .spoke_projection_position(HOST)
+            .unwrap()
+            .unwrap()
+            .applied,
+        2
+    );
+    // A spoke run gets a summarizer of its own, because it now has a file to read.
+    let slot = fx
+        .state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .find(|slot| slot.run_id == fx.execution_id)
+        .expect("the run has a slot");
+    assert!(fx.state.live_status_manager.active_slot_ids().contains(&slot.slot_id));
+}

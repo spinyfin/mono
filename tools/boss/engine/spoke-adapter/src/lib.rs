@@ -45,6 +45,7 @@ use boss_execution_contracts::{
 };
 use boss_protocol::{WorkExecution, WorkItem};
 use boss_protocol_spoke::v1::{Command, CommandResult, ResultCode, Run, WorkspaceKind, command};
+use boss_spoke_custody::{Collected, Custody};
 use boss_spoke_stream::{CommandOutcome, StreamManager};
 use boss_work_db::{Host, HostTransport, SpokeAssignment, WorkDb};
 use prost::Message;
@@ -113,6 +114,9 @@ pub(crate) struct Hub {
     pub(crate) config: SpokeAdapterConfig,
     #[builder(skip)]
     nonce: AtomicU64,
+    /// The hub's copy of spoke transcripts and artifacts, once installed.
+    #[builder(skip)]
+    custody: std::sync::OnceLock<Arc<Custody>>,
     /// One lock per `(host, command id)` that [`Hub::send_stable`] is working
     /// on, so two overlapping calls for the same stable request cannot both
     /// decide nothing was stored.
@@ -849,10 +853,20 @@ impl HostAdapter for SpokeHostAdapter {
     }
 
     async fn read_transcript_tail_bytes(&self, path: &str, max_bytes: u64) -> Result<Option<String>> {
-        // A spoke run's transcript is materialized on the hub by run identity;
-        // its recorded path is a path on the host and is never opened here, or
-        // sent over SSH. Only a transcript a legacy run on this host recorded is
-        // the legacy transport's to read, whatever layout its driver used.
+        // A spoke run's transcript is materialized on the hub by run identity.
+        // The path its run records is the hub's own copy, which custody reads
+        // because its ledger names it; a path on the host is never opened here,
+        // or sent over SSH. Only a transcript a legacy run on this host recorded
+        // is the legacy transport's to read, whatever layout its driver used.
+        if let Some(custody) = self.hub.custody.get().cloned() {
+            let owned = std::path::PathBuf::from(path);
+            let held = tokio::task::spawn_blocking(move || custody.read_tail_at(&owned, max_bytes))
+                .await
+                .context("custody read task failed")??;
+            if held.is_some() {
+                return Ok(held);
+            }
+        }
         let (host, owned) = (self.host.id.clone(), path.to_owned());
         if !self.db(move |db| db.transcript_is_legacy(&host, &owned)).await? {
             // `Ok(None)` would tell the caller the transcript is engine-local
@@ -948,7 +962,16 @@ impl HostAdapter for SpokeHostAdapter {
 
     async fn read_worker_log_tail(&self, workspace_path: &str, max_bytes: u64) -> Result<Option<String>> {
         match self.route_path(Path::new(workspace_path)).await? {
-            Route::Spoke(_) => Ok(None),
+            Route::Spoke(assignment) => match self.hub.custody.get().cloned() {
+                // The worker log is an artifact the spoke may have sent; its
+                // absence is "not applicable", never an empty log.
+                Some(custody) => {
+                    tokio::task::spawn_blocking(move || custody.worker_log_tail(&assignment.execution_id, max_bytes))
+                        .await
+                        .context("custody read task failed")?
+                }
+                None => Ok(None),
+            },
             Route::Legacy(legacy) => legacy.read_worker_log_tail(workspace_path, max_bytes).await,
         }
     }
@@ -960,8 +983,28 @@ impl HostAdapter for SpokeHostAdapter {
         destination: &Path,
     ) -> Result<CollectOutcome> {
         match self.route_execution(execution_id).await? {
-            // A spoke run's artifacts reach the hub through its journal.
-            Route::Spoke(_) => Ok(CollectOutcome::NotAvailable),
+            // A spoke run's artifacts reach the hub through its journal, where
+            // custody holds them digest-checked. Absent, still arriving and
+            // unavailable are `NotAvailable`; only positive evidence the output
+            // is bad is `Failed`.
+            Route::Spoke(_) => {
+                let Some(custody) = self.hub.custody.get().cloned() else {
+                    return Ok(CollectOutcome::NotAvailable);
+                };
+                let (execution, destination) = (execution_id.to_owned(), destination.to_owned());
+                let collected =
+                    tokio::task::spawn_blocking(move || custody.collect_output(&execution, kind, &destination))
+                        .await
+                        .context("custody read task failed")??;
+                Ok(match collected {
+                    Collected::Installed => CollectOutcome::Collected,
+                    Collected::NotAvailable(reason) => {
+                        tracing::debug!(execution_id, %reason, "spoke structured output is not available");
+                        CollectOutcome::NotAvailable
+                    }
+                    Collected::Failed(reason) => CollectOutcome::Failed(reason),
+                })
+            }
             Route::Legacy(legacy) => legacy.collect_structured_output(execution_id, kind, destination).await,
         }
     }
@@ -1047,6 +1090,13 @@ impl SpokeHostAdapterProvider {
                     .build(),
             ),
         }
+    }
+
+    /// Give the adapters the hub's copy of spoke transcripts and artifacts, so
+    /// transcript, worker-log and structured-output reads of a spoke run are
+    /// answered from it. Set once; without it those reads stay unavailable.
+    pub fn install_custody(&self, custody: Arc<Custody>) {
+        let _ = self.hub.custody.set(custody);
     }
 
     /// The command outbox to give the stream manager, so the manager and the

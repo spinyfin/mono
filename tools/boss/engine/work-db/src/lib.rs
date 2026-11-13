@@ -966,6 +966,7 @@ mod progression_calibration;
 mod progression_calibration_data;
 mod prompt_confirmation;
 mod semantic_progress;
+mod spoke_custody;
 mod spoke_hub;
 mod spoke_ingress;
 mod spoke_probe;
@@ -1143,6 +1144,7 @@ pub use review_verdicts::{
     is_informative_gate_outcome,
 };
 pub use revision_helpers::normalize_priority;
+pub use spoke_custody::{CustodyState, SpokeCustody};
 pub use spoke_hub::{
     AmbiguousSpokeAssignment, HOST_COMMAND_LEASE_PREFIX, HOST_COMMAND_SPAWN_PREFIX, HOST_COMMAND_STOP_PREFIX,
     HostOutboxFault, HostTransport, LegacyDestinationHeld, MAX_UNSETTLED_HOST_COMMAND_BYTES,

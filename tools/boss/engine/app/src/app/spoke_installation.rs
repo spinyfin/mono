@@ -142,6 +142,7 @@ impl Prepared {
         signals: Arc<dyn boss_execution_contracts::DriverSignals>,
     ) -> Arc<dyn HostAdapterProvider> {
         let Self { db, bound, hosts } = self;
+        let custody_db = db.clone();
         let provider = Arc::new(SpokeHostAdapterProvider::new(
             inner,
             bound.stream.manager().clone(),
@@ -150,6 +151,13 @@ impl Prepared {
             SpokeAdapterConfig::builder().build(),
             signals,
         ));
+        // The same custody directory the projector writes, so transcript,
+        // worker-log and structured-output reads of a spoke run find its bytes.
+        if let Ok(root) = boss_engine_driver::transcript_store::transcript_store_root() {
+            provider.install_custody(Arc::new(boss_engine_runtime::hub::projection::Custody::new(
+                custody_db, root,
+            )));
+        }
         boss_task_scope::spawn(async move {
             if let Err(error) = bound.serve().await {
                 tracing::error!(error = %error, "spoke listener stopped");

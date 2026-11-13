@@ -27,7 +27,8 @@ The sink stores the original frame bytes and advances the receipt in one transac
 | `PaneState`, inventory page                                                                                           | a pane observation per run | durable `spoke_pane_observations` row, then live state: `Exited` marks the slot terminated, `Missing` shows it exited without fencing, `Alive` revives it, `Indeterminate` does nothing                                                                                                                                         |
 | `CommandResult`                                                                                                       | nothing                    | settled at ingress with its receipt                                                                                                                                                                                                                                                                                             |
 | `PaneCapture`                                                                                                         | an empty tombstone         | stored without quota so the sequence stays contiguous; the projector skips it as live-only and keeps applying later records                                                                                                                                                                                                     |
-| capacity, transcript, artifact, gap, worker request                                                                   | nothing yet                | owned by other consumers                                                                                                                                                                                                                                                                                                        |
+| `TranscriptDelta`, `ArtifactChunk`, `Gap`                                                                             | a custody write            | `boss_spoke_custody`: the bytes are written at their own offset and fsynced, then the ledger row moves; see [transcript and artifact custody](#transcript-and-artifact-custody). A resource the hub cannot trust is halted and stored as a failed `custody_halt` effect                                                         |
+| capacity, worker request                                                                                              | nothing yet                | owned by other consumers                                                                                                                                                                                                                                                                                                        |
 
 A pane observation is evidence only. Whether absence or an exit changes a task's status is still decided by the engine's existing liveness policy.
 
@@ -63,8 +64,8 @@ A decision is `Ok` with a bounded summary (hub proposal id, state, applied refer
 ## Not covered
 
 - Authorizing the worker gateway's online requests (`WorkerRequest` replies) is separate follow-on work; this projection does not touch them.
-- Transcripts, artifacts and gaps are not projected here, so retained `spoke_ingress` frames are not pruned yet; whichever consumer is last to need a frame decides when it can go. Capture tombstones (empty frames) are deleted once the projection cursor passes them.
-- A projected `Stop` carries no hub-local transcript path; Stop-time consumers that read a transcript see unavailable evidence. Replayed hook events stamp live-state `last_event_at` and the semantic-progress checkpoint (the in-memory registry and `work_runs.semantic_progress_at`, which the stale-worker and hung-worker sweeps read) from the record's observed wall time, clamped so a spoke clock ahead of the hub cannot pin the monotonic checkpoint in the future, and that checkpoint never moves backwards, so a worker that died during an outage is not treated as freshly active when its backlog drains. Unretained pane-capture frames are stored as empty tombstones so they do not leave sequence holes.
+- `spoke_ingress` retains frames until a decision about their retention window is made. Capture tombstones (empty frames) are deleted once the projection cursor passes them. Custody was the last consumer that needed the transcript and artifact frames, so the retained ones can go once the cursor passes them; the window for that is a separate decision.
+- A turn-ending `Stop` (and a queued proposal) carries the transcript size the spoke saw. The projector waits, up to `watermark_wait`, for custody to hold those bytes before applying it, and a `Stop` then carries the hub's own copy of the transcript; when the bytes are unavailable or never arrive, Stop-time consumers see unavailable evidence and custody records why ([custody](#transcript-and-artifact-custody)). Replayed hook events stamp live-state `last_event_at` and the semantic-progress checkpoint (the in-memory registry and `work_runs.semantic_progress_at`, which the stale-worker and hung-worker sweeps read) from the record's observed wall time, clamped so a spoke clock ahead of the hub cannot pin the monotonic checkpoint in the future, and that checkpoint never moves backwards, so a worker that died during an outage is not treated as freshly active when its backlog drains. Unretained pane-capture frames are stored as empty tombstones so they do not leave sequence holes.
 
 ## Diagnosing
 
@@ -74,3 +75,84 @@ A decision is `Ok` with a bounded summary (hub proposal id, state, applied refer
 - Quarantined frames and abandoned decisions are `spoke_effects` rows in state `failed` with `last_error`; they are never retried.
 - Pane evidence: `WorkDb::spoke_pane_observation(execution_id)`.
 - Parked remote workers: `spoke_turn_state` holds the latest main-session turn per assignment so a hub restart rebuilds the in-memory map. A restore that fails is retried on every projector sweep, not only when another hook arrives, and the map is published only once the whole set has been read. A hook's turn state is saved before its fan-out, so a persistence retry never re-dispatches the hook.
+
+## Transcript and artifact custody
+
+A spoke streams a run's transcript, the output files its worker registers (structured output, PR-url output, attachments) and the gaps in what it could read as records in its journal. The hub keeps those records as received (above); **custody** turns them into files the engine's existing readers can open, addressed by run identity and never by a path on the host. Design context: [hub-and-spoke-distributed-engine](designs/hub-and-spoke-distributed-engine.md), "Journal, acknowledgement and crash recovery" and the transcript and structured-output rows of the adapter contract.
+
+Nothing here runs until a hub listener is configured and a spoke host is enrolled and `spoke_ready` ([listener setup](spoke-hub-listener.md)). With no Boss state root to hold the bytes, the projector logs that custody is off and leaves transcript and artifact records received but unapplied-to-disk, as before.
+
+### Where the bytes live
+
+| What                  | Where                                                                                                       |
+| --------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Files                 | `<Boss state root>/executions/<execution>/spoke/<run>/` (the root `BOSS_WORKER_TRANSCRIPTS_ROOT` overrides) |
+| Transcript generation | `transcript-<16 hex of sha256(resource)>.jsonl`, one file per spoke-reported generation                     |
+| Artifact              | `artifact-<16 hex of sha256(resource)>.bin`, one file per registered artifact id                            |
+| Ledger                | `spoke_custody` in the work database: one row per `(execution, assignment generation, resource)`            |
+
+No name comes from the peer: the execution and run segments are checked against `[A-Za-z0-9._-]`, and the file name is a hash of the resource. Each row records its file's path relative to the root, which is what retention acts on.
+
+### Writing is exact-offset and replay-safe
+
+`boss_spoke_custody::write::extend` is the only writer. A chunk is applied at **its own offset**, never appended:
+
+1. The chunk's bytes must match its `sha256`; otherwise the resource halts.
+2. A chunk that starts past the ledger's `materialized` prefix is a **hole**: the bytes between cannot be supplied, so the resource halts. It is never filled in.
+3. Bytes the hub already holds under the chunk are **compared** with it. A difference is a changed overlap and halts the resource; identical bytes are a replay and write nothing.
+4. New bytes are written at `materialized`, the file is truncated to the new end (dropping anything a crashed earlier write left past it), fsynced, and only then does the ledger row move.
+
+A crash after the fsync and before the row replays the chunk and rewrites the same bytes at the same offset. A crash after the row and before the projection cursor moves replays the record, which is then a verified replay. A file shorter than the ledger says (deleted or truncated underneath) halts the resource: the hub does not pretend to hold bytes it lost.
+
+An artifact is complete only when `materialized` equals the declared `total_bytes` **and** the file hashes to the digest in its identity (`<kind>:<sha256 hex>`). A mismatch is `invalid`; `eof` before the total, a changed declared size or kind, and a size past the hub's limits (512 MiB per transcript, the attachment cap per artifact) halt it.
+
+### Resource states and what a reader is told
+
+| State         | Meaning                                                                                              | Reader sees                                   |
+| ------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `open`        | Bytes may still arrive                                                                               | `Pending` / `Incomplete`                      |
+| `complete`    | An artifact whole and verified                                                                       | `Ready`                                       |
+| `unavailable` | The spoke said the rest will not arrive (a `Gap`: replaced or vanished source, spool full)           | `Unavailable(reason)`; held bytes still count |
+| `invalid`     | The worker's output is positively bad (not JSON, too large) or its bytes do not match their identity | `Invalid(reason)`                             |
+| `halted`      | The hub cannot trust its own copy (hole, changed overlap, bad digest, shortened file)                | `Unavailable("the hub's copy was halted")`    |
+
+"Not there yet", "will not come" and "is bad" stay three different answers all the way to the consumer. A gap is never turned into a complete transcript, and a transcript closed by a gap still satisfies a watermark inside the bytes it holds. A bare `transcript` gap (no generation) is how a spoke says it has no transcript to name.
+
+### Watermarks: how a boundary waits without deadlocking
+
+A `Stop` or a queued proposal carries `(transcript_generation, transcript_through)`: the size the transcript had when the boundary was recorded. The spoke numbers the boundary at once and the bulk bytes only as send credit allows, so the bytes can sit **behind** the boundary in the journal. A projector that simply held its cursor until they arrived would never reach them.
+
+Before such a boundary is applied the projector waits for custody to hold every byte through the mark (and no registered artifact of the run still arriving). While it waits it does not stand still: each pass **materializes the custody records the hub has already received after the boundary**, which are idempotent when the cursor reaches them later. The wait ends when
+
+- the mark is met: a `Stop` is dispatched carrying the hub's copy (`IncomingHookEvent::with_transcript_source`), confined to the run's custody directory, so cost capture, the run's recorded transcript path and completion read it exactly as they read a local transcript;
+- the spoke declared the bytes unavailable, or the resource is halted: the boundary proceeds without a copy; custody's row holds the reason;
+- `watermark_wait` (default 60 s) passes with the bytes still missing: the boundary proceeds without a copy and a failed `transcript_evidence_unavailable` effect is stored, so the host counts against engine health.
+
+This differs from the design's "pending outbox item for the completion" in one respect: the host's cursor is held for at most `watermark_wait`, with lookahead materialization so it cannot deadlock, instead of the boundary being parked and re-applied later. Re-applying a Stop later would hand the live-state reducer an old event after newer ones; keeping boundaries in order is what the existing consumers assume.
+
+### Who reads what
+
+| Consumer                                  | Routed by                                                                                                                                                                                                                                                                                      |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Live summary, transcript-tail, cost       | `work_runs.transcript_path`, set to the hub copy the first time a generation holds bytes (`ObservationApplier::transcript_attached`); the spoke run's slot gets a summarizer, which never infers death from a missing local tmux session or pid (a spoke's liveness is what the spoke reports) |
+| Completion at `Stop`                      | The same path, carried on the event once the watermark is met                                                                                                                                                                                                                                  |
+| `HostAdapter::read_transcript_tail_bytes` | The run's custody file, by path ownership; a path that is not a recorded custody file is still refused rather than opened on the hub                                                                                                                                                           |
+| `HostAdapter::read_worker_log_tail`       | The newest `WORKER_LOG` artifact of the run, if the spoke sent one                                                                                                                                                                                                                             |
+| `HostAdapter::collect_structured_output`  | `Custody::collect_output`: `Collected` installs the verified file at the destination atomically; `NotAvailable` for absent, still arriving or unavailable; `Failed` only for positive evidence of a bad output                                                                                 |
+
+Which artifact is which output: `PR_URL` artifacts are the PR-url output; `REVIEW_RESULT` artifacts carry `output_kind` (the kind's slug) in their metadata and serve the other kinds. A newer valid artifact beats an older gap that called the output bad, and a newer gap beats an older artifact: the later record wins, as the file's latest content does for a local reader.
+
+### Retention
+
+The execution-retention sweep calls the custody reclaim (`Custody::reclaim_execution`) for every execution that holds a ledger row and is **terminal** and finished more than 14 days ago. Liveness is the execution's status, never a file's age, and an execution this database cannot place keeps its bytes. Files go before rows, so a crash between leaves rows whose files are already gone and the next pass removes them.
+
+### Not covered by custody
+
+- `spoke_ingress` is still not pruned. Custody was the last consumer that needed the transcript and artifact frames, so they can now go once the cursor has passed them; the retention window for that is a separate decision.
+- Hub-initiated `ReadArtifact` (asking a spoke for a bounded range of a registered artifact it holds) is not issued: everything custody holds arrived through the journal.
+
+### Diagnosing custody
+
+- A resource's state and reason: `WorkDb::spoke_custody_for_execution(execution_id)`; `materialized` against the file's length; `source_sequence` names the record that last changed it.
+- A halted resource appears as a failed `custody_halt` effect (key `<run>:<resource>`) and counts in `spoke_projection_failed_effects` on `GetEngineHealth`. A boundary that went ahead because bytes never arrived is a failed `transcript_evidence_unavailable` effect. Neither is retried; the evidence is gone or distrusted, not pending.
+- A host that stalls at a `Stop`: the log says `a completion boundary goes ahead without the transcript bytes it named`, or the host is waiting out `watermark_wait` while the spoke is still sending.

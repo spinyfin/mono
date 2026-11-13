@@ -174,6 +174,16 @@ impl IncomingHookEvent {
         }
     }
 
+    /// Point the event at a transcript the hub itself holds for the run, read
+    /// beneath `containment_root`. A spoke's transcript lives on another host,
+    /// where the driver's own containment root means nothing; the hub's copy is
+    /// confined to the run's custody directory instead.
+    pub fn with_transcript_source(mut self, path: String, containment_root: PathBuf) -> Self {
+        self.transcript_path = Some(path);
+        self.driver_resolution.transcript_containment_root = Ok(Some(containment_root));
+        self
+    }
+
     /// Mark this event as having fired inside a subagent.
     pub fn with_subagent_origin(mut self, from_subagent: bool) -> Self {
         self.connection.from_subagent = from_subagent;

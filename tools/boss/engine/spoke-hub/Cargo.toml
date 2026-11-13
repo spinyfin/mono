@@ -12,6 +12,7 @@ boss-backoff = { path = "../../backoff" }
 boss-host-enrollment = { path = "../host-enrollment" }
 boss-protocol = { path = "../../protocol" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
+boss-spoke-custody = { path = "../spoke-custody" }
 boss-spoke-stream = { path = "../spoke-stream" }
 boss-work-db = { path = "../work-db" }
 prost = { workspace = true }

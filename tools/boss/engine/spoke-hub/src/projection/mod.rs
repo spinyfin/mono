@@ -66,6 +66,8 @@ use boss_protocol_spoke::{
     limits::MAX_PAYLOAD_BYTES,
     v1::{Command, CommandResult, ProposalDecision, ResultCode, command},
 };
+use boss_spoke_custody::{Applied as Custodied, Evidence, Source};
+pub use boss_spoke_custody::{Custody, Mark, TranscriptSource};
 pub use boss_spoke_stream::CommandOutcome;
 use boss_spoke_stream::{StreamManager, store::CommandAdmission};
 use boss_work_db::{
@@ -78,15 +80,48 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio::task::{Id, JoinSet};
 
+use crate::HubStream;
+
 pub use reduce::{
-    EventObservation, Life, Observation, Origin, PaneObservation, ProposalObservation, ProposalRequest, Reduction, Skip,
+    ArtifactObservation, EventObservation, GapObservation, Life, Observation, Origin, PaneObservation,
+    ProposalObservation, ProposalRequest, Reduction, Skip, TranscriptObservation,
 };
+
+impl HubStream {
+    /// A projector that also holds each run's transcript and artifact bytes in
+    /// `custody`, so the engine's readers find them by run identity. Lives here
+    /// beside the projector it builds; the stream's wake and manager are private
+    /// to the crate.
+    pub fn projector_with_custody(
+        &self,
+        db: WorkDb,
+        applier: Arc<dyn ObservationApplier>,
+        config: ProjectorConfig,
+        custody: Arc<Custody>,
+    ) -> Projector {
+        Projector::with_custody(
+            db,
+            applier,
+            Arc::new(self.manager.clone()),
+            Arc::clone(&self.projection_wake),
+            config,
+            custody,
+        )
+    }
+}
 
 /// Effect kind: the decision for a queued proposal, owed to the spoke.
 pub const PROPOSAL_DECISION: &str = "proposal_decision";
 /// Effect kind: a frame that could not be read. Stored as a failed effect and
 /// never retried; the cursor moves on.
 pub const QUARANTINE: &str = "quarantine";
+/// Effect kind: a transcript or artifact the hub stopped holding because its
+/// own copy could not be trusted. Stored as a failed effect, so it counts
+/// against the host on engine health; the resource's ledger row says which.
+pub const CUSTODY_HALT: &str = "custody_halt";
+/// Effect kind: a completion boundary went ahead without transcript bytes the
+/// spoke had said it needed, because they did not arrive in time.
+pub const EVIDENCE_UNAVAILABLE: &str = "transcript_evidence_unavailable";
 
 /// The longest `reason` a decision carries.
 const MAX_REASON_CHARS: usize = 1024;
@@ -184,6 +219,15 @@ pub trait ObservationApplier: Send + Sync {
     /// without needing another observation to arrive first.
     async fn sweep(&self) {}
 
+    /// A run's transcript now has bytes on the hub. The projector has already
+    /// written them; this lets the engine point the run at its hub copy, so the
+    /// readers that find a transcript by run (live summary, cost, completion)
+    /// open that file and never a path on the host.
+    async fn transcript_attached(&self, origin: &Origin, source: &TranscriptSource) -> Applied {
+        let _ = (origin, source);
+        Applied::Done
+    }
+
     /// Reflect a pane the host looked at. The projector has already recorded the
     /// observation durably; this is its effect on live state.
     async fn pane(&self, observation: &PaneObservation) -> Applied;
@@ -249,6 +293,16 @@ pub struct ProjectorConfig {
     /// health can report the host as blocked.
     #[builder(default = Duration::from_secs(30))]
     pub retry_stall: Duration,
+    /// The longest a completion boundary waits for transcript bytes the spoke
+    /// said it needed. While it waits the projector keeps materializing the
+    /// bytes already received behind it, so the wait cannot deadlock on its own
+    /// watermark; past this it goes ahead and records the evidence as
+    /// unavailable.
+    #[builder(default = Duration::from_secs(60))]
+    pub watermark_wait: Duration,
+    /// How often a waiting boundary looks for newly received bytes.
+    #[builder(default = Duration::from_millis(50))]
+    pub watermark_poll: Duration,
 }
 
 impl Default for ProjectorConfig {
@@ -284,6 +338,17 @@ impl RetryHold {
     }
 }
 
+/// How a wait for transcript bytes ended.
+enum Settled {
+    Ready(TranscriptSource),
+    Unavailable {
+        reason: String,
+        /// Worth an alert: bytes the spoke sent did not arrive. The spoke
+        /// declaring them unavailable is recorded in custody and is not one.
+        alert: bool,
+    },
+}
+
 enum Currentness {
     Current,
     Superseded(String),
@@ -313,6 +378,9 @@ struct Inner {
     sender: Arc<dyn CommandSender>,
     wake: Arc<Notify>,
     config: ProjectorConfig,
+    /// Where transcript and artifact bytes are held. Without it those records
+    /// are received and left alone, as before custody existed.
+    custody: Option<Arc<Custody>>,
     /// The position a halt was last reported at, per host, so a persistent
     /// fault is logged once rather than every sweep.
     #[builder(skip)]
@@ -338,6 +406,30 @@ impl Projector {
         wake: Arc<Notify>,
         config: ProjectorConfig,
     ) -> Self {
+        Self::build(db, applier, sender, wake, config, None)
+    }
+
+    /// A projector that also holds each run's transcript and artifact bytes in
+    /// `custody`.
+    pub fn with_custody(
+        db: WorkDb,
+        applier: Arc<dyn ObservationApplier>,
+        sender: Arc<dyn CommandSender>,
+        wake: Arc<Notify>,
+        config: ProjectorConfig,
+        custody: Arc<Custody>,
+    ) -> Self {
+        Self::build(db, applier, sender, wake, config, Some(custody))
+    }
+
+    fn build(
+        db: WorkDb,
+        applier: Arc<dyn ObservationApplier>,
+        sender: Arc<dyn CommandSender>,
+        wake: Arc<Notify>,
+        config: ProjectorConfig,
+        custody: Option<Arc<Custody>>,
+    ) -> Self {
         Self {
             inner: Arc::new(
                 Inner::builder()
@@ -346,6 +438,7 @@ impl Projector {
                     .sender(sender)
                     .wake(wake)
                     .config(config)
+                    .maybe_custody(custody)
                     .build(),
             ),
         }
@@ -675,6 +768,26 @@ impl Inner {
         let currentness = self.currentness(observation.origin()).await?;
         match (observation, currentness) {
             (Observation::Proposal(proposal), currentness) => self.apply_proposal(proposal, currentness, owed).await,
+            (Observation::Event(mut event), Currentness::Current) if event.mark.is_some() => {
+                // A turn boundary that needs transcript bytes waits for them,
+                // then carries the hub's copy to the consumers that read it.
+                if let Some(mark) = event.mark.clone() {
+                    match self.await_evidence(&event.origin, &mark).await? {
+                        Settled::Ready(source) => event.transcript = Some(source),
+                        Settled::Unavailable { reason, alert } => {
+                            self.note_unavailable(&event.origin, &mark, &reason, alert, owed);
+                        }
+                    }
+                }
+                match self.applier.event(&event).await {
+                    Applied::Done => Ok(()),
+                    Applied::Retry(reason) => Err(Interrupted::Retry(reason)),
+                }
+            }
+            (
+                observation @ (Observation::Transcript(_) | Observation::Artifact(_) | Observation::Gap(_)),
+                Currentness::Current,
+            ) => self.apply_custody(observation, owed).await,
             (observation, Currentness::Superseded(why)) => {
                 tracing::debug!(
                     host = %observation.origin().host_id,
@@ -723,6 +836,12 @@ impl Inner {
             );
             return Ok(());
         }
+        if let (Currentness::Current, ProposalRequest::Standard { .. }, Some(mark)) =
+            (&currentness, &proposal.request, &proposal.mark)
+            && let Settled::Unavailable { reason, alert } = self.await_evidence(origin, mark).await?
+        {
+            self.note_unavailable(origin, mark, &reason, alert, owed);
+        }
         let decision = match (&proposal.request, currentness) {
             (_, Currentness::Superseded(why)) => Decision::refused(format!("the assignment was superseded: {why}")),
             (ProposalRequest::Refused(reason), _) => Decision::refused(reason.clone()),
@@ -751,6 +870,162 @@ impl Inner {
         };
         owed.push(Owed::decision(&proposal, &key, &decision));
         Ok(())
+    }
+
+    /// Write one transcript, artifact or gap record to the hub's custody copy.
+    /// A disk or database fault holds the cursor and retries; a resource the
+    /// hub cannot trust is halted and reported, and the cursor moves on.
+    async fn apply_custody(&self, observation: Observation, owed: &mut Vec<Owed>) -> Result<(), Interrupted> {
+        let Some(custody) = self.custody.clone() else {
+            tracing::debug!(
+                sequence = observation.origin().sequence,
+                "no custody is configured; the record is received and left alone"
+            );
+            return Ok(());
+        };
+        let origin = observation.origin().clone();
+        let transcript = matches!(observation, Observation::Transcript(_));
+        let handle = Arc::clone(&custody);
+        let applied = self
+            .blocking(move |_| {
+                let origin = observation.origin().clone();
+                let source = Source {
+                    host_id: &origin.host_id,
+                    run: &origin.run,
+                    sequence: origin.sequence,
+                };
+                match &observation {
+                    Observation::Transcript(found) => handle.apply_transcript(&source, &found.delta),
+                    Observation::Artifact(found) => handle.apply_artifact(&source, &found.chunk),
+                    Observation::Gap(found) => handle.apply_gap(&source, &found.gap),
+                    _ => Ok(Custodied::Ignored("not a custody record")),
+                }
+            })
+            .await?;
+        match applied {
+            Custodied::Halted { resource, reason } => {
+                tracing::error!(
+                    host = %origin.host_id,
+                    sequence = origin.sequence,
+                    %resource,
+                    %reason,
+                    "the hub stopped holding a spoke resource: its copy cannot be trusted"
+                );
+                owed.push(Owed::custody_halt(&origin, &resource, &reason));
+            }
+            Custodied::Wrote { resource, .. } | Custodied::Replayed { resource } if transcript => {
+                self.attach_transcript(&custody, &origin, &resource).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Point the run at its hub transcript. Repeated for every written or
+    /// replayed chunk, because a crash after a chunk is held and before the run
+    /// is pointed at it replays the chunk, not the pointer.
+    async fn attach_transcript(
+        &self,
+        custody: &Arc<Custody>,
+        origin: &Origin,
+        resource: &str,
+    ) -> Result<(), Interrupted> {
+        let (handle, run, generation) = (
+            Arc::clone(custody),
+            origin.run.clone(),
+            resource.trim_start_matches("transcript:").to_owned(),
+        );
+        let source = self
+            .blocking(move |_| handle.transcript_source(&run, &generation))
+            .await?;
+        let Some(source) = source else {
+            return Ok(());
+        };
+        match self.applier.transcript_attached(origin, &source).await {
+            Applied::Done => Ok(()),
+            Applied::Retry(reason) => Err(Interrupted::Retry(reason)),
+        }
+    }
+
+    /// Wait until the bytes `mark` names are held, or will not come.
+    ///
+    /// The bytes can sit behind this very record in the journal: the spoke
+    /// numbers bulk chunks only as send credit allows, while a Stop or proposal
+    /// is numbered at once with the size the transcript had. So the wait does
+    /// not stand still. Each pass writes whatever custody records the hub has
+    /// already received after this one, which are idempotent when the cursor
+    /// reaches them later, until the mark is met, the spoke says it will not be,
+    /// or [`ProjectorConfig::watermark_wait`] runs out.
+    async fn await_evidence(&self, origin: &Origin, mark: &Mark) -> Result<Settled, Interrupted> {
+        let Some(custody) = self.custody.clone() else {
+            return Ok(Settled::Unavailable {
+                reason: "no custody is configured on this hub".into(),
+                alert: false,
+            });
+        };
+        let started = std::time::Instant::now();
+        let mut scanned = origin.sequence;
+        loop {
+            let (handle, run, wanted) = (Arc::clone(&custody), origin.run.clone(), mark.clone());
+            match self
+                .blocking(move |_| handle.transcript_evidence(&run, &wanted, true))
+                .await?
+            {
+                Evidence::Ready(source) => return Ok(Settled::Ready(source)),
+                Evidence::Unavailable(reason) => return Ok(Settled::Unavailable { reason, alert: false }),
+                Evidence::Pending { have, want } => {
+                    if started.elapsed() >= self.config.watermark_wait {
+                        return Ok(Settled::Unavailable {
+                            reason: format!(
+                                "only {have} of {want} bytes arrived within {:?}",
+                                self.config.watermark_wait
+                            ),
+                            alert: true,
+                        });
+                    }
+                }
+            }
+            let (host, journal, batch) = (origin.host_id.clone(), origin.journal_id.clone(), self.config.batch);
+            let after = scanned;
+            let rows = self
+                .blocking(move |db| db.spoke_ingress_after(&host, &journal, after, batch))
+                .await?;
+            if rows.is_empty() {
+                tokio::time::sleep(self.config.watermark_poll).await;
+                continue;
+            }
+            for row in &rows {
+                scanned = row.sequence;
+                let Reduction::Observations(found) = reduce::reduce(&origin.host_id, &origin.journal_id, row) else {
+                    continue;
+                };
+                for observation in found {
+                    let custody_record = matches!(
+                        observation,
+                        Observation::Transcript(_) | Observation::Artifact(_) | Observation::Gap(_)
+                    );
+                    if custody_record && matches!(self.currentness(observation.origin()).await?, Currentness::Current) {
+                        // A resource halted here is reported when the cursor
+                        // reaches the record; its alert is not lost by waiting.
+                        self.apply_custody(observation, &mut Vec::new()).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    fn note_unavailable(&self, origin: &Origin, mark: &Mark, reason: &str, alert: bool, owed: &mut Vec<Owed>) {
+        tracing::warn!(
+            host = %origin.host_id,
+            execution = %origin.run.execution_id,
+            generation = %mark.generation,
+            through = mark.through,
+            %reason,
+            "a completion boundary goes ahead without the transcript bytes it named"
+        );
+        if alert {
+            owed.push(Owed::evidence_unavailable(origin, mark, reason));
+        }
     }
 
     /// Whether the observation's run is still the execution's current
@@ -933,6 +1208,24 @@ impl Owed {
         Self {
             kind: QUARANTINE,
             key: sequence.to_string(),
+            payload: reason.as_bytes().to_vec(),
+            failure: Some(reason.to_owned()),
+        }
+    }
+
+    fn custody_halt(origin: &Origin, resource: &str, reason: &str) -> Self {
+        Self {
+            kind: CUSTODY_HALT,
+            key: format!("{}:{resource}", origin.run.run_id),
+            payload: reason.as_bytes().to_vec(),
+            failure: Some(format!("{resource}: {reason}")),
+        }
+    }
+
+    fn evidence_unavailable(origin: &Origin, mark: &Mark, reason: &str) -> Self {
+        Self {
+            kind: EVIDENCE_UNAVAILABLE,
+            key: format!("{}:{}:{}", origin.run.run_id, mark.generation, mark.through),
             payload: reason.as_bytes().to_vec(),
             failure: Some(reason.to_owned()),
         }

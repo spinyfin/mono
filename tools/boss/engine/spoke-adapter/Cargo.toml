@@ -13,6 +13,7 @@ boss-execution-contracts = { path = "../execution-contracts" }
 boss-host-execution = { path = "../host-execution" }
 boss-protocol = { path = "../../protocol" }
 boss-protocol-spoke = { path = "../../protocol-spoke" }
+boss-spoke-custody = { path = "../spoke-custody" }
 boss-spoke-stream = { path = "../spoke-stream" }
 boss-engine-structured-output = { path = "../structured-output" }
 boss-work-db = { path = "../work-db" }
@@ -28,6 +29,7 @@ boss-engine-runtime = { path = "../core/runtime" }
 boss-host-enrollment = { path = "../host-enrollment" }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tokio-stream = { workspace = true, features = ["net"] }
