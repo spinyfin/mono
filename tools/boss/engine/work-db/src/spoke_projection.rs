@@ -690,6 +690,30 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Replace the payload of a still-pending effect. Delivery uses this when a
+    /// successful worker reply is rewritten to a data-free rejection so the
+    /// stored command matches what the outbox will admit.
+    pub fn replace_pending_spoke_effect_payload(
+        &self,
+        host_id: &str,
+        kind: &str,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_ms();
+        let rows = conn.execute(
+            "UPDATE spoke_effects
+                SET payload = ?4, updated_at_ms = ?5
+              WHERE host_id = ?1 AND effect_kind = ?2 AND effect_key = ?3 AND state = 'pending'",
+            params![host_id, kind, key, payload, now],
+        )?;
+        if rows == 0 {
+            bail!("no pending spoke effect {kind}/{key} on {host_id}");
+        }
+        Ok(())
+    }
+
     /// Per-host projection health. Hosts with no journal are omitted.
     pub fn spoke_projection_status(&self) -> Result<Vec<SpokeProjectionStatus>> {
         let conn = self.connect()?;
@@ -1060,6 +1084,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.pending_spoke_effects(10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_pending_effect_payload_can_be_replaced_until_it_settles() {
+        let db = db();
+        receive(&db, "host-a", 1);
+        db.advance_spoke_projection("host-a", "journal", 1, &[effect("reply", "run:1", b"ok")])
+            .unwrap();
+        db.replace_pending_spoke_effect_payload("host-a", "reply", "run:1", b"denied")
+            .unwrap();
+        assert_eq!(
+            db.spoke_effect("host-a", "reply", "run:1").unwrap().unwrap().payload,
+            b"denied"
+        );
+        db.settle_spoke_effect("host-a", "reply", "run:1", &SpokeEffectOutcome::Done)
+            .unwrap();
+        db.replace_pending_spoke_effect_payload("host-a", "reply", "run:1", b"again")
+            .unwrap_err();
+        assert_eq!(
+            db.spoke_effect("host-a", "reply", "run:1").unwrap().unwrap().payload,
+            b"denied"
+        );
     }
 
     #[test]

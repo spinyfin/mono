@@ -38,9 +38,19 @@ pub(super) async fn read(state: &ServerState, observation: &WorkerObservation, m
             Ok(bundle) => FrontendEvent::WorkerContextResult {
                 bundle: Box::new(bundle),
             },
-            Err(error) => return WorkerResponse::Retry(error.to_string()),
+            Err(context::AttributedReadError::Transient(error)) => return WorkerResponse::Retry(error.to_string()),
+            Err(context::AttributedReadError::Denied(reason)) => return WorkerResponse::Denied(reason),
         },
-        WorkerRead::PrStatus { refresh } => pr_status::status_for_caller(state, &state.work_db, &caller, refresh).await,
+        WorkerRead::PrStatus { refresh } => {
+            pr_status::status_for_caller_timed(
+                state,
+                &state.work_db,
+                &caller,
+                refresh,
+                Some(pr_status::HUB_PR_STATUS_PROBE_TIMEOUT),
+            )
+            .await
+        }
         WorkerRead::PrBody => pr_status::body_for_caller(&state.work_db, &caller),
     };
     match event {

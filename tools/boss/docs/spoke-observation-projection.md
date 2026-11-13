@@ -42,6 +42,8 @@ Ingress checks the complete execution/run/generation/spawn-token tuple against t
 
 Each reply is a `worker_reply` effect keyed by `run_id:request_id`, committed with the projection cursor and delivered through the existing command outbox. Replayed records and repeated request IDs do not recompute a committed reply. The exact serialized reply is retained across delivery retries and hub restarts. Successful replies contain the normal frontend event, a content-digest revision, and the hub's read timestamp; PR status retains the merge poller's observation time within that event. Oversized responses are explicitly rejected, never truncated into success. A crash before committing a read's reply can repeat that read; PR refresh continues to use the shared refresh budget.
 
+If a successful reply is recorded and the assignment is replaced before that reply is first admitted to the command outbox, delivery converts it to a data-free rejection (the only reply that can cross the assignment fence). That is a permanent authorization outcome: the worker receives an explicit denial, and later replies and proposal decisions for the same host are not held behind a retry that can never succeed. An outbox quota failure remains distinct from that denial and is retried.
+
 This path is enabled by the same configured hub listener and manually enrolled spoke as the rest of projection; no new dispatch mode or operator switch is introduced.
 
 ## Why an effect happens once
@@ -58,6 +60,8 @@ Hook events are the exception that is at-least-once: a crash in that window repe
 A host's records are applied strictly in order, so a worker's queued `done` is applied before the `Stop` behind it, as the synchronous local call would have been. A record that cannot be applied yet (database busy) holds that host's cursor and is retried with backoff; it is never skipped. Different hosts project concurrently.
 
 Work that waits on something other than the database is a durable **effect** and does not hold the cursor. Proposal decisions and worker replies are such effects: both need the spoke reachable.
+
+A `pr status --refresh` GitHub probe is the exception that still runs while the host's cursor is held: it is a live `gh` shell-out, not a durable effect. The hub bounds that probe to one second and falls back to the stored snapshot (the same path as a probe error) so a hung `gh` cannot stall later records from that host. The spoke gateway waits two seconds for a reply; a live `gh` call often exceeds that, which is why the bound exists and why a refresh may still report hub unavailable to the CLI even after the snapshot has been stored as the durable reply. Missing or inconsistent rows (a deleted task, an unknown product, a work item that is not a task) are answered with a data-free rejection rather than retried, so they also cannot hold the cursor.
 
 ## Decisions
 

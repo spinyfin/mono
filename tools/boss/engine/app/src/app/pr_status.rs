@@ -16,13 +16,30 @@
 //! Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
 //! §"Read-only model access and the exposure boundary".
 
-use super::context::own_task;
+use super::context::{AttributedReadError, own_task};
 use super::proposals::{AttributedCaller, attribute_caller, send_rejection};
 use super::*;
 
-use boss_protocol::{PrBodyView, PrStatusView, ProposalErrorCode, ProposalSubmissionError};
+use std::time::Duration;
+
+use boss_protocol::{PrBodyView, PrStatusView};
 
 use boss_engine_merge_poller::PrLifecycleState;
+
+/// Hub projection bound for a live `gh` refresh. The spoke gateway waits
+/// two seconds for a reply; a hung probe must not hold that host's ordered
+/// cursor. The stored snapshot is returned instead, as on a probe error.
+pub(super) const HUB_PR_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn reject_read(prefix: &str, err: AttributedReadError) -> FrontendEvent {
+    FrontendEvent::ProposalRejected {
+        error: err.as_proposal_error(prefix),
+    }
+}
+
+fn reject_storage(prefix: &str, err: anyhow::Error) -> FrontendEvent {
+    reject_read(prefix, AttributedReadError::from_storage(err))
+}
 
 /// `work_invalidated` reason published when a `boss pr status --refresh`
 /// observation changed a stored PR-state column. `pub(super)` so the handler
@@ -188,28 +205,28 @@ pub(super) async fn status_for_caller(
     caller: &AttributedCaller,
     refresh: bool,
 ) -> FrontendEvent {
+    status_for_caller_timed(server_state, work_db, caller, refresh, None).await
+}
+
+pub(super) async fn status_for_caller_timed(
+    server_state: &ServerState,
+    work_db: &WorkDb,
+    caller: &AttributedCaller,
+    refresh: bool,
+    probe_timeout: Option<Duration>,
+) -> FrontendEvent {
     let task = match own_task(work_db, &caller.work_item_id) {
         Ok(task) => task,
         Err(err) => {
-            tracing::error!(work_item_id = %caller.work_item_id, ?err, "get_pr_status failed to read task");
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read pr status: {err}"),
-                ),
-            };
+            tracing::error!(work_item_id = %caller.work_item_id, %err, "get_pr_status failed to read task");
+            return reject_read("failed to read pr status", err);
         }
     };
     let execution = match work_db.get_execution(&caller.execution_id) {
         Ok(execution) => execution,
         Err(err) => {
             tracing::error!(execution_id = %caller.execution_id, ?err, "get_pr_status failed to read execution");
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read pr status: {err}"),
-                ),
-            };
+            return reject_storage("failed to read pr status", err);
         }
     };
     let effective = resolve_effective_pr(work_db, &task, &execution);
@@ -222,21 +239,14 @@ pub(super) async fn status_for_caller(
                 status_task_id = %effective.status_task_id,
                 "get_pr_status failed: resolved status task has no row",
             );
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    "attributed work item could not be read",
-                ),
-            };
+            return reject_read(
+                "failed to read pr status",
+                AttributedReadError::Denied("attributed work item could not be read".into()),
+            );
         }
         Err(err) => {
             tracing::error!(work_item_id = %caller.work_item_id, ?err, "get_pr_status failed to read");
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read pr status: {err}"),
-                ),
-            };
+            return reject_storage("failed to read pr status", err);
         }
     };
     // The resolved PR URL is authoritative over the status-task row's own
@@ -281,7 +291,31 @@ pub(super) async fn status_for_caller(
         };
     }
 
-    let probe = match server_state.merge_probe.probe(&pr_url).await {
+    let stored_snapshot = FrontendEvent::PrStatusResult {
+        status: PrStatusView::builder()
+            .pr_url(pr_url.clone())
+            .maybe_mergeable(snapshot.mergeable.clone())
+            .maybe_merge_state_status(snapshot.merge_state_status.clone())
+            .maybe_head_sha(snapshot.head_sha.clone())
+            .maybe_observed_at(snapshot.observed_at.clone())
+            .build(),
+    };
+    let probe_result = match probe_timeout {
+        Some(bound) => match tokio::time::timeout(bound, server_state.merge_probe.probe(&pr_url)).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    work_item_id = %caller.work_item_id,
+                    pr_url = %pr_url,
+                    ?bound,
+                    "get_pr_status: refresh probe exceeded the hub bound, returning stored snapshot",
+                );
+                return stored_snapshot;
+            }
+        },
+        None => server_state.merge_probe.probe(&pr_url).await,
+    };
+    let probe = match probe_result {
         Ok(probe) => probe,
         Err(err) => {
             tracing::warn!(
@@ -290,15 +324,7 @@ pub(super) async fn status_for_caller(
                 ?err,
                 "get_pr_status: refresh probe failed, returning stored snapshot",
             );
-            return FrontendEvent::PrStatusResult {
-                status: PrStatusView::builder()
-                    .pr_url(pr_url)
-                    .maybe_mergeable(snapshot.mergeable)
-                    .maybe_merge_state_status(snapshot.merge_state_status)
-                    .maybe_head_sha(snapshot.head_sha)
-                    .maybe_observed_at(snapshot.observed_at)
-                    .build(),
-            };
+            return stored_snapshot;
         }
     };
 
@@ -420,25 +446,15 @@ pub(super) fn body_for_caller(work_db: &WorkDb, caller: &AttributedCaller) -> Fr
     let task = match own_task(work_db, &caller.work_item_id) {
         Ok(task) => task,
         Err(err) => {
-            tracing::error!(work_item_id = %caller.work_item_id, ?err, "get_pr_body failed to read task");
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read pr body: {err}"),
-                ),
-            };
+            tracing::error!(work_item_id = %caller.work_item_id, %err, "get_pr_body failed to read task");
+            return reject_read("failed to read pr body", err);
         }
     };
     let execution = match work_db.get_execution(&caller.execution_id) {
         Ok(execution) => execution,
         Err(err) => {
             tracing::error!(execution_id = %caller.execution_id, ?err, "get_pr_body failed to read execution");
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read pr body: {err}"),
-                ),
-            };
+            return reject_storage("failed to read pr body", err);
         }
     };
     let effective = resolve_effective_pr(work_db, &task, &execution);
@@ -451,12 +467,7 @@ pub(super) fn body_for_caller(work_db: &WorkDb, caller: &AttributedCaller) -> Fr
                 ?err,
                 "get_pr_body failed to read execution title snapshot",
             );
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read pr body: {err}"),
-                ),
-            };
+            return reject_storage("failed to read pr body", err);
         }
     };
 
@@ -468,12 +479,7 @@ pub(super) fn body_for_caller(work_db: &WorkDb, caller: &AttributedCaller) -> Fr
                 ?err,
                 "get_pr_body failed to read execution snapshot",
             );
-            return FrontendEvent::ProposalRejected {
-                error: ProposalSubmissionError::new(
-                    ProposalErrorCode::Internal,
-                    format!("failed to read pr body: {err}"),
-                ),
-            };
+            return reject_storage("failed to read pr body", err);
         }
     };
 

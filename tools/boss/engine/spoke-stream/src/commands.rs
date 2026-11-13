@@ -24,8 +24,10 @@ pub enum CommandOutcome {
     ResetReleaseUnsupported,
     #[error("outcome uncertain; reconcile using the same command ID")]
     OutcomeUncertain,
-    #[error("outbox refused command; command not submitted")]
+    #[error("outbox quota exhausted; command not submitted")]
     NotSubmitted,
+    #[error("outbox denied the command; command not submitted")]
+    Denied,
 }
 
 impl StreamManager {
@@ -99,7 +101,8 @@ impl StreamManager {
         if let Err(error) = storage.append(host_id, admission, command).await {
             connection.waiters.remove(&id);
             return Err(match error {
-                crate::store::StoreError::Denied | crate::store::StoreError::Full => NotSubmitted,
+                crate::store::StoreError::Denied => Denied,
+                crate::store::StoreError::Full => NotSubmitted,
                 _ => OutcomeUncertain,
             });
         }

@@ -1,8 +1,10 @@
 //! Real CLI -> peer-authenticated gateway -> mTLS hub -> durable projection
 //! -> command reply -> CLI. No frontend dispatch is impersonated by the hub.
 use super::*;
+use boss_engine_runtime::hub::projection::ProjectorConfig;
 use boss_protocol_spoke::v1::{self, command, record};
 use prost::Message;
+use std::time::Duration;
 
 #[path = "spoke_requests/support.rs"]
 mod support;
@@ -162,6 +164,97 @@ async fn revocation_between_receipt_and_projection_denies_without_reading() {
                 }))
             )
     );
+}
+
+#[tokio::test]
+async fn a_successful_reply_replaced_before_delivery_is_denied_and_later_runs_still_deliver() {
+    let mut fx = Fixture::new().await;
+    let cli = fx.start_cli(&["context"], &fx.execution_id);
+    fx.receive_next().await;
+    fx.disconnect().await;
+    fx.projector_with(
+        ProjectorConfig::builder()
+            .delivery_deadline(Duration::from_millis(300))
+            .build(),
+    )
+    .drain()
+    .await;
+    let payloads = fx.effect_payloads();
+    assert_eq!(payloads.len(), 1);
+    let stored = reply(&payloads[0]);
+    assert_eq!(stored.code, v1::ResultCode::Ok as i32);
+    let command_id = v1::Command::decode(payloads[0].as_slice()).unwrap().command_id;
+    assert!(
+        fx.state.work_db.host_command_wire(HOST, &command_id).unwrap().is_none(),
+        "the successful reply must not have been admitted before the assignment changed"
+    );
+
+    fx.state
+        .work_db
+        .resolve_spoke_assignment(&fx.execution_id, fx.run.assignment_generation, "completed")
+        .unwrap();
+    fx.state
+        .work_db
+        .reserve_spoke_assignment(&fx.execution_id, HOST)
+        .unwrap();
+    fx.reconnect().await;
+    fx.project_and_reply().await;
+    let denied_reply = reply(&fx.effect_payloads()[0]);
+    assert_eq!(denied_reply.code, v1::ResultCode::Rejected as i32);
+    assert!(denied_reply.result_json.is_empty());
+    assert!(denied_reply.reason.contains("worker_assignment_denied"));
+    denied(cli.await.unwrap(), "worker_assignment_denied");
+
+    let (later_execution, later_work_item) = new_execution(&fx.state, "Later run on the same host");
+    let later_assignment = fx
+        .state
+        .work_db
+        .reserve_spoke_assignment(&later_execution, HOST)
+        .unwrap();
+    fx.adopt_run(
+        later_execution,
+        later_work_item.clone(),
+        v1::Run {
+            execution_id: later_assignment.execution_id,
+            run_id: later_assignment.run_id,
+            assignment_generation: later_assignment.assignment_generation,
+            spawn_token: later_assignment.spawn_token,
+        },
+    );
+    let later = fx.read(&["context"]).await;
+    assert_eq!(later["task"]["id"], later_work_item);
+}
+
+#[tokio::test]
+async fn a_deleted_task_between_receipt_and_projection_denies_without_holding_the_host() {
+    let mut fx = Fixture::new().await;
+    let cli = fx.start_cli(&["context"], &fx.execution_id);
+    fx.receive_next().await;
+    fx.state.work_db.delete_work_item(&fx.work_item_id).unwrap();
+    fx.project_and_reply().await;
+    let effects = fx.effect_payloads();
+    assert_eq!(reply(&effects[0]).code, v1::ResultCode::Rejected as i32);
+    assert!(reply(&effects[0]).result_json.is_empty());
+    denied(cli.await.unwrap(), "unknown task");
+
+    let (later_execution, later_work_item) = new_execution(&fx.state, "Still-projectable later run");
+    let later_assignment = fx
+        .state
+        .work_db
+        .reserve_spoke_assignment(&later_execution, HOST)
+        .unwrap();
+    fx.adopt_run(
+        later_execution,
+        later_work_item.clone(),
+        v1::Run {
+            execution_id: later_assignment.execution_id,
+            run_id: later_assignment.run_id,
+            assignment_generation: later_assignment.assignment_generation,
+            spawn_token: later_assignment.spawn_token,
+        },
+    );
+    let later = fx.read(&["context"]).await;
+    assert_eq!(later["task"]["id"], later_work_item);
 }
 
 fn reply(bytes: &[u8]) -> v1::WorkerReply {

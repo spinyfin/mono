@@ -70,6 +70,9 @@ pub struct Fixture {
     socket: PathBuf,
     sent: u64,
     command_journal: String,
+    hub_url: String,
+    tls: ClientTlsConfig,
+    spoke_journal_id: String,
     tasks: Vec<JoinHandle<()>>,
     _dir: tempfile::TempDir,
 }
@@ -149,13 +152,13 @@ impl Fixture {
         let server_task = tokio::spawn(async move {
             server.serve(listener, server_identity).await.unwrap();
         });
-        let channel = Endpoint::from_shared(format!("https://{address}"))
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(issuer.pem()))
+            .identity(client_identity);
+        let hub_url = format!("https://{address}");
+        let channel = Endpoint::from_shared(hub_url.clone())
             .unwrap()
-            .tls_config(
-                ClientTlsConfig::new()
-                    .ca_certificate(Certificate::from_pem(issuer.pem()))
-                    .identity(client_identity),
-            )
+            .tls_config(tls.clone())
             .unwrap()
             .connect()
             .await
@@ -203,7 +206,7 @@ impl Fixture {
             .send(v1::SpokeFrame {
                 body: Some(spoke_frame::Body::Hello(v1::Hello {
                     host_id: HOST.into(),
-                    journal_id,
+                    journal_id: journal_id.clone(),
                     boot_id: "boot".into(),
                     min_epoch: 1,
                     max_epoch: 1,
@@ -236,6 +239,9 @@ impl Fixture {
             .socket(socket)
             .sent(0)
             .command_journal(welcome.command_journal_id)
+            .hub_url(hub_url)
+            .tls(tls)
+            .spoke_journal_id(journal_id)
             .tasks(vec![server_task, gateway_task])
             .dir(dir)
             .build()
@@ -323,11 +329,116 @@ impl Fixture {
     }
 
     pub fn projector(&self) -> Projector {
+        self.projector_with(ProjectorConfig::default())
+    }
+
+    pub fn projector_with(&self, config: ProjectorConfig) -> Projector {
         self.hub.projector(
             (*self.state.work_db).clone(),
             crate::app::spoke_projection::applier(&self.state),
-            ProjectorConfig::default(),
+            config,
         )
+    }
+
+    /// Drop the live stream so the hub forgets this host before the next
+    /// delivery pass. Pulses are drained so a blocked write cannot hold the slot.
+    pub async fn disconnect(&mut self) {
+        let (tx, rx) = mpsc::channel(1);
+        let previous = std::mem::replace(&mut self.outgoing, tx);
+        drop(previous);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+            while let Ok(Some(_)) = self.incoming.message().await {}
+        })
+        .await;
+        // The hub clears `active` after its inbound read ends; wait for that
+        // so the next delivery pass sees the host as gone before admission.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    pub async fn reconnect(&mut self) {
+        let last_record = self.gateway.journal.lock().unwrap().record_bounds().unwrap().1;
+        let channel = Endpoint::from_shared(self.hub_url.clone())
+            .unwrap()
+            .tls_config(self.tls.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let (outgoing, rx) = mpsc::channel(8);
+        outgoing
+            .send(v1::SpokeFrame {
+                body: Some(spoke_frame::Body::Hello(v1::Hello {
+                    host_id: HOST.into(),
+                    journal_id: self.spoke_journal_id.clone(),
+                    boot_id: "boot".into(),
+                    min_epoch: 1,
+                    max_epoch: 1,
+                    features: Contracts::first_release().features,
+                    first_retained: 1,
+                    last_record,
+                    instance_nonce: vec![2; 16],
+                    ..Default::default()
+                })),
+            })
+            .await
+            .unwrap();
+        let mut incoming = SpokeHubClient::new(channel)
+            .connect(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let Some(hub_frame::Body::Welcome(welcome)) = incoming.message().await.unwrap().unwrap().body else {
+            panic!("welcome")
+        };
+        self.command_journal = welcome.command_journal_id;
+        self.outgoing = outgoing;
+        self.incoming = incoming;
+    }
+
+    pub fn adopt_run(&mut self, execution_id: String, work_item_id: String, run: v1::Run) {
+        let execution = ExecutionRecord::builder()
+            .execution_id(&execution_id)
+            .run_id(&run.run_id)
+            .spawn_token(&run.spawn_token)
+            .assignment_generation(run.assignment_generation)
+            .lease_id("lease")
+            .workspace_id("workspace")
+            .session("session")
+            .phase(Phase::Alive)
+            .boot_id("boot")
+            .pid(std::process::id() as u64)
+            .driver_id("claude")
+            .observation(ObservationConfig {
+                workspace: self.socket.parent().unwrap().into(),
+                pending: self.socket.parent().unwrap().into(),
+                file: None,
+                pid_start: Some(process_snapshot(std::process::id() as i32).unwrap().start),
+            })
+            .build();
+        let mut journal = self.gateway.journal.lock().unwrap();
+        // Peer-pid attribution returns the first live record for this process.
+        // Retire the previous run so the later CLI is bound to this assignment.
+        for bytes in journal.list_executions().unwrap() {
+            let mut previous: ExecutionRecord = serde_json::from_slice(&bytes).unwrap();
+            if previous.phase != Phase::Terminal {
+                previous.phase = Phase::Terminal;
+                journal
+                    .save_execution(
+                        &previous.run_id,
+                        &previous.spawn_token,
+                        &serde_json::to_vec(&previous).unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        journal
+            .save_execution(&run.run_id, &run.spawn_token, &serde_json::to_vec(&execution).unwrap())
+            .unwrap();
+        drop(journal);
+        self.execution_id = execution_id;
+        self.work_item_id = work_item_id;
+        self.run = run;
     }
 
     pub fn append(&self, body: record::Body) {
