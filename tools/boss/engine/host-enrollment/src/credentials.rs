@@ -80,6 +80,23 @@ pub struct CredentialStatus {
     pub previous: Option<CertificateSummary>,
 }
 
+/// One row of [`HostCredentials::list_hosts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSummary {
+    pub host_id: String,
+    pub state: HostState,
+    /// The certificate the host should be using, if it has enrolled.
+    pub current: Option<CertificateSummary>,
+    /// When the host's unused enrollment token stops working, if one is
+    /// outstanding and has not expired.
+    pub token_expires_at: Option<SystemTime>,
+}
+
+/// The job id every manually minted token is bound to. A manual enrollment has
+/// no provisioning job behind it, so the token names this fixed one; the token
+/// itself is what is single-use and host-bound.
+pub const MANUAL_JOB_ID: &str = "manual-enrollment";
+
 impl HostCredentials {
     /// Opens (creating on first use) the credential state under `dir`: the
     /// CA in `dir/ca` and the database at `dir/credentials.db`.
@@ -112,6 +129,20 @@ impl HostCredentials {
         })
     }
 
+    /// Like [`open`](Self::open), but for an operator tool that must not
+    /// create a CA: the state has to exist already, written by the hub.
+    pub fn open_existing(dir: &Path, policy: Policy, clock: Arc<dyn Clock>) -> Result<Self, CredentialError> {
+        for part in ["ca/issuer.key.pem", "ca/issuer.crt.der", "credentials.db"] {
+            if !dir.join(part).exists() {
+                return Err(CredentialError::Internal(format!(
+                    "{} has no {part}: the hub has not initialized its host credentials here",
+                    dir.display()
+                )));
+            }
+        }
+        Self::open(dir, policy, clock)
+    }
+
     pub fn policy(&self) -> &Policy {
         &self.policy
     }
@@ -138,22 +169,33 @@ impl HostCredentials {
     /// again from `pending`.
     pub fn authorize_host(&self, host_id: &str, actor: &str) -> Result<(), CredentialError> {
         check_host_id(host_id)?;
+        self.store.write(|tx| self.authorize_host_tx(tx, host_id, actor, true))
+    }
+
+    fn authorize_host_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        host_id: &str,
+        actor: &str,
+        allow_reopen: bool,
+    ) -> Result<(), CredentialError> {
         let now = unix_secs(self.clock.now());
-        self.store.write(|tx| {
-            match store::host(tx, host_id)? {
-                None => {
-                    store::insert_host(tx, host_id)?;
-                    store::audit(tx, now, host_id, "authorized", &note("actor", actor))?;
-                }
-                Some(row) if row.state == HostState::Revoked => {
-                    store::set_host(tx, host_id, HostState::Pending, (None, None))?;
-                    store::bump_generation(tx, host_id)?;
-                    store::audit(tx, now, host_id, "reauthorized", &note("actor", actor))?;
-                }
-                Some(_) => {}
+        match store::host(tx, host_id)? {
+            None => {
+                store::insert_host(tx, host_id)?;
+                store::audit(tx, now, host_id, "authorized", &note("actor", actor))?;
             }
-            Ok(())
-        })
+            Some(row) if row.state == HostState::Revoked => {
+                if !allow_reopen {
+                    return Err(Denial::Revoked.into());
+                }
+                store::set_host(tx, host_id, HostState::Pending, (None, None))?;
+                store::bump_generation(tx, host_id)?;
+                store::audit(tx, now, host_id, "reauthorized", &note("actor", actor))?;
+            }
+            Some(_) => {}
+        }
+        Ok(())
     }
 
     /// Mints the single-use secret for one provisioning job of an authorized
@@ -168,22 +210,84 @@ impl HostCredentials {
         let now = self.clock.now();
         let expires_at = now + self.policy.token_lifetime;
         let token = EnrollmentToken::generate();
+        self.store
+            .write(|tx| self.issue_token_tx(tx, host_id, job_id, &token, now, expires_at))?;
+        Ok(EnrollmentGrant { token, expires_at })
+    }
+
+    fn issue_token_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        host_id: &str,
+        job_id: &str,
+        token: &EnrollmentToken,
+        now: SystemTime,
+        expires_at: SystemTime,
+    ) -> Result<(), CredentialError> {
+        let host = store::host(tx, host_id)?.ok_or(CredentialError::UnknownHost)?;
+        if host.state == HostState::Revoked {
+            return Err(Denial::Revoked.into());
+        }
+        store::retire_grants(tx, host_id, None, "replaced")?;
+        store::insert_grant(
+            tx,
+            &token.hash(),
+            host_id,
+            job_id,
+            (host.generation, unix_secs(expires_at)),
+        )?;
+        store::audit(tx, unix_secs(now), host_id, "token_issued", &note("job", job_id))
+    }
+
+    /// Mints the single-use token a person carries to a host by hand.
+    ///
+    /// Authorizes `host_id` if it is new, then issues a token for
+    /// [`MANUAL_JOB_ID`]; an earlier unused token for the host stops working.
+    /// A revoked host is refused unless `reauthorize` says the operator means
+    /// to open it again, because revocation is meant to hold until someone
+    /// decides otherwise.
+    pub fn issue_manual_token(
+        &self,
+        host_id: &str,
+        actor: &str,
+        reauthorize: bool,
+    ) -> Result<EnrollmentGrant, CredentialError> {
+        check_host_id(host_id)?;
+        let now = self.clock.now();
+        let expires_at = now + self.policy.token_lifetime;
+        let token = EnrollmentToken::generate();
         self.store.write(|tx| {
-            let host = store::host(tx, host_id)?.ok_or(CredentialError::UnknownHost)?;
-            if host.state == HostState::Revoked {
-                return Err(Denial::Revoked.into());
-            }
-            store::retire_grants(tx, host_id, None, "replaced")?;
-            store::insert_grant(
-                tx,
-                &token.hash(),
-                host_id,
-                job_id,
-                (host.generation, unix_secs(expires_at)),
-            )?;
-            store::audit(tx, unix_secs(now), host_id, "token_issued", &note("job", job_id))
+            self.authorize_host_tx(tx, host_id, actor, reauthorize)?;
+            self.issue_token_tx(tx, host_id, MANUAL_JOB_ID, &token, now, expires_at)
         })?;
         Ok(EnrollmentGrant { token, expires_at })
+    }
+
+    /// Every authorized host, ordered by host id.
+    pub fn list_hosts(&self) -> Result<Vec<HostSummary>, CredentialError> {
+        let now = unix_secs(self.clock.now());
+        self.store.read(|conn| {
+            let mut hosts = Vec::new();
+            for (host_id, row) in store::all_hosts(conn)? {
+                let current = match &row.current_serial {
+                    Some(serial) => store::certificate(conn, serial)?.map(|cert| CertificateSummary {
+                        serial: cert.serial,
+                        valid_until: from_unix_secs(cert.not_after),
+                    }),
+                    None => None,
+                };
+                let token_expires_at = store::open_token_expiry(conn, &host_id)?
+                    .filter(|expires_at| *expires_at > now)
+                    .map(from_unix_secs);
+                hosts.push(HostSummary {
+                    host_id,
+                    state: row.state,
+                    current,
+                    token_expires_at,
+                });
+            }
+            Ok(hosts)
+        })
     }
 
     /// Cancels a provisioning job: its secret stops working and an enrollment

@@ -528,6 +528,7 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
     let readiness = boss_spoke_preflight::Config::builder()
         .state_dir(args.state_dir.clone())
         .maybe_homes_root(std::env::var_os(boss_host_execution::homes::ROOT_ENV).map(PathBuf::from))
+        .report_bootstrap(true)
         .cube_bin(cube.command.clone())
         .maybe_tmux_bin(args.tmux_bin.clone())
         .build();

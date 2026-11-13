@@ -120,6 +120,11 @@ pub(crate) fn read_identity(dir: &Path) -> Result<Option<Identity>, ClientError>
     }))
 }
 
+/// Installs a PEM file the daemon reads, owner-only, with one rename.
+pub(crate) fn write_pem(dir: &Path, name: &str, text: &str) -> Result<(), ClientError> {
+    write_atomic(dir, name, text)
+}
+
 pub(crate) fn write_pending(dir: &Path, name: &str, pending: &Pending) -> Result<(), ClientError> {
     let text = format!(
         "request_id {}\nkey {}\n",

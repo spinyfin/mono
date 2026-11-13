@@ -262,6 +262,39 @@ pub(crate) fn host(conn: &Connection, host_id: &str) -> Result<Option<HostRow>, 
     .map_err(Into::into)
 }
 
+/// Every host with its record, ordered by host id.
+pub(crate) fn all_hosts(conn: &Connection) -> Result<Vec<(String, HostRow)>, CredentialError> {
+    let mut statement = conn.prepare(
+        "SELECT host_id, state, generation, current_serial, previous_serial, previous_valid_until
+         FROM hosts ORDER BY host_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let state: String = row.get(1)?;
+        Ok((
+            row.get(0)?,
+            HostRow {
+                state: HostState::parse(&state).unwrap_or(HostState::Revoked),
+                generation: row.get(2)?,
+                current_serial: row.get(3)?,
+                previous_serial: row.get(4)?,
+                previous_valid_until: row.get(5)?,
+            },
+        ))
+    })?;
+    rows.collect::<Result<_, _>>().map_err(Into::into)
+}
+
+/// When the host's unused enrollment token stops working, if it has one that
+/// has not been consumed, replaced or cancelled.
+pub(crate) fn open_token_expiry(conn: &Connection, host_id: &str) -> Result<Option<i64>, CredentialError> {
+    conn.query_row(
+        "SELECT MAX(expires_at) FROM enrollment_grants WHERE host_id = ?1 AND state = 'issued'",
+        [host_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 pub(crate) fn insert_host(tx: &Transaction<'_>, host_id: &str) -> Result<(), CredentialError> {
     tx.execute(
         "INSERT INTO hosts (host_id, state, generation) VALUES (?1, 'pending', 1)",

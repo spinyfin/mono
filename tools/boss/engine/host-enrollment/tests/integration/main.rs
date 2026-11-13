@@ -13,3 +13,5 @@
 mod lifecycle;
 mod support;
 mod tls_boundary;
+
+mod manual_race;

@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
+use boss_spoke_package::archive::INSTALLER_BINARY;
+use boss_spoke_package::bootstrap::{self, Failure};
 use boss_spoke_package::install::{self, Host, InstallRecord, Layout, Request};
 use boss_spoke_package::manifest::{self, Platform, SigningKey, TrustedKey};
-use boss_spoke_package::system::{Staged, System, run_as};
+use boss_spoke_package::system::{Staged, System};
 use boss_spoke_package::update::{self, AlwaysReady, Apply, FileProbe, HttpFetcher, MapFetcher};
 use boss_spoke_package::{build, read_owner_only};
 use clap::Parser;
@@ -79,6 +81,40 @@ enum Cli {
         /// JSON object of URL → file path, used by isolated crash tests.
         #[arg(long, hide = true)]
         fixture_files: Option<PathBuf>,
+    },
+    /// Enroll this host with the hub using a single-use token, start its service
+    /// and check it as the service user. Run as root, after `install`.
+    ///
+    /// The token comes from an owner-only file or stdin, never from the command
+    /// line. Exits non-zero with a typed failure (`failure: <code>`) unless the
+    /// host enrolled, its service stayed up, and every as-user check passed.
+    Enroll {
+        #[arg(long, default_value = "/etc/boss-spoke/install.json")]
+        config: PathBuf,
+        /// Read the token from this owner-only file. It is deleted once spent.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_file: Option<PathBuf>,
+        /// Read the token from standard input.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Enroll again over an existing identity, for a lost or expired one.
+        #[arg(long)]
+        replace_identity: bool,
+        /// Repositories (URLs) the preflight must be able to read.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Stage against this directory instead of `/`. Test and inspect only.
+        #[arg(long, hide = true)]
+        root: Option<PathBuf>,
+        /// Run the as-user step in this process. The root side launches it.
+        #[arg(long, hide = true)]
+        inline: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        hub_url: Option<String>,
+        #[arg(long, hide = true)]
+        host_id: Option<String>,
     },
     /// Print a journal's SQLite `user_version`. Run by the update helper as the
     /// service user so root never opens the service user's database.
@@ -214,6 +250,28 @@ fn run(cli: Cli) -> Result<ExitCode> {
             root,
             fixture_files,
         } => return apply_update_command(&config, root, fixture_files),
+        Cli::Enroll {
+            config,
+            token_file,
+            token_stdin,
+            replace_identity,
+            repo,
+            root,
+            inline,
+            state_dir,
+            hub_url,
+            host_id,
+        } => {
+            if inline {
+                return Ok(inline_enroll(
+                    state_dir.context("--inline needs --state-dir")?,
+                    hub_url.context("--inline needs --hub-url")?,
+                    host_id.context("--inline needs --host-id")?,
+                    replace_identity,
+                ));
+            }
+            return enroll_command(&config, root, token_file, token_stdin, replace_identity, &repo);
+        }
         Cli::JournalVersion { path } => {
             println!("user_version={}", update::read_user_version(&path)?);
             return Ok(ExitCode::SUCCESS);
@@ -385,6 +443,7 @@ fn install_command(args: InstallArgs) -> Result<ExitCode> {
             root: args.root,
         })
         .build();
+    let installed_binary = request.layout.on_disk(&request.layout.current()).join(INSTALLER_BINARY);
     let staged_host = Staged::default();
     let host: &dyn Host = if staged { &staged_host } else { &System { platform } };
     let report = install::install(host, &request)?;
@@ -399,7 +458,8 @@ fn install_command(args: InstallArgs) -> Result<ExitCode> {
         println!("service restarted; running workers and the journal were kept");
     } else if !report.enrolled {
         println!(
-            "service not started: this host is not enrolled. Enroll it as the service user, then start the service."
+            "service not started: this host is not enrolled. Run `{} enroll` as root with a token from the hub.",
+            installed_binary.display()
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -410,40 +470,122 @@ fn install_command(args: InstallArgs) -> Result<ExitCode> {
 fn service_user_preflight(config: &Path, storage_only: bool, repos: &[String]) -> Result<ExitCode> {
     let record = InstallRecord::read(config)?;
     let layout = record.layout()?;
-    let spec = layout.spec(&record.host_id, &record.hub_url);
-    let account = System {
-        platform: layout.platform,
-    }
-    .lookup_user(&layout.user)?
-    .with_context(|| format!("service user {} does not exist", layout.user))?;
-    let mut args = vec![
-        "preflight".to_owned(),
-        "--inline".into(),
-        "--state-dir".into(),
-        layout.state_dir().display().to_string(),
-        "--hub-url".into(),
-        record.hub_url.clone(),
-    ];
-    if storage_only {
-        args.push("--storage-only".into());
-    }
-    for repo in repos {
-        args.extend(["--repo".to_owned(), repo.clone()]);
-    }
-    let installed = layout.current().join(boss_spoke_package::archive::INSTALLER_BINARY);
-    let program = if installed.is_file() {
-        installed
-    } else {
-        std::env::current_exe()?
-    };
-    let output = run_as(&account, &spec.environment(), &program, &args)
-        .context("run preflight as root or as the service user")?;
-    print!("{}", output.output);
-    Ok(if output.success {
+    let run = bootstrap::preflight_as_service_user(
+        &System {
+            platform: layout.platform,
+        },
+        &record,
+        &layout,
+        storage_only,
+        repos,
+        &std::env::current_exe()?,
+    )?;
+    print!("{}", run.output);
+    Ok(if run.success {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The as-user half of `enroll`: prints one line, `enrolled …` or `failure: …`.
+fn inline_enroll(state_dir: PathBuf, hub_url: String, host_id: String, replace_identity: bool) -> ExitCode {
+    let args = bootstrap::InlineEnroll {
+        state_dir: &state_dir,
+        hub_url: &hub_url,
+        host_id: &host_id,
+        replace_identity,
+    };
+    match bootstrap::enroll_inline(&args) {
+        Ok(enrolled) => {
+            println!("{}", enrolled.to_line());
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            println!("{}", failure.to_line());
+            ExitCode::from(failure.exit_code())
+        }
+    }
+}
+
+fn enroll_command(
+    config: &Path,
+    root: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    token_stdin: bool,
+    replace_identity: bool,
+    repos: &[String],
+) -> Result<ExitCode> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if root.is_none() && unsafe { libc::geteuid() } != 0 {
+        bail!("enroll starts the service and hands the token to the service user; run it as root");
+    }
+    let token = match (&token_file, token_stdin) {
+        (Some(path), false) => read_owner_only(path)?,
+        (None, true) => {
+            use std::io::Read as _;
+            let mut text = String::new();
+            std::io::stdin()
+                .take(bootstrap::MAX_TOKEN_TEXT)
+                .read_to_string(&mut text)
+                .context("cannot read the token from standard input")?;
+            text
+        }
+        _ => bail!("give the token with --token-file <owner-only file> or --token-stdin"),
+    };
+    let fail = |failure: &Failure| {
+        println!("enrollment failed: {}", failure.code());
+        println!("{}", failure.detail());
+        if let Failure::PreflightFailed { failed, output } = failure {
+            print!("{output}");
+            println!("failed_preflights: {}", failed.join(", "));
+            println!(
+                "The host is enrolled and its service runs; enrollment does not enable dispatch. Fix the \
+                 host as the service user, then run the installed package binary with `preflight` again."
+            );
+        }
+        ExitCode::from(failure.exit_code())
+    };
+    let record = match bootstrap::load_record(config) {
+        Ok(record) => record,
+        Err(failure) => return Ok(fail(&failure)),
+    };
+    let platform = Platform::parse(&record.platform)?;
+    let staged_host = Staged::default();
+    let system = System { platform };
+    let host: &dyn Host = if root.is_some() { &staged_host } else { &system };
+    let fallback = std::env::current_exe()?;
+    let options = bootstrap::Options::builder()
+        .config(config)
+        .maybe_root(root)
+        .token(&token)
+        .replace_identity(replace_identity)
+        .repos(repos)
+        .fallback_installer(&fallback)
+        .build();
+    let result = bootstrap::bootstrap(host, &options);
+    // A spent token is no use to anyone; do not leave it lying around. After a
+    // failure that left it unspent the person needs it to try again.
+    let spent = result.as_ref().map_or_else(Failure::token_spent, |_| true);
+    if spent && let Some(path) = &token_file {
+        let _ = fs::remove_file(path);
+    }
+    match result {
+        Ok(report) => {
+            print!("{}", report.preflight_output);
+            println!(
+                "enrolled host {} (certificate serial {})",
+                report.host_id, report.serial
+            );
+            println!("service started; as-user preflight passed");
+            println!(
+                "Enrollment establishes identity and management connectivity only; hub registration and dispatch are not enabled. Inspect credentials on the hub \
+                 with `bossctl enrollment list`."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(failure) => Ok(fail(&failure)),
+    }
 }
 
 fn inline_preflight(

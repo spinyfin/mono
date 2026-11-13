@@ -13,6 +13,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 bon = { workspace = true }
 boss-http-retry = { path = "../http_retry" }
+boss-spoke-credentials = { path = "../spoke-credentials" }
 boss-spoke-preflight = { path = "../engine/spoke-preflight" }
 clap = { workspace = true, features = ["derive"] }
 flate2 = { workspace = true }
@@ -30,4 +31,9 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 url = { workspace = true }
 
 [dev-dependencies]
+boss-host-enrollment = { path = "../engine/host-enrollment" }
+rcgen = { workspace = true }
 rusqlite = { workspace = true }
+rustls = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }

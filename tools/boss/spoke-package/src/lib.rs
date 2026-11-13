@@ -8,6 +8,7 @@
 //! Installing files enrolls nothing: see [`install`] and the README.
 
 pub mod archive;
+pub mod bootstrap;
 pub mod install;
 pub mod manifest;
 pub mod service;

@@ -29,11 +29,16 @@ use boss_protocol_spoke::v1::{Certificate, EnrollRequest, RenewRequest};
 use rand::Rng;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use tokio::sync::watch;
+use tonic::transport::{Certificate as TlsCertificate, ClientTlsConfig, Endpoint};
 use tonic::{Status, async_trait};
 
 pub use error::ClientError;
 pub use files::Identity;
 use files::{PENDING_ENROLL, PENDING_RENEW, Pending};
+
+/// The files the daemon reads its client identity from.
+pub const DAEMON_KEY: &str = "key.pem";
+pub const DAEMON_CERT: &str = "cert.pem";
 
 /// Renewal is due when this much of the certificate's life is left (or more,
 /// by the jitter).
@@ -64,6 +69,22 @@ impl Exchange for Client {
     }
 }
 
+/// A client for the hub's `Enroll` endpoint, which answers before the host has a
+/// certificate: the connection is server-authenticated only, against the hub's
+/// CA (`ca_pem`). The connection is made on first use, so a hub that is down
+/// surfaces as [`ClientError::Unavailable`] from `enroll`, which can be repeated.
+///
+/// Must be called inside a Tokio runtime.
+pub fn enrollment_client(hub_url: &str, ca_pem: &[u8]) -> Result<impl Exchange + use<>, ClientError> {
+    let endpoint = Endpoint::from_shared(hub_url.to_owned())
+        .map_err(|e| ClientError::Endpoint(e.to_string()))?
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .tls_config(ClientTlsConfig::new().ca_certificate(TlsCertificate::from_pem(ca_pem)))
+        .map_err(|e| ClientError::Endpoint(e.to_string()))?;
+    Ok(Client::new(endpoint.connect_lazy()))
+}
+
 /// What provisioning handed the spoke to enroll with.
 #[derive(Debug, Clone, Copy)]
 pub struct EnrollParams<'a> {
@@ -91,6 +112,34 @@ impl SpokeCredentials {
     /// The installed identity, if the host has enrolled.
     pub fn identity(&self) -> Result<Option<Identity>, ClientError> {
         files::read_identity(&self.dir)
+    }
+
+    /// Writes the installed identity where the `boss-spoke` daemon reads it:
+    /// `key.pem`, then `cert.pem`, each with one rename.
+    ///
+    /// The certificate goes last on purpose. The service definitions start the
+    /// daemon once `cert.pem` exists, so by then the key it pairs with is
+    /// already in place. Safe to repeat. Returns the identity written, or
+    /// `None` when the host has not enrolled.
+    pub fn publish_daemon_files(&self) -> Result<Option<Identity>, ClientError> {
+        let Some(identity) = self.identity()? else {
+            return Ok(None);
+        };
+        files::write_pem(&self.dir, DAEMON_KEY, &identity.key_pem())?;
+        files::write_pem(&self.dir, DAEMON_CERT, &identity.leaf_pem())?;
+        Ok(Some(identity))
+    }
+
+    /// Whether both daemon files match the durable installed identity.
+    pub fn daemon_files_present(&self) -> bool {
+        let Ok(Some(identity)) = self.identity() else {
+            return false;
+        };
+        [(DAEMON_KEY, identity.key_pem()), (DAEMON_CERT, identity.leaf_pem())]
+            .iter()
+            .all(|(name, expected)| {
+                std::fs::read_to_string(self.dir.join(name)).is_ok_and(|actual| actual == *expected)
+            })
     }
 
     /// A counter that changes each time an identity is installed. The stream

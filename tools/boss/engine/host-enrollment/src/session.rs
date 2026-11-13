@@ -21,6 +21,11 @@ use crate::error::Denial;
 /// again, so a deadline that moves (or a clock that jumps) is noticed promptly.
 const MAX_WAIT: Duration = Duration::from_secs(1);
 
+/// How often an open stream is checked against the records even when no event
+/// arrived. Events only reach streams in this process; a revocation made by an
+/// operator command running beside the hub is seen at the next check.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Why a stream must close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseReason {
@@ -45,6 +50,8 @@ pub struct StreamGuard {
     /// has answered. It lives on the guard so dropping a `closed()` future
     /// mid-recheck does not forget it.
     needs_revalidate: bool,
+    /// When the records are next re-read regardless of events.
+    next_recheck: tokio::time::Instant,
 }
 
 /// Authorizes the certificate chain of a new stream.
@@ -66,6 +73,7 @@ pub async fn admit(
         events,
         host,
         needs_revalidate: false,
+        next_recheck: tokio::time::Instant::now() + RECHECK_INTERVAL,
     })
 }
 
@@ -93,6 +101,9 @@ impl StreamGuard {
     /// other hosts do not postpone it.
     pub async fn closed(&mut self) -> CloseReason {
         loop {
+            if tokio::time::Instant::now() >= self.next_recheck {
+                self.needs_revalidate = true;
+            }
             if self.needs_revalidate
                 && let Err(reason) = self.refresh().await
             {
@@ -133,11 +144,64 @@ impl StreamGuard {
             Ok(Ok(updated)) => {
                 self.host = updated;
                 self.needs_revalidate = false;
+                self.next_recheck = tokio::time::Instant::now() + RECHECK_INTERVAL;
                 Ok(())
             }
             Ok(Err(Denial::Revoked)) => Err(CloseReason::Revoked),
+            Ok(Err(Denial::StoreUnavailable)) | Err(_) => {
+                // Keep the last proven deadline; a store outage cannot extend it.
+                self.needs_revalidate = false;
+                self.next_recheck = tokio::time::Instant::now() + RECHECK_INTERVAL;
+                Ok(())
+            }
             Ok(Err(denial)) => Err(CloseReason::Denied(denial)),
-            Err(_) => Err(CloseReason::Denied(Denial::StoreUnavailable)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::SystemTime;
+    struct Authority {
+        events: broadcast::Sender<CredentialEvent>,
+        answer: Mutex<Result<AuthorizedHost, Denial>>,
+    }
+    impl HostAuthorizer for Authority {
+        fn authorize(&self, _: &[CertificateDer<'_>]) -> Result<AuthorizedHost, Denial> {
+            panic!("test constructs an admitted guard")
+        }
+        fn revalidate(&self, _: &AuthorizedHost) -> Result<AuthorizedHost, Denial> {
+            self.answer.lock().unwrap().clone()
+        }
+        fn subscribe(&self) -> broadcast::Receiver<CredentialEvent> {
+            self.events.subscribe()
+        }
+    }
+    #[tokio::test]
+    async fn transient_store_failure_keeps_deadline_then_authoritative_revoke_closes() {
+        let host = AuthorizedHost {
+            host_id: "edge".into(),
+            serial: "a".into(),
+            valid_until: SystemTime::now() + Duration::from_secs(60),
+        };
+        let authority = Arc::new(Authority {
+            events: broadcast::channel(4).0,
+            answer: Mutex::new(Err(Denial::StoreUnavailable)),
+        });
+        let mut guard = StreamGuard {
+            authorizer: authority.clone(),
+            events: authority.subscribe(),
+            host: host.clone(),
+            needs_revalidate: true,
+            next_recheck: tokio::time::Instant::now(),
+        };
+        guard.refresh().await.unwrap();
+        assert_eq!(guard.host, host);
+        assert!(!guard.needs_revalidate);
+        assert!(guard.next_recheck > tokio::time::Instant::now());
+        *authority.answer.lock().unwrap() = Err(Denial::Revoked);
+        assert_eq!(guard.refresh().await, Err(CloseReason::Revoked));
     }
 }

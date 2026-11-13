@@ -180,6 +180,43 @@ async fn enrolling_installs_an_identity_the_hub_accepts_with_a_key_that_stays_lo
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_daemons_identity_files_are_published_key_first_and_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let hub = Hub::new();
+    let token = hub.grant("edge-1", "job-1");
+    let dir = tempfile::tempdir().expect("dir");
+    let spoke = SpokeCredentials::open(dir.path()).expect("open");
+    assert!(spoke.publish_daemon_files().expect("nothing yet").is_none());
+    assert!(!spoke.daemon_files_present());
+
+    let identity = spoke.enroll(&*hub, &params(&token)).await.expect("enroll");
+    assert!(
+        !spoke.daemon_files_present(),
+        "enrolling alone does not start the daemon"
+    );
+
+    spoke.publish_daemon_files().expect("publish").expect("identity");
+    assert!(spoke.daemon_files_present());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("cert.pem")).expect("cert"),
+        identity.leaf_pem()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("key.pem")).expect("key"),
+        identity.key_pem()
+    );
+    for name in ["cert.pem", "key.pem"] {
+        let mode = std::fs::metadata(dir.path().join(name))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{name}");
+    }
+    spoke.publish_daemon_files().expect("publishing again changes nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_lost_reply_is_retried_with_the_same_request_even_across_a_restart() {
     let hub = Hub::new();
     let token = hub.grant("edge-1", "job-1");

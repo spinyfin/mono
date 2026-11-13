@@ -1077,6 +1077,16 @@ printf '%s\n' '{"repos":[]}'
 #[tokio::test]
 async fn daemon_reports_pending_then_missing_driver_preflights() {
     let mut hub = Fixture::new().await;
+    std::fs::create_dir_all(hub.root().join("credentials")).unwrap();
+    for dir in [hub.root(), hub.root().join("credentials")] {
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(
+        hub.root().join("credentials/preflight-repos"),
+        "/nonexistent/boss-preflight-repository",
+    )
+    .unwrap();
+    std::fs::write(hub.root().join("credentials/preflight-run-pending"), "pending").unwrap();
     let _daemon = hub.start_without_tools();
     let mut connection = hub.connection().await;
     connection.welcome(0).await;
@@ -1092,7 +1102,14 @@ async fn daemon_reports_pending_then_missing_driver_preflights() {
                         pending = true;
                     } else {
                         assert!(pending, "initial capacity must report pending readiness");
-                        for name in ["tool_claude", "claude_credentials", "tool_codex", "codex_credentials"] {
+                        for name in [
+                            "tool_claude",
+                            "claude_credentials",
+                            "tool_codex",
+                            "codex_credentials",
+                            "repo_access",
+                            "preflight_run",
+                        ] {
                             assert!(failures.iter().any(|failure| failure == name), "{failures:?}");
                         }
                         break;
