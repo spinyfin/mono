@@ -510,18 +510,29 @@ impl WorkDb {
             tx.execute(
                 "UPDATE work_runs
                  SET status = 'orphaned',
-                     error_text = COALESCE(NULLIF(TRIM(error_text), ''), ?3),
+                     result_summary = COALESCE(result_summary, ?3),
                      finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = (SELECT id FROM work_runs WHERE execution_id = ?1 ORDER BY rowid DESC LIMIT 1)",
+                 WHERE execution_id = ?1
+                   AND finished_at IS NULL",
                 params![dead_execution_id, now.as_str(), reason],
+            )?;
+            // Persist the reason on the latest run even when it was already
+            // closed; see `mark_execution_orphaned`.
+            tx.execute(
+                "UPDATE work_runs
+                 SET error_text = COALESCE(NULLIF(TRIM(error_text), ''), ?2)
+                 WHERE id = (
+                     SELECT id FROM work_runs
+                     WHERE execution_id = ?1
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 1
+                 )",
+                params![dead_execution_id, reason],
             )?;
         }
 
         tx.execute(
-            "UPDATE work_executions SET last_error = COALESCE(NULLIF(TRIM(last_error), ''),
-                (SELECT COALESCE(NULLIF(TRIM(body_markdown), ''), NULLIF(TRIM(title), ''))
-                 FROM work_attention_items WHERE execution_id = ?1 AND kind IN ('hung_worker', 'stale_worker')
-                 ORDER BY rowid DESC LIMIT 1), ?2)
+            "UPDATE work_executions SET last_error = COALESCE(NULLIF(TRIM(last_error), ''), ?2)
              WHERE id = ?1",
             params![dead_execution_id, reason],
         )?;
@@ -2095,8 +2106,21 @@ impl WorkDb {
                  error_text = COALESCE(?2, error_text),
                  result_summary = COALESCE(?2, result_summary),
                  finished_at = COALESCE(finished_at, ?3)
-             WHERE id = (SELECT id FROM work_runs WHERE execution_id = ?1 ORDER BY rowid DESC LIMIT 1)",
+             WHERE execution_id = ?1
+               AND finished_at IS NULL",
             params![execution_id, normalized_error, now],
+        )?;
+        // Keep the diagnostic on the latest run even when it was already closed.
+        tx.execute(
+            "UPDATE work_runs
+             SET error_text = COALESCE(NULLIF(TRIM(error_text), ''), ?2)
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            params![execution_id, normalized_error],
         )?;
         tx.execute(
             "UPDATE work_executions

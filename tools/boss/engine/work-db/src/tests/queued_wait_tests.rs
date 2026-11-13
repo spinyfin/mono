@@ -1480,49 +1480,61 @@ fn transient_resume_stamps_failure_backoff_with_orphaned_run_error() {
 }
 
 #[test]
-fn hung_attention_fills_in_when_the_orphaned_run_has_no_error_text() {
+fn resume_closes_every_unfinished_run_and_keeps_the_reason_on_the_latest() {
     let db = db();
     let product = create_test_product(&db);
     let pid = product.id.as_str();
-    let (chore, execution) = ready_chore(&db, pid, "hung source");
-    let (_running, run) = db
-        .start_execution_run(&execution.id, "worker", "repo", "lease", "ws", "/tmp/hung-backoff")
+    let (chore, execution) = ready_chore(&db, pid, "older open run");
+    let (_running, older) = db
+        .start_execution_run(&execution.id, "worker", "repo", "lease", "ws", "/tmp/older-run")
+        .unwrap();
+    let newer_id = "newer_run".to_owned();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE run_copy AS SELECT * FROM work_runs WHERE id = '{}';
+             UPDATE run_copy SET id = '{newer_id}', tmux_spawn_token = NULL, persona = NULL, persona_lease_active = 0;
+             INSERT INTO work_runs SELECT * FROM run_copy;
+             DROP TABLE run_copy;",
+            older.id
+        ))
+        .unwrap();
+    }
+    db.connect()
+        .unwrap()
+        .execute("UPDATE work_runs SET created_at = '1000' WHERE id = ?1", [&older.id])
         .unwrap();
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_runs
-             SET error_text = NULL, result_summary = NULL, finished_at = '1000', status = 'completed'
-             WHERE id = ?1",
-            [&run.id],
-        )
-        .unwrap();
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE work_executions SET status = 'orphaned', finished_at = '1000', last_error = NULL WHERE id = ?1",
-            [&execution.id],
-        )
-        .unwrap();
-    let attention_body = "Driver has made no observable progress while awaiting model output";
-    db.connect()
-        .unwrap()
-        .execute(
-            "INSERT INTO work_attention_items (id, execution_id, kind, status, title, body_markdown, created_at)
-             VALUES ('attn_hung', ?1, 'hung_worker', 'resolved', 'Hung worker', ?2, '1000')",
-            params![execution.id, attention_body],
+            "UPDATE work_runs SET created_at = '2000', finished_at = '2001', status = 'completed',
+                 error_text = NULL WHERE id = ?1",
+            [&newer_id],
         )
         .unwrap();
     let future = boss_engine_utils::epoch_time::now_epoch_secs() + 3600;
     db.request_resume_execution(&execution.id, 1, future, "resume after hung worker")
         .unwrap()
-        .expect("orphaned predecessor still resumes");
+        .expect("resumes");
+    let conn = db.connect().unwrap();
+    let older_row: (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, finished_at FROM work_runs WHERE id = ?1",
+            [&older.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(older_row.0, "orphaned");
+    assert!(older_row.1.is_some(), "older unfinished run is closed");
+    let newer_error: Option<String> = conn
+        .query_row("SELECT error_text FROM work_runs WHERE id = ?1", [&newer_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(newer_error.as_deref(), Some("resume after hung worker"));
+    drop(conn);
     let wait = wait_of(&db, pid, &chore.id);
-    assert_eq!(
-        wait.dispatch_wait_label.as_deref(),
-        Some("Retrying after error (attempt 2)")
-    );
-    assert_failure_details(&wait, attention_body);
+    assert_failure_details(&wait, "resume after hung worker");
 }
 
 #[test]

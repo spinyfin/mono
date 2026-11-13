@@ -316,31 +316,6 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
             1,
         ),
         (
-            "failure attention fallback",
-            Box::new({
-                let first = first.clone();
-                move |b| {
-                    b.sql(
-                        "UPDATE work_runs SET error_text = NULL WHERE execution_id = ?1",
-                        &[&first],
-                    );
-                    b.sql("INSERT INTO work_attention_items(id, execution_id, kind, status, title, body_markdown, created_at)
-                           VALUES ('cache_failure', ?1, 'hung_worker', 'open', 'Hung worker', 'driver stopped producing output', '1235')", &[&first]);
-                }
-            }),
-            1,
-        ),
-        (
-            "failure attention update",
-            Box::new({
-                let first = first.clone();
-                move |b| {
-                    b.sql("UPDATE work_attention_items SET body_markdown = 'driver stalled awaiting output' WHERE execution_id = ?1", &[&first])
-                }
-            }),
-            1,
-        ),
-        (
             "failure start event",
             Box::new({
                 let target = target.clone();
@@ -487,11 +462,7 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
         let (misses, queries) = board.assert_equivalent();
         if matches!(
             label,
-            "retry backoff"
-                | "failure run error stamp"
-                | "failure attention fallback"
-                | "failure attention update"
-                | "failure start event"
+            "retry backoff" | "failure run error stamp" | "failure start event"
         ) {
             assert_eq!(misses, 1, "{label}: failure details are recomputed on every read");
             assert!(
