@@ -611,7 +611,7 @@ impl WorkDb {
         // nothing else would delete them.
         tx.execute(
             "DELETE FROM spoke_ingress
-              WHERE host_id = ?1 AND journal_id = ?2 AND sequence <= ?3 AND LENGTH(frame) = 0",
+              WHERE host_id = ?1 AND journal_id = ?2 AND sequence = ?3 AND LENGTH(frame) = 0",
             params![host_id, journal_id, sequence as i64],
         )?;
         tx.commit()?;

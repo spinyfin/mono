@@ -55,7 +55,7 @@ pub mod reduce;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -319,10 +319,6 @@ struct Inner {
     reported: Mutex<HashMap<String, u64>>,
     #[builder(skip)]
     delivering: AtomicBool,
-    /// Remaining injected `advance_spoke_projection` failures. Tests use this
-    /// to prove a transient cursor-commit error does not re-run observations.
-    #[builder(skip)]
-    fail_advances: AtomicU32,
 }
 
 /// Applies each host's stored observations, in order, and delivers the effects
@@ -430,13 +426,6 @@ impl Projector {
             Err(reason) => tracing::warn!(%reason, "cannot list spoke hosts awaiting projection"),
         }
         self.inner.deliver_pending().await;
-    }
-
-    /// Fail the next `n` cursor advances with a retryable busy error. Tests
-    /// use this to prove observations are not re-applied when only the commit
-    /// fails.
-    pub fn fail_next_advances(&self, n: u32) {
-        self.inner.fail_advances.store(n, Ordering::SeqCst);
     }
 }
 
@@ -625,15 +614,6 @@ impl Inner {
     ) -> Result<(), Interrupted> {
         let mut hold = RetryHold::new();
         loop {
-            if self
-                .fail_advances
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                self.hold_retry(host, sequence, "database is locked (SQLITE_BUSY)", &mut hold)
-                    .await;
-                continue;
-            }
             let (host_id, journal_id, owed) = (host.to_owned(), journal.to_owned(), owed.clone());
             match self
                 .blocking(move |db| {

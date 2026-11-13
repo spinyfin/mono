@@ -1422,6 +1422,57 @@ async fn a_reporting_member_is_finalized_when_the_hub_restarts_before_its_decisi
 }
 
 #[tokio::test]
+async fn a_refused_settlement_does_not_finalize_an_accepted_member_but_an_accepted_one_does() {
+    use boss_engine_runtime::hub::projection::{DecisionSettled, Settlement};
+    let (mut fx, batch) = review_member_on_a_spoke();
+    fx.receive_proposal(
+        "report-1",
+        ProposalKind::ReviewReport,
+        v1::ProposalKind::ReviewReport,
+        review_report_payload(&batch, "head-sha"),
+    );
+    fx.wire.unreachable.store(true, Ordering::SeqCst);
+    fx.projector().drain().await;
+    assert!(!is_terminal(&fx));
+    let effect_key = fx
+        .state
+        .work_db
+        .pending_spoke_effects(10)
+        .unwrap()
+        .into_iter()
+        .find(|effect| effect.kind == "proposal_decision")
+        .expect("the accepted proposal owes a decision")
+        .key;
+
+    // A fresh applier holds no submission, as after a restart or when another
+    // generation's refusal settles under a colliding key.
+    let applier = crate::app::spoke_projection::applier(&fx.state);
+    let settle = |code: v1::ResultCode| {
+        let (applier, effect_key, execution_id) = (applier.clone(), effect_key.clone(), fx.execution_id.clone());
+        async move {
+            applier
+                .decision_settled(&DecisionSettled {
+                    effect_key: &effect_key,
+                    execution_id: &execution_id,
+                    proposal_id: "report-1",
+                    settlement: Settlement::Delivered,
+                    code: code as i32,
+                })
+                .await;
+        }
+    };
+    settle(v1::ResultCode::Rejected).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !is_terminal(&fx),
+        "a refused settlement must not finish an accepted proposal"
+    );
+
+    settle(v1::ResultCode::Ok).await;
+    eventually("the accepted settlement to finalize the member", || is_terminal(&fx)).await;
+}
+
+#[tokio::test]
 async fn an_answer_reply_refreshes_the_thread_like_the_local_handler() {
     let mut fx = delivered_with_a_resolvable_pr();
     let comment = answer_agent_comment(&fx);
