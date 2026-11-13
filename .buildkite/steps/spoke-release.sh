@@ -90,22 +90,69 @@ phase_build() {
     --key "${work}/release.key" \
     --out "${out}/boss-spoke-package-${platform}.sig"
 
+  local digest catalog
+  digest="$(shasum -a 256 "${out}/boss-spoke-${platform}.manifest.json" | awk '{print $1}')"
+  catalog="${out}/spoke-packages.${platform}.json"
+  python3 - "${catalog}" "${version}" "${platform}" "${tag}" "${digest}" <<'PY'
+import json, sys
+path, version, platform, tag, digest = sys.argv[1:]
+json.dump(
+    {
+        "release_id": version,
+        "packages": {
+            platform: {
+                "manifest_url": f"https://github.com/spinyfin/mono/releases/download/{tag}/boss-spoke-{platform}.manifest.json",
+                "manifest_sha256": digest,
+            }
+        },
+    },
+    open(path, "w"),
+    indent=2,
+)
+print("", file=open(path, "a"))
+PY
+
   bin/release upload --config "${CONFIG}" --tag "${tag}" \
     --asset "boss-spoke-${platform}.tar.gz=${out}/boss-spoke-${platform}.tar.gz" \
     --asset "boss-spoke-${platform}.manifest.json=${out}/boss-spoke-${platform}.manifest.json" \
     --asset "boss-spoke-${platform}.manifest.json.sig=${out}/boss-spoke-${platform}.manifest.json.sig" \
     --asset "boss-spoke-package-${platform}=${installer}" \
-    --asset "boss-spoke-package-${platform}.sig=${out}/boss-spoke-package-${platform}.sig"
+    --asset "boss-spoke-package-${platform}.sig=${out}/boss-spoke-package-${platform}.sig" \
+    --asset "spoke-packages.${platform}.json=${catalog}"
 
   rm -rf -- "${work}"
   trap - EXIT
 }
 
 phase_publish() {
-  local tag
+  local tag version work
   release_tag || return
   tag="${RELEASE_TAG}"
+  version="${tag#"${TAG_PREFIX}"}"
+  work="$(mktemp -d)"
+  trap "rm -rf -- $(printf '%q' "${work}")" EXIT
+  # Merge per-platform fragments into the catalog the hub fetches for this
+  # Boss version. Missing fragments leave that platform unpublished.
+  if command -v gh >/dev/null && gh release download "${tag}" --pattern 'spoke-packages.*.json' --dir "${work}" 2>/dev/null; then
+    python3 - "${work}" "${version}" <<'PY'
+import json, pathlib, sys
+work, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+packages = {}
+for path in sorted(work.glob("spoke-packages.*.json")):
+    data = json.loads(path.read_text())
+    if data.get("release_id") == version:
+        packages.update(data.get("packages") or {})
+catalog = work / "spoke-packages.json"
+catalog.write_text(json.dumps({"release_id": version, "packages": packages}, indent=2) + "\n")
+PY
+    if [[ -f "${work}/spoke-packages.json" ]]; then
+      bin/release upload --config "${CONFIG}" --tag "${tag}" \
+        --asset "spoke-packages.json=${work}/spoke-packages.json"
+    fi
+  fi
   bin/release publish --config "${CONFIG}" --tag "${tag}"
+  rm -rf -- "${work}"
+  trap - EXIT
 }
 
 case "${1:-}" in

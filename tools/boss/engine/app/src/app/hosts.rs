@@ -9,10 +9,11 @@
 use super::*;
 use boss_engine_runtime::host_registry::{Host, HostCapability};
 use boss_protocol::{HostCapabilitySnapshot, HostSnapshot};
+use boss_work_db::HostUpgradeView;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn to_host_snapshot(host: Host, caps: Vec<HostCapability>) -> HostSnapshot {
+fn to_host_snapshot(host: Host, caps: Vec<HostCapability>, upgrade: Option<HostUpgradeView>) -> HostSnapshot {
     HostSnapshot {
         id: host.id,
         ssh_target: host.ssh_target,
@@ -29,6 +30,12 @@ fn to_host_snapshot(host: Host, caps: Vec<HostCapability>) -> HostSnapshot {
                 source: c.source,
             })
             .collect(),
+        running_release: upgrade.as_ref().and_then(|view| view.running_release.clone()),
+        desired_release: upgrade.as_ref().and_then(|view| view.desired_release.clone()),
+        upgrade_state: upgrade.as_ref().map(|view| view.state.as_str().to_owned()),
+        last_upgrade_at: upgrade.as_ref().and_then(|view| view.last_upgrade_at.clone()),
+        last_upgrade_result: upgrade.as_ref().and_then(|view| view.last_upgrade_result.clone()),
+        last_upgrade_error: upgrade.as_ref().and_then(|view| view.last_upgrade_error.clone()),
     }
 }
 
@@ -37,7 +44,8 @@ fn fetch_snapshot(work_db: &boss_work_db::WorkDb, id: &str) -> anyhow::Result<Ho
         .get_host(id)?
         .ok_or_else(|| anyhow::anyhow!("host '{}' not found", id))?;
     let caps = work_db.list_host_capabilities(id)?;
-    Ok(to_host_snapshot(host, caps))
+    let upgrade = work_db.host_upgrade_view(id)?;
+    Ok(to_host_snapshot(host, caps, upgrade))
 }
 
 fn send_error_msg(sink: &super::SessionSink, request_id: &str, msg: impl Into<String>) {
@@ -62,7 +70,8 @@ pub(super) async fn handle_list_hosts(ctx: Dispatch, req: FrontendRequest) {
             .into_iter()
             .map(|h| {
                 let caps = work_db.list_host_capabilities(&h.id)?;
-                Ok(to_host_snapshot(h, caps))
+                let upgrade = work_db.host_upgrade_view(&h.id)?;
+                Ok(to_host_snapshot(h, caps, upgrade))
             })
             .collect()
     })();

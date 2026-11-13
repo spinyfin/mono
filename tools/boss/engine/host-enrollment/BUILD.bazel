@@ -21,6 +21,7 @@ rust_library(
         "//tools/boss/engine/spoke-adapter:__pkg__",
         "//tools/boss/engine/spoke-hub:__pkg__",
         "//tools/boss/engine/spoke-stream:__pkg__",
+        "//tools/boss/engine/spoke-upgrade:__pkg__",
         "//tools/boss/spoke-credentials:__pkg__",
     ],
     deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),

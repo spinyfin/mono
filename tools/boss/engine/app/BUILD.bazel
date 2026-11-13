@@ -13,6 +13,7 @@ filegroup(
 
 APP_DEPS = [
     "//tools/boss/engine/spoke-adapter",
+    "//tools/boss/engine/spoke-upgrade",
     "//tools/boss/command-runner",
     "//tools/boss/engine/execution-runner",
     "//tools/boss/engine/execution-contracts",
@@ -86,6 +87,8 @@ rust_test(
     aliases = TEST_ALIASES | {
         "//tools/boss/engine/spoke-adapter": "boss_spoke_adapter_production",
         "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support": "boss_spoke_adapter",
+        "//tools/boss/engine/spoke-upgrade": "boss_spoke_upgrade_production",
+        "//tools/boss/engine/spoke-upgrade:spoke_upgrade_test_support": "boss_spoke_upgrade",
         "//tools/boss/engine/core:runtime": "boss_engine_runtime_production",
         "//tools/boss/engine/core:runtime_test_support": "boss_engine_runtime",
     },
@@ -114,6 +117,7 @@ rust_test(
         "//tools/boss/engine/core:runtime_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support",
+        "//tools/boss/engine/spoke-upgrade:spoke_upgrade_test_support",
         "//tools/boss/engine/task-scope",
         "//tools/boss/protocol-spoke",
         "//tools/boss/worker-processes",

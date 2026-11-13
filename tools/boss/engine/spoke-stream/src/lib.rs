@@ -173,6 +173,24 @@ impl StreamManager {
         Some(connection.session.selection.has(feature))
     }
 
+    /// Host ids with an active connection, sorted. Used by sequential upgrade
+    /// so an offline host is offered when it next appears here.
+    pub async fn connected_hosts(&self) -> Vec<String> {
+        let hosts = self.0.hosts.lock().await;
+        let mut ids = Vec::new();
+        for (id, host) in hosts.iter() {
+            let guard = host.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|connection| connection.active.load(Ordering::Acquire))
+            {
+                ids.push(id.clone());
+            }
+        }
+        ids.sort();
+        ids
+    }
+
     pub(crate) fn publish_capture(&self, host_id: &str, record: &boss_protocol_spoke::v1::Record) {
         use boss_protocol_spoke::v1::record::Body;
         let (Some(Body::Capture(capture)), Some(run)) = (&record.body, &record.run) else {

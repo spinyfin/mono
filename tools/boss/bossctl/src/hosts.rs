@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use boss_engine::host_provisioning::{RemoteProvisionOutcome, provision_remote_host};
 use boss_engine::host_registry::{Host, HostCapability};
 use boss_engine::remote_wrapper::expected_version;
-use boss_engine::work::WorkDb;
+use boss_engine::work::{HostUpgradeView, WorkDb};
 use clap::Subcommand;
 
 use crate::open_state_db;
@@ -144,14 +144,14 @@ pub(crate) async fn hosts_add(
     let host = db.get_host(&host.id)?.context("host disappeared after registration")?;
     let caps = db.list_host_capabilities(&host.id)?;
     if json {
-        let mut obj = host_to_json(&host, &caps);
+        let mut obj = host_to_json(&host, &caps, db.host_upgrade_view(&host.id).ok().flatten().as_ref());
         if let Some(outcome) = push_outcome.as_ref() {
             obj["wrapper_push"] = serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null);
         }
         println!("{}", obj);
     } else {
         println!("registered host {}", host.id);
-        print_host_detail(&host, &caps);
+        print_host_detail(&host, &caps, db.host_upgrade_view(&host.id).ok().flatten().as_ref());
         if let Some(outcome) = push_outcome.as_ref() {
             match outcome {
                 EagerPushOutcome::Ok { version, capabilities } => {
@@ -276,7 +276,7 @@ pub(crate) async fn hosts_probe(json: bool, state_root: Option<PathBuf>, id: Str
     let db = open_state_db(state_root)?;
     let (outcome, host, caps) = probe_host_with(&db, &id, &SshHostProvisioner).await?;
     if json {
-        let mut obj = host_to_json(&host, &caps);
+        let mut obj = host_to_json(&host, &caps, db.host_upgrade_view(&host.id).ok().flatten().as_ref());
         obj["wrapper_push"] = serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null);
         println!("{obj}");
     } else {
@@ -287,7 +287,7 @@ pub(crate) async fn hosts_probe(json: bool, state_root: Option<PathBuf>, id: Str
                 println!("probe failed ({kind}) — host disabled. detail: {detail}")
             }
         }
-        print_host_detail(&host, &caps);
+        print_host_detail(&host, &caps, db.host_upgrade_view(&host.id).ok().flatten().as_ref());
     }
     Ok(())
 }
@@ -303,7 +303,8 @@ pub(crate) fn hosts_list(json: bool, state_root: Option<PathBuf>, only_enabled: 
             .iter()
             .map(|h| {
                 let caps = db.list_host_capabilities(&h.id).unwrap_or_default();
-                host_to_json(h, &caps)
+                let upgrade = db.host_upgrade_view(&h.id).ok().flatten();
+                host_to_json(h, &caps, upgrade.as_ref())
             })
             .collect();
         println!("{}", serde_json::json!({ "hosts": arr }));
@@ -312,7 +313,8 @@ pub(crate) fn hosts_list(json: bool, state_root: Option<PathBuf>, only_enabled: 
     } else {
         for host in &hosts {
             let caps = db.list_host_capabilities(&host.id).unwrap_or_default();
-            print_host_short(host, &caps);
+            let upgrade = db.host_upgrade_view(&host.id).ok().flatten();
+            print_host_short(host, &caps, upgrade.as_ref());
         }
     }
     Ok(())
@@ -330,10 +332,11 @@ pub(crate) fn hosts_show(json: bool, state_root: Option<PathBuf>, id: String) ->
         }
         Some(host) => {
             let caps = db.list_host_capabilities(&host.id)?;
+            let upgrade = db.host_upgrade_view(&host.id).ok().flatten();
             if json {
-                println!("{}", host_to_json(&host, &caps));
+                println!("{}", host_to_json(&host, &caps, upgrade.as_ref()));
             } else {
-                print_host_detail(&host, &caps);
+                print_host_detail(&host, &caps, upgrade.as_ref());
             }
         }
     }
@@ -348,10 +351,13 @@ pub(crate) fn hosts_tag_add(json: bool, state_root: Option<PathBuf>, id: String,
     let host = db.get_host(&id)?.context("host disappeared after tag add")?;
     let caps = db.list_host_capabilities(&id)?;
     if json {
-        println!("{}", host_to_json(&host, &caps));
+        println!(
+            "{}",
+            host_to_json(&host, &caps, db.host_upgrade_view(&id).ok().flatten().as_ref())
+        );
     } else {
         println!("added {} tag(s) to host {id}", tags.len());
-        print_host_detail(&host, &caps);
+        print_host_detail(&host, &caps, db.host_upgrade_view(&id).ok().flatten().as_ref());
     }
     Ok(())
 }
@@ -364,10 +370,13 @@ pub(crate) fn hosts_tag_remove(json: bool, state_root: Option<PathBuf>, id: Stri
     let host = db.get_host(&id)?.context("host disappeared after tag remove")?;
     let caps = db.list_host_capabilities(&id)?;
     if json {
-        println!("{}", host_to_json(&host, &caps));
+        println!(
+            "{}",
+            host_to_json(&host, &caps, db.host_upgrade_view(&id).ok().flatten().as_ref())
+        );
     } else {
         println!("removed {} tag(s) from host {id}", tags.len());
-        print_host_detail(&host, &caps);
+        print_host_detail(&host, &caps, db.host_upgrade_view(&id).ok().flatten().as_ref());
     }
     Ok(())
 }
@@ -378,7 +387,10 @@ pub(crate) fn hosts_set_enabled(json: bool, state_root: Option<PathBuf>, id: Str
     let host = db.get_host(&id)?.context("host disappeared after enable/disable")?;
     let caps = db.list_host_capabilities(&host.id)?;
     if json {
-        println!("{}", host_to_json(&host, &caps));
+        println!(
+            "{}",
+            host_to_json(&host, &caps, db.host_upgrade_view(&host.id).ok().flatten().as_ref())
+        );
     } else {
         let verb = if enabled { "enabled" } else { "disabled" };
         println!("{verb} host {id}");
@@ -397,8 +409,8 @@ pub(crate) fn hosts_remove(json: bool, state_root: Option<PathBuf>, id: String) 
     Ok(())
 }
 
-fn host_to_json(host: &Host, caps: &[HostCapability]) -> serde_json::Value {
-    serde_json::json!({
+fn host_to_json(host: &Host, caps: &[HostCapability], upgrade: Option<&HostUpgradeView>) -> serde_json::Value {
+    let mut value = serde_json::json!({
         "id": host.id,
         "ssh_target": host.ssh_target,
         "pool_size": host.pool_size,
@@ -411,38 +423,53 @@ fn host_to_json(host: &Host, caps: &[HostCapability]) -> serde_json::Value {
             "capability": c.capability,
             "source": c.source,
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(view) = upgrade {
+        value["running_release"] = serde_json::json!(view.running_release);
+        value["desired_release"] = serde_json::json!(view.desired_release);
+        value["upgrade_state"] = serde_json::json!(view.state.as_str());
+        value["last_upgrade_at"] = serde_json::json!(view.last_upgrade_at);
+        value["last_upgrade_result"] = serde_json::json!(view.last_upgrade_result);
+        value["last_upgrade_error"] = serde_json::json!(view.last_upgrade_error);
+    }
+    value
 }
 
-fn print_host_short(host: &Host, caps: &[HostCapability]) {
-    println!("{}", format_host_short(host, caps));
+fn print_host_short(host: &Host, caps: &[HostCapability], upgrade: Option<&HostUpgradeView>) {
+    println!("{}", format_host_short(host, caps, upgrade));
 }
 
 /// Render the single-line `hosts list` summary for a host. Pure so it can
 /// be unit-tested without capturing stdout; `print_host_short` is the
 /// stdout-writing wrapper.
-fn format_host_short(host: &Host, caps: &[HostCapability]) -> String {
+fn format_host_short(host: &Host, caps: &[HostCapability], upgrade: Option<&HostUpgradeView>) -> String {
     let enabled = if host.enabled { "enabled" } else { "disabled" };
     let target = host.ssh_target.as_deref().unwrap_or("(local)");
-    format!(
+    let mut line = format!(
         "{}  {}  pool={}  caps={}  target={}",
         host.id,
         enabled,
         host.pool_size,
         caps.len(),
         target,
-    )
+    );
+    if let Some(view) = upgrade {
+        let running = view.running_release.as_deref().unwrap_or("-");
+        let desired = view.desired_release.as_deref().unwrap_or("-");
+        line.push_str(&format!("  release={running}/{desired} {}", view.state.as_str()));
+    }
+    line
 }
 
-fn print_host_detail(host: &Host, caps: &[HostCapability]) {
-    print!("{}", format_host_detail(host, caps));
+fn print_host_detail(host: &Host, caps: &[HostCapability], upgrade: Option<&HostUpgradeView>) {
+    print!("{}", format_host_detail(host, caps, upgrade));
 }
 
 /// Render the multi-line `hosts show` detail block for a host. Pure so it
 /// can be unit-tested without capturing stdout; `print_host_detail` is the
 /// stdout-writing wrapper. The returned string ends with a trailing
 /// newline so it renders identically to the original per-line prints.
-fn format_host_detail(host: &Host, caps: &[HostCapability]) -> String {
+fn format_host_detail(host: &Host, caps: &[HostCapability], upgrade: Option<&HostUpgradeView>) -> String {
     use std::fmt::Write as _;
 
     let enabled = if host.enabled { "enabled" } else { "disabled" };
@@ -462,6 +489,22 @@ fn format_host_detail(host: &Host, caps: &[HostCapability]) -> String {
     }
     if host.consecutive_failures > 0 {
         let _ = writeln!(out, "  consecutive_failures: {}", host.consecutive_failures);
+    }
+    if let Some(view) = upgrade {
+        let running = view.running_release.as_deref().unwrap_or("-");
+        let desired = view.desired_release.as_deref().unwrap_or("-");
+        let _ = writeln!(out, "  running:     {running}");
+        let _ = writeln!(out, "  desired:     {desired}");
+        let _ = writeln!(out, "  upgrade:     {}", view.state.as_str());
+        if let Some(at) = &view.last_upgrade_at {
+            let _ = writeln!(out, "  last_upgrade_at: {at}");
+        }
+        if let Some(result) = &view.last_upgrade_result {
+            let _ = writeln!(out, "  last_upgrade: {}", result);
+        }
+        if let Some(error) = &view.last_upgrade_error {
+            let _ = writeln!(out, "  last_upgrade_error: {error}");
+        }
     }
     if caps.is_empty() {
         let _ = writeln!(out, "  capabilities: (none)");
@@ -550,7 +593,7 @@ mod tests {
         h.consecutive_failures = 2;
         let caps = [cap("h1", "gpu", "user"), cap("h1", "linux", "probe")];
 
-        let v = host_to_json(&h, &caps);
+        let v = host_to_json(&h, &caps, None);
 
         assert_eq!(
             v,
@@ -579,7 +622,7 @@ mod tests {
         h.last_error_text = None;
         h.enabled = false;
 
-        let v = host_to_json(&h, &[]);
+        let v = host_to_json(&h, &[], None);
 
         assert_eq!(v["ssh_target"], serde_json::Value::Null);
         assert_eq!(v["last_seen_at"], serde_json::Value::Null);
@@ -589,7 +632,7 @@ mod tests {
 
     #[test]
     fn json_empty_capabilities_is_empty_array() {
-        let v = host_to_json(&host(), &[]);
+        let v = host_to_json(&host(), &[], None);
         assert_eq!(v["capabilities"], json!([]));
     }
 
@@ -601,7 +644,7 @@ mod tests {
             cap("h1", "linux", "probe"),
         ];
 
-        let v = host_to_json(&host(), &caps);
+        let v = host_to_json(&host(), &caps, None);
 
         let arr = v["capabilities"].as_array().expect("capabilities is an array");
         assert_eq!(arr.len(), 3);
@@ -614,7 +657,7 @@ mod tests {
 
     #[test]
     fn json_consecutive_failures_zero_is_emitted() {
-        let v = host_to_json(&host(), &[]);
+        let v = host_to_json(&host(), &[], None);
         assert_eq!(v["consecutive_failures"], json!(0));
     }
 
@@ -623,7 +666,7 @@ mod tests {
     #[test]
     fn short_line_enabled_with_target() {
         let caps = [cap("h1", "gpu", "user")];
-        let line = format_host_short(&host(), &caps);
+        let line = format_host_short(&host(), &caps, None);
         assert_eq!(line, "h1  enabled  pool=4  caps=1  target=user@example.com");
     }
 
@@ -631,7 +674,7 @@ mod tests {
     fn short_line_disabled_label() {
         let mut h = host();
         h.enabled = false;
-        let line = format_host_short(&h, &[]);
+        let line = format_host_short(&h, &[], None);
         assert!(line.contains("  disabled  "), "line was: {line}");
         assert!(line.contains("caps=0"), "line was: {line}");
     }
@@ -640,7 +683,7 @@ mod tests {
     fn short_line_none_target_renders_local() {
         let mut h = host();
         h.ssh_target = None;
-        let line = format_host_short(&h, &[]);
+        let line = format_host_short(&h, &[], None);
         assert!(line.ends_with("target=(local)"), "line was: {line}");
     }
 
@@ -652,7 +695,7 @@ mod tests {
         h.last_seen_at = Some("seen-ts".to_owned());
         let caps = [cap("h1", "gpu", "user"), cap("h1", "linux", "probe")];
 
-        let out = format_host_detail(&h, &caps);
+        let out = format_host_detail(&h, &caps, None);
 
         assert_eq!(
             out,
@@ -672,7 +715,7 @@ mod tests {
     fn detail_disabled_label() {
         let mut h = host();
         h.enabled = false;
-        let out = format_host_detail(&h, &[]);
+        let out = format_host_detail(&h, &[], None);
         assert!(out.contains("  status:      disabled\n"), "out was:\n{out}");
     }
 
@@ -680,14 +723,14 @@ mod tests {
     fn detail_none_target_omits_ssh_target_line() {
         let mut h = host();
         h.ssh_target = None;
-        let out = format_host_detail(&h, &[]);
+        let out = format_host_detail(&h, &[], None);
         assert!(!out.contains("ssh_target:"), "out was:\n{out}");
     }
 
     #[test]
     fn detail_omits_last_seen_and_last_error_when_none() {
         let h = host(); // last_seen_at / last_error_text default to None
-        let out = format_host_detail(&h, &[]);
+        let out = format_host_detail(&h, &[], None);
         assert!(!out.contains("last_seen:"), "out was:\n{out}");
         assert!(!out.contains("last_error:"), "out was:\n{out}");
     }
@@ -696,7 +739,7 @@ mod tests {
     fn detail_includes_last_error_when_present() {
         let mut h = host();
         h.last_error_text = Some("connection refused".to_owned());
-        let out = format_host_detail(&h, &[]);
+        let out = format_host_detail(&h, &[], None);
         assert!(out.contains("  last_error:  connection refused\n"), "out was:\n{out}");
     }
 
@@ -705,18 +748,18 @@ mod tests {
         let mut h = host();
         h.consecutive_failures = 0;
         assert!(
-            !format_host_detail(&h, &[]).contains("consecutive_failures"),
+            !format_host_detail(&h, &[], None).contains("consecutive_failures"),
             "zero failures must not be shown"
         );
 
         h.consecutive_failures = 3;
-        let out = format_host_detail(&h, &[]);
+        let out = format_host_detail(&h, &[], None);
         assert!(out.contains("  consecutive_failures: 3\n"), "out was:\n{out}");
     }
 
     #[test]
     fn detail_empty_capabilities_renders_none_marker() {
-        let out = format_host_detail(&host(), &[]);
+        let out = format_host_detail(&host(), &[], None);
         assert!(out.contains("  capabilities: (none)\n"), "out was:\n{out}");
         assert!(!out.contains("  capabilities:\n"), "out was:\n{out}");
     }
@@ -724,10 +767,35 @@ mod tests {
     #[test]
     fn detail_lists_each_capability_with_source() {
         let caps = [cap("h1", "gpu", "user"), cap("h1", "linux", "probe")];
-        let out = format_host_detail(&host(), &caps);
+        let out = format_host_detail(&host(), &caps, None);
         assert!(out.contains("  capabilities:\n"), "out was:\n{out}");
         assert!(out.contains("    gpu [user]\n"), "out was:\n{out}");
         assert!(out.contains("    linux [probe]\n"), "out was:\n{out}");
         assert!(!out.contains("(none)"), "out was:\n{out}");
+    }
+
+    #[test]
+    fn short_and_detail_show_behind_and_failed_upgrade_state() {
+        let view = HostUpgradeView {
+            running_release: Some("1.0.1".into()),
+            desired_release: Some("1.0.9".into()),
+            state: boss_engine::work::HostUpgradeState::Behind,
+            last_upgrade_at: None,
+            last_upgrade_result: None,
+            last_upgrade_error: None,
+        };
+        let line = format_host_short(&host(), &[], Some(&view));
+        assert!(line.contains("release=1.0.1/1.0.9 behind"), "line was: {line}");
+        let failed = HostUpgradeView {
+            state: boss_engine::work::HostUpgradeState::Failed,
+            last_upgrade_at: Some("9".into()),
+            last_upgrade_result: Some("manifest_sig".into()),
+            last_upgrade_error: Some("bad signature".into()),
+            ..view
+        };
+        let out = format_host_detail(&host(), &[], Some(&failed));
+        assert!(out.contains("  upgrade:     failed\n"), "out was:\n{out}");
+        assert!(out.contains("  last_upgrade: manifest_sig\n"), "out was:\n{out}");
+        assert!(out.contains("  last_upgrade_error: bad signature\n"), "out was:\n{out}");
     }
 }

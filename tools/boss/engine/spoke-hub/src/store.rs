@@ -156,6 +156,10 @@ impl SpokeObservationSink for WorkDbSink {
             )),
             _ => None,
         };
+        let inventory = match &record.body {
+            Some(record::Body::Capacity(capacity)) => capacity.inventory.clone(),
+            _ => None,
+        };
         // Snapshots are live display data: receipt them so the spoke can
         // advance, but do not keep the bytes against the host's quota.
         let retain = !matches!(record.body, Some(record::Body::Capture(_)));
@@ -185,6 +189,11 @@ impl SpokeObservationSink for WorkDbSink {
                         .build(),
                 )
                 .map_err(store_error)?;
+            if let Some(inventory) = inventory
+                && let Err(error) = db.record_host_inventory(host_id.as_str(), &inventory)
+            {
+                tracing::warn!(host_id = %host_id, error = %error, "spoke inventory persist failed");
+            }
             Ok(Cursor { journal_id, through })
         })
         .await?;

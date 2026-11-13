@@ -970,6 +970,8 @@ mod spoke_hub;
 mod spoke_ingress;
 mod spoke_probe;
 mod spoke_projection;
+mod spoke_upgrade;
+pub use spoke_upgrade::{HostUpgradeState, HostUpgradeStatus, HostUpgradeView, SpokeUpgradeRollout};
 mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;
