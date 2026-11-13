@@ -1,6 +1,6 @@
 //! One crate-private INSERT for production `tasks` rows.
 //!
-//! Callers still own validation, identity allocation, transactions, and
+//! Callers own validation, identity allocation, transactions, and
 //! domain-specific values. This module owns the column list and the defaults
 //! applied when a creator leaves a field unset; builder defaults equal the
 //! schema defaults (`autostart=1`, `deferred`/`human_driven`/`xhigh=0`,
@@ -92,9 +92,10 @@ pub(crate) struct TaskInsert {
 
 /// Insert one `tasks` row through [`crate::task_status_audit::execute`].
 ///
-/// `operation` is the existing helper name stored as the ledger basis
-/// (`insert_task_in_tx_as_actor`, `insert_revision_in_tx`, …) so provenance
-/// strings stay identical. Does not open a connection, commit, allocate
+/// `operation` is the calling creator’s helper name, recorded verbatim as the ledger
+/// basis (`insert_task_in_tx_as_actor`, `insert_revision_in_tx`, …). Basis strings
+/// are persisted audit data that readers and tests match on, so a creator’s
+/// operation name must not change. Does not open a connection, commit, allocate
 /// identities, or publish events.
 pub(crate) fn insert_task_row(
     conn: &Connection,
