@@ -1223,6 +1223,10 @@ async fn a_turn_stop_captures_outputs_while_the_worker_stays_alive() {
     assert!(streamed.last().is_some_and(|c| c.eof));
     assert!(String::from_utf8_lossy(&streamed[0].data).contains("/pull/123"));
     assert!(crate::captures_concluded(&gateway.journal, &execution).unwrap());
+    assert!(records(&gateway).iter().any(|r| matches!(
+        &r.body,
+        Some(record::Body::Gap(g)) if g.resource == "output:concluded"
+    )));
 }
 
 #[tokio::test]

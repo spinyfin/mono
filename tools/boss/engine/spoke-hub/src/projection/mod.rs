@@ -122,6 +122,9 @@ pub const CUSTODY_HALT: &str = "custody_halt";
 /// Effect kind: a completion boundary went ahead without transcript bytes the
 /// spoke had said it needed, because they did not arrive in time.
 pub const EVIDENCE_UNAVAILABLE: &str = "transcript_evidence_unavailable";
+/// Effect kind: a Stop or proposal parked so the host cursor can move while
+/// its transcript or artifact bytes materialize independently.
+pub const PENDING_OBSERVATION: &str = "pending_observation";
 
 /// The longest `reason` a decision carries.
 const MAX_REASON_CHARS: usize = 1024;
@@ -293,11 +296,10 @@ pub struct ProjectorConfig {
     /// health can report the host as blocked.
     #[builder(default = Duration::from_secs(30))]
     pub retry_stall: Duration,
-    /// The longest a completion boundary waits for transcript bytes the spoke
-    /// said it needed. While it waits the projector keeps materializing the
-    /// bytes already received behind it, so the wait cannot deadlock on its own
-    /// watermark; past this it goes ahead and records the evidence as
-    /// unavailable.
+    /// How long parked completion work waits for transcript or artifact bytes
+    /// after its record has already advanced the host cursor. Past this the
+    /// observation is applied with unavailable evidence. Independent
+    /// materialization of later records is never held for this bound.
     #[builder(default = Duration::from_secs(60))]
     pub watermark_wait: Duration,
     /// How often a waiting boundary looks for newly received bytes.
@@ -347,6 +349,11 @@ enum Settled {
         /// declaring them unavailable is recorded in custody and is not one.
         alert: bool,
     },
+    /// Bytes or named outputs are still arriving; the observation is parked.
+    Pending {
+        have: u64,
+        want: u64,
+    },
 }
 
 enum Currentness {
@@ -378,8 +385,8 @@ struct Inner {
     sender: Arc<dyn CommandSender>,
     wake: Arc<Notify>,
     config: ProjectorConfig,
-    /// Where transcript and artifact bytes are held. Without it those records
-    /// are received and left alone, as before custody existed.
+    /// Where transcript and artifact bytes are held. Without it, transcript,
+    /// artifact and gap records are received but not written to disk.
     custody: Option<Arc<Custody>>,
     /// The position a halt was last reported at, per host, so a persistent
     /// fault is logged once rather than every sweep.
@@ -461,6 +468,7 @@ impl Projector {
                 _ = inner.wake.notified() => {}
                 _ = sweep.tick() => {
                     inner.applier.sweep().await;
+                    inner.settle_parked(false).await;
                 }
                 _ = delivery.tick() => {
                     // A pass already under way makes this one return at once.
@@ -518,6 +526,7 @@ impl Projector {
             }
             Err(reason) => tracing::warn!(%reason, "cannot list spoke hosts awaiting projection"),
         }
+        self.inner.settle_parked(true).await;
         self.inner.deliver_pending().await;
     }
 }
@@ -562,6 +571,9 @@ impl Inner {
             if position.lag() == 0 {
                 let host_id = host.to_owned();
                 let _ = self.blocking(move |db| db.clear_spoke_projection_halt(&host_id)).await;
+                // Bytes this pass just wrote may unblock a parked completion of
+                // this host; apply it now rather than on the next sweep.
+                self.settle_parked_inner(Some(host), false).await;
                 return HostEnd::CaughtUp;
             }
             if position
@@ -608,6 +620,7 @@ impl Inner {
                 }
                 next = row.sequence;
             }
+            self.settle_parked(false).await;
             self.reported
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -767,22 +780,19 @@ impl Inner {
     async fn apply_observation(&self, observation: Observation, owed: &mut Vec<Owed>) -> Result<(), Interrupted> {
         let currentness = self.currentness(observation.origin()).await?;
         match (observation, currentness) {
-            (Observation::Proposal(proposal), currentness) => self.apply_proposal(proposal, currentness, owed).await,
-            (Observation::Event(mut event), Currentness::Current) if event.mark.is_some() => {
-                // A turn boundary that needs transcript bytes waits for them,
-                // then carries the hub's copy to the consumers that read it.
-                if let Some(mark) = event.mark.clone() {
-                    match self.await_evidence(&event.origin, &mark).await? {
-                        Settled::Ready(source) => event.transcript = Some(source),
-                        Settled::Unavailable { reason, alert } => {
-                            self.note_unavailable(&event.origin, &mark, &reason, alert, owed);
-                        }
-                    }
+            (Observation::Proposal(proposal), currentness) => {
+                if matches!(currentness, Currentness::Current) && self.should_park_proposal(&proposal).await? {
+                    owed.push(Owed::pending_observation(&proposal.origin, "proposal"));
+                    return Ok(());
                 }
-                match self.applier.event(&event).await {
-                    Applied::Done => Ok(()),
-                    Applied::Retry(reason) => Err(Interrupted::Retry(reason)),
+                self.apply_proposal(proposal, currentness, Some(owed)).await
+            }
+            (Observation::Event(event), Currentness::Current) => {
+                if self.should_park_event(&event).await? {
+                    owed.push(Owed::pending_observation(&event.origin, "event"));
+                    return Ok(());
                 }
+                self.dispatch_event(event, Some(owed)).await
             }
             (
                 observation @ (Observation::Transcript(_) | Observation::Artifact(_) | Observation::Gap(_)),
@@ -798,10 +808,6 @@ impl Inner {
                 );
                 Ok(())
             }
-            (Observation::Event(event), Currentness::Current) => match self.applier.event(&event).await {
-                Applied::Done => Ok(()),
-                Applied::Retry(reason) => Err(Interrupted::Retry(reason)),
-            },
             (Observation::Pane(pane), Currentness::Current) => {
                 let stored = observation_row(&pane);
                 self.blocking(move |db| db.record_spoke_pane_observation(&stored))
@@ -818,7 +824,7 @@ impl Inner {
         &self,
         proposal: ProposalObservation,
         currentness: Currentness,
-        owed: &mut Vec<Owed>,
+        owed: Option<&mut Vec<Owed>>,
     ) -> Result<(), Interrupted> {
         let origin = &proposal.origin;
         // `run_id` is unique per assignment, so one proposal id can never name
@@ -836,11 +842,29 @@ impl Inner {
             );
             return Ok(());
         }
-        if let (Currentness::Current, ProposalRequest::Standard { .. }, Some(mark)) =
-            (&currentness, &proposal.request, &proposal.mark)
-            && let Settled::Unavailable { reason, alert } = self.await_evidence(origin, mark).await?
-        {
-            self.note_unavailable(origin, mark, &reason, alert, owed);
+        let mut local = Vec::new();
+        let record_local = owed.is_none();
+        let dest = owed.unwrap_or(&mut local);
+        if let (Currentness::Current, Some(mark)) = (&currentness, &proposal.mark) {
+            match self
+                .check_evidence(origin, mark, proposal_wants_capture(&proposal))
+                .await?
+            {
+                Settled::Unavailable { reason, alert } => {
+                    self.note_unavailable(origin, mark, &reason, alert, dest).await;
+                }
+                Settled::Pending { have, want } => {
+                    self.note_unavailable(
+                        origin,
+                        mark,
+                        &pending_timeout_reason(have, want, self.config.watermark_wait),
+                        true,
+                        dest,
+                    )
+                    .await;
+                }
+                Settled::Ready(_) => {}
+            }
         }
         let decision = match (&proposal.request, currentness) {
             (_, Currentness::Superseded(why)) => Decision::refused(format!("the assignment was superseded: {why}")),
@@ -868,7 +892,12 @@ impl Inner {
                 Proposed::Retry(reason) => return Err(Interrupted::Retry(reason)),
             },
         };
-        owed.push(Owed::decision(&proposal, &key, &decision));
+        dest.push(Owed::decision(&proposal, &key, &decision));
+        if record_local {
+            for item in local {
+                self.record_owed(&proposal.origin, item).await?;
+            }
+        }
         Ok(())
     }
 
@@ -947,74 +976,270 @@ impl Inner {
         }
     }
 
-    /// Wait until the bytes `mark` names are held, or will not come.
-    ///
-    /// The bytes can sit behind this very record in the journal: the spoke
-    /// numbers bulk chunks only as send credit allows, while a Stop or proposal
-    /// is numbered at once with the size the transcript had. So the wait does
-    /// not stand still. Each pass writes whatever custody records the hub has
-    /// already received after this one, which are idempotent when the cursor
-    /// reaches them later, until the mark is met, the spoke says it will not be,
-    /// or [`ProjectorConfig::watermark_wait`] runs out.
-    async fn await_evidence(&self, origin: &Origin, mark: &Mark) -> Result<Settled, Interrupted> {
+    async fn dispatch_event(
+        &self,
+        mut event: EventObservation,
+        owed: Option<&mut Vec<Owed>>,
+    ) -> Result<(), Interrupted> {
+        let mut local = Vec::new();
+        let record_local = owed.is_none();
+        let dest = owed.unwrap_or(&mut local);
+        if let Some(mark) = event.mark.clone() {
+            match self
+                .check_evidence(&event.origin, &mark, event_wants_capture(&event))
+                .await?
+            {
+                Settled::Ready(source) => event.transcript = Some(source),
+                Settled::Unavailable { reason, alert } => {
+                    self.note_unavailable(&event.origin, &mark, &reason, alert, dest).await;
+                }
+                Settled::Pending { have, want } => {
+                    self.note_unavailable(
+                        &event.origin,
+                        &mark,
+                        &pending_timeout_reason(have, want, self.config.watermark_wait),
+                        true,
+                        dest,
+                    )
+                    .await;
+                }
+            }
+        }
+        match self.applier.event(&event).await {
+            Applied::Done => {}
+            Applied::Retry(reason) => return Err(Interrupted::Retry(reason)),
+        }
+        if record_local {
+            for item in local {
+                self.record_owed(&event.origin, item).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn should_park_event(&self, event: &EventObservation) -> Result<bool, Interrupted> {
+        if self.run_is_parked(&event.origin).await? {
+            return Ok(true);
+        }
+        if !event_wants_capture(event) {
+            return Ok(false);
+        }
+        self.boundary_is_pending(&event.origin, event.mark.as_ref()).await
+    }
+
+    async fn should_park_proposal(&self, proposal: &ProposalObservation) -> Result<bool, Interrupted> {
+        if self.run_is_parked(&proposal.origin).await? {
+            return Ok(true);
+        }
+        if !proposal_wants_capture(proposal) {
+            return Ok(false);
+        }
+        self.boundary_is_pending(&proposal.origin, proposal.mark.as_ref()).await
+    }
+
+    async fn boundary_is_pending(&self, origin: &Origin, mark: Option<&Mark>) -> Result<bool, Interrupted> {
+        Ok(matches!(
+            self.boundary_settled(origin, mark).await?,
+            Settled::Pending { .. }
+        ))
+    }
+
+    /// Capture-concluded and, when the spoke named a watermark, the transcript
+    /// bytes. A Stop with no watermark still waits for named outputs.
+    async fn boundary_settled(&self, origin: &Origin, mark: Option<&Mark>) -> Result<Settled, Interrupted> {
+        self.check_evidence(origin, mark.unwrap_or(&Mark::default()), true)
+            .await
+    }
+
+    async fn run_is_parked(&self, origin: &Origin) -> Result<bool, Interrupted> {
+        let (host, run) = (origin.host_id.clone(), origin.run.run_id.clone());
+        self.blocking(move |db| db.spoke_run_has_pending_observation(&host, &run))
+            .await
+    }
+
+    /// Whether the bytes `mark` names are held, still arriving, or will not come.
+    /// Does not wait and does not hold the host cursor.
+    async fn check_evidence(
+        &self,
+        origin: &Origin,
+        mark: &Mark,
+        artifacts_settled: bool,
+    ) -> Result<Settled, Interrupted> {
         let Some(custody) = self.custody.clone() else {
             return Ok(Settled::Unavailable {
                 reason: "no custody is configured on this hub".into(),
                 alert: false,
             });
         };
-        let started = std::time::Instant::now();
-        let mut scanned = origin.sequence;
-        loop {
-            let (handle, run, wanted) = (Arc::clone(&custody), origin.run.clone(), mark.clone());
+        let (handle, run, wanted) = (Arc::clone(&custody), origin.run.clone(), mark.clone());
+        Ok(
             match self
-                .blocking(move |_| handle.transcript_evidence(&run, &wanted, true))
+                .blocking(move |_| handle.transcript_evidence(&run, &wanted, artifacts_settled))
                 .await?
             {
-                Evidence::Ready(source) => return Ok(Settled::Ready(source)),
-                Evidence::Unavailable(reason) => return Ok(Settled::Unavailable { reason, alert: false }),
-                Evidence::Pending { have, want } => {
-                    if started.elapsed() >= self.config.watermark_wait {
-                        return Ok(Settled::Unavailable {
-                            reason: format!(
-                                "only {have} of {want} bytes arrived within {:?}",
-                                self.config.watermark_wait
-                            ),
-                            alert: true,
-                        });
-                    }
+                Evidence::Ready(source) => Settled::Ready(source),
+                Evidence::Unavailable(reason) => Settled::Unavailable { reason, alert: false },
+                Evidence::Pending { have, want } => Settled::Pending { have, want },
+            },
+        )
+    }
+
+    /// Apply parked Stop and proposal observations whose bytes have arrived, or
+    /// whose wait has run out. Later observations of the same run stay parked
+    /// until earlier ones apply, so per-run order is preserved. Other runs are
+    /// not in this outbox.
+    async fn settle_parked(&self, wait: bool) {
+        self.settle_parked_inner(None, wait).await;
+    }
+
+    async fn settle_parked_inner(&self, host: Option<&str>, wait: bool) {
+        loop {
+            let pending = match self.blocking(|db| db.pending_spoke_observations()).await {
+                Ok(pending) => pending,
+                Err(Interrupted::Retry(reason) | Interrupted::Halt(reason)) => {
+                    tracing::warn!(%reason, "cannot list parked spoke observations");
+                    return;
                 }
+            };
+            if pending.is_empty() {
+                return;
             }
-            let (host, journal, batch) = (origin.host_id.clone(), origin.journal_id.clone(), self.config.batch);
-            let after = scanned;
-            let rows = self
-                .blocking(move |db| db.spoke_ingress_after(&host, &journal, after, batch))
-                .await?;
-            if rows.is_empty() {
-                tokio::time::sleep(self.config.watermark_poll).await;
-                continue;
-            }
-            for row in &rows {
-                scanned = row.sequence;
-                let Reduction::Observations(found) = reduce::reduce(&origin.host_id, &origin.journal_id, row) else {
+            let mut applied_any = false;
+            let mut wait_for: Option<Duration> = None;
+            let mut seen: HashSet<String> = HashSet::new();
+            for effect in pending {
+                if let Some(host) = host
+                    && effect.host_id != host
+                {
+                    continue;
+                }
+                let Ok(parked) = serde_json::from_slice::<Parked>(&effect.payload) else {
+                    tracing::error!(
+                        host = %effect.host_id,
+                        key = %effect.key,
+                        "parked observation payload does not decode; it is dropped"
+                    );
+                    self.finish_parked(&effect, SpokeEffectOutcome::Failed("payload does not decode".into()))
+                        .await;
+                    applied_any = true;
                     continue;
                 };
-                for observation in found {
-                    let custody_record = matches!(
-                        observation,
-                        Observation::Transcript(_) | Observation::Artifact(_) | Observation::Gap(_)
-                    );
-                    if custody_record && matches!(self.currentness(observation.origin()).await?, Currentness::Current) {
-                        // A resource halted here is reported when the cursor
-                        // reaches the record; its alert is not lost by waiting.
-                        self.apply_custody(observation, &mut Vec::new()).await?;
+                if !seen.insert(parked.run_id.clone()) {
+                    continue;
+                }
+                match self.settle_one(&effect, &parked).await {
+                    Ok(ParkedEnd::Applied) => applied_any = true,
+                    Ok(ParkedEnd::Waiting(remaining)) => {
+                        wait_for = Some(wait_for.map_or(remaining, |current| current.min(remaining)));
+                    }
+                    Err(Interrupted::Retry(reason) | Interrupted::Halt(reason)) => {
+                        tracing::warn!(
+                            host = %effect.host_id,
+                            key = %effect.key,
+                            %reason,
+                            "parked observation could not be applied yet"
+                        );
                     }
                 }
             }
+            if applied_any {
+                continue;
+            }
+            let Some(remaining) = wait_for else {
+                return;
+            };
+            if !wait {
+                return;
+            }
+            tokio::time::sleep(remaining.min(self.config.watermark_poll)).await;
         }
     }
 
-    fn note_unavailable(&self, origin: &Origin, mark: &Mark, reason: &str, alert: bool, owed: &mut Vec<Owed>) {
+    async fn settle_one(&self, effect: &SpokeEffect, parked: &Parked) -> Result<ParkedEnd, Interrupted> {
+        let (host, journal, sequence) = (effect.host_id.clone(), effect.journal_id.clone(), effect.sequence);
+        let after = sequence.saturating_sub(1);
+        let rows = self
+            .blocking(move |db| db.spoke_ingress_after(&host, &journal, after, 1))
+            .await?;
+        let Some(row) = rows.into_iter().find(|row| row.sequence == sequence) else {
+            self.finish_parked(
+                effect,
+                SpokeEffectOutcome::Failed("the parked record is no longer stored".into()),
+            )
+            .await;
+            return Ok(ParkedEnd::Applied);
+        };
+        let Reduction::Observations(found) = reduce::reduce(&effect.host_id, &effect.journal_id, &row) else {
+            self.finish_parked(
+                effect,
+                SpokeEffectOutcome::Failed("the parked record no longer reduces".into()),
+            )
+            .await;
+            return Ok(ParkedEnd::Applied);
+        };
+        let Some(observation) = found.into_iter().find(|observation| {
+            observation.origin().run.run_id == parked.run_id && observation.origin().sequence == sequence
+        }) else {
+            self.finish_parked(
+                effect,
+                SpokeEffectOutcome::Failed("the parked record has no matching observation".into()),
+            )
+            .await;
+            return Ok(ParkedEnd::Applied);
+        };
+        if let Some(remaining) = self.parked_still_waiting(&observation, parked).await? {
+            return Ok(ParkedEnd::Waiting(remaining));
+        }
+        match observation {
+            Observation::Event(event) => self.dispatch_event(event, None).await?,
+            Observation::Proposal(proposal) => self.apply_proposal(proposal, Currentness::Current, None).await?,
+            _ => {}
+        }
+        self.finish_parked(effect, SpokeEffectOutcome::Done).await;
+        Ok(ParkedEnd::Applied)
+    }
+
+    async fn parked_still_waiting(
+        &self,
+        observation: &Observation,
+        parked: &Parked,
+    ) -> Result<Option<Duration>, Interrupted> {
+        let elapsed = parked_elapsed(parked.parked_at_ms);
+        let bound = self.config.watermark_wait;
+        let remaining = bound.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let pending = match observation {
+            Observation::Event(event) if event_wants_capture(event) => {
+                self.boundary_is_pending(&event.origin, event.mark.as_ref()).await?
+            }
+            Observation::Proposal(proposal) if proposal_wants_capture(proposal) => {
+                self.boundary_is_pending(&proposal.origin, proposal.mark.as_ref())
+                    .await?
+            }
+            _ => false,
+        };
+        Ok(pending.then_some(remaining))
+    }
+
+    async fn finish_parked(&self, effect: &SpokeEffect, outcome: SpokeEffectOutcome) {
+        let (host, kind, key) = (effect.host_id.clone(), effect.kind.clone(), effect.key.clone());
+        if let Err(Interrupted::Retry(reason) | Interrupted::Halt(reason)) = self
+            .blocking(move |db| db.settle_spoke_effect(&host, &kind, &key, &outcome))
+            .await
+        {
+            tracing::warn!(host = %effect.host_id, %reason, "cannot settle a parked observation");
+        }
+    }
+
+    async fn record_owed(&self, origin: &Origin, owed: Owed) -> Result<(), Interrupted> {
+        let (host, journal, sequence) = (origin.host_id.clone(), origin.journal_id.clone(), origin.sequence);
+        self.blocking(move |db| db.record_spoke_effect(&host, &journal, sequence, owed.as_new()))
+            .await
+    }
+
+    async fn note_unavailable(&self, origin: &Origin, mark: &Mark, reason: &str, alert: bool, owed: &mut Vec<Owed>) {
         tracing::warn!(
             host = %origin.host_id,
             execution = %origin.run.execution_id,
@@ -1072,6 +1297,9 @@ impl Inner {
         };
         let mut unreachable: HashSet<String> = HashSet::new();
         for effect in effects {
+            if effect.kind == PENDING_OBSERVATION {
+                continue;
+            }
             if unreachable.contains(&effect.host_id) {
                 continue;
             }
@@ -1231,6 +1459,21 @@ impl Owed {
         }
     }
 
+    fn pending_observation(origin: &Origin, kind: &str) -> Self {
+        let payload = serde_json::to_vec(&Parked {
+            run_id: origin.run.run_id.clone(),
+            kind: kind.to_owned(),
+            parked_at_ms: unix_ms(SystemTime::now()),
+        })
+        .unwrap_or_default();
+        Self {
+            kind: PENDING_OBSERVATION,
+            key: format!("{}:{}", origin.run.run_id, origin.sequence),
+            payload,
+            failure: None,
+        }
+    }
+
     fn decision(proposal: &ProposalObservation, key: &str, decision: &Decision) -> Self {
         let mut result = serde_json::to_vec(&decision.result).unwrap_or_default();
         if result.len() > MAX_PAYLOAD_BYTES / 2 {
@@ -1292,6 +1535,44 @@ fn observation_row(pane: &PaneObservation) -> SpokePaneObservation {
 fn unix_ms(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct Parked {
+    run_id: String,
+    kind: String,
+    parked_at_ms: i64,
+}
+
+enum ParkedEnd {
+    Applied,
+    Waiting(Duration),
+}
+
+fn event_wants_capture(event: &EventObservation) -> bool {
+    matches!(event.event, boss_protocol::WorkerEvent::Stop { .. })
+}
+
+fn proposal_wants_capture(proposal: &ProposalObservation) -> bool {
+    matches!(
+        proposal.request,
+        ProposalRequest::Standard {
+            kind: ProposalKind::RunDone,
+            ..
+        }
+    )
+}
+
+fn parked_elapsed(parked_at_ms: i64) -> Duration {
+    Duration::from_millis(unix_ms(SystemTime::now()).saturating_sub(parked_at_ms) as u64)
+}
+
+fn pending_timeout_reason(have: u64, want: u64, bound: Duration) -> String {
+    if have == 0 && want == 1 {
+        format!("named outputs did not arrive within {bound:?}")
+    } else {
+        format!("only {have} of {want} transcript bytes arrived within {bound:?}")
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

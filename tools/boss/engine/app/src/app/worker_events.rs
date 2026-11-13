@@ -680,6 +680,10 @@ pub(super) async fn dispatch_live_worker_state(
             let _ = server_state.transcript_path_cache.record_if_unset(run_id, &path);
             (Some(path), false)
         }
+        None if incoming.skip_cached_transcript() => {
+            server_state.dispatcher_stats.inc_without_transcript_path();
+            (None, false)
+        }
         None => {
             server_state.dispatcher_stats.inc_without_transcript_path();
             match server_state.transcript_path_cache.get(run_id) {

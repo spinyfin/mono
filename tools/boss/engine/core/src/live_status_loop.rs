@@ -379,7 +379,13 @@ pub struct DispatcherStatsSnapshot {
 /// same run finally win.
 #[derive(Default)]
 pub struct TranscriptPathCache {
-    inner: StdMutex<HashMap<String, String>>,
+    inner: StdMutex<HashMap<String, CachedTranscriptPath>>,
+}
+
+#[derive(Clone)]
+struct CachedTranscriptPath {
+    path: String,
+    generation: Option<String>,
 }
 
 impl TranscriptPathCache {
@@ -398,7 +404,36 @@ impl TranscriptPathCache {
         if guard.contains_key(run_id) {
             return false;
         }
-        guard.insert(run_id.to_owned(), path.to_owned());
+        guard.insert(
+            run_id.to_owned(),
+            CachedTranscriptPath {
+                path: path.to_owned(),
+                generation: None,
+            },
+        );
+        true
+    }
+
+    /// Point `run_id` at `path` when `generation` is newer than the one
+    /// already cached, so a replaced spoke transcript is not pinned to its
+    /// first file. Replaying an older generation does not roll the pointer
+    /// back.
+    pub fn record_if_newer(&self, run_id: &str, path: &str, generation: &str) -> bool {
+        let rank = generation_rank(generation);
+        let mut guard = self.inner.lock().expect("transcript path cache poisoned");
+        if let Some(cached) = guard.get(run_id)
+            && let Some(current) = &cached.generation
+            && generation_rank(current) >= rank
+        {
+            return false;
+        }
+        guard.insert(
+            run_id.to_owned(),
+            CachedTranscriptPath {
+                path: path.to_owned(),
+                generation: Some(generation.to_owned()),
+            },
+        );
         true
     }
 
@@ -407,7 +442,7 @@ impl TranscriptPathCache {
             .lock()
             .expect("transcript path cache poisoned")
             .get(run_id)
-            .cloned()
+            .map(|cached| cached.path.clone())
     }
 
     /// Drop the cache entry for `run_id`. Called when a run is
@@ -426,6 +461,13 @@ impl TranscriptPathCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn generation_rank(generation: &str) -> (u64, u64) {
+    let mut parts = generation.split('-');
+    let incarnation = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let cursor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    (incarnation, cursor)
 }
 
 fn trigger_kind(t: &Trigger) -> &'static str {
@@ -496,6 +538,14 @@ pub trait TranscriptPathResolver: Send + Sync {
     /// death parks the loop until a later Alive inspection or re-adoption.
     async fn worker_can_refresh(&self, _run_id: &str) -> WorkerRefreshPermit {
         WorkerRefreshPermit::Refresh
+    }
+
+    /// Trusted directory the transcript path must stay inside. Spoke runs
+    /// return the hub custody directory for the run so Codex and Grok tails
+    /// open the copy the hub holds rather than a local driver home that does
+    /// not exist for a remote worker. `None` uses the driver's own root.
+    async fn transcript_containment_root(&self, _run_id: &str) -> Option<PathBuf> {
+        None
     }
 }
 
@@ -829,11 +879,19 @@ fn normalize_lines(
         .collect()
 }
 
-fn start_transcript_tail(driver: &dyn AgentDriver, run_id: &str, path: PathBuf) -> Result<TranscriptTail, String> {
-    match driver
-        .transcript_containment_root(run_id)
-        .map_err(|err| format!("{err:#}"))?
-    {
+fn start_transcript_tail(
+    driver: &dyn AgentDriver,
+    run_id: &str,
+    path: PathBuf,
+    resolver_root: Option<PathBuf>,
+) -> Result<TranscriptTail, String> {
+    let root = match resolver_root {
+        Some(root) => Some(root),
+        None => driver
+            .transcript_containment_root(run_id)
+            .map_err(|err| format!("{err:#}"))?,
+    };
+    match root {
         Some(root) => TranscriptTail::new_contained(path, root).map_err(|err| err.to_string()),
         None => Ok(TranscriptTail::new(path)),
     }
@@ -868,6 +926,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         debug_store,
     } = cfg;
     let mut tail: Option<TranscriptTail> = None;
+    let mut tailed_path: Option<PathBuf> = None;
     let mut transcript_session = driver.transcript_session();
     let mut transcript_buffer: Vec<Value> = Vec::new();
     let mut post_tool_use_count: u32 = 0;
@@ -1094,39 +1153,48 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             }
         }
 
-        // Resolve the transcript path lazily on the first tick (the
-        // path is recorded on the WorkRun row some time after spawn).
-        if tail.is_none() {
-            if let Some(path) = resolver.transcript_path(&run_id).await {
-                let path_str = path.display().to_string();
-                tracing::info!(
-                    slot_id,
-                    run_id = %run_id,
-                    transcript_path = %path_str,
-                    "live_status: resolved transcript path; tail started",
-                );
-                debug_store.update(slot_id, |snap| {
-                    snap.transcript_path = Some(path_str);
-                });
-                match start_transcript_tail(driver.as_ref(), &run_id, path) {
-                    Ok(started) => tail = Some(started),
-                    Err(err) => {
-                        tracing::warn!(
-                            slot_id,
-                            run_id = %run_id,
-                            %err,
-                            "live_status: transcript path failed driver containment policy",
-                        );
-                        continue;
+        // Resolve the transcript path lazily, and again when a newer
+        // generation attaches so the tail is not stuck on a closed file.
+        let resolved = resolver.transcript_path(&run_id).await;
+        if tailed_path.as_ref() != resolved.as_ref() {
+            match resolved {
+                Some(path) => {
+                    let path_str = path.display().to_string();
+                    tracing::info!(
+                        slot_id,
+                        run_id = %run_id,
+                        transcript_path = %path_str,
+                        "live_status: resolved transcript path; tail started",
+                    );
+                    debug_store.update(slot_id, |snap| {
+                        snap.transcript_path = Some(path_str);
+                    });
+                    let containment = resolver.transcript_containment_root(&run_id).await;
+                    match start_transcript_tail(driver.as_ref(), &run_id, path.clone(), containment) {
+                        Ok(started) => {
+                            tail = Some(started);
+                            tailed_path = Some(path);
+                            transcript_buffer.clear();
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                slot_id,
+                                run_id = %run_id,
+                                %err,
+                                "live_status: transcript path failed driver containment policy",
+                            );
+                            continue;
+                        }
                     }
                 }
-            } else {
-                tracing::info!(
-                    slot_id,
-                    run_id = %run_id,
-                    "live_status: skip — no transcript path yet (work_runs row has NULL)",
-                );
-                continue;
+                None => {
+                    tracing::info!(
+                        slot_id,
+                        run_id = %run_id,
+                        "live_status: skip — no transcript path yet (work_runs row has NULL)",
+                    );
+                    continue;
+                }
             }
         }
 
@@ -1501,12 +1569,21 @@ mod tests {
 
     struct CannedResolver {
         path: TokioMutex<Option<PathBuf>>,
+        containment: Option<PathBuf>,
     }
 
     impl CannedResolver {
         fn new(path: Option<PathBuf>) -> Self {
             Self {
                 path: TokioMutex::new(path),
+                containment: None,
+            }
+        }
+
+        fn with_containment(path: PathBuf, containment: PathBuf) -> Self {
+            Self {
+                path: TokioMutex::new(Some(path)),
+                containment: Some(containment),
             }
         }
     }
@@ -1515,6 +1592,10 @@ mod tests {
     impl TranscriptPathResolver for CannedResolver {
         async fn transcript_path(&self, _run_id: &str) -> Option<PathBuf> {
             self.path.lock().await.clone()
+        }
+
+        async fn transcript_containment_root(&self, _run_id: &str) -> Option<PathBuf> {
+            self.containment.clone()
         }
     }
 
@@ -1635,6 +1716,94 @@ mod tests {
             Some("reading the Codex rollout")
         );
         manager.stop_slot(9);
+    }
+
+    #[test]
+    fn a_codex_spoke_custody_tail_summarizes_outside_the_driver_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes = tmp.path().join("homes");
+        let custody = tmp.path().join("executions/exec-1/spoke/run-1");
+        std::fs::create_dir_all(&custody).unwrap();
+        let transcript = custody.join("transcript-gen.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"agent_message","message":"spoke custody transcript for Codex"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"spoke custody transcript for Codex"}]}
+            }),
+        ];
+        let jsonl = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript, jsonl).unwrap();
+        let _env = codex_homes_override(&homes);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(codex_spoke_custody_tail_body(&transcript, &custody));
+    }
+
+    async fn codex_spoke_custody_tail_body(transcript: &Path, custody: &Path) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::live_status::test_support::status_reply("reading the spoke copy")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let utility: Arc<dyn UtilityModel> = Arc::new(
+            crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri())),
+        );
+        let run_id = "run-codex-spoke-custody";
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(4, run_id, "gpt-5.6-terra", 0, None);
+        let manager = LiveStatusManager::new();
+        let broadcaster: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::with_containment(
+            transcript.to_path_buf(),
+            custody.to_path_buf(),
+        ));
+        manager.start_slot(
+            4,
+            LiveStatusRun::new(run_id, Arc::new(crate::driver::CodexDriver::default())),
+            utility,
+            registry.clone(),
+            broadcaster,
+            resolver,
+        );
+        manager.notify(4, Trigger::ActivityChanged(WorkerActivity::Working));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(4).and_then(|state| state.live_status).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex spoke slot did not summarize the custody transcript");
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests.first().expect("summarizer request").body);
+        assert!(body.contains("spoke custody transcript for Codex"), "{body}");
+        assert_eq!(
+            registry.get(4).unwrap().live_status.as_deref(),
+            Some("reading the spoke copy")
+        );
+        manager.stop_slot(4);
     }
 
     /// Run one summarizer attempt against `reply` with a prior label already

@@ -1028,6 +1028,41 @@ fn gap_record(sequence: u64, run: &Run, resource: &str, from: u64, reason: &str)
     )
 }
 
+fn concluded(sequence: u64, run: &Run, ids: &[&str]) -> v1::Record {
+    gap_record(
+        sequence,
+        run,
+        "output:concluded",
+        0,
+        &serde_json::to_string(ids).unwrap(),
+    )
+}
+
+fn artifact_record(
+    sequence: u64,
+    run: &Run,
+    id: &str,
+    kind: v1::ArtifactKind,
+    data: &[u8],
+    metadata: &[u8],
+) -> v1::Record {
+    use sha2::{Digest, Sha256};
+    record_of(
+        sequence,
+        run,
+        record::Body::Artifact(v1::ArtifactChunk {
+            artifact_id: id.into(),
+            kind: kind as i32,
+            offset: 0,
+            data: data.to_vec(),
+            sha256: Sha256::digest(data).to_vec(),
+            eof: true,
+            total_bytes: data.len() as u64,
+            metadata_json: metadata.to_vec(),
+        }),
+    )
+}
+
 fn failed_effects(db: &WorkDb, kind: &str) -> Vec<boss_work_db::SpokeEffect> {
     let keys: Vec<String> = {
         let conn = db.connect().unwrap();
@@ -1056,6 +1091,7 @@ async fn a_stop_whose_bytes_are_behind_it_gets_them_without_deadlocking_on_its_o
     spoke.send(&stop_at(1, &run, "0-1", 10)).await;
     spoke.send(&transcript_record(2, &run, "0-1", 0, b"01234")).await;
     spoke.send(&transcript_record(3, &run, "0-1", 5, b"56789")).await;
+    spoke.send(&concluded(4, &run, &[])).await;
 
     let applier = Applier::default();
     let custody = world.custody(&db);
@@ -1069,7 +1105,7 @@ async fn a_stop_whose_bytes_are_behind_it_gets_them_without_deadlocking_on_its_o
     .drain()
     .await;
 
-    assert_eq!(applied(&db), 3);
+    assert_eq!(applied(&db), 4);
     let sources = applier.custody.sources();
     assert_eq!(sources.len(), 1);
     let (sequence, held) = &sources[0];
@@ -1100,8 +1136,9 @@ async fn a_boundary_whose_bytes_never_arrive_goes_ahead_and_records_the_evidence
     let run = assign(&db, "exec_1").1;
     let spoke = Spoke::connect(&db, None).await;
     spoke.send(&transcript_record(1, &run, "0-1", 0, b"0123")).await;
-    spoke.send(&stop_at(2, &run, "0-1", 100)).await;
-    spoke.send(&tool_record(3, &run)).await;
+    spoke.send(&concluded(2, &run, &[])).await;
+    spoke.send(&stop_at(3, &run, "0-1", 100)).await;
+    spoke.send(&tool_record(4, &run)).await;
 
     let applier = Applier::default();
     let custody = world.custody(&db);
@@ -1117,10 +1154,10 @@ async fn a_boundary_whose_bytes_never_arrive_goes_ahead_and_records_the_evidence
 
     assert_eq!(
         applied(&db),
-        3,
+        4,
         "the host is not stranded behind a transcript that never comes"
     );
-    assert_eq!(applier.log(|l| l.events.clone()), ["2#stop", "3#pre_tool_use"]);
+    assert_eq!(applier.log(|l| l.events.clone()), ["3#stop", "4#pre_tool_use"]);
     assert!(
         applier.custody.sources()[0].1.is_none(),
         "no copy is claimed to be complete"
@@ -1140,7 +1177,8 @@ async fn a_gap_the_spoke_declared_is_unavailable_evidence_and_not_an_alert() {
     spoke
         .send(&gap_record(2, &run, "transcript:0-1", 5, "source replaced"))
         .await;
-    spoke.send(&stop_at(3, &run, "0-1", 9)).await;
+    spoke.send(&concluded(3, &run, &[])).await;
+    spoke.send(&stop_at(4, &run, "0-1", 9)).await;
 
     let applier = Applier::default();
     let custody = world.custody(&db);
@@ -1154,7 +1192,7 @@ async fn a_gap_the_spoke_declared_is_unavailable_evidence_and_not_an_alert() {
     .drain()
     .await;
 
-    assert_eq!(applied(&db), 3);
+    assert_eq!(applied(&db), 4);
     assert!(applier.custody.sources()[0].1.is_none());
     assert!(failed_effects(&db, "transcript_evidence_unavailable").is_empty());
     let row = db.spoke_custody("exec_1", 1, "transcript:0-1").unwrap().unwrap();
@@ -1294,6 +1332,216 @@ async fn artifacts_and_output_gaps_are_held_by_run_identity_and_survive_replay()
     );
     assert_eq!(std::fs::read(destination).unwrap(), whole);
     assert!(failed_effects(&db, "custody_halt").is_empty());
+}
+
+#[tokio::test]
+async fn another_run_keeps_projecting_while_a_completion_waits_for_bytes() {
+    let world = World::new();
+    let db = world.open();
+    let run_a = assign(&db, "exec_a").1;
+    let run_b = assign(&db, "exec_b").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&concluded(1, &run_a, &[])).await;
+    spoke.send(&stop_at(2, &run_a, "0-1", 10)).await;
+    spoke.send(&tool_record(3, &run_b)).await;
+
+    let applier = Applier::default();
+    let custody = world.custody(&db);
+    let wake = Arc::new(Notify::new());
+    let running = tokio::spawn(
+        Projector::with_custody(
+            db.clone(),
+            Arc::new(applier.clone()),
+            Arc::new(Sender::default()),
+            wake.clone(),
+            ProjectorConfig::builder()
+                .sweep_interval(Duration::from_millis(40))
+                .delivery_interval(Duration::from_millis(40))
+                .retry_initial(Duration::from_millis(5))
+                .retry_max(Duration::from_millis(20))
+                .halt_hold(Duration::from_millis(80))
+                .watermark_wait(Duration::from_secs(5))
+                .watermark_poll(Duration::from_millis(5))
+                .build(),
+            custody.clone(),
+        )
+        .run(),
+    );
+    eventually("the other run's observation is applied while the Stop waits", || {
+        applier.log(|l| l.events == ["3#pre_tool_use"]) && applied(&db) == 3
+    })
+    .await;
+    assert!(
+        !applier.custody.sources().iter().any(|(sequence, _)| *sequence == 2),
+        "the Stop is still parked"
+    );
+
+    spoke.send(&transcript_record(4, &run_a, "0-1", 0, b"0123456789")).await;
+    wake.notify_waiters();
+    eventually("the parked Stop applies once its bytes arrive", || {
+        applier.log(|l| l.events == ["3#pre_tool_use", "2#stop"])
+    })
+    .await;
+    let sources = applier.custody.sources();
+    let held = sources
+        .iter()
+        .find(|(sequence, _)| *sequence == 2)
+        .and_then(|(_, held)| held.as_ref())
+        .expect("hub copy");
+    assert_eq!(held.1, b"0123456789");
+    running.abort();
+    let _ = running.await;
+}
+
+#[tokio::test]
+async fn a_named_output_arriving_after_stop_is_collectable_at_dispatch() {
+    use sha2::{Digest, Sha256};
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    let whole = br#"{"findings":[]}"#;
+    let digest: String = Sha256::digest(whole).iter().map(|b| format!("{b:02x}")).collect();
+    let id = format!("{}:{digest}", v1::ArtifactKind::ReviewResult as i32);
+
+    spoke.send(&transcript_record(1, &run, "0-1", 0, b"hello")).await;
+    spoke.send(&concluded(2, &run, &[&id])).await;
+    spoke.send(&stop_at(3, &run, "0-1", 5)).await;
+
+    let applier = Applier::default();
+    let custody = world.custody(&db);
+    let wake = Arc::new(Notify::new());
+    let running =
+        tokio::spawn(custody_projector(&db, &applier, &Arc::new(Sender::default()), wake.clone(), &custody).run());
+    eventually("the Stop is parked until the named artifact exists", || {
+        applied(&db) == 3
+    })
+    .await;
+    assert!(
+        applier.log(|l| l.events.is_empty()),
+        "Stop is not dispatched with a missing named output"
+    );
+
+    spoke
+        .send(&artifact_record(
+            4,
+            &run,
+            &id,
+            v1::ArtifactKind::ReviewResult,
+            whole,
+            br#"{"output_kind":"review-result"}"#,
+        ))
+        .await;
+    wake.notify_waiters();
+    eventually("Stop dispatches once the named artifact is complete", || {
+        applier.log(|l| l.events == ["3#stop"])
+    })
+    .await;
+    running.abort();
+    let _ = running.await;
+
+    let destination = world._dir.path().join("out").join("review.json");
+    assert_eq!(
+        custody
+            .collect_output(
+                "exec_1",
+                boss_spoke_custody::StructuredOutputKind::ReviewResult,
+                &destination
+            )
+            .unwrap(),
+        boss_spoke_custody::Collected::Installed
+    );
+}
+
+#[tokio::test]
+async fn a_stop_with_no_transcript_watermark_still_waits_for_a_named_output() {
+    use sha2::{Digest, Sha256};
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    let whole = br#"{"pr_url":"https://github.com/example/repo/pull/1"}"#;
+    let digest: String = Sha256::digest(whole).iter().map(|b| format!("{b:02x}")).collect();
+    let id = format!("{}:{digest}", v1::ArtifactKind::PrUrl as i32);
+
+    spoke.send(&concluded(1, &run, &[&id])).await;
+    spoke.send(&stop_record(2, &run)).await;
+
+    let applier = Applier::default();
+    let custody = world.custody(&db);
+    let wake = Arc::new(Notify::new());
+    let running =
+        tokio::spawn(custody_projector(&db, &applier, &Arc::new(Sender::default()), wake.clone(), &custody).run());
+    eventually("cursor advanced with the Stop parked", || applied(&db) == 2).await;
+    assert!(applier.log(|l| l.events.is_empty()));
+
+    spoke
+        .send(&artifact_record(3, &run, &id, v1::ArtifactKind::PrUrl, whole, b"{}"))
+        .await;
+    wake.notify_waiters();
+    eventually("Stop dispatches after the named PR-url artifact completes", || {
+        applier.log(|l| l.events == ["2#stop"])
+    })
+    .await;
+    running.abort();
+    let _ = running.await;
+    let destination = world._dir.path().join("pr.json");
+    assert_eq!(
+        custody
+            .collect_output("exec_1", boss_spoke_custody::StructuredOutputKind::PrUrl, &destination)
+            .unwrap(),
+        boss_spoke_custody::Collected::Installed
+    );
+}
+
+#[tokio::test]
+async fn a_done_proposal_waits_for_a_named_output_arriving_later() {
+    use sha2::{Digest, Sha256};
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    let whole = br#"{"pr_url":"https://github.com/example/repo/pull/1"}"#;
+    let digest: String = Sha256::digest(whole).iter().map(|b| format!("{b:02x}")).collect();
+    let id = format!("{}:{digest}", v1::ArtifactKind::PrUrl as i32);
+
+    spoke.send(&transcript_record(1, &run, "0-1", 0, b"hello")).await;
+    spoke.send(&concluded(2, &run, &[&id])).await;
+    let mut done = proposal_record(3, &run, "done-1");
+    if let Some(record::Body::Proposal(proposal)) = &mut done.body {
+        proposal.transcript_generation = "0-1".into();
+        proposal.transcript_through = 5;
+    }
+    spoke.send(&done).await;
+
+    let applier = Applier::default();
+    let custody = world.custody(&db);
+    let wake = Arc::new(Notify::new());
+    let running =
+        tokio::spawn(custody_projector(&db, &applier, &Arc::new(Sender::default()), wake.clone(), &custody).run());
+    eventually("cursor advanced with the done proposal parked", || applied(&db) == 3).await;
+    assert!(
+        applier.log(|l| l.proposals.is_empty()),
+        "done is not applied with a missing named output"
+    );
+
+    spoke
+        .send(&artifact_record(4, &run, &id, v1::ArtifactKind::PrUrl, whole, b"{}"))
+        .await;
+    wake.notify_waiters();
+    eventually("done applies once the named artifact is complete", || {
+        applier.log(|l| l.proposals == ["3#done-1"])
+    })
+    .await;
+    running.abort();
+    let _ = running.await;
+    let destination = world._dir.path().join("pr.json");
+    assert_eq!(
+        custody
+            .collect_output("exec_1", boss_spoke_custody::StructuredOutputKind::PrUrl, &destination)
+            .unwrap(),
+        boss_spoke_custody::Collected::Installed
+    );
 }
 
 /// Move the projection cursor back to the start, as if the cursor commit of

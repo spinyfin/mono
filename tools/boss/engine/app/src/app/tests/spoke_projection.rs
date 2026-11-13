@@ -2029,6 +2029,11 @@ async fn a_stop_that_names_transcript_bytes_runs_against_the_hub_copy_of_them() 
         sha256: Sha256::digest(line).to_vec(),
         eof: true,
     }));
+    fx.receive(record::Body::Gap(v1::Gap {
+        resource: "output:concluded".into(),
+        reason: "[]".into(),
+        ..Default::default()
+    }));
     let custody = Arc::new(Custody::new(
         fx.state.work_db.as_ref().clone(),
         fx._dir.path().join("custody"),
@@ -2068,7 +2073,7 @@ async fn a_stop_that_names_transcript_bytes_runs_against_the_hub_copy_of_them() 
             .unwrap()
             .unwrap()
             .applied,
-        2
+        3
     );
     // A spoke run gets a summarizer of its own, because it now has a file to read.
     let slot = fx
@@ -2079,4 +2084,77 @@ async fn a_stop_that_names_transcript_bytes_runs_against_the_hub_copy_of_them() 
         .find(|slot| slot.run_id == fx.execution_id)
         .expect("the run has a slot");
     assert!(fx.state.live_status_manager.active_slot_ids().contains(&slot.slot_id));
+}
+
+#[tokio::test]
+async fn a_newer_transcript_generation_advances_the_run_pointer() {
+    use boss_engine_runtime::hub::projection::Custody;
+    use sha2::{Digest, Sha256};
+
+    let mut fx = delivered_with_a_resolvable_pr();
+    let first = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"}}\n";
+    let second = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"two\"}}\n";
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 0,
+        data: first.to_vec(),
+        sha256: Sha256::digest(first).to_vec(),
+        eof: true,
+    }));
+    let custody = Arc::new(Custody::new(
+        fx.state.work_db.as_ref().clone(),
+        fx._dir.path().join("custody"),
+    ));
+    let config = ProjectorConfig::builder()
+        .retry_initial(std::time::Duration::from_millis(5))
+        .retry_max(std::time::Duration::from_millis(20))
+        .watermark_poll(std::time::Duration::from_millis(5))
+        .build();
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        config.clone(),
+        custody.clone(),
+    )
+    .drain()
+    .await;
+    let first_path = fx
+        .state
+        .work_db
+        .transcript_path_for_execution(&fx.execution_id)
+        .unwrap()
+        .expect("first generation is recorded");
+    assert_eq!(std::fs::read(&first_path).unwrap(), first);
+
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-2".into(),
+        offset: 0,
+        data: second.to_vec(),
+        sha256: Sha256::digest(second).to_vec(),
+        eof: true,
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        config,
+        custody.clone(),
+    )
+    .drain()
+    .await;
+    let second_path = fx
+        .state
+        .work_db
+        .transcript_path_for_execution(&fx.execution_id)
+        .unwrap()
+        .expect("second generation is recorded");
+    assert_ne!(first_path, second_path, "each generation is a different file");
+    assert_eq!(std::fs::read(&second_path).unwrap(), second);
+    assert_eq!(
+        fx.state.transcript_path_cache.get(&fx.execution_id).as_deref(),
+        Some(second_path.as_str())
+    );
 }

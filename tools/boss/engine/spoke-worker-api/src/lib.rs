@@ -378,6 +378,23 @@ mod artifacts {
                 state.capture.attempts = 0;
                 state.capture.exited |= terminal;
             }
+            if !state.capture.pending {
+                let ids: Vec<&str> = state
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        artifact.kind == v1::ArtifactKind::PrUrl as i32
+                            || artifact.kind == v1::ArtifactKind::ReviewResult as i32
+                    })
+                    .map(|artifact| artifact.id.as_str())
+                    .collect();
+                observations.push(gap_record(
+                    &run,
+                    stamp,
+                    "output:concluded".into(),
+                    serde_json::to_string(&ids)?,
+                ));
+            }
             journal.commit_source(&run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, observations)
         }
 

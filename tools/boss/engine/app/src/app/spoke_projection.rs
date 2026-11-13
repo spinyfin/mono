@@ -137,6 +137,12 @@ impl TranscriptPathResolver for SpokeSlotResolver {
             _ => WorkerRefreshPermit::Refresh,
         }
     }
+
+    async fn transcript_containment_root(&self, run_id: &str) -> Option<std::path::PathBuf> {
+        self.transcript_path(run_id)
+            .await
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+    }
 }
 
 impl ServerApplier {
@@ -208,6 +214,8 @@ impl ObservationApplier for ServerApplier {
         .with_observed_at_ms(observation.origin.observed.wall_unix_ms);
         if let Some(source) = &observation.transcript {
             incoming = incoming.with_transcript_source(source.path.to_string_lossy().into_owned(), source.root.clone());
+        } else if matches!(observation.event, boss_protocol::WorkerEvent::Stop { .. }) {
+            incoming = incoming.without_cached_transcript();
         }
         // Persist the turn state before the fan-out: a failure here retries the
         // record, and a retry must not re-run the fan-out's turn-boundary
@@ -230,15 +238,23 @@ impl ObservationApplier for ServerApplier {
         };
         let execution_id = origin.run.execution_id.as_str();
         let path = source.path.to_string_lossy().into_owned();
-        // The same first-writer-wins record a local hook's transcript path gets:
-        // the live-status summarizer and cost capture find the transcript by the
-        // run's row. A run whose row does not exist yet is pointed at its copy by
-        // the next boundary that carries it.
-        match state.work_db.set_run_transcript_path_if_unset(execution_id, &path) {
+        // A newer generation replaces the pointer; replaying an older one does
+        // not roll it back. Local hooks stay first-writer-wins.
+        if !state
+            .transcript_path_cache
+            .record_if_newer(execution_id, &path, &source.generation)
+        {
+            // The cache already holds this or a newer generation. Still fill a
+            // work_runs row that did not exist when the first chunk attached.
+            if let Err(error) = state.work_db.set_run_transcript_path_if_unset(execution_id, &path) {
+                return Applied::Retry(format!("{error:#}"));
+            }
+            return Applied::Done;
+        }
+        match state.work_db.set_run_transcript_path(execution_id, &path) {
             Ok(_) => {}
             Err(error) => return Applied::Retry(format!("{error:#}")),
         }
-        let _ = state.transcript_path_cache.record_if_unset(execution_id, &path);
         state
             .record_driver_signal(execution_id, DriverSignalKind::TranscriptPath)
             .await;

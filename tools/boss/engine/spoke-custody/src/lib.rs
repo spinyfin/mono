@@ -17,8 +17,9 @@
 //!   or positively bad ([`OutputEvidence::Invalid`]). The first is never
 //!   reported as the second.
 //! * **Recorded roots.** Every file lives under `<root>/<execution>/spoke/<run>`
-//!   and the ledger records each path, so retention reclaims what was recorded,
-//!   never what a directory scan finds.
+//!   and the ledger records each path. Retention deletes those recorded files
+//!   (and empty directories they leave), never extra files a directory scan
+//!   might find beside them.
 //!
 //! Nothing here decides what evidence means for work status.
 
@@ -31,7 +32,7 @@ mod write {
     //! write and the ledger row, a duplicated delivery and a restart all converge on
     //! the same file.
 
-    use std::fs::{self, DirBuilder, File, OpenOptions};
+    use std::fs::{DirBuilder, File, OpenOptions};
     use std::io::{self, Read};
     use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
     use std::path::Path;
@@ -122,27 +123,22 @@ mod write {
         Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    /// The last `max_bytes` of the file, lossily decoded.
-    pub(crate) fn tail(path: &Path, max_bytes: u64) -> io::Result<String> {
+    /// The last `max_bytes` of the first `materialized` bytes of the file,
+    /// lossily decoded. Bytes a write left past the ledger are not read.
+    pub(crate) fn tail(path: &Path, materialized: u64, max_bytes: u64) -> io::Result<String> {
         let file = File::open(path)?;
-        let len = file.metadata()?.len();
+        let held = file.metadata()?.len();
+        let len = materialized.min(held);
         let start = len.saturating_sub(max_bytes);
         let mut bytes = vec![0u8; (len - start) as usize];
         file.read_exact_at(&mut bytes, start)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Bytes under `path`, counting every regular file.
-    pub(crate) fn tree_bytes(path: &Path) -> u64 {
-        let Ok(entries) = fs::read_dir(path) else {
-            return fs::metadata(path).map_or(0, |meta| meta.len());
-        };
-        entries.flatten().map(|entry| tree_bytes(&entry.path())).sum()
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::fs;
 
         fn file() -> (tempfile::TempDir, std::path::PathBuf) {
             let dir = tempfile::tempdir().unwrap();
@@ -200,6 +196,10 @@ pub const BARE_TRANSCRIPT: &str = "transcript";
 const OUTPUT_PREFIX: &str = "output:";
 /// The spool could not take a worker output: unavailable, not invalid.
 const OUTPUT_CAPTURE: &str = "output:capture";
+/// The spoke finished capturing outputs for a boundary. `reason` is a JSON
+/// array of artifact identities registered for that capture; an empty array
+/// means the capture found nothing to send.
+const OUTPUT_CONCLUDED: &str = "output:concluded";
 const PR_URL_OUTPUT: &str = "output:BOSS_PR_URL_OUTPUT";
 const STRUCTURED_OUTPUT: &str = "output:BOSS_STRUCTURED_OUTPUT";
 const MAX_RESOURCE_CHARS: usize = 256;
@@ -382,6 +382,12 @@ impl Custody {
         if let Some(halted) = self.screen(source, "artifact", &resource, &chunk.data, &chunk.sha256)? {
             return Ok(halted);
         }
+        let digest = match identity_digest(&chunk.artifact_id, chunk.kind) {
+            Ok(digest) => digest,
+            Err(reason) => {
+                return self.close(source, "artifact", &resource, CustodyState::Invalid, &reason, 0);
+            }
+        };
         let relative = self.relative(source.run, "artifact", &resource, "bin")?;
         let spec = Spec {
             kind: "artifact",
@@ -391,7 +397,7 @@ impl Custody {
             artifact: Some(ArtifactSpec {
                 kind: chunk.kind,
                 total: chunk.total_bytes,
-                digest: identity_digest(&chunk.artifact_id),
+                digest,
                 metadata: String::from_utf8_lossy(&chunk.metadata_json).into_owned(),
             }),
         };
@@ -441,11 +447,26 @@ impl Custody {
         if resource == OUTPUT_CAPTURE {
             return self.close(source, "output", resource, CustodyState::Unavailable, &reason, 0);
         }
+        if resource == OUTPUT_CONCLUDED {
+            return self.close(source, "output", resource, CustodyState::Complete, &reason, 0);
+        }
         if resource == PR_URL_OUTPUT || resource == STRUCTURED_OUTPUT {
             return self.close(source, "output", resource, CustodyState::Invalid, &reason, 0);
         }
         if resource.starts_with(OUTPUT_PREFIX) {
             return Ok(Applied::Ignored("unrecognised output gap"));
+        }
+        if let Some(rest) = resource.strip_prefix("artifact:")
+            && !rest.is_empty()
+        {
+            return self.close(
+                source,
+                "artifact",
+                resource,
+                CustodyState::Unavailable,
+                &reason,
+                gap.from_offset,
+            );
         }
         Ok(Applied::Ignored("gap about a resource custody does not hold"))
     }
@@ -547,8 +568,16 @@ impl Custody {
                     if let Some(artifact) = &spec.artifact {
                         next.total_bytes = Some(artifact.total);
                         next.artifact_kind = Some(artifact.kind);
-                        next.expected_digest = artifact.digest.clone();
+                        next.expected_digest = Some(artifact.digest.clone());
                         next.metadata_json = Some(artifact.metadata.clone());
+                        if now > artifact.total {
+                            return self.halt(
+                                source,
+                                spec.kind,
+                                &spec.resource,
+                                &format!("the stream wrote {now} bytes, past the {} it declared", artifact.total),
+                            );
+                        }
                         if eof && now != artifact.total {
                             return self.halt(
                                 source,
@@ -675,34 +704,59 @@ impl Custody {
     // ── Reading transcripts ─────────────────────────────────────────────────
 
     /// Whether `mark` has been met for the run, and if not, whether it will be.
-    /// With `artifacts_settled`, a registered artifact still arriving also
-    /// keeps the answer pending, so a completion boundary does not read a
-    /// structured output half-written.
+    ///
+    /// When `artifacts_settled`, a completion boundary also waits for the
+    /// spoke's capture-concluded marker and for every artifact identity that
+    /// marker names. A named artifact with no row is pending, not settled.
+    /// Absence of open artifact rows is not treated as settled.
     pub fn transcript_evidence(&self, run: &Run, mark: &Mark, artifacts_settled: bool) -> Result<Evidence> {
         let rows = self.db.spoke_custody_for_execution(&run.execution_id)?;
-        let mine = |row: &&SpokeCustody| row.assignment_generation == run.assignment_generation;
-        if artifacts_settled
-            && let Some(open) = rows
-                .iter()
-                .filter(mine)
-                .find(|row| row.kind == "artifact" && row.state == CustodyState::Open)
-        {
-            return Ok(Evidence::Pending {
-                have: open.materialized,
-                want: open.total_bytes.unwrap_or(open.materialized),
-            });
+        let mine: Vec<&SpokeCustody> = rows
+            .iter()
+            .filter(|row| row.assignment_generation == run.assignment_generation)
+            .collect();
+        if artifacts_settled && let Some(pending) = self.capture_pending(&mine) {
+            return Ok(pending);
         }
+        self.transcript_mark(&mine, mark)
+    }
+
+    /// Capture has not finished, or a named artifact is still arriving.
+    fn capture_pending(&self, rows: &[&SpokeCustody]) -> Option<Evidence> {
+        let capture_fail = rows.iter().any(|row| row.resource == OUTPUT_CAPTURE);
+        let concluded = rows.iter().find(|row| row.resource == OUTPUT_CONCLUDED);
+        if concluded.is_none() && !capture_fail {
+            return Some(Evidence::Pending { have: 0, want: 1 });
+        }
+        let concluded = concluded?;
+        let ids: Vec<String> = serde_json::from_str(concluded.reason.as_deref().unwrap_or("[]")).unwrap_or_default();
+        for id in ids {
+            let resource = format!("artifact:{id}");
+            match rows.iter().find(|row| row.resource == resource) {
+                None => return Some(Evidence::Pending { have: 0, want: 1 }),
+                Some(row) if row.state == CustodyState::Open => {
+                    return Some(Evidence::Pending {
+                        have: row.materialized,
+                        want: row.total_bytes.unwrap_or(row.materialized),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
+    fn transcript_mark(&self, rows: &[&SpokeCustody], mark: &Mark) -> Result<Evidence> {
         if mark.generation.is_empty() {
             let reason = rows
                 .iter()
-                .filter(mine)
                 .find(|row| row.resource == BARE_TRANSCRIPT)
                 .and_then(|row| row.reason.clone())
                 .unwrap_or_else(|| "the spoke reported no transcript watermark".to_owned());
             return Ok(Evidence::Unavailable(reason));
         }
         let resource = format!("transcript:{}", mark.generation);
-        let Some(row) = rows.iter().filter(mine).find(|row| row.resource == resource) else {
+        let Some(row) = rows.iter().find(|row| row.resource == resource) else {
             return Ok(if mark.through == 0 {
                 Evidence::Unavailable("the transcript is empty at this boundary".to_owned())
             } else {
@@ -745,7 +799,10 @@ impl Custody {
             .transpose()
     }
 
-    /// The execution's newest transcript, whatever its state.
+    /// The execution's newest transcript generation that holds bytes.
+    ///
+    /// Adapter tests and generation-advancing readers use this to find the
+    /// active file when a run has more than one transcript generation.
     pub fn latest_transcript(&self, execution_id: &str) -> Result<Option<(TranscriptSource, CustodyState)>> {
         let rows = self.db.spoke_custody_for_execution(execution_id)?;
         rows.iter()
@@ -763,22 +820,30 @@ impl Custody {
         })
     }
 
-    /// The last `max_bytes` of a held transcript or log file.
-    pub fn read_tail(&self, source: &TranscriptSource, max_bytes: u64) -> Result<String> {
-        write::tail(&source.path, max_bytes).with_context(|| format!("reading {}", source.path.display()))
-    }
-
     /// The last `max_bytes` of the file at `path` if the ledger recorded it as
     /// one of ours, and `None` for any other path: custody never opens a path it
     /// did not write, least of all one that names a file on a spoke's host.
+    /// Halted or invalid rows are an error, not a silent miss, so a caller
+    /// cannot fall through to another path. The read is bounded to the
+    /// committed watermark.
     pub fn read_tail_at(&self, path: &Path, max_bytes: u64) -> Result<Option<String>> {
         let Some(relative) = path.strip_prefix(&self.root).ok().and_then(Path::to_str) else {
             return Ok(None);
         };
-        if self.db.spoke_custody_at(relative)?.is_none() {
+        let Some(row) = self.db.spoke_custody_at(relative)? else {
             return Ok(None);
+        };
+        match row.state {
+            CustodyState::Halted | CustodyState::Invalid => {
+                anyhow::bail!(
+                    "the hub's copy of this transcript is {}: {}",
+                    row.state.as_str(),
+                    row.reason.as_deref().unwrap_or("unusable")
+                );
+            }
+            _ => {}
         }
-        write::tail(path, max_bytes)
+        write::tail(path, row.materialized, max_bytes)
             .map(Some)
             .with_context(|| format!("reading {}", path.display()))
     }
@@ -797,7 +862,7 @@ impl Custody {
         };
         let path = self.root.join(&row.path);
         Ok(Some(
-            write::tail(&path, max_bytes).with_context(|| format!("reading {}", path.display()))?,
+            write::tail(&path, row.materialized, max_bytes).with_context(|| format!("reading {}", path.display()))?,
         ))
     }
 
@@ -831,7 +896,13 @@ impl Custody {
             (Some(artifact), Some(gap)) if gap.source_sequence > artifact.source_sequence => from_gap(gap),
             (Some(artifact), _) => self.artifact_evidence(artifact, kind),
             (None, Some(gap)) => from_gap(gap),
-            (None, None) => capture.map_or(OutputEvidence::Absent, |gap| from_gap(gap)),
+            (None, None) => {
+                if expected_output(&rows, kind) {
+                    OutputEvidence::Incomplete { have: 0, total: 0 }
+                } else {
+                    capture.map_or(OutputEvidence::Absent, |gap| from_gap(gap))
+                }
+            }
         })
     }
 
@@ -900,16 +971,41 @@ impl Custody {
 
     // ── Retention ───────────────────────────────────────────────────────────
 
-    /// Remove an execution's custody files and ledger rows. The caller decides
-    /// that the execution is finished and past retention; this never judges
-    /// liveness. Returns the bytes freed.
+    /// Remove an execution's recorded custody files and ledger rows. The caller
+    /// decides that the execution is finished and past retention; this never
+    /// judges liveness. Only paths the ledger recorded are deleted. Returns the
+    /// bytes those files occupied.
     pub fn reclaim_execution(&self, execution_id: &str) -> Result<u64> {
-        let dir = self.root.join(segment(execution_id)?).join("spoke");
-        let bytes = write::tree_bytes(&dir);
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("removing {}", dir.display())),
+        let rows = self.db.spoke_custody_for_execution(execution_id)?;
+        let mut bytes = 0;
+        let mut parents = Vec::new();
+        for row in &rows {
+            if row.path.is_empty() {
+                continue;
+            }
+            let path = self.root.join(&row.path);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                bytes += meta.len();
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| format!("removing {}", path.display())),
+            }
+            if let Some(parent) = path.parent() {
+                parents.push(parent.to_path_buf());
+            }
+        }
+        parents.sort();
+        parents.dedup();
+        for parent in parents.into_iter().rev() {
+            let _ = std::fs::remove_dir(&parent);
+        }
+        if let Ok(spoke) = segment(execution_id).map(|id| self.root.join(id).join("spoke")) {
+            let _ = std::fs::remove_dir(&spoke);
+            if let Some(execution) = spoke.parent() {
+                let _ = std::fs::remove_dir(execution);
+            }
         }
         // Rows go after the files: a crash between leaves rows whose files are
         // already gone, which the next pass removes.
@@ -929,7 +1025,7 @@ struct Spec {
 struct ArtifactSpec {
     kind: i32,
     total: u64,
-    digest: Option<String>,
+    digest: String,
     metadata: String,
 }
 
@@ -962,20 +1058,46 @@ fn segment(text: &str) -> Result<&str> {
     }
 }
 
-/// The whole-content SHA-256 an artifact's identity carries: `<kind>:<64 hex>`.
-fn identity_digest(artifact_id: &str) -> Option<String> {
-    let (_, digest) = artifact_id.rsplit_once(':')?;
-    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| digest.to_ascii_lowercase())
+/// The whole-content SHA-256 an artifact's identity carries: `<kind>:<64 hex>`,
+/// with `kind` matching the chunk's [`ArtifactKind`].
+fn identity_digest(artifact_id: &str, kind: i32) -> std::result::Result<String, String> {
+    let Some((prefix, digest)) = artifact_id.rsplit_once(':') else {
+        return Err("the artifact identity is not kind:digest".into());
+    };
+    if prefix != kind.to_string() {
+        return Err(format!(
+            "the artifact identity names kind {prefix}, not the chunk's kind {kind}"
+        ));
+    }
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("the artifact identity does not carry a SHA-256 digest".into());
+    }
+    Ok(digest.to_ascii_lowercase())
 }
 
 fn verified(path: &Path, artifact: &ArtifactSpec) -> std::result::Result<(), String> {
     let actual = write::digest_hex(path, artifact.total)?;
-    match &artifact.digest {
-        Some(expected) if *expected != actual => Err(format!(
-            "the artifact's bytes hash to {actual}, not the {expected} its identity names"
-        )),
-        _ => Ok(()),
+    if artifact.digest != actual {
+        return Err(format!(
+            "the artifact's bytes hash to {actual}, not the {} its identity names",
+            artifact.digest
+        ));
     }
+    Ok(())
+}
+
+fn expected_output(rows: &[&SpokeCustody], kind: StructuredOutputKind) -> bool {
+    let Some(concluded) = rows.iter().find(|row| row.resource == OUTPUT_CONCLUDED) else {
+        return false;
+    };
+    let ids: Vec<String> = serde_json::from_str(concluded.reason.as_deref().unwrap_or("[]")).unwrap_or_default();
+    ids.iter().any(|id| {
+        let prefix = id.split_once(':').map(|(kind, _)| kind);
+        match kind {
+            StructuredOutputKind::PrUrl => prefix == Some(&(ArtifactKind::PrUrl as i32).to_string()),
+            _ => prefix == Some(&(ArtifactKind::ReviewResult as i32).to_string()),
+        }
+    })
 }
 
 fn output_matches(row: &SpokeCustody, kind: StructuredOutputKind) -> bool {
@@ -1219,7 +1341,7 @@ mod tests {
             source.path.starts_with(&source.root),
             "readers can confine the path to the run's directory"
         );
-        assert_eq!(f.custody.read_tail(&source, 4).unwrap(), "6789");
+        assert_eq!(f.custody.read_tail_at(&source.path, 4).unwrap().unwrap(), "6789");
     }
 
     #[test]
@@ -1284,6 +1406,7 @@ mod tests {
                 total: whole.len() as u64
             }
         );
+        f.gap(2, OUTPUT_CONCLUDED, 0, &format!(r#"["{id}"]"#));
         // A settled boundary does not read it half-written.
         assert!(matches!(
             f.custody
@@ -1291,7 +1414,7 @@ mod tests {
                 .unwrap(),
             Evidence::Pending { have: 10, .. }
         ));
-        f.artifact(2, chunk(&id, ArtifactKind::PrUrl, whole, 10, whole.len() - 10, ""));
+        f.artifact(3, chunk(&id, ArtifactKind::PrUrl, whole, 10, whole.len() - 10, ""));
         assert_eq!(f.row(&format!("artifact:{id}")).state, CustodyState::Complete);
 
         let destination = path_for(&f.dir.path().join("out"), "exec_1", StructuredOutputKind::PrUrl);
@@ -1450,5 +1573,113 @@ mod tests {
         };
         assert!(f.custody.apply_transcript(&source, &delta("0-1", 0, b"x")).is_err());
         assert!(!f.dir.path().join("escape").exists());
+    }
+
+    #[test]
+    fn a_malformed_artifact_identity_is_invalid_not_complete() {
+        let f = fixture();
+        let whole = br#"{"pr_url":"https://github.com/o/r/pull/1"}"#;
+        let mut bad = chunk("not-a-digest", ArtifactKind::PrUrl, whole, 0, whole.len(), "");
+        bad.artifact_id = "4:zzzz".into();
+        assert!(matches!(
+            f.artifact(1, bad),
+            Applied::Recorded | Applied::Halted { .. } | Applied::Ignored(_)
+        ));
+        let row = f.row("artifact:4:zzzz");
+        assert_eq!(row.state, CustodyState::Invalid);
+        assert!(row.reason.as_deref().unwrap_or("").contains("SHA-256 digest"));
+
+        let g = fixture();
+        let mut wrong_kind = chunk(
+            &identity(ArtifactKind::PrUrl, whole),
+            ArtifactKind::ReviewResult,
+            whole,
+            0,
+            whole.len(),
+            "review-result",
+        );
+        wrong_kind.artifact_id = identity(ArtifactKind::PrUrl, whole);
+        assert!(matches!(g.artifact(1, wrong_kind), Applied::Recorded));
+        assert_eq!(
+            g.row(&format!("artifact:{}", identity(ArtifactKind::PrUrl, whole)))
+                .state,
+            CustodyState::Invalid
+        );
+    }
+
+    #[test]
+    fn writing_past_the_declared_total_halts_and_an_artifact_gap_closes_it() {
+        let f = fixture();
+        let whole = br#"{"a":1}"#;
+        let id = identity(ArtifactKind::ReviewResult, whole);
+        let mut over = chunk(&id, ArtifactKind::ReviewResult, whole, 0, whole.len(), "review-result");
+        over.total_bytes = 2;
+        over.eof = false;
+        assert!(is_halted(&f.artifact(1, over)));
+
+        let g = fixture();
+        g.artifact(1, chunk(&id, ArtifactKind::ReviewResult, whole, 0, 3, "review-result"));
+        assert_eq!(g.row(&format!("artifact:{id}")).state, CustodyState::Open);
+        g.gap(2, &format!("artifact:{id}"), 3, "the source vanished");
+        assert_eq!(g.row(&format!("artifact:{id}")).state, CustodyState::Unavailable);
+    }
+
+    #[test]
+    fn a_named_output_with_no_row_stays_pending_until_capture_concludes() {
+        let f = fixture();
+        f.transcript(1, "0-1", 0, b"hello");
+        assert!(matches!(
+            f.custody
+                .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
+                .unwrap(),
+            Evidence::Pending { .. }
+        ));
+        let whole = br#"{"pr_url":"https://github.com/o/r/pull/1"}"#;
+        let id = identity(ArtifactKind::PrUrl, whole);
+        f.gap(2, OUTPUT_CONCLUDED, 0, &format!(r#"["{id}"]"#));
+        assert!(matches!(
+            f.custody
+                .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
+                .unwrap(),
+            Evidence::Pending { have: 0, want: 1 }
+        ));
+        assert_eq!(
+            f.custody
+                .output_evidence("exec_1", StructuredOutputKind::PrUrl)
+                .unwrap(),
+            OutputEvidence::Incomplete { have: 0, total: 0 }
+        );
+        f.artifact(3, chunk(&id, ArtifactKind::PrUrl, whole, 0, whole.len(), ""));
+        let Evidence::Ready(_) = f
+            .custody
+            .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
+            .unwrap()
+        else {
+            panic!("named output is collectable once complete");
+        };
+    }
+
+    #[test]
+    fn a_halted_transcript_is_not_served_and_reads_stop_at_the_watermark() {
+        let f = fixture();
+        f.transcript(1, "0-1", 0, b"abcdef");
+        let path = f.file("transcript:0-1");
+        std::fs::write(&path, b"abcdefSTALE").unwrap();
+        assert_eq!(f.custody.read_tail_at(&path, 20).unwrap().as_deref(), Some("abcdef"));
+        f.gap(2, "transcript:0-1", 0, "source replaced");
+        // Unavailable still serves the committed prefix.
+        assert_eq!(f.custody.read_tail_at(&path, 20).unwrap().as_deref(), Some("abcdef"));
+        let g = fixture();
+        g.transcript(1, "0-1", 0, b"abcd");
+        assert!(is_halted(&g.transcript(2, "0-1", 20, b"zz")));
+        let halted = g.file("transcript:0-1");
+        assert!(
+            g.custody
+                .read_tail_at(&halted, 20)
+                .unwrap_err()
+                .to_string()
+                .contains("halted"),
+            "a halted copy is not served as ordinary text"
+        );
     }
 }

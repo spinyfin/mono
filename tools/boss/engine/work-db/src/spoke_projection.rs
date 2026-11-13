@@ -655,12 +655,66 @@ impl WorkDb {
                 SELECT {EFFECT_COLUMNS},
                        ROW_NUMBER() OVER (PARTITION BY host_id ORDER BY sequence, effect_kind) AS rn
                   FROM spoke_effects
-                 WHERE state = 'pending'
+                 WHERE state = 'pending' AND effect_kind != 'pending_observation'
              ) WHERE rn <= ?1
              ORDER BY host_id, sequence, effect_kind"
         ))?;
         let rows = statement.query_map([limit], map_effect)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Pending completion work parked so the host cursor can move: Stop and
+    /// proposal observations waiting for transcript or artifact bytes.
+    pub fn pending_spoke_observations(&self) -> Result<Vec<SpokeEffect>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {EFFECT_COLUMNS} FROM spoke_effects
+              WHERE state = 'pending' AND effect_kind = 'pending_observation'
+              ORDER BY host_id, sequence"
+        ))?;
+        let rows = statement.query_map([], map_effect)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether this run already has a parked observation waiting to apply.
+    pub fn spoke_run_has_pending_observation(&self, host_id: &str, run_id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM spoke_effects
+              WHERE host_id = ?1 AND effect_kind = 'pending_observation' AND state = 'pending'
+                AND effect_key LIKE ?2)",
+            params![host_id, format!("{run_id}:%")],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Record one effect without moving the projection cursor. Used when parked
+    /// completion work settles after its record has already been applied.
+    pub fn record_spoke_effect(
+        &self,
+        host_id: &str,
+        journal_id: &str,
+        sequence: u64,
+        effect: NewSpokeEffect<'_>,
+    ) -> Result<()> {
+        let now = now_ms();
+        self.connect()?.execute(
+            "INSERT OR IGNORE INTO spoke_effects
+                (host_id, journal_id, sequence, effect_kind, effect_key, state, payload,
+                 last_error, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![
+                host_id,
+                journal_id,
+                sequence as i64,
+                effect.kind,
+                effect.key,
+                effect.state.as_str(),
+                effect.payload,
+                effect.error,
+                now
+            ],
+        )?;
+        Ok(())
     }
 
     /// Settle one delivery attempt. A settled effect is never reopened, so a
