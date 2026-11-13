@@ -84,14 +84,25 @@ impl Platform {
             .ok_or_else(|| Error::Malformed(format!("unknown platform {text:?}")))
     }
 
+    /// Package id for a host's reported `(os, arch)` pair, matching inventory.
+    pub fn from_os_arch(os: &str, arch: &str) -> Option<Self> {
+        match (os, arch) {
+            ("macos", "aarch64") => Some(Self::MacosArm64),
+            ("linux", "x86_64") => Some(Self::LinuxAmd64),
+            ("linux", "aarch64") => Some(Self::LinuxArm64),
+            _ => None,
+        }
+    }
+
     /// The platform this process is running on.
     pub fn host() -> Result<Self, Error> {
-        match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("macos", "aarch64") => Ok(Self::MacosArm64),
-            ("linux", "x86_64") => Ok(Self::LinuxAmd64),
-            ("linux", "aarch64") => Ok(Self::LinuxArm64),
-            (os, arch) => Err(Error::UnsupportedHost(format!("{os}/{arch} has no spoke package"))),
-        }
+        Self::from_os_arch(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
+            Error::UnsupportedHost(format!(
+                "{}/{} has no spoke package",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ))
+        })
     }
 
     pub const fn is_macos(self) -> bool {

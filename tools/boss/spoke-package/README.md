@@ -157,14 +157,8 @@ neither the current nor the previous binary can start. A host id never changes a
 (the journal belongs to it).
 
 A hand `install` of a newer package still does not roll back automatically:
-that path is disaster recovery. After the first install, the hub keeps a live
-host current: it offers the Boss release it itself is running, one host at a
-time, over the management contract. No person, SSH, or external management
-system is involved in routine upgrades. `bossctl hosts list` and `bossctl hosts
-show` display each host's running release, the hub's desired release, and the
-last upgrade attempt (time, result, error). A host that is behind or whose
-upgrade failed is labelled as such. A hand reinstall is only disaster recovery
-when neither the current nor the previous binary on the host can start.
+that path is disaster recovery. The helper path is what keeps a live host
+current.
 
 ## Checking a host: `preflight`
 

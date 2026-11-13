@@ -24,7 +24,14 @@ use crate::{
 
 /// Buildkite's per-build key that passes a release tag from `prepare` to the
 /// build and publish phases. Pipelines are isolated, so one fixed key is safe.
+/// Override with `RELEASE_TAG_KEY` when two products share a Buildkite build
+/// (Boss app + matching spoke packages).
 pub const BUILDKITE_TAG_KEY: &str = "release-tag";
+
+/// Pin `prepare` to this version instead of incrementing the product counter.
+/// Used so spoke packages are tagged `boss-spoke-v{Boss version}`.
+const PIN_VERSION_ENV: &str = "RELEASE_PIN_VERSION";
+const TAG_KEY_ENV: &str = "RELEASE_TAG_KEY";
 
 const UPLOAD_ATTEMPTS: usize = 3;
 const VERSION_PLACEHOLDER: &str = "{version}";
@@ -87,6 +94,24 @@ pub fn prepare(
     buildkite_job_id: Option<&str>,
     resume_draft: bool,
 ) -> Result<PrepareOutcome> {
+    prepare_with_pin(
+        runner,
+        config,
+        trigger_source,
+        buildkite_job_id,
+        resume_draft,
+        pin_version_from_env().as_deref(),
+    )
+}
+
+fn prepare_with_pin(
+    runner: &impl CommandRunner,
+    config: &ReleaseConfig,
+    trigger_source: &str,
+    buildkite_job_id: Option<&str>,
+    resume_draft: bool,
+    pin_version: Option<&str>,
+) -> Result<PrepareOutcome> {
     let trigger = assert_allowed_trigger(trigger_source)?;
     fetch_tags(runner)?;
 
@@ -97,7 +122,8 @@ pub fn prepare(
     let last_published_sha = resolve_tag_sha(runner, config, state.last.published.as_ref())?;
     let last_draft_sha = resolve_tag_sha(runner, config, state.last.draft.as_ref())?;
 
-    if let (Some(draft), Some(draft_sha)) = (&state.last.draft, last_draft_sha.as_deref())
+    if pin_version.is_none()
+        && let (Some(draft), Some(draft_sha)) = (&state.last.draft, last_draft_sha.as_deref())
         && draft_sha == head_sha
     {
         if trigger == Trigger::Schedule && !resume_draft {
@@ -110,6 +136,41 @@ pub fn prepare(
         return Ok(PrepareOutcome::Resumed {
             tag: draft.tag_name.clone(),
         });
+    }
+
+    if let Some(version) = pin_version {
+        let tag = format!("{}{version}", config.tag_prefix);
+        if state
+            .releases
+            .iter()
+            .any(|release| release.tag_name == tag && !release.draft)
+        {
+            eprintln!("release skipped: {tag} is already published");
+            return Ok(PrepareOutcome::Skipped);
+        }
+        if let Some(draft) = state
+            .releases
+            .iter()
+            .find(|release| release.tag_name == tag && release.draft)
+        {
+            record_tag(runner, buildkite_job_id, &draft.tag_name)?;
+            return Ok(PrepareOutcome::Resumed {
+                tag: draft.tag_name.clone(),
+            });
+        }
+        create_draft(
+            runner,
+            DraftRequest {
+                config,
+                repo_root: &repo_root,
+                notes_start_tag: state.last.published.as_ref().map(|release| release.tag_name.as_str()),
+                head_sha: &head_sha,
+                tag: &tag,
+                version,
+                buildkite_job_id,
+            },
+        )?;
+        return Ok(PrepareOutcome::Created { tag });
     }
 
     let changed_paths =
@@ -169,13 +230,13 @@ pub fn read_tag(runner: &impl CommandRunner, buildkite_job_id: Option<&str>) -> 
             [
                 "meta-data".to_owned(),
                 "get".to_owned(),
-                BUILDKITE_TAG_KEY.to_owned(),
+                tag_metadata_key(),
                 "--default".to_owned(),
                 String::new(),
             ],
         ),
     )
-    .with_context(|| format!("could not read {BUILDKITE_TAG_KEY} for Buildkite job {job_id}"))?;
+    .with_context(|| format!("could not read {} for Buildkite job {job_id}", tag_metadata_key()))?;
     let tag = output.stdout.trim();
     if tag.is_empty() {
         return Ok(None);
@@ -538,10 +599,50 @@ fn record_tag(runner: &impl CommandRunner, buildkite_job_id: Option<&str>, tag: 
     }
     run_checked(
         runner,
-        Command::new("buildkite-agent", ["meta-data", "set", BUILDKITE_TAG_KEY, tag]),
+        Command::new("buildkite-agent", ["meta-data", "set", &tag_metadata_key(), tag]),
     )
     .context("could not record release tag in Buildkite metadata")?;
     Ok(())
+}
+
+fn tag_metadata_key() -> String {
+    std::env::var(TAG_KEY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| BUILDKITE_TAG_KEY.to_owned())
+}
+
+pub fn pin_version_from_env() -> Option<String> {
+    std::env::var(PIN_VERSION_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Asset names a release script passes to `bin/release upload --asset name=`.
+/// `${platform}` expands to macos-arm64, linux-amd64 and linux-arm64.
+pub fn upload_asset_names_from_script(script: &str) -> Vec<String> {
+    const PLATFORMS: [&str; 3] = ["macos-arm64", "linux-amd64", "linux-arm64"];
+    let mut names = Vec::new();
+    for line in script.lines() {
+        let mut cursor = line;
+        while let Some(start) = cursor.find("--asset ") {
+            let after = cursor[start + "--asset ".len()..].trim_start_matches(['"', '\'']);
+            let Some((name, _)) = after.split_once('=') else {
+                break;
+            };
+            let name = name.trim_matches(['"', '\'']);
+            if name.contains("${platform}") {
+                names.extend(PLATFORMS.iter().map(|platform| name.replace("${platform}", platform)));
+            } else {
+                names.push(name.to_owned());
+            }
+            cursor = &cursor[start + "--asset ".len()..];
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -1176,6 +1277,120 @@ source = "github-generated"
                 call.program == "git" && call.args == ["rev-parse", "--show-toplevel"].map(str::to_owned)
             })
         );
+    }
+
+    #[test]
+    fn prepare_pins_an_exact_version_instead_of_incrementing() {
+        let root = tempdir().expect("repo root");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            success(""),
+            repo_root_response(root.path()),
+            success(r#"[{"tag_name":"demo-v1.0.5","draft":false}]"#),
+            success("sha\trefs/tags/demo-v1.0.5\n"),
+            success("head\n"),
+            success("oldsha\n"),
+            success(""),
+            failure("not found"),
+            success(""),
+            success(""),
+            success(""),
+            success(""),
+        ]);
+        let outcome = prepare_with_pin(&runner, &config, "ui", Some("job-1"), false, Some("1.0.42")).expect("prepare");
+        assert_eq!(
+            outcome,
+            PrepareOutcome::Created {
+                tag: "demo-v1.0.42".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn prepare_skips_a_pin_that_is_already_published() {
+        let root = tempdir().expect("repo root");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            success(""),
+            repo_root_response(root.path()),
+            success(r#"[{"tag_name":"demo-v1.0.5","draft":false}]"#),
+            success("sha\trefs/tags/demo-v1.0.5\n"),
+            success("head\n"),
+            success("oldsha\n"),
+        ]);
+        let outcome = prepare_with_pin(&runner, &config, "ui", Some("job-1"), false, Some("1.0.5")).expect("prepare");
+        assert_eq!(outcome, PrepareOutcome::Skipped);
+    }
+
+    #[test]
+    fn spoke_catalog_upload_names_are_declared_in_the_release_config() {
+        // Mirrors .buildkite/steps/spoke-release.sh --asset flags and
+        // tools/boss/spoke-release.toml. ${platform} expands to all three ids.
+        let script = r#"
+  bin/release upload --config "${CONFIG}" --tag "${tag}" \
+    --asset "boss-spoke-${platform}.tar.gz=${out}/boss-spoke-${platform}.tar.gz" \
+    --asset "boss-spoke-${platform}.manifest.json=${out}/boss-spoke-${platform}.manifest.json" \
+    --asset "boss-spoke-${platform}.manifest.json.sig=${out}/boss-spoke-${platform}.manifest.json.sig" \
+    --asset "boss-spoke-package-${platform}=${installer}" \
+    --asset "boss-spoke-package-${platform}.sig=${out}/boss-spoke-package-${platform}.sig" \
+    --asset "spoke-packages.${platform}.json=${catalog}"
+  bin/release upload --config "${CONFIG}" --tag "${tag}" \
+    --asset "spoke-packages.json=${work}/spoke-packages.json"
+"#;
+        let config = ReleaseConfig::parse(
+            r#"
+repo = "spinyfin/mono"
+tag_prefix = "boss-spoke-v"
+title_prefix = "Boss spoke"
+change_paths = ["tools/boss/"]
+required_assets = [
+  "boss-spoke-macos-arm64.tar.gz",
+  "boss-spoke-macos-arm64.manifest.json",
+  "boss-spoke-macos-arm64.manifest.json.sig",
+  "boss-spoke-package-macos-arm64",
+  "boss-spoke-package-macos-arm64.sig",
+  "boss-spoke-linux-amd64.tar.gz",
+  "boss-spoke-linux-amd64.manifest.json",
+  "boss-spoke-linux-amd64.manifest.json.sig",
+  "boss-spoke-package-linux-amd64",
+  "boss-spoke-package-linux-amd64.sig",
+  "spoke-packages.macos-arm64.json",
+  "spoke-packages.linux-amd64.json",
+  "spoke-packages.json",
+]
+optional_assets = [
+  "boss-spoke-linux-arm64.tar.gz",
+  "boss-spoke-linux-arm64.manifest.json",
+  "boss-spoke-linux-arm64.manifest.json.sig",
+  "boss-spoke-package-linux-arm64",
+  "boss-spoke-package-linux-arm64.sig",
+  "spoke-packages.linux-arm64.json",
+]
+[version]
+scheme = "patch-counter"
+major_minor = "1.0"
+[notes]
+source = "github-generated"
+"#,
+        )
+        .expect("config");
+        let names = upload_asset_names_from_script(script);
+        assert!(names.contains(&"spoke-packages.json".to_owned()), "{names:?}");
+        assert!(
+            names.contains(&"spoke-packages.macos-arm64.json".to_owned()),
+            "{names:?}"
+        );
+        let dummy = tempdir().expect("asset file");
+        let file = dummy.path().join("asset");
+        std::fs::write(&file, b"x").expect("write");
+        let assets: Vec<Asset> = names
+            .iter()
+            .map(|name| Asset {
+                name: name.clone(),
+                source: file.clone(),
+            })
+            .collect();
+        validate_upload_assets(&config, "boss-spoke-v1.0.9", &assets).expect("every uploaded name is declared");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use boss_host_enrollment::HostCredentials;
 use boss_protocol_spoke::v1::enrollment_client::EnrollmentClient;
@@ -240,6 +241,231 @@ async fn refused_upgrade_halts_without_offering_the_next_host() {
     let rollout_row = db.spoke_upgrade_rollout().unwrap().unwrap();
     assert!(rollout_row.halted);
     tick(&controller).await;
+    second.expect_no_command().await;
+
+    let view = db.host_upgrade_view("edge-a").unwrap().unwrap();
+    assert_eq!(view.state, HostUpgradeState::Failed);
+    assert_eq!(view.last_upgrade_result.as_deref(), Some("refused"));
+    assert_eq!(view.last_upgrade_error.as_deref(), Some("upgrade_busy"));
+    assert!(view.last_upgrade_at.is_some());
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_helper_failure_does_not_halt_a_new_offer() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
+    first
+        .report_inventory("1.0.1", "manifest_sig", "old", "upgrade-edge-a-1.0.1")
+        .await;
+    second.report_inventory("1.0.1", "", "", "").await;
+
+    let controller = shared(rollout(&db, &hub, Some(published_catalog())));
+    tick_offer(&controller, &mut first).await;
+    tick(&controller).await;
+    second.expect_no_command().await;
+    let rollout_row = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert!(
+        !rollout_row.halted,
+        "stale helper failure must not halt the new command"
+    );
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_running_release_without_helper_ok_does_not_advance() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
+    first.report_inventory("1.0.1", "", "", "").await;
+    second.report_inventory("1.0.1", "", "", "").await;
+
+    let controller = shared(rollout(&db, &hub, Some(published_catalog())));
+    let command = tick_offer(&controller, &mut first).await;
+    first.report_inventory(DESIRED, "", "", &command.command_id).await;
+    tick(&controller).await;
+    second.expect_no_command().await;
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_without_a_catalog_package_does_not_block_the_fleet() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut arm = enroll_and_connect(&hub, &fx.credentials, "edge-arm").await;
+    let mut amd = enroll_and_connect(&hub, &fx.credentials, "edge-amd").await;
+    arm.report_inventory_on("linux", "aarch64", "1.0.1", "", "", "").await;
+    amd.report_inventory("1.0.1", "", "", "").await;
+
+    let controller = shared(rollout(&db, &hub, Some(published_catalog())));
+    let command = tick_offer(&controller, &mut amd).await;
+    assert_eq!(command.command_id, upgrade_command_id("edge-amd", DESIRED));
+    arm.expect_no_command().await;
+    let view = db.host_upgrade_view("edge-arm").unwrap().unwrap();
+    assert_eq!(view.state, HostUpgradeState::Unpublished);
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_before_append_resubmits_the_saved_command() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut peer = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    peer.report_inventory("1.0.1", "", "", "").await;
+
+    let command_id = upgrade_command_id("edge-a", DESIRED);
+    let command = v1::Command {
+        command_id: command_id.clone(),
+        not_after_unix_ms: 4_102_444_800_000,
+        body: Some(v1::command::Body::Upgrade(v1::Upgrade {
+            release_id: DESIRED.into(),
+            manifest_url: MANIFEST_URL.into(),
+            manifest_sha256: decode_sha256(DIGEST_HEX).unwrap(),
+        })),
+        ..Default::default()
+    };
+    let mut row = boss_work_db::SpokeUpgradeRollout::for_release(DESIRED, true);
+    row.in_flight_host_id = Some("edge-a".into());
+    row.in_flight_command_id = Some(command_id);
+    row.in_flight_release = Some(DESIRED.into());
+    row.in_flight_command = Some(prost::Message::encode_to_vec(&command));
+    db.save_spoke_upgrade_rollout(&row).unwrap();
+
+    let controller = shared(rollout(&db, &hub, Some(published_catalog())));
+    let offered = tick_offer(&controller, &mut peer).await;
+    assert_eq!(offered.command_id, upgrade_command_id("edge-a", DESIRED));
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_refusal_is_read_from_the_durable_outbox() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
+    first.report_inventory("1.0.1", "", "", "").await;
+    second.report_inventory("1.0.1", "", "", "").await;
+
+    let controller = shared(
+        UpgradeController::new(
+            db.clone(),
+            hub.stream.manager().clone(),
+            DESIRED,
+            Arc::new(boss_spoke_upgrade::StaticCatalog(Some(published_catalog()))),
+        )
+        .with_command_deadline(Duration::from_millis(80)),
+    );
+    let ticking = {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move { controller.tick().await })
+    };
+    let command = first.take_command().await;
+    ticking.await.expect("join").expect("tick");
+    first
+        .send_record(result_record(
+            first.next_sequence,
+            &command.command_id,
+            ResultCode::Rejected,
+            "upgrade_busy",
+        ))
+        .await;
+    first.next_sequence += 1;
+    tick(&controller).await;
+    let rollout_row = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert!(rollout_row.halted);
+    second.expect_no_command().await;
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn desired_release_change_waits_for_the_outstanding_offer() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
+    first.report_inventory("1.0.1", "", "", "").await;
+    second.report_inventory("1.0.1", "", "", "").await;
+
+    let first_controller = shared(rollout(&db, &hub, Some(published_catalog())));
+    tick_offer(&first_controller, &mut first).await;
+
+    let mut next_catalog = published_catalog();
+    next_catalog.release_id = "1.0.10".into();
+    let next = shared(
+        UpgradeController::new(
+            db.clone(),
+            hub.stream.manager().clone(),
+            "1.0.10",
+            Arc::new(boss_spoke_upgrade::StaticCatalog(Some(next_catalog))),
+        )
+        .with_command_deadline(Duration::from_millis(80)),
+    );
+    tick(&next).await;
+    second.expect_no_command().await;
+    let outstanding = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert_eq!(outstanding.in_flight_host_id.as_deref(), Some("edge-a"));
+    assert_eq!(
+        outstanding.in_flight_command_id.as_deref(),
+        Some("upgrade-edge-a-1.0.9")
+    );
+    assert_eq!(outstanding.desired_release, "1.0.10");
+    first
+        .report_inventory(DESIRED, "ok", "", &upgrade_command_id("edge-a", DESIRED))
+        .await;
+    tick(&next).await;
+    let settled = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert!(
+        settled
+            .in_flight_command_id
+            .as_deref()
+            .is_some_and(|id| id.ends_with("-1.0.10")),
+        "after the outstanding offer settles, the new release is offered one host at a time, got {:?}",
+        settled.in_flight_command_id
+    );
+    assert!(!settled.halted);
+
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_flight_upgrade_times_out_while_connected() {
+    let fx = Credentials::new();
+    let (_dir, db) = work_db();
+    let hub = start(db.clone(), fx.credentials.clone()).await;
+    let mut first = enroll_and_connect(&hub, &fx.credentials, "edge-a").await;
+    let mut second = enroll_and_connect(&hub, &fx.credentials, "edge-b").await;
+    first.report_inventory("1.0.1", "", "", "").await;
+    second.report_inventory("1.0.1", "", "", "").await;
+
+    let controller = shared(
+        UpgradeController::new(
+            db.clone(),
+            hub.stream.manager().clone(),
+            DESIRED,
+            Arc::new(boss_spoke_upgrade::StaticCatalog(Some(published_catalog()))),
+        )
+        .with_upgrade_timeout(Duration::ZERO),
+    );
+    tick_offer(&controller, &mut first).await;
+    tick(&controller).await;
+    let rollout_row = db.spoke_upgrade_rollout().unwrap().unwrap();
+    assert!(rollout_row.halted);
+    assert_eq!(rollout_row.halt_reason.as_deref(), Some("upgrade_timeout"));
     second.expect_no_command().await;
 
     hub.stop().await;

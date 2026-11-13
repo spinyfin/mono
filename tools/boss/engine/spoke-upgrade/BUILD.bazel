@@ -16,7 +16,9 @@ rust_library(
     deps = [
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db",
+        "//tools/boss/http_retry",
         "//tools/boss/protocol-spoke",
+        "//tools/boss/spoke-package",
     ] + all_crate_deps(normal = True),
 )
 
@@ -35,7 +37,9 @@ rust_library(
     deps = [
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/http_retry",
         "//tools/boss/protocol-spoke",
+        "//tools/boss/spoke-package",
     ] + all_crate_deps(normal = True),
 )
 

@@ -8,6 +8,7 @@ use rusqlite::OptionalExtension;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const MIGRATION_ID: &str = "20261112_1200_spoke_upgrade_rollout";
+pub(crate) const PROGRESS_MIGRATION_ID: &str = "20261113_1400_spoke_upgrade_rollout_progress";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -31,17 +32,57 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             halt_reason TEXT,
             in_flight_host_id TEXT,
             in_flight_command_id TEXT,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            published_platforms TEXT NOT NULL DEFAULT '',
+            halt_at TEXT,
+            in_flight_release TEXT,
+            in_flight_offered_at TEXT,
+            in_flight_connected_secs INTEGER NOT NULL DEFAULT 0,
+            in_flight_last_progress_at TEXT,
+            in_flight_command BLOB
          );",
     )?;
     Ok(())
 }
 
-fn now_epoch_string() -> String {
+pub(crate) fn migrate_progress(conn: &Connection) -> Result<()> {
+    let columns = [
+        ("published_platforms", "TEXT NOT NULL DEFAULT ''"),
+        ("halt_at", "TEXT"),
+        ("in_flight_release", "TEXT"),
+        ("in_flight_offered_at", "TEXT"),
+        ("in_flight_connected_secs", "INTEGER NOT NULL DEFAULT 0"),
+        ("in_flight_last_progress_at", "TEXT"),
+        ("in_flight_command", "BLOB"),
+    ];
+    for (name, ty) in columns {
+        if !crate::schema_init::table_has_column(conn, "spoke_upgrade_rollout", name)? {
+            conn.execute(&format!("ALTER TABLE spoke_upgrade_rollout ADD COLUMN {name} {ty}"), [])?;
+        }
+    }
+    Ok(())
+}
+
+pub fn unix_epoch_secs_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs().to_string())
         .unwrap_or_else(|_| "0".into())
+}
+
+/// Command id the hub uses for one host's upgrade to `release_id`.
+pub fn upgrade_command_id(host_id: &str, release_id: &str) -> String {
+    format!("upgrade-{host_id}-{release_id}")
+}
+
+/// Package id for inventory `(os, arch)`, matching `Platform::from_os_arch`.
+pub fn package_platform(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("macos-arm64"),
+        ("linux", "x86_64") => Some("linux-amd64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        _ => None,
+    }
 }
 
 /// What a spoke last reported about its install and helper.
@@ -65,15 +106,59 @@ pub struct HostUpgradeStatus {
 pub struct SpokeUpgradeRollout {
     pub desired_release: String,
     pub packages_published: bool,
+    #[builder(default)]
+    pub published_platforms: String,
     pub halted: bool,
     pub halt_host_id: Option<String>,
     pub halt_reason: Option<String>,
+    pub halt_at: Option<String>,
     pub in_flight_host_id: Option<String>,
     pub in_flight_command_id: Option<String>,
+    pub in_flight_release: Option<String>,
+    pub in_flight_offered_at: Option<String>,
+    #[builder(default)]
+    pub in_flight_connected_secs: i64,
+    pub in_flight_last_progress_at: Option<String>,
+    pub in_flight_command: Option<Vec<u8>>,
     pub updated_at: String,
 }
 
-/// Operator-visible upgrade state for one host. Never silent for behind/failed.
+impl SpokeUpgradeRollout {
+    pub fn for_release(desired: impl Into<String>, packages_published: bool) -> Self {
+        Self {
+            desired_release: desired.into(),
+            packages_published,
+            published_platforms: String::new(),
+            halted: false,
+            halt_host_id: None,
+            halt_reason: None,
+            halt_at: None,
+            in_flight_host_id: None,
+            in_flight_command_id: None,
+            in_flight_release: None,
+            in_flight_offered_at: None,
+            in_flight_connected_secs: 0,
+            in_flight_last_progress_at: None,
+            in_flight_command: None,
+            updated_at: unix_epoch_secs_string(),
+        }
+    }
+
+    pub fn platform_is_published(&self, os: &str, arch: &str) -> bool {
+        if !self.packages_published {
+            return false;
+        }
+        if self.published_platforms.is_empty() {
+            return true;
+        }
+        let Some(platform) = package_platform(os, arch) else {
+            return false;
+        };
+        self.published_platforms.split(',').any(|entry| entry == platform)
+    }
+}
+
+/// Upgrade state shown in host listings; behind and failed hosts always get a distinct state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostUpgradeState {
     Current,
@@ -111,7 +196,7 @@ fn nonempty(value: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value.to_owned()) }
 }
 
-fn helper_failed(result: &str) -> bool {
+pub fn helper_failed(result: &str) -> bool {
     !result.is_empty() && result != "ok"
 }
 
@@ -133,8 +218,17 @@ pub fn host_upgrade_view(
     let in_flight = rollout.is_some_and(|row| host_id.is_some_and(|id| row.in_flight_host_id.as_deref() == Some(id)));
     let halted_here =
         rollout.is_some_and(|row| row.halted && host_id.is_some_and(|id| row.halt_host_id.as_deref() == Some(id)));
-    let failed = status.is_some_and(|row| helper_failed(&row.last_upgrade_result)) || halted_here;
-    let state = if rollout.is_none_or(|row| !row.packages_published) {
+    let helper_for_desired = status.is_some_and(|row| {
+        let Some(rollout) = rollout else {
+            return false;
+        };
+        helper_failed(&row.last_upgrade_result)
+            && row.last_upgrade_command_id == upgrade_command_id(&row.host_id, &rollout.desired_release)
+    });
+    let failed = helper_for_desired || halted_here;
+    let platform_published =
+        rollout.is_none_or(|row| status.is_none_or(|host| row.platform_is_published(&host.os, &host.arch)));
+    let state = if rollout.is_none_or(|row| !row.packages_published) || !platform_published {
         HostUpgradeState::Unpublished
     } else if failed {
         HostUpgradeState::Failed
@@ -145,13 +239,40 @@ pub fn host_upgrade_view(
     } else {
         HostUpgradeState::Behind
     };
+    let (last_upgrade_at, last_upgrade_result, last_upgrade_error) = if halted_here {
+        let reason = rollout.and_then(|row| row.halt_reason.clone());
+        let at = rollout
+            .and_then(|row| row.halt_at.clone())
+            .or_else(|| status.and_then(|row| row.last_upgrade_at.clone()));
+        let helper_is_this_attempt = status.is_some_and(|row| {
+            rollout.is_some_and(|rollout| {
+                rollout.in_flight_command_id.as_deref() == Some(row.last_upgrade_command_id.as_str())
+                    || row.last_upgrade_command_id == upgrade_command_id(&row.host_id, &rollout.desired_release)
+            })
+        });
+        if helper_is_this_attempt {
+            (
+                status.and_then(|row| row.last_upgrade_at.clone()).or(at),
+                status.and_then(|row| nonempty(&row.last_upgrade_result)).or(reason),
+                status.and_then(|row| nonempty(&row.last_upgrade_error)),
+            )
+        } else {
+            (at, reason, None)
+        }
+    } else {
+        (
+            status.and_then(|row| row.last_upgrade_at.clone()),
+            status.and_then(|row| nonempty(&row.last_upgrade_result)),
+            status.and_then(|row| nonempty(&row.last_upgrade_error)),
+        )
+    };
     Some(HostUpgradeView {
         running_release: nonempty(running),
         desired_release: nonempty(desired),
         state,
-        last_upgrade_at: status.and_then(|row| row.last_upgrade_at.clone()),
-        last_upgrade_result: status.and_then(|row| nonempty(&row.last_upgrade_result)),
-        last_upgrade_error: status.and_then(|row| nonempty(&row.last_upgrade_error)),
+        last_upgrade_at,
+        last_upgrade_result,
+        last_upgrade_error,
     })
 }
 
@@ -179,6 +300,13 @@ fn map_rollout(row: &Row<'_>) -> rusqlite::Result<SpokeUpgradeRollout> {
         in_flight_host_id: row.get(5)?,
         in_flight_command_id: row.get(6)?,
         updated_at: row.get(7)?,
+        published_platforms: row.get(8)?,
+        halt_at: row.get(9)?,
+        in_flight_release: row.get(10)?,
+        in_flight_offered_at: row.get(11)?,
+        in_flight_connected_secs: row.get(12)?,
+        in_flight_last_progress_at: row.get(13)?,
+        in_flight_command: row.get(14)?,
     })
 }
 
@@ -187,7 +315,7 @@ impl WorkDb {
     /// Upsert the inventory a spoke reported on Capacity.
     pub fn record_host_inventory(&self, host_id: &str, inventory: &boss_protocol_spoke::v1::Inventory) -> Result<()> {
         let conn = self.connect()?;
-        let observed_at = now_epoch_string();
+        let observed_at = unix_epoch_secs_string();
         let previous: Option<String> = conn
             .query_row(
                 "SELECT last_upgrade_command_id FROM host_upgrade_status WHERE host_id = ?1",
@@ -250,7 +378,9 @@ impl WorkDb {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT desired_release, packages_published, halted, halt_host_id, halt_reason,
-                    in_flight_host_id, in_flight_command_id, updated_at
+                    in_flight_host_id, in_flight_command_id, updated_at,
+                    published_platforms, halt_at, in_flight_release, in_flight_offered_at,
+                    in_flight_connected_secs, in_flight_last_progress_at, in_flight_command
                FROM spoke_upgrade_rollout WHERE id = 1",
             [],
             map_rollout,
@@ -264,8 +394,10 @@ impl WorkDb {
         conn.execute(
             "INSERT INTO spoke_upgrade_rollout (
                 id, desired_release, packages_published, halted, halt_host_id, halt_reason,
-                in_flight_host_id, in_flight_command_id, updated_at
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                in_flight_host_id, in_flight_command_id, updated_at,
+                published_platforms, halt_at, in_flight_release, in_flight_offered_at,
+                in_flight_connected_secs, in_flight_last_progress_at, in_flight_command
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                 desired_release = excluded.desired_release,
                 packages_published = excluded.packages_published,
@@ -274,7 +406,14 @@ impl WorkDb {
                 halt_reason = excluded.halt_reason,
                 in_flight_host_id = excluded.in_flight_host_id,
                 in_flight_command_id = excluded.in_flight_command_id,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                published_platforms = excluded.published_platforms,
+                halt_at = excluded.halt_at,
+                in_flight_release = excluded.in_flight_release,
+                in_flight_offered_at = excluded.in_flight_offered_at,
+                in_flight_connected_secs = excluded.in_flight_connected_secs,
+                in_flight_last_progress_at = excluded.in_flight_last_progress_at,
+                in_flight_command = excluded.in_flight_command",
             params![
                 rollout.desired_release,
                 rollout.packages_published as i64,
@@ -284,7 +423,40 @@ impl WorkDb {
                 rollout.in_flight_host_id,
                 rollout.in_flight_command_id,
                 rollout.updated_at,
+                rollout.published_platforms,
+                rollout.halt_at,
+                rollout.in_flight_release,
+                rollout.in_flight_offered_at,
+                rollout.in_flight_connected_secs,
+                rollout.in_flight_last_progress_at,
+                rollout.in_flight_command,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a hub-side command outcome when the helper never ran.
+    pub fn record_upgrade_command_outcome(
+        &self,
+        host_id: &str,
+        command_id: &str,
+        result: &str,
+        error: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let observed_at = unix_epoch_secs_string();
+        conn.execute(
+            "INSERT INTO host_upgrade_status (
+                host_id, last_upgrade_command_id, last_upgrade_result, last_upgrade_error,
+                last_upgrade_at, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(host_id) DO UPDATE SET
+                last_upgrade_command_id = excluded.last_upgrade_command_id,
+                last_upgrade_result = excluded.last_upgrade_result,
+                last_upgrade_error = excluded.last_upgrade_error,
+                last_upgrade_at = excluded.last_upgrade_at,
+                observed_at = excluded.observed_at",
+            params![host_id, command_id, result, error, observed_at],
         )?;
         Ok(())
     }
@@ -369,16 +541,7 @@ mod tests {
             last_upgrade_at: None,
             observed_at: None,
         };
-        let rollout = SpokeUpgradeRollout {
-            desired_release: "1.0.2".into(),
-            packages_published: true,
-            halted: false,
-            halt_host_id: None,
-            halt_reason: None,
-            in_flight_host_id: None,
-            in_flight_command_id: None,
-            updated_at: "1".into(),
-        };
+        let rollout = SpokeUpgradeRollout::for_release("1.0.2", true);
         let view = host_upgrade_view(Some(&status), Some(&rollout)).unwrap();
         assert_eq!(view.state, HostUpgradeState::Behind);
         assert_eq!(view.running_release.as_deref(), Some("1.0.1"));
@@ -392,22 +555,13 @@ mod tests {
             running_release: "1.0.1".into(),
             os: String::new(),
             arch: String::new(),
-            last_upgrade_command_id: "up-1".into(),
+            last_upgrade_command_id: upgrade_command_id("edge", "1.0.2"),
             last_upgrade_result: "manifest_sig".into(),
             last_upgrade_error: "bad sig".into(),
             last_upgrade_at: Some("9".into()),
             observed_at: None,
         };
-        let unpublished = SpokeUpgradeRollout {
-            desired_release: "1.0.2".into(),
-            packages_published: false,
-            halted: false,
-            halt_host_id: None,
-            halt_reason: None,
-            in_flight_host_id: None,
-            in_flight_command_id: None,
-            updated_at: "1".into(),
-        };
+        let unpublished = SpokeUpgradeRollout::for_release("1.0.2", false);
         assert_eq!(
             host_upgrade_view(Some(&status), Some(&unpublished)).unwrap().state,
             HostUpgradeState::Unpublished
@@ -417,6 +571,7 @@ mod tests {
             halted: true,
             halt_host_id: Some("edge".into()),
             halt_reason: Some("manifest_sig".into()),
+            halt_at: Some("9".into()),
             ..unpublished.clone()
         };
         let failed = host_upgrade_view(Some(&status), Some(&halted)).unwrap();
@@ -428,16 +583,49 @@ mod tests {
     #[test]
     fn hosts_without_inventory_stay_blank() {
         assert!(host_upgrade_view(None, None).is_none());
-        let rollout = SpokeUpgradeRollout {
-            desired_release: "1.0.2".into(),
-            packages_published: true,
-            halted: false,
-            halt_host_id: None,
-            halt_reason: None,
-            in_flight_host_id: Some("other".into()),
-            in_flight_command_id: Some("up".into()),
-            updated_at: "1".into(),
-        };
+        let mut rollout = SpokeUpgradeRollout::for_release("1.0.2", true);
+        rollout.in_flight_host_id = Some("other".into());
+        rollout.in_flight_command_id = Some("up".into());
         assert!(host_upgrade_view(None, Some(&rollout)).is_none());
+    }
+
+    #[test]
+    fn stale_helper_failure_for_another_command_does_not_fail_the_view() {
+        let status = HostUpgradeStatus {
+            host_id: "edge".into(),
+            running_release: "1.0.1".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            last_upgrade_command_id: "upgrade-edge-1.0.1".into(),
+            last_upgrade_result: "manifest_sig".into(),
+            last_upgrade_error: "old".into(),
+            last_upgrade_at: Some("9".into()),
+            observed_at: None,
+        };
+        let mut rollout = SpokeUpgradeRollout::for_release("1.0.2", true);
+        rollout.published_platforms = "linux-amd64".into();
+        rollout.in_flight_host_id = Some("edge".into());
+        rollout.in_flight_command_id = Some("upgrade-edge-1.0.2".into());
+        let view = host_upgrade_view(Some(&status), Some(&rollout)).unwrap();
+        assert_eq!(view.state, HostUpgradeState::Upgrading);
+    }
+
+    #[test]
+    fn missing_platform_in_catalog_is_unpublished() {
+        let status = HostUpgradeStatus {
+            host_id: "edge".into(),
+            running_release: "1.0.1".into(),
+            os: "linux".into(),
+            arch: "aarch64".into(),
+            last_upgrade_command_id: String::new(),
+            last_upgrade_result: String::new(),
+            last_upgrade_error: String::new(),
+            last_upgrade_at: None,
+            observed_at: None,
+        };
+        let mut rollout = SpokeUpgradeRollout::for_release("1.0.2", true);
+        rollout.published_platforms = "linux-amd64".into();
+        let view = host_upgrade_view(Some(&status), Some(&rollout)).unwrap();
+        assert_eq!(view.state, HostUpgradeState::Unpublished);
     }
 }

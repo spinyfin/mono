@@ -40,6 +40,9 @@ required_assets = [
   "boss-spoke-linux-amd64.manifest.json.sig",
   "boss-spoke-package-linux-amd64",
   "boss-spoke-package-linux-amd64.sig",
+  "spoke-packages.macos-arm64.json",
+  "spoke-packages.linux-amd64.json",
+  "spoke-packages.json",
 ]
 # No Linux arm64 build agent exists yet; the step script already builds it when
 # one runs the `build` phase, and `publish` accepts it when present.
@@ -49,6 +52,7 @@ optional_assets = [
   "boss-spoke-linux-arm64.manifest.json.sig",
   "boss-spoke-package-linux-arm64",
   "boss-spoke-package-linux-arm64.sig",
+  "spoke-packages.linux-arm64.json",
 ]
 
 [version]

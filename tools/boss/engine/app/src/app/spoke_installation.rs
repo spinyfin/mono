@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use boss_engine_runtime::hub::{BoundHub, HubConfig, HubStream};
 use boss_execution_contracts::{HostAdapterProvider, RunOutcome, RunWaitState};
 use boss_spoke_adapter::{ComposedSpawn, SpawnComposer, SpawnInput, SpokeAdapterConfig, SpokeHostAdapterProvider};
-use boss_spoke_upgrade::{CatalogSource, SpokePackageCatalog, UpgradeController, parse_catalog};
+use boss_spoke_upgrade::UpgradeController;
 use boss_work_db::WorkDb;
 use serde::Deserialize;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 #[derive(Default, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,7 +153,7 @@ impl Prepared {
             signals,
         ));
         let desired = boss_engine_runtime::build_info::version().to_owned();
-        let catalog = catalog_source();
+        let catalog = boss_spoke_upgrade::production_catalog();
         boss_task_scope::spawn(async move {
             boss_spoke_upgrade::run(UpgradeController::new(db, manager, desired, catalog)).await;
         });
@@ -164,34 +164,6 @@ impl Prepared {
         });
         provider
     }
-}
-
-struct GithubReleaseCatalog {
-    client: reqwest::Client,
-}
-
-#[async_trait]
-impl CatalogSource for GithubReleaseCatalog {
-    async fn catalog(&self, release_id: &str) -> Option<SpokePackageCatalog> {
-        let url = boss_spoke_upgrade::github_catalog_url(release_id);
-        let response = self.client.get(&url).send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let body = response.text().await.ok()?;
-        parse_catalog(&body).filter(|catalog| catalog.release_id == release_id)
-    }
-}
-
-fn catalog_source() -> Arc<dyn CatalogSource> {
-    boss_spoke_upgrade::env_catalog().unwrap_or_else(|| {
-        Arc::new(GithubReleaseCatalog {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        })
-    })
 }
 
 #[cfg(test)]

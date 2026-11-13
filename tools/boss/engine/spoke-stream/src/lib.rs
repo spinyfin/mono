@@ -176,19 +176,38 @@ impl StreamManager {
     /// Host ids with an active connection, sorted. Used by sequential upgrade
     /// so an offline host is offered when it next appears here.
     pub async fn connected_hosts(&self) -> Vec<String> {
-        let hosts = self.0.hosts.lock().await;
+        let hosts: Vec<(String, Host)> = {
+            let guard = self.0.hosts.lock().await;
+            guard.iter().map(|(id, host)| (id.clone(), Arc::clone(host))).collect()
+        };
         let mut ids = Vec::new();
-        for (id, host) in hosts.iter() {
+        for (id, host) in hosts {
             let guard = host.lock().await;
             if guard
                 .as_ref()
                 .is_some_and(|connection| connection.active.load(Ordering::Acquire))
             {
-                ids.push(id.clone());
+                ids.push(id);
             }
         }
         ids.sort();
         ids
+    }
+
+    /// Durable result for `command_id`, if the outbox has committed one.
+    pub async fn command_result(&self, host_id: &str, command_id: &str) -> Option<CommandResult> {
+        self.0
+            .storage
+            .outbox
+            .completed(host_id, command_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Durable original command, if the outbox still has it.
+    pub async fn stored_command(&self, host_id: &str, command_id: &str) -> Option<boss_protocol_spoke::v1::Command> {
+        self.0.storage.outbox.command(host_id, command_id).await.ok().flatten()
     }
 
     pub(crate) fn publish_capture(&self, host_id: &str, record: &boss_protocol_spoke::v1::Record) {

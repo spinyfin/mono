@@ -971,7 +971,10 @@ mod spoke_ingress;
 mod spoke_probe;
 mod spoke_projection;
 mod spoke_upgrade;
-pub use spoke_upgrade::{HostUpgradeState, HostUpgradeStatus, HostUpgradeView, SpokeUpgradeRollout};
+pub use spoke_upgrade::{
+    HostUpgradeState, HostUpgradeStatus, HostUpgradeView, SpokeUpgradeRollout, helper_failed, package_platform,
+    unix_epoch_secs_string, upgrade_command_id,
+};
 mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;

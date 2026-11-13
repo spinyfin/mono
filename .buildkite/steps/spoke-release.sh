@@ -17,6 +17,10 @@ CONFIG="tools/boss/spoke-release.toml"
 TAG_PREFIX="boss-spoke-v"
 SPOKE_TARGET="//tools/boss/engine/spoke:boss-spoke"
 INSTALLER_TARGET="//tools/boss/spoke-package:boss-spoke-package"
+# Distinct from the Boss app pipeline's `release-tag` meta-data key, so a
+# matching spoke draft can be prepared in the same Buildkite build.
+export RELEASE_TAG_KEY="${RELEASE_TAG_KEY:-spoke-release-tag}"
+REQUIRED_CATALOG_PLATFORMS=(macos-arm64 linux-amd64)
 
 # The platform id the package and manifest are named for; it must match
 # Platform::host() in //tools/boss/spoke-package.
@@ -39,6 +43,18 @@ signing_key() {
 
 phase_prepare() {
   echo "[spoke-release] agent: $(uname -a)"
+  # The hub looks up boss-spoke-v{Boss version}. Pin to that version so a
+  # Boss release always has a matching signed spoke catalog.
+  if [[ -z "${RELEASE_PIN_VERSION:-}" ]]; then
+    local boss_tag
+    boss_tag="$(git tag --list 'boss-v*' --sort=-v:refname | head -1 || true)"
+    if [[ -z "${boss_tag}" ]]; then
+      echo "[spoke-release] no boss-v tag; nothing to publish"
+      return
+    fi
+    export RELEASE_PIN_VERSION="${boss_tag#"boss-v"}"
+  fi
+  echo "[spoke-release] pinning spoke packages to Boss version ${RELEASE_PIN_VERSION}"
   local tag
   tag="$(bin/release prepare --config "${CONFIG}")"
   if [[ -z "${tag}" ]]; then
@@ -131,25 +147,31 @@ phase_publish() {
   version="${tag#"${TAG_PREFIX}"}"
   work="$(mktemp -d)"
   trap "rm -rf -- $(printf '%q' "${work}")" EXIT
-  # Merge per-platform fragments into the catalog the hub fetches for this
-  # Boss version. Missing fragments leave that platform unpublished.
-  if command -v gh >/dev/null && gh release download "${tag}" --pattern 'spoke-packages.*.json' --dir "${work}" 2>/dev/null; then
-    python3 - "${work}" "${version}" <<'PY'
+  command -v gh >/dev/null || die "gh is required to merge spoke package catalogs"
+  gh release download "${tag}" --repo spinyfin/mono --pattern 'spoke-packages.*.json' --dir "${work}" \
+    || die "could not download spoke-packages.*.json fragments for ${tag}"
+  python3 - "${work}" "${version}" "${REQUIRED_CATALOG_PLATFORMS[*]}" <<'PY'
 import json, pathlib, sys
 work, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+required = sys.argv[3].split()
 packages = {}
 for path in sorted(work.glob("spoke-packages.*.json")):
+    if path.name == "spoke-packages.json":
+        continue
     data = json.loads(path.read_text())
-    if data.get("release_id") == version:
-        packages.update(data.get("packages") or {})
+    if data.get("release_id") != version:
+        raise SystemExit(f"{path.name} release_id {data.get('release_id')!r} != {version!r}")
+    packages.update(data.get("packages") or {})
+missing = [platform for platform in required if platform not in packages]
+if missing:
+    raise SystemExit(f"catalog missing required platforms: {', '.join(missing)}")
 catalog = work / "spoke-packages.json"
 catalog.write_text(json.dumps({"release_id": version, "packages": packages}, indent=2) + "\n")
+print(f"merged {len(packages)} platform(s) into spoke-packages.json")
 PY
-    if [[ -f "${work}/spoke-packages.json" ]]; then
-      bin/release upload --config "${CONFIG}" --tag "${tag}" \
-        --asset "spoke-packages.json=${work}/spoke-packages.json"
-    fi
-  fi
+  [[ -f "${work}/spoke-packages.json" ]] || die "spoke-packages.json was not produced"
+  bin/release upload --config "${CONFIG}" --tag "${tag}" \
+    --asset "spoke-packages.json=${work}/spoke-packages.json"
   bin/release publish --config "${CONFIG}" --tag "${tag}"
   rm -rf -- "${work}"
   trap - EXIT

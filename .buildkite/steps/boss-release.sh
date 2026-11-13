@@ -122,7 +122,21 @@ log "[boss-release] uploading Boss-{version}.zip"
 bin/release upload --config "${CONFIG}" --tag "${TAG}" \
   --asset "Boss-{version}.zip=${ZIP_PATH}"
 
+# Matching signed spoke packages for this Boss version. The hub fetches
+# boss-spoke-v{same version}/spoke-packages.json; an independent spoke
+# patch counter would never line up.
+VERSION="${TAG#"boss-v"}"
+log "[boss-release] preparing spoke packages for ${VERSION}"
+export RELEASE_PIN_VERSION="${VERSION}"
+export RELEASE_TAG_KEY="spoke-release-tag"
+SPOKE_TAG="$(bin/release prepare --config tools/boss/spoke-release.toml)"
+if [[ -z "${SPOKE_TAG}" ]]; then
+  die "spoke package prepare for Boss ${VERSION} produced no tag"
+fi
+echo "[boss-release] spoke release tag: ${SPOKE_TAG}"
+buildkite-agent pipeline upload .buildkite/pipeline-spoke-release-builds.yml
+
 log "[boss-release] publishing ${TAG}"
 bin/release publish --config "${CONFIG}" --tag "${TAG}"
 
-log "[boss-release] done — release ${TAG} published"
+log "[boss-release] done — release ${TAG} published; spoke packages ${SPOKE_TAG} building"

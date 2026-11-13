@@ -92,8 +92,10 @@ pub fn stamp() -> Stamp {
     }
 }
 
-pub fn inventory_capacity(
+pub fn inventory_capacity_on(
     sequence: u64,
+    os: &str,
+    arch: &str,
     release_id: &str,
     last_result: &str,
     last_error: &str,
@@ -107,8 +109,8 @@ pub fn inventory_capacity(
             generation: sequence,
             total_slots: 1,
             inventory: Some(v1::Inventory {
-                os: "linux".into(),
-                arch: "x86_64".into(),
+                os: os.into(),
+                arch: arch.into(),
                 release_id: release_id.into(),
                 last_upgrade_command_id: command_id.into(),
                 last_upgrade_result: last_result.into(),
@@ -273,16 +275,38 @@ impl Peer {
     }
 
     pub async fn report_inventory(&mut self, release_id: &str, last_result: &str, last_error: &str, command_id: &str) {
+        self.report_inventory_on("linux", "x86_64", release_id, last_result, last_error, command_id)
+            .await;
+    }
+
+    pub async fn report_inventory_on(
+        &mut self,
+        os: &str,
+        arch: &str,
+        release_id: &str,
+        last_result: &str,
+        last_error: &str,
+        command_id: &str,
+    ) {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.send_record(inventory_capacity(
+        self.send_record(inventory_capacity_on(
             sequence,
+            os,
+            arch,
             release_id,
             last_result,
             last_error,
             command_id,
         ))
         .await;
+    }
+
+    pub async fn take_command(&mut self) -> v1::Command {
+        match self.next().await {
+            Some(v1::hub_frame::Body::Command(command)) => command,
+            other => panic!("expected command, got {other:?}"),
+        }
     }
 
     pub async fn accept_command(&mut self, code: ResultCode, reason: &str) -> v1::Command {
