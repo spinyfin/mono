@@ -262,21 +262,22 @@ fn proposal_record(sequence: u64, run: &Run, key: &str) -> v1::Record {
                 "idempotency_key": key,
             }))
             .unwrap(),
+            capture_epoch: 1,
             ..Default::default()
         }),
     )
 }
 
 fn stop_record(sequence: u64, run: &Run) -> v1::Record {
-    record_of(
-        sequence,
-        run,
-        record::Body::Event(worker_event::to_wire(&WorkerEvent::Stop {
-            session_id: "session".into(),
-            stop_hook_active: false,
-            stop_reason: boss_protocol::StopReason::Completed,
-        })),
-    )
+    let mut wire = worker_event::to_wire(&WorkerEvent::Stop {
+        session_id: "session".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::Completed,
+    });
+    if let Some(v1::worker_event::Event::Stop(stop)) = &mut wire.event {
+        stop.capture_epoch = 1;
+    }
+    record_of(sequence, run, record::Body::Event(wire))
 }
 
 fn tool_record(sequence: u64, run: &Run) -> v1::Record {
@@ -1010,6 +1011,10 @@ fn transcript_record(sequence: u64, run: &Run, generation: &str, offset: u64, da
 
 /// A turn-ending Stop recorded with the transcript size the spoke saw.
 fn stop_at(sequence: u64, run: &Run, generation: &str, through: u64) -> v1::Record {
+    stop_at_epoch(sequence, run, generation, through, 1)
+}
+
+fn stop_at_epoch(sequence: u64, run: &Run, generation: &str, through: u64, epoch: u64) -> v1::Record {
     let mut wire = worker_event::to_wire(&WorkerEvent::Stop {
         session_id: "session".into(),
         stop_hook_active: false,
@@ -1018,6 +1023,7 @@ fn stop_at(sequence: u64, run: &Run, generation: &str, through: u64) -> v1::Reco
     if let Some(v1::worker_event::Event::Stop(stop)) = &mut wire.event {
         stop.transcript_generation = generation.into();
         stop.transcript_through = through;
+        stop.capture_epoch = epoch;
     }
     record_of(sequence, run, record::Body::Event(wire))
 }
@@ -1036,10 +1042,14 @@ fn gap_record(sequence: u64, run: &Run, resource: &str, from: u64, reason: &str)
 }
 
 fn concluded(sequence: u64, run: &Run, ids: &[&str]) -> v1::Record {
+    concluded_epoch(sequence, run, 1, ids)
+}
+
+fn concluded_epoch(sequence: u64, run: &Run, epoch: u64, ids: &[&str]) -> v1::Record {
     gap_record(
         sequence,
         run,
-        "output:concluded",
+        &format!("output:concluded:{epoch}"),
         0,
         &serde_json::to_string(ids).unwrap(),
     )
@@ -1334,7 +1344,7 @@ async fn artifacts_and_output_gaps_are_held_by_run_identity_and_survive_replay()
     let destination = world._dir.path().join("out").join("review.json");
     let kind = boss_spoke_custody::StructuredOutputKind::ReviewResult;
     assert_eq!(
-        custody.collect_output("exec_1", kind, &destination).unwrap(),
+        custody.collect_output("exec_1", 1, kind, &destination).unwrap(),
         boss_spoke_custody::Collected::Installed
     );
     assert_eq!(std::fs::read(destination).unwrap(), whole);
@@ -1452,6 +1462,7 @@ async fn a_named_output_arriving_after_stop_is_collectable_at_dispatch() {
         custody
             .collect_output(
                 "exec_1",
+                1,
                 boss_spoke_custody::StructuredOutputKind::ReviewResult,
                 &destination
             )
@@ -1495,7 +1506,12 @@ async fn a_stop_with_no_transcript_watermark_still_waits_for_a_named_output() {
     let destination = world._dir.path().join("pr.json");
     assert_eq!(
         custody
-            .collect_output("exec_1", boss_spoke_custody::StructuredOutputKind::PrUrl, &destination)
+            .collect_output(
+                "exec_1",
+                1,
+                boss_spoke_custody::StructuredOutputKind::PrUrl,
+                &destination
+            )
             .unwrap(),
         boss_spoke_custody::Collected::Installed
     );
@@ -1545,7 +1561,12 @@ async fn a_done_proposal_waits_for_a_named_output_arriving_later() {
     let destination = world._dir.path().join("pr.json");
     assert_eq!(
         custody
-            .collect_output("exec_1", boss_spoke_custody::StructuredOutputKind::PrUrl, &destination)
+            .collect_output(
+                "exec_1",
+                1,
+                boss_spoke_custody::StructuredOutputKind::PrUrl,
+                &destination
+            )
             .unwrap(),
         boss_spoke_custody::Collected::Installed
     );
@@ -1625,6 +1646,7 @@ async fn second_turn_waits_for_its_own_capture_and_serializes_concurrent_settler
         custody
             .collect_output(
                 "exec_1",
+                1,
                 boss_spoke_custody::StructuredOutputKind::ReviewResult,
                 &destination
             )
@@ -1714,4 +1736,131 @@ async fn subagent_stop_does_not_wait_for_main_capture() {
             .is_none(),
         "a subagent Stop never enters the capture-wait outbox"
     );
+}
+
+#[tokio::test]
+async fn a_capture_timeout_still_dispatches_the_hub_transcript_copy() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&transcript_record(1, &run, "0-1", 0, b"0123456789")).await;
+    spoke.send(&stop_at(2, &run, "0-1", 10)).await;
+
+    let applier = Applier::default();
+    let custody = world.custody(&db);
+    custody_projector(
+        &db,
+        &applier,
+        &Arc::new(Sender::default()),
+        Arc::new(Notify::new()),
+        &custody,
+    )
+    .drain()
+    .await;
+
+    assert_eq!(applier.log(|l| l.events.clone()), ["2#stop"]);
+    let (_, held) = &applier.custody.sources()[0];
+    let (_, bytes) = held.as_ref().expect("the Stop is given the hub's copy");
+    assert_eq!(bytes, b"0123456789");
+    assert!(failed_effects(&db, "transcript_evidence_unavailable").is_empty());
+    let alerts = failed_effects(&db, "output_capture_unavailable");
+    assert_eq!(alerts.len(), 1);
+    assert!(alerts[0].last_error.as_deref().unwrap().contains("did not conclude"));
+}
+
+#[tokio::test]
+async fn a_parked_stop_does_not_expire_while_its_host_still_has_projection_lag() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&stop_at(1, &run, "0-1", 10)).await;
+
+    let applier = Applier::default();
+    let sender = Arc::new(Sender::default());
+    let custody = world.custody(&db);
+    let running = tokio::spawn(custody_projector(&db, &applier, &sender, Arc::new(Notify::new()), &custody).run());
+    eventually("the Stop is parked", || {
+        applied(&db) == 1 && applier.log(|l| l.events.is_empty())
+    })
+    .await;
+    running.abort();
+    let _ = running.await;
+
+    spoke.send(&transcript_record(2, &run, "0-1", 0, b"0123456789")).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let running = tokio::spawn(custody_projector(&db, &applier, &sender, Arc::new(Notify::new()), &custody).run());
+    eventually("the Stop is dispatched with bytes that were only received", || {
+        applier
+            .custody
+            .sources()
+            .iter()
+            .any(|(sequence, held)| *sequence == 1 && held.as_ref().is_some_and(|(_, bytes)| bytes == b"0123456789"))
+    })
+    .await;
+    running.abort();
+    let _ = running.await;
+}
+
+#[tokio::test]
+async fn a_pane_exit_stays_parked_behind_a_waiting_stop() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&stop_at(1, &run, "0-1", 5)).await;
+    spoke.send(&pane_record(2, &run, v1::PaneLife::Exited)).await;
+
+    let applier = Applier::default();
+    let sender = Arc::new(Sender::default());
+    let custody = world.custody(&db);
+    let wake = Arc::new(Notify::new());
+    let running = tokio::spawn(custody_projector(&db, &applier, &sender, wake.clone(), &custody).run());
+    eventually("Stop and pane are parked", || {
+        applied(&db) == 2 && applier.log(|l| l.events.is_empty() && l.panes.is_empty())
+    })
+    .await;
+
+    spoke.send(&transcript_record(3, &run, "0-1", 0, b"hello")).await;
+    spoke.send(&concluded(4, &run, &[])).await;
+    wake.notify_waiters();
+    eventually("Stop then pane apply in that order", || {
+        applier.log(|l| l.events == ["1#stop"] && l.panes == [("exec_1".to_string(), v1::PaneLife::Exited as i32)])
+    })
+    .await;
+    let (_, held) = &applier.custody.sources()[0];
+    assert!(held.is_some(), "the Stop still carries the hub copy");
+    running.abort();
+    let _ = running.await;
+}
+
+#[tokio::test]
+async fn epoch_zero_does_not_wait_for_a_concluded_marker() {
+    let world = World::new();
+    let db = world.open();
+    let run = assign(&db, "exec_1").1;
+    let spoke = Spoke::connect(&db, None).await;
+    spoke.send(&transcript_record(1, &run, "0-1", 0, b"hello")).await;
+    spoke.send(&stop_at_epoch(2, &run, "0-1", 5, 0)).await;
+
+    let applier = Applier::default();
+    let custody = world.custody(&db);
+    custody_projector(
+        &db,
+        &applier,
+        &Arc::new(Sender::default()),
+        Arc::new(Notify::new()),
+        &custody,
+    )
+    .drain()
+    .await;
+
+    assert_eq!(applier.log(|l| l.events.clone()), ["2#stop"]);
+    let (_, held) = &applier.custody.sources()[0];
+    assert_eq!(held.as_ref().unwrap().1, b"hello");
+    assert!(failed_effects(&db, "transcript_evidence_unavailable").is_empty());
+    assert!(failed_effects(&db, "output_capture_unavailable").is_empty());
+    assert!(db.pending_spoke_observations().unwrap().is_empty());
 }

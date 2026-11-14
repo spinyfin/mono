@@ -122,6 +122,11 @@ pub const CUSTODY_HALT: &str = "custody_halt";
 /// Effect kind: a completion boundary went ahead without transcript bytes the
 /// spoke had said it needed, because they did not arrive in time.
 pub const EVIDENCE_UNAVAILABLE: &str = "transcript_evidence_unavailable";
+/// Effect kind: a completion boundary went ahead with its transcript copy, but
+/// output capture or a named artifact did not settle in time. Distinct from
+/// [`EVIDENCE_UNAVAILABLE`] so a capture timeout cannot be read as missing
+/// transcript bytes the hub already holds.
+pub const CAPTURE_UNAVAILABLE: &str = "output_capture_unavailable";
 /// Effect kind: a Stop or proposal parked so the host cursor can move while
 /// its transcript or artifact bytes materialize independently.
 pub const PENDING_OBSERVATION: &str = "pending_observation";
@@ -297,10 +302,14 @@ pub struct ProjectorConfig {
     #[builder(default = Duration::from_secs(30))]
     pub retry_stall: Duration,
     /// How long parked completion work waits for transcript or artifact bytes
-    /// after its record has already advanced the host cursor. Past this the
-    /// observation is applied with unavailable evidence. Independent
-    /// materialization of later records is never held for this bound.
-    #[builder(default = Duration::from_secs(60))]
+    /// after its record has already advanced the host cursor, and after this
+    /// host has no remaining projection lag. Past this the observation is
+    /// applied: a ready transcript copy is attached even if capture is still
+    /// pending, and the missing capture is recorded as
+    /// [`CAPTURE_UNAVAILABLE`]. Matches the spoke's per-second capture retry
+    /// budget (`MAX_CAPTURE_ATTEMPTS` = 120). Independent materialization of
+    /// later records is never held for this bound.
+    #[builder(default = Duration::from_secs(120))]
     pub watermark_wait: Duration,
     /// How often a waiting boundary looks for newly received bytes.
     #[builder(default = Duration::from_millis(50))]
@@ -466,12 +475,20 @@ impl Projector {
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut delivery = tokio::time::interval(inner.config.delivery_interval);
         delivery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first sweep tick fires immediately. Do not settle until every
+        // host has had a chance to drain received-but-unprojected records,
+        // otherwise a restart would expire parked completions whose bytes
+        // are already stored in ingress.
+        let mut settle_ready = false;
         loop {
             tokio::select! {
                 _ = inner.wake.notified() => {}
                 _ = sweep.tick() => {
                     inner.applier.sweep().await;
-                    inner.settle_parked(false).await;
+                    if settle_ready {
+                        let inner = Arc::clone(&inner);
+                        tasks.spawn(async move { inner.settle_parked(false).await });
+                    }
                 }
                 _ = delivery.tick() => {
                     // A pass already under way makes this one return at once.
@@ -496,11 +513,11 @@ impl Projector {
                     continue;
                 }
             };
-            for position in behind {
+            for position in &behind {
                 if running.values().any(|host| host == &position.host_id) {
                     continue;
                 }
-                let host = position.host_id;
+                let host = position.host_id.clone();
                 let task_inner = Arc::clone(&inner);
                 let task_host = host.clone();
                 let hold = inner.config.halt_hold;
@@ -513,6 +530,13 @@ impl Projector {
                     }
                 });
                 running.insert(handle.id(), host);
+            }
+            if !settle_ready {
+                settle_ready = true;
+                if behind.is_empty() {
+                    let inner = Arc::clone(&inner);
+                    tasks.spawn(async move { inner.settle_parked(false).await });
+                }
             }
         }
     }
@@ -623,7 +647,7 @@ impl Inner {
                 }
                 next = row.sequence;
             }
-            self.settle_parked(false).await;
+            self.settle_parked_inner(Some(host), false).await;
             self.reported
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -812,13 +836,11 @@ impl Inner {
                 Ok(())
             }
             (Observation::Pane(pane), Currentness::Current) => {
-                let stored = observation_row(&pane);
-                self.blocking(move |db| db.record_spoke_pane_observation(&stored))
-                    .await?;
-                match self.applier.pane(&pane).await {
-                    Applied::Done => Ok(()),
-                    Applied::Retry(reason) => Err(Interrupted::Retry(reason)),
+                if self.run_is_parked(&pane.origin).await? {
+                    owed.push(Owed::pending_observation(&pane.origin, "pane"));
+                    return Ok(());
                 }
+                self.apply_pane(pane).await
             }
         }
     }
@@ -854,13 +876,15 @@ impl Inner {
                 .await?
             {
                 Settled::Unavailable { reason, alert } => {
-                    self.note_unavailable(origin, mark, &reason, alert, dest).await;
+                    self.note_unavailable(origin, mark, &reason, EVIDENCE_UNAVAILABLE, alert, dest)
+                        .await;
                 }
                 Settled::Pending { have, want, cause } => {
                     self.note_unavailable(
                         origin,
                         mark,
                         &pending_timeout_reason(&cause, have, want, self.config.watermark_wait),
+                        pending_timeout_kind(&cause),
                         true,
                         dest,
                     )
@@ -994,13 +1018,24 @@ impl Inner {
             {
                 Settled::Ready(source) => event.transcript = Some(source),
                 Settled::Unavailable { reason, alert } => {
-                    self.note_unavailable(&event.origin, &mark, &reason, alert, dest).await;
+                    self.note_unavailable(&event.origin, &mark, &reason, EVIDENCE_UNAVAILABLE, alert, dest)
+                        .await;
                 }
                 Settled::Pending { have, want, cause } => {
+                    // Capture or a named artifact can still be arriving after
+                    // every transcript byte through the mark is held. Attach
+                    // that copy so Stop-time consumers are not told the
+                    // transcript is missing.
+                    if !matches!(cause, PendingCause::Transcript)
+                        && let Settled::Ready(source) = self.check_evidence(&event.origin, &mark, false).await?
+                    {
+                        event.transcript = Some(source);
+                    }
                     self.note_unavailable(
                         &event.origin,
                         &mark,
                         &pending_timeout_reason(&cause, have, want, self.config.watermark_wait),
+                        pending_timeout_kind(&cause),
                         true,
                         dest,
                     )
@@ -1203,6 +1238,7 @@ impl Inner {
                 self.dispatch_event(event, None).await?
             }
             Observation::Proposal(proposal) => self.apply_proposal(proposal, currentness, None).await?,
+            Observation::Pane(pane) if matches!(currentness, Currentness::Current) => self.apply_pane(pane).await?,
             _ => {}
         }
         self.finish_parked(effect, SpokeEffectOutcome::Done).await;
@@ -1214,12 +1250,6 @@ impl Inner {
         observation: &Observation,
         parked: &Parked,
     ) -> Result<Option<Duration>, Interrupted> {
-        let elapsed = parked_elapsed(parked.parked_at_ms);
-        let bound = self.config.watermark_wait;
-        let remaining = bound.saturating_sub(elapsed);
-        if remaining.is_zero() {
-            return Ok(None);
-        }
         let pending = match observation {
             Observation::Event(event) if event_wants_capture(event) => {
                 self.boundary_is_pending(&event.origin, event.mark.as_ref()).await?
@@ -1230,7 +1260,39 @@ impl Inner {
             }
             _ => false,
         };
-        Ok(pending.then_some(remaining))
+        if !pending {
+            return Ok(None);
+        }
+        // Bytes already received but not yet projected can sit in ingress
+        // longer than watermark_wait, especially after a long disconnect or
+        // a hub restart. Do not expire until this host has caught up.
+        if self.host_lag(&observation.origin().host_id).await? > 0 {
+            return Ok(Some(self.config.watermark_poll));
+        }
+        let remaining = self
+            .config
+            .watermark_wait
+            .saturating_sub(parked_elapsed(parked.parked_at_ms));
+        Ok(if remaining.is_zero() { None } else { Some(remaining) })
+    }
+
+    async fn host_lag(&self, host: &str) -> Result<u64, Interrupted> {
+        let host_id = host.to_owned();
+        Ok(self
+            .blocking(move |db| db.spoke_projection_position(&host_id))
+            .await?
+            .map(|position| position.lag())
+            .unwrap_or(0))
+    }
+
+    async fn apply_pane(&self, pane: PaneObservation) -> Result<(), Interrupted> {
+        let stored = observation_row(&pane);
+        self.blocking(move |db| db.record_spoke_pane_observation(&stored))
+            .await?;
+        match self.applier.pane(&pane).await {
+            Applied::Done => Ok(()),
+            Applied::Retry(reason) => Err(Interrupted::Retry(reason)),
+        }
     }
 
     async fn finish_parked(&self, effect: &SpokeEffect, outcome: SpokeEffectOutcome) {
@@ -1249,17 +1311,26 @@ impl Inner {
             .await
     }
 
-    async fn note_unavailable(&self, origin: &Origin, mark: &Mark, reason: &str, alert: bool, owed: &mut Vec<Owed>) {
+    async fn note_unavailable(
+        &self,
+        origin: &Origin,
+        mark: &Mark,
+        reason: &str,
+        kind: &'static str,
+        alert: bool,
+        owed: &mut Vec<Owed>,
+    ) {
         tracing::warn!(
             host = %origin.host_id,
             execution = %origin.run.execution_id,
             generation = %mark.generation,
             through = mark.through,
+            effect_kind = kind,
             %reason,
-            "a completion boundary goes ahead without the transcript bytes it named"
+            "a completion boundary goes ahead without evidence it named"
         );
         if alert {
-            owed.push(Owed::evidence_unavailable(origin, mark, reason));
+            owed.push(Owed::evidence_unavailable(kind, origin, mark, reason));
         }
     }
 
@@ -1460,10 +1531,15 @@ impl Owed {
         }
     }
 
-    fn evidence_unavailable(origin: &Origin, mark: &Mark, reason: &str) -> Self {
+    fn evidence_unavailable(kind: &'static str, origin: &Origin, mark: &Mark, reason: &str) -> Self {
+        let key = if kind == CAPTURE_UNAVAILABLE {
+            format!("{}:capture:{}", origin.run.run_id, mark.capture_epoch)
+        } else {
+            format!("{}:{}:{}", origin.run.run_id, mark.generation, mark.through)
+        };
         Self {
-            kind: EVIDENCE_UNAVAILABLE,
-            key: format!("{}:{}:{}", origin.run.run_id, mark.generation, mark.through),
+            kind,
+            key,
             payload: reason.as_bytes().to_vec(),
             failure: Some(reason.to_owned()),
         }
@@ -1582,6 +1658,13 @@ fn pending_timeout_reason(cause: &PendingCause, have: u64, want: u64, bound: Dur
         PendingCause::Transcript => format!("only {have} of {want} transcript bytes arrived within {bound:?}"),
         PendingCause::OutputsNotConcluded => format!("output capture did not conclude within {bound:?}"),
         PendingCause::Artifact { id } => format!("artifact {id}: only {have} of {want} bytes arrived within {bound:?}"),
+    }
+}
+
+fn pending_timeout_kind(cause: &PendingCause) -> &'static str {
+    match cause {
+        PendingCause::Transcript => EVIDENCE_UNAVAILABLE,
+        PendingCause::OutputsNotConcluded | PendingCause::Artifact { .. } => CAPTURE_UNAVAILABLE,
     }
 }
 

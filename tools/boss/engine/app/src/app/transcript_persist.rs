@@ -146,21 +146,12 @@ pub(super) async fn persist_transcript_and_capture_cost(
     }
 }
 
-/// Look up the transcript path the run is currently writing to (via
-/// `WorkRun`), and stat its current byte size so we can use that as
-/// the lower bound for the next reply-extraction read. Returns
-/// `(None, 0)` when the run has no transcript path recorded yet —
-/// the in-flight bookkeeping still tracks the dispatched probe, but
-/// `dispatch_probe_reply_on_stop` will skip emission with a warning
-/// rather than fabricate empty reply text.
-///
-/// The `run_id` argument is the execution id (`exec_*`) carried on
-/// the hook event — the same value
-/// `LiveStatusManager`/`dispatch_live_worker_state` plumb everywhere
-/// in this file. PR #384 flagged this code path as broken (its
-/// "Out of scope" section called out that `work_db.get_run(run_id)`
-/// was joining the wrong namespace). Fixed here alongside the
-/// `TranscriptPathResolver` impl.
+/// Returns the run's recorded transcript path and its current readable size,
+/// used as the lower bound for the next reply-extraction read. For a hub-held
+/// spoke copy the size is clamped to the committed custody prefix. Returns
+/// `(None, 0)` when no path is recorded or custody refuses the copy (halted
+/// or invalid); `run_id` is the execution id (`exec_*`) carried on the hook
+/// event.
 pub(super) async fn transcript_offset_for_run(server_state: &ServerState, run_id: &str) -> (Option<String>, u64) {
     let path = match server_state.work_db.transcript_path_for_execution(run_id) {
         Ok(path) => path,

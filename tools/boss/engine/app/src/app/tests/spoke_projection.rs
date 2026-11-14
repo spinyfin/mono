@@ -2019,6 +2019,7 @@ async fn a_stop_that_names_transcript_bytes_runs_against_the_hub_copy_of_them() 
     if let Some(v1::worker_event::Event::Stop(turn)) = &mut stop.event {
         turn.transcript_generation = "0-1".into();
         turn.transcript_through = line.len() as u64;
+        turn.capture_epoch = 1;
     }
     // The spoke numbers the Stop at once; its bytes follow.
     fx.receive(record::Body::Event(stop));
@@ -2030,7 +2031,7 @@ async fn a_stop_that_names_transcript_bytes_runs_against_the_hub_copy_of_them() 
         eof: true,
     }));
     fx.receive(record::Body::Gap(v1::Gap {
-        resource: "output:concluded".into(),
+        resource: "output:concluded:1".into(),
         reason: "[]".into(),
         ..Default::default()
     }));
