@@ -1818,6 +1818,12 @@ async fn deliver_probe_via_pane_write(
             .await;
             ProbeDispatchOutcome::Dispatched(state)
         }
+        Err(PaneSendFailure::Tmux(error)) if error.is::<boss_tmux::BlockingDialogOnScreen>() => {
+            server_state
+                .settle_blocked_probe(run_id, &probe_id, error.to_string())
+                .await;
+            ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
+        }
         Err(PaneSendFailure::DriverExited {
             expected_driver_binary,
             observed_process,
@@ -2314,6 +2320,14 @@ async fn inject_probe_mid_turn(
                     .await;
                 ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
             }
+        }
+        PaneInjectOutcome::SendFailed(PaneSendFailure::Tmux(error))
+            if error.is::<boss_tmux::BlockingDialogOnScreen>() =>
+        {
+            server_state
+                .settle_blocked_probe(run_id, &probe_id, error.to_string())
+                .await;
+            ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
         }
         PaneInjectOutcome::SendFailed(PaneSendFailure::DriverExited {
             expected_driver_binary,

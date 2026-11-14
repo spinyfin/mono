@@ -775,6 +775,15 @@ impl AgentDriver for ClaudeDriver {
         // app's Claude-default fallback and the engine-supplied path
         // behaviour-identical for Claude workers.
         Some(PaneMonitorSpec {
+            blocking_dialog_markers: vec![
+                "Do you want to proceed?".into(),
+                "Do you want to make this edit".into(),
+                "Do you want to create".into(),
+                "Do you want to allow".into(),
+                "Do you trust the files in this folder?".into(),
+                "Yes, I trust this folder".into(),
+                "Yes, I accept".into(),
+            ],
             // "auto mode on" is the footer under `--permission-mode auto`;
             // "bypass permissions on" is its counterpart under
             // `--dangerously-skip-permissions`. Without it a bypass-mode

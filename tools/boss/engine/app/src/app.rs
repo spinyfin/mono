@@ -75,6 +75,7 @@ mod app_session;
 pub(crate) mod attachments;
 mod attentions;
 mod automations;
+mod blocking_dialog;
 mod board_progress;
 mod broadcasts;
 mod ci_remediation;
@@ -465,36 +466,6 @@ impl boss_engine_runtime::stale_worker_sweep::StaleWorkerReaper for ServerState 
     /// missing — the sweep used to free the pool slot without ever
     /// killing the `claude` process, so a redispatch could re-lease the
     /// still-occupied workspace.
-    async fn reap_worker(&self, execution_id: &str) {
-        let _ = ServerState::release_worker_pane(self, execution_id).await;
-    }
-}
-
-#[async_trait]
-impl boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper for ServerState {
-    async fn resubmit_prompt(&self, execution_id: &str) -> anyhow::Result<()> {
-        let identity = self
-            .work_db
-            .tmux_identity_for_execution(execution_id)?
-            .ok_or_else(|| anyhow::anyhow!("no recorded tmux identity"))?;
-        let tmux = self.tmux_for_pane_delivery(execution_id)?;
-        let token = boss_engine_runtime::tmux_adoption::session_spawn_token(&tmux, &identity.session_name).await?;
-        anyhow::ensure!(
-            token.as_deref() == Some(identity.spawn_token.as_str()),
-            "worker session token changed"
-        );
-        anyhow::ensure!(
-            !self.work_db.get_execution(execution_id)?.status.is_terminal(),
-            "execution is terminal"
-        );
-        tmux.send_submit(&identity.session_name).await
-    }
-
-    /// Route the driver-start-timeout reap through the same
-    /// `release_worker_pane` tmux teardown as the stale-worker sweep:
-    /// verifies and kills the recorded tmux session, signals the
-    /// recorded pane pid's process group, releases the pool slot, and
-    /// drops the live-state entry.
     async fn reap_worker(&self, execution_id: &str) {
         let _ = ServerState::release_worker_pane(self, execution_id).await;
     }

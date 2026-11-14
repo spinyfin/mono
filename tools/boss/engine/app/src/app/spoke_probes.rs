@@ -29,6 +29,15 @@ pub(super) async fn dispatch(state: &Arc<ServerState>, run: &str) -> Option<Prob
     let outcome = adapter
         .deliver_worker_input(run, WorkerInputKind::Probe, &probe.text)
         .await;
+    if let Ok(outcome) = &outcome {
+        state.settle_spoke_dialog_failure(run, outcome).await;
+        if let ControlOutcome::Rejected { reason, .. } = outcome
+            && boss_tmux::BlockingDialogOnScreen::is_delivery_rejection(reason)
+        {
+            state.settle_blocked_probe(run, &probe.probe_id, reason.clone()).await;
+            return Some(ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned));
+        }
+    }
     match outcome {
         Ok(ControlOutcome::NotSubmitted(reason) | ControlOutcome::Rejected { reason, .. }) => {
             state.set_probe_lifecycle_detail(&probe.probe_id, ProbeDeliveryState::Queued, Some(reason));

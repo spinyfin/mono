@@ -1461,7 +1461,10 @@ impl ExecutionRunner for PaneSpawnRunner {
             // be taken, so the prompt wait runs now, with its retries and its
             // own failure, instead of the veto reporting a live worker.
             let confirm = match confirm {
-                Err(err) if late_start_rescues(spawner.driver_signals(), started.slot_id, &execution.id, &err) => {
+                Err(err)
+                    if !err.is::<boss_tmux::BlockingDialogOnScreen>()
+                        && late_start_rescues(spawner.driver_signals(), started.slot_id, &execution.id, &err) =>
+                {
                     tracing::info!(
                         worker_id,
                         execution_id = %execution.id,
@@ -1506,7 +1509,8 @@ impl ExecutionRunner for PaneSpawnRunner {
                 return Ok(cancelled);
             }
             if let Err(err) = confirm
-                && !reap_vetoed_by_late_evidence(spawner.driver_signals(), started.slot_id, &execution.id, &err)
+                && (err.is::<boss_tmux::BlockingDialogOnScreen>()
+                    || !reap_vetoed_by_late_evidence(spawner.driver_signals(), started.slot_id, &execution.id, &err))
             {
                 tracing::warn!(
                     worker_id,
@@ -1697,7 +1701,15 @@ async fn confirm_prompt_phase(
         || async { signals.has_prompt_accepted_for_run(run_id) },
         || async { crate::driver::initial_prompt::delivery_state(home) },
         // Return alone: the launcher pasted the brief, and it is never pasted again.
-        || async { tmux_host.tmux().send_submit(tmux_host.session_name()).await },
+        || async {
+            let driver = crate::driver::DriverRegistry::default().require(driver_name)?;
+            tmux_host
+                .tmux()
+                .clone()
+                .with_blocking_dialog_markers(driver.blocking_dialog_markers())
+                .send_submit(tmux_host.session_name())
+                .await
+        },
         || {
             work_db
                 .get_execution(run_id)
@@ -1717,6 +1729,9 @@ async fn confirm_prompt_phase(
         .await
     {
         store_capture_snapshot(last_capture, &visible);
+    }
+    if let Some(marker) = crate::driver::initial_prompt::blocking_dialog_marker(home) {
+        return Err(boss_tmux::BlockingDialogOnScreen { marker }.into());
     }
     result
 }
@@ -1810,6 +1825,9 @@ async fn confirm_local_spawn(
             },
         )
         .await;
+    }
+    if let Some(marker) = crate::driver::initial_prompt::blocking_dialog_marker(&home) {
+        result = Err(boss_tmux::BlockingDialogOnScreen { marker }.into());
     }
     // Whichever wait ended confirmation, say how far the launcher got.
     log_delivery_steps(run_id, driver_name, &home);

@@ -1,4 +1,5 @@
 use super::*;
+mod blocking_dialog;
 mod frontend_metrics;
 mod mismatch_answer_dispatch;
 mod read_freshness;

@@ -677,6 +677,17 @@ impl WorkerCompletionHandler {
         StopOutcome::NudgeBreakerParked { reason }
     }
 
+    /// Fail a worker whose pane is owned by an approval or trust dialog.
+    pub async fn fail_blocking_dialog(&self, run_id: &str, detail: &str) -> anyhow::Result<()> {
+        let execution = self.work_db.get_execution(run_id)?;
+        anyhow::ensure!(
+            self.finalize_worker_failure(&execution, detail, WorkerFailureBasis::BlockingDialogOnScreen)
+                .await,
+            "could not persist blocking-dialog failure for {run_id}"
+        );
+        Ok(())
+    }
+
     /// Commit the durable failure before resource teardown and publication.
     /// A database error must not be reported to the caller as successful completion.
     pub(super) async fn finalize_worker_failure(

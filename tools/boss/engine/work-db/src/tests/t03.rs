@@ -212,6 +212,210 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn finish_execution_run_records_worker_failure_basis_and_parks_the_task() {
+    let path = temp_db_path("finish-run-dialog-basis");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
+    let (execution, run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+    let (execution, _run, attention) = db
+        .finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::Failed)
+                .run_status("failed")
+                .error_text("BlockingDialogOnScreen: pane input refused")
+                .record_last_error(true)
+                .increment_pre_start_failure_count(true)
+                .worker_failure_basis(WorkerFailureBasis::BlockingDialogOnScreen)
+                .attention(CreateAttentionItemInput {
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
+                    kind: "pane_spawn_failed".to_owned(),
+                    status: None,
+                    title: "Worker pane failed to spawn".to_owned(),
+                    body_markdown: "dialog".to_owned(),
+                    resolved_at: None,
+                })
+                .build(),
+        )
+        .unwrap();
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(
+        execution.last_error.as_deref(),
+        Some("BlockingDialogOnScreen: pane input refused")
+    );
+    assert_eq!(execution.pre_start_failure_count, 1);
+    assert_eq!(attention.unwrap().kind, "pane_spawn_failed");
+    let item = db.get_work_item(&chore.id).unwrap();
+    match &item {
+        WorkItem::Chore(task) | WorkItem::Task(task) => {
+            assert_eq!(&task.status, &TaskStatus::Blocked);
+            assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+    let basis: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT basis FROM task_status_audit
+             WHERE work_item_id = ?1 AND property = 'blocked_reason'
+             ORDER BY id DESC LIMIT 1",
+            [&chore.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(basis, "blocking_dialog_on_screen");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WorkerFailureParkCaller {
+    FinishExecutionRun,
+    RecordWorkerFailure,
+}
+
+fn latest_blocked_reason_basis(db: &WorkDb, work_item_id: &str) -> String {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT basis FROM task_status_audit
+             WHERE work_item_id = ?1 AND property = 'blocked_reason'
+             ORDER BY id DESC LIMIT 1",
+            [work_item_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn parked_task(db: &WorkDb, work_item_id: &str) -> Task {
+    match db.get_work_item(work_item_id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task,
+        other => panic!("expected chore or task, got {other:?}"),
+    }
+}
+
+fn start_ready_run(db: &WorkDb, work_item_id: &str) -> (WorkExecution, WorkRun) {
+    let execution = create_ready_chore_execution(db, work_item_id.to_owned());
+    db.start_execution_run(
+        &execution.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap()
+}
+
+fn apply_worker_failure_park(
+    db: &WorkDb,
+    caller: WorkerFailureParkCaller,
+    execution: &WorkExecution,
+    run: &WorkRun,
+    detail: &str,
+    basis: WorkerFailureBasis,
+) {
+    match caller {
+        WorkerFailureParkCaller::FinishExecutionRun => {
+            db.finish_execution_run(
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::Failed)
+                    .run_status("failed")
+                    .error_text(detail)
+                    .worker_failure_basis(basis)
+                    .build(),
+            )
+            .unwrap();
+        }
+        WorkerFailureParkCaller::RecordWorkerFailure => {
+            db.record_worker_failure_with_basis(&execution.id, detail, basis)
+                .unwrap();
+        }
+    }
+}
+
+/// Spawn-time (`finish_execution_run`) and runtime (`record_worker_failure`)
+/// parking share one helper: both must block an `active`/`todo` item as
+/// `worker_failed`, and both must fold a diagnostic into an already-blocked
+/// item without replacing its domain reason.
+#[test]
+fn worker_failure_parking_is_shared_across_callers_and_task_states() {
+    let callers = [
+        WorkerFailureParkCaller::FinishExecutionRun,
+        WorkerFailureParkCaller::RecordWorkerFailure,
+    ];
+    let basis = WorkerFailureBasis::BlockingDialogOnScreen;
+    for caller in callers {
+        for status in ["todo", "active"] {
+            let path = temp_db_path(&format!("park-{status}-{caller:?}"));
+            let db = WorkDb::open(path.clone()).unwrap();
+            let product = create_test_product(&db);
+            let chore = create_test_chore(&db, product.id.clone(), format!("Park {status}"));
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                    rusqlite::params![chore.id, status],
+                )
+                .unwrap();
+            let (execution, run) = start_ready_run(&db, &chore.id);
+            apply_worker_failure_park(&db, caller, &execution, &run, "dialog refused", basis);
+            let task = parked_task(&db, &chore.id);
+            assert_eq!(task.status, TaskStatus::Blocked, "{status:?} via {caller:?}");
+            assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+            assert_eq!(task.blocked_detail.as_deref(), Some("dialog refused"));
+            assert!(!task.autostart);
+            assert_eq!(task.last_status_actor, "engine");
+            assert_eq!(latest_blocked_reason_basis(&db, &chore.id), basis.as_str());
+            let _ = std::fs::remove_file(path);
+        }
+
+        let path = temp_db_path(&format!("park-blocked-{caller:?}"));
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Already blocked");
+        let (execution, run) = start_ready_run(&db, &chore.id);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks
+                 SET status = 'blocked', blocked_reason = 'ci_failure', blocked_detail = 'existing'
+                 WHERE id = ?1",
+                [&chore.id],
+            )
+            .unwrap();
+        apply_worker_failure_park(&db, caller, &execution, &run, "dialog refused", basis);
+        let task = parked_task(&db, &chore.id);
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(
+            task.blocked_reason.as_deref(),
+            Some("ci_failure"),
+            "already-blocked domain reason must be kept"
+        );
+        assert_eq!(task.blocked_detail.as_deref(), Some("existing\n\ndialog refused"));
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// The bug `complete_pane_parked_execution` closes: a pane-spawn confirmation
 /// (`finish_execution_run` with `WaitingHuman`) already closes the run row
 /// (`finished_at` stamped) the instant the pane comes up, well before the

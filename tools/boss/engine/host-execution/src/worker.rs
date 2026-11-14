@@ -171,6 +171,13 @@ pub fn open_tmux(program: Option<&Path>, socket: impl Into<PathBuf>) -> Result<T
     }
 }
 
+/// True when a spawn or deliver error is a refused pane write because a
+/// blocking dialog was on screen. Dispatch matches this instead of depending
+/// on the tmux crate.
+pub fn is_blocking_dialog_on_screen(err: &anyhow::Error) -> bool {
+    err.is::<boss_tmux::BlockingDialogOnScreen>()
+}
+
 pub fn session_name(spawn_token: &str) -> String {
     format!("boss-{spawn_token}")
 }
@@ -372,7 +379,17 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         record.phase = Phase::Alive;
         self.persist(&record)?;
         let pane = self.wait_for_brief(&record).await;
+        // Reclaim removes the launcher's log, so retain the refusal first.
+        let dialog = record.home.as_deref().and_then(initial_prompt::blocking_dialog_marker);
         self.settle(&mut record, &pane).await?;
+        if let Some(marker) = dialog {
+            return Ok(outcome(
+                command,
+                ResultCode::Rejected,
+                boss_tmux::BlockingDialogOnScreen { marker }.to_string(),
+                Some(pane),
+            ));
+        }
         let code = match pane_life(&pane) {
             PaneLife::Indeterminate => ResultCode::OutcomeUncertain,
             PaneLife::Missing => ResultCode::Absent,
@@ -708,6 +725,14 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 ));
             }
         }
+        let driver = match DriverRegistry::default().require(&record.driver_id) {
+            Ok(driver) => driver,
+            Err(error) => return Ok(outcome(command, ResultCode::Rejected, error.to_string(), None)),
+        };
+        let tmux = self
+            .tmux
+            .clone()
+            .with_blocking_dialog_markers(driver.blocking_dialog_markers());
         record.phase = Phase::Delivering;
         record.delivery = Some(DeliveryProgress {
             command_id: command.command_id.clone(),
@@ -716,14 +741,14 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         self.persist(&record)?;
         let target = exact_target(&record.session);
         let sent = match &gesture {
-            Gesture::Text(text) => self.tmux.send_keys(&target, text).await,
+            Gesture::Text(text) => tmux.send_keys(&target, text).await,
             Gesture::Keys { key, presses, interval } => {
                 let mut sent = Ok(());
                 for press in 0..*presses {
                     if press > 0 {
                         tokio::time::sleep(*interval).await;
                     }
-                    if let Err(error) = self.tmux.send_key(&target, key).await {
+                    if let Err(error) = tmux.send_key(&target, key).await {
                         sent = Err(error);
                         break;
                     }
@@ -749,8 +774,12 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 self.persist(&record)?;
                 Ok(outcome(
                     command,
-                    ResultCode::OutcomeUncertain,
-                    format!("deliver attempted: {error:#}"),
+                    if error.downcast_ref::<boss_tmux::BlockingDialogOnScreen>().is_some() {
+                        ResultCode::Rejected
+                    } else {
+                        ResultCode::OutcomeUncertain
+                    },
+                    boss_tmux::BlockingDialogOnScreen::delivery_attempt_reason(&error),
                     Some(self.observe(&record).await),
                 ))
             }

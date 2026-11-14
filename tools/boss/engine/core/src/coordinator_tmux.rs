@@ -917,6 +917,11 @@ async fn maybe_nudge_prompt_change(
         "Your coordinator instructions changed since this session started. Re-read {} now and follow the updated instructions.",
         prompt_path.display()
     );
+    let markers = crate::driver::DriverRegistry::default()
+        .require("claude")
+        .expect("the coordinator driver is registered")
+        .blocking_dialog_markers();
+    let tmux = tmux.clone().with_blocking_dialog_markers(markers);
     match tmux.send_keys(&record.session_name, &message).await {
         Ok(()) => {
             if let Err(error) = work_db.set_metadata(PROMPT_NUDGE_HASH_KEY, &current_hash) {
@@ -1641,6 +1646,7 @@ mod tests {
                     String::new(),
                     "tmux server unreachable (fake failure)".to_owned(),
                 ),
+                Some("capture-pane") => (true, String::new(), String::new()),
                 Some("send-keys") => (true, String::new(), String::new()),
                 other => panic!("unexpected tmux command: {other:?}, args={args:?}"),
             };

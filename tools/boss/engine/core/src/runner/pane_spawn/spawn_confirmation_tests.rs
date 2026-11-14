@@ -1,6 +1,99 @@
 //! Spawn confirmation, prompt acceptance, and cancellation regressions.
 use super::*;
 
+struct DialogCapture {
+    spawner: Arc<CapturingSpawner>,
+    config_dir: PathBuf,
+    launcher_refused: bool,
+}
+
+#[async_trait]
+impl CommandRunner for DialogCapture {
+    async fn run(&self, program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+        let mut output = self.spawner.run(program, args, cwd).await?;
+        if args.iter().any(|arg| arg == "capture-pane") {
+            if self.launcher_refused {
+                let home = crate::driver::initial_prompt::delivery_home(&self.config_dir);
+                std::fs::write(
+                    home.join(crate::driver::initial_prompt::DELIVERY_LOG),
+                    "{\"step\":\"failed\",\"at_ms\":0,\"blocking_dialog_marker\":\"Do you want to proceed?\"}\n",
+                )?;
+            }
+            output.stdout = "Claude Code\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel".into();
+        }
+        Ok(output)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocking_dialog_spawn_refusal_is_terminal_even_after_session_start() {
+    use std::sync::atomic::Ordering;
+    for (session_started, launcher_refused) in [(false, true), (true, true), (true, false)] {
+        let workspace = TempDir::new().unwrap();
+        let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+        spawner
+            .hook_before_registration
+            .store(session_started, Ordering::SeqCst);
+        spawner.accept_prompt.store(false, Ordering::SeqCst);
+        *spawner.delivery_marker.lock().unwrap() = Some((
+            workspace.path().join(".claude"),
+            crate::driver::initial_prompt::DELIVERED_MARKER,
+        ));
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+        runner.set_server_state(weak);
+        let capture = Arc::new(DialogCapture {
+            spawner: spawner.clone(),
+            config_dir: workspace.path().join(".claude"),
+            launcher_refused,
+        });
+        let tmux = Tmux::with_runner_and_socket("/fake/tmux", capture, boss_tmux::TEST_SOCKET_PATH).unwrap();
+        runner.set_tmux_host(TmuxWorkerHost::new(tmux, spawner.clone(), "boss-test-worker".into()));
+        runner.set_skip_spawn_confirm(false);
+        runner.set_spawn_confirm_timeout(Duration::from_millis(60));
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+        let chore = create_test_chore(&work_db, product.id, "Refused initial prompt");
+        let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+        let (execution, _) = work_db
+            .start_execution_run(
+                &ready.id,
+                "worker-1",
+                "foo",
+                "lease-1",
+                "foo-agent-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let item = work_db.get_work_item(&chore.id).unwrap();
+        let err = runner
+            .run_execution("worker-1", &execution, &item, workspace.path(), Some("change-1"))
+            .await
+            .expect_err("dialog refusal must fail spawn");
+        assert!(err.is::<boss_tmux::BlockingDialogOnScreen>(), "{err:#}");
+        assert_eq!(spawner.reaped_run_ids(), [execution.id.clone()]);
+        assert!(spawner.sent_keys().is_empty(), "a refused Return must never be sent");
+        assert!(work_db.prompt_confirmation_pending(&execution.id).unwrap());
+        assert_eq!(
+            work_db.get_execution(&execution.id).unwrap().status,
+            ExecutionStatus::Running,
+            "the runner returns the refusal; the dispatcher terminalizes the run",
+        );
+        let chore_item = work_db.get_work_item(&chore.id).unwrap();
+        match &chore_item {
+            WorkItem::Chore(task) | WorkItem::Task(task) => {
+                assert_eq!(&task.status, &TaskStatus::Active);
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert_eq!(
+            spawner.live_states.has_driver_signal_for_run(&execution.id),
+            session_started
+        );
+    }
+}
+
 // The confirming-spawn tests below run on the paused runtime clock. Their
 // confirmation windows are tens of milliseconds, and on the wall clock a
 // starved host can spend a whole window inside the first evidence read,

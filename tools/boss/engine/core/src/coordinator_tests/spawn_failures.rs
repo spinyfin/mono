@@ -242,6 +242,99 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     assert_eq!(demote.details["reason"], "pane_spawn_failure");
 }
 
+/// A local spawn refused because a blocking dialog was on screen must be
+/// terminalized by the dispatcher, not the runner. The runner returns the
+/// typed error while the execution is still live; this arm files the
+/// attention item, stamps last_error, records the failure basis, and must
+/// not fall into the double-fault "failed to record execution run failure"
+/// path.
+#[tokio::test]
+async fn blocking_dialog_spawn_refusal_is_terminalized_by_the_dispatcher() {
+    let buffer = log_capture::install();
+    let starting_offset = buffer.lock().len();
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
+    let runner = Arc::new(FakeExecutionRunner {
+        fail_blocking_dialog: true,
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+    let failed = db.get_execution(&execution_id).unwrap();
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("BlockingDialogOnScreen")),
+        "dialog refusal must persist last_error; got {:?}",
+        failed.last_error,
+    );
+    assert_eq!(failed.pre_start_failure_count, 1);
+
+    let attention_items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        attention_items.iter().any(|item| item.kind == "pane_spawn_failed"),
+        "dialog refusal must file pane_spawn_failed; got {attention_items:#?}",
+    );
+
+    let basis: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT basis FROM task_status_audit
+             WHERE work_item_id = ?1 AND property = 'blocked_reason'
+             ORDER BY id DESC LIMIT 1",
+            [&chore.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(basis, "blocking_dialog_on_screen");
+
+    let item = db.get_work_item(&chore.id).unwrap();
+    match &item {
+        WorkItem::Chore(task) | WorkItem::Task(task) => {
+            assert_eq!(&task.status, &TaskStatus::Blocked);
+            assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+
+    wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "pane_spawned" && event.outcome == "error",
+        "pane_spawned:error",
+    )
+    .await;
+    let events = recording.events_for(&execution_id).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.stage == "status_transition" && event.details["to_status"] == "todo"),
+        "a dialog refusal parks the task; it must not bounce to todo; got {events:#?}",
+    );
+
+    let captured = captured_lines_for(&buffer, starting_offset, &execution_id);
+    assert!(
+        !captured.contains("failed to record execution run failure"),
+        "dispatcher must finish the live run instead of double-faulting; logs:\n{captured}"
+    );
+}
+
 /// Coordinator persistence for a spawn that the runner refused because
 /// no turn-start evidence arrived: the execution is `failed`, the
 /// attention item is `pane_spawn_failed`, and the recorded reason names

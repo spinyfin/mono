@@ -105,6 +105,8 @@ impl CubeJsonTransport for ListingCube {
 #[derive(Default, bon::Builder)]
 struct FakeTmux {
     #[builder(default)]
+    visible: Mutex<String>,
+    #[builder(default)]
     delivered_home: Mutex<Option<PathBuf>>,
     #[builder(default)]
     sessions: Mutex<HashMap<String, String>>,
@@ -170,6 +172,7 @@ impl CommandRunner for FakeTmux {
             return Ok(ok(""));
         };
         match verb {
+            "capture-pane" => Ok(ok(&self.visible.lock().unwrap())),
             "new-session" => {
                 self.launches.lock().unwrap().push(rest.last().unwrap().clone());
                 let name = rest
@@ -960,6 +963,43 @@ fn brief_budget_covers_every_launcher_stage_with_a_margin() {
 }
 
 #[tokio::test]
+async fn spawn_retains_blocking_dialog_error_before_reclaiming_the_home() {
+    let root = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeTmux::default());
+    let mut supervisor = supervisor(root.path(), fake.clone()).await;
+    supervisor.brief_budget = Duration::from_secs(10);
+    let mut command = spawn_command();
+    // Other spawn fixtures reclaim their shared run-test home concurrently.
+    command.run.as_mut().unwrap().run_id = "run-dialog".into();
+    let (result, home) = tokio::join!(supervisor.execute(&command, false, 1), async {
+        for _ in 0..500 {
+            if !fake.sessions.lock().unwrap().is_empty() {
+                let record = decode(&supervisor.store.load("run-dialog", "token").unwrap().unwrap()).unwrap();
+                let home = record.home.unwrap();
+                std::fs::write(
+                    home.join(initial_prompt::DELIVERY_LOG),
+                    r#"{"step":"failed","at_ms":0,"blocking_dialog_marker":"Do you want to proceed?"}"#,
+                )
+                .unwrap();
+                fake.pane_dead
+                    .lock()
+                    .unwrap()
+                    .insert(session_name("token"), ("1".into(), Some(64)));
+                return home;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the pane was never started");
+    });
+    assert_eq!(result.code, ResultCode::Rejected as i32, "{}", result.reason);
+    assert!(result.reason.contains("BlockingDialogOnScreen"), "{}", result.reason);
+    assert!(result.reason.contains("Do you want to proceed?"), "{}", result.reason);
+    assert_eq!(pane_life(&pane_of(&result)), PaneLife::BriefNotDelivered);
+    assert!(!home.exists());
+    assert!(fake.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn live_pane_without_a_delivered_brief_is_not_a_successful_delivery() {
     let root = tempfile::tempdir().unwrap();
     let fake = Arc::new(FakeTmux::default());
@@ -1460,6 +1500,71 @@ async fn deliver_with_a_foreign_live_token_sends_nothing() {
         .execute(&deliver_command("d1", DeliveryKind::Nudge, "hello"), false, 1)
         .await;
     assert_eq!(result.code, ResultCode::Absent as i32, "{}", result.reason);
+    assert!(fake.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn blocking_dialog_rejects_each_host_delivery_kind() {
+    for kind in [
+        DeliveryKind::Nudge,
+        DeliveryKind::Probe,
+        DeliveryKind::Answer,
+        DeliveryKind::Interrupt,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        *fake.visible.lock().unwrap() = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel".into();
+        live(&fake);
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        seed(&supervisor.store, Phase::Alive);
+        let result = supervisor
+            .execute(&deliver_command("dialog", kind, "3 never approve"), false, 1)
+            .await;
+        assert_eq!(result.code, ResultCode::Rejected as i32, "{kind:?}: {}", result.reason);
+        assert!(
+            result
+                .reason
+                .starts_with(boss_tmux::BlockingDialogOnScreen::DELIVERY_ATTEMPTED_PREFIX),
+            "{kind:?}: {}",
+            result.reason
+        );
+        assert_eq!(
+            result.reason,
+            boss_tmux::BlockingDialogOnScreen::delivery_attempt_reason(&boss_tmux::BlockingDialogOnScreen {
+                marker: "Do you want to proceed?".into(),
+            }),
+            "{kind:?}: {}",
+            result.reason
+        );
+        assert!(
+            boss_tmux::BlockingDialogOnScreen::is_delivery_rejection(&result.reason),
+            "{}",
+            result.reason
+        );
+        assert!(result.reason.contains("Do you want to proceed?"), "{}", result.reason);
+        assert!(fake.sent.lock().unwrap().is_empty(), "{kind:?}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_driver_rejects_delivery_without_persisting_delivering() {
+    let root = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeTmux::default());
+    live(&fake);
+    let supervisor = supervisor(root.path(), fake.clone()).await;
+    seed(&supervisor.store, Phase::Alive);
+    let bytes = supervisor.store.load("run-test", "token").unwrap().unwrap();
+    let mut record: ExecutionRecord = serde_json::from_slice(&bytes).unwrap();
+    record.driver_id = "unknown-driver".into();
+    supervisor.persist(&record).unwrap();
+    let result = supervisor
+        .execute(&deliver_command("unknown", DeliveryKind::Nudge, "hello"), false, 1)
+        .await;
+    assert_eq!(result.code, ResultCode::Rejected as i32, "{}", result.reason);
+    let bytes = supervisor.store.load("run-test", "token").unwrap().unwrap();
+    let record: ExecutionRecord = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(record.phase, Phase::Alive);
+    assert!(record.delivery.is_none());
     assert!(fake.sent.lock().unwrap().is_empty());
 }
 

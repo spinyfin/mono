@@ -230,8 +230,65 @@ def spawn_supervised(argv, master, slave):
     return pid, writer
 
 
+class BlockingDialogOnScreen(RuntimeError):
+    def __init__(self, marker):
+        self.marker = marker.decode("utf-8", "replace")
+        super().__init__(f"BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker {self.marker!r}")
+
+
+PROMPT_MARK = "❯".encode()
+_BOX_PREFIXES = (b"|", "│".encode(), "┃".encode(), "║".encode())
+
+
+def _strip_box_glyphs(row):
+    for prefix in _BOX_PREFIXES:
+        if row.startswith(prefix):
+            row = row[len(prefix):].lstrip()
+            break
+    for prefix in _BOX_PREFIXES:
+        if row.endswith(prefix):
+            row = row[:-len(prefix)].rstrip()
+            break
+    return row
+
+
+def _dialog_line(line):
+    return _strip_box_glyphs(line.strip()).lstrip(PROMPT_MARK).strip()
+
+
+def _is_later_composer(line):
+    row = _strip_box_glyphs(line.strip())
+    return bool(row) and (PROMPT_MARK in row or row.startswith(b">"))
+
+
+def check_blocking_dialog(view, markers, payload=b""):
+    visible = view.text()
+    if len(payload) <= len(visible) and b"\n" in payload:
+        visible = visible.replace("❯ ".encode() + payload, b"", 1)
+    lines = visible.splitlines()
+    footer = next((index for index in range(len(lines) - 1, -1, -1)
+                   if b"esc to cancel" in _dialog_line(lines[index]).lower()), None)
+    if footer is None:
+        return
+    if any(_is_later_composer(row) for row in lines[footer + 1:]):
+        return
+    lines = lines[:footer + 1]
+    for index, line in enumerate(lines):
+        question = _dialog_line(line)
+        window = lines[max(0, index - 2):]
+        tail = [_dialog_line(row) for row in window]
+        numbered = any(row.startswith(b"1.") for row in tail) and any(row.startswith(b"2.") for row in tail)
+        trust = (b"No, exit" in tail
+                 and (b"Yes, I trust this folder" in tail or b"Yes, I accept" in tail)
+                 and any(PROMPT_MARK in row for row in window))
+        if len(lines) - index <= 12 and (numbered or trust):
+            for marker in markers:
+                if marker and question.startswith(marker):
+                    raise BlockingDialogOnScreen(marker)
+
+
 def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
-        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None):
+        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None, blocking_dialog_markers=()):
     if b"\x1b[201~" in prompt or b"\0" in prompt:
         raise ValueError("initial brief contains a terminal paste terminator or NUL")
     outer_tty = os.isatty(0)
@@ -334,8 +391,9 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                         pending += REPLIES[query[1]]
                         consumed = query.end()
                     query_buffer = query_buffer[consumed:][-32:]
-                if not submitting:
+                if not delivered:
                     view.feed(output)
+                    check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
                 if stage == "landing":
                     echo = (echo + output)[-65536:]
                 if not paste_started:
@@ -367,6 +425,12 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                 else:
                     stdin_open = False
             if master in writable:
+                # Drain already available output before checking the current screen.
+                # A dialog may have appeared after readiness or during the paste.
+                if not delivered and select.select([master], [], [], 0)[0]:
+                    continue
+                if not delivered:
+                    check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]
                 if not pending and submitting and not delivered:
@@ -468,7 +532,8 @@ def main():
         prompt = prompt_file.read()
     # A retried launch starts its own record.
     write_marker(DELIVERY_LOG)
-    return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery)
+    return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery,
+               blocking_dialog_markers=[s.encode() for s in config.get("blocking_dialog_markers", [])])
 
 
 if __name__ == "__main__":
@@ -476,7 +541,8 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         print(f"boss initial brief delivery failed: {error}", file=sys.stderr)
-        log_delivery("failed", reason=str(error))
+        log_delivery("failed", reason=str(error),
+                     blocking_dialog_marker=error.marker if isinstance(error, BlockingDialogOnScreen) else None)
         if (prompt_home() / DELIVERED_MARKER).is_file():
             sys.exit(1)
         write_marker(UNDELIVERED_MARKER)

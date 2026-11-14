@@ -1803,6 +1803,7 @@ impl WorkDb {
             clear_workspace_lease,
             increment_pre_start_failure_count,
             record_last_error,
+            worker_failure_basis,
             attention,
         } = input;
         // Re-borrow the owned fields as the &str/Option<&str> shapes the
@@ -1925,9 +1926,23 @@ impl WorkDb {
             None
         };
 
+        if let Some(basis) = worker_failure_basis {
+            crate::pr_flow::park_task_for_worker_failure_basis(
+                &tx,
+                &execution.work_item_id,
+                normalized_error_text.as_deref().unwrap_or(""),
+                basis,
+                &now,
+                None,
+            )?;
+        }
+
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, run_id).require("run", run_id)?;
         let mut pending = PendingEvents::new();
+        if worker_failure_basis.is_some() {
+            crate::pr_flow::cascade_dependents_if_worker_failed(&mut pending, &tx, &execution.work_item_id, &now)?;
+        }
         if execution_status.is_terminal() {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
             tracing::warn!(

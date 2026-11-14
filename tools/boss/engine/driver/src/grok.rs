@@ -362,6 +362,7 @@ impl AgentDriver for GrokDriver {
         // Do NOT merge these into Claude's marker sets — each driver
         // owns its surface strings.
         Some(PaneMonitorSpec {
+            blocking_dialog_markers: vec![],
             // OR-semantics. "always-approve" assumes Boss spawn keeps
             // --always-approve. "Grok 4" matches footer "Grok 4.6 …"
             // without pinning the patch model id — the prefix is
