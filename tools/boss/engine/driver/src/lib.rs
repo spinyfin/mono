@@ -2389,12 +2389,14 @@ pub trait AgentDriver: Send + Sync {
     fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate>;
 }
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod grok;
 pub mod registry;
 
 // Also available in-module for trait signatures (pub use is an import + re-export).
+pub use agy::AgyDriver;
 pub use boss_protocol::DriverRuntimeState;
 pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;

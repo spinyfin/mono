@@ -63,6 +63,19 @@ fn native_blocked_marker_jsonl(slug: &str) -> Option<String> {
             ),
             marker = serde_json::to_string(BLOCKED_MARKER).unwrap(),
         )),
+        // agy writes PLANNER_RESPONSE rows to transcript_full.jsonl (the path
+        // stamped on Stop as transcriptPath). Shape matches the pane-viability
+        // study summaries under
+        // tools/boss/docs/investigations/ghostty-agy-pane-viability-artifacts/.
+        "agy" => Some(format!(
+            concat!(
+                r#"{{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"do the work"}}"#,
+                "\n",
+                r#"{{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":{marker}}}"#,
+                "\n",
+            ),
+            marker = serde_json::to_string(BLOCKED_MARKER).unwrap(),
+        )),
         _ => None,
     }
 }

@@ -217,8 +217,8 @@ fn eligible_drivers_for(
 /// share sits on unregistered slugs.
 ///
 /// Settings can persist that split (the stepper does not know which slugs
-/// the engine has registered). `agy = 100` before an Antigravity driver
-/// exists is the current case: the unregistered share is dropped from the
+/// the engine has registered). A future fifth slug at 100% before its
+/// driver exists is the case: the unregistered share is dropped from the
 /// eligible set and every registered driver is at 0. Failing the insert
 /// would strand every unpinned row; [`decide_execution_driver`] falls
 /// through to the engine default instead.
