@@ -77,13 +77,16 @@ async fn blocking_dialog_spawn_refusal_is_terminal_even_after_session_start() {
         assert!(work_db.prompt_confirmation_pending(&execution.id).unwrap());
         assert_eq!(
             work_db.get_execution(&execution.id).unwrap().status,
-            ExecutionStatus::Failed
+            ExecutionStatus::Running,
+            "the runner returns the refusal; the dispatcher terminalizes the run",
         );
-        let basis: String = work_db.connect().unwrap().query_row(
-            "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 AND property = 'blocked_reason' ORDER BY id DESC LIMIT 1",
-            [&chore.id], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(basis, "blocking_dialog_on_screen");
+        let chore_item = work_db.get_work_item(&chore.id).unwrap();
+        match &chore_item {
+            WorkItem::Chore(task) | WorkItem::Task(task) => {
+                assert_eq!(&task.status, &TaskStatus::Active);
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
         assert_eq!(
             spawner.live_states.has_driver_signal_for_run(&execution.id),
             session_started

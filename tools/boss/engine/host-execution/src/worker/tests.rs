@@ -1521,7 +1521,26 @@ async fn blocking_dialog_rejects_each_host_delivery_kind() {
             .execute(&deliver_command("dialog", kind, "3 never approve"), false, 1)
             .await;
         assert_eq!(result.code, ResultCode::Rejected as i32, "{kind:?}: {}", result.reason);
-        assert!(result.reason.contains("BlockingDialogOnScreen"), "{}", result.reason);
+        assert!(
+            result
+                .reason
+                .starts_with(boss_tmux::BlockingDialogOnScreen::DELIVERY_ATTEMPTED_PREFIX),
+            "{kind:?}: {}",
+            result.reason
+        );
+        assert_eq!(
+            result.reason,
+            boss_tmux::BlockingDialogOnScreen::delivery_attempt_reason(&boss_tmux::BlockingDialogOnScreen {
+                marker: "Do you want to proceed?".into(),
+            }),
+            "{kind:?}: {}",
+            result.reason
+        );
+        assert!(
+            boss_tmux::BlockingDialogOnScreen::is_delivery_rejection(&result.reason),
+            "{}",
+            result.reason
+        );
         assert!(result.reason.contains("Do you want to proceed?"), "{}", result.reason);
         assert!(fake.sent.lock().unwrap().is_empty(), "{kind:?}");
     }

@@ -1520,13 +1520,6 @@ impl ExecutionRunner for PaneSpawnRunner {
                     "spawn confirmation failed; reaping the worker pane",
                 );
                 spawner.reap_worker_pane(&execution.id).await;
-                if err.is::<boss_tmux::BlockingDialogOnScreen>() {
-                    self.work_db.record_worker_failure_with_basis(
-                        &execution.id,
-                        &err.to_string(),
-                        boss_work_db::WorkerFailureBasis::BlockingDialogOnScreen,
-                    )?;
-                }
                 return Err(err);
             }
         }

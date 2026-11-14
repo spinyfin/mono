@@ -561,6 +561,10 @@ pub(super) struct FakeExecutionRunner {
     /// this error (so the coordinator can downcast it) instead of a
     /// string-only `fail_message`.
     pub(super) fail_source: Option<crate::runner::spawn_confirmation::SpawnConfirmationError>,
+    /// When `true`, `run_execution` fails with a typed
+    /// `BlockingDialogOnScreen` so the coordinator's spawn-failure arm
+    /// can downcast it the same way a real pane-spawn refusal does.
+    pub(super) fail_blocking_dialog: bool,
     /// Fail this many `run_execution` calls (with `fail_message`), then
     /// behave as otherwise configured. Unlike the all-or-nothing `fail`, this lets one
     /// runner model a spawn path that is broken and then recovers — the
@@ -610,6 +614,7 @@ impl Default for FakeExecutionRunner {
             fail_message: None,
             fail_context: None,
             fail_source: None,
+            fail_blocking_dialog: false,
             fail_remaining: std::sync::atomic::AtomicUsize::new(0),
             slot_busy: false,
             viewer_abort_failed: false,
@@ -678,6 +683,12 @@ impl ExecutionRunner for FakeExecutionRunner {
         }
         if let Some(source) = self.fail_source.clone() {
             return Err(anyhow::Error::from(source));
+        }
+        if self.fail_blocking_dialog {
+            return Err(anyhow::Error::new(boss_tmux::BlockingDialogOnScreen {
+                marker: "Do you want to proceed?".into(),
+            })
+            .context("spawn confirmation failed"));
         }
         if self.fail {
             let err = anyhow!("{}", self.fail_message.as_deref().unwrap_or("worker prompt failed"));

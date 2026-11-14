@@ -55,6 +55,74 @@ impl WorkerFailureBasis {
     pub fn waives_progression_grace(self) -> bool {
         matches!(self, Self::DeclaredBlocked | Self::NudgeBreaker)
     }
+
+    /// Inverse of [`Self::as_str`]. Unknown strings are rejected so a
+    /// `finish_execution_run` caller cannot stamp an unattributed basis.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|basis| basis.as_str() == value)
+    }
+}
+
+/// Park an `active` / `todo` work item as `blocked: worker_failed` with
+/// `basis` on the status-audit row. Spawn-time dialog refusals go through
+/// `finish_execution_run` so this write shares that transaction instead of
+/// terminalizing the execution first.
+pub(crate) fn park_task_for_worker_failure_basis(
+    tx: &rusqlite::Transaction<'_>,
+    work_item_id: &str,
+    diagnostic: &str,
+    basis: WorkerFailureBasis,
+    now: &str,
+) -> Result<()> {
+    let Some(task) = query_task(tx, work_item_id)?.filter(|task| task.deleted_at.is_none()) else {
+        return Ok(());
+    };
+    let trimmed = diagnostic.trim();
+    match task.status {
+        TaskStatus::Active | TaskStatus::Todo => {
+            crate::task_status_audit::execute(
+                tx,
+                basis.as_str(),
+                "engine",
+                "UPDATE tasks
+                 SET status = 'blocked', blocked_reason = 'worker_failed', blocked_detail = ?2,
+                     autostart = 0, last_status_actor = 'engine', updated_at = ?3,
+                     progression_grace_waived_at = CASE WHEN ?4 THEN strftime('%s','now')
+                                                        ELSE progression_grace_waived_at END
+                 WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
+                params![work_item_id, trimmed, now, basis.waives_progression_grace()],
+            )?;
+        }
+        TaskStatus::Blocked
+            if task.blocked_reason.is_some()
+                && (!trimmed.is_empty() || task.blocked_reason.as_deref() == Some("worker_failed")) =>
+        {
+            let folded = match task.blocked_detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(existing) if trimmed.is_empty() => existing.to_owned(),
+                Some(existing) => format!("{existing}\n\n{trimmed}"),
+                None => trimmed.to_owned(),
+            };
+            crate::task_status_audit::execute(
+                tx,
+                basis.as_str(),
+                "engine",
+                "UPDATE tasks
+                 SET blocked_detail = ?2, updated_at = ?3, blocked_reason = ?4,
+                     progression_grace_waived_at = CASE WHEN ?5 THEN strftime('%s','now')
+                                                        ELSE progression_grace_waived_at END
+                 WHERE id = ?1 AND deleted_at IS NULL AND status = 'blocked' AND blocked_reason IS NOT NULL",
+                params![
+                    work_item_id,
+                    folded,
+                    now,
+                    task.blocked_reason.as_deref(),
+                    basis.waives_progression_grace() && task.blocked_reason.as_deref() == Some("worker_failed"),
+                ],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 worker_failure_basis_variants! {

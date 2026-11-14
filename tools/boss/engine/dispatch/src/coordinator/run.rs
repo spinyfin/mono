@@ -642,6 +642,10 @@ impl ExecutionCoordinator {
                 // doesn't just re-select the same bad slot and repeat the
                 // rejection — see the tail of this function.
                 let is_slot_busy = slot_busy;
+                // Dialog refusals park the task in the same transaction as
+                // the run finish. Retrying the spawn would hit the same
+                // modal, so this path must not bounce the card to To-Do.
+                let blocking_dialog = boss_host_execution::worker::is_blocking_dialog_on_screen(&err);
 
                 // Historical silent-release path: a pane-spawn
                 // failure (tmux creation failure, viewer rejection, prompt
@@ -677,6 +681,9 @@ impl ExecutionCoordinator {
                         .error_text(error_text.as_str())
                         .increment_pre_start_failure_count(!is_slot_busy)
                         .record_last_error(true)
+                        .maybe_worker_failure_basis(
+                            blocking_dialog.then_some(crate::work::WorkerFailureBasis::BlockingDialogOnScreen.as_str()),
+                        )
                         .maybe_attention(attention)
                         .build(),
                 ) {
@@ -774,7 +781,7 @@ impl ExecutionCoordinator {
                         // queue a fresh execution automatically, so the item
                         // stays in Doing and dispatches onto the next free
                         // slot exactly like a plain pool-exhaustion wait.
-                        if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
+                        if execution.kind != ExecutionKind::PrReview && !is_slot_busy && !blocking_dialog {
                             match self.work_db.bounce_dispatch_failed_to_backlog(
                                 &execution.work_item_id,
                                 "pane_spawn_failed",
@@ -819,7 +826,7 @@ impl ExecutionCoordinator {
                                 execution_id = %execution.id,
                                 work_item_id = %execution.work_item_id,
                                 is_slot_busy,
-                                "skipping demote for pr_review or slot-busy spawn failure — engine infrastructure issue, not a task regression",
+                                "skipping demote for pr_review, slot-busy, or blocking-dialog spawn failure",
                             );
                         }
                         self.publisher

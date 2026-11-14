@@ -77,8 +77,27 @@ class View:
     def text(self): return self.screen
 question = b'Do you want to proceed?'
 dialog = question + b'\n1. Yes\n2. No\nEsc to cancel'
+bordered = (
+    '╭───────────────────────────────────────────────────╮\n'
+    '│ Do you want to proceed?                           │\n'
+    '│ ❯ 1. Yes                                          │\n'
+    '│   2. No                                           │\n'
+    '│ Esc to cancel                                     │\n'
+    '╰───────────────────────────────────────────────────╯\n'
+    '  bypass permissions on'
+).encode()
+bordered_trust = (
+    '╭───────────────────────────────────────────────────╮\n'
+    '│ Quick safety check: Is this a project you created │\n'
+    '│ ❯ No, exit                                        │\n'
+    '│   Yes, I trust this folder                        │\n'
+    '│ Enter to confirm · Esc to cancel                  │\n'
+    '╰───────────────────────────────────────────────────╯\n'
+).encode()
 for screen, marker in [
     (dialog, question),
+    (bordered, question),
+    (bordered_trust, b'Yes, I trust this folder'),
     ('❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel'.encode(), b'Yes, I trust this folder'),
     ('❯ No, exit\nYes, I accept\nEnter to confirm · Esc to cancel'.encode(), b'Yes, I accept'),
 ]:

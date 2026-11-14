@@ -1803,8 +1803,22 @@ impl WorkDb {
             clear_workspace_lease,
             increment_pre_start_failure_count,
             record_last_error,
+            worker_failure_basis,
             attention,
         } = input;
+        let worker_failure_basis = match worker_failure_basis
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => None,
+            Some(value) => {
+                let Some(basis) = crate::WorkerFailureBasis::parse(value) else {
+                    bail!("unknown worker failure basis `{value}`");
+                };
+                Some(basis)
+            }
+        };
         // Re-borrow the owned fields as the &str/Option<&str> shapes the
         // transaction body was written against, so the SQL below is unchanged.
         let execution_id = execution_id.as_str();
@@ -1925,9 +1939,26 @@ impl WorkDb {
             None
         };
 
+        if let Some(basis) = worker_failure_basis {
+            crate::pr_flow::park_task_for_worker_failure_basis(
+                &tx,
+                &execution.work_item_id,
+                normalized_error_text.as_deref().unwrap_or(""),
+                basis,
+                &now,
+            )?;
+        }
+
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, run_id).require("run", run_id)?;
         let mut pending = PendingEvents::new();
+        if worker_failure_basis.is_some()
+            && query_task(&tx, &execution.work_item_id)?.is_some_and(|task| {
+                task.status == TaskStatus::Blocked && task.blocked_reason.as_deref() == Some("worker_failed")
+            })
+        {
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &execution.work_item_id, "blocked", &now)?;
+        }
         if execution_status.is_terminal() {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
             tracing::warn!(

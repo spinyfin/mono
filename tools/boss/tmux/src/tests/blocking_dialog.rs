@@ -2,6 +2,40 @@ use super::*;
 
 const MARKER: &str = "Do you want to proceed?";
 const DIALOG: &str = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+// Claude's tool-approval modal is a boxed question. A status line can sit
+// under the footer. The matcher must still see the dialog through that chrome.
+const BORDERED_APPROVAL: &str = "\
+╭───────────────────────────────────────────────────╮
+│ Do you want to proceed?                           │
+│ ❯ 1. Yes                                          │
+│   2. No                                           │
+│ Esc to cancel                                     │
+╰───────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+#[tokio::test]
+async fn bordered_approval_dialog_with_status_chrome_is_blocked() {
+    let bordered_trust = "\
+╭───────────────────────────────────────────────────╮
+│ Quick safety check: Is this a project you created │
+│ ❯ No, exit                                        │
+│   Yes, I trust this folder                        │
+│ Enter to confirm · Esc to cancel                  │
+╰───────────────────────────────────────────────────╯
+";
+    for (screen, marker) in [
+        (BORDERED_APPROVAL, MARKER),
+        (bordered_trust, "Yes, I trust this folder"),
+    ] {
+        let (tmux, _) = tmux([success(screen)]);
+        let error = tmux
+            .with_blocking_dialog_markers(vec![marker.into()])
+            .send_submit("worker")
+            .await
+            .unwrap_err();
+        assert!(error.is::<BlockingDialogOnScreen>(), "{marker}");
+    }
+}
 
 #[tokio::test]
 async fn live_claude_trust_layout_is_blocked_but_transcript_copy_is_clear() {
@@ -134,10 +168,12 @@ async fn dialog_appearing_while_loading_a_buffer_prevents_paste_and_cleans_up() 
 #[test]
 fn shared_remote_rejection_predicate_matches_host_display_envelope() {
     let error = BlockingDialogOnScreen { marker: MARKER.into() };
-    assert!(BlockingDialogOnScreen::is_delivery_rejection(&format!(
-        "deliver attempted: {error:#}"
-    )));
-    assert!(!BlockingDialogOnScreen::is_delivery_rejection(
-        "deliver attempted: capture failed"
-    ));
+    let enveloped = BlockingDialogOnScreen::delivery_attempt_reason(&error);
+    assert!(
+        enveloped.starts_with(BlockingDialogOnScreen::DELIVERY_ATTEMPTED_PREFIX),
+        "{enveloped}"
+    );
+    assert!(BlockingDialogOnScreen::is_delivery_rejection(&enveloped));
+    let capture = BlockingDialogOnScreen::delivery_attempt_reason(&"capture failed");
+    assert!(!BlockingDialogOnScreen::is_delivery_rejection(&capture));
 }

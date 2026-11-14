@@ -171,6 +171,13 @@ pub fn open_tmux(program: Option<&Path>, socket: impl Into<PathBuf>) -> Result<T
     }
 }
 
+/// True when a spawn or deliver error is a refused pane write because a
+/// blocking dialog was on screen. Dispatch matches this instead of depending
+/// on the tmux crate.
+pub fn is_blocking_dialog_on_screen(err: &anyhow::Error) -> bool {
+    err.is::<boss_tmux::BlockingDialogOnScreen>()
+}
+
 pub fn session_name(spawn_token: &str) -> String {
     format!("boss-{spawn_token}")
 }
@@ -772,7 +779,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                     } else {
                         ResultCode::OutcomeUncertain
                     },
-                    format!("deliver attempted: {error:#}"),
+                    boss_tmux::BlockingDialogOnScreen::delivery_attempt_reason(&error),
                     Some(self.observe(&record).await),
                 ))
             }

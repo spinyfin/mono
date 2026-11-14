@@ -413,6 +413,12 @@ pub struct FinishExecutionRunInput {
     /// left alone.
     #[builder(default)]
     pub record_last_error: bool,
+    /// Optional `WorkerFailureBasis` string recorded on the linked work
+    /// item in this same transaction. A spawn-time blocking-dialog refusal
+    /// uses this so the dispatcher is the only writer that terminalizes
+    /// the execution: the task is parked `blocked` with that audit basis
+    /// rather than demoted back onto the dispatch queue.
+    pub worker_failure_basis: Option<String>,
     pub attention: Option<CreateAttentionItemInput>,
 }
 

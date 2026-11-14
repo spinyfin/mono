@@ -236,22 +236,51 @@ class BlockingDialogOnScreen(RuntimeError):
         super().__init__(f"BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker {self.marker!r}")
 
 
+PROMPT_MARK = "❯".encode()
+_BOX_PREFIXES = (b"|", "│".encode(), "┃".encode(), "║".encode())
+
+
+def _strip_box_glyphs(row):
+    for prefix in _BOX_PREFIXES:
+        if row.startswith(prefix):
+            row = row[len(prefix):].lstrip()
+            break
+    for prefix in _BOX_PREFIXES:
+        if row.endswith(prefix):
+            row = row[:-len(prefix)].rstrip()
+            break
+    return row
+
+
+def _dialog_line(line):
+    return _strip_box_glyphs(line.strip()).lstrip(PROMPT_MARK).strip()
+
+
+def _is_later_composer(line):
+    row = _strip_box_glyphs(line.strip())
+    return bool(row) and (PROMPT_MARK in row or row.startswith(b">"))
+
+
 def check_blocking_dialog(view, markers, payload=b""):
     visible = view.text()
     if len(payload) <= len(visible) and b"\n" in payload:
         visible = visible.replace("❯ ".encode() + payload, b"", 1)
     lines = visible.splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines or b"esc to cancel" not in lines[-1].lower():
+    footer = next((index for index in range(len(lines) - 1, -1, -1)
+                   if b"esc to cancel" in _dialog_line(lines[index]).lower()), None)
+    if footer is None:
         return
+    if any(_is_later_composer(row) for row in lines[footer + 1:]):
+        return
+    lines = lines[:footer + 1]
     for index, line in enumerate(lines):
-        question = line.strip().lstrip("❯".encode()).strip()
-        tail = [row.strip().lstrip("❯".encode()).strip() for row in lines[max(0, index - 2):]]
+        question = _dialog_line(line)
+        window = lines[max(0, index - 2):]
+        tail = [_dialog_line(row) for row in window]
         numbered = any(row.startswith(b"1.") for row in tail) and any(row.startswith(b"2.") for row in tail)
         trust = (b"No, exit" in tail
                  and (b"Yes, I trust this folder" in tail or b"Yes, I accept" in tail)
-                 and any(row.strip().startswith("❯".encode()) for row in lines[max(0, index - 2):]))
+                 and any(PROMPT_MARK in row for row in window))
         if len(lines) - index <= 12 and (numbered or trust):
             for marker in markers:
                 if marker and question.startswith(marker):
