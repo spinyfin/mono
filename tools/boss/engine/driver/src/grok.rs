@@ -104,6 +104,7 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
+        resolve_model_effort: None,
         // Authenticated `grok models` reported this as the default on
         // 2026-08-18. Step-5 fall-through and every classified row resolve
         // to the current generation.

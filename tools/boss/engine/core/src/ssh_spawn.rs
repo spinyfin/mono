@@ -932,7 +932,12 @@ mod tests {
                     },
                 })
             } else if owned.first().map(String::as_str) == Some("cat") {
-                if let Some(pid) = self.published_worker_pid {
+                // This fixture publishes its PID only under the Claude run directory.
+                // Other registered drivers must be probed as missing.
+                if let Some(pid) = self
+                    .published_worker_pid
+                    .filter(|_| argv.get(2).is_some_and(|path| path.contains("/.claude/runs/")))
+                {
                     Ok(SshOutput {
                         status: 0,
                         stdout: format!("{pid}\n"),

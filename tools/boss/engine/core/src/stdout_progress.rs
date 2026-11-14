@@ -672,6 +672,7 @@ mod tests {
                     agent_rules_filename: "AGENTS.md",
                     initial_prompt_filename: "initial-prompt.txt",
                     model_menu: crate::driver::ModelMenu {
+                        resolve_model_effort: None,
                         engine_default: "stub-model",
                         effort_value_for_level: no_effort_value,
                         default_model_for_level: only_model,

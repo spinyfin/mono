@@ -11,8 +11,7 @@
 //!
 //! The live-status summariser and the blocked-marker parser expect the
 //! canonical Claude-shaped assistant record. This module maps native
-//! planner replies onto that shape. A later transcript-access task
-//! replaces the skeleton fixture with a captured run.
+//! planner replies onto that shape. Tests use a representative planner row.
 
 use serde_json::{Value, json};
 

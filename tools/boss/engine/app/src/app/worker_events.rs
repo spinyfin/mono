@@ -2871,6 +2871,7 @@ mod post_hoc_interception_decision_tests {
             agent_rules_filename: "AGENTS.md",
             initial_prompt_filename: "initial-prompt.txt",
             model_menu: ModelMenu {
+                resolve_model_effort: None,
                 engine_default: "stub-model",
                 effort_value_for_level: |_| None,
                 default_model_for_level: |_| "stub-model",

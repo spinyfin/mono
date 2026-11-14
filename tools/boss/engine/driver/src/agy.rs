@@ -1,10 +1,7 @@
 //! `AgyDriver` — Google Antigravity (`agy`) agent driver skeleton.
 //!
-//! Descriptor, capability set, and Gemini-family model menu for Boss's
-//! fourth driver. Pane spawn, per-run `HOME` provisioning, hook wiring,
-//! and Control Verbs beyond the interrupt declaration land in follow-on
-//! tasks — this module is the seed that keeps the registry and
-//! conformance suite green once the slug is registered.
+//! Descriptor, capability set, and Gemini-family model menu.
+//! Spawn attempts fail until per-run HOME isolation and guard hooks are implemented.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -17,7 +14,6 @@ use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{NormalizeError, WorkerEvent};
-use boss_ssh_transport::shell_quote;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
@@ -46,11 +42,12 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     binary: "agy",
     // Boss-owned control directory for the initial-prompt launcher, matching
     // Grok's `.grok`. `agy` itself has no config-dir flag; per-run state
-    // lives under a scoped HOME (later provisioning task).
+    // requires a scoped HOME, which is not provisioned yet.
     config_dir: ".agy",
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
+        resolve_model_effort: Some(model_menu::resolve_model_effort),
         engine_default: model_menu::FAMILY_HYDROGEN,
         effort_value_for_level: model_menu::effort_value_for_level,
         default_model_for_level: model_menu::default_model_for_level,
@@ -76,21 +73,15 @@ const AGY_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker 
 ///
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Spawn, provisioning, and hook wiring are
-/// stubs in this seed; later tasks replace them.
+/// unimplemented; spawn attempts exit with a not-ready error.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
 }
 
-/// Build the skeleton pane command: `agy --model <composed catalogue id>`.
-///
-/// Effort is encoded in the model-id suffix (`-low`/`-medium`/`-high`/
-/// `-xhigh`) and clamped to the family's catalogue ceiling. `--effort` is
-/// omitted so it cannot contradict that suffix. HOME wrapping, the
-/// initial-brief launcher, and spawn flags land in the pane-spawn task.
-pub fn build_agy_pane_command(request: &SpawnRequest<'_>) -> String {
-    let model = model_menu::compose_model_id(request.model, request.effort);
-    format!("agy --model {}\n", shell_quote(&model))
+/// Refuse launch until per-run HOME isolation and guard hooks are available.
+pub fn build_agy_pane_command(_request: &SpawnRequest<'_>) -> String {
+    "printf '%s\n' 'agy driver is not spawnable yet (no HOME isolation or guard hooks)' >&2; exit 1\n".into()
 }
 
 #[async_trait]
@@ -102,7 +93,7 @@ impl AgentDriver for AgyDriver {
     fn capabilities(&self) -> CapabilitySet {
         // Capability declaration for AgyDriver (v1) — design doc
         // §Capability declaration. Every omission below is deliberate;
-        // each notes its absence disposition and the phase-0 evidence.
+        // each notes its absence disposition and the supporting study evidence.
         //
         // Provided:
         //   Spawn, WorkspaceProvisioning, PermissionPolicy, ModelAndEffortMenu,
@@ -112,10 +103,8 @@ impl AgentDriver for AgyDriver {
         //
         // ToolUseInterception is rewrite-or-deny: PreToolUse rewrites
         // arguments through `overwrite` on both measured binaries (hook
-        // surface study, "PreToolUse can rewrite arguments"). The adapter
-        // that actually emits `overwrite` is a later task; the declaration
-        // matches the measured surface so `--driver agy` can clear the
-        // design-family gate once an explicit pin is set.
+        // surface study, "PreToolUse can rewrite arguments"). The hook adapter
+        // is not implemented; spawn attempts fail despite this declaration.
         CapabilitySet::new([
             Capability::Spawn,
             Capability::WorkspaceProvisioning,
@@ -191,8 +180,8 @@ impl AgentDriver for AgyDriver {
     fn progress_observation_wiring(&self, _config: &ProgressObservationConfig) -> ProgressIngress {
         // Destination is DriverOwned: hooks are discovered from
         // `$HOME/.gemini/config/hooks.json`, never from the Claude worker
-        // settings file. The map is empty in this seed; the hook-wiring
-        // task fills it. Must not return StdoutJsonl — the registry
+        // settings file. The map is empty because progress hooks are not wired.
+        // Must not return StdoutJsonl — the registry
         // refuses that topology for built-in drivers.
         ProgressIngress::HookCallback(ProgressObservationWiring {
             hooks: serde_json::Map::new(),
@@ -258,9 +247,8 @@ impl AgentDriver for AgyDriver {
     /// `--log-file` line `Cancelling in-progress response for conversation
     /// <uuid>` and pane text `Interrupted · What should Antigravity CLI do
     /// instead?`. `transcript_full.jsonl` does not record the cancellation.
-    /// Full recovery/stop/probe wiring belongs to a later Control Verbs
-    /// task; this plan is what keeps the registry interrupt-declaration
-    /// guard and the conformance interrupt-plan suite green.
+    /// The recovery observer is not wired; this plan declares the measured
+    /// interrupt contract.
     fn interrupt_plan(&self) -> Option<InterruptPlan> {
         Some(InterruptPlan {
             gesture: InterruptGesture {
@@ -281,9 +269,8 @@ impl AgentDriver for AgyDriver {
     }
 
     fn is_interrupt_recovery_turn_end(&self, raw: &serde_json::Value) -> bool {
-        // Skeleton matcher for the measured Esc-cancel log line. A later
-        // Control Verbs task replaces this with the real recovery observer
-        // that tails `--log-file`.
+        // Matcher for the measured Esc-cancel log line. The recovery observer
+        // does not yet tail `--log-file`.
         raw.get("type").and_then(|v| v.as_str()) == Some("log")
             && raw
                 .get("message")
@@ -363,17 +350,6 @@ mod tests {
                     }
                 };
                 assert_eq!(composed, expected, "{reasoning:?} {level:?}");
-                let command = AgyDriver::default()
-                    .spawn_invocation(spawn_request(family, effort))
-                    .command;
-                assert!(
-                    command.contains(&format!("--model '{composed}'")),
-                    "{reasoning:?} {level:?} spawn must show {composed}, got {command}"
-                );
-                assert!(
-                    !command.contains("--effort"),
-                    "{reasoning:?} {level:?} must not emit --effort, got {command}"
-                );
             }
         }
     }
@@ -426,18 +402,21 @@ mod tests {
     }
 
     #[test]
-    fn spawn_clamps_design_xhigh_on_carbon() {
-        let command = AgyDriver::default()
-            .spawn_invocation(spawn_request(model_menu::FAMILY_CARBON, Some("xhigh")))
-            .command;
-        assert!(
-            command.contains("--model 'gemini-4-carbon-high'"),
-            "Carbon has no xhigh id, got {command}"
+    fn skeleton_spawn_exits_without_launching_agy() {
+        let plan = AgyDriver::default().spawn_invocation(spawn_request(model_menu::FAMILY_CARBON, Some("xhigh")));
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&plan.command)
+            .env("PATH", "/nonexistent")
+            .output()
+            .expect("run refusal command without any agy executable");
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "agy driver is not spawnable yet (no HOME isolation or guard hooks)\n"
         );
-        assert!(
-            !command.contains("xhigh"),
-            "clamped Carbon must not keep xhigh: {command}"
-        );
+        assert!(output.stdout.is_empty());
+        assert!(plan.env.is_empty());
     }
 
     #[test]

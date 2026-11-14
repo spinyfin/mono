@@ -65,7 +65,7 @@ fn family_entry(model: &str) -> Option<(&'static str, &'static str)> {
     FAMILIES
         .iter()
         .copied()
-        .find(|(prefix, _)| lower == *prefix || lower.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('-')))
+        .find(|(prefix, _)| lower == *prefix || existing_rung(&lower, prefix).is_some())
 }
 
 fn rung_rank(rung: &str) -> Option<usize> {
@@ -107,9 +107,18 @@ pub(super) fn compose_model_id(model: &str, effort: Option<&str>) -> String {
     format!("{}-{}", prefix, clamp_rung(requested, ceiling))
 }
 
+/// Resolve both recorded spawn fields from the same catalogue entry.
+pub(super) fn resolve_model_effort(model: &str, effort: Option<&str>) -> (String, Option<&'static str>) {
+    let model = compose_model_id(model, effort);
+    let rung = family_entry(&model)
+        .and_then(|(prefix, _)| existing_rung(&model, prefix))
+        .and_then(|suffix| RUNGS.into_iter().find(|rung| *rung == suffix));
+    (model, rung)
+}
+
 /// Map a Boss effort level onto Hydrogen's four-rung id-suffix ladder.
 ///
-/// Spawn clamps this value to the selected family's ceiling — Carbon /
+/// Spawn resolution clamps this value to the selected family's ceiling — Carbon /
 /// Argon / Flash have no `xhigh` id — so `effort_value_for_level` itself
 /// stays family-blind, matching the `ModelMenu` function-pointer shape.
 ///
@@ -184,6 +193,14 @@ pub(super) fn model_belongs_to_driver(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_suffixes_are_rejected_and_never_rewritten() {
+        for model in ["gemini-4-hydrogen-max", "gemini-3.8-flash-lite-low"] {
+            assert!(!model_belongs_to_driver(model));
+            assert_eq!(compose_model_id(model, Some("high")), model);
+        }
+    }
 
     #[test]
     fn compose_clamps_per_family_ceiling() {

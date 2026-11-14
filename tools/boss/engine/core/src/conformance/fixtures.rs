@@ -378,6 +378,7 @@ impl CodexShapedDriver {
                 agent_rules_filename: "AGENTS.md",
                 initial_prompt_filename: "initial-prompt.txt",
                 model_menu: ModelMenu {
+                    resolve_model_effort: None,
                     engine_default: "gpt-5.5",
                     effort_value_for_level: no_effort_value,
                     default_model_for_level: only_model,
