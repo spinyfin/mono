@@ -87,6 +87,27 @@ async fn normal_screen_allows_text_interrupt_and_recovery_return() {
                 super::super::worker_events::dispatch_probe_now(&state, &run).await;
                 assert_eq!(
                     state.probe_lifecycle_state(&probe_id),
+                    Some(boss_protocol::ProbeDeliveryState::Injected)
+                );
+                dispatch_live_worker_state(
+                    &state,
+                    &boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+                        boss_protocol::WorkerEvent::UserPromptSubmit {
+                            session_id: "sess".into(),
+                            prompt: if path == "answer" {
+                                "answer: continue"
+                            } else {
+                                "status?"
+                            }
+                            .into(),
+                        },
+                        Some(run.clone()),
+                        None,
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    state.probe_lifecycle_state(&probe_id),
                     Some(boss_protocol::ProbeDeliveryState::Consumed)
                 );
             }

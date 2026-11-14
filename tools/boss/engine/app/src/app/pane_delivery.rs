@@ -738,7 +738,9 @@ impl ServerState {
         let submit_settle = boss_engine_completion::driver_transcript::driver_for_execution(&self.work_db, run_id)
             .map(|driver| driver.pane_submit_settle())
             .unwrap_or_default();
-        let result = tmux.send_keys_with_submit_settle(&session_name, text, submit_settle).await;
+        let result = tmux
+            .send_keys_with_submit_settle(&session_name, text, submit_settle)
+            .await;
         self.settle_pane_input_failure(run_id, &result).await;
         result.map_err(PaneSendFailure::Tmux)
     }
