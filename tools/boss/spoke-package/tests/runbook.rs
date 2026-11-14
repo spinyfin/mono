@@ -94,8 +94,57 @@ fn it_names_the_paths_and_service_labels_of_both_platforms() {
     }
 }
 
+fn parse_installer_invocation(text: &str) -> Option<(String, BTreeSet<String>)> {
+    let logical = text.trim();
+    for tool in [
+        "/opt/boss-spoke/current/bin/boss-spoke-package",
+        "boss-spoke-package-<platform>",
+    ] {
+        let Some(rest) = logical
+            .strip_prefix(&format!("./{tool} "))
+            .or_else(|| logical.strip_prefix(&format!("{tool} ")))
+        else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let name = words.next().unwrap_or_default().to_owned();
+        let flags = words
+            .filter_map(|word| word.strip_prefix("--"))
+            .map(str::to_owned)
+            .collect();
+        return Some((name, flags));
+    }
+    None
+}
+
+fn inline_code_spans(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        if rest.starts_with("``") {
+            // A fenced block; skip through the closing fence.
+            rest = rest.trim_start_matches('`');
+            if let Some(end) = rest.find("```") {
+                rest = &rest[end + 3..];
+            } else {
+                break;
+            }
+            continue;
+        }
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        spans.push(&rest[..end]);
+        rest = &rest[end + 1..];
+    }
+    spans
+}
+
 /// Every installer command in the runbook, as `(subcommand, flags)`. A command
 /// continued over several lines with a trailing backslash is one command.
+/// Inline code spans are parsed the same way, so flags documented only in
+/// prose still get checked.
 fn installer_commands(text: &str) -> Vec<(String, BTreeSet<String>)> {
     let mut commands = Vec::new();
     let mut lines = text.lines();
@@ -109,26 +158,34 @@ fn installer_commands(text: &str) -> Vec<(String, BTreeSet<String>)> {
                 None => break,
             }
         }
-        for tool in [
-            "/opt/boss-spoke/current/bin/boss-spoke-package",
-            "boss-spoke-package-<platform>",
-        ] {
-            let Some(rest) = logical
-                .strip_prefix(&format!("./{tool} "))
-                .or_else(|| logical.strip_prefix(&format!("{tool} ")))
-            else {
-                continue;
-            };
-            let mut words = rest.split_whitespace();
-            let name = words.next().unwrap_or_default().to_owned();
-            let flags = words
+        if let Some(command) = parse_installer_invocation(&logical) {
+            commands.push(command);
+        }
+    }
+    for span in inline_code_spans(text) {
+        if let Some(command) = parse_installer_invocation(span) {
+            commands.push(command);
+        } else if let Some(rest) = span.trim().strip_prefix("enroll ") {
+            let flags = rest
+                .split_whitespace()
                 .filter_map(|word| word.strip_prefix("--"))
                 .map(str::to_owned)
                 .collect();
-            commands.push((name, flags));
+            commands.push(("enroll".into(), flags));
         }
     }
     commands
+}
+
+/// True when `help` documents `--flag` as its own long option, not as a prefix
+/// of a longer one (`--token` must not match `--token-file`).
+fn help_has_flag(help: &str, flag: &str) -> bool {
+    let needle = format!("--{flag}");
+    help.match_indices(&needle).any(|(index, _)| {
+        help.as_bytes()
+            .get(index + needle.len())
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-')
+    })
 }
 
 #[test]
@@ -140,6 +197,16 @@ fn every_installer_subcommand_and_flag_it_runs_exists() {
         used.contains("install") && used.contains("enroll") && used.contains("preflight"),
         "{used:?}"
     );
+    let flags: BTreeSet<&str> = commands
+        .iter()
+        .flat_map(|(_, flags)| flags.iter().map(String::as_str))
+        .collect();
+    for required in ["replace-identity", "token-stdin"] {
+        assert!(
+            flags.contains(required),
+            "the runbook never shows --{required}; collected {flags:?}"
+        );
+    }
     let installer = std::env::var("INSTALLER_BIN").expect("INSTALLER_BIN");
     for (name, flags) in &commands {
         let help = std::process::Command::new(&installer)
@@ -154,7 +221,7 @@ fn every_installer_subcommand_and_flag_it_runs_exists() {
         let help = String::from_utf8_lossy(&help.stdout);
         for flag in flags {
             assert!(
-                help.contains(&format!("--{flag}")),
+                help_has_flag(&help, flag),
                 "`{name}` has no --{flag}; its help is:\n{help}"
             );
         }

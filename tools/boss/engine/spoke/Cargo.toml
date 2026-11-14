@@ -23,6 +23,7 @@ boss-protocol-spoke = { path = "../../protocol-spoke" }
 boss-spoke-journal = { path = "../spoke-journal" }
 boss-spoke-outbound = { path = "../spoke-outbound" }
 boss-spoke-preflight = { path = "../spoke-preflight" }
+boss-spoke-credentials = { path = "../../spoke-credentials" }
 clap = { workspace = true, features = ["derive"] }
 fs4 = { workspace = true }
 libc = { workspace = true }

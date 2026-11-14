@@ -231,7 +231,7 @@ impl Enrolled {
 /// crash between the two) is finished, not replaced, and spends no token. The
 /// token file is removed once it has been used.
 pub fn enroll_inline(args: &InlineEnroll<'_>) -> Result<Enrolled, Failure> {
-    let dir = args.state_dir.join("credentials");
+    let dir = boss_spoke_preflight::credentials_dir(args.state_dir);
     let credentials = SpokeCredentials::open(&dir).map_err(unwritable)?;
     let existing = credentials.identity().map_err(unwritable)?;
     let marker_path = dir.join(REPLACING_MARKER);
@@ -383,7 +383,7 @@ pub fn bootstrap(host: &dyn Host, options: &Options<'_>) -> Result<Report, Failu
         )));
     }
     decode_token(options.token)?;
-    let credentials = layout.on_disk(&layout.state_dir()).join("credentials");
+    let credentials = layout.on_disk(&layout.credentials_dir());
     if !credentials.join("ca.pem").is_file() {
         return Err(Failure::NotInstalled(format!(
             "{} is missing; run `{} install` first",

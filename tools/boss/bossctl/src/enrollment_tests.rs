@@ -240,12 +240,21 @@ fn the_runbooks_bossctl_commands_and_flags_exist() {
         .find_subcommand("enrollment")
         .expect("bossctl has an enrollment command");
     let mut shown = std::collections::BTreeSet::new();
+    let mut flags = std::collections::BTreeSet::new();
+    let mut snippets = Vec::new();
     for line in runbook.lines() {
-        let Some((_, rest)) = line.split_once("bossctl enrollment ") else {
-            continue;
-        };
-        // Inline code ends at the closing backtick; a fenced line at the end.
-        let command = rest.split('`').next().unwrap_or(rest);
+        if let Some((_, rest)) = line.split_once("bossctl enrollment ") {
+            snippets.push(rest.split('`').next().unwrap_or(rest).to_owned());
+        }
+    }
+    for (index, span) in runbook.split('`').enumerate() {
+        if index % 2 == 1
+            && let Some((_, rest)) = span.split_once("bossctl enrollment ")
+        {
+            snippets.push(rest.to_owned());
+        }
+    }
+    for command in snippets {
         let mut words = command.split_whitespace();
         let name = words.next().expect("a subcommand");
         let sub = enrollment
@@ -257,6 +266,7 @@ fn the_runbooks_bossctl_commands_and_flags_exist() {
                 sub.get_arguments().any(|arg| arg.get_long() == Some(flag)),
                 "`bossctl enrollment {name}` has no --{flag}"
             );
+            flags.insert(flag.to_owned());
         }
     }
     for want in ["token", "list", "revoke"] {
@@ -265,4 +275,8 @@ fn the_runbooks_bossctl_commands_and_flags_exist() {
             "the runbook never shows `bossctl enrollment {want}`"
         );
     }
+    assert!(
+        flags.contains("credentials-dir"),
+        "the runbook never shows --credentials-dir; collected {flags:?}"
+    );
 }

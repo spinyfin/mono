@@ -1669,6 +1669,7 @@ dependencies = [
  "boss-host-execution",
  "boss-protocol",
  "boss-protocol-spoke",
+ "boss-spoke-credentials",
  "boss-spoke-journal",
  "boss-spoke-outbound",
  "boss-spoke-preflight",

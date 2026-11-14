@@ -45,6 +45,7 @@ rust_binary(
         "//tools/boss/engine/spoke-preflight",
         "//tools/boss/engine/spoke-worker-api",
         "//tools/boss/protocol-spoke",
+        "//tools/boss/spoke-credentials",
     ] + all_crate_deps(normal = True),
 )
 

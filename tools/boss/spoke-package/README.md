@@ -130,8 +130,9 @@ exists). It removes the token file, starts the service through the installed
 launchd/systemd definition, and runs the as-user preflight below. Every failure
 is typed (`enrollment failed: <code>`, with a distinct exit status 10–18); a
 failed preflight (`preflight_failed`, 17) leaves the host enrolled and reports
-the failed checks. Enrollment does not enable dispatch: hub registration and
-promotion to a schedulable spoke have no supported production command yet.
+the failed checks. Enrollment does not enable dispatch: hub registration and promotion to a
+schedulable spoke are owned by the design-breakdown entries **Remote capacity
+qualification** and **Capacity scheduling and unreachable hosts**.
 There is no SSH and no
 other enrollment path. `--replace-identity` enrolls again over an existing
 identity (a lost or expired one) with a newly minted token. The full procedure,
@@ -157,10 +158,10 @@ daemon over a live tmux session).
 
 ### Upgrades
 
-Two pieces are not built yet: the hub does not offer releases (nothing sends the
-daemon an `Upgrade`, so a host stays on its installed release), and the daemon
-does not renew its certificate, so certificate replacement currently requires
-manual re-enrollment before the 30-day expiry.
+The hub does not offer releases yet (nothing sends the daemon an `Upgrade`, so a
+host stays on its installed release); that work is owned by the design-breakdown
+entry **Hub spoke-upgrade rollout**. The daemon renews its own certificate when
+ten days remain.
 The first install also writes a root-run helper
 (systemd path unit / launchd WatchPaths) that applies a request the service
 user drops into `update-request/`. The helper claims that file into an

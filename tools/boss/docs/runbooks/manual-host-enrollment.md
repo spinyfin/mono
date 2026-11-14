@@ -2,9 +2,9 @@
 
 Install the signed spoke package by hand, enroll the host's identity with a single-use token from the hub, and check it. This is the only supported way to enroll a host. There is no SSH anywhere in it, and no cloud-hosted spokes for now: you install on a machine you control, and the spoke then dials out to the hub. Design: [Manual enrollment and upgrades](../designs/hub-and-spoke-distributed-engine.md); package details: [`spoke-package/README.md`](../../spoke-package/README.md).
 
-**Enrollment establishes identity and an authenticated management stream; it does not enable dispatch.** Hub host registration, launch-path configuration and promotion to `spoke_ready` have no supported production command yet. Preflight reports are sent to the hub but are not consumed by its scheduler. Do not use this runbook to commission worker capacity.
+**Enrollment establishes identity and an authenticated management stream; it does not enable dispatch.** Hub host registration, launch-path configuration and promotion to `spoke_ready` are owned by the design-breakdown entries **Remote capacity qualification** and **Capacity scheduling and unreachable hosts**. Preflight reports are sent to the hub but are not consumed by its scheduler until those entries land. Do not use this runbook to commission worker capacity.
 
-**Package installation is a one-time step**, and the package installs an update helper that can apply signed releases (see [Upgrades](#upgrades)). Two pieces are not built yet: the hub does not offer releases, so a host stays on the release it was installed with, and the daemon does not renew its own certificate, so until it does an administrator replaces each host's certificate by hand every 30 days (see [Certificate lifetime](#certificate-lifetime)).
+**Package installation is a one-time step**, and the package installs an update helper that can apply signed releases (see [Upgrades](#upgrades)). The hub does not offer releases yet; that work is owned by **Hub spoke-upgrade rollout**, so a host stays on the release it was installed with until then. Certificate renewal is built into the daemon (see [Certificate lifetime](#certificate-lifetime)).
 
 Two people may be involved: the **hub operator** (runs `bossctl` where the hub's credential state lives) and the **host installer** (has root on the new machine). They can be the same person. The only thing that passes between them is the token, which is single use, bound to one host id and valid for 15 minutes.
 
@@ -27,8 +27,10 @@ On the hub, the listener must already be configured (`BOSS_HUB_LISTEN`, `BOSS_HU
 On the machine where the hub's credential directory lives:
 
 ```sh
-export BOSS_HUB_CREDENTIALS_DIR=/path/to/hub-credentials   # or pass --credentials-dir
+export BOSS_HUB_CREDENTIALS_DIR=/path/to/hub-credentials
 bossctl enrollment token build-box-1 --token-out ./build-box-1.token
+# or, instead of the environment variable:
+bossctl enrollment token --credentials-dir /path/to/hub-credentials build-box-1 --token-out ./build-box-1.token
 ```
 
 This authorizes `build-box-1` (if it is new) and writes a fresh token to a new owner-only file. Without `--token-out` it prints the token once instead. The hub stores only a hash, so a lost token is replaced, not recovered: minting again invalidates the earlier unused token.
@@ -97,6 +99,9 @@ Use `/opt/boss-spoke/current/bin/boss-spoke-package` on Linux and `/usr/local/li
 ```sh
 /opt/boss-spoke/current/bin/boss-spoke-package enroll --token-file /root/build-box-1.token \
   --repo https://github.com/spinyfin/mono          # optional: repeat for each repo the host must read
+# token from stdin instead of a file:
+/opt/boss-spoke/current/bin/boss-spoke-package enroll --token-stdin \
+  --repo https://github.com/spinyfin/mono
 ```
 
 The token comes from an owner-only (`0600`) file or from `--token-stdin`; it is never a command-line argument. In order, `enroll`:
@@ -114,17 +119,17 @@ A successful run prints the preflight `PASS` lines, `enrolled host … (certific
 
 Every failure prints `enrollment failed: <code>` and exits with the status below. There is no fallback to anything but the hub's `Enroll` call.
 
-| Code                     | Exit | Meaning and what to do                                                                                                                                                                                                         |
-| ------------------------ | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `not_installed`          | 10   | No install record, service user, registered service or `ca.pem`. Run `install` (step 2) first. Nothing was changed.                                                                                                            |
-| `token_invalid`          | 11   | The text is not a 32-byte token (truncated paste, extra characters). Re-copy it. The token is never echoed.                                                                                                                    |
-| `already_enrolled`       | 12   | The host already has `cert.pem` and `key.pem`. To replace the identity (lost or expired), mint a new token and add `--replace-identity`.                                                                                       |
-| `hub_unreachable`        | 13   | The hub could not be reached or its certificate did not verify against `ca.pem`. The token was **not** spent and your token file is kept: fix the address or CA, then run the same command again.                              |
-| `enrollment_refused`     | 14   | The hub said no: token spent, expired, replaced, for another host, or the host is revoked. Mint a new token (step 1) and run again. Your token file is deleted.                                                                |
-| `credentials_unwritable` | 15   | The credentials directory is not owner-only, not owned by `boss-worker`, or is not a real directory. Fix it as `install` describes; `install` never repairs paths the service user controls.                                   |
-| `service_not_running`    | 16   | The host enrolled but the service did not start or stay up. Read the service log (below), fix the cause and restart the service. Do not re-enroll.                                                                             |
-| `preflight_failed`       | 17   | The host enrolled and the service runs, but a check failed. The failing names are printed as `failed_preflights: …`. Enrollment does not enable dispatch; fix it as `boss-worker`, then run the installed `preflight` command. |
-| `enrollment_failed`      | 18   | The as-user step failed without saying why. Its output is printed; check the `boss-worker` state directory permissions and the hub log.                                                                                        |
+| Code                     | Exit | Meaning and what to do                                                                                                                                                                                                              |
+| ------------------------ | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `not_installed`          | 10   | No install record, service user, registered service or `ca.pem`. Run `install` (step 2) first. Nothing was changed.                                                                                                                 |
+| `token_invalid`          | 11   | The text is not a 32-byte token (truncated paste, extra characters). Re-copy it. The token is never echoed.                                                                                                                         |
+| `already_enrolled`       | 12   | The host already has `cert.pem` and `key.pem`. To replace the identity (lost or expired), mint a new token and run `/opt/boss-spoke/current/bin/boss-spoke-package enroll --replace-identity --token-file /root/build-box-1.token`. |
+| `hub_unreachable`        | 13   | The hub could not be reached or its certificate did not verify against `ca.pem`. The token was **not** spent and your token file is kept: fix the address or CA, then run the same command again.                                   |
+| `enrollment_refused`     | 14   | The hub said no: token spent, expired, replaced, for another host, or the host is revoked. Mint a new token (step 1) and run again. Your token file is deleted.                                                                     |
+| `credentials_unwritable` | 15   | The credentials directory is not owner-only, not owned by `boss-worker`, or is not a real directory. Fix it as `install` describes; `install` never repairs paths the service user controls.                                        |
+| `service_not_running`    | 16   | The host enrolled but the service did not start or stay up. Read the service log (below), fix the cause and restart the service. Do not re-enroll.                                                                                  |
+| `preflight_failed`       | 17   | The host enrolled and the service runs, but a check failed. The failing names are printed as `failed_preflights: …`. Enrollment does not enable dispatch; fix it as `boss-worker`, then run the installed `preflight` command.      |
+| `enrollment_failed`      | 18   | The as-user step failed without saying why. Its output is printed; check the `boss-worker` state directory permissions and the hub log.                                                                                             |
 
 Preflight checks and what fixes them (the installed `preflight` command prints one `PASS`/`FAIL` line each and is safe to run repeatedly):
 
@@ -175,7 +180,7 @@ The package installs a root-run **update helper** (a systemd path unit on Linux,
 3. stages the release, switches `current`, and restarts only the daemon, so tmux workers and the journal stay up;
 4. requires lock, journal, inventory and a management handshake within two minutes, and otherwise **rolls back to `previous` by itself**.
 
-> **Status: the hub does not offer releases yet.** The daemon and helper handle an offer, but no hub code sends one, so a host enrolled with this runbook stays on the release it was installed with. Until the hub side exists, move a host to a newer release by running the signed `install` again with the **same `--host-id`**, hub URL and CA, exactly as in [Disaster recovery](#disaster-recovery) steps 2 to 5; that reinstall is not rolled back automatically if it fails, so do it on one host first.
+> **Status: the hub does not offer releases yet.** That work is owned by the design-breakdown entry **Hub spoke-upgrade rollout**. The daemon and helper handle an offer, but no hub code sends one, so a host enrolled with this runbook stays on the release it was installed with. Until that entry lands, move a host to a newer release by running the signed `install` again with the **same `--host-id`**, hub URL and CA, exactly as in [Disaster recovery](#disaster-recovery) steps 2 to 5; that reinstall is not rolled back automatically if it fails, so do it on one host first.
 
 The `boss-worker` user cannot write release binaries, `current`, the pinned key or the service definitions.
 
@@ -204,7 +209,7 @@ The hub operator's view of each host's release and last attempt is a separate pi
 
 ## Certificate lifetime
 
-A host certificate lasts 30 days and the hub keeps a 24-hour overlap across renewal. **This release's daemon does not renew its own certificate yet** (the client-side renewal exists in `spoke-credentials` but is not wired into the daemon). Until it is, re-enroll a host before its certificate expires: mint a new token for the same host id and run `enroll --replace-identity` (step 4). The journal is preserved. `bossctl enrollment list` shows how long each certificate has left. An expired identity is recovered the same way; the host's journal and pending evidence stay on disk.
+A host certificate lasts 30 days and the hub keeps a 24-hour overlap across renewal. The daemon renews on its own when ten days remain, with up to one day of jitter so a fleet enrolled together does not renew together; it publishes the new key and certificate atomically and reconnects the outbound session. `bossctl enrollment list` shows how long each certificate has left. If the identity is lost, expired while the daemon was down, or revoked, mint a new token for the same host id and run `/opt/boss-spoke/current/bin/boss-spoke-package enroll --replace-identity --token-file /root/build-box-1.token` (step 4). The journal is preserved.
 
 ## Disaster recovery
 

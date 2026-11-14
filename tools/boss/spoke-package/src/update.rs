@@ -1435,7 +1435,7 @@ fn refused(layout: &Layout, request: &Request, error: &str) -> Status {
 }
 
 fn record_enrolled(layout: &Layout, record: &InstallRecord) -> bool {
-    let credentials = layout.on_disk(&layout.state_dir().join("credentials"));
+    let credentials = layout.on_disk(&layout.credentials_dir());
     ["cert.pem", "key.pem"]
         .iter()
         .all(|name| credentials.join(name).is_file())
