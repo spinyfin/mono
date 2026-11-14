@@ -932,6 +932,24 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
     }
 
+    /// Observe token-identified sessions for a replay readiness barrier.
+    pub async fn inventory(&self) -> Result<Vec<boss_protocol_spoke::v1::RunObservation>> {
+        let mut observations = Vec::new();
+        for bytes in self.store.assigned()? {
+            let record: ExecutionRecord = serde_json::from_slice(&bytes)?;
+            observations.push(boss_protocol_spoke::v1::RunObservation {
+                run: Some(Run {
+                    execution_id: record.execution_id.clone(),
+                    run_id: record.run_id.clone(),
+                    assignment_generation: record.assignment_generation,
+                    spawn_token: record.spawn_token.clone(),
+                }),
+                pane: Some(self.observe(&record).await),
+            });
+        }
+        Ok(observations)
+    }
+
     /// Classify the pane. `Missing` only when tmux positively reports the
     /// session absent or owned by another token; any failed or unparseable
     /// query is `Indeterminate`, never a guess.

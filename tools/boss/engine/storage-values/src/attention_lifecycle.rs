@@ -274,6 +274,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          start instead of staying open forever after the upgrade.",
     ),
     entry(
+        "host_unreachable",
+        ClearedBy::ProducerReconciles,
+        "The capacity reconciler clears this after a fresh nonce response or explicit assignment resolution. Silence never abandons a worker or releases its lease.",
+    ),
+    entry(
         REMOTE_WORKER_DIED_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Records that the item's worker died on a remote host and was reaped, and carries the worker's last \

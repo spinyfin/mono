@@ -314,6 +314,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: driver_allocation::traffic_split_migration::migrate,
         },
         Migration {
+            id: host_capacity::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: host_capacity::migrate,
+        },
+        Migration {
             id: spoke_hub::RUN_INDEX_MIGRATION_ID.into(),
             legacy_version: None,
             apply: spoke_hub::migrate_host_commands_run_idx,

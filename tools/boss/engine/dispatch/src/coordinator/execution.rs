@@ -5,20 +5,13 @@ use crate::work::CancelExecutionOpts;
 use anyhow::bail;
 use boss_protocol::ReviewBatchPhase;
 
-use super::spoke_in_doubt::waitable_spoke_lease;
+use super::spoke_in_doubt::{DispatchDeferred, HostSelectionFailure, waitable_spoke_lease};
 use super::*;
 
 /// The original dispatch failure is already visible in the event stream.
 #[derive(Debug, thiserror::Error)]
 #[error("pre-start failure bookkeeping failed")]
 pub(super) struct PreStartFailureReported;
-
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
-struct HostSelectionFailure {
-    report: Vec<Eligibility>,
-    message: String,
-}
 
 /// Where `cube workspace goto` should position the working copy: a PR
 /// branch head, or (for a post-merge review batch member) a frozen
@@ -205,14 +198,22 @@ impl ExecutionCoordinator {
     /// report the local slot as always-free (`active_runs = 0`) and let
     /// only remote hosts be gated by their `work_runs` active count.
     ///
+    /// A host on the ready spoke transport is not counted that way: its seats
+    /// come from the fresh resource budget and outstanding reservations
+    /// ([`crate::work::WorkDb::available_host_budget`]), which is zero whenever the host has
+    /// not answered a fresh challenge and reported capacity. A host that cannot
+    /// read its budget admits nothing without hiding the other hosts. A
+    /// `spoke_pending` host still launches over SSH and is counted like a
+    /// legacy host.
+    ///
     /// The execution's resolved agent driver is a hard placement
     /// constraint: only hosts whose auto-discovered capabilities include
     /// `driver=<slug>` are candidates. There is no silent fall-back to a
     /// different driver or to `local`.
     ///
-    /// Returns the selected [`Host`] or an error describing why nothing was
-    /// eligible (consumed by the caller as a recoverable pre-start
-    /// failure).
+    /// Returns the selected [`Host`], or an error describing why nothing was
+    /// eligible. A budget-only miss is deferred without a pre-start failure;
+    /// capability, enablement and pin mismatches still fail or cancel.
     fn pick_host(
         &self,
         work_item: &WorkItem,
@@ -253,6 +254,7 @@ impl ExecutionCoordinator {
             .active_runs_per_host()
             .context("host-selection: active runs per host")?;
 
+        let mut budget_gated_hosts = BTreeSet::new();
         let slots: Vec<HostSlot> = hosts
             .iter()
             .map(|host| {
@@ -261,13 +263,26 @@ impl ExecutionCoordinator {
                     .list_host_capabilities(&host.id)
                     .map(|caps| caps.into_iter().map(|c| c.capability).collect::<BTreeSet<_>>())
                     .context("host-selection: host capabilities")?;
-                let active_runs = if host.id == "local" {
+                let mut slot_host = host.clone();
+                let active_runs = if self.work_db.host_transport(&host.id)? == boss_work_db::HostTransport::SpokeReady {
+                    budget_gated_hosts.insert(host.id.clone());
+                    slot_host.pool_size = self
+                        .work_db
+                        .available_host_budget(&host.id)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(host_id = %host.id, %error, "host-selection: host budget unavailable");
+                            0
+                        })
+                        .try_into()
+                        .unwrap_or(i64::MAX);
+                    0
+                } else if host.id == "local" {
                     0
                 } else {
                     *active.get(&host.id).unwrap_or(&0)
                 };
                 Ok(HostSlot {
-                    host: host.clone(),
+                    host: slot_host,
                     capabilities,
                     active_runs,
                     // Branch-affinity tiebreaker is deferred (PR4): the
@@ -297,8 +312,9 @@ impl ExecutionCoordinator {
                 .into_iter()
                 .find(|h| h.id == host_id)
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
-            None => Err(anyhow!(HostSelectionFailure {
+            None => Err(HostSelectionFailure {
                 report: report.clone(),
+                budget_gated_hosts,
                 message: format!(
                     "no eligible host for work item {}: {}{}",
                     work_item.primary_id(),
@@ -307,7 +323,8 @@ impl ExecutionCoordinator {
                         .map(|reason| format!("; {reason}"))
                         .unwrap_or_default(),
                 ),
-            })),
+            }
+            .into()),
         }
     }
 
@@ -1075,6 +1092,25 @@ impl ExecutionCoordinator {
                 return Err(self.park_held_spoke_attempt(execution, err).await);
             }
             Err(err) => {
+                if err
+                    .downcast_ref::<HostSelectionFailure>()
+                    .is_some_and(HostSelectionFailure::is_budget_only)
+                {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        "no host has a fresh resource budget; deferring dispatch"
+                    );
+                    return Err(self
+                        .defer_claimed_dispatch(
+                            execution,
+                            worker_id,
+                            err.context(DispatchDeferred {
+                                reason: "host_budget_exhausted",
+                            }),
+                            serde_json::json!({ "reason": "host_budget_exhausted" }),
+                        )
+                        .await);
+                }
                 if had_requested_host {
                     match self.work_db.cancel_execution_with(
                         &execution.id,
@@ -1142,6 +1178,29 @@ impl ExecutionCoordinator {
             .await
         {
             Ok(adapter) => adapter,
+            Err(err) if err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_some() => {
+                // Another dispatcher took the seat, or the freshness window closed
+                // after selection. Nothing has started: return the row to `ready`
+                // without spending a pre-start retry or raising attention.
+                tracing::info!(
+                    execution_id = %execution.id,
+                    host_id = %selected_host.id,
+                    "host budget was spent between selection and admission; deferring dispatch"
+                );
+                return Err(self
+                    .defer_claimed_dispatch(
+                        execution,
+                        worker_id,
+                        err.context(DispatchDeferred {
+                            reason: "host_budget_exhausted",
+                        }),
+                        serde_json::json!({
+                            "reason": "host_budget_exhausted",
+                            "host_id": selected_host.id.clone(),
+                        }),
+                    )
+                    .await);
+            }
             Err(err) if held_spoke_host.is_some() => {
                 return Err(self.park_held_spoke_attempt(execution, err).await);
             }

@@ -927,6 +927,40 @@ async fn auto_reaps_offline_host_execution_without_cube_confirmation() {
     assert_eq!(reap_event.details["host_offline"], true);
 }
 
+/// A disabled host on the ready spoke transport is not offline: dispatch
+/// enablement is independent of reachability, so a silent worker on it keeps
+/// the confirm-dead gate and is never reaped on silence alone. A
+/// `spoke_pending` host still launches over SSH and is treated like a legacy
+/// host.
+#[tokio::test]
+async fn disabled_spoke_host_execution_keeps_the_cube_confirmation_gate() {
+    let (_dir, db) = open_db_arc();
+    let product_id = create_product(&db);
+    let work_item_id = create_chore(&db, &product_id);
+    db.add_host("spoke", "", 4, &[]).unwrap();
+    db.set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
+        .unwrap();
+    let execution_id = running_execution_on_host_with_lease(&db, &work_item_id, "lease-spoke", "spoke");
+    db.set_host_enabled("spoke", false).unwrap();
+
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+    let cube = Arc::new(RecordingCube::default());
+    cube.fail.store(true, Ordering::SeqCst);
+    let sink = RecordingDispatchEventSink::new();
+    let breaker = HeartbeatFailureBreaker::default();
+
+    for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES * 2 {
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        assert_eq!(outcome.auto_reaped, 0);
+    }
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Running
+    );
+    assert!(cube.force_release_calls().is_empty());
+}
+
 /// An `automation_triage` execution auto-reaped this way still gets its
 /// `automation_runs` outcome recorded honestly (via the same
 /// open-task-recovery helper `lost_workspace_sweep` uses) instead of

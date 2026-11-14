@@ -2788,6 +2788,11 @@ impl ExecutionCoordinator {
                         .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
                         .await;
                     coordinator.recover_failed_dispatch(&execution, &worker_id, &err).await;
+                    // The freed slot can serve other rows now; a deferred row is
+                    // held by `dispatch_not_before`, so this cannot re-claim it.
+                    if err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some() {
+                        coordinator.kick();
+                    }
                 }
             }
         });
@@ -2823,8 +2828,24 @@ impl ExecutionCoordinator {
         }
         // Park already returned the row to ready without spending the retry
         // budget. A drain that re-claims before this runs must not count the
-        // same unanswered lease as a start failure.
+        // same unanswered lease or a budget deferral as a start failure.
         if waitable_spoke_lease(err).is_some() {
+            return;
+        }
+        if err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_some()
+            || err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some()
+        {
+            // The deferral already held the row; if a transient DB error left it
+            // claimed, release it here rather than waiting for the boot sweep.
+            if current.status == ExecutionStatus::Claimed
+                && let Err(release_err) = self.work_db.release_dispatch_claim(&current.id)
+            {
+                tracing::error!(
+                    execution_id = %current.id,
+                    ?release_err,
+                    "budget deferral: failed to release a still-claimed dispatch"
+                );
+            }
             return;
         }
         if current.status != ExecutionStatus::Claimed {

@@ -67,6 +67,7 @@ impl Driver {
             }
         }
         self.active.store(false, Ordering::Release);
+        let _ = self.manager.0.storage.sink.disconnected(&self.session).await;
         // Wake an idle response body before waiting for a concurrent outbox
         // operation to release the host gate. A full queue is already readable.
         let _ = self.tx.try_send(Err(Status::cancelled("stream closed")));
@@ -180,16 +181,27 @@ impl Driver {
                         }
                     }
                 },
-                _ = ticks.tick(), if challenge.is_none() => { challenge = Some(self.challenge(None).await?); },
+                _ = ticks.tick() => {
+                    let next = self.challenge(None).await?;
+                    if let Some(pending) = challenge.as_mut() {
+                        pending.previous.push(std::mem::replace(&mut pending.nonce, next.nonce));
+                    } else {
+                        challenge = Some(next);
+                    }
+                },
                 _ = self.wake.notified() => {},
                 incoming = self.inbound.message() => {
                     let Some(raw) = incoming? else { return Ok(()); };
                     match raw.frame.body {
                         Some(spoke_frame::Body::PulseReply(pulse)) => {
                             pulse.validate().map_err(|_| Status::invalid_argument("invalid pulse"))?;
-                            if challenge.as_ref().is_some_and(|c| c.nonce == pulse.nonce)
-                                && let Some(reply) = challenge.take().and_then(|c| c.reply) {
-                                let _ = reply.send(ChallengeOutcome::Answered);
+                            if challenge.as_ref().is_some_and(|c| c.nonce == pulse.nonce || c.previous.contains(&pulse.nonce)) {
+                                if let Some(stamp) = &pulse.stamp {
+                                    self.manager.0.storage.sink.pulse(&self.session, stamp).await.map_err(status)?;
+                                }
+                                if let Some(reply) = challenge.take().and_then(|c| c.reply) {
+                                    let _ = reply.send(ChallengeOutcome::Answered);
+                                }
                             }
                         },
                         Some(spoke_frame::Body::CommandReceipt(cursor)) => {
@@ -300,6 +312,7 @@ impl Driver {
         .await?;
         Ok(Challenge {
             nonce,
+            previous: Vec::new(),
             until: tokio::time::Instant::now() + self.manager.0.config.pulse_timeout,
             reply,
         })
@@ -308,6 +321,7 @@ impl Driver {
 
 struct Challenge {
     nonce: Vec<u8>,
+    previous: Vec<Vec<u8>>,
     until: tokio::time::Instant,
     reply: Option<oneshot::Sender<ChallengeOutcome>>,
 }

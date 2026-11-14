@@ -4,12 +4,16 @@ use boss_protocol_spoke::v1::{self, command, hub_frame, record, spoke_frame};
 use boss_spoke_journal::{Journal, Limits};
 use hub::Fixture;
 
-fn capacity(body: spoke_frame::Body) -> v1::Record {
-    let spoke_frame::Body::Record(record) = body else {
-        panic!("expected journal record")
-    };
-    assert!(matches!(record.body, Some(record::Body::Capacity(_))));
-    record
+async fn capacity(connection: &mut hub::Connection) -> v1::Record {
+    loop {
+        let spoke_frame::Body::Record(record) = connection.next().await else {
+            panic!("expected journal record")
+        };
+        if matches!(record.body, Some(record::Body::Capacity(_))) {
+            return record;
+        }
+        assert!(matches!(record.body, Some(record::Body::Inventory(_))));
+    }
 }
 
 fn journal_lock_still_held(error: &anyhow::Error) -> bool {
@@ -119,18 +123,20 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
     let identity = first.hello.journal_id.clone();
     let boot = first.hello.boot_id.clone();
     first.welcome(0).await;
-    let observed = capacity(first.next().await);
+    let observed = capacity(&mut first).await;
     let Some(record::Body::Capacity(value)) = &observed.body else {
         unreachable!()
     };
-    assert_eq!(value.total_slots, 0);
+    assert!(value.total_slots > 0);
+    assert!(value.available_memory_bytes > 0);
+    assert!(value.available_cpu_millis > 0);
     assert!(value.free_disk_bytes > 0);
     assert_eq!(observed.sequence, 1);
     drop(first); // The hub received bytes but lost its receipt.
     let mut second = hub.connection().await;
     assert_eq!(second.hello.journal_id, identity);
     second.welcome(0).await;
-    assert_eq!(capacity(second.next().await), observed);
+    assert_eq!(capacity(&mut second).await, observed);
     second.receipt(1).await;
     let command = v1::Command {
         sequence: 1,
@@ -467,8 +473,8 @@ async fn actual_daemon_journals_capacity_before_welcome_and_replays_offline_back
     let mut connection = hub.connection().await;
     connection.welcome(0).await;
     // Both backlog records are in flight under the credit window before any receipt.
-    let one = capacity(connection.next().await);
-    let two = capacity(connection.next().await);
+    let one = capacity(&mut connection).await;
+    let two = capacity(&mut connection).await;
     assert_eq!((one.sequence, two.sequence), (1, 2));
     connection.receipt(two.sequence).await;
     assert!(two.observed.unwrap().awake_ns > one.observed.unwrap().awake_ns);

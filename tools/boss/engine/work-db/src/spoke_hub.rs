@@ -598,6 +598,20 @@ impl WorkDb {
     /// two dispatchers cannot both win. Fails with [`SpokeHeldByOtherHost`] while
     /// an unresolved assignment names a different host.
     pub fn reserve_spoke_assignment(&self, execution_id: &str, host_id: &str) -> Result<SpokeAssignment> {
+        self.reserve_spoke_assignment_inner(execution_id, host_id, false)
+    }
+
+    /// New dispatch admission, with resource accounting in the ownership transaction.
+    pub fn admit_spoke_assignment(&self, execution_id: &str, host_id: &str) -> Result<SpokeAssignment> {
+        self.reserve_spoke_assignment_inner(execution_id, host_id, true)
+    }
+
+    fn reserve_spoke_assignment_inner(
+        &self,
+        execution_id: &str,
+        host_id: &str,
+        admission: bool,
+    ) -> Result<SpokeAssignment> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // A legacy destination already holds the execution (a claim, or a lease
@@ -645,6 +659,9 @@ impl WorkDb {
                  WHERE execution_id = ?1 AND assignment_generation = ?2",
                 params![execution_id, open.assignment_generation as i64, now_ms()],
             )?;
+        }
+        if admission {
+            crate::host_capacity::require_budget(&tx, host_id)?;
         }
         let generation: i64 = tx.query_row(
             "SELECT COALESCE(MAX(assignment_generation), 0) + 1 FROM spoke_assignments WHERE execution_id = ?1",
