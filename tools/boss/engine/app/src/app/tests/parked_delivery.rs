@@ -19,6 +19,10 @@ use boss_engine_completion::{NudgeDelivery, ProbeQueuer, StopOutcome};
 use boss_observation_contracts::CompletionRequests;
 use boss_protocol::WorkerEvent;
 
+use super::worker_probe_dispatch::{attention_status, open_worker_escalation_attention};
+use crate::app::parked_delivery::watch_parked_write;
+use boss_engine_completion::PROBE_NO_PR;
+
 const SLOT: u8 = 6;
 
 /// The whole of one delivery attempt: every Return, and slack for the poll.
@@ -28,6 +32,14 @@ fn one_failed_delivery() -> Duration {
 
 fn parked_codex_worker(server_state: &ServerState) -> (String, std::sync::Arc<super::tmux_stub::RecordingPaneRunner>) {
     let run_id = register_idle_worker_with_driver(server_state, SLOT, Some("codex"));
+    let runner = install_live_tmux_delivery(server_state, &run_id, SLOT, "boss-6");
+    (run_id, runner)
+}
+
+/// A Claude-driver worker: its hook carries the submitted prompt, so a
+/// non-empty `UserPromptSubmit` is realistic here and only here.
+fn parked_claude_worker(server_state: &ServerState) -> (String, std::sync::Arc<super::tmux_stub::RecordingPaneRunner>) {
+    let run_id = register_idle_worker_with_driver(server_state, SLOT, Some("claude"));
     let runner = install_live_tmux_delivery(server_state, &run_id, SLOT, "boss-6");
     (run_id, runner)
 }
@@ -74,7 +86,7 @@ fn undelivered_probe_attentions(server_state: &ServerState, run_id: &str) -> Vec
 #[tokio::test(start_paused = true)]
 async fn a_parked_write_is_delivered_when_the_driver_starts_a_turn() {
     let (server_state, _dir) = test_server_state();
-    let (run_id, runner) = parked_codex_worker(&server_state);
+    let (run_id, runner) = parked_claude_worker(&server_state);
     let probe_id = server_state.queue_probe(run_id.clone(), "push your branch".into(), false);
 
     let outcome = dispatch_probe_now(&server_state, &run_id).await;
@@ -202,7 +214,7 @@ async fn a_parked_codex_write_that_starts_no_turn_is_a_failed_delivery() {
 #[tokio::test(start_paused = true)]
 async fn pressing_return_again_delivers_a_write_whose_return_was_swallowed() {
     let (server_state, _dir) = test_server_state();
-    let (run_id, runner) = parked_codex_worker(&server_state);
+    let (run_id, runner) = parked_claude_worker(&server_state);
     let probe_id = server_state.queue_probe(run_id.clone(), "push your branch".into(), false);
     dispatch_probe_now(&server_state, &run_id).await;
 
@@ -408,7 +420,7 @@ async fn a_parked_worker_is_not_failed_for_nudges_it_was_never_shown() {
 #[tokio::test(start_paused = true)]
 async fn an_unconfirmed_interrupting_nudge_cannot_be_displaced() {
     let (server, _dir) = test_server_state();
-    let (run, _) = parked_codex_worker(&server);
+    let (run, _) = parked_claude_worker(&server);
     let queuer = ServerStateProbeQueuer::default();
     queuer.set_server_state(Arc::downgrade(&server));
     queuer.queue_probe(&run, "push your branch");
@@ -449,7 +461,7 @@ async fn an_unconfirmed_interrupting_nudge_cannot_be_displaced() {
 #[tokio::test(start_paused = true)]
 async fn an_unrelated_turn_does_not_confirm_a_parked_probe() {
     let (server, _dir) = test_server_state();
-    let (run, _) = parked_codex_worker(&server);
+    let (run, _) = parked_claude_worker(&server);
     let probe = server.queue_probe(run.clone(), "push your branch".into(), false);
     dispatch_probe_now(&server, &run).await;
     let unrelated = hook(
@@ -475,9 +487,12 @@ async fn an_unrelated_turn_does_not_confirm_a_parked_probe() {
     );
 }
 
-async fn confirmation_during_diagnostics(deadline: u32) {
+/// Each Return retry makes two pane captures under a Claude worker: the
+/// diagnostics read, then the guarded submit's dialog read. The turn start is
+/// delivered while capture number `confirm_at` is paused.
+async fn confirmation_during_capture(confirm_at: u32, expected_returns: usize) {
     let (server, _dir) = test_server_state();
-    let (run, _) = parked_codex_worker(&server);
+    let (run, _) = parked_claude_worker(&server);
     let pause = Arc::new(super::tmux_stub::ProbePause::default());
     let runner = Arc::new(super::tmux_stub::RecordingPaneRunner::new("boss-6").pause_capture(pause.clone()));
     *server.pane_delivery_tmux_override.write().unwrap() = Some(super::tmux_stub::tmux_with_runner(runner.clone()));
@@ -487,9 +502,9 @@ async fn confirmation_during_diagnostics(deadline: u32) {
     server.set_probe_submission(&probe, true, Some(ProbeResumeEvidence::Unconfirmed));
     server.mark_in_flight_probe_awaiting_turn_start(&run, &probe, "push your branch");
     super::super::parked_delivery::watch_parked_write(&server, &run, SLOT, &probe, "push your branch".into());
-    for window in 0..=deadline {
+    for capture in 0..=confirm_at {
         pause.entered.notified().await;
-        if window == deadline {
+        if capture == confirm_at {
             dispatch_live_worker_state(&server, &turn_started(&run)).await;
         }
         pause.resume.notify_one();
@@ -501,7 +516,7 @@ async fn confirmation_during_diagnostics(deadline: u32) {
     assert_eq!(record.resumed, Some(ProbeResumeEvidence::Confirmed));
     assert_eq!(
         runner.return_presses(),
-        deadline as usize,
+        expected_returns,
         "no Return after confirmation"
     );
     assert!(undelivered_probe_attentions(&server, &run).is_empty());
@@ -509,12 +524,12 @@ async fn confirmation_during_diagnostics(deadline: u32) {
 
 #[tokio::test(start_paused = true)]
 async fn confirmation_during_retry_diagnostics_prevents_return() {
-    confirmation_during_diagnostics(0).await;
+    confirmation_during_capture(0, 0).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn confirmation_during_final_diagnostics_prevents_failure() {
-    confirmation_during_diagnostics(RETURN_RETRIES).await;
+    confirmation_during_capture(2 * RETURN_RETRIES, RETURN_RETRIES as usize).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -578,5 +593,171 @@ async fn a_failed_pre_pass_write_rechecks_the_deferred_stop_decision() {
     assert!(
         detector.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "the failed write must re-drive the PR detection withheld at Stop"
+    );
+}
+
+/// The eligibility check runs after the guarded submit's dialog capture: a
+/// confirmation that lands while that capture is paused sends no Return.
+#[tokio::test(start_paused = true)]
+async fn confirmation_during_the_dialog_capture_prevents_return() {
+    confirmation_during_capture(1, 0).await;
+}
+
+// ── Evidence as a codex worker really produces it ───────────────────────────
+//
+// Codex reports a turn start with an empty prompt, so the transcript is the only
+// evidence, and the rollout stores the user message as a JSON string in which
+// every double quote of the probe is escaped.
+
+/// What codex records for a user turn: the message as a JSON string.
+fn rollout_user_message(text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "event_msg", "payload": {"type": "user_message", "message": text}})
+    )
+}
+
+/// What codex sends when a turn starts: no prompt text at all.
+fn codex_turn_started(run_id: &str) -> boss_engine_runtime::events_socket::IncomingHookEvent {
+    hook(
+        WorkerEvent::UserPromptSubmit {
+            session_id: "sess".into(),
+            prompt: String::new(),
+        },
+        run_id,
+    )
+}
+
+/// Claim `run_id`'s delivery slot for a probe holding `text`, as the write into
+/// a parked pane leaves it: written, awaiting evidence of a turn.
+fn written_parked_probe(server: &ServerState, run_id: &str, text: &str, transcript: &std::path::Path) -> String {
+    let probe = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
+    server
+        .try_reserve_probe_for_delivery(run_id, Some(transcript.display().to_string()), 0)
+        .unwrap();
+    server.set_probe_lifecycle(&probe, ProbeDeliveryState::Injected);
+    server.mark_in_flight_probe_awaiting_turn_start(run_id, &probe, text);
+    probe
+}
+
+/// The incident's own nudge into a codex pane: empty prompt on the hook, quotes
+/// in the probe, and the quotes escaped in the rollout.
+#[tokio::test(start_paused = true)]
+async fn a_codex_write_with_quotes_is_confirmed_from_the_escaped_rollout() {
+    let (server, _dir) = test_server_state();
+    let (run, runner) = parked_codex_worker(&server);
+    let rollout_dir = tempfile::tempdir().unwrap();
+    let rollout = rollout_dir.path().join("rollout.jsonl");
+    std::fs::write(&rollout, "").unwrap();
+    assert!(PROBE_NO_PR.contains('"'), "the fixture must exercise escaped quotes");
+    let probe = written_parked_probe(&server, &run, PROBE_NO_PR, &rollout);
+    watch_parked_write(&server, &run, SLOT, &probe, PROBE_NO_PR.to_owned());
+
+    std::fs::write(&rollout, rollout_user_message(PROBE_NO_PR)).unwrap();
+    dispatch_live_worker_state(&server, &codex_turn_started(&run)).await;
+
+    let record = server.probe_record(&probe).unwrap();
+    assert_eq!(record.state, ProbeDeliveryState::Consumed);
+    assert_eq!(record.resumed, Some(ProbeResumeEvidence::Confirmed));
+    tokio::time::sleep(one_failed_delivery()).await;
+    assert_eq!(
+        runner.return_presses(),
+        0,
+        "a confirmed delivery gets no further Return"
+    );
+    assert_eq!(server.probe_lifecycle_state(&probe), Some(ProbeDeliveryState::Consumed));
+    assert!(undelivered_probe_attentions(&server, &run).is_empty());
+}
+
+/// A turn start whose rollout does not (yet) show the text is not evidence.
+#[tokio::test(start_paused = true)]
+async fn an_empty_prompt_without_matching_rollout_text_confirms_nothing() {
+    let (server, _dir) = test_server_state();
+    let (run, _) = parked_codex_worker(&server);
+    let rollout_dir = tempfile::tempdir().unwrap();
+    let rollout = rollout_dir.path().join("rollout.jsonl");
+    std::fs::write(&rollout, rollout_user_message("what time is it?")).unwrap();
+    let probe = written_parked_probe(&server, &run, PROBE_NO_PR, &rollout);
+
+    dispatch_live_worker_state(&server, &codex_turn_started(&run)).await;
+
+    assert!(server.probe_awaiting_turn_start(&run, &probe));
+    assert_eq!(server.probe_lifecycle_state(&probe), Some(ProbeDeliveryState::Injected));
+}
+
+/// A confirmed parked write acknowledges the worker signal it was issued for.
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_parked_write_resolves_the_worker_signal_attention() {
+    let (server, _dir) = test_server_state();
+    let (run, _) = parked_codex_worker(&server);
+    let attention = open_worker_escalation_attention(&server, &run);
+    let probe = server.queue_probe_resolving_worker_signal(run.clone(), "proceed".into(), false);
+    server.try_reserve_probe_for_delivery(&run, None, 0).unwrap();
+    server.set_probe_lifecycle(&probe, ProbeDeliveryState::Injected);
+    server.mark_in_flight_probe_awaiting_turn_start(&run, &probe, "proceed");
+    assert_eq!(attention_status(&server, &run, &attention), "open");
+
+    assert!(server.settle_awaiting_probe(&run, &probe, true, "confirmed".into()));
+
+    assert_eq!(attention_status(&server, &run, &attention), "resolved");
+}
+
+/// A failed settlement never acknowledged anything: the attention stays open and
+/// the pending resolution tag is dropped.
+#[tokio::test(start_paused = true)]
+async fn a_failed_parked_write_leaves_the_attention_open_and_clears_the_tag() {
+    let (server, _dir) = test_server_state();
+    let (run, _) = parked_codex_worker(&server);
+    let attention = open_worker_escalation_attention(&server, &run);
+    let probe = server.queue_probe_resolving_worker_signal(run.clone(), "proceed".into(), false);
+    server.try_reserve_probe_for_delivery(&run, None, 0).unwrap();
+    server.set_probe_lifecycle(&probe, ProbeDeliveryState::Injected);
+    server.mark_in_flight_probe_awaiting_turn_start(&run, &probe, "proceed");
+
+    assert!(server.settle_awaiting_probe(&run, &probe, false, "never taken".into()));
+
+    assert_eq!(attention_status(&server, &run, &attention), "open");
+    assert!(
+        !server
+            .probe_worker_signal_resolution
+            .lock()
+            .unwrap()
+            .contains_key(&probe),
+        "the tag of a probe that will not be acknowledged must not linger",
+    );
+}
+
+/// The worker's turn ended before the engine found evidence of it. The Stop was
+/// refused the claim, and a parked worker produces no further boundary, so the
+/// confirmation itself must release the claim and let the queue move.
+#[tokio::test(start_paused = true)]
+async fn a_confirmation_after_the_turns_stop_releases_the_claim() {
+    let (server, _dir) = test_server_state();
+    let (run, _) = parked_codex_worker(&server);
+    let rollout_dir = tempfile::tempdir().unwrap();
+    let rollout = rollout_dir.path().join("rollout.jsonl");
+    std::fs::write(&rollout, "").unwrap();
+    let first = written_parked_probe(&server, &run, "push your branch", &rollout);
+    let second = server.queue_probe(run.clone(), "and report back".into(), false);
+
+    // The turn starts with no evidence, runs, and stops.
+    dispatch_live_worker_state(&server, &codex_turn_started(&run)).await;
+    assert!(server.probe_awaiting_turn_start(&run, &first));
+    dispatch_live_worker_state(&server, &stop(&run)).await;
+    dispatch_probe_reply_on_stop(&server, &stop(&run)).await;
+    assert_eq!(server.in_flight_probe_id(&run).as_deref(), Some(first.as_str()));
+
+    // Evidence lands afterwards.
+    std::fs::write(&rollout, rollout_user_message("push your branch")).unwrap();
+    server.confirm_parked_write_turn_started(&run, None).await;
+
+    assert_eq!(
+        server.probe_record(&first).unwrap().resumed,
+        Some(ProbeResumeEvidence::Confirmed)
+    );
+    assert_eq!(
+        server.in_flight_probe_id(&run).as_deref(),
+        Some(second.as_str()),
+        "the confirmed probe's claim is released and the next probe dispatched",
     );
 }

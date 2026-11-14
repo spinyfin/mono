@@ -299,16 +299,71 @@ pub(super) fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Decode the JSON string escapes a JSONL transcript uses for whitespace.
+/// Decode JSON string escapes in a raw JSONL chunk.
 ///
-/// The fallback scan reads the file as raw bytes, not parsed JSON. A
-/// multi-line injection (`INTERRUPT_NOTICE\n\n{probe}`) is stored as the
-/// two-character sequence `\n` inside a JSON string, so `normalize_ws` on
-/// the raw chunk cannot collapse those "newlines" into the spaces it
-/// collapsed in the needle — and the match fails for every interrupting
-/// probe, which is exactly the confirmation miss observed in production.
-fn json_unescape_whitespace(s: &str) -> String {
-    s.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+/// The fallback scan reads the file as raw bytes, not parsed JSON, so text
+/// is stored escaped: a multi-line injection (`INTERRUPT_NOTICE\n\n{probe}`)
+/// holds the two-character sequence `\n`, and a probe containing double
+/// quotes holds `\"`. Without decoding, `normalize_ws` cannot collapse the
+/// former and the needle never matches the latter. Handles `\n \r \t \b
+/// \f \" \\ \/` and `\uXXXX` (including surrogate pairs); an unrecognised
+/// escape is kept verbatim.
+fn json_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('u') => {
+                chars.next();
+                let mut rest = chars.clone();
+                let Some(unit) = take_hex4(&mut rest) else {
+                    out.push_str("\\u");
+                    continue;
+                };
+                let decoded = if (0xD800..0xDC00).contains(&unit) {
+                    let mut after = rest.clone();
+                    match (after.next(), after.next(), take_hex4(&mut after)) {
+                        (Some('\\'), Some('u'), Some(low)) if (0xDC00..0xE000).contains(&low) => {
+                            rest = after;
+                            char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    char::from_u32(unit)
+                };
+                out.push(decoded.unwrap_or('\u{FFFD}'));
+                chars = rest;
+                continue;
+            }
+            _ => {
+                out.push('\\');
+                continue;
+            }
+        }
+        chars.next();
+    }
+    out
+}
+
+fn take_hex4(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u32> {
+    let mut value = 0;
+    for _ in 0..4 {
+        value = value * 16 + chars.next()?.to_digit(16)?;
+    }
+    Some(value)
 }
 
 /// Best-effort check for whether `text` appears anywhere in
@@ -347,7 +402,7 @@ pub(super) async fn transcript_shows_text(transcript_path: &str, offset_bytes: u
     if normalized.contains(&needle) {
         return true;
     }
-    normalize_ws(&json_unescape_whitespace(&chunk)).contains(&needle)
+    normalize_ws(&json_unescape(&chunk)).contains(&needle)
 }
 
 impl ServerState {

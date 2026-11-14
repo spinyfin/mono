@@ -1165,3 +1165,36 @@ async fn send_submit_presses_enter_never_c_m() {
     );
     assert_eq!(SUBMIT_KEY, "Enter");
 }
+
+#[tokio::test]
+async fn send_submit_if_evaluates_the_predicate_after_the_dialog_capture() {
+    let (tmux, runner) = tmux([success("composer idle")]);
+    let tmux = tmux.with_blocking_dialog_markers(vec!["Allow this command?".to_owned()]);
+    let calls_at_decision = std::sync::Mutex::new(0usize);
+    let sent = tmux
+        .send_submit_if("boss-1", || {
+            *calls_at_decision.lock().unwrap() = runner.calls().len();
+            false
+        })
+        .await
+        .unwrap();
+    assert!(!sent);
+    assert_eq!(
+        *calls_at_decision.lock().unwrap(),
+        1,
+        "the capture ran before the decision"
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![vec!["-S", TEST_SOCKET_PATH, "capture-pane", "-p", "-t", "boss-1"]],
+        "no Return when the predicate declines",
+    );
+}
+
+#[tokio::test]
+async fn send_submit_if_sends_return_when_permitted() {
+    let (tmux, runner) = tmux([success("composer idle"), success("")]);
+    let tmux = tmux.with_blocking_dialog_markers(vec!["Allow this command?".to_owned()]);
+    assert!(tmux.send_submit_if("boss-1", || true).await.unwrap());
+    assert_eq!(runner.calls().last().unwrap().last().unwrap(), "Enter");
+}

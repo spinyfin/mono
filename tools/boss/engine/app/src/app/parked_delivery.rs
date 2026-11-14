@@ -111,7 +111,7 @@ fn confirm_turn_start(
 /// settles it, and a Return pressed into a busy pane can answer a dialog
 /// nobody meant to answer. The window therefore only runs while the pane is
 /// parked.
-async fn wait_for_turn_start(server: &ServerState, write: &ParkedWrite) -> bool {
+async fn wait_for_turn_start(server: &Arc<ServerState>, write: &ParkedWrite) -> bool {
     let mut deadline = tokio::time::Instant::now() + TURN_START_CONFIRM_TIMEOUT;
     loop {
         // Anything but the two states a watched write can be in means another
@@ -151,7 +151,9 @@ async fn wait_for_turn_start(server: &ServerState, write: &ParkedWrite) -> bool 
     if let Some(path) = transcript_path
         && transcript_shows_text(&path, offset_bytes, &write.text).await
     {
-        server.settle_parked_write_delivered(write, "the transcript recorded the text");
+        server
+            .settle_parked_write_delivered(write, "the transcript recorded the text")
+            .await;
         return true;
     }
     false
@@ -268,7 +270,7 @@ fn unconfirmed_attention_body(write: &ParkedWrite, detail: &str, diagnostics: &P
 impl ServerState {
     /// A main-session turn confirms only the text carried by this probe.
     /// Empty prompts and tool-only events need transcript evidence.
-    pub(super) async fn confirm_parked_write_turn_started(&self, run_id: &str, prompt: Option<&str>) {
+    pub(super) async fn confirm_parked_write_turn_started(self: &Arc<Self>, run_id: &str, prompt: Option<&str>) {
         let Some(claim) = self.parked_probe_snapshot(run_id) else {
             return;
         };
@@ -287,22 +289,65 @@ impl ServerState {
                 false
             };
         if matches_prompt || matches_transcript {
-            self.settle_awaiting_probe(
+            self.settle_confirmed_parked_write(
                 run_id,
                 &claim.probe_id,
-                true,
                 "written into the parked pane; matching submission evidence confirmed delivery".to_owned(),
-            );
+            )
+            .await;
         }
     }
 
-    fn settle_parked_write_delivered(&self, write: &ParkedWrite, evidence: &str) {
-        self.settle_awaiting_probe(
+    async fn settle_parked_write_delivered(self: &Arc<Self>, write: &ParkedWrite, evidence: &str) {
+        self.settle_confirmed_parked_write(
             &write.run_id,
             &write.probe_id,
-            true,
             format!("written into the parked pane; {evidence}"),
-        );
+        )
+        .await;
+    }
+
+    /// Confirm a parked write. When the turn it started already ended (a Stop
+    /// arrived while the claim still awaited evidence, so the reply reader
+    /// refused it), no later boundary is coming for a parked worker: run the
+    /// reply extraction and claim release the Stop would have run, then hand
+    /// the queue back to the dispatcher.
+    async fn settle_confirmed_parked_write(self: &Arc<Self>, run_id: &str, probe_id: &str, detail: String) {
+        let Some(stop_seen) = self.settle_awaiting_probe_inner(run_id, probe_id, true, detail) else {
+            return;
+        };
+        if !stop_seen {
+            return;
+        }
+        // A pane that is working again is in a newer turn; its own boundary
+        // will extract the reply.
+        let slot = self.worker_registry.slot_for_run(run_id);
+        if slot.and_then(|slot| self.pane_typed_input_activity(slot)) == Some(WorkerActivity::Working) {
+            return;
+        }
+        if let Some(claim) = self.take_submitted_probe_reply(run_id, probe_id) {
+            let deferred_completion = claim.deferred_completion;
+            Box::pin(super::worker_events::dispatch_one_probe_reply(
+                self, run_id, &claim, false,
+            ))
+            .await;
+            if deferred_completion {
+                let outcome = self.completion_handler.on_stop(run_id).await;
+                tracing::info!(
+                    run_id,
+                    ?outcome,
+                    "rechecked completion after a late parked confirmation"
+                );
+            }
+        }
+        if self.has_pending_probe(run_id) && !self.has_in_flight_probe(run_id) {
+            let outcome = Box::pin(dispatch_probe_now(self, run_id)).await;
+            tracing::info!(
+                run_id,
+                outcome = outcome.as_str(),
+                "released the claim of a parked write confirmed after its turn ended; attempted the next queued probe",
+            );
+        }
     }
 }
 
@@ -312,7 +357,7 @@ impl ServerState {
     pub(super) async fn resubmit_prompt_if(
         &self,
         execution_id: &str,
-        permitted: impl Fn() -> bool,
+        permitted: impl FnOnce() -> bool,
     ) -> anyhow::Result<bool> {
         let identity = self
             .work_db
@@ -331,12 +376,16 @@ impl ServerState {
         let tmux = self.guard_pane_input(execution_id, tmux)?;
         self.leave_pane_modes_before_keys(execution_id, &tmux, &identity.session_name)
             .await?;
-        if !permitted() {
-            return Ok(false);
+        // The dialog capture inside the guarded submit is an await point:
+        // `permitted` runs after it, immediately before the Return is sent.
+        match tmux.send_submit_if(&identity.session_name, permitted).await {
+            Ok(sent) => Ok(sent),
+            Err(error) => {
+                // Keep the error's concrete type: dialog refusal is recognised by downcast.
+                let failed = Err(error);
+                self.settle_pane_input_failure(execution_id, &failed).await;
+                failed.map(|()| false)
+            }
         }
-        let result = tmux.send_submit(&identity.session_name).await;
-        self.settle_pane_input_failure(execution_id, &result).await;
-        result?;
-        Ok(true)
     }
 }

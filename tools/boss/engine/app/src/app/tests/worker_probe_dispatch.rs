@@ -1081,7 +1081,7 @@ async fn dispatch_probe_on_stop_refuses_when_slot_mapping_is_already_gone() {
 // worker from a premature "produce a PR" nudge is gone while the actual
 // acknowledgement text may still never arrive.
 
-fn open_worker_escalation_attention(server_state: &ServerState, run_id: &str) -> String {
+pub(super) fn open_worker_escalation_attention(server_state: &ServerState, run_id: &str) -> String {
     server_state
         .work_db
         .create_attention_item(boss_work_db::CreateAttentionItemInput {
@@ -1097,7 +1097,7 @@ fn open_worker_escalation_attention(server_state: &ServerState, run_id: &str) ->
         .id
 }
 
-fn attention_status(server_state: &ServerState, run_id: &str, attention_id: &str) -> String {
+pub(super) fn attention_status(server_state: &ServerState, run_id: &str, attention_id: &str) -> String {
     server_state
         .work_db
         .list_attention_items(run_id)

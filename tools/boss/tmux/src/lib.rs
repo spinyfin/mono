@@ -748,6 +748,21 @@ impl Tmux {
         self.send_key(session, SUBMIT_KEY).await
     }
 
+    /// [`Self::send_submit`], gated on `permitted` evaluated after the blocking
+    /// dialog capture and immediately before the key is sent. The capture is
+    /// an await point; state that justified the Return can change during it.
+    /// `Ok(false)` means nothing was sent because `permitted` declined.
+    pub async fn send_submit_if(&self, session: &str, permitted: impl FnOnce() -> bool) -> Result<bool> {
+        validate_value("session name", session)?;
+        let mut args = self.server_args();
+        args.extend(["send-keys".into(), "-t".into(), session.into(), SUBMIT_KEY.into()]);
+        self.check_blocking_dialog_excluding(session, "").await?;
+        if !permitted() {
+            return Ok(false);
+        }
+        self.invoke(args).await.map(|_| true)
+    }
+
     /// Captures the visible text of a detached session's pane.
     pub async fn capture_pane(&self, session: &str) -> Result<String> {
         validate_value("session name", session)?;

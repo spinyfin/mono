@@ -372,6 +372,10 @@ pub(super) struct InFlightProbe {
     /// [`super::parked_delivery`].
     #[builder(default)]
     awaiting_turn_start: bool,
+    /// A turn boundary arrived while the claim still awaited evidence, so the
+    /// reply reader refused it; confirmation must finish that boundary's work.
+    #[builder(default)]
+    stop_seen_while_awaiting: bool,
     /// Text whose submission must be proved before releasing verification.
     pub(super) awaiting_turn_text: Option<String>,
     /// A Stop decision is waiting for this write to settle.
@@ -483,45 +487,83 @@ impl ServerState {
             .cloned()
     }
 
+    /// Record that a turn boundary arrived while `run_id`'s claim awaited
+    /// evidence that its parked write was submitted.
+    pub(super) fn note_boundary_for_awaiting_probe(&self, run_id: &str) {
+        if let Some(claim) = self
+            .in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get_mut(run_id)
+            .filter(|claim| claim.awaiting_turn_start)
+        {
+            claim.stop_seen_while_awaiting = true;
+        }
+    }
+
     /// Settle verification while holding the claim and lifecycle locks in
     /// claim-first order, so a late timeout cannot overwrite confirmation.
     pub(super) fn settle_awaiting_probe(&self, run_id: &str, probe_id: &str, confirmed: bool, detail: String) -> bool {
-        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
-        let Some(claim) = claims
-            .get_mut(run_id)
-            .filter(|claim| claim.probe_id == probe_id && claim.awaiting_turn_start)
-        else {
-            return false;
-        };
-        let mut records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
-        let Some(record) = records.get_mut(probe_id).filter(|record| {
-            matches!(
-                record.state,
-                ProbeDeliveryState::Injected | ProbeDeliveryState::Consumed
-            )
-        }) else {
-            return false;
-        };
-        claim.awaiting_turn_start = false;
-        record.state = if confirmed {
-            ProbeDeliveryState::Consumed
-        } else {
-            ProbeDeliveryState::Unconfirmed
-        };
-        record.submitted = Some(true);
-        record.resumed = Some(if confirmed {
-            ProbeResumeEvidence::Confirmed
-        } else {
-            ProbeResumeEvidence::Unconfirmed
-        });
-        record.detail = Some(detail);
-        if !confirmed {
-            let previous = claims.remove(run_id).and_then(|claim| claim.previous_reply);
-            if let Some(previous) = previous {
-                claims.insert(run_id.to_owned(), *previous);
+        self.settle_awaiting_probe_inner(run_id, probe_id, confirmed, detail)
+            .is_some()
+    }
+
+    /// As [`Self::settle_awaiting_probe`]; `Some` carries whether a turn
+    /// boundary was seen while the claim awaited evidence.
+    pub(super) fn settle_awaiting_probe_inner(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        confirmed: bool,
+        detail: String,
+    ) -> Option<bool> {
+        let (settled_state, stop_seen) = {
+            let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+            let claim = claims
+                .get_mut(run_id)
+                .filter(|claim| claim.probe_id == probe_id && claim.awaiting_turn_start)?;
+            let mut records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+            let record = records.get_mut(probe_id).filter(|record| {
+                matches!(
+                    record.state,
+                    ProbeDeliveryState::Injected | ProbeDeliveryState::Consumed
+                )
+            })?;
+            claim.awaiting_turn_start = false;
+            let stop_seen = std::mem::take(&mut claim.stop_seen_while_awaiting);
+            record.state = if confirmed {
+                ProbeDeliveryState::Consumed
+            } else {
+                ProbeDeliveryState::Unconfirmed
+            };
+            record.submitted = Some(true);
+            record.resumed = Some(if confirmed {
+                ProbeResumeEvidence::Confirmed
+            } else {
+                ProbeResumeEvidence::Unconfirmed
+            });
+            record.detail = Some(detail);
+            let settled_state = record.state;
+            drop(records);
+            if !confirmed {
+                let previous = claims.remove(run_id).and_then(|claim| claim.previous_reply);
+                if let Some(previous) = previous {
+                    claims.insert(run_id.to_owned(), *previous);
+                }
             }
+            (settled_state, stop_seen)
+        };
+        // Locks dropped: the side effects take their own.
+        self.after_probe_lifecycle_change(probe_id, settled_state);
+        if !confirmed {
+            // A failed settlement never acknowledges a worker signal; free the
+            // tag without resolving any attention item.
+            self.probe_worker_signal_resolution
+                .lock()
+                .expect("probe_worker_signal_resolution mutex poisoned")
+                .remove(probe_id);
         }
-        true
+        Some(stop_seen)
     }
 
     /// Recheck ownership, evidence and activity immediately before Return.

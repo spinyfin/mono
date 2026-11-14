@@ -835,7 +835,7 @@ pub(super) async fn dispatch_live_worker_state(
             boss_protocol::WorkerEvent::UserPromptSubmit { prompt, .. } => Some(prompt.as_str()),
             _ => None,
         };
-        server_state.confirm_parked_write_turn_started(run_id, prompt).await;
+        Box::pin(server_state.confirm_parked_write_turn_started(run_id, prompt)).await;
     }
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
@@ -2542,6 +2542,9 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
+    // A boundary that precedes a parked write's confirmation cannot extract
+    // its reply yet; remember it so the confirmation finishes the job.
+    server_state.note_boundary_for_awaiting_probe(run_id);
     let mut previous_replies = Vec::new();
     while let Some(previous) = server_state.take_previous_probe_reply(run_id) {
         previous_replies.push(previous);
@@ -2561,7 +2564,7 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     }
 }
 
-async fn dispatch_one_probe_reply(
+pub(super) async fn dispatch_one_probe_reply(
     server_state: &Arc<ServerState>,
     run_id: &str,
     in_flight: &super::probes::InFlightProbe,
