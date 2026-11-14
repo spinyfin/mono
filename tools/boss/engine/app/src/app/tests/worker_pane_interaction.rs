@@ -189,8 +189,8 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     assert_eq!(runner.escape_presses(), 0, "an idle worker must not be interrupted");
     let calls = runner.calls();
     assert!(
-        calls.len() >= 6,
-        "session, spawn-token, and pane verification plus paste delivery issue six tmux calls; extra capture-pane reads are the pane-text confirmation signal racing the UserPromptSubmit hook: {calls:?}"
+        calls.len() >= 7,
+        "session, spawn-token, pane and pane-mode verification plus paste delivery issue seven tmux calls; extra capture-pane reads are the pane-text confirmation signal racing the UserPromptSubmit hook: {calls:?}"
     );
     assert_eq!(
         calls[0],
@@ -225,6 +225,21 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "#{pane_dead}",
         ]
     );
+    // The pane is checked for a tmux mode before any key is sent: a pane
+    // left in copy-mode would have tmux consume the paste's Return.
+    assert_eq!(
+        calls[3],
+        vec![
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
+            "display-message",
+            "-p",
+            "-t",
+            "boss-tmux-send",
+            "#{pane_in_mode}",
+        ]
+    );
+    let calls = &calls[1..];
     assert_eq!(calls[3][..3], ["-S", boss_tmux::TEST_SOCKET_PATH, "load-buffer"]);
     assert_eq!(calls[3][3], "-b");
     let buffer_name = calls[3][4].clone();

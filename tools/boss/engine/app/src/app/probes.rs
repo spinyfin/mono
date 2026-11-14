@@ -22,6 +22,7 @@
 
 use super::*;
 
+use boss_engine_completion::NudgeDelivery;
 use boss_work_db::CreateAttentionItemInput;
 
 pub use boss_engine_storage_values::attention_kinds::PROBE_UNDELIVERED_ATTENTION_KIND;
@@ -41,6 +42,11 @@ pub(super) struct ServerStateProbeQueuer {
     /// delivery task currently owns it. `deliver_queued_probes_now` consults
     /// this instead of inferring ownership from the worker's posture at the
     /// moment it runs, which can differ from the posture `queue_probe` saw.
+    ///
+    /// The entry outlives the delivery attempt: it is how
+    /// [`ProbeQueuer::nudge_delivery`] finds the nudge whose fate the ladder
+    /// is asking about. It is dropped once that nudge is known to have
+    /// arrived, and replaced when the next one is queued.
     nudges: Arc<StdMutex<HashMap<String, QueuedNudge>>>,
 }
 
@@ -74,7 +80,8 @@ impl ServerStateProbeQueuer {
 }
 
 /// Run the interrupting delivery for a nudge this caller owns, then release
-/// the ownership record (unless a newer nudge has replaced it meanwhile).
+/// the ownership (unless a newer nudge has replaced it meanwhile). The record
+/// itself stays: the nudge's fate is still to be read.
 async fn deliver_owned_nudge(
     nudges: &StdMutex<HashMap<String, QueuedNudge>>,
     server: &ServerState,
@@ -83,8 +90,8 @@ async fn deliver_owned_nudge(
 ) {
     super::probe_interrupt::deliver_probe_interrupting(server, run_id, probe_id).await;
     let mut guard = nudges.lock().expect("queuer nudges mutex poisoned");
-    if guard.get(run_id).is_some_and(|nudge| nudge.probe_id == probe_id) {
-        guard.remove(run_id);
+    if let Some(nudge) = guard.get_mut(run_id).filter(|nudge| nudge.probe_id == probe_id) {
+        nudge.interrupt_owned = false;
     }
 }
 
@@ -135,9 +142,9 @@ impl ProbeQueuer for ServerStateProbeQueuer {
     /// their boundary.
     ///
     /// Spawned rather than awaited because [`ProbeQueuer`] is a sync trait
-    /// and this is fire-and-forget by contract: the caller has already
-    /// recorded the nudge against the circuit breaker and its decision does
-    /// not depend on the delivery outcome. `dispatch_probe_now` logs and
+    /// and this is fire-and-forget by contract: the caller does not wait for
+    /// the outcome, it reads the nudge's fate from [`Self::nudge_delivery`]
+    /// the next time it has a decision to make. `dispatch_probe_now` logs and
     /// names every exit itself, so a failed or refused delivery still leaves
     /// a trace, and an undeliverable probe stays queued rather than being
     /// dropped.
@@ -172,10 +179,7 @@ impl ProbeQueuer for ServerStateProbeQueuer {
                         nudge.interrupt_owned = true;
                         Some(nudge.probe_id.clone())
                     }
-                    _ => {
-                        guard.remove(&run_id);
-                        None
-                    }
+                    _ => None,
                 }
             };
             if let Some(probe_id) = takeover {
@@ -194,6 +198,71 @@ impl ProbeQueuer for ServerStateProbeQueuer {
                 "probe queuer: out-of-band delivery attempted for a sweep-driven nudge",
             );
         });
+    }
+
+    /// Read the fate of the run's most recent nudge off its own delivery
+    /// record, which every dispatch path already keeps.
+    ///
+    /// Keyed to the nudge's probe id rather than to whatever the dispatcher
+    /// last did for the run, so another probe's outcome is never mistaken for
+    /// the nudge's: a coordinator probe that was abandoned says nothing about
+    /// whether the worker saw the nudge queued behind it.
+    fn nudge_delivery(&self, run_id: &str) -> NudgeDelivery {
+        let Some(server) = self.server.get().and_then(Weak::upgrade) else {
+            return NudgeDelivery::Settled;
+        };
+        let mut guard = self.nudges.lock().expect("queuer nudges mutex poisoned");
+        let Some(nudge) = guard.get(run_id) else {
+            return NudgeDelivery::Settled;
+        };
+        let nudge_id = nudge.probe_id.clone();
+        let Some(record) = server.probe_record(&nudge_id) else {
+            guard.remove(run_id);
+            return NudgeDelivery::Settled;
+        };
+        match record.state {
+            // Waiting for a boundary, or written and waiting for the driver
+            // to start a turn on it. Either way the worker has not been shown
+            // it yet and the engine still intends that it will be.
+            ProbeDeliveryState::Queued | ProbeDeliveryState::Injected => NudgeDelivery::Pending { nudge_id },
+            // Written after an interrupt and recorded on the strength of the
+            // write alone; the turn it should start has not been seen yet.
+            ProbeDeliveryState::Consumed if record.resumed != Some(ProbeResumeEvidence::Confirmed) => {
+                NudgeDelivery::Pending { nudge_id }
+            }
+            ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Replied => {
+                guard.remove(run_id);
+                NudgeDelivery::Settled
+            }
+            // Never written. `InterruptFailed` is a worker too busy to be cut
+            // short, which says nothing against its pane: a boundary is
+            // coming, and failing a working worker for it would be wrong.
+            ProbeDeliveryState::Dropped | ProbeDeliveryState::InterruptFailed => NudgeDelivery::Withdrawn { nudge_id },
+            ProbeDeliveryState::Unconfirmed | ProbeDeliveryState::Abandoned | ProbeDeliveryState::Orphaned => {
+                NudgeDelivery::Failed {
+                    detail: record.detail.unwrap_or_else(|| {
+                        format!(
+                            "the nudge settled {} without reaching the worker",
+                            record.state.as_str()
+                        )
+                    }),
+                    nudge_id,
+                }
+            }
+        }
+    }
+
+    fn withdraw_nudge(&self, run_id: &str, reason: &str) -> bool {
+        let Some(server) = self.server.get().and_then(Weak::upgrade) else {
+            return false;
+        };
+        let nudge_id = self
+            .nudges
+            .lock()
+            .expect("queuer nudges mutex poisoned")
+            .get(run_id)
+            .map(|nudge| nudge.probe_id.clone());
+        nudge_id.is_some_and(|nudge_id| server.drop_pending_probe(run_id, &nudge_id, reason))
     }
 }
 
@@ -260,27 +329,6 @@ impl ProbeDispatchOutcome {
             Self::RequeuedAfterFailure => "requeued_after_failure",
         }
     }
-
-    /// True when this outcome means a nudge was issued (queued against the
-    /// circuit breaker) but never reached the pane. The breaker must not
-    /// count these as unproductive nudges.
-    ///
-    /// Deliberately narrower than "every outcome that didn't deliver right
-    /// now": `NoSlotMapping`, `PostureRefused`, and `RequeuedAfterFailure`
-    /// all leave the probe queued for a later boundary rather than removing
-    /// it — reverting on them un-counts a nudge that then lands on the very
-    /// next boundary (recorded at N, refused, reverted, then delivered at
-    /// N+1 alongside a freshly recorded nudge), which pins the count and
-    /// makes `max_unproductive_nudges` unreachable for exactly the wedged
-    /// workers the breaker exists to park. Only `Dispatched` describes a
-    /// probe that actually left the queue through this call; among those,
-    /// only an undeliverable terminal state (e.g. `Abandoned`) never reached
-    /// the pane and must be reverted. The two interrupting-path call sites
-    /// (`probe_interrupt.rs`) already invoke the revert directly for their
-    /// own terminal failures, so this predicate does not need to cover them.
-    pub(super) fn should_revert_undelivered_nudge(self) -> bool {
-        matches!(self, Self::Dispatched(state) if state.is_undeliverable())
-    }
 }
 
 /// One queued probe that has not yet been dispatched into the worker.
@@ -318,6 +366,17 @@ pub(super) struct InFlightProbe {
     /// replacement probe displaces it: anything the transcript gains from the
     /// replacement's own snapshot onward answers the replacement, not this probe.
     pub(super) end_offset: Option<u64>,
+    /// The probe was written into a pane the worker was parked at, and the
+    /// engine has not yet seen the driver start a turn on it. Cleared by the
+    /// first main-session turn start for the run; see
+    /// [`super::parked_delivery`].
+    #[builder(default)]
+    awaiting_turn_start: bool,
+    /// Text whose submission must be proved before releasing verification.
+    pub(super) awaiting_turn_text: Option<String>,
+    /// A Stop decision is waiting for this write to settle.
+    #[builder(default)]
+    pub(super) deferred_completion: bool,
 }
 
 /// Everything the engine knows about one probe id after it was accepted:
@@ -361,9 +420,183 @@ impl ServerState {
             .expect("probe_lifecycle mutex poisoned")
             .get_mut(probe_id)
         {
+            // A delayed transport result cannot undo positive turn evidence.
+            if record.resumed == Some(ProbeResumeEvidence::Confirmed)
+                && resumed == Some(ProbeResumeEvidence::Unconfirmed)
+            {
+                return;
+            }
             record.submitted = Some(submitted);
             record.resumed = resumed;
         }
+    }
+
+    /// Record that `probe_id`'s text was written into the pane, leaving any
+    /// evidence of what followed as it is: the turn the write starts can be
+    /// seen before the write is recorded.
+    pub(super) fn mark_probe_written(&self, probe_id: &str) {
+        if let Some(record) = self
+            .probe_lifecycle
+            .lock()
+            .expect("probe_lifecycle mutex poisoned")
+            .get_mut(probe_id)
+        {
+            record.submitted = Some(true);
+        }
+    }
+
+    /// Mark `run_id`'s claim on `probe_id` as a parked write that still owes
+    /// evidence of a turn. Set before the write goes out, so a turn that
+    /// starts while the keys are still being sent is not missed.
+    pub(super) fn mark_in_flight_probe_awaiting_turn_start(&self, run_id: &str, probe_id: &str, text: &str) {
+        if let Some(entry) = self
+            .in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get_mut(run_id)
+            .filter(|entry| entry.probe_id == probe_id)
+        {
+            entry.awaiting_turn_start = true;
+            entry.awaiting_turn_text = Some(text.to_owned());
+        }
+    }
+
+    pub(super) fn defer_completion_for_parked_probe(&self, run_id: &str) {
+        if let Some(claim) = self
+            .in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get_mut(run_id)
+            .filter(|claim| claim.awaiting_turn_start)
+        {
+            claim.deferred_completion = true;
+        }
+    }
+
+    /// Snapshot only the claim still awaiting evidence for its own text.
+    pub(super) fn parked_probe_snapshot(&self, run_id: &str) -> Option<InFlightProbe> {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get(run_id)
+            .filter(|claim| claim.awaiting_turn_start)
+            .cloned()
+    }
+
+    /// Settle verification while holding the claim and lifecycle locks in
+    /// claim-first order, so a late timeout cannot overwrite confirmation.
+    pub(super) fn settle_awaiting_probe(&self, run_id: &str, probe_id: &str, confirmed: bool, detail: String) -> bool {
+        let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let Some(claim) = claims
+            .get_mut(run_id)
+            .filter(|claim| claim.probe_id == probe_id && claim.awaiting_turn_start)
+        else {
+            return false;
+        };
+        let mut records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+        let Some(record) = records.get_mut(probe_id).filter(|record| {
+            matches!(
+                record.state,
+                ProbeDeliveryState::Injected | ProbeDeliveryState::Consumed
+            )
+        }) else {
+            return false;
+        };
+        claim.awaiting_turn_start = false;
+        record.state = if confirmed {
+            ProbeDeliveryState::Consumed
+        } else {
+            ProbeDeliveryState::Unconfirmed
+        };
+        record.submitted = Some(true);
+        record.resumed = Some(if confirmed {
+            ProbeResumeEvidence::Confirmed
+        } else {
+            ProbeResumeEvidence::Unconfirmed
+        });
+        record.detail = Some(detail);
+        if !confirmed {
+            let previous = claims.remove(run_id).and_then(|claim| claim.previous_reply);
+            if let Some(previous) = previous {
+                claims.insert(run_id.to_owned(), *previous);
+            }
+        }
+        true
+    }
+
+    /// Recheck ownership, evidence and activity immediately before Return.
+    pub(super) fn parked_probe_needs_return(&self, run_id: &str, probe_id: &str, slot_id: u8) -> bool {
+        let claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+        claims
+            .get(run_id)
+            .is_some_and(|claim| claim.probe_id == probe_id && claim.awaiting_turn_start)
+            && records.get(probe_id).is_some_and(|record| {
+                matches!(
+                    record.state,
+                    ProbeDeliveryState::Injected | ProbeDeliveryState::Consumed
+                ) && record.resumed != Some(ProbeResumeEvidence::Confirmed)
+            })
+            && self.pane_typed_input_activity(slot_id) != Some(boss_protocol::WorkerActivity::Working)
+    }
+
+    /// Whether `run_id`'s claim on `probe_id` is a parked write still owing
+    /// evidence of a turn.
+    pub(super) fn probe_awaiting_turn_start(&self, run_id: &str, probe_id: &str) -> bool {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get(run_id)
+            .is_some_and(|entry| entry.probe_id == probe_id && entry.awaiting_turn_start)
+    }
+
+    /// The transcript snapshot taken when `probe_id` claimed `run_id`'s
+    /// delivery slot, or `(None, 0)` when it no longer holds it.
+    pub(super) fn in_flight_probe_snapshot(&self, run_id: &str, probe_id: &str) -> (Option<String>, u64) {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get(run_id)
+            .filter(|entry| entry.probe_id == probe_id)
+            .map_or((None, 0), |entry| (entry.transcript_path.clone(), entry.offset_bytes))
+    }
+
+    /// True while an interrupting delivery holds `run_id`'s slot for a probe
+    /// it has claimed and not yet written: the window in which it is cutting
+    /// the worker's turn short. A probe claimed by any other path is marked
+    /// `Injected` in the same step, so `Queued` under a claim is that window
+    /// and nothing else.
+    pub(super) fn probe_claimed_ahead_of_its_write(&self, run_id: &str) -> bool {
+        self.in_flight_probe_id(run_id)
+            .is_some_and(|probe_id| self.probe_lifecycle_state(&probe_id) == Some(ProbeDeliveryState::Queued))
+    }
+
+    /// Move `probe_id` from `from` to `to`, and only from `from`. Returns the
+    /// state now on record, which is `to` exactly when this call made the
+    /// move.
+    ///
+    /// A pane write and the worker's reaction to it race by construction: the
+    /// turn the write starts can begin, and even end, while the engine is
+    /// still deciding what to record for the write. Whichever path observed
+    /// more must win, so a state another path already advanced is left alone.
+    pub(super) fn advance_probe_lifecycle(
+        &self,
+        probe_id: &str,
+        from: ProbeDeliveryState,
+        to: ProbeDeliveryState,
+        detail: Option<String>,
+    ) -> Option<ProbeDeliveryState> {
+        {
+            let mut guard = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+            let record = guard.get_mut(probe_id)?;
+            if record.state != from {
+                return Some(record.state);
+            }
+            record.state = to;
+            record.detail = detail;
+        }
+        self.after_probe_lifecycle_change(probe_id, to);
+        Some(to)
     }
 
     /// Push probe text onto the queue for `run_id`, mint a fresh
@@ -618,7 +851,10 @@ impl ServerState {
         if let Some(held) = in_flight.get(run_id) {
             let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
             let record = records.get(&held.probe_id)?;
-            if !awaits_reply_after_submission(record.state) || record.submitted == Some(false) {
+            if held.awaiting_turn_start
+                || !awaits_reply_after_submission(record.state)
+                || record.submitted == Some(false)
+            {
                 return None;
             }
         }
@@ -779,6 +1015,34 @@ impl ServerState {
         ids
     }
 
+    /// Remove the one probe `probe_id` from `run_id`'s queue, if it is still
+    /// there, and settle it `Dropped` with `reason`. Returns whether it was
+    /// removed. A probe that has been claimed for delivery is no longer in
+    /// the queue and is left to the path that claimed it.
+    pub(super) fn drop_pending_probe(&self, run_id: &str, probe_id: &str, reason: &str) -> bool {
+        {
+            let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
+            let Some(queue) = pending.get_mut(run_id) else {
+                return false;
+            };
+            let Some(position) = queue.iter().position(|probe| probe.probe_id == probe_id) else {
+                return false;
+            };
+            queue.remove(position);
+            if queue.is_empty() {
+                pending.remove(run_id);
+            }
+        }
+        tracing::warn!(
+            run_id,
+            probe_id,
+            reason,
+            "queued probe withdrawn undelivered; recording it dropped",
+        );
+        self.set_probe_lifecycle_detail(probe_id, ProbeDeliveryState::Dropped, Some(reason.to_owned()));
+        true
+    }
+
     /// Drop every not-yet-delivered probe queued for `run_id`. Used by
     /// the completion handler to discard a stale nudge (e.g. one
     /// requeued for retry after a failed pane write) once a Stop
@@ -881,9 +1145,18 @@ impl ServerState {
         while let Some(mut in_flight) = chain {
             chain = in_flight.previous_reply.take();
             let probe_id = in_flight.probe_id;
-            match self.probe_lifecycle_state(&probe_id) {
-                Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {
-                }
+            match self
+                .probe_record(&probe_id)
+                .map(|record| (record.state, record.submitted))
+            {
+                Some((
+                    ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed,
+                    _,
+                )) => {}
+                // Written into a parked pane and still waiting for the turn
+                // it should have started: the write itself is finished, so
+                // there is no other task left to record its outcome.
+                Some((ProbeDeliveryState::Injected, Some(true))) => {}
                 // `Replied` already has the worker's answer; `Injected` means the
                 // write is still in flight on another task and that task records
                 // its own outcome — via `record_pane_write_outcome`, which
@@ -1005,10 +1278,23 @@ impl ServerState {
              Full record: `bossctl probe-status {probe_id}`.",
             state.as_str(),
         );
+        self.file_probe_attention(
+            run_id,
+            probe_id,
+            format!("Probe {probe_id} was never delivered to the worker"),
+            body,
+        )
+        .await;
+    }
+
+    /// File a [`PROBE_UNDELIVERED_ATTENTION_KIND`] item against `run_id` and
+    /// announce it. Best-effort throughout: the caller is reporting a
+    /// delivery problem and has nothing useful to do with a second one.
+    pub(super) async fn file_probe_attention(&self, run_id: &str, probe_id: &str, title: String, body: String) {
         let input = CreateAttentionItemInput {
             body_markdown: body,
             kind: PROBE_UNDELIVERED_ATTENTION_KIND.to_owned(),
-            title: format!("Probe {probe_id} was never delivered to the worker"),
+            title,
             execution_id: Some(run_id.to_owned()),
             resolved_at: None,
             status: None,
@@ -1086,12 +1372,36 @@ impl ServerState {
         probe_id: &str,
         eligible: impl FnOnce(ProbeDeliveryState) -> bool,
     ) -> Option<InFlightProbe> {
+        self.take_in_flight_probe_where(run_id, probe_id, |_, state| eligible(state))
+    }
+
+    /// A boundary may extract a reply only after the parked text was submitted.
+    pub(super) fn take_submitted_probe_reply(&self, run_id: &str, probe_id: &str) -> Option<InFlightProbe> {
+        self.take_in_flight_probe_where(run_id, probe_id, |claim, state| {
+            !claim.awaiting_turn_start
+                && matches!(
+                    state,
+                    ProbeDeliveryState::Injected
+                        | ProbeDeliveryState::Consumed
+                        | ProbeDeliveryState::Buffered
+                        | ProbeDeliveryState::Unconfirmed
+                        | ProbeDeliveryState::Orphaned
+                )
+        })
+    }
+
+    fn take_in_flight_probe_where(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        eligible: impl FnOnce(&InFlightProbe, ProbeDeliveryState) -> bool,
+    ) -> Option<InFlightProbe> {
         let mut claims = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
         if claims.get(run_id)?.probe_id != probe_id || claims.get(run_id)?.reply_reading {
             return None;
         }
         let records = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
-        if !eligible(records.get(probe_id)?.state) {
+        if !eligible(claims.get(run_id)?, records.get(probe_id)?.state) {
             return None;
         }
         let mut claim = claims.remove(run_id)?;
@@ -1227,6 +1537,11 @@ impl ServerState {
             ),
         }
         drop(guard);
+        self.after_probe_lifecycle_change(probe_id, state);
+    }
+
+    /// What a probe reaching `state` settles beyond its own record.
+    fn after_probe_lifecycle_change(&self, probe_id: &str, state: ProbeDeliveryState) {
         if state.is_delivered() {
             self.resolve_worker_signal_attentions_if_pending(probe_id);
         } else if state.is_undeliverable() {

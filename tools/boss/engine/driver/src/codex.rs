@@ -2496,6 +2496,20 @@ impl AgentDriver for CodexDriver {
         MidTurnPaneInput::Buffers
     }
 
+    /// One second, **measured**: the TUI treats keys that arrive in a burst
+    /// as a paste, and a Return landing right behind them as a newline in it.
+    ///
+    /// `docs/investigations/codex-0.160.1-qualification-2026-10-06.md`
+    /// ("Harness notes") records `tmux send-keys -l -- <text>` followed
+    /// immediately by Return leaving the prompt in the composer with a
+    /// newline inserted instead of submitting, on both 0.153.4 and 0.160.1,
+    /// and a 1 s gap before Return submitting reliably. Without the gap a
+    /// single-line probe typed into a parked pane sits in the composer and
+    /// starts no turn, while the write itself succeeds.
+    fn pane_submit_settle(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
     /// The bare TUI is a long-lived, multi-turn session — the retired
     /// `codex exec` shape was the one-turn-per-process outlier among Boss's
     /// drivers, not the norm: Claude asserts `Persistent` explicitly

@@ -589,7 +589,7 @@ async fn inject_after_interrupt(
                 server_state,
                 run_id,
                 slot_id,
-                &probe_id,
+                &probe,
                 DETAIL_SUBMITTED_PANE_ECHO_ONLY,
                 interrupt,
                 attempts,
@@ -624,29 +624,22 @@ async fn inject_after_interrupt(
             }
         }
         PaneInjectOutcome::Unconfirmed => {
-            // The worker is parked by construction — we confirmed the turn
-            // ended before typing. A successful write into a parked pane is
-            // the same evidence `deliver_probe_via_pane_write` records as
-            // Consumed without waiting for a hook. UserPromptSubmit for
-            // pane-injected text has never been validated end-to-end and
-            // routinely misses this window (Grok's hooks block the TUI for
-            // up to 15s after an interrupted tool call; JSONL stores
-            // multi-line injections escaped). Treating that miss as "NOT
-            // delivered" is the false negative this path existed to close.
-            // Liveness still gates the claim: a dead process is Orphaned.
+            // A parked write proves only that the keys reached the pane.
+            // Keep its claim under verification until submission is proved
+            // or the bounded watch settles delivery as unconfirmed.
             tracing::info!(
                 run_id,
                 slot_id,
                 probe_id = %probe_id,
                 timeout = ?POST_INTERRUPT_VERIFY_TIMEOUT,
                 "probe written into a parked pane after interrupt; UserPromptSubmit/transcript did \
-                 not confirm within the window — recording parked-write consumption",
+                 not confirm within the window — awaiting parked-write submission evidence",
             );
             settle_unconfirmed_write(
                 server_state,
                 run_id,
                 slot_id,
-                &probe_id,
+                &probe,
                 DETAIL_SUBMITTED_UNCONFIRMED,
                 interrupt,
                 attempts,
@@ -694,15 +687,21 @@ async fn inject_after_interrupt(
 /// [`super::worker_events::record_pane_write_outcome`] then downgrades the
 /// state to `Orphaned`. The returned `detail` is read back from the stored
 /// record, so the synchronous reply always matches `probe-status`.
+///
+/// The answer given here is provisional in one direction: the write is
+/// watched for the turn it should start ([`super::parked_delivery`]), and a
+/// write that starts none is taken back to `Unconfirmed` and surfaced.
 async fn settle_unconfirmed_write(
     server_state: &ServerState,
     run_id: &str,
     slot_id: u8,
-    probe_id: &str,
+    probe: &PendingProbe,
     success_message: &'static str,
     interrupt: ProbeInterruptOutcome,
     attempts: u8,
 ) -> InterruptingDelivery {
+    let probe_id = probe.probe_id.as_str();
+    server_state.mark_in_flight_probe_awaiting_turn_start(run_id, probe_id, &probe.text);
     let state = super::worker_events::record_pane_write_outcome(
         server_state,
         run_id,
@@ -713,6 +712,11 @@ async fn settle_unconfirmed_write(
     )
     .await;
     server_state.set_probe_submission(probe_id, true, Some(ProbeResumeEvidence::Unconfirmed));
+    if state == ProbeDeliveryState::Consumed
+        && let Some(server) = server_state._self_weak.upgrade()
+    {
+        super::parked_delivery::watch_parked_write(&server, run_id, slot_id, probe_id, probe.text.clone());
+    }
     InterruptingDelivery {
         state,
         interrupt,
@@ -728,15 +732,10 @@ async fn settle_unconfirmed_write(
 /// Deliberately **not** `InterruptFailed`: the interrupt did take. Reporting
 /// otherwise would send an operator to fix the wrong thing.
 ///
-/// Deliberately does **not** call `revert_undelivered_nudge` on the requeue
-/// branch: this is a requeue path (the probe id is pushed back for a later
-/// boundary), and [`super::probes::ProbeDispatchOutcome::should_revert_undelivered_nudge`]'s
-/// doc explains why requeue-style outcomes must not revert — a probe
-/// recorded at boundary N, reverted, then delivered at N+1 alongside a
-/// freshly recorded nudge pins the count and makes `max_unproductive_nudges`
-/// unreachable for exactly the wedged workers the breaker exists to park.
-/// The revert only belongs on the terminal `Abandoned` branch below, where
-/// the probe truly never reaches the pane.
+/// Neither branch touches the nudge breaker. A re-queued nudge is still on
+/// its way, which holds the ladder without counting, and an abandoned one is
+/// handed back when the ladder next reads its fate
+/// ([`boss_engine_completion::ProbeQueuer::nudge_delivery`]).
 async fn requeue_after_write_declined(
     server_state: &ServerState,
     run_id: &str,
@@ -764,7 +763,6 @@ async fn requeue_after_write_declined(
         }
     } else {
         let detail = format!("{reason}, and the run had already been released, so there was nothing to retry against");
-        server_state.completion_handler.revert_undelivered_nudge(run_id);
         server_state
             .surface_undelivered_probe(run_id, &probe_id, ProbeDeliveryState::Abandoned, &detail)
             .await;
@@ -808,7 +806,6 @@ async fn settle_interrupt_failure(
     server_state
         .surface_undelivered_probe(run_id, &probe_id, state, &failure.detail)
         .await;
-    server_state.completion_handler.revert_undelivered_nudge(run_id);
     InterruptingDelivery::failed(failure.outcome, failure.attempts, failure.detail)
 }
 

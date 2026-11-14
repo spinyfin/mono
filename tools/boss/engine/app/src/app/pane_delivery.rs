@@ -5,7 +5,8 @@
 //! prove the foreground
 //! process treated them as a pending user prompt. Text injected while
 //! the worker is idle at its prompt (the `Stop`-boundary probe path)
-//! has proven reliable. Text injected while the worker is actively
+//! usually becomes its next prompt, and is confirmed by the turn it starts
+//! ([`super::parked_delivery`]). Text injected while the worker is actively
 //! mid-turn — the urgent `PostToolUse` probe path, and the chore-update
 //! auto-notice, which can land at any point in a turn — depends on what
 //! the driver's foreground process does with mid-turn stdin: when it
@@ -244,13 +245,57 @@ pub(crate) enum PaneSendFailure {
     DriverLivenessUnavailable(String),
 }
 
+/// What a pane looked like when a write into it started no turn, read back so
+/// the cause can be told from the record: text still sitting in the composer,
+/// a pane left in a tmux mode, a dialog over the composer, a foreground
+/// process that is not the driver.
+#[derive(Debug, Default)]
+pub(super) struct PaneDeliveryDiagnostics {
+    /// `#{pane_in_mode}`: tmux itself was consuming the pane's keys.
+    pub(super) pane_in_mode: Option<bool>,
+    /// `#{pane_current_command}`.
+    pub(super) foreground_command: Option<String>,
+    pub(super) activity: Option<WorkerActivity>,
+    /// The last lines of the visible pane, where a composer is drawn.
+    pub(super) pane_tail: Option<String>,
+}
+
+impl PaneDeliveryDiagnostics {
+    /// The scalar readings on one line, for a failure reason. The pane text
+    /// itself goes to the log and the attention item, not into a reason.
+    pub(super) fn summary(&self) -> String {
+        fn or_unknown<T: ToString>(value: Option<T>) -> String {
+            value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+        }
+        format!(
+            "pane_in_mode={}, foreground={}, activity={}",
+            or_unknown(self.pane_in_mode),
+            or_unknown(self.foreground_command.as_deref()),
+            or_unknown(self.activity.map(WorkerActivity::as_str)),
+        )
+    }
+}
+
+/// The last [`PANE_TAIL_LINES`] non-blank lines of `captured`, bounded in
+/// bytes. `None` for a blank capture.
+fn pane_tail(captured: &str) -> Option<String> {
+    const PANE_TAIL_LINES: usize = 20;
+    const PANE_TAIL_BYTES: usize = 2000;
+    let lines: Vec<&str> = captured.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let tail = lines[lines.len().saturating_sub(PANE_TAIL_LINES)..].join("\n");
+    Some(boss_engine_utils::string_clip::clip_to_bytes(&tail, PANE_TAIL_BYTES))
+}
+
 /// Collapse runs of whitespace (including newlines) to single spaces
 /// and trim the ends. Chore-update text can be multi-line, and the
 /// TUI's input handling may reflow or re-wrap it before the prompt is
 /// recorded, so exact substring matching on raw text is brittle —
 /// comparing normalized forms tolerates that without requiring an
 /// exact verbatim match.
-fn normalize_ws(s: &str) -> String {
+pub(super) fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -273,7 +318,7 @@ fn json_unescape_whitespace(s: &str) -> String {
 /// chunk, not scoped to a particular JSONL message shape) since the
 /// point is to catch injected text recorded under a transcript shape
 /// this engine doesn't otherwise parse, not to validate structure.
-async fn transcript_shows_text(transcript_path: &str, offset_bytes: u64, text: &str) -> bool {
+pub(super) async fn transcript_shows_text(transcript_path: &str, offset_bytes: u64, text: &str) -> bool {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     let Ok(mut file) = tokio::fs::File::open(transcript_path).await else {
         return false;
@@ -708,10 +753,80 @@ impl ServerState {
                 )));
             }
         }
+        self.leave_pane_modes_before_keys(run_id, &tmux, &session_name)
+            .await
+            .map_err(PaneSendFailure::Tmux)?;
         // `send_keys` strips trailing newlines itself and submits
         // with a separate Return, so the caller passes the payload
-        // verbatim here.
-        tmux.send_keys(&session_name, text).await.map_err(PaneSendFailure::Tmux)
+        // verbatim here. The settle is the driver's own: a composer that
+        // reads a Return landing right behind typed text as part of a paste
+        // would keep the text and never submit it.
+        let submit_settle = boss_engine_completion::driver_transcript::driver_for_execution(&self.work_db, run_id)
+            .map(|driver| driver.pane_submit_settle())
+            .unwrap_or_default();
+        tmux.send_keys_with_submit_settle(&session_name, text, submit_settle)
+            .await
+            .map_err(PaneSendFailure::Tmux)
+    }
+
+    /// Take `run_id`'s pane out of any tmux mode before keys are sent to it.
+    ///
+    /// A pane someone has scrolled is in copy-mode, and tmux then consumes
+    /// every key itself: typed text runs as copy-mode commands and the Return
+    /// is swallowed, so a probe is lost or left unsubmitted in the composer
+    /// while every tmux command reports success. Codex sessions run with
+    /// `mouse on`, so one wheel tick is enough to put a pane there. Leaving
+    /// the mode costs the viewer their scroll position, which is the price of
+    /// the worker receiving what it was sent. Logged when it happens, because
+    /// it is the one cause of an unanswered write the pane text alone cannot
+    /// show afterwards.
+    pub(super) async fn leave_pane_modes_before_keys(
+        &self,
+        run_id: &str,
+        tmux: &Tmux,
+        session_name: &str,
+    ) -> anyhow::Result<()> {
+        if tmux
+            .leave_pane_modes(session_name)
+            .await
+            .context("leaving the pane's tmux mode before sending keys")?
+        {
+            tracing::warn!(
+                run_id,
+                session = session_name,
+                "pane was in a tmux mode (scrolled into copy-mode); left it so the keys reach the \
+                 driver instead of being consumed by tmux",
+            );
+        }
+        Ok(())
+    }
+
+    /// Read back what `run_id`'s pane looks like. Best-effort: each reading
+    /// that cannot be taken is left `None`.
+    pub(super) async fn capture_pane_delivery_diagnostics(&self, run_id: &str, slot_id: u8) -> PaneDeliveryDiagnostics {
+        let mut diagnostics = PaneDeliveryDiagnostics {
+            activity: self.pane_typed_input_activity(slot_id),
+            ..PaneDeliveryDiagnostics::default()
+        };
+        let Some((tmux, session_name)) = self.pane_capture_target(run_id) else {
+            return diagnostics;
+        };
+        diagnostics.pane_in_mode = tmux
+            .display_message(&session_name, boss_tmux::DisplayField::PaneInMode)
+            .await
+            .ok()
+            .map(|value| value == "1");
+        diagnostics.foreground_command = tmux
+            .display_message(&session_name, boss_tmux::DisplayField::PaneCurrentCommand)
+            .await
+            .ok()
+            .filter(|command| !command.is_empty());
+        diagnostics.pane_tail = tmux
+            .capture_pane(&session_name)
+            .await
+            .ok()
+            .and_then(|text| pane_tail(&text));
+        diagnostics
     }
 
     /// Write `req.text` into `req.run_id`'s worker pane (`req.slot_id`) and

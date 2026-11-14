@@ -113,6 +113,7 @@ mod pane_ops;
 mod pane_viewers;
 mod panes;
 mod panic_hook;
+mod parked_delivery;
 mod pid_file;
 mod planner_ops;
 mod pr_status;
@@ -473,21 +474,7 @@ impl boss_engine_runtime::stale_worker_sweep::StaleWorkerReaper for ServerState 
 #[async_trait]
 impl boss_engine_runtime::spawn_ack_sweep::SpawnAckReaper for ServerState {
     async fn resubmit_prompt(&self, execution_id: &str) -> anyhow::Result<()> {
-        let identity = self
-            .work_db
-            .tmux_identity_for_execution(execution_id)?
-            .ok_or_else(|| anyhow::anyhow!("no recorded tmux identity"))?;
-        let tmux = self.tmux_for_pane_delivery(execution_id)?;
-        let token = boss_engine_runtime::tmux_adoption::session_spawn_token(&tmux, &identity.session_name).await?;
-        anyhow::ensure!(
-            token.as_deref() == Some(identity.spawn_token.as_str()),
-            "worker session token changed"
-        );
-        anyhow::ensure!(
-            !self.work_db.get_execution(execution_id)?.status.is_terminal(),
-            "execution is terminal"
-        );
-        tmux.send_submit(&identity.session_name).await
+        self.resubmit_prompt_if(execution_id, || true).await.map(|_| ())
     }
 
     /// Route the driver-start-timeout reap through the same

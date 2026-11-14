@@ -277,6 +277,15 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     );
     dispatch_probe_reply_on_stop(&server_state, &first_stop).await;
     dispatch_probe_on_stop(&server_state, &first_stop).await;
+    let submitted = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::UserPromptSubmit {
+            session_id: "claude-sess-1".into(),
+            prompt: "what now?".into(),
+        },
+        Some(execution.id.clone()),
+        None,
+    );
+    dispatch_live_worker_state(&server_state, &submitted).await;
 
     // Append an assistant turn — the worker has now "replied".
     {
@@ -908,6 +917,20 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
         server_state.pop_pending_probe(&run_id).is_none(),
         "probe must be consumed on Stop after mid-turn deferral",
     );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Injected),
+        "written on the boundary; delivered when the worker takes it as its prompt",
+    );
+    let submitted = boss_engine_runtime::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::UserPromptSubmit {
+            session_id: "claude-sess-1".into(),
+            prompt: "please pivot".to_owned(),
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_live_worker_state(&server_state, &submitted).await;
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Consumed),
