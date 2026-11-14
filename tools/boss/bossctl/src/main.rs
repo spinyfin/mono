@@ -28,6 +28,7 @@ mod comments;
 mod dispatch_concurrency;
 mod dispatch_stats;
 mod doctor;
+mod enrollment;
 mod focus;
 mod hosts;
 mod logs;
@@ -254,6 +255,15 @@ enum Command {
     Hosts {
         #[command(subcommand)]
         action: hosts::HostsAction,
+    },
+    /// Enroll spoke worker hosts by hand: mint a single-use token, list the
+    /// hosts the hub has authorized, and revoke one.
+    ///
+    /// Opens the hub's host-credential directory directly, so it works while
+    /// the engine is stopped. See the manual host enrollment runbook.
+    Enrollment {
+        #[command(subcommand)]
+        action: enrollment::EnrollmentAction,
     },
     /// Cancel never-started executions, or prune terminal ones (retention).
     ///
@@ -1524,6 +1534,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     state_root,
                 },
         } => hosts::hosts_add(cli.json, state_root, id, ssh_target, pool_size, tags, skip_wrapper_push).await,
+        Command::Enrollment { action } => enrollment::run(cli.json, action),
         Command::Hosts {
             action: hosts::HostsAction::List { enabled, state_root },
         } => hosts::hosts_list(cli.json, state_root, enabled),

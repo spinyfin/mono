@@ -5,7 +5,7 @@
 //! a `current` pointer, the service user's owner-only state, the hub's CA, the
 //! service definition and a small install record. It **never enrolls** the host
 //! and never starts a service that has no client certificate: enrollment is a
-//! separate step the person takes as the service user.
+//! separate step the person takes afterwards ([`crate::bootstrap`]).
 //!
 //! Running it again with the same inputs changes nothing and restarts nothing.
 //! Running it with a newer release switches `current`, then restarts an
@@ -893,6 +893,26 @@ fn install_update_helper(layout: &Layout) -> Result<bool> {
 pub(crate) fn resolve_pinned_key(layout: &Layout) -> Result<crate::manifest::TrustedKey> {
     let (key, _) = resolve_trust(layout, None)?;
     Ok(key)
+}
+
+/// Writes `name` into the service user's credentials directory, owned by that
+/// user and readable by no one else. Root reaches the directory by descriptor
+/// and creates the file through it, so a directory or file the service user
+/// swaps for a symlink cannot redirect the write.
+pub(crate) fn write_credential_file(layout: &Layout, account: &Account, name: &str, bytes: &[u8]) -> Result<()> {
+    let dir = secure_fs::open_dir(layout.base(), &layout.state_dir().join("credentials"))
+        .context("the credentials directory is missing or was replaced")?;
+    secure_fs::verify_user_dir(&dir, account, true, "credentials")?;
+    secure_fs::write_file_at(&dir, name, bytes, 0o600, Some(account))?;
+    Ok(())
+}
+
+/// Removes `name` from the credentials directory; absent is fine.
+pub(crate) fn remove_credential_file(layout: &Layout, account: &Account, name: &str) -> Result<()> {
+    let dir = secure_fs::open_dir(layout.base(), &layout.state_dir().join("credentials"))
+        .context("the credentials directory is missing or was replaced")?;
+    secure_fs::verify_user_dir(&dir, account, true, "credentials")?;
+    secure_fs::unlink_file_at(&dir, name)
 }
 
 pub(crate) fn wait_healthy(host: &dyn Host, health: &Health, layout: &Layout) -> Result<()> {

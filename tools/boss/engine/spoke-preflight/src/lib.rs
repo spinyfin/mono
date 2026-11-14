@@ -58,6 +58,9 @@ pub struct Config {
     /// Repositories (URLs) the host must be able to read.
     #[builder(default)]
     pub repos: Vec<String>,
+    /// Include an incomplete installer check in daemon reports.
+    #[builder(default)]
+    pub report_bootstrap: bool,
     /// Driver CLIs. Defaults match how workers invoke them off `PATH`.
     #[builder(default = PathBuf::from("claude"))]
     pub claude_bin: PathBuf,
@@ -120,8 +123,33 @@ pub async fn run(config: &Config) -> Vec<Outcome> {
     if let Some(hub) = &config.hub {
         outcomes.push(hub_reachable(hub).await);
     }
-    if !config.repos.is_empty() {
-        outcomes.push(repo_access(&config.repos).await);
+    match std::fs::read_to_string(config.state_dir.join("credentials/preflight-repos")) {
+        Ok(text) => {
+            let mut repos: std::collections::BTreeSet<String> = config.repos.iter().cloned().collect();
+            repos.extend(text.split('\0').filter(|repo| !repo.is_empty()).map(str::to_owned));
+            let repos: Vec<String> = repos.into_iter().collect();
+            if !repos.is_empty() {
+                outcomes.push(repo_access(&repos).await);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !config.repos.is_empty() {
+                outcomes.push(repo_access(&config.repos).await);
+            }
+        }
+        Err(_) => outcomes.push(Outcome::of(
+            "preflight_config",
+            Err("cannot read configured repositories".into()),
+        )),
+    }
+    if config.report_bootstrap {
+        match std::fs::symlink_metadata(config.state_dir.join("credentials/preflight-run-pending")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => outcomes.push(Outcome::of(
+                "preflight_run",
+                Err("installer preflight has not completed successfully".into()),
+            )),
+        }
     }
     outcomes
 }

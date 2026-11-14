@@ -4,7 +4,8 @@
 use std::time::Duration;
 
 use boss_host_enrollment::{
-    CredentialError, CredentialEvent, Denial, EnrollInput, HostAuthorizer as _, HostState, Policy, RenewInput,
+    CredentialError, CredentialEvent, Denial, EnrollInput, HostAuthorizer as _, HostState, MANUAL_JOB_ID, Policy,
+    RenewInput,
 };
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
@@ -636,6 +637,167 @@ fn revoking_a_host_the_hub_never_authorized_is_an_error() {
     ));
 }
 
+// ------------------------------------------------------ manual enrollment
+
+#[test]
+fn a_manual_token_enrolls_its_host_once_and_a_replay_is_refused() {
+    let fx = Fixture::new();
+    let grant = fx
+        .credentials
+        .issue_manual_token("edge-1", "operator", false)
+        .expect("mint");
+    assert_eq!(
+        fx.credentials.status("edge-1").expect("status").map(|s| s.state),
+        Some(HostState::Pending),
+        "minting a token does not enroll"
+    );
+
+    let cert = fx
+        .enroll(&Spoke::new(), ("edge-1", MANUAL_JOB_ID, "req-1"), &grant.token)
+        .expect("the token enrolls its host");
+    fx.credentials
+        .authorize(&presented(&cert))
+        .expect("the certificate works");
+
+    // The token is spent: another key and request cannot use it again, and
+    // another host's token does not enroll this host.
+    assert_eq!(
+        refusal(fx.enroll(&Spoke::new(), ("edge-1", MANUAL_JOB_ID, "req-2"), &grant.token)),
+        Denial::TokenReplayed,
+        "replay with a new key"
+    );
+    let other = fx
+        .credentials
+        .issue_manual_token("edge-2", "operator", false)
+        .expect("mint");
+    assert_eq!(
+        refusal(fx.enroll(&Spoke::new(), ("edge-1", MANUAL_JOB_ID, "req-3"), &other.token)),
+        Denial::HostMismatch,
+        "another host's token"
+    );
+}
+
+#[test]
+fn minting_again_replaces_the_outstanding_manual_token() {
+    let fx = Fixture::new();
+    let first = fx
+        .credentials
+        .issue_manual_token("edge-1", "operator", false)
+        .expect("mint");
+    let second = fx
+        .credentials
+        .issue_manual_token("edge-1", "operator", false)
+        .expect("mint");
+    assert_eq!(
+        refusal(fx.enroll(&Spoke::new(), ("edge-1", MANUAL_JOB_ID, "req-1"), &first.token)),
+        Denial::TokenReplaced
+    );
+    fx.enroll(&Spoke::new(), ("edge-1", MANUAL_JOB_ID, "req-2"), &second.token)
+        .expect("the newest token works");
+}
+
+#[test]
+fn a_manual_token_expires_after_fifteen_minutes() {
+    let fx = Fixture::new();
+    let grant = fx
+        .credentials
+        .issue_manual_token("edge-1", "operator", false)
+        .expect("mint");
+    fx.clock.advance(15 * MINUTE + Duration::from_secs(1));
+    assert_eq!(
+        refusal(fx.enroll(&Spoke::new(), ("edge-1", MANUAL_JOB_ID, "req-1"), &grant.token)),
+        Denial::TokenExpired
+    );
+}
+
+#[test]
+fn a_revoked_host_gets_no_manual_token_until_the_operator_reauthorizes() {
+    let fx = Fixture::new();
+    let (_spoke, cert) = fx.enrolled("edge-1");
+    fx.credentials.revoke("edge-1", "operator", "retired").expect("revoke");
+
+    assert_eq!(
+        refusal(fx.credentials.issue_manual_token("edge-1", "operator", false)),
+        Denial::Revoked
+    );
+    assert_eq!(
+        fx.credentials.authorize(&presented(&cert)).unwrap_err(),
+        Denial::Revoked,
+        "still dead after the refused mint"
+    );
+
+    let grant = fx
+        .credentials
+        .issue_manual_token("edge-1", "operator", true)
+        .expect("explicit reauthorization");
+    let fresh = fx
+        .enroll(&Spoke::new(), ("edge-1", MANUAL_JOB_ID, "req-9"), &grant.token)
+        .expect("enroll again");
+    assert_eq!(
+        fx.credentials.authorize(&presented(&cert)).unwrap_err(),
+        Denial::Superseded
+    );
+    fx.credentials.authorize(&presented(&fresh)).expect("new identity");
+}
+
+#[test]
+fn the_host_list_reports_state_certificate_and_outstanding_token() {
+    let fx = Fixture::new();
+    fx.enrolled("a-enrolled");
+    fx.credentials
+        .issue_manual_token("b-pending", "operator", false)
+        .expect("mint");
+    fx.enrolled("c-revoked");
+    fx.credentials.revoke("c-revoked", "operator", "gone").expect("revoke");
+
+    let hosts = fx.credentials.list_hosts().expect("list");
+    let summary: Vec<_> = hosts
+        .iter()
+        .map(|host| {
+            (
+                host.host_id.as_str(),
+                host.state,
+                host.current.is_some(),
+                host.token_expires_at.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("a-enrolled", HostState::Enrolled, true, false),
+            ("b-pending", HostState::Pending, false, true),
+            ("c-revoked", HostState::Revoked, true, false),
+        ]
+    );
+    let expires = hosts[1].token_expires_at.expect("outstanding");
+    let expected = fx.now() + 15 * MINUTE;
+    assert!(
+        expires <= expected && expected.duration_since(expires).expect("ordered") < Duration::from_secs(1),
+        "the token expires at the policy's fifteen minutes, in whole seconds"
+    );
+
+    fx.clock.advance(16 * MINUTE);
+    let hosts = fx.credentials.list_hosts().expect("list");
+    assert_eq!(hosts[1].token_expires_at, None, "an expired token is not outstanding");
+}
+
+#[test]
+fn an_operator_tool_cannot_create_credentials_the_hub_never_made() {
+    let dir = tempfile::tempdir().expect("dir");
+    set_mode(dir.path(), 0o700);
+    let clock: std::sync::Arc<dyn boss_host_enrollment::Clock> = std::sync::Arc::new(boss_host_enrollment::SystemClock);
+    let error = boss_host_enrollment::HostCredentials::open_existing(dir.path(), Policy::default(), clock.clone())
+        .err()
+        .expect("refused");
+    assert!(error.to_string().contains("has not initialized"), "{error}");
+    assert!(!dir.path().join("ca").exists(), "nothing was created");
+    std::fs::create_dir(dir.path().join("ca")).unwrap();
+    std::fs::write(dir.path().join("credentials.db"), []).unwrap();
+    assert!(boss_host_enrollment::HostCredentials::open_existing(dir.path(), Policy::default(), clock).is_err());
+    assert_eq!(std::fs::read_dir(dir.path().join("ca")).unwrap().count(), 0);
+}
+
 // ------------------------------------------------------------ durability
 
 #[test]
@@ -871,6 +1033,22 @@ mod stream_guard {
         let mut guard = admit(authorizer(&fx), presented(&cert)).await.expect("admitted");
         fx.credentials.revoke("edge-1", "test", "gone").expect("revoke");
         assert_eq!(guard.closed().await, CloseReason::Revoked);
+    }
+
+    /// An operator command runs in another process, so its revocation never
+    /// reaches this process's event channel; the guard must find it in the
+    /// records on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revocation_made_by_another_process_closes_an_open_guard() {
+        let fx = Fixture::new();
+        let (_spoke, cert) = fx.enrolled("edge-1");
+        let mut guard = admit(authorizer(&fx), presented(&cert)).await.expect("admitted");
+        let operator = super::reopen(&fx).expect("a second handle on the same state");
+        operator.revoke("edge-1", "operator", "retired").expect("revoke");
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(20), guard.closed())
+            .await
+            .expect("the guard notices without an event");
+        assert_eq!(closed, CloseReason::Revoked);
     }
 
     #[tokio::test(flavor = "multi_thread")]

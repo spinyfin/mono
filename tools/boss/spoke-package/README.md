@@ -112,6 +112,32 @@ and a hidden non-login account (created with `dscl`, a free UID in 200–400,
 primary group `staff`, and shell `/usr/bin/false`) on macOS. The service definition names only the user, so
 systemd and launchd use that account's primary group.
 
+## Enrolling (as root, after `install`)
+
+```sh
+/opt/boss-spoke/current/bin/boss-spoke-package enroll --token-file /root/host.token [--repo <url>]...
+```
+
+On macOS use `/usr/local/lib/boss-spoke/current/bin/boss-spoke-package`; install creates no PATH link.
+
+The token is the single-use, host-bound secret the hub operator minted with
+`bossctl enrollment token <host-id>`. It comes from an owner-only file or
+`--token-stdin`, never argv. `enroll` hands it to the service user through an
+owner-only file, then **as the service user** generates the key on the host,
+sends the CSR to the hub's `Enroll` call, and installs `key.pem` then `cert.pem`
+(the certificate last, because the service definitions start the daemon once it
+exists). It removes the token file, starts the service through the installed
+launchd/systemd definition, and runs the as-user preflight below. Every failure
+is typed (`enrollment failed: <code>`, with a distinct exit status 10–18); a
+failed preflight (`preflight_failed`, 17) leaves the host enrolled and reports
+the failed checks. Enrollment does not enable dispatch: hub registration and
+promotion to a schedulable spoke have no supported production command yet.
+There is no SSH and no
+other enrollment path. `--replace-identity` enrolls again over an existing
+identity (a lost or expired one) with a newly minted token. The full procedure,
+failure table and removal steps are in the
+[manual host enrollment runbook](../docs/runbooks/manual-host-enrollment.md).
+
 ### The service environment
 
 Both definitions run the daemon as `boss-worker` with a private umask and the
@@ -131,7 +157,9 @@ daemon over a live tmux session).
 
 ### Upgrades
 
-Provisioning is one-time. The first install also writes a root-run helper
+Package installation is one-time, but certificate replacement currently requires
+manual re-enrollment before the 30-day expiry; the daemon does not yet renew.
+The first install also writes a root-run helper
 (systemd path unit / launchd WatchPaths) that applies a request the service
 user drops into `update-request/`. The helper claims that file into an
 installer-owned path before it trusts the bytes, and the path unit (or launchd
@@ -212,6 +240,12 @@ There is no Linux arm64 agent, so those assets are optional.
   executed as the service user: layout and modes, idempotence, upgrade and
   restart, key pinning, wrong platform and bad digest installing nothing, unsafe
   state directories refused, the unset-pin refusal, and both service definitions.
+- `bootstrap_test`: `enroll` against a hub serving the real `Enroll` endpoint
+  over TLS: a minted token enrolls its host once; replay, another host's token,
+  revocation, an unreachable hub, a malformed token, and failed preflights are
+  typed failures; the token is never in argv or left on disk.
+- `runbook_test`: the runbook's commands, paths, service labels and failure
+  codes equal the shipped ones.
 - `update_test`: the helper against a staging root: verified switch with
   workers retained, bad signature/digest, wrong platform, unapproved origin,
   journal incompatibility, health-fail rollback, interrupted-switch recovery,

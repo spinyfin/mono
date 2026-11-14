@@ -21,6 +21,7 @@ rust_library(
     deps = [
         "//tools/boss/engine/spoke-preflight",
         "//tools/boss/http_retry",
+        "//tools/boss/spoke-credentials",
     ] + all_crate_deps(normal = True),
 )
 
@@ -141,6 +142,57 @@ rust_test(
         "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
         "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
     },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":spoke-package"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Manual host enrollment: tokens minted by a hub serving the real `Enroll`
+# endpoint over TLS, taken through the as-user enroll step (the real binary),
+# service start and the as-user preflight; replay, revocation, unreachable hub
+# and failed-preflight outcomes. `moderate` because the real preflight runs
+# tool and credential probes as a subprocess.
+rust_test(
+    name = "bootstrap_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/bootstrap.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/host-enrollment",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The runbook's commands, paths, service labels and failure codes against the
+# shipped ones.
+rust_test(
+    name = "runbook_test",
+    size = "small",
+    srcs = ["tests/runbook.rs"],
+    data = ["//tools/boss/docs:runbooks/manual-host-enrollment.md"],
+    edition = "2024",
+    env = {"RUNBOOK": "$(rootpath //tools/boss/docs:runbooks/manual-host-enrollment.md)"},
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

@@ -3,8 +3,8 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# No consumer exists yet (the spoke daemon is added to `visibility` in the PR
-# that makes it depend on this crate), so this is package-private.
+# The spoke package's enroll step is the only consumer so far (the daemon is
+# added to `visibility` in the PR that makes it depend on this crate).
 rust_library(
     name = "spoke-credentials",
     srcs = glob(["src/**/*.rs"]),
@@ -12,6 +12,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/spoke-package:__pkg__"],
     deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
 )
 

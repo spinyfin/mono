@@ -8,6 +8,8 @@ pub enum ClientError {
     Corrupt,
     #[error("key or request generation failed: {0}")]
     Generate(String),
+    #[error("the hub address or its CA is unusable: {0}")]
+    Endpoint(String),
     #[error("renewal needs an enrolled identity")]
     NotEnrolled,
     /// The hub answered with something that cannot be installed.
