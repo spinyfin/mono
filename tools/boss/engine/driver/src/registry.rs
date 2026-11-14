@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    AgentDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngress, ProgressObservationConfig,
-    WorkerProcessLifetime,
+    AgentDriver, AgyDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngress,
+    ProgressObservationConfig, WorkerProcessLifetime,
 };
 
 /// A driver slug the current binary's [`DriverRegistry`] does not recognise.
@@ -50,6 +50,7 @@ impl Default for DriverRegistry {
         drivers.insert("claude", Arc::new(ClaudeDriver));
         drivers.insert("codex", Arc::new(CodexDriver::default()));
         drivers.insert("grok", Arc::new(GrokDriver::default()));
+        drivers.insert("agy", Arc::new(AgyDriver::default()));
         for (slug, driver) in &drivers {
             refuse_stdout_jsonl_ingress(slug, driver.as_ref());
             refuse_one_turn_per_process(slug, driver.as_ref());
@@ -70,7 +71,7 @@ impl Default for DriverRegistry {
 /// named. Panicking here at registration turns that into a loud failure at
 /// startup instead of a silent hang discovered only via the staleness sweep.
 ///
-/// Deliberately probes only the three built-in slugs constructed above, not
+/// Deliberately probes only the built-in slugs constructed above, not
 /// [`DriverRegistry::with_driver`] generally: the shared JSONL reader crate
 /// (`boss-engine-stdout-progress`) legitimately registers synthetic
 /// `StdoutJsonl`-declaring test drivers to exercise that still-supported
@@ -107,7 +108,7 @@ fn refuse_stdout_jsonl_ingress(slug: &str, driver: &dyn AgentDriver) {
 /// driver author's untested assumption into a loud startup failure instead
 /// of a redispatch storm discovered in production.
 ///
-/// Deliberately probes only the three built-in slugs constructed above, not
+/// Deliberately probes only the built-in slugs constructed above, not
 /// [`DriverRegistry::with_driver`] generally, mirroring
 /// [`refuse_stdout_jsonl_ingress`].
 fn refuse_one_turn_per_process(slug: &str, driver: &dyn AgentDriver) {
@@ -292,6 +293,18 @@ mod tests {
         assert_eq!(driver.descriptor().model_menu.engine_default, "grok-4.6");
     }
 
+    #[test]
+    fn default_registry_contains_agy() {
+        let reg = DriverRegistry::default();
+        let driver = reg.require("agy").expect("default registry must contain 'agy'");
+        assert_eq!(driver.descriptor().name, "agy");
+        assert_eq!(driver.descriptor().config_dir, ".agy");
+        assert_eq!(driver.descriptor().agent_rules_filename, "AGENTS.md");
+        assert_eq!(driver.descriptor().binary, "agy");
+        assert_eq!(driver.descriptor().label, "Antigravity");
+        assert_eq!(driver.descriptor().model_menu.engine_default, "gemini-4-hydrogen");
+    }
+
     /// Acceptance: `--driver codex` resolves in the registry and the
     /// dispatch capability gate evaluates against Codex's real `CapabilitySet`
     /// — not a registry-lookup failure.
@@ -369,6 +382,40 @@ mod tests {
             resolver
                 .check_dispatch(&kind, None)
                 .unwrap_or_else(|e| panic!("Grok provides ToolUseInterception + StructuredOutput for {kind:?}: {e}"));
+        }
+    }
+
+    /// Acceptance: `--driver agy` resolves in the registry and the
+    /// dispatch capability gate evaluates against Agy's real `CapabilitySet`.
+    #[test]
+    fn agy_dispatch_gate_uses_declared_capability_set() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        let resolver = reg.resolver("agy").expect("agy is registered");
+        let plan = resolver
+            .check_dispatch(&TaskKind::Chore, None)
+            .expect("Agy CapabilitySet must clear the chore dispatch gate");
+        assert_eq!(plan.driver_name, "agy");
+        assert!(
+            plan.provided.contains(&Capability::Spawn),
+            "gate must see Agy's declared Spawn, not an empty set: {:?}",
+            plan.provided
+        );
+        assert!(
+            plan.provided.contains(&Capability::ToolUseInterception),
+            "ToolUseInterception is declared rewrite-or-deny: {:?}",
+            plan.provided
+        );
+        assert!(
+            plan.degraded.contains(&Capability::CommandOutcomeObservation)
+                || !plan.provided.contains(&Capability::CommandOutcomeObservation),
+            "CommandOutcomeObservation must be absent/degraded for Agy: {plan:?}"
+        );
+        for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+            resolver
+                .check_dispatch(&kind, None)
+                .unwrap_or_else(|e| panic!("Agy provides ToolUseInterception + StructuredOutput for {kind:?}: {e}"));
         }
     }
 
@@ -511,7 +558,7 @@ mod tests {
     /// A driver that lacks a capability a kind marks required-strict is
     /// excluded — the mechanism the document-producing kinds rely on. Uses a
     /// stub with a deliberately thin `CapabilitySet` so the case is covered
-    /// even while all three built-in drivers happen to clear every gate.
+    /// even while all built-in drivers happen to clear every gate.
     #[test]
     fn eligible_drivers_for_kind_excludes_a_driver_the_kind_refuses() {
         use boss_protocol::TaskKind;
@@ -557,7 +604,7 @@ mod tests {
         use boss_protocol::{ExecutionKind, TaskKind};
 
         let reg = DriverRegistry::default();
-        let candidates = ["codex", "claude", "grok"];
+        let candidates = ["codex", "claude", "grok", "agy"];
         for execution_kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
             // The underlying task row can be any ordinary implementation
             // kind — the point is that the escalation comes from the
@@ -570,15 +617,15 @@ mod tests {
             );
         }
         // The same task kind with no execution context (or an execution kind
-        // that carries no escalation) is unaffected — codex/grok still clear
-        // an ordinary chore.
+        // that carries no escalation) is unaffected — codex/grok/agy still
+        // clear an ordinary chore.
         assert_eq!(
             reg.eligible_drivers_for_kind(&TaskKind::Chore, None, &candidates),
-            vec!["codex", "claude", "grok"],
+            vec!["codex", "claude", "grok", "agy"],
         );
         assert_eq!(
             reg.eligible_drivers_for_kind(&TaskKind::Chore, Some(&ExecutionKind::ChoreImplementation), &candidates),
-            vec!["codex", "claude", "grok"],
+            vec!["codex", "claude", "grok", "agy"],
         );
     }
 
@@ -587,7 +634,7 @@ mod tests {
         let reg = DriverRegistry::default();
         let mut slugs: Vec<&str> = reg.slugs().collect();
         slugs.sort_unstable();
-        assert_eq!(slugs, vec!["claude", "codex", "grok"]);
+        assert_eq!(slugs, vec!["agy", "claude", "codex", "grok"]);
         for slug in reg.slugs() {
             assert!(reg.require(slug).is_ok(), "enumerated slug must resolve: {slug}");
         }
@@ -620,6 +667,13 @@ mod tests {
         let reg = DriverRegistry::default();
         assert!(reg.resolver("grok").is_some());
         assert!(reg.require("grok").is_ok());
+    }
+
+    #[test]
+    fn resolver_for_agy_succeeds() {
+        let reg = DriverRegistry::default();
+        assert!(reg.resolver("agy").is_some());
+        assert!(reg.require("agy").is_ok());
     }
 
     /// Acceptance for the call-site cutover: a second registered driver

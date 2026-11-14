@@ -677,17 +677,23 @@ pub fn resolve_spawn_config_in(
         });
     }
 
+    let effort_value = if input.design_reasoning_effort_xhigh
+        && matches!(input.kind, Some(TaskKind::Design))
+        && input.pool_model_override.is_none()
+    {
+        Some("xhigh")
+    } else {
+        effort_level.and_then(|l| (menu.effort_value_for_level)(l))
+    };
+    let (model, effort_value) = match menu.resolve_model_effort {
+        Some(resolve) => resolve(&model, effort_value),
+        None => (model, effort_value),
+    };
+
     Ok(SpawnConfig {
         effort_level,
         reasoning: input.reasoning,
-        effort_value: if input.design_reasoning_effort_xhigh
-            && matches!(input.kind, Some(TaskKind::Design))
-            && input.pool_model_override.is_none()
-        {
-            Some("xhigh")
-        } else {
-            effort_level.and_then(|l| (menu.effort_value_for_level)(l))
-        },
+        effort_value,
         model,
         model_source,
         driver,
@@ -1066,6 +1072,7 @@ mod tests {
             agent_rules_filename: "AGENTS.md",
             initial_prompt_filename: "initial-prompt.txt",
             model_menu: DriverModelMenu {
+                resolve_model_effort: None,
                 engine_default: "stub-model",
                 effort_value_for_level: stub_effort_value_for_level,
                 default_model_for_level: stub_default_model_for_level,
@@ -2203,6 +2210,21 @@ mod tests {
     }
 
     // --- reasoning: the capability lever, independent of effort ---
+
+    #[test]
+    fn agy_investigation_large_records_concrete_catalogue_id() {
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .task_driver("agy")
+                .effort_level(EffortLevel::Large)
+                .kind(&TaskKind::Chore)
+                .reasoning(ReasoningMode::Investigation)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "gemini-4-carbon-high");
+        assert_eq!(cfg.effort_value, Some("high"));
+    }
 
     #[test]
     fn investigation_reasoning_reaches_fable_with_mapped_effort_at_every_effort_level() {

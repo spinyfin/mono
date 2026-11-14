@@ -501,6 +501,9 @@ impl CapabilitySet {
     }
 }
 
+/// Resolve a selected model and effort into their concrete spawn values.
+pub type ModelEffortResolver = fn(&str, Option<&str>) -> (String, Option<&'static str>);
+
 /// Per-driver model and effort menu (capability: [`Capability::ModelAndEffortMenu`]).
 ///
 /// All fields are function pointers so the menu can live in a `static`
@@ -513,6 +516,9 @@ impl CapabilitySet {
 /// force every construction site to change.
 #[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct ModelMenu {
+    /// Resolve a selected family and effort into a concrete catalogue id and rung.
+    /// Drivers with independent model and effort flags leave this unset.
+    pub resolve_model_effort: Option<ModelEffortResolver>,
     /// Engine-default model slug for this driver (resolve-spawn precedence step 5:
     /// last resort when no override, pool override, effort level, or product default applies).
     pub engine_default: &'static str,
@@ -2389,12 +2395,14 @@ pub trait AgentDriver: Send + Sync {
     fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate>;
 }
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod grok;
 pub mod registry;
 
 // Also available in-module for trait signatures (pub use is an import + re-export).
+pub use agy::AgyDriver;
 pub use boss_protocol::DriverRuntimeState;
 pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;
