@@ -91,8 +91,8 @@ pub struct DeliveryStep {
 }
 
 /// The delivery steps the launcher has recorded in `home` so far. A missing or
-/// partly written log yields the steps that parse; it is diagnostics, and
-/// never decides an outcome.
+/// partly written log yields the steps that parse. A recorded blocking-dialog
+/// refusal also supplies the specific failure when brief delivery ends.
 pub fn read_delivery_log(home: &Path) -> Vec<DeliveryStep> {
     fs::read_to_string(home.join(DELIVERY_LOG))
         .map(|text| {
@@ -150,6 +150,16 @@ pub fn owned_home_from_runtime_state(state: &boss_protocol::DriverRuntimeState) 
     (!home.as_os_str().is_empty()).then_some(home)
 }
 
+/// A dialog refusal is terminal even if driver startup evidence arrived meanwhile.
+pub fn blocking_dialog_marker(home: &Path) -> Option<String> {
+    read_delivery_log(home).into_iter().rev().find_map(|step| {
+        step.fields
+            .get("blocking_dialog_marker")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    })
+}
+
 pub const LAUNCHER: &str = include_str!("initial_prompt.py");
 
 /// Shared by local provisioning and SSH staging.
@@ -165,6 +175,7 @@ pub fn launcher_config(driver: &dyn crate::AgentDriver) -> Result<String> {
     let mut starting_markers = spec.starting_markers;
     starting_markers.extend(driver.launcher_starting_markers());
     Ok(serde_json::to_string(&serde_json::json!({
+        "blocking_dialog_markers": spec.blocking_dialog_markers,
         "agent_markers": spec.agent_markers,
         "starting_markers": starting_markers,
         "paste_landed_markers": driver.paste_landed_markers(),
@@ -247,6 +258,10 @@ pub fn provision(config_dir: &Path, run_home: &Path, prompt: &str, driver: &dyn 
     )?;
     write_private(&config_dir.join("initial-prompt.py"), LAUNCHER.as_bytes())
 }
+
+#[cfg(test)]
+#[path = "initial_prompt/blocking_dialog_tests.rs"]
+mod blocking_dialog_tests;
 
 #[cfg(test)]
 mod tests {

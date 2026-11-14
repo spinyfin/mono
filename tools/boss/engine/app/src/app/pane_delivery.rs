@@ -708,10 +708,13 @@ impl ServerState {
                 )));
             }
         }
+        let tmux = self.guard_pane_input(run_id, tmux).map_err(PaneSendFailure::Tmux)?;
         // `send_keys` strips trailing newlines itself and submits
         // with a separate Return, so the caller passes the payload
         // verbatim here.
-        tmux.send_keys(&session_name, text).await.map_err(PaneSendFailure::Tmux)
+        let result = tmux.send_keys(&session_name, text).await;
+        self.settle_pane_input_failure(run_id, &result).await;
+        result.map_err(PaneSendFailure::Tmux)
     }
 
     /// Write `req.text` into `req.run_id`'s worker pane (`req.slot_id`) and

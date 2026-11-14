@@ -1697,7 +1697,19 @@ async fn confirm_prompt_phase(
         || async { signals.has_prompt_accepted_for_run(run_id) },
         || async { crate::driver::initial_prompt::delivery_state(home) },
         // Return alone: the launcher pasted the brief, and it is never pasted again.
-        || async { tmux_host.tmux().send_submit(tmux_host.session_name()).await },
+        || async {
+            let driver = crate::driver::DriverRegistry::default().require(driver_name)?;
+            let markers = driver
+                .pane_monitor_spec()
+                .map(|spec| spec.blocking_dialog_markers)
+                .unwrap_or_default();
+            tmux_host
+                .tmux()
+                .clone()
+                .with_blocking_dialog_markers(markers)
+                .send_submit(tmux_host.session_name())
+                .await
+        },
         || {
             work_db
                 .get_execution(run_id)
@@ -1717,6 +1729,9 @@ async fn confirm_prompt_phase(
         .await
     {
         store_capture_snapshot(last_capture, &visible);
+    }
+    if let Some(marker) = crate::driver::initial_prompt::blocking_dialog_marker(home) {
+        return Err(boss_tmux::BlockingDialogOnScreen { marker }.into());
     }
     result
 }
@@ -1810,6 +1825,9 @@ async fn confirm_local_spawn(
             },
         )
         .await;
+    }
+    if let Some(marker) = crate::driver::initial_prompt::blocking_dialog_marker(&home) {
+        result = Err(boss_tmux::BlockingDialogOnScreen { marker }.into());
     }
     // Whichever wait ended confirmation, say how far the launcher got.
     log_delivery_steps(run_id, driver_name, &home);

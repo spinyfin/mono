@@ -225,16 +225,29 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "#{pane_dead}",
         ]
     );
-    assert_eq!(calls[3][..3], ["-S", boss_tmux::TEST_SOCKET_PATH, "load-buffer"]);
-    assert_eq!(calls[3][3], "-b");
-    let buffer_name = calls[3][4].clone();
+    for capture in [3, 5, 7] {
+        assert_eq!(
+            calls[capture],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "capture-pane",
+                "-p",
+                "-t",
+                "boss-tmux-send"
+            ]
+        );
+    }
+    assert_eq!(calls[4][..3], ["-S", boss_tmux::TEST_SOCKET_PATH, "load-buffer"]);
+    assert_eq!(calls[4][3], "-b");
+    let buffer_name = calls[4][4].clone();
     assert!(
         buffer_name.starts_with("boss-deliver-boss-tmux-send-"),
         "unexpected buffer name: {buffer_name}"
     );
-    assert_eq!(calls[3][5], "-");
+    assert_eq!(calls[4][5], "-");
     assert_eq!(
-        calls[4],
+        calls[6],
         vec![
             "-S",
             boss_tmux::TEST_SOCKET_PATH,
@@ -248,7 +261,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
         ]
     );
     assert_eq!(
-        calls[5],
+        calls[8],
         vec![
             "-S",
             boss_tmux::TEST_SOCKET_PATH,
@@ -258,7 +271,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "Enter"
         ]
     );
-    for extra in &calls[6..] {
+    for extra in &calls[9..] {
         assert!(
             extra.contains(&"capture-pane".to_owned()),
             "commands after the paste must be pane-text confirmation, not another write: {extra:?}"
@@ -742,9 +755,10 @@ async fn interrupt_worker_pane_unknown_run_returns_unknown_run() {
 #[tokio::test]
 async fn interrupt_tmux_worker_sends_the_key_via_tmux() {
     let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 6, Some("claude"));
     server_state
         .worker_registry
-        .register_tmux_run_slot("run-tmux-interrupt", 6, "boss-tmux-interrupt");
+        .register_tmux_run_slot(&run_id, 6, "boss-tmux-interrupt");
     *server_state.tmux_preflight.write().unwrap() = boss_engine_runtime::tmux_preflight::TmuxPreflight::Ready {
         program: std::path::PathBuf::from("/usr/bin/true"),
         version: boss_tmux::MINIMUM_VERSION,
@@ -752,7 +766,7 @@ async fn interrupt_tmux_worker_sends_the_key_via_tmux() {
 
     assert_eq!(
         server_state
-            .interrupt_worker_pane("run-tmux-interrupt")
+            .interrupt_worker_pane(&run_id)
             .await
             .expect("tmux interrupt succeeds"),
         6

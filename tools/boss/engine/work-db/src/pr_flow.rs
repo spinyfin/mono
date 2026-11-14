@@ -24,6 +24,7 @@ pub const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 /// could not confirm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFailureBasis {
+    BlockingDialogOnScreen,
     NudgeBreaker,
     DeclaredBlocked,
     DeliveredWithoutPr,
@@ -57,6 +58,7 @@ impl WorkerFailureBasis {
 }
 
 worker_failure_basis_variants! {
+    BlockingDialogOnScreen => "blocking_dialog_on_screen",
     NudgeBreaker => "nudge_breaker",
     DeclaredBlocked => "declared_blocked",
     DeliveredWithoutPr => "delivered_without_pr",

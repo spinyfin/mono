@@ -29,6 +29,16 @@ pub(super) async fn dispatch(state: &Arc<ServerState>, run: &str) -> Option<Prob
     let outcome = adapter
         .deliver_worker_input(run, WorkerInputKind::Probe, &probe.text)
         .await;
+    if let Ok(outcome) = &outcome {
+        state.settle_spoke_dialog_failure(run, outcome).await;
+        if matches!(outcome, ControlOutcome::Rejected { reason, .. } if reason.starts_with("deliver attempted: BlockingDialogOnScreen:"))
+        {
+            state
+                .settle_blocked_probe(run, &probe.probe_id, format!("{outcome:?}"))
+                .await;
+            return Some(ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned));
+        }
+    }
     match outcome {
         Ok(ControlOutcome::NotSubmitted(reason) | ControlOutcome::Rejected { reason, .. }) => {
             state.set_probe_lifecycle_detail(&probe.probe_id, ProbeDeliveryState::Queued, Some(reason));

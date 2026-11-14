@@ -66,6 +66,7 @@ use boss_protocol::PaneMonitorSpec;
 /// Measured marker set for a Codex TUI pane under `--no-alt-screen`.
 pub(super) fn spec() -> PaneMonitorSpec {
     PaneMonitorSpec {
+        blocking_dialog_markers: vec![],
         // OR-semantics (the app's `agentMarkers.contains { … }`). The banner
         // literal is precise but short-lived; `"›"` prefixes the composer
         // and every user-message line in the transcript, so it survives for

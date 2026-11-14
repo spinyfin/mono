@@ -343,6 +343,11 @@ where
                 let sent = tokio::time::timeout(policy.confirm_timeout, resubmit())
                     .await
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("pressing Return timed out")));
+                if let Err(error) = &sent
+                    && error.downcast_ref::<boss_tmux::BlockingDialogOnScreen>().is_some()
+                {
+                    return sent;
+                }
                 tracing::warn!(
                     run_id,
                     driver = driver_name,
@@ -703,6 +708,30 @@ mod tests {
         retries: 2,
         poll: Duration::from_millis(5),
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn blocking_dialog_stops_return_retries_immediately() {
+        use std::sync::atomic::AtomicU32;
+        let attempts = AtomicU32::new(0);
+        let result = confirm_prompt_submitted(
+            "claude",
+            "exec-dialog",
+            SHORT_POLICY,
+            || async { false },
+            || async { DeliveryState::Submitted },
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(boss_tmux::BlockingDialogOnScreen {
+                    marker: "Do you want to proceed?".into(),
+                }
+                .into())
+            },
+            || false,
+        )
+        .await;
+        assert!(result.unwrap_err().is::<boss_tmux::BlockingDialogOnScreen>());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 
     /// Drive [`confirm_prompt_submitted`] against a worker whose launcher
     /// reports `delivery` after `delivered_after`, and which starts its turn

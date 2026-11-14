@@ -5,6 +5,8 @@
 //! under `/tmp`. The process runner is injectable so callers can test command
 //! construction without a live tmux daemon.
 
+mod blocking_dialog;
+pub use blocking_dialog::BlockingDialogOnScreen;
 mod diagnostics;
 mod probe;
 pub mod session_options;
@@ -168,6 +170,7 @@ enum ServerAddress {
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
 pub struct Tmux {
+    blocking_dialog_markers: Vec<String>,
     program: PathBuf,
     runner: Arc<dyn CommandRunner>,
     server: ServerAddress,
@@ -287,6 +290,7 @@ impl Tmux {
             bail!("tmux executable path must be absolute: {program:?}");
         }
         Ok(Self {
+            blocking_dialog_markers: Vec::new(),
             program,
             runner,
             server,
@@ -618,6 +622,7 @@ impl Tmux {
         }
         let text = text.trim_end_matches(['\r', '\n']);
         if text.contains(['\r', '\n']) {
+            self.check_blocking_dialog(session).await?;
             let buffer_name = format!(
                 "boss-deliver-{session}-{}",
                 PASTE_BUFFER_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -635,12 +640,18 @@ impl Tmux {
             args.extend([
                 "paste-buffer".into(),
                 "-b".into(),
-                buffer_name.into(),
+                buffer_name.clone().into(),
                 "-p".into(),
                 "-d".into(),
                 "-t".into(),
                 session.into(),
             ]);
+            if let Err(error) = self.check_blocking_dialog(session).await {
+                let mut cleanup = self.server_args();
+                cleanup.extend(["delete-buffer".into(), "-b".into(), buffer_name.into()]);
+                let _ = self.invoke(cleanup).await;
+                return Err(error);
+            }
             self.invoke(args).await?;
         } else {
             self.send_literal_chunks(session, text).await?;
@@ -660,6 +671,7 @@ impl Tmux {
                 "--".into(),
                 chunk.into(),
             ]);
+            self.check_blocking_dialog(session).await?;
             self.invoke(args).await?;
             sleep(DEFAULT_SEND_CHUNK_DELAY).await;
         }
@@ -675,6 +687,7 @@ impl Tmux {
         validate_value("tmux key", key)?;
         let mut args = self.server_args();
         args.extend(["send-keys".into(), "-t".into(), session.into(), key.into()]);
+        self.check_blocking_dialog(session).await?;
         self.invoke(args).await.map(|_| ())
     }
 

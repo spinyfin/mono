@@ -230,8 +230,21 @@ def spawn_supervised(argv, master, slave):
     return pid, writer
 
 
+class BlockingDialogOnScreen(RuntimeError):
+    def __init__(self, marker):
+        self.marker = marker.decode("utf-8", "replace")
+        super().__init__(f"BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker {self.marker!r}")
+
+
+def check_blocking_dialog(view, markers):
+    visible = view.text()
+    for marker in markers:
+        if marker and marker in visible:
+            raise BlockingDialogOnScreen(marker)
+
+
 def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
-        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None):
+        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None, blocking_dialog_markers=()):
     if b"\x1b[201~" in prompt or b"\0" in prompt:
         raise ValueError("initial brief contains a terminal paste terminator or NUL")
     outer_tty = os.isatty(0)
@@ -334,8 +347,9 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                         pending += REPLIES[query[1]]
                         consumed = query.end()
                     query_buffer = query_buffer[consumed:][-32:]
-                if not submitting:
+                if not delivered:
                     view.feed(output)
+                    check_blocking_dialog(view, blocking_dialog_markers)
                 if stage == "landing":
                     echo = (echo + output)[-65536:]
                 if not paste_started:
@@ -367,6 +381,12 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                 else:
                     stdin_open = False
             if master in writable:
+                # Drain already available output before checking the current screen.
+                # A dialog may have appeared after readiness or during the paste.
+                if not delivered and select.select([master], [], [], 0)[0]:
+                    continue
+                if not delivered:
+                    check_blocking_dialog(view, blocking_dialog_markers)
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]
                 if not pending and submitting and not delivered:
@@ -468,7 +488,8 @@ def main():
         prompt = prompt_file.read()
     # A retried launch starts its own record.
     write_marker(DELIVERY_LOG)
-    return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery)
+    return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery,
+               blocking_dialog_markers=[s.encode() for s in config.get("blocking_dialog_markers", [])])
 
 
 if __name__ == "__main__":
@@ -476,7 +497,8 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         print(f"boss initial brief delivery failed: {error}", file=sys.stderr)
-        log_delivery("failed", reason=str(error))
+        log_delivery("failed", reason=str(error),
+                     blocking_dialog_marker=error.marker if isinstance(error, BlockingDialogOnScreen) else None)
         if (prompt_home() / DELIVERED_MARKER).is_file():
             sys.exit(1)
         write_marker(UNDELIVERED_MARKER)

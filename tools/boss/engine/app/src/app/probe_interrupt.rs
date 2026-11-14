@@ -667,6 +667,20 @@ async fn inject_after_interrupt(
             )
             .await
         }
+        PaneInjectOutcome::SendFailed(super::pane_delivery::PaneSendFailure::Tmux(error))
+            if error.is::<boss_tmux::BlockingDialogOnScreen>() =>
+        {
+            let detail = error.to_string();
+            server_state
+                .settle_blocked_probe(run_id, &probe_id, detail.clone())
+                .await;
+            InterruptingDelivery {
+                state: ProbeDeliveryState::Abandoned,
+                interrupt,
+                attempts,
+                detail: Some(detail),
+            }
+        }
         PaneInjectOutcome::SendFailed(failure) => {
             tracing::warn!(
                 ?failure,

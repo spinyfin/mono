@@ -1,4 +1,5 @@
 mod absence;
+mod blocking_dialog;
 mod probe;
 mod teardown;
 

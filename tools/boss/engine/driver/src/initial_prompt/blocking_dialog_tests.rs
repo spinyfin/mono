@@ -1,0 +1,62 @@
+use super::*;
+
+#[test]
+fn blocking_dialog_refuses_brief_and_submit_without_answering() {
+    for after_paste in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
+        let stub = temp.path().join("driver.py");
+        fs::write(
+            &stub,
+            format!(
+                r#"
+import os, select, sys, tty
+from pathlib import Path
+tty.setraw(0)
+if {after_paste}:
+    os.write(1, b'\x1b[?2004hClaude Code')
+    data = b''
+    while not data.endswith(b'\x1b[201~'):
+        data += os.read(0, 4096)
+os.write(1, b'\r\nDo you want to proceed?\r\n1. Yes\r\n2. No')
+while True:
+    data = os.read(0, 4096)
+    if data:
+        Path(sys.argv[1]).write_bytes(data)
+"#,
+                after_paste = if after_paste { "True" } else { "False" }
+            ),
+        )
+        .unwrap();
+        let received = temp.path().join("received");
+        let output = boss_command_runner::output_blocking_timeout(
+            std::process::Command::new("python3")
+                .arg(temp.path().join("initial-prompt.py"))
+                .arg("python3")
+                .arg(stub)
+                .arg(&received)
+                .stdin(std::process::Stdio::null()),
+            Duration::from_secs(15),
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(BRIEF_NOT_DELIVERED_EXIT), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("BlockingDialogOnScreen"), "{stderr}");
+        assert!(stderr.contains("Do you want to proceed?"), "{stderr}");
+        assert!(!received.exists(), "dialog received input: {after_paste}");
+        assert!(!delivered_marker_present(temp.path()));
+        assert_eq!(
+            blocking_dialog_marker(temp.path()).as_deref(),
+            Some("Do you want to proceed?")
+        );
+    }
+}
+
+#[test]
+fn every_claude_marker_is_exported_to_the_launcher() {
+    use crate::AgentDriver;
+    let markers = crate::ClaudeDriver.pane_monitor_spec().unwrap().blocking_dialog_markers;
+    assert!(!markers.is_empty());
+    let config: serde_json::Value = serde_json::from_str(&launcher_config(&crate::ClaudeDriver).unwrap()).unwrap();
+    assert_eq!(config["blocking_dialog_markers"], serde_json::json!(markers));
+}

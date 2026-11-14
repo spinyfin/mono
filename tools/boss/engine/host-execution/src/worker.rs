@@ -372,7 +372,17 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         record.phase = Phase::Alive;
         self.persist(&record)?;
         let pane = self.wait_for_brief(&record).await;
+        // Reclaim removes the launcher's log, so retain the refusal first.
+        let dialog = record.home.as_deref().and_then(initial_prompt::blocking_dialog_marker);
         self.settle(&mut record, &pane).await?;
+        if let Some(marker) = dialog {
+            return Ok(outcome(
+                command,
+                ResultCode::Rejected,
+                boss_tmux::BlockingDialogOnScreen { marker }.to_string(),
+                Some(pane),
+            ));
+        }
         let code = match pane_life(&pane) {
             PaneLife::Indeterminate => ResultCode::OutcomeUncertain,
             PaneLife::Missing => ResultCode::Absent,
@@ -715,15 +725,21 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         });
         self.persist(&record)?;
         let target = exact_target(&record.session);
+        let driver = DriverRegistry::default().require(&record.driver_id)?;
+        let markers = driver
+            .pane_monitor_spec()
+            .map(|spec| spec.blocking_dialog_markers)
+            .unwrap_or_default();
+        let tmux = self.tmux.clone().with_blocking_dialog_markers(markers);
         let sent = match &gesture {
-            Gesture::Text(text) => self.tmux.send_keys(&target, text).await,
+            Gesture::Text(text) => tmux.send_keys(&target, text).await,
             Gesture::Keys { key, presses, interval } => {
                 let mut sent = Ok(());
                 for press in 0..*presses {
                     if press > 0 {
                         tokio::time::sleep(*interval).await;
                     }
-                    if let Err(error) = self.tmux.send_key(&target, key).await {
+                    if let Err(error) = tmux.send_key(&target, key).await {
                         sent = Err(error);
                         break;
                     }
@@ -749,7 +765,11 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 self.persist(&record)?;
                 Ok(outcome(
                     command,
-                    ResultCode::OutcomeUncertain,
+                    if error.downcast_ref::<boss_tmux::BlockingDialogOnScreen>().is_some() {
+                        ResultCode::Rejected
+                    } else {
+                        ResultCode::OutcomeUncertain
+                    },
                     format!("deliver attempted: {error:#}"),
                     Some(self.observe(&record).await),
                 ))

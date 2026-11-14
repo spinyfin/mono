@@ -25,8 +25,13 @@ pub struct EnvVar {
 /// driver crate (not currently carried on any engine↔app wire message).
 ///
 /// All marker lists are OR-semantics: any hit means the condition is true.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[builder(on(String, into))]
 pub struct PaneMonitorSpec {
+    /// Visible substrings that forbid all pane input because a dialog owns it.
+    #[serde(default)]
+    #[builder(default)]
+    pub blocking_dialog_markers: Vec<String>,
     /// Substrings whose presence means "the agent is running in this pane".
     pub agent_markers: Vec<String>,
     /// Substrings meaning "a turn is in flight" (Claude: `"esc to interrupt"`).

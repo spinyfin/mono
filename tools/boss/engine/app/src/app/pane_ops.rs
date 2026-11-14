@@ -304,6 +304,7 @@ impl ServerState {
                     .deliver_worker_input(run_id, boss_execution_contracts::WorkerInputKind::Nudge, &text)
                     .await
                     .map_err(|err| SendInputError::Host(format!("{err:#}")))?;
+                self.settle_spoke_dialog_failure(run_id, &outcome).await;
                 return spoke_delivery(outcome).map(|()| (boss_protocol::REMOTE_SLOT_BASE, None));
             }
             Ok(None) => {}
@@ -425,6 +426,7 @@ impl ServerState {
                     .interrupt_worker(run_id)
                     .await
                     .map_err(|err| InterruptPaneError::Host(format!("{err:#}")))?;
+                self.settle_spoke_dialog_failure(run_id, &outcome).await;
                 return spoke_delivery(outcome)
                     .map(|()| boss_protocol::REMOTE_SLOT_BASE)
                     .map_err(|err| match err {
@@ -574,14 +576,13 @@ impl ServerState {
                 super::pane_delivery::missing_session_identity_message(run_id, pane.slot_id)
             )));
         };
-        match self.tmux_for_pane_delivery(run_id) {
-            Ok(tmux) => tmux
-                .send_key(&session_name, key)
-                .await
-                .map(|_| slot_id)
-                .map_err(InterruptPaneError::Tmux),
-            Err(err) => Err(InterruptPaneError::Tmux(err)),
-        }
+        let tmux = self
+            .tmux_for_pane_delivery(run_id)
+            .and_then(|tmux| self.guard_pane_input(run_id, tmux))
+            .map_err(InterruptPaneError::Tmux)?;
+        let result = tmux.send_key(&session_name, key).await;
+        self.settle_pane_input_failure(run_id, &result).await;
+        result.map(|_| slot_id).map_err(InterruptPaneError::Tmux)
     }
 
     /// Resolve `id` (a short-form or canonical work-item identifier) to a
