@@ -718,6 +718,14 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 ));
             }
         }
+        let driver = match DriverRegistry::default().require(&record.driver_id) {
+            Ok(driver) => driver,
+            Err(error) => return Ok(outcome(command, ResultCode::Rejected, error.to_string(), None)),
+        };
+        let tmux = self
+            .tmux
+            .clone()
+            .with_blocking_dialog_markers(driver.blocking_dialog_markers());
         record.phase = Phase::Delivering;
         record.delivery = Some(DeliveryProgress {
             command_id: command.command_id.clone(),
@@ -725,12 +733,6 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         });
         self.persist(&record)?;
         let target = exact_target(&record.session);
-        let driver = DriverRegistry::default().require(&record.driver_id)?;
-        let markers = driver
-            .pane_monitor_spec()
-            .map(|spec| spec.blocking_dialog_markers)
-            .unwrap_or_default();
-        let tmux = self.tmux.clone().with_blocking_dialog_markers(markers);
         let sent = match &gesture {
             Gesture::Text(text) => tmux.send_keys(&target, text).await,
             Gesture::Keys { key, presses, interval } => {

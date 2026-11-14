@@ -920,9 +920,7 @@ async fn maybe_nudge_prompt_change(
     let markers = crate::driver::DriverRegistry::default()
         .require("claude")
         .expect("the coordinator driver is registered")
-        .pane_monitor_spec()
-        .map(|spec| spec.blocking_dialog_markers)
-        .unwrap_or_default();
+        .blocking_dialog_markers();
     let tmux = tmux.clone().with_blocking_dialog_markers(markers);
     match tmux.send_keys(&record.session_name, &message).await {
         Ok(()) => {

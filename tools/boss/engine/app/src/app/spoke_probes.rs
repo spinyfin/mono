@@ -31,11 +31,10 @@ pub(super) async fn dispatch(state: &Arc<ServerState>, run: &str) -> Option<Prob
         .await;
     if let Ok(outcome) = &outcome {
         state.settle_spoke_dialog_failure(run, outcome).await;
-        if matches!(outcome, ControlOutcome::Rejected { reason, .. } if reason.starts_with("deliver attempted: BlockingDialogOnScreen:"))
+        if let ControlOutcome::Rejected { reason, .. } = outcome
+            && boss_tmux::BlockingDialogOnScreen::is_delivery_rejection(reason)
         {
-            state
-                .settle_blocked_probe(run, &probe.probe_id, format!("{outcome:?}"))
-                .await;
+            state.settle_blocked_probe(run, &probe.probe_id, reason.clone()).await;
             return Some(ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned));
         }
     }

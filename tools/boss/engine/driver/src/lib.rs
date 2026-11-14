@@ -1862,6 +1862,13 @@ pub trait AgentDriver: Send + Sync {
     fn descriptor(&self) -> &DriverDescriptor;
     fn capabilities(&self) -> CapabilitySet;
 
+    /// Dialog policy shared by every pane input transport.
+    fn blocking_dialog_markers(&self) -> Vec<String> {
+        self.pane_monitor_spec()
+            .map(|spec| spec.blocking_dialog_markers)
+            .unwrap_or_default()
+    }
+
     /// Explicit remote-spawn declaration. Drivers default to host-local until
     /// they prove their per-run state can be provisioned remotely.
     fn remote_spawn_host_independent(&self) -> bool {

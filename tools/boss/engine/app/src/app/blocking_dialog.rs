@@ -27,11 +27,7 @@ impl ServerState {
                 .context("no driver recorded for pane input")?,
         };
         let driver = boss_engine_driver::DriverRegistry::default().require(&slug)?;
-        let markers = driver
-            .pane_monitor_spec()
-            .map(|spec| spec.blocking_dialog_markers)
-            .unwrap_or_default();
-        Ok(tmux.with_blocking_dialog_markers(markers))
+        Ok(tmux.with_blocking_dialog_markers(driver.blocking_dialog_markers()))
     }
 
     pub(super) async fn settle_spoke_dialog_failure(
@@ -40,7 +36,7 @@ impl ServerState {
         outcome: &boss_execution_contracts::ControlOutcome,
     ) {
         if let boss_execution_contracts::ControlOutcome::Rejected { reason, .. } = outcome
-            && reason.starts_with("deliver attempted: BlockingDialogOnScreen:")
+            && boss_tmux::BlockingDialogOnScreen::is_delivery_rejection(reason)
         {
             if let Err(error) = self.completion_handler.fail_blocking_dialog(run_id, reason).await {
                 tracing::error!(run_id, %error, "could not finalize spoke blocking-dialog failure");

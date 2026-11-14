@@ -236,11 +236,26 @@ class BlockingDialogOnScreen(RuntimeError):
         super().__init__(f"BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker {self.marker!r}")
 
 
-def check_blocking_dialog(view, markers):
+def check_blocking_dialog(view, markers, payload=b""):
     visible = view.text()
-    for marker in markers:
-        if marker and marker in visible:
-            raise BlockingDialogOnScreen(marker)
+    if len(payload) <= len(visible) and b"\n" in payload:
+        visible = visible.replace("❯ ".encode() + payload, b"", 1)
+    lines = visible.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or b"esc to cancel" not in lines[-1].lower():
+        return
+    for index, line in enumerate(lines):
+        question = line.strip().lstrip("❯".encode()).strip()
+        tail = [row.strip().lstrip("❯".encode()).strip() for row in lines[max(0, index - 2):]]
+        numbered = any(row.startswith(b"1.") for row in tail) and any(row.startswith(b"2.") for row in tail)
+        trust = (b"No, exit" in tail
+                 and (b"Yes, I trust this folder" in tail or b"Yes, I accept" in tail)
+                 and any(row.strip().startswith("❯".encode()) for row in lines[max(0, index - 2):]))
+        if len(lines) - index <= 12 and (numbered or trust):
+            for marker in markers:
+                if marker and question.startswith(marker):
+                    raise BlockingDialogOnScreen(marker)
 
 
 def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
@@ -349,7 +364,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     query_buffer = query_buffer[consumed:][-32:]
                 if not delivered:
                     view.feed(output)
-                    check_blocking_dialog(view, blocking_dialog_markers)
+                    check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
                 if stage == "landing":
                     echo = (echo + output)[-65536:]
                 if not paste_started:
@@ -386,7 +401,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                 if not delivered and select.select([master], [], [], 0)[0]:
                     continue
                 if not delivered:
-                    check_blocking_dialog(view, blocking_dialog_markers)
+                    check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]
                 if not pending and submitting and not delivered:

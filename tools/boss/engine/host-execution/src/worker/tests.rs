@@ -1513,7 +1513,7 @@ async fn blocking_dialog_rejects_each_host_delivery_kind() {
     ] {
         let root = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeTmux::default());
-        *fake.visible.lock().unwrap() = "Do you want to proceed?".into();
+        *fake.visible.lock().unwrap() = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel".into();
         live(&fake);
         let supervisor = supervisor(root.path(), fake.clone()).await;
         seed(&supervisor.store, Phase::Alive);
@@ -1525,6 +1525,28 @@ async fn blocking_dialog_rejects_each_host_delivery_kind() {
         assert!(result.reason.contains("Do you want to proceed?"), "{}", result.reason);
         assert!(fake.sent.lock().unwrap().is_empty(), "{kind:?}");
     }
+}
+
+#[tokio::test]
+async fn unknown_driver_rejects_delivery_without_persisting_delivering() {
+    let root = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeTmux::default());
+    live(&fake);
+    let supervisor = supervisor(root.path(), fake.clone()).await;
+    seed(&supervisor.store, Phase::Alive);
+    let bytes = supervisor.store.load("run-test", "token").unwrap().unwrap();
+    let mut record: ExecutionRecord = serde_json::from_slice(&bytes).unwrap();
+    record.driver_id = "unknown-driver".into();
+    supervisor.persist(&record).unwrap();
+    let result = supervisor
+        .execute(&deliver_command("unknown", DeliveryKind::Nudge, "hello"), false, 1)
+        .await;
+    assert_eq!(result.code, ResultCode::Rejected as i32, "{}", result.reason);
+    let bytes = supervisor.store.load("run-test", "token").unwrap().unwrap();
+    let record: ExecutionRecord = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(record.phase, Phase::Alive);
+    assert!(record.delivery.is_none());
+    assert!(fake.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

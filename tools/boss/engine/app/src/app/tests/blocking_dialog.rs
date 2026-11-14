@@ -10,7 +10,8 @@ async fn blocking_dialog_refuses_text_interrupt_and_recovery_return_and_fails_ru
         state.worker_registry.register_tmux_run_slot(&run, 1, "boss-dialog");
         register_tmux_identity_for_test(&state, &run, "boss-dialog", TEST_SPAWN_TOKEN);
         let runner = Arc::new(
-            RecordingPaneRunner::new("boss-dialog").capture_text("Claude Code\nDo you want to proceed?\n1. Yes\n2. No"),
+            RecordingPaneRunner::new("boss-dialog")
+                .capture_text("Claude Code\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel"),
         );
         *state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
         state.set_tmux_override_for_test(tmux_with_runner(runner.clone()));

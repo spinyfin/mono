@@ -656,10 +656,11 @@ impl Tmux {
         } else {
             self.send_literal_chunks(session, text).await?;
         }
-        self.send_submit(session).await
+        self.send_key_excluding(session, SUBMIT_KEY, text).await
     }
 
     async fn send_literal_chunks(&self, session: &str, text: &str) -> Result<()> {
+        let mut typed = String::new();
         for chunk in utf8_chunks(text, DEFAULT_SEND_CHUNK_BYTES) {
             let chunk = if chunk == ";" { "\\;" } else { chunk };
             let mut args = self.server_args();
@@ -671,8 +672,9 @@ impl Tmux {
                 "--".into(),
                 chunk.into(),
             ]);
-            self.check_blocking_dialog(session).await?;
+            self.check_blocking_dialog_excluding(session, &typed).await?;
             self.invoke(args).await?;
+            typed.push_str(chunk);
             sleep(DEFAULT_SEND_CHUNK_DELAY).await;
         }
         Ok(())
@@ -683,11 +685,15 @@ impl Tmux {
     /// [`Self::send_keys`], which deliberately follows the literal text with
     /// a separate Return keypress.
     pub async fn send_key(&self, session: &str, key: &str) -> Result<()> {
+        self.send_key_excluding(session, key, "").await
+    }
+
+    async fn send_key_excluding(&self, session: &str, key: &str, payload: &str) -> Result<()> {
         validate_value("session name", session)?;
         validate_value("tmux key", key)?;
         let mut args = self.server_args();
         args.extend(["send-keys".into(), "-t".into(), session.into(), key.into()]);
-        self.check_blocking_dialog(session).await?;
+        self.check_blocking_dialog_excluding(session, payload).await?;
         self.invoke(args).await.map(|_| ())
     }
 

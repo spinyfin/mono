@@ -28,7 +28,8 @@ pub struct EnvVar {
 #[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[builder(on(String, into))]
 pub struct PaneMonitorSpec {
-    /// Visible substrings that forbid all pane input because a dialog owns it.
+    /// Question or option text identifying a blocking dialog. Input transports
+    /// also require the active dialog's choice rows and cancellation footer.
     #[serde(default)]
     #[builder(default)]
     pub blocking_dialog_markers: Vec<String>,

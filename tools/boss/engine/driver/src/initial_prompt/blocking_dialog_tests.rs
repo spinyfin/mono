@@ -18,7 +18,7 @@ if {after_paste}:
     data = b''
     while not data.endswith(b'\x1b[201~'):
         data += os.read(0, 4096)
-os.write(1, b'\r\nDo you want to proceed?\r\n1. Yes\r\n2. No')
+os.write(1, b'\r\nDo you want to proceed?\r\n1. Yes\r\n2. No\r\nEsc to cancel')
 while True:
     data = os.read(0, 4096)
     if data:
@@ -59,4 +59,39 @@ fn every_claude_marker_is_exported_to_the_launcher() {
     assert!(!markers.is_empty());
     let config: serde_json::Value = serde_json::from_str(&launcher_config(&crate::ClaudeDriver).unwrap()).unwrap();
     assert_eq!(config["blocking_dialog_markers"], serde_json::json!(markers));
+}
+
+#[test]
+fn launcher_distinguishes_active_dialogs_from_payload_and_transcript() {
+    let temp = tempfile::tempdir().unwrap();
+    provision(temp.path(), temp.path(), "brief", &crate::ClaudeDriver).unwrap();
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import runpy, sys
+module = runpy.run_path(sys.argv[1], run_name='dialog_check')
+check, error = module['check_blocking_dialog'], module['BlockingDialogOnScreen']
+class View:
+    def __init__(self, text): self.screen = text
+    def text(self): return self.screen
+question = b'Do you want to proceed?'
+dialog = question + b'\n1. Yes\n2. No\nEsc to cancel'
+for screen, marker in [
+    (dialog, question),
+    ('❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel'.encode(), b'Yes, I trust this folder'),
+    ('❯ No, exit\nYes, I accept\nEnter to confirm · Esc to cancel'.encode(), b'Yes, I accept'),
+]:
+    try: check(View(screen), [marker])
+    except error: pass
+    else: raise AssertionError('active dialog accepted')
+check(View(question), [question])
+check(View(dialog + b'\nClaude Code\n> status?'), [question])
+check(View("❯ ".encode() + dialog), [question], dialog)
+"#,
+        )
+        .arg(temp.path().join("initial-prompt.py"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }

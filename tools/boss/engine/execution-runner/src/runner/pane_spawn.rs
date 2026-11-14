@@ -1461,7 +1461,10 @@ impl ExecutionRunner for PaneSpawnRunner {
             // be taken, so the prompt wait runs now, with its retries and its
             // own failure, instead of the veto reporting a live worker.
             let confirm = match confirm {
-                Err(err) if late_start_rescues(spawner.driver_signals(), started.slot_id, &execution.id, &err) => {
+                Err(err)
+                    if !err.is::<boss_tmux::BlockingDialogOnScreen>()
+                        && late_start_rescues(spawner.driver_signals(), started.slot_id, &execution.id, &err) =>
+                {
                     tracing::info!(
                         worker_id,
                         execution_id = %execution.id,
@@ -1506,7 +1509,8 @@ impl ExecutionRunner for PaneSpawnRunner {
                 return Ok(cancelled);
             }
             if let Err(err) = confirm
-                && !reap_vetoed_by_late_evidence(spawner.driver_signals(), started.slot_id, &execution.id, &err)
+                && (err.is::<boss_tmux::BlockingDialogOnScreen>()
+                    || !reap_vetoed_by_late_evidence(spawner.driver_signals(), started.slot_id, &execution.id, &err))
             {
                 tracing::warn!(
                     worker_id,
@@ -1516,6 +1520,13 @@ impl ExecutionRunner for PaneSpawnRunner {
                     "spawn confirmation failed; reaping the worker pane",
                 );
                 spawner.reap_worker_pane(&execution.id).await;
+                if err.is::<boss_tmux::BlockingDialogOnScreen>() {
+                    self.work_db.record_worker_failure_with_basis(
+                        &execution.id,
+                        &err.to_string(),
+                        boss_work_db::WorkerFailureBasis::BlockingDialogOnScreen,
+                    )?;
+                }
                 return Err(err);
             }
         }
@@ -1699,14 +1710,10 @@ async fn confirm_prompt_phase(
         // Return alone: the launcher pasted the brief, and it is never pasted again.
         || async {
             let driver = crate::driver::DriverRegistry::default().require(driver_name)?;
-            let markers = driver
-                .pane_monitor_spec()
-                .map(|spec| spec.blocking_dialog_markers)
-                .unwrap_or_default();
             tmux_host
                 .tmux()
                 .clone()
-                .with_blocking_dialog_markers(markers)
+                .with_blocking_dialog_markers(driver.blocking_dialog_markers())
                 .send_submit(tmux_host.session_name())
                 .await
         },
