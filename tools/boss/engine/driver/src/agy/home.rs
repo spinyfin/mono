@@ -34,20 +34,6 @@ const WORKSPACE_PATH_FILENAME: &str = "boss-workspace-path";
 const ONBOARDING_JSON: &str = r#"{"consumerOnboardingComplete": true, "enterpriseOnboardingComplete": false, "onboardingComplete": true}
 "#;
 
-/// Mutable `agy` artifacts that must stay private to the run. The login
-/// keychain is deliberately absent: it is the shared credential bridge.
-const PRIVATE_STATE_LEAVES: &[&str] = &[
-    ".gemini/antigravity-cli/conversation_summaries.db",
-    ".gemini/antigravity-cli/settings.json",
-    ".gemini/antigravity-cli/presence",
-    ".gemini/antigravity-cli/brain",
-    ".gemini/antigravity-cli/conversations",
-    ".gemini/antigravity-cli/updater",
-    ".gemini/antigravity-cli/log",
-    ".gemini/antigravity-cli/cache",
-    ".gemini/config",
-];
-
 /// Check existing paths before creating or overwriting any run state.
 fn validate_private_layout(process_home: &Path) -> anyhow::Result<()> {
     let root = agy_homes_root();
@@ -88,13 +74,10 @@ fn validate_private_layout(process_home: &Path) -> anyhow::Result<()> {
         path.push(component);
         check_private_entry(&path)?;
     }
-    // Check the entire mutable subtree, including intermediate directories
-    // and previously created token files, rather than a fixed leaf list.
+    // Reject symlinks and shared hard links under the run’s .gemini, control and rules trees.
     check_private_tree(&process_home.join(".gemini"))?;
     check_private_tree(&process_home.parent().context("run container")?.join(CONTROL_LEAF))?;
-    for leaf in PRIVATE_STATE_LEAVES {
-        check_private_entry(&process_home.join(leaf))?;
-    }
+    check_private_tree(&process_home.parent().context("run container")?.join("rules-root"))?;
     Ok(())
 }
 
@@ -182,7 +165,7 @@ pub fn log_file_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
 }
 
 pub fn agent_rules_path_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
-    Ok(control_dir_for_run(run_id)?.join(".agents/rules/boss.md"))
+    Ok(agy_run_container_for_run(run_id)?.join("rules-root/.agents/rules/boss.md"))
 }
 
 pub fn workspace_path_stamp(control_dir: &Path) -> PathBuf {
@@ -276,7 +259,7 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     fs::create_dir_all(&process_home)
         .with_context(|| format!("creating agy process HOME {}", process_home.display()))?;
     fs::create_dir_all(&control_dir).with_context(|| format!("creating agy control dir {}", control_dir.display()))?;
-    fs::create_dir_all(control_dir.join(".agents/rules"))?;
+    fs::create_dir_all(agent_rules_path_for_run(run_id)?.parent().context("rules directory")?)?;
 
     refuse_host_gemini_as_home(&process_home)?;
 
@@ -412,6 +395,34 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    Ok(())
+}
+
+/// Remove run state while keeping conversation paths readable after teardown.
+pub fn reclaim_agy_run(process_home: &Path) -> anyhow::Result<()> {
+    let container = process_home.parent().context("agy run container")?;
+    assert_agy_home_safe_to_delete(container)?;
+    validate_private_layout(process_home)?;
+    retain_conversations(
+        container,
+        &["process-home", ".gemini", "antigravity-cli", "conversations"],
+    )
+}
+
+fn retain_conversations(path: &Path, keep: &[&str]) -> anyhow::Result<()> {
+    if keep.is_empty() || !path.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name() == keep[0] {
+            retain_conversations(&entry.path(), &keep[1..])?;
+        } else if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
     }
     Ok(())
 }

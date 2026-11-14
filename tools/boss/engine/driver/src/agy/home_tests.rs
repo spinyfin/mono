@@ -1,4 +1,5 @@
 use super::*;
+use crate::AgentDriver;
 use crate::test_support::home_override;
 use tempfile::TempDir;
 
@@ -8,6 +9,8 @@ fn provisioning_refuses_aliases_before_writing_host_files() {
         "process-home",
         "process-home/.gemini",
         "process-home/.gemini/antigravity-cli",
+        "control",
+        "rules-root",
     ] {
         let tmp = TempDir::new().unwrap();
         let homes = tmp.path().join("homes");
@@ -91,7 +94,19 @@ fn provision_creates_private_tree_and_keychain_bridge() {
     assert!(gemini.join("antigravity-cli/cache/onboarding.json").is_file());
     assert!(gemini.join("antigravity-cli/settings.json").is_file());
     assert!(gemini.join("config/hooks.json").is_file());
-    assert!(gemini.join("AGENTS.md").parent().unwrap().is_dir());
+    let rules_dir = homes.join("run-prov-1/rules-root/.agents/rules");
+    assert!(rules_dir.is_dir());
+    assert_eq!(
+        agent_rules_path_for_run("run-prov-1").unwrap().parent(),
+        Some(rules_dir.as_path())
+    );
+    assert_eq!(
+        super::super::AgyDriver::default()
+            .agent_rules_destination(&workspace, "run-prov-1")
+            .parent(),
+        Some(rules_dir.as_path())
+    );
+    assert!(!gemini.join("AGENTS.md").exists());
     assert!(!gemini.join("settings.json").exists());
     assert!(!gemini.join("trustedFolders.json").exists());
     assert!(runtime.control_dir.join("initial-prompt.txt").is_file());

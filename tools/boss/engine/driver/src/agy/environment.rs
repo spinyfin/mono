@@ -18,7 +18,8 @@ use crate::scoped_home::{HostToolPaths, worker_tool_path_directive};
 
 /// Installation source for the Boss-owned `agy` executable. Tests and deployments select a
 /// specific binary; production copies a qualified host binary into the
-/// homes-root `bin/` directory the updater cannot write.
+/// homes-root `bin/` directory the updater cannot write. The first installation
+/// pins its bytes; later overrides must match the pinned copy.
 pub const AGY_BIN_ENV: &str = "BOSS_AGY_BIN";
 
 /// When set to `1`/`true`, skip live identity checks (`codesign`, `--version`).
@@ -92,11 +93,11 @@ impl AgyProcessEnvironment {
             "--log-file".into(),
             self.log_file.as_os_str().to_owned(),
             "--add-dir".into(),
-            self.session_settings_path
+            self.process_home
                 .parent()
-                .expect("control directory")
-                .as_os_str()
-                .to_owned(),
+                .expect("run container")
+                .join("rules-root")
+                .into_os_string(),
         ]
     }
 
@@ -141,7 +142,7 @@ pub fn peek_agy_binary(homes_root: &Path) -> anyhow::Result<PathBuf> {
         return Ok(owned);
     }
     bail!(
-        "Boss-owned agy binary {} is missing; provision the workspace first or set {AGY_BIN_ENV}",
+        "Boss-owned agy binary {} is missing; provision the workspace first",
         owned.display()
     )
 }
@@ -182,6 +183,11 @@ fn resolve_agy_binary_with(
         return Ok(owned);
     }
     assert_protected_binary(&owned)?;
+    if let Some(source) = crate::scoped_home::nonempty_env(AGY_BIN_ENV)
+        && fs::read(&source).context("reading agy installation override")? != fs::read(&owned)?
+    {
+        bail!("{AGY_BIN_ENV} override differs from pinned copy {}", owned.display());
+    }
     qualify(&owned)?;
     Ok(owned)
 }
@@ -350,7 +356,8 @@ fn verify_codesign_with(
     let requirement = format!(
         "anchor apple generic and identifier \"{AGY_CODESIGN_IDENTIFIER}\" and certificate leaf[subject.OU] = \"{AGY_CODESIGN_TEAM}\""
     );
-    let verified = run(&["--verify", "--strict", "-R", &requirement])?;
+    let requirement = codesign_literal_requirement(&requirement);
+    let verified = run(&codesign_verify_args(&requirement))?;
     if !verified.status.success() {
         bail!(
             "agy signature verification failed for {}: {}",
@@ -367,6 +374,16 @@ fn verify_codesign_with(
         bail!("agy binary {} has wrong vendor identity: {details}", path.display());
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn codesign_literal_requirement(source: &str) -> String {
+    format!("={source}")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn codesign_verify_args(requirement: &str) -> [&str; 4] {
+    ["--verify", "--strict", "-R", requirement]
 }
 
 #[cfg(any(target_os = "macos", test))]

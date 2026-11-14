@@ -32,9 +32,8 @@ mod transcript;
 
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
 use home::{
-    AgyRuntimeState, agent_rules_path_for_run, agy_homes_root, assert_agy_home_safe_to_delete, control_dir_for_run,
-    log_file_for_run, process_home_for_run, provision_agy_home, read_workspace_path_stamp,
-    session_settings_path_for_run,
+    AgyRuntimeState, agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run,
+    process_home_for_run, provision_agy_home, read_workspace_path_stamp, session_settings_path_for_run,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,7 +82,7 @@ pub struct AgyDriver {
     _private: (),
 }
 
-/// Refuse launch. Refuse launch while guard hooks are unavailable.
+/// Refuse launch while guard hooks are unavailable.
 pub fn refuse_agy_spawn(reason: &str) -> String {
     format!("printf '%s\\n' {} >&2; exit 1\n", shell_quote(reason))
 }
@@ -277,11 +276,7 @@ impl AgentDriver for AgyDriver {
             return Ok(());
         };
         let runtime = AgyRuntimeState::from_driver_runtime_state(state)?;
-        let container = runtime.process_home.parent().context("agy run container")?;
-        assert_agy_home_safe_to_delete(container)?;
-        if container.exists() {
-            std::fs::remove_dir_all(container).context("reclaiming private agy run state")?;
-        }
+        home::reclaim_agy_run(&runtime.process_home)?;
         Ok(())
     }
 
@@ -332,13 +327,13 @@ impl AgentDriver for AgyDriver {
         AGY_AGENT_RULES_PREAMBLE
     }
 
-    /// Route Boss worker rules to `<control>/.agents/rules/boss.md` under the
+    /// Route Boss worker rules to `<rules-root>/.agents/rules/boss.md` under the
     /// per-run container, added to the CLI workspace with `--add-dir`.
     fn agent_rules_destination(&self, _workspace: &Path, run_id: &str) -> PathBuf {
         agent_rules_path_for_run(run_id).unwrap_or_else(|_| {
             agy_homes_root()
                 .join("unknown-run")
-                .join("control/.agents/rules/boss.md")
+                .join("rules-root/.agents/rules/boss.md")
         })
     }
 
@@ -623,11 +618,18 @@ mod tests {
         assert!(stderr.contains("guard hooks are not wired"), "{stderr}");
         let fallback = runtime.process_home.join(".gemini/antigravity-cli/fallback-token.json");
         fs::write(&fallback, "private token").unwrap();
+        let transcript = runtime
+            .process_home
+            .join(".gemini/antigravity-cli/conversations/session/transcript_full.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "conversation").unwrap();
         driver
             .teardown_workspace(Some(&workspace), "run-prov-agy", Some(&state))
             .await
             .unwrap();
-        assert!(!runtime.process_home.parent().unwrap().exists());
+        assert!(!fallback.exists());
+        assert!(!runtime.control_dir.exists());
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), "conversation");
         assert_eq!(
             fs::read(keychain_dir.join("login.keychain-db")).unwrap(),
             b"dummy-keychain"
@@ -678,12 +680,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_rules_destination_is_control_directory_rules() {
+    fn agent_rules_destination_is_rules_only_directory() {
         let tmp = TempDir::new().unwrap();
         let _guard = env_for_provision(tmp.path());
         let workspace = tmp.path().join("ws");
         let dest = AgyDriver::default().agent_rules_destination(&workspace, "run-agents-1");
-        assert!(dest.ends_with("control/.agents/rules/boss.md"), "dest={dest:?}");
+        assert!(dest.ends_with("rules-root/.agents/rules/boss.md"), "dest={dest:?}");
         assert!(
             !dest.components().any(|c| c.as_os_str() == ".agy"),
             "must not write under workspace .agy: {dest:?}"

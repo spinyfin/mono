@@ -18,7 +18,7 @@ fn signature_integrity_and_vendor_requirement_precede_display() {
         verify_codesign_with(path, |args| {
             calls += 1;
             assert_eq!(&args[..2], &["--verify", "--strict"]);
-            assert!(args[3].contains("anchor apple generic"));
+            assert!(args[3].starts_with("=anchor apple generic"));
             assert!(args[3].contains("EQHXZ8M8AV"));
             Ok(output(false, "invalid signature"))
         })
@@ -141,7 +141,7 @@ fn directives_scope_home_and_disable_the_updater() {
             std::ffi::OsString::from("--log-file"),
             "/run/log/agy.log".into(),
             "--add-dir".into(),
-            "/run/control".into(),
+            "/run/rules-root".into(),
         ]
     );
     assert!(
@@ -168,4 +168,32 @@ fn directives_scope_home_and_disable_the_updater() {
 fn skip_binary_assert_accepts_a_missing_file() {
     let _guard = EnvGuard::set(&[(AGY_SKIP_BINARY_ASSERT_ENV, "1")]);
     verify_agy_binary(Path::new("/definitely/missing/agy")).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn real_codesign_accepts_literal_requirement() {
+    let requirement = codesign_literal_requirement("anchor apple");
+    let result = Command::new("/usr/bin/codesign")
+        .args(codesign_verify_args(&requirement))
+        .arg("/usr/bin/true")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
+fn changed_override_is_rejected_after_installation() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    fs::write(&source, "original").unwrap();
+    let _guard = EnvGuard::set(&[(AGY_BIN_ENV, source.to_str().unwrap())]);
+    let root = tmp.path().join("homes");
+    let owned = resolve_agy_binary_with(&root, |_| Ok(())).unwrap();
+    resolve_agy_binary_with(&root, |_| Ok(())).unwrap();
+    fs::write(&source, "replacement").unwrap();
+    let error = resolve_agy_binary_with(&root, |_| Ok(())).unwrap_err();
+    assert!(error.to_string().contains("override differs from pinned copy"));
+    assert_eq!(fs::read(&owned).unwrap(), b"original");
+    fs::set_permissions(root.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
 }
