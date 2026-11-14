@@ -169,6 +169,7 @@ impl AgentDriver for AgyDriver {
             starting_markers: vec!["Signing in...".into()],
             prompt_prefixes: vec![">".into()],
             idle_debounce_polls: 2,
+            blocking_dialog_markers: vec![],
         })
     }
 
