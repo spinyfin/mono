@@ -316,6 +316,7 @@ mod host {
 
 use anyhow::Result;
 use boss_protocol_spoke::v1::{Capacity, Inventory, Record, record};
+use boss_spoke_credentials::{ClientError, DAEMON_CERT, DAEMON_KEY, SpokeCredentials};
 use boss_spoke_journal::{Admission, Fault, Journal, Limits};
 use boss_spoke_outbound::{SessionObserver, SharedJournal};
 use clap::Parser;
@@ -325,7 +326,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::watch;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
@@ -409,6 +410,10 @@ impl SessionObserver for HealthWatch {
     }
 }
 
+/// How often an already-due certificate is retried, and how often a fresh one
+/// is re-checked. The first check runs at startup so a host that was down
+/// through its renewal window reconnects with a new certificate.
+const RENEW_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How often host readiness is re-checked. The first check runs at startup.
 const PREFLIGHT_INTERVAL: Duration = Duration::from_secs(300);
 /// Reported until the first check finishes, so a host that has not yet proven
@@ -470,15 +475,9 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         &args.host_id,
         Limits::default(),
     )?));
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(std::fs::read(args.tls_dir.join("ca.pem"))?))
-        .identity(Identity::from_pem(
-            std::fs::read(args.tls_dir.join("cert.pem"))?,
-            std::fs::read(args.tls_dir.join("key.pem"))?,
-        ));
-    let endpoint = Endpoint::from_shared(args.hub)?
-        .connect_timeout(Duration::from_secs(10))
-        .tls_config(tls)?;
+    let _ = tls_endpoint(&args.hub, &args.tls_dir)?;
+    let credentials = SpokeCredentials::open(&args.tls_dir)?;
+    let (reconnect, reconnects) = watch::channel(0u64);
     let boot = host::boot_id()?;
     let stamp = || host::stamp(&boot);
     let cube = boss_host_execution::cube::LocalCube {
@@ -555,7 +554,15 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         brief_budget: boss_host_execution::worker::BRIEF_DELIVERY_BUDGET,
     });
     tokio::select! {
-        result = boss_spoke_outbound::run_with_observer(Arc::clone(&journal), endpoint, stamp, true, health.as_ref()) => result,
+        result = outbound_loop(
+            Arc::clone(&journal),
+            args.hub.clone(),
+            args.tls_dir.clone(),
+            stamp,
+            health.as_ref(),
+            reconnects,
+        ) => result,
+        result = renew_loop(credentials, args.hub.clone(), args.tls_dir.clone(), reconnect) => result,
         result = commands::run(Arc::clone(&journal), executor, supervisor, Arc::clone(&captures), stamp, &gateway, &health.execution) => result,
         result = capture_loop(Arc::clone(&journal), Arc::clone(&captures), panes, stamp) => result,
         result = produce(&journal, &args.state_dir, &boot, tmux_ready, preflights, first_report, health.as_ref()) => result,
@@ -566,6 +573,116 @@ async fn serve(args: Args, homes_root: PathBuf) -> Result<()> {
         result = gateway.serve(workers, stamp) => result,
         result = gateway.observe(stamp) => result,
         result = tokio::signal::ctrl_c() => { result?; Ok(()) }
+    }
+}
+
+fn tls_endpoint(hub: &str, tls_dir: &Path) -> Result<Endpoint> {
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(std::fs::read(tls_dir.join("ca.pem"))?))
+        .identity(Identity::from_pem(
+            std::fs::read(tls_dir.join(DAEMON_CERT))?,
+            std::fs::read(tls_dir.join(DAEMON_KEY))?,
+        ));
+    Ok(Endpoint::from_shared(hub.to_owned())?
+        .connect_timeout(Duration::from_secs(10))
+        .tls_config(tls)?)
+}
+
+fn renew_check_interval() -> Duration {
+    std::env::var("BOSS_SPOKE_RENEW_INTERVAL_SECS")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(RENEW_CHECK_INTERVAL)
+}
+
+/// Rebuilds the outbound endpoint from the published files whenever the
+/// renewal loop installs a new identity, so the next session presents it.
+async fn outbound_loop(
+    journal: SharedJournal,
+    hub: String,
+    tls_dir: PathBuf,
+    stamp: impl Fn() -> Result<boss_protocol_spoke::v1::Stamp>,
+    observer: &impl SessionObserver,
+    mut reconnects: watch::Receiver<u64>,
+) -> Result<()> {
+    loop {
+        let endpoint = tls_endpoint(&hub, &tls_dir)?;
+        tokio::select! {
+            result = boss_spoke_outbound::run_with_observer(
+                Arc::clone(&journal),
+                endpoint,
+                &stamp,
+                true,
+                observer,
+            ) => return result,
+            changed = reconnects.changed() => {
+                changed?;
+                tracing::info!("spoke identity replaced; reconnecting");
+            }
+        }
+    }
+}
+
+/// Renews the installed identity when it is inside the design's window, then
+/// publishes `key.pem` / `cert.pem` atomically and asks the outbound session
+/// to reconnect.
+async fn renew_loop(
+    credentials: SpokeCredentials,
+    hub: String,
+    tls_dir: PathBuf,
+    reconnect: watch::Sender<u64>,
+) -> Result<()> {
+    let jitter = boss_spoke_credentials::renewal_jitter();
+    let mut interval = tokio::time::interval(renew_check_interval());
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !matches!(credentials.identity(), Ok(Some(_))) {
+            continue;
+        }
+        let (ca, cert, key) = match (
+            std::fs::read(tls_dir.join("ca.pem")),
+            std::fs::read(tls_dir.join(DAEMON_CERT)),
+            std::fs::read(tls_dir.join(DAEMON_KEY)),
+        ) {
+            (Ok(ca), Ok(cert), Ok(key)) => (ca, cert, key),
+            (ca, cert, key) => {
+                tracing::warn!(
+                    ca = ca.err().map(|error| error.to_string()),
+                    cert = cert.err().map(|error| error.to_string()),
+                    key = key.err().map(|error| error.to_string()),
+                    "certificate files unreadable; skipping renewal check"
+                );
+                continue;
+            }
+        };
+        let exchange = match boss_spoke_credentials::renewal_client(&hub, &ca, &cert, &key) {
+            Ok(exchange) => exchange,
+            Err(error) => {
+                tracing::warn!(error = %error, "certificate renewal client");
+                continue;
+            }
+        };
+        match credentials.renew_if_due(&exchange, SystemTime::now(), jitter).await {
+            Ok(None) => {}
+            Ok(Some(identity)) => {
+                if let Err(error) = credentials.publish_daemon_files() {
+                    tracing::error!(error = %error, "failed to publish renewed certificate");
+                    continue;
+                }
+                tracing::info!(serial = %identity.serial, "spoke certificate renewed");
+                reconnect.send_modify(|generation| *generation += 1);
+            }
+            Err(ClientError::NotEnrolled) => {}
+            Err(error) if error.is_retryable() => {
+                tracing::warn!(error = %error, "certificate renewal deferred");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "certificate renewal refused");
+            }
+        }
     }
 }
 

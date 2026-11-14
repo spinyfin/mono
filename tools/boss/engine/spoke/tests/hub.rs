@@ -1,7 +1,11 @@
 //! Shared spoke-daemon fixture. Each test crate_root uses a different subset.
 #![allow(dead_code)]
 
-use boss_host_enrollment::{EnrollInput, HostCredentials, Policy, SystemClock};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use boss_host_enrollment::{
+    EnrollInput, EnrollmentService, HostCredentials, IssuedCertificate, Policy, ServiceLimits, SystemClock,
+};
 use boss_protocol_spoke::v1::{
     self, hub_frame, spoke_frame,
     spoke_hub_server::{SpokeHub, SpokeHubServer},
@@ -175,7 +179,8 @@ impl Fixture {
         let authority = dir.path().join("authority");
         std::fs::create_dir(&authority).unwrap();
         std::fs::set_permissions(&authority, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-        let credentials = HostCredentials::open(&authority, Policy::default(), Arc::new(SystemClock)).unwrap();
+        let credentials =
+            Arc::new(HostCredentials::open(&authority, Policy::default(), Arc::new(SystemClock)).unwrap());
         credentials.authorize_host("host", "test").unwrap();
         let grant = credentials.issue_enrollment_token("host", "job").unwrap();
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -200,25 +205,37 @@ impl Fixture {
         )
         .unwrap();
         std::fs::write(dir.path().join("key.pem"), key.serialize_pem()).unwrap();
-        let key = KeyPair::generate().unwrap();
+        let key_pkcs8_der = key.serialize_der();
+        write_identity_file(
+            dir.path(),
+            &issued,
+            &key_pkcs8_der,
+            issued.expires_unix_ms.max(0) as u64,
+        );
+        let server_key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::default();
         params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let cert = params.signed_by(&key, &issuer).unwrap();
-        let (cert, key) = (cert.pem(), key.serialize_pem());
+        let cert = params.signed_by(&server_key, &issuer).unwrap();
+        let (cert, server_key) = (cert.pem(), server_key.serialize_pem());
+        // Client certificates are optional so Enroll can be answered before the
+        // caller has one; Renew and Connect still require a presented cert.
         let tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(cert, key))
-            .client_ca_root(Certificate::from_pem(credentials.trust_bundle_pem()));
+            .identity(Identity::from_pem(cert, server_key))
+            .client_ca_root(Certificate::from_pem(credentials.trust_bundle_pem()))
+            .client_auth_optional(true);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("https://{}", listener.local_addr().unwrap());
         let (tx, connections) = mpsc::channel(8);
         let refused = Arc::new(Mutex::new(Vec::new()));
         let hub_refused = Arc::clone(&refused);
+        let enrollment = EnrollmentService::new(Arc::clone(&credentials), ServiceLimits::default());
         let server = tokio::spawn(async move {
             Server::builder()
                 .initial_stream_window_size(1024)
                 .tls_config(tls)
                 .unwrap()
+                .add_service(enrollment.into_server())
                 .add_service(SpokeHubServer::new(Hub {
                     connections: tx,
                     refusals: Mutex::new(codes.into()),
@@ -235,6 +252,26 @@ impl Fixture {
             refused,
             server,
         }
+    }
+
+    /// Rewrites the durable identity so renewal is due on the next check, without
+    /// changing the still-valid TLS files the current session is using.
+    pub fn expire_installed_identity(&self) {
+        let path = self.dir.path().join("identity");
+        let rewritten = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.starts_with("expires_unix_ms ") {
+                    "expires_unix_ms 1".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(path, rewritten).unwrap();
     }
     pub fn root(&self) -> PathBuf {
         self.dir.path().join("state")
@@ -259,6 +296,19 @@ impl Fixture {
     }
     pub fn start(&self) -> Daemon {
         Daemon::start(self.dir.path(), &self.endpoint, Path::new("cube"), None)
+    }
+
+    /// Same as [`Self::start`], with a one-second renewal check so a test can
+    /// take a certificate through renewal without waiting an hour.
+    pub fn start_checking_renewal(&self) -> Daemon {
+        Daemon::start_with_env(
+            self.dir.path(),
+            &self.endpoint,
+            Path::new("cube"),
+            None,
+            None,
+            &[("BOSS_SPOKE_RENEW_INTERVAL_SECS", "1")],
+        )
     }
     pub fn start_without_tools(&self) -> Daemon {
         Daemon::start_with_path(
@@ -318,6 +368,19 @@ impl Fixture {
     }
 }
 
+fn write_identity_file(dir: &Path, issued: &IssuedCertificate, key_pkcs8_der: &[u8], expires_unix_ms: u64) {
+    let mut text = format!(
+        "host_id host\nserial {}\nexpires_unix_ms {expires_unix_ms}\nkey {}\nleaf {}\n",
+        issued.serial,
+        STANDARD.encode(key_pkcs8_der),
+        STANDARD.encode(&issued.leaf_der),
+    );
+    for cert in &issued.chain_der {
+        text.push_str(&format!("chain {}\n", STANDARD.encode(cert)));
+    }
+    std::fs::write(dir.join("identity"), text).unwrap();
+}
+
 pub struct Daemon {
     child: Child,
     log: PathBuf,
@@ -327,6 +390,17 @@ impl Daemon {
         Self::start_with_path(dir, endpoint, cube, tmux, None)
     }
     fn start_with_path(dir: &Path, endpoint: &str, cube: &Path, tmux: Option<&Path>, path: Option<&Path>) -> Self {
+        Self::start_with_env(dir, endpoint, cube, tmux, path, &[])
+    }
+
+    fn start_with_env(
+        dir: &Path,
+        endpoint: &str,
+        cube: &Path,
+        tmux: Option<&Path>,
+        path: Option<&Path>,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let log = dir.join("daemon.log");
         let mut command = Command::new(std::env::var("SPOKE_BIN").unwrap());
         command
@@ -345,6 +419,9 @@ impl Daemon {
         }
         if let Some(path) = path {
             command.env("PATH", path);
+        }
+        for (key, value) in extra_env {
+            command.env(key, value);
         }
         let child = {
             let _gate = spawn_or_close();

@@ -279,6 +279,23 @@ async fn assert_seeded_command_recovery(claim_before_restart: bool, expected: v1
 }
 
 #[tokio::test]
+async fn actual_daemon_renews_a_near_expiry_certificate_and_reconnects() {
+    let mut hub = Fixture::new().await;
+    let original = std::fs::read(hub.cert_pem()).unwrap();
+    let _daemon = hub.start_checking_renewal();
+    let first = hub.connection().await;
+    first.welcome(0).await;
+    hub.expire_installed_identity();
+    let second = hub.connection().await;
+    second.welcome(0).await;
+    let renewed = std::fs::read(hub.cert_pem()).unwrap();
+    assert_ne!(
+        renewed, original,
+        "renewal must publish a new certificate before reconnecting"
+    );
+}
+
+#[tokio::test]
 async fn actual_daemon_applies_an_upgrade_offer_and_reports_the_running_release() {
     let mut hub = Fixture::new().await;
     std::fs::write(
@@ -1164,8 +1181,8 @@ printf '%s\n' '{"repos":[]}'
 #[tokio::test]
 async fn daemon_reports_pending_then_missing_driver_preflights() {
     let mut hub = Fixture::new().await;
-    std::fs::create_dir_all(hub.root().join("credentials")).unwrap();
-    for dir in [hub.root(), hub.root().join("credentials")] {
+    std::fs::create_dir_all(hub.root().join(boss_spoke_preflight::CREDENTIALS_DIR)).unwrap();
+    for dir in [hub.root(), hub.root().join(boss_spoke_preflight::CREDENTIALS_DIR)] {
         std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     }
     std::fs::write(
