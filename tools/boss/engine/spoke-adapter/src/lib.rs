@@ -964,11 +964,16 @@ impl HostAdapter for SpokeHostAdapter {
         match self.route_path(Path::new(workspace_path)).await? {
             Route::Spoke(assignment) => match self.hub.custody.get().cloned() {
                 // The worker log is an artifact the spoke may have sent; its
-                // absence is "not applicable", never an empty log.
+                // absence is "not applicable", never an empty log. Only this
+                // assignment's rows count: a previous attempt's log is not
+                // this run's evidence.
                 Some(custody) => {
-                    tokio::task::spawn_blocking(move || custody.worker_log_tail(&assignment.execution_id, max_bytes))
-                        .await
-                        .context("custody read task failed")?
+                    let generation = assignment.assignment_generation;
+                    tokio::task::spawn_blocking(move || {
+                        custody.worker_log_tail(&assignment.execution_id, generation, max_bytes)
+                    })
+                    .await
+                    .context("custody read task failed")?
                 }
                 None => Ok(None),
             },
@@ -987,15 +992,20 @@ impl HostAdapter for SpokeHostAdapter {
             // custody holds them digest-checked. Absent, still arriving and
             // unavailable are `NotAvailable`; only positive evidence the output
             // is bad is `Failed`.
-            Route::Spoke(_) => {
+            Route::Spoke(assignment) => {
                 let Some(custody) = self.hub.custody.get().cloned() else {
                     return Ok(CollectOutcome::NotAvailable);
                 };
-                let (execution, destination) = (execution_id.to_owned(), destination.to_owned());
-                let collected =
-                    tokio::task::spawn_blocking(move || custody.collect_output(&execution, kind, &destination))
-                        .await
-                        .context("custody read task failed")??;
+                let (execution, generation, destination) = (
+                    execution_id.to_owned(),
+                    assignment.assignment_generation,
+                    destination.to_owned(),
+                );
+                let collected = tokio::task::spawn_blocking(move || {
+                    custody.collect_output(&execution, generation, kind, &destination)
+                })
+                .await
+                .context("custody read task failed")??;
                 Ok(match collected {
                     Collected::Installed => CollectOutcome::Collected,
                     Collected::NotAvailable(reason) => {

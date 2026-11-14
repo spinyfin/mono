@@ -268,6 +268,11 @@ impl Mark {
             capture_epoch: 0,
         }
     }
+
+    pub fn with_epoch(mut self, epoch: u64) -> Self {
+        self.capture_epoch = epoch;
+        self
+    }
 }
 
 /// A transcript file on the hub, addressed by run identity.
@@ -718,43 +723,51 @@ impl Custody {
 
     /// Whether `mark` has been met for the run, and if not, whether it will be.
     ///
-    /// When `artifacts_settled`, a completion boundary also waits for the
-    /// spoke's capture-concluded marker and for every artifact identity that
-    /// marker names. A named artifact with no row is pending, not settled.
-    /// Absence of open artifact rows is not treated as settled.
+    /// The transcript watermark and the capture-concluded marker are computed
+    /// separately. When `artifacts_settled`, a completion boundary also waits
+    /// for the spoke's capture-concluded marker and for every artifact identity
+    /// that marker names. A named artifact with no row is pending, not settled.
+    /// Absence of open artifact rows is not treated as settled. A pending
+    /// transcript is reported in preference to a pending capture, so a caller
+    /// that times out can still attach a ready transcript by asking again with
+    /// `artifacts_settled` false.
+    ///
+    /// Epoch zero never emitted a concluded marker; those journals are treated
+    /// as already settled for outputs.
     pub fn transcript_evidence(&self, run: &Run, mark: &Mark, artifacts_settled: bool) -> Result<Evidence> {
         let rows = self.db.spoke_custody_for_execution(&run.execution_id)?;
         let mine: Vec<&SpokeCustody> = rows
             .iter()
             .filter(|row| row.assignment_generation == run.assignment_generation)
             .collect();
-        if artifacts_settled && let Some(pending) = self.capture_pending(&mine, mark.capture_epoch) {
+        let transcript = self.transcript_mark(&mine, mark)?;
+        if artifacts_settled
+            && !matches!(transcript, Evidence::Pending { .. })
+            && let Some(pending) = self.capture_pending(&mine, mark.capture_epoch)
+        {
             return Ok(pending);
         }
-        self.transcript_mark(&mine, mark)
+        Ok(transcript)
     }
 
     /// Capture has not finished, or a named artifact is still arriving.
     fn capture_pending(&self, rows: &[&SpokeCustody], epoch: u64) -> Option<Evidence> {
-        let capture_fail = epoch == 0 && rows.iter().any(|row| row.resource == OUTPUT_CAPTURE);
-        let resource = if epoch == 0 {
-            OUTPUT_CONCLUDED.to_owned()
-        } else {
-            format!("{OUTPUT_CONCLUDED}:{epoch}")
-        };
+        if epoch == 0 {
+            return None;
+        }
+        let resource = format!("{OUTPUT_CONCLUDED}:{epoch}");
         let concluded = rows
             .iter()
             .filter(|row| {
                 row.resource == resource
-                    || (epoch > 0
-                        && row
-                            .resource
-                            .strip_prefix("output:concluded:")
-                            .and_then(|n| n.parse::<u64>().ok())
-                            .is_some_and(|n| n >= epoch))
+                    || row
+                        .resource
+                        .strip_prefix("output:concluded:")
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .is_some_and(|n| n >= epoch)
             })
             .min_by_key(|row| row.source_sequence);
-        if concluded.is_none() && !capture_fail {
+        if concluded.is_none() {
             return Some(Evidence::Pending {
                 have: 0,
                 want: 1,
@@ -897,12 +910,18 @@ impl Custody {
         Ok(Some(row.materialized))
     }
 
-    /// The last `max_bytes` of the execution's worker-log artifact, if the spoke
-    /// sent one.
-    pub fn worker_log_tail(&self, execution_id: &str, max_bytes: u64) -> Result<Option<String>> {
+    /// The last `max_bytes` of this assignment's worker-log artifact, if the
+    /// spoke sent one. Rows from another assignment generation are ignored.
+    pub fn worker_log_tail(
+        &self,
+        execution_id: &str,
+        assignment_generation: u64,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
         let rows = self.db.spoke_custody_for_execution(execution_id)?;
         let Some(row) = rows.iter().find(|row| {
-            row.kind == "artifact"
+            row.assignment_generation == assignment_generation
+                && row.kind == "artifact"
                 && row.artifact_kind == Some(ArtifactKind::WorkerLog as i32)
                 && row.materialized > 0
                 && !matches!(row.state, CustodyState::Halted | CustodyState::Invalid)
@@ -917,13 +936,24 @@ impl Custody {
 
     // ── Reading structured output ───────────────────────────────────────────
 
-    /// What the hub holds of the execution's structured output of `kind`.
-    pub fn output_evidence(&self, execution_id: &str, kind: StructuredOutputKind) -> Result<OutputEvidence> {
+    /// What the hub holds of this assignment's structured output of `kind`.
+    /// Rows from another assignment generation are ignored: a newer attempt
+    /// with no rows yet is [`OutputEvidence::Absent`], not the previous
+    /// attempt's file.
+    pub fn output_evidence(
+        &self,
+        execution_id: &str,
+        assignment_generation: u64,
+        kind: StructuredOutputKind,
+    ) -> Result<OutputEvidence> {
         let rows = self.db.spoke_custody_for_execution(execution_id)?;
-        let Some(latest) = rows.first().map(|row| row.assignment_generation) else {
+        let rows: Vec<&SpokeCustody> = rows
+            .iter()
+            .filter(|row| row.assignment_generation == assignment_generation)
+            .collect();
+        if rows.is_empty() {
             return Ok(OutputEvidence::Absent);
-        };
-        let rows: Vec<&SpokeCustody> = rows.iter().filter(|row| row.assignment_generation == latest).collect();
+        }
         let pr_url = kind == StructuredOutputKind::PrUrl;
         let artifact = rows
             .iter()
@@ -980,16 +1010,17 @@ impl Custody {
         }
     }
 
-    /// Install the execution's verified output of `kind` at `destination`, the
+    /// Install this assignment's verified output of `kind` at `destination`, the
     /// place the engine's structured-output readers look. Atomic: a reader sees
     /// the whole file or none.
     pub fn collect_output(
         &self,
         execution_id: &str,
+        assignment_generation: u64,
         kind: StructuredOutputKind,
         destination: &Path,
     ) -> Result<Collected> {
-        let path = match self.output_evidence(execution_id, kind)? {
+        let path = match self.output_evidence(execution_id, assignment_generation, kind)? {
             OutputEvidence::Ready { path, .. } => path,
             OutputEvidence::Incomplete { have, total } => {
                 return Ok(Collected::NotAvailable(format!(
@@ -1459,18 +1490,18 @@ mod tests {
         assert_eq!(f.row(&format!("artifact:{id}")).state, CustodyState::Open);
         assert_eq!(
             f.custody
-                .output_evidence("exec_1", StructuredOutputKind::PrUrl)
+                .output_evidence("exec_1", 1, StructuredOutputKind::PrUrl)
                 .unwrap(),
             OutputEvidence::Incomplete {
                 have: 10,
                 total: whole.len() as u64
             }
         );
-        f.gap(2, OUTPUT_CONCLUDED, 0, &format!(r#"["{id}"]"#));
+        f.gap(2, "output:concluded:1", 0, &format!(r#"["{id}"]"#));
         // A settled boundary does not read it half-written.
         assert!(matches!(
             f.custody
-                .transcript_evidence(&f.run, &Mark::new("0-1", 0), true)
+                .transcript_evidence(&f.run, &Mark::new("0-1", 0).with_epoch(1), true)
                 .unwrap(),
             Evidence::Pending { have: 10, .. }
         ));
@@ -1480,7 +1511,7 @@ mod tests {
         let destination = path_for(&f.dir.path().join("out"), "exec_1", StructuredOutputKind::PrUrl);
         assert_eq!(
             f.custody
-                .collect_output("exec_1", StructuredOutputKind::PrUrl, &destination)
+                .collect_output("exec_1", 1, StructuredOutputKind::PrUrl, &destination)
                 .unwrap(),
             Collected::Installed
         );
@@ -1491,7 +1522,7 @@ mod tests {
     fn structured_output_that_is_unusable_is_distinct_from_output_that_is_missing() {
         let kind = StructuredOutputKind::ReviewResult;
         let out = |f: &Fixture| f.dir.path().join("out").join("review.json");
-        let collect = |f: &Fixture| f.custody.collect_output("exec_1", kind, &out(f)).unwrap();
+        let collect = |f: &Fixture| f.custody.collect_output("exec_1", 1, kind, &out(f)).unwrap();
 
         // Nothing registered: not available, not failed.
         let f = fixture();
@@ -1531,7 +1562,7 @@ mod tests {
         f.artifact(1, chunk(&id, ArtifactKind::PrUrl, empty, 0, empty.len(), ""));
         let pr = f
             .custody
-            .output_evidence("exec_1", StructuredOutputKind::PrUrl)
+            .output_evidence("exec_1", 1, StructuredOutputKind::PrUrl)
             .unwrap();
         assert!(matches!(pr, OutputEvidence::Invalid(reason) if reason.contains("no URL")));
 
@@ -1690,33 +1721,90 @@ mod tests {
         f.transcript(1, "0-1", 0, b"hello");
         assert!(matches!(
             f.custody
-                .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
+                .transcript_evidence(&f.run, &Mark::new("0-1", 5).with_epoch(1), true)
                 .unwrap(),
             Evidence::Pending { .. }
         ));
         let whole = br#"{"pr_url":"https://github.com/o/r/pull/1"}"#;
         let id = identity(ArtifactKind::PrUrl, whole);
-        f.gap(2, OUTPUT_CONCLUDED, 0, &format!(r#"["{id}"]"#));
+        f.gap(2, "output:concluded:1", 0, &format!(r#"["{id}"]"#));
         assert!(matches!(
             f.custody
-                .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
+                .transcript_evidence(&f.run, &Mark::new("0-1", 5).with_epoch(1), true)
                 .unwrap(),
             Evidence::Pending { have: 0, want: 1, .. }
         ));
         assert_eq!(
             f.custody
-                .output_evidence("exec_1", StructuredOutputKind::PrUrl)
+                .output_evidence("exec_1", 1, StructuredOutputKind::PrUrl)
                 .unwrap(),
             OutputEvidence::Incomplete { have: 0, total: 0 }
         );
         f.artifact(3, chunk(&id, ArtifactKind::PrUrl, whole, 0, whole.len(), ""));
         let Evidence::Ready(_) = f
             .custody
-            .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
+            .transcript_evidence(&f.run, &Mark::new("0-1", 5).with_epoch(1), true)
             .unwrap()
         else {
             panic!("named output is collectable once complete");
         };
+    }
+
+    #[test]
+    fn epoch_zero_treats_outputs_as_settled_without_a_concluded_marker() {
+        let f = fixture();
+        f.transcript(1, "0-1", 0, b"hello");
+        let Evidence::Ready(_) = f
+            .custody
+            .transcript_evidence(&f.run, &Mark::new("0-1", 5), true)
+            .unwrap()
+        else {
+            panic!("epoch zero does not wait for a marker no spoke emitted");
+        };
+    }
+
+    #[test]
+    fn structured_output_and_the_worker_log_are_read_from_the_named_assignment() {
+        let f = fixture();
+        let whole = br#"{"pr_url":"https://github.com/o/r/pull/1"}"#;
+        let id = identity(ArtifactKind::PrUrl, whole);
+        f.artifact(1, chunk(&id, ArtifactKind::PrUrl, whole, 0, whole.len(), ""));
+        f.artifact(
+            2,
+            chunk(
+                &identity(ArtifactKind::WorkerLog, b"boot"),
+                ArtifactKind::WorkerLog,
+                b"boot",
+                0,
+                4,
+                "",
+            ),
+        );
+        assert!(matches!(
+            f.custody
+                .output_evidence("exec_1", 1, StructuredOutputKind::PrUrl)
+                .unwrap(),
+            OutputEvidence::Ready { .. }
+        ));
+        assert_eq!(
+            f.custody
+                .output_evidence("exec_1", 2, StructuredOutputKind::PrUrl)
+                .unwrap(),
+            OutputEvidence::Absent
+        );
+        let destination = path_for(&f.dir.path().join("out"), "exec_1", StructuredOutputKind::PrUrl);
+        assert!(matches!(
+            f.custody
+                .collect_output("exec_1", 2, StructuredOutputKind::PrUrl, &destination)
+                .unwrap(),
+            Collected::NotAvailable(_)
+        ));
+        assert!(!destination.exists());
+        assert_eq!(
+            f.custody.worker_log_tail("exec_1", 1, 4).unwrap().as_deref(),
+            Some("boot")
+        );
+        assert!(f.custody.worker_log_tail("exec_1", 2, 4).unwrap().is_none());
     }
 
     #[test]
