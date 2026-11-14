@@ -2,11 +2,11 @@
 //!
 //! The invariant this module enforces is not "each run has a directory":
 //! no two concurrent `agy` runs share a mutable `agy` state artifact, and
-//! the operator's `~/.gemini` is never one of those artifacts. The login
+//! the host login home's `~/.gemini` is never one of those artifacts. The login
 //! keychain file is the deliberate credential exception, bridged through
 //! [`crate::scoped_home`].
 
-use std::collections::BTreeSet;
+use crate::scoped_home::trust_path_variants;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,7 +14,7 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use super::environment::{AgyProcessEnvironment, resolve_agy_binary, skip_binary_assert, verify_agy_binary};
+use super::environment::{AgyProcessEnvironment, resolve_agy_binary, skip_binary_assert};
 #[cfg(test)]
 use crate::scoped_home::LOGIN_KEYCHAIN_LEAF;
 
@@ -47,6 +47,78 @@ const PRIVATE_STATE_LEAVES: &[&str] = &[
     ".gemini/antigravity-cli/cache",
     ".gemini/config",
 ];
+
+/// Check existing paths before creating or overwriting any run state.
+fn validate_private_layout(process_home: &Path) -> anyhow::Result<()> {
+    let root = agy_homes_root();
+    let relative = process_home
+        .strip_prefix(&root)
+        .context("agy HOME outside homes root")?;
+    if relative.components().count() != 2
+        || relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        bail!("invalid agy process HOME {}", process_home.display());
+    }
+    refuse_host_gemini_as_home(process_home)?;
+    if let Some(home) = std::env::var_os("HOME") {
+        let host_gemini = PathBuf::from(home).join(".gemini");
+        match fs::canonicalize(&host_gemini) {
+            Ok(host) => {
+                for ancestor in process_home.ancestors().filter(|p| p.exists()) {
+                    if fs::canonicalize(ancestor)?.starts_with(&host) {
+                        bail!("agy private HOME reaches host ~/.gemini");
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("resolving host ~/.gemini"),
+        }
+    }
+    let mut path = root.clone();
+    for ancestor in root.ancestors() {
+        // macOS exposes these system aliases; run-specific aliases are refused.
+        if ancestor != Path::new("/tmp") && ancestor != Path::new("/var") {
+            check_private_entry(ancestor)?;
+        }
+    }
+    check_private_entry(&path)?;
+    for component in relative.components() {
+        path.push(component);
+        check_private_entry(&path)?;
+    }
+    // Check the entire mutable subtree, including intermediate directories
+    // and previously created token files, rather than a fixed leaf list.
+    check_private_tree(&process_home.join(".gemini"))?;
+    check_private_tree(&process_home.parent().context("run container")?.join(CONTROL_LEAF))?;
+    for leaf in PRIVATE_STATE_LEAVES {
+        check_private_entry(&process_home.join(leaf))?;
+    }
+    Ok(())
+}
+
+fn check_private_entry(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || (meta.is_file() && meta.nlink() != 1) => {
+            bail!("agy private path {} is a symlink or shared hard link", path.display());
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("stat private path {}", path.display())),
+    }
+}
+
+fn check_private_tree(path: &Path) -> anyhow::Result<()> {
+    check_private_entry(path)?;
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            check_private_tree(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Path resolution
@@ -110,7 +182,7 @@ pub fn log_file_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
 }
 
 pub fn agent_rules_path_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
-    Ok(process_home_for_run(run_id)?.join(".gemini").join("AGENTS.md"))
+    Ok(control_dir_for_run(run_id)?.join(".agents/rules/boss.md"))
 }
 
 pub fn workspace_path_stamp(control_dir: &Path) -> PathBuf {
@@ -140,7 +212,6 @@ pub struct AgyRuntimeState {
     pub log_file: PathBuf,
     pub workspace_path: PathBuf,
     pub agy_binary: PathBuf,
-    pub agy_version: Option<String>,
 }
 
 impl AgyRuntimeState {
@@ -169,9 +240,9 @@ pub fn render_trusted_workspaces_json(workspace: &Path) -> String {
 }
 
 pub fn render_session_settings_json(workspace: &Path) -> String {
-    // Trust only. Permission posture (agentMode, toolPermission, allow/deny)
-    // is the later per-kind settings renderer; skipping onboarding is not a
-    // data-collection consent answer, so enableTelemetry is omitted.
+    // Trust only. Permission settings are supplied by the permission renderer.
+    // Skipping onboarding does not answer data-collection consent;
+    // enableTelemetry is omitted.
     render_trusted_workspaces_json(workspace)
 }
 
@@ -190,35 +261,6 @@ fn render_provision_hooks_json() -> String {
     .to_owned()
 }
 
-pub fn trust_path_variants(workspace: &Path) -> Vec<String> {
-    let mut paths = BTreeSet::new();
-    push_path_and_symlink_forms(&mut paths, workspace);
-    if let Ok(canon) = fs::canonicalize(workspace) {
-        push_path_and_symlink_forms(&mut paths, &canon);
-    }
-    paths.into_iter().collect()
-}
-
-fn push_path_and_symlink_forms(paths: &mut BTreeSet<String>, path: &Path) {
-    let s = path.display().to_string();
-    if s.is_empty() {
-        return;
-    }
-    paths.insert(s.clone());
-    if let Some(rest) = s.strip_prefix("/tmp") {
-        paths.insert(format!("/private/tmp{rest}"));
-    }
-    if let Some(rest) = s.strip_prefix("/private/tmp") {
-        paths.insert(format!("/tmp{rest}"));
-    }
-    if let Some(rest) = s.strip_prefix("/var/") {
-        paths.insert(format!("/private/var/{rest}"));
-    }
-    if let Some(rest) = s.strip_prefix("/private/var/") {
-        paths.insert(format!("/var/{rest}"));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Provision
 // ---------------------------------------------------------------------------
@@ -230,11 +272,13 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     let session_settings_path = control_dir.join("session-settings.json");
     let log_file = control_dir.join("agy.log");
 
+    validate_private_layout(&process_home)?;
     fs::create_dir_all(&process_home)
         .with_context(|| format!("creating agy process HOME {}", process_home.display()))?;
     fs::create_dir_all(&control_dir).with_context(|| format!("creating agy control dir {}", control_dir.display()))?;
+    fs::create_dir_all(control_dir.join(".agents/rules"))?;
 
-    refuse_operator_gemini_as_home(&process_home)?;
+    refuse_host_gemini_as_home(&process_home)?;
 
     let gemini = process_home.join(".gemini");
     let antigravity = gemini.join("antigravity-cli");
@@ -276,9 +320,6 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
         .context("delegating host tool state into scoped agy HOME")?;
 
     assert_agy_posture(&process_home, workspace)?;
-    if !skip_binary_assert() {
-        verify_agy_binary(&agy_binary).context("verifying Boss-owned agy binary identity at provision")?;
-    }
 
     if !skip_posture_assert() && !skip_binary_assert() {
         probe_agy_models(&environment).context("live agy models posture probe")?;
@@ -294,87 +335,28 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
         .build())
 }
 
-fn refuse_operator_gemini_as_home(process_home: &Path) -> anyhow::Result<()> {
+fn refuse_host_gemini_as_home(process_home: &Path) -> anyhow::Result<()> {
     if let Some(home) = std::env::var_os("HOME") {
         let interactive = PathBuf::from(&home);
         if process_home == interactive {
-            bail!("refusing to use the operator HOME as the Boss-owned agy process HOME");
+            bail!("refusing to use the host HOME as the Boss-owned agy process HOME");
         }
         let interactive_gemini = PathBuf::from(home).join(".gemini");
         if process_home.join(".gemini") == interactive_gemini {
-            bail!("refusing to use operator ~/.gemini as the Boss-owned agy state tree");
+            bail!("refusing to use host ~/.gemini as the Boss-owned agy state tree");
         }
     }
     Ok(())
 }
 
 pub(super) fn skip_posture_assert() -> bool {
-    match std::env::var(AGY_SKIP_POSTURE_ASSERT_ENV) {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
-    }
+    crate::scoped_home::env_flag(AGY_SKIP_POSTURE_ASSERT_ENV)
 }
 
 /// Filesystem invariant: private `agy` state is not shared, and the
-/// operator's `~/.gemini` is not the run's `.gemini`.
+/// host login home's `~/.gemini` is not the run's `.gemini`.
 pub fn assert_agy_posture(process_home: &Path, workspace: &Path) -> anyhow::Result<()> {
-    let root = agy_homes_root();
-    if !process_home.starts_with(&root) {
-        bail!(
-            "agy process HOME {} is outside Boss homes root {}",
-            process_home.display(),
-            root.display()
-        );
-    }
-    refuse_operator_gemini_as_home(process_home)?;
-
-    let gemini = process_home.join(".gemini");
-    if gemini.is_symlink() {
-        bail!(
-            "agy .gemini at {} is a symlink; private state must not be shared",
-            gemini.display()
-        );
-    }
-    if !gemini.is_dir() {
-        bail!("agy .gemini {} is missing after provision", gemini.display());
-    }
-    if let Some(operator_home) = std::env::var_os("HOME") {
-        let operator_gemini = PathBuf::from(&operator_home).join(".gemini");
-        if let (Ok(run), Ok(operator)) = (fs::canonicalize(&gemini), fs::canonicalize(&operator_gemini))
-            && run == operator
-        {
-            bail!(
-                "agy process HOME .gemini canonicalizes to the operator ~/.gemini ({})",
-                operator.display()
-            );
-        }
-        // HOME itself is the operator home at provision time; the worker's
-        // HOME will be process_home. Confirm they differ.
-        if process_home == Path::new(&operator_home) {
-            bail!("scoped agy HOME equals the operator HOME");
-        }
-    }
-
-    for leaf in PRIVATE_STATE_LEAVES {
-        let path = process_home.join(leaf);
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                let target = fs::read_link(&path).with_context(|| format!("read_link {}", path.display()))?;
-                if !target.starts_with(process_home) {
-                    bail!(
-                        "agy private state {} is a symlink to {} outside this run; \
-                         concurrent runs must not share mutable agy artifacts",
-                        path.display(),
-                        target.display()
-                    );
-                }
-            }
-            Ok(_) | Err(_) => {}
-        }
-    }
+    validate_private_layout(process_home)?;
 
     let onboarding = process_home.join(".gemini/antigravity-cli/cache/onboarding.json");
     let body = fs::read_to_string(&onboarding)
@@ -417,7 +399,7 @@ pub fn assert_agy_posture(process_home: &Path, workspace: &Path) -> anyhow::Resu
 
 fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
     let mut command = Command::new(environment.agy_binary());
-    command.arg("models");
+    command.args(environment.launch_args()).arg("models");
     environment.apply_to_command(&mut command);
     let output = command
         .output()
@@ -487,191 +469,5 @@ pub fn assert_agy_home_safe_to_delete(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK;
-    use crate::test_support::home_override;
-    use std::ffi::OsString;
-    use tempfile::TempDir;
-
-    struct EnvGuard {
-        _lock: Option<std::sync::MutexGuard<'static, ()>>,
-        prior_homes: Option<OsString>,
-        prior_skip: Option<OsString>,
-        prior_bin_skip: Option<OsString>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            restore(AGY_HOMES_ROOT_ENV, self.prior_homes.as_ref());
-            restore(AGY_SKIP_POSTURE_ASSERT_ENV, self.prior_skip.as_ref());
-            restore(
-                super::super::environment::AGY_SKIP_BINARY_ASSERT_ENV,
-                self.prior_bin_skip.as_ref(),
-            );
-        }
-    }
-
-    fn restore(key: &str, prior: Option<&OsString>) {
-        match prior {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
-    fn env_for_provision(homes: &Path) -> EnvGuard {
-        let lock = SCOPED_HOME_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        env_for_provision_with_lock(homes, Some(lock))
-    }
-
-    fn env_for_provision_with_home_override(homes: &Path) -> EnvGuard {
-        env_for_provision_with_lock(homes, None)
-    }
-
-    fn env_for_provision_with_lock(homes: &Path, lock: Option<std::sync::MutexGuard<'static, ()>>) -> EnvGuard {
-        let prior_homes = std::env::var_os(AGY_HOMES_ROOT_ENV);
-        let prior_skip = std::env::var_os(AGY_SKIP_POSTURE_ASSERT_ENV);
-        let prior_bin_skip = std::env::var_os(super::super::environment::AGY_SKIP_BINARY_ASSERT_ENV);
-        unsafe {
-            std::env::set_var(AGY_HOMES_ROOT_ENV, homes);
-            std::env::set_var(AGY_SKIP_POSTURE_ASSERT_ENV, "1");
-            std::env::set_var(super::super::environment::AGY_SKIP_BINARY_ASSERT_ENV, "1");
-        }
-        EnvGuard {
-            _lock: lock,
-            prior_homes,
-            prior_skip,
-            prior_bin_skip,
-        }
-    }
-
-    #[test]
-    fn process_home_for_run_is_under_homes_root() {
-        let tmp = TempDir::new().unwrap();
-        let _guard = env_for_provision(tmp.path());
-        let home = process_home_for_run("run-abc").unwrap();
-        assert!(home.starts_with(tmp.path()));
-        assert!(home.ends_with("process-home"));
-    }
-
-    #[test]
-    fn onboarding_json_skips_the_screen_without_answering_consent() {
-        let parsed: serde_json::Value = serde_json::from_str(render_onboarding_json()).unwrap();
-        assert_eq!(parsed["onboardingComplete"], true);
-        assert_eq!(parsed["consumerOnboardingComplete"], true);
-        assert!(parsed.get("enableTelemetry").is_none());
-    }
-
-    #[test]
-    fn provision_creates_private_tree_and_keychain_bridge() {
-        let tmp = TempDir::new().unwrap();
-        let homes = tmp.path().join("homes");
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        let real_home = tmp.path().join("real-home");
-        let keychain_dir = real_home.join("Library/Keychains");
-        fs::create_dir_all(&keychain_dir).unwrap();
-        let keychain_file = keychain_dir.join("login.keychain-db");
-        fs::write(&keychain_file, b"dummy-keychain").unwrap();
-        fs::create_dir_all(real_home.join(".gemini/antigravity-cli")).unwrap();
-        fs::write(
-            real_home.join(".gemini/antigravity-cli/settings.json"),
-            "{\"enableTelemetry\": true}\n",
-        )
-        .unwrap();
-        let _home = home_override(&real_home);
-        let _guard = env_for_provision_with_home_override(&homes);
-
-        let runtime = provision_agy_home(&workspace, "hello prompt", "run-prov-1").unwrap();
-        assert!(runtime.process_home.starts_with(&homes));
-        assert_ne!(runtime.process_home, real_home);
-
-        let gemini = runtime.process_home.join(".gemini");
-        assert!(gemini.join("antigravity-cli/cache/onboarding.json").is_file());
-        assert!(gemini.join("antigravity-cli/settings.json").is_file());
-        assert!(gemini.join("config/hooks.json").is_file());
-        assert!(gemini.join("AGENTS.md").parent().unwrap().is_dir());
-        assert!(!gemini.join("settings.json").exists());
-        assert!(!gemini.join("trustedFolders.json").exists());
-        assert!(runtime.control_dir.join("initial-prompt.txt").is_file());
-        assert_eq!(
-            fs::read_to_string(runtime.control_dir.join("initial-prompt.txt")).unwrap(),
-            "hello prompt"
-        );
-        assert_eq!(
-            read_workspace_path_stamp(&runtime.control_dir).unwrap(),
-            fs::canonicalize(&workspace).unwrap()
-        );
-
-        let bridged = runtime.process_home.join(LOGIN_KEYCHAIN_LEAF);
-        let meta = fs::symlink_metadata(&bridged).expect("login keychain bridge");
-        assert!(meta.file_type().is_symlink());
-        assert_eq!(fs::read_link(&bridged).unwrap(), keychain_file);
-
-        // Operator ~/.gemini must not be the run's .gemini.
-        let operator_gemini = fs::canonicalize(real_home.join(".gemini")).unwrap();
-        let run_gemini = fs::canonicalize(&gemini).unwrap();
-        assert_ne!(operator_gemini, run_gemini);
-
-        let settings = fs::read_to_string(gemini.join("antigravity-cli/settings.json")).unwrap();
-        assert!(!settings.contains("enableTelemetry"));
-        assert!(settings.contains("trustedWorkspaces"));
-
-        assert_agy_posture(&runtime.process_home, &workspace).unwrap();
-    }
-
-    #[test]
-    fn posture_fails_when_private_state_is_symlinked_out() {
-        let tmp = TempDir::new().unwrap();
-        let homes = tmp.path().join("homes");
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        let real_home = tmp.path().join("real-home");
-        fs::create_dir_all(&real_home).unwrap();
-        let _home = home_override(&real_home);
-        let _guard = env_for_provision_with_home_override(&homes);
-
-        let runtime = provision_agy_home(&workspace, "p", "run-leak-1").unwrap();
-        let dest = runtime
-            .process_home
-            .join(".gemini/antigravity-cli/conversation_summaries.db");
-        let outside = tmp.path().join("shared-db");
-        fs::write(&outside, b"shared").unwrap();
-        let _ = fs::remove_file(&dest);
-        std::os::unix::fs::symlink(&outside, &dest).unwrap();
-
-        let err = assert_agy_posture(&runtime.process_home, &workspace)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlink"), "{err}");
-        assert!(err.contains("conversation_summaries.db"), "{err}");
-    }
-
-    #[test]
-    fn two_runs_do_not_share_private_state_paths() {
-        let tmp = TempDir::new().unwrap();
-        let homes = tmp.path().join("homes");
-        let a = process_home_for_run_with(&homes, "run-a");
-        let b = process_home_for_run_with(&homes, "run-b");
-        assert_ne!(a, b);
-        assert_ne!(
-            a.join(".gemini/antigravity-cli/settings.json"),
-            b.join(".gemini/antigravity-cli/settings.json")
-        );
-    }
-
-    fn process_home_for_run_with(homes: &Path, run_id: &str) -> PathBuf {
-        let _guard = env_for_provision(homes);
-        process_home_for_run(run_id).unwrap()
-    }
-
-    #[test]
-    fn safe_to_delete_refuses_operator_home() {
-        let tmp = TempDir::new().unwrap();
-        let _guard = env_for_provision(&tmp.path().join("homes"));
-        let err = assert_agy_home_safe_to_delete(Path::new("/Users/someone/.gemini"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("outside"), "{err}");
-    }
-}
+#[path = "home_tests.rs"]
+mod tests;

@@ -26,9 +26,11 @@ use super::{
 mod environment;
 mod home;
 mod model_menu;
+#[cfg(test)]
+mod test_environment;
 mod transcript;
 
-use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_agy_binary};
+use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
 use home::{
     AgyRuntimeState, agent_rules_path_for_run, agy_homes_root, assert_agy_home_safe_to_delete, control_dir_for_run,
     log_file_for_run, process_home_for_run, provision_agy_home, read_workspace_path_stamp,
@@ -50,7 +52,7 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     // Workspace-local leaf used only as the descriptor's config-dir name.
     // Per-run `agy` state lives under the Boss-owned process HOME; the
     // initial-prompt launcher lives in that run's `control/` directory.
-    // Agent rules go to `$process_home/.gemini/AGENTS.md`.
+    // Agent rules go to `<control>/.agents/rules/boss.md`.
     config_dir: ".agy",
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
@@ -81,8 +83,7 @@ pub struct AgyDriver {
     _private: (),
 }
 
-/// Refuse launch. Guard-hook wiring is a later task; a provisioned HOME is
-/// not enough to start the TUI.
+/// Refuse launch. Refuse launch while guard hooks are unavailable.
 pub fn refuse_agy_spawn(reason: &str) -> String {
     format!("printf '%s\\n' {} >&2; exit 1\n", shell_quote(reason))
 }
@@ -232,8 +233,13 @@ impl AgentDriver for AgyDriver {
         if !process_home.exists() {
             return refuse_agy_plan(env, "agy spawn refused: per-run HOME is not provisioned");
         }
+        if let Err(error) =
+            home::assert_agy_posture(&process_home, workspace_stamp.as_deref().unwrap_or(Path::new(".")))
+        {
+            return refuse_agy_plan(env, &format!("agy spawn refused: private HOME posture: {error:#}"));
+        }
         if !skip_binary_assert()
-            && let Err(error) = verify_agy_binary(environment.agy_binary())
+            && let Err(error) = verify_cached_agy_binary(environment.agy_binary())
         {
             return refuse_agy_plan(
                 env,
@@ -271,7 +277,11 @@ impl AgentDriver for AgyDriver {
             return Ok(());
         };
         let runtime = AgyRuntimeState::from_driver_runtime_state(state)?;
-        assert_agy_home_safe_to_delete(&runtime.process_home)?;
+        let container = runtime.process_home.parent().context("agy run container")?;
+        assert_agy_home_safe_to_delete(container)?;
+        if container.exists() {
+            std::fs::remove_dir_all(container).context("reclaiming private agy run state")?;
+        }
         Ok(())
     }
 
@@ -322,13 +332,13 @@ impl AgentDriver for AgyDriver {
         AGY_AGENT_RULES_PREAMBLE
     }
 
-    /// Route Boss worker rules to `$HOME/.gemini/AGENTS.md` under the
-    /// per-run process HOME. `agy` does not read workspace `.agy/AGENTS.md`.
+    /// Route Boss worker rules to `<control>/.agents/rules/boss.md` under the
+    /// per-run container, added to the CLI workspace with `--add-dir`.
     fn agent_rules_destination(&self, _workspace: &Path, run_id: &str) -> PathBuf {
         agent_rules_path_for_run(run_id).unwrap_or_else(|_| {
             agy_homes_root()
                 .join("unknown-run")
-                .join("process-home/.gemini/AGENTS.md")
+                .join("control/.agents/rules/boss.md")
         })
     }
 
@@ -385,10 +395,8 @@ mod tests {
     use super::*;
     use crate::AbsenceDisposition;
     use crate::EnvDirective;
-    use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK;
     use crate::test_support::home_override;
     use boss_protocol::{EffortLevel, ReasoningMode, ReviewModelTier};
-    use std::ffi::OsString;
     use std::fs;
     use tempfile::TempDir;
 
@@ -403,53 +411,7 @@ mod tests {
         }
     }
 
-    struct EnvGuard {
-        _lock: Option<std::sync::MutexGuard<'static, ()>>,
-        prior_homes: Option<OsString>,
-        prior_skip: Option<OsString>,
-        prior_bin_skip: Option<OsString>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            restore(home::AGY_HOMES_ROOT_ENV, self.prior_homes.as_ref());
-            restore(home::AGY_SKIP_POSTURE_ASSERT_ENV, self.prior_skip.as_ref());
-            restore(environment::AGY_SKIP_BINARY_ASSERT_ENV, self.prior_bin_skip.as_ref());
-        }
-    }
-
-    fn restore(key: &str, prior: Option<&OsString>) {
-        match prior {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
-    fn env_for_provision(homes: &Path) -> EnvGuard {
-        let lock = SCOPED_HOME_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        env_for_provision_with_lock(homes, Some(lock))
-    }
-
-    fn env_for_provision_with_home_override(homes: &Path) -> EnvGuard {
-        env_for_provision_with_lock(homes, None)
-    }
-
-    fn env_for_provision_with_lock(homes: &Path, lock: Option<std::sync::MutexGuard<'static, ()>>) -> EnvGuard {
-        let prior_homes = std::env::var_os(home::AGY_HOMES_ROOT_ENV);
-        let prior_skip = std::env::var_os(home::AGY_SKIP_POSTURE_ASSERT_ENV);
-        let prior_bin_skip = std::env::var_os(environment::AGY_SKIP_BINARY_ASSERT_ENV);
-        unsafe {
-            std::env::set_var(home::AGY_HOMES_ROOT_ENV, homes);
-            std::env::set_var(home::AGY_SKIP_POSTURE_ASSERT_ENV, "1");
-            std::env::set_var(environment::AGY_SKIP_BINARY_ASSERT_ENV, "1");
-        }
-        EnvGuard {
-            _lock: lock,
-            prior_homes,
-            prior_skip,
-            prior_bin_skip,
-        }
-    }
+    use super::test_environment::{env_for_provision, env_for_provision_with_home_override};
 
     #[test]
     fn descriptor_matches_the_seed_contract() {
@@ -552,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_without_run_id_refuses_without_operator_home() {
+    fn spawn_without_run_id_refuses_without_host_home() {
         let plan = AgyDriver::default().spawn_invocation(spawn_request(model_menu::STRONG_FAMILY, Some("xhigh"), None));
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -659,15 +621,69 @@ mod tests {
         )
         .unwrap();
         assert!(stderr.contains("guard hooks are not wired"), "{stderr}");
+        let fallback = runtime.process_home.join(".gemini/antigravity-cli/fallback-token.json");
+        fs::write(&fallback, "private token").unwrap();
+        driver
+            .teardown_workspace(Some(&workspace), "run-prov-agy", Some(&state))
+            .await
+            .unwrap();
+        assert!(!runtime.process_home.parent().unwrap().exists());
+        assert_eq!(
+            fs::read(keychain_dir.join("login.keychain-db")).unwrap(),
+            b"dummy-keychain"
+        );
     }
 
     #[test]
-    fn agent_rules_destination_is_process_home_gemini() {
+    fn spawn_refuses_unqualified_override_and_changed_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = env_for_provision(&homes);
+        provision_agy_home(tmp.path(), "prompt", "run-old").unwrap();
+        let script = tmp.path().join("old-agy");
+        fs::write(&script, "#!/bin/sh\necho 1.5.5\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _binary_env = test_environment::EnvGuard::set_with_lock(
+            &[
+                (environment::AGY_SKIP_BINARY_ASSERT_ENV, "0"),
+                (environment::AGY_BIN_ENV, script.to_str().unwrap()),
+            ],
+            None,
+        );
+        let plan = AgyDriver::default().spawn_invocation(spawn_request("model", None, Some("run-old")));
+        assert!(
+            plan.command.contains("binary identity check failed"),
+            "{}",
+            plan.command
+        );
+        let owned = homes.join("bin/agy");
+        fs::create_dir_all(owned.parent().unwrap()).unwrap();
+        fs::write(&owned, "#!/bin/sh\necho 1.5.7\n").unwrap();
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o555)).unwrap();
+        environment::verify_agy_binary_with(&owned, |_| Ok(())).unwrap();
+        fs::set_permissions(owned.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
+        let qualified = AgyDriver::default().spawn_invocation(spawn_request("model", None, Some("run-old")));
+        assert!(
+            qualified.command.contains("guard hooks are not wired"),
+            "{}",
+            qualified.command
+        );
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&owned, "#!/bin/sh\necho 1.5.5\n").unwrap();
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o555)).unwrap();
+        let changed = AgyDriver::default().spawn_invocation(spawn_request("model", None, Some("run-old")));
+        assert!(changed.command.contains("identity changed"), "{}", changed.command);
+        fs::set_permissions(owned.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn agent_rules_destination_is_control_directory_rules() {
         let tmp = TempDir::new().unwrap();
         let _guard = env_for_provision(tmp.path());
         let workspace = tmp.path().join("ws");
         let dest = AgyDriver::default().agent_rules_destination(&workspace, "run-agents-1");
-        assert!(dest.ends_with("process-home/.gemini/AGENTS.md"), "dest={dest:?}");
+        assert!(dest.ends_with("control/.agents/rules/boss.md"), "dest={dest:?}");
         assert!(
             !dest.components().any(|c| c.as_os_str() == ".agy"),
             "must not write under workspace .agy: {dest:?}"

@@ -1,7 +1,7 @@
 //! Shared host-tool and login-keychain delegation for scoped worker `HOME`.
 //!
 //! Grok and Antigravity both isolate CLI state under a Boss-owned per-run
-//! `HOME` while still needing the operator's gh, Cube, jj, git, ssh, and
+//! `HOME` while still needing the host login home's gh, Cube, jj, git, ssh, and
 //! Bazel caches. Credential access for tools that use the macOS login
 //! keychain is a filesystem symlink of that one keychain file — never a
 //! keychain API, never the macOS security CLI, and never a copied token.
@@ -9,6 +9,7 @@
 //! Behaviour of [`HostToolPaths::provision_into`] is the Grok bridge lifted
 //! into this module so both drivers call the same helper.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -348,21 +349,37 @@ pub(crate) fn nonempty_env(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// True when a macOS authorization dialog process is currently running.
-///
-/// Used by soak apparatus. Provisioning never calls this, and it never
-/// invokes the macOS security CLI.
-pub fn authorization_ui_process_running() -> bool {
-    pgrep_exact("SecurityAgent") || pgrep_exact("SecurityUIAgent")
+pub fn trust_path_variants(workspace: &Path) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    push_path_and_symlink_forms(&mut paths, workspace);
+    if let Ok(canon) = fs::canonicalize(workspace) {
+        push_path_and_symlink_forms(&mut paths, &canon);
+    }
+    paths.into_iter().collect()
 }
 
-fn pgrep_exact(name: &str) -> bool {
-    std::process::Command::new("pgrep")
-        .arg("-x")
-        .arg(name)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+fn push_path_and_symlink_forms(paths: &mut BTreeSet<String>, path: &Path) {
+    let s = path.display().to_string();
+    if s.is_empty() {
+        return;
+    }
+    paths.insert(s.clone());
+    if let Some(rest) = s.strip_prefix("/tmp") {
+        paths.insert(format!("/private/tmp{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix("/private/tmp") {
+        paths.insert(format!("/tmp{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix("/var/") {
+        paths.insert(format!("/private/var/{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix("/private/var/") {
+        paths.insert(format!("/var/{rest}"));
+    }
+}
+
+pub(crate) fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 #[cfg(test)]
