@@ -386,6 +386,7 @@ mod tests {
     fn registered_driver_binaries_covers_built_ins_in_sorted_order() {
         let pairs = registered_driver_binaries();
         let slugs: Vec<&str> = pairs.iter().map(|(s, _)| *s).collect();
+        assert!(slugs.contains(&"agy"));
         assert!(slugs.contains(&"claude"));
         assert!(slugs.contains(&"codex"));
         assert!(slugs.contains(&"grok"));

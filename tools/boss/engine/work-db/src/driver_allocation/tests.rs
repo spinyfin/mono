@@ -694,45 +694,39 @@ fn allocation_renormalises_four_shares_and_never_revives_zero_agy() {
     assert!(err.to_string().contains("agy=0"));
 }
 
-/// Settings can persist `agy > 0` before any Antigravity driver is
-/// registered. The real registry drops the unregistered slug, so that share
-/// redistributes among registered drivers: no row is allocated to `agy`,
-/// and every row lands on a registered driver.
+/// Once `agy` is registered, a non-zero share actually lands on it. The
+/// default split still ships `agy = 0`; this covers the Settings path
+/// that raises the share after the driver exists.
 #[test]
-fn unregistered_agy_share_is_redistributed_among_registered_drivers() {
+fn registered_agy_share_is_allocated() {
     let registry = boss_engine_driver::DriverRegistry::default();
     assert!(
-        registry.get(DRIVER_SLUG_AGY).is_none(),
-        "this test pins the Settings-reachable state where agy has a share before any agy driver is registered",
+        registry.get(DRIVER_SLUG_AGY).is_some(),
+        "agy must be a registered driver for a non-zero share to be reachable",
     );
     let registered: Vec<_> = registry.slugs().collect();
-    assert!(!registered.is_empty());
 
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 30, 40))
         .unwrap();
     let product = create_test_product(&db);
+    let mut saw_agy = false;
     for driver in allocated_drivers(&db, &product.id, 200) {
         let slug = driver.expect("an allocated row always names a driver");
-        assert_ne!(slug, DRIVER_SLUG_AGY, "unregistered agy must receive no rows");
+        saw_agy |= slug == DRIVER_SLUG_AGY;
         assert!(registered.contains(&slug.as_str()), "{slug} is not a registered driver",);
     }
+    assert!(saw_agy, "agy's 40% share must receive some eligible chores");
 }
 
-/// The unregistered-share fallback is only for when the *whole* share sits
-/// on unregistered drivers. A leftover `agy` share next to a funded
-/// registered driver must not convert EveryEligibleDriverAtZero (claude = 0
-/// on ConflictResolution / CiRemediation, whose eligible set is `{claude}`)
-/// or NoEligibleDriver into engine-default routing. `0/0/90/10` must fail
-/// the insert the same way `0/0/100/0` already does.
+/// A leftover `agy` share next to a funded registered driver must not
+/// convert EveryEligibleDriverAtZero (claude = 0 on ConflictResolution /
+/// CiRemediation, whose eligible set is `{claude}` because agy does not
+/// declare CommandOutcomeObservation) or NoEligibleDriver into
+/// engine-default routing. `0/0/90/10` must fail the insert the same way
+/// `0/0/100/0` already does.
 #[test]
 fn conflict_resolution_and_ci_remediation_fail_loudly_when_claude_is_at_zero_even_if_agy_holds_a_share() {
-    assert!(
-        boss_engine_driver::DriverRegistry::default()
-            .get(DRIVER_SLUG_AGY)
-            .is_none(),
-        "this test pins the Settings-reachable state where agy holds a share before any agy driver is registered",
-    );
     for split in [
         DriverTrafficSplit::new(0, 0, 90, 10),
         DriverTrafficSplit::new(0, 0, 100, 0),
@@ -766,12 +760,6 @@ fn conflict_resolution_and_ci_remediation_fail_loudly_when_claude_is_at_zero_eve
 
 #[test]
 fn whole_share_sits_on_unregistered_drivers_requires_eligible_set_and_all_registered_at_zero() {
-    assert!(
-        boss_engine_driver::DriverRegistry::default()
-            .get(DRIVER_SLUG_AGY)
-            .is_none(),
-        "this test pins the Settings-reachable state where agy is unregistered",
-    );
     let agy_partial = DriverTrafficSplit::new(0, 0, 90, 10);
     let agy_all = DriverTrafficSplit::new(0, 0, 0, 100);
     let no_agy = DriverTrafficSplit::new(0, 0, 100, 0);
@@ -788,36 +776,35 @@ fn whole_share_sits_on_unregistered_drivers_requires_eligible_set_and_all_regist
         !whole_share_sits_on_unregistered_drivers(&agy_all, &[]),
         "agy = 100 must not convert an empty eligible set into default routing",
     );
-    assert!(whole_share_sits_on_unregistered_drivers(
-        &agy_all,
-        &[DRIVER_SLUG_CLAUDE]
-    ));
+    assert!(
+        !whole_share_sits_on_unregistered_drivers(&agy_all, &[DRIVER_SLUG_CLAUDE]),
+        "agy is registered, so agy = 100 is a real share rather than an unregistered fallback",
+    );
     assert!(!whole_share_sits_on_unregistered_drivers(
         &no_agy,
         &[DRIVER_SLUG_CLAUDE]
     ));
 }
 
-/// `agy = 100` with no registered Antigravity driver leaves every eligible
-/// registered driver at 0. Inserting that unpinned row must fall through to
-/// the engine default rather than failing — Settings can persist this split.
+/// `agy = 100` with the driver registered sends every eligible chore to
+/// agy rather than falling through to the engine default.
 #[test]
-fn unregistered_agy_at_one_hundred_falls_back_instead_of_failing_insert() {
+fn agy_at_one_hundred_allocates_to_agy() {
     assert!(
         boss_engine_driver::DriverRegistry::default()
             .get(DRIVER_SLUG_AGY)
-            .is_none(),
-        "this test pins the Settings-reachable state where agy is 100 before any agy driver is registered",
+            .is_some(),
+        "agy must be registered for a 100% share to be reachable",
     );
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
         .unwrap();
     let product = create_test_product(&db);
-    let chore = create_test_chore(&db, &product.id, "agy 100 unregistered");
+    let chore = create_test_chore(&db, &product.id, "agy 100 registered");
     let execution = create_ready_chore_execution(&db, &chore.id);
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.reason, REASON_DEFAULT);
-    assert_eq!(decision.driver, None);
+    assert_eq!(decision.reason, REASON_ALLOCATION);
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_AGY));
 }
 
 /// Restricting to a subset keeps allocation inside that subset for every
@@ -842,9 +829,7 @@ fn allocation_stays_inside_a_restricted_eligible_set() {
 /// End-to-end: a driver at 0 receives literally zero eligible rows, across a
 /// wide spread of work item ids (not a hand-picked one that happens to hash
 /// into a convenient bucket). Run for each driver in turn, so "zero is zero"
-/// is checked for every driver in the split. (agy is not registered yet, so its
-/// case is vacuous end-to-end; `allocation_renormalises_four_shares_and_never_revives_zero_agy`
-/// covers its zero share at the allocation layer.)
+/// is checked for every driver in the split.
 #[test]
 fn a_driver_at_zero_receives_no_rows_end_to_end() {
     for (split, zeroed) in [
@@ -873,6 +858,7 @@ fn three_drivers_at_zero_send_everything_to_the_funded_registered_driver() {
         (DriverTrafficSplit::new(100, 0, 0, 0), DRIVER_SLUG_GROK),
         (DriverTrafficSplit::new(0, 100, 0, 0), DRIVER_SLUG_CLAUDE),
         (DriverTrafficSplit::new(0, 0, 100, 0), DRIVER_SLUG_CODEX),
+        (DriverTrafficSplit::new(0, 0, 0, 100), DRIVER_SLUG_AGY),
     ] {
         let (_dir, db) = open_db();
         db.set_driver_traffic_split(split).unwrap();
