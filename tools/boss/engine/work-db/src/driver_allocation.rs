@@ -13,9 +13,9 @@
 //! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
 //! [`eligible_drivers_for`]) against each driver's declared `CapabilitySet` —
 //! which of the four drivers may run a work item of that kind, and
-//! renormalises the configured split over exactly that subset
+//! excludes drivers whose launch is not ready, then renormalises over that subset
 //! ([`DriverTrafficSplit::driver_for_bucket_among`]). One source of truth: a
-//! driver declared eligible for a kind can receive it, one that is not
+//! launch-ready driver declared eligible for a kind can receive it, one that is not
 //! cannot, and widening or narrowing eligibility is a `KindRequirements` /
 //! `CapabilitySet` change that this path picks up with no edit of its own.
 //! The earlier narrow slice (implementation kinds at `standard` reasoning
@@ -201,6 +201,7 @@ fn eligible_drivers_for(
     registry
         .eligible_drivers_for_kind(kind, Some(execution_kind), &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER)
         .into_iter()
+        .filter(|slug| registry.get(slug).is_some_and(|driver| driver.launch_ready()))
         .filter(|slug| !design_or_investigation_tier || *slug == DRIVER_SLUG_CLAUDE || *slug == DRIVER_SLUG_CODEX)
         .filter(|slug| {
             model_override.is_none_or(|model| {
@@ -212,30 +213,17 @@ fn eligible_drivers_for(
         .collect()
 }
 
-/// True when `eligible` is non-empty and every *registered* driver in
-/// [`DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER`] holds 0 — i.e. the whole
-/// share sits on unregistered slugs.
-///
-/// Settings can persist that split (the stepper does not know which slugs
-/// the engine has registered). A future fifth slug at 100% before its
-/// driver exists is the case: the unregistered share is dropped from the
-/// eligible set and every registered driver is at 0. Failing the insert
-/// would strand every unpinned row; [`decide_execution_driver`] falls
-/// through to the engine default instead.
-///
-/// A leftover unregistered share next to a funded registered driver does
-/// not qualify. ConflictResolution / CiRemediation with `claude = 0` and
-/// `agy > 0` is still `EveryEligibleDriverAtZero`, and an empty `eligible`
-/// set is still `NoEligibleDriver` — falling back would hand those to a
-/// gate-refusing default or revive a registered driver set to 0.
-fn whole_share_sits_on_unregistered_drivers(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
+/// Fall back when all persisted shares sit on unavailable drivers, including
+/// registered skeletons. Funded launchable drivers excluded by capability or
+/// model constraints must still fail loudly.
+fn whole_share_sits_on_unavailable_drivers(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
     if eligible.is_empty() {
         return false;
     }
     let registry = boss_engine_driver::DriverRegistry::default();
     DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
         .iter()
-        .filter(|driver| registry.get(driver).is_some())
+        .filter(|driver| registry.get(driver).is_some_and(|driver| driver.launch_ready()))
         .all(|driver| split.share_for(driver) == Some(0))
 }
 
@@ -582,7 +570,7 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         Ok(driver) => driver,
         Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
         Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
-        Err(_) if whole_share_sits_on_unregistered_drivers(&split, &eligible) => {
+        Err(_) if whole_share_sits_on_unavailable_drivers(&split, &eligible) => {
             return Ok(DriverDecision::default_no_override());
         }
         Err(err) => return Err(err),

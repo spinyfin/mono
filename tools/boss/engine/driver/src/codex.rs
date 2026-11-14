@@ -399,14 +399,9 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// The block says nothing to discourage backgrounding: a job deliberately left
 /// running is covered by the engine-wide `propose wait` rule, which the block
 /// points at in one sentence.
-const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
-     spawned you in a leased cube workspace and observes this session\n\
-     via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
-     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
-     in a shell `timeout`.\n\
+const CODEX_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!(
+    "via the Codex rollout JSONL file in this run's isolated CODEX_HOME.",
+    "\n\
      \n\
      Two tool routes are blocked in this session, because the command\n\
      guardrails cannot see them:\n\
@@ -466,7 +461,8 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worke
      is still a failed run. A blocker is reportable only when something\n\
      external forced it: a command that ran and failed, a missing credential,\n\
      a genuinely conflicting instruction. Say so plainly and show the\n\
-     evidence when that happens — and complete the work when it has not.";
+     evidence when that happens — and complete the work when it has not."
+);
 
 /// Single-pattern gitignore for the workspace-local `.codex/` config dir
 /// (prompt + agent-rules copies). Engine-injected files must not appear in

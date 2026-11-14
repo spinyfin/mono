@@ -8,7 +8,6 @@
 //! 2026-11-14).
 
 use std::path::Path;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
@@ -17,10 +16,9 @@ use boss_protocol::{NormalizeError, WorkerEvent};
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
-    InterruptDelivery, InterruptGesture, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts,
-    PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
-    SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, TurnEndEvidence,
-    WorkerErrorClass,
+    InterruptDelivery, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput,
+    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, SpawnPlan, SpawnRequest,
+    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 
 mod model_menu;
@@ -31,9 +29,7 @@ mod transcript;
 // ---------------------------------------------------------------------------
 //
 // Model menu refresh path: `agy models` is the machine-readable source.
-// Update the family constants in [`model_menu`] together with
-// engine_default / model_for_reasoning / default_model_for_level /
-// review_model_for_tier / design_investigation_model. Do not dispatch
+// Update catalogue entries and role choices in model_menu. Do not dispatch
 // Claude, GPT-OSS, or orchestrator ids through this driver.
 
 static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
@@ -48,7 +44,7 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
         resolve_model_effort: Some(model_menu::resolve_model_effort),
-        engine_default: model_menu::FAMILY_HYDROGEN,
+        engine_default: model_menu::STANDARD_FAMILY,
         effort_value_for_level: model_menu::effort_value_for_level,
         default_model_for_level: model_menu::default_model_for_level,
         model_for_reasoning: model_menu::model_for_reasoning,
@@ -60,14 +56,8 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     },
 };
 
-const AGY_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
-     spawned you in a leased cube workspace and observes this session\n\
-     via Antigravity hooks under an engine-owned per-run HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
-     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
-     in a shell `timeout`.";
+const AGY_AGENT_RULES_PREAMBLE: &str =
+    agent_rules_preamble!("via Antigravity hooks under an engine-owned per-run HOME.", "");
 
 /// Google Antigravity CLI driver.
 ///
@@ -88,6 +78,10 @@ pub fn build_agy_pane_command(_request: &SpawnRequest<'_>) -> String {
 impl AgentDriver for AgyDriver {
     fn descriptor(&self) -> &DriverDescriptor {
         &AGY_DESCRIPTOR
+    }
+
+    fn launch_ready(&self) -> bool {
+        false
     }
 
     fn capabilities(&self) -> CapabilitySet {
@@ -236,46 +230,20 @@ impl AgentDriver for AgyDriver {
     }
 
     fn interrupt(&self) -> InterruptDelivery {
-        InterruptDelivery::PaneEsc
+        InterruptDelivery::Unsupported
     }
 
-    /// One Escape, confirmed through the interrupt-recovery observer.
-    ///
-    /// Measured in `docs/investigations/ghostty-agy-pane-viability.md` Q6:
-    /// Esc cancels the in-flight turn and the process survives, but the
-    /// cancelled turn **skips the `Stop` hook**. The only records are a
-    /// `--log-file` line `Cancelling in-progress response for conversation
-    /// <uuid>` and pane text `Interrupted · What should Antigravity CLI do
-    /// instead?`. `transcript_full.jsonl` does not record the cancellation.
-    /// The recovery observer is not wired; this plan declares the measured
-    /// interrupt contract.
+    // Pane viability study Q6: one Esc cancels and skips Stop. The plain-text
+    // --log-file line is "Cancelling in-progress response for conversation <cid>".
+    // No JSONL recovery source exists, so interrupts remain unsupported.
     fn interrupt_plan(&self) -> Option<InterruptPlan> {
-        Some(InterruptPlan {
-            gesture: InterruptGesture {
-                key: "Escape",
-                presses: 1,
-                press_interval: Duration::from_millis(120),
-            },
-            confirm_window: Duration::from_secs(8),
-            max_attempts: 2,
-            turn_end_evidence: TurnEndEvidence::RecoveryObserver,
-        })
+        None
     }
 
     fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
         // Pane viability study Q5: mid-turn stdin is buffered as the next
         // prompt. Override the safe Rejects default with that measurement.
         MidTurnPaneInput::Buffers
-    }
-
-    fn is_interrupt_recovery_turn_end(&self, raw: &serde_json::Value) -> bool {
-        // Matcher for the measured Esc-cancel log line. The recovery observer
-        // does not yet tail `--log-file`.
-        raw.get("type").and_then(|v| v.as_str()) == Some("log")
-            && raw
-                .get("message")
-                .and_then(|v| v.as_str())
-                .is_some_and(|message| message.contains("Cancelling in-progress response for conversation"))
     }
 
     fn structured_output_fallback(&self, _kind: StructuredOutputKind, _text: &str) -> Vec<FallbackCandidate> {
@@ -310,10 +278,12 @@ mod tests {
         assert_eq!(d.config_dir, ".agy");
         assert_eq!(d.agent_rules_filename, "AGENTS.md");
         assert_eq!(d.initial_prompt_filename, "initial-prompt.txt");
-        assert_eq!(d.model_menu.engine_default, model_menu::FAMILY_HYDROGEN);
+        assert_eq!(d.model_menu.engine_default, model_menu::STANDARD_FAMILY);
         assert_eq!(
-            (d.model_menu.design_investigation_model.expect("agy names Carbon"))(),
-            model_menu::FAMILY_CARBON,
+            (d.model_menu
+                .design_investigation_model
+                .expect("agy names a strong family"))(),
+            model_menu::STRONG_FAMILY,
         );
     }
 
@@ -331,24 +301,21 @@ mod tests {
         for reasoning in [ReasoningMode::Standard, ReasoningMode::Investigation] {
             let family = (menu.model_for_reasoning)(reasoning);
             let expected_family = match reasoning {
-                ReasoningMode::Standard => model_menu::FAMILY_HYDROGEN,
-                ReasoningMode::Investigation => model_menu::FAMILY_CARBON,
+                ReasoningMode::Standard => model_menu::STANDARD_FAMILY,
+                ReasoningMode::Investigation => model_menu::STRONG_FAMILY,
             };
             assert_eq!(family, expected_family, "{reasoning:?}");
             for level in levels {
                 let effort = (menu.effort_value_for_level)(level);
                 let composed = model_menu::compose_model_id(family, effort);
-                let expected = match (reasoning, level) {
-                    (ReasoningMode::Standard, EffortLevel::Trivial) => "gemini-4-hydrogen-low",
-                    (ReasoningMode::Standard, EffortLevel::Small) => "gemini-4-hydrogen-medium",
-                    (ReasoningMode::Standard, EffortLevel::Medium) => "gemini-4-hydrogen-high",
-                    (ReasoningMode::Standard, EffortLevel::Large | EffortLevel::Max) => "gemini-4-hydrogen-xhigh",
-                    (ReasoningMode::Investigation, EffortLevel::Trivial) => "gemini-4-carbon-low",
-                    (ReasoningMode::Investigation, EffortLevel::Small) => "gemini-4-carbon-medium",
-                    (ReasoningMode::Investigation, EffortLevel::Medium | EffortLevel::Large | EffortLevel::Max) => {
-                        "gemini-4-carbon-high"
-                    }
+                let rung = match level {
+                    EffortLevel::Trivial => "low",
+                    EffortLevel::Small => "medium",
+                    EffortLevel::Medium => "high",
+                    EffortLevel::Large | EffortLevel::Max if expected_family == model_menu::FAMILY_HYDROGEN => "xhigh",
+                    EffortLevel::Large | EffortLevel::Max => "high",
                 };
+                let expected = format!("{expected_family}-{rung}");
                 assert_eq!(composed, expected, "{reasoning:?} {level:?}");
             }
         }
@@ -360,35 +327,35 @@ mod tests {
         let menu = &driver.descriptor().model_menu;
         assert_eq!(
             (menu.review_model_for_tier)(ReviewModelTier::Fast),
-            model_menu::FAMILY_HYDROGEN
+            model_menu::STANDARD_FAMILY
         );
         assert_eq!(
             (menu.review_model_for_tier)(ReviewModelTier::Balanced),
-            model_menu::FAMILY_HYDROGEN
+            model_menu::STANDARD_FAMILY
         );
         assert_eq!(
             (menu.review_model_for_tier)(ReviewModelTier::Strong),
-            model_menu::FAMILY_CARBON
+            model_menu::STRONG_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Trivial),
-            model_menu::FAMILY_FLASH
+            model_menu::LIGHT_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Small),
-            model_menu::FAMILY_HYDROGEN
+            model_menu::STANDARD_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Medium),
-            model_menu::FAMILY_HYDROGEN
+            model_menu::STANDARD_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Large),
-            model_menu::FAMILY_CARBON
+            model_menu::STRONG_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Max),
-            model_menu::FAMILY_CARBON
+            model_menu::STRONG_FAMILY
         );
         assert!((menu.model_belongs_to_driver)("gemini-4-hydrogen-xhigh"));
         assert!((menu.model_belongs_to_driver)("GEMINI-4-CARBON-HIGH"));
@@ -398,12 +365,12 @@ mod tests {
         assert!(!(menu.model_belongs_to_driver)("claude-opus-5-5-high"));
         assert!(!(menu.model_belongs_to_driver)("gpt-oss-120b-medium"));
         assert!(!(menu.model_belongs_to_driver)("gemini-pro-orchestrator"));
-        assert!(!(menu.model_requires_auto_permissions)(model_menu::FAMILY_HYDROGEN));
+        assert!(!(menu.model_requires_auto_permissions)(model_menu::STANDARD_FAMILY));
     }
 
     #[test]
     fn skeleton_spawn_exits_without_launching_agy() {
-        let plan = AgyDriver::default().spawn_invocation(spawn_request(model_menu::FAMILY_CARBON, Some("xhigh")));
+        let plan = AgyDriver::default().spawn_invocation(spawn_request(model_menu::STRONG_FAMILY, Some("xhigh")));
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(&plan.command)
@@ -464,21 +431,11 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_uses_esc_and_recovery_observer() {
+    fn interrupts_are_unsupported_without_recovery() {
         let driver = AgyDriver::default();
-        assert_eq!(driver.interrupt(), InterruptDelivery::PaneEsc);
-        let plan = driver.interrupt_plan().expect("agy declares an interrupt plan");
-        assert_eq!(plan.gesture.key, "Escape");
-        assert_eq!(plan.gesture.presses, 1);
-        assert_eq!(plan.turn_end_evidence, TurnEndEvidence::RecoveryObserver);
-        assert!(driver.is_interrupt_recovery_turn_end(&serde_json::json!({
-            "type": "log",
-            "message": "Cancelling in-progress response for conversation 9476903e-615e-4a03-b5b5-ea82733cc97b",
-        })));
-        assert!(!driver.is_interrupt_recovery_turn_end(&serde_json::json!({
-            "type": "turn_ended",
-            "outcome": "cancelled",
-        })));
+        assert_eq!(driver.interrupt(), InterruptDelivery::Unsupported);
+        assert!(driver.interrupt_plan().is_none());
+        assert!(!driver.launch_ready());
     }
 
     #[test]

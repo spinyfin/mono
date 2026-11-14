@@ -23,29 +23,19 @@
 //! `ModelMenu` is static function pointers today, so this is a baked
 //! snapshot rather than a live `agy models` parse. Refresh source is the
 //! machine-readable `agy models` listing. When the catalogue changes,
-//! update the family constants below together with
-//! [`super::AGY_DESCRIPTOR`]'s `engine_default` / `model_for_reasoning` /
-//! `default_model_for_level` / `review_model_for_tier` /
-//! `design_investigation_model`. Do not dispatch Claude, GPT-OSS, or
-//! orchestrator ids through this driver.
+//! update the catalogue entries and role choices below.
 
 use boss_protocol::{EffortLevel, ReasoningMode, ReviewModelTier};
 
-/// Everyday-coding family. `standard` reasoning, engine default, Fast and
-/// Balanced review. Encoded in one place so a catalogue bump changes the
-/// menu in a single edit.
 pub(super) const FAMILY_HYDROGEN: &str = "gemini-4-hydrogen";
-
-/// Strongest family. `investigation` reasoning, Strong review, and the
-/// dedicated design/investigation tier.
 pub(super) const FAMILY_CARBON: &str = "gemini-4-carbon";
-
-/// Lightest-work family. Legacy `Trivial` fall-through only.
 pub(super) const FAMILY_FLASH: &str = "gemini-3.8-flash";
-
-/// Present on the catalogue; the menu never selects it. Kept so a
-/// hand-set `--model gemini-4-argon-*` still belongs to this driver.
 pub(super) const FAMILY_ARGON: &str = "gemini-4-argon";
+
+// Role choices shared by every selector.
+pub(super) const STANDARD_FAMILY: &str = FAMILY_HYDROGEN;
+pub(super) const STRONG_FAMILY: &str = FAMILY_CARBON;
+pub(super) const LIGHT_FAMILY: &str = FAMILY_FLASH;
 
 /// Catalogue families this driver accepts, with each family's highest
 /// advertised id suffix. Hydrogen is the only family that reaches `xhigh`;
@@ -143,15 +133,15 @@ pub(super) fn effort_value_for_level(level: EffortLevel) -> Option<&'static str>
 
 pub(super) fn model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
     match reasoning {
-        ReasoningMode::Standard => FAMILY_HYDROGEN,
-        ReasoningMode::Investigation => FAMILY_CARBON,
+        ReasoningMode::Standard => STANDARD_FAMILY,
+        ReasoningMode::Investigation => STRONG_FAMILY,
     }
 }
 
 pub(super) fn review_model_for_tier(tier: ReviewModelTier) -> &'static str {
     match tier {
-        ReviewModelTier::Fast | ReviewModelTier::Balanced => FAMILY_HYDROGEN,
-        ReviewModelTier::Strong => FAMILY_CARBON,
+        ReviewModelTier::Fast | ReviewModelTier::Balanced => STANDARD_FAMILY,
+        ReviewModelTier::Strong => STRONG_FAMILY,
     }
 }
 
@@ -160,14 +150,14 @@ pub(super) fn review_model_for_tier(tier: ReviewModelTier) -> &'static str {
 /// default; Carbon is the strongest family for Large/Max.
 pub(super) fn default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
-        EffortLevel::Trivial => FAMILY_FLASH,
-        EffortLevel::Small | EffortLevel::Medium => FAMILY_HYDROGEN,
-        EffortLevel::Large | EffortLevel::Max => FAMILY_CARBON,
+        EffortLevel::Trivial => LIGHT_FAMILY,
+        EffortLevel::Small | EffortLevel::Medium => STANDARD_FAMILY,
+        EffortLevel::Large | EffortLevel::Max => STRONG_FAMILY,
     }
 }
 
 pub(super) fn design_investigation_model() -> &'static str {
-    FAMILY_CARBON
+    STRONG_FAMILY
 }
 
 pub(super) fn prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> {

@@ -142,14 +142,9 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// isn't asking anything answerable by a default, it's entered a UI whose
 /// only exit is a human pressing a key. Planning and recording a plan are
 /// still fine; blocking on approval of one is not.
-const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
-     spawned you in a leased cube workspace and observes this session\n\
-     via Grok hooks under an engine-owned GROK_HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
-     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
-     in a shell `timeout`.\n\
+const GROK_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!(
+    "via Grok hooks under an engine-owned GROK_HOME.",
+    "\n\
      \n\
      Default to proceeding on a reasonable assumption instead of stopping to\n\
      ask the human: pick the interpretation a competent engineer would\n\
@@ -173,7 +168,8 @@ const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker
      surface, not an interactive prompt mid-run. This does not change the\n\
      genuinely blocking cases above (unsafe, destructive, or irreversible\n\
      actions, or a missing credential) — those remain reasons to stop\n\
-     and emit a blocked marker, not reasons to open an approval UI.";
+     and emit a blocked marker, not reasons to open an approval UI."
+);
 
 // ---------------------------------------------------------------------------
 // GrokDriver
