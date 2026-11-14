@@ -414,6 +414,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: spoke_projection::migrate_applied_writes,
         },
         Migration {
+            id: spoke_custody::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_custody::migrate,
+        },
+        Migration {
             id: spoke_hub::MIGRATION_ID.into(),
             legacy_version: None,
             apply: spoke_hub::migrate,

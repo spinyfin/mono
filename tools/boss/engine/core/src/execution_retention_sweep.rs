@@ -71,6 +71,7 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
     prune_spoke_commands(work_db, now_epoch);
+    reclaim_spoke_custody(work_db, now_epoch);
 
     // Storage does not probe processes; the sweep supplies the observation
     // that lets it reap staging files whose writer is proven gone.
@@ -95,6 +96,49 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
         Err(err) => {
             tracing::warn!(?err, "execution-retention sweep: prune failed; skipping this pass");
             ExecutionRetentionSweepOutcome::default()
+        }
+    }
+}
+
+/// How long the hub keeps its copies of a finished spoke run's transcript and
+/// artifacts. The same window as a terminal execution's Codex home and its
+/// diagnostics: long enough for "what happened last week?".
+pub const SPOKE_CUSTODY_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
+
+/// Reclaim the hub's custody files of spoke runs that finished long enough ago.
+///
+/// Like the home sweeps, it acts only on what the ledger recorded, and liveness
+/// is the execution's status, never a file's age: a run that is still going, or
+/// that this database cannot place, keeps its bytes.
+fn reclaim_spoke_custody(work_db: &WorkDb, now_epoch: i64) {
+    let Ok(root) = boss_engine_driver::transcript_store::transcript_store_root() else {
+        return;
+    };
+    let custody = crate::hub::projection::Custody::new(work_db.clone(), root);
+    let executions = match work_db.spoke_custody_executions() {
+        Ok(executions) => executions,
+        Err(error) => {
+            tracing::warn!(%error, "execution-retention sweep: cannot list spoke custody owners");
+            return;
+        }
+    };
+    for execution_id in executions {
+        let Ok(execution) = work_db.get_execution(&execution_id) else {
+            continue;
+        };
+        if !execution.status.is_terminal() {
+            continue;
+        }
+        let finished = execution
+            .finished_epoch()
+            .or_else(|| execution.created_epoch())
+            .unwrap_or(now_epoch);
+        if now_epoch.saturating_sub(finished) < SPOKE_CUSTODY_MAX_AGE_SECS {
+            continue;
+        }
+        match custody.reclaim_execution(&execution_id) {
+            Ok(bytes) => tracing::info!(execution = %execution_id, bytes, "reclaimed spoke transcript custody"),
+            Err(error) => tracing::warn!(execution = %execution_id, %error, "spoke custody retention failed"),
         }
     }
 }
@@ -167,6 +211,86 @@ mod tests {
             "backlog beyond the keep floor must be pruned, got {} remaining",
             remaining.len()
         );
+    }
+
+    #[test]
+    fn sweep_reclaims_spoke_custody_of_old_finished_runs_and_keeps_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("executions");
+        let _store = boss_engine_driver::test_support::transcript_store_override(&store);
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "test-product", Some("https://github.com/test/repo")).id;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let make = |name: &str, status: &str, age_days: i64| {
+            let work_item_id = db
+                .create_chore(
+                    CreateChoreInput::builder()
+                        .product_id(product_id.clone())
+                        .name(name)
+                        .build(),
+                )
+                .unwrap()
+                .id;
+            let execution = db
+                .request_execution(
+                    boss_protocol::RequestExecutionInput::builder()
+                        .work_item_id(work_item_id)
+                        .build(),
+                )
+                .unwrap();
+            let when = (now - age_days * 24 * 60 * 60).to_string();
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE work_executions SET status = ?2, created_at = ?3, finished_at = ?3, started_at = ?3 WHERE id = ?1",
+                    rusqlite::params![execution.id, status, when],
+                )
+                .unwrap();
+            let held = store.join(&execution.id).join("spoke").join("run_1");
+            std::fs::create_dir_all(&held).unwrap();
+            std::fs::write(held.join("transcript.jsonl"), b"bytes").unwrap();
+            db.put_spoke_custody(
+                &boss_work_db::SpokeCustody::builder()
+                    .execution_id(execution.id.clone())
+                    .assignment_generation(1_u64)
+                    .resource("transcript:0-1")
+                    .host_id("host-a")
+                    .run_id("run_1")
+                    .kind("transcript")
+                    .state(boss_work_db::CustodyState::Open)
+                    .path(format!("{}/spoke/run_1/transcript.jsonl", execution.id))
+                    .materialized(5_u64)
+                    .build(),
+                None,
+            )
+            .unwrap();
+            (execution.id, held)
+        };
+        let (old_done, old_dir) = make("old-finished", "completed", 30);
+        let neighbour = old_dir.join("unregistered.txt");
+        std::fs::write(&neighbour, b"keep").unwrap();
+        let (recent_done, recent_dir) = make("recent-finished", "completed", 1);
+        let (old_live, live_dir) = make("old-but-running", "running", 30);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_one_pass(&db));
+
+        assert!(
+            !old_dir.join("transcript.jsonl").exists(),
+            "the recorded hub copy is reclaimed"
+        );
+        assert_eq!(std::fs::read(&neighbour).unwrap(), b"keep");
+        assert!(db.spoke_custody_for_execution(&old_done).unwrap().is_empty());
+        assert!(recent_dir.exists(), "a recently finished run keeps its bytes");
+        assert!(!db.spoke_custody_for_execution(&recent_done).unwrap().is_empty());
+        assert!(
+            live_dir.exists(),
+            "a run that is still going keeps its bytes however old"
+        );
+        assert!(!db.spoke_custody_for_execution(&old_live).unwrap().is_empty());
     }
 
     #[tokio::test]

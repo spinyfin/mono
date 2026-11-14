@@ -20,6 +20,7 @@ rust_library(
         "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
         "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/spoke-custody:__pkg__",
         "//tools/boss/engine/stdout-progress:__pkg__",
     ],
     deps = [

@@ -22,6 +22,7 @@ rust_library(
         "//tools/boss/engine/pane-summary:__pkg__",
         "//tools/boss/engine/progression-brief:__pkg__",
         "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/spoke-custody:__pkg__",
         "//tools/boss/engine/spoke-hub:__pkg__",
     ],
     deps = [
@@ -74,6 +75,7 @@ rust_library(
         "//tools/boss/engine/pane-summary:__pkg__",
         "//tools/boss/engine/progression-brief:__pkg__",
         "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/spoke-custody:__pkg__",
         "//tools/boss/engine/spoke-hub:__pkg__",
     ],
     deps = [

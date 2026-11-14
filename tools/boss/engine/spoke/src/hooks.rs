@@ -84,7 +84,7 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
     let file_ingress = execution.observation.as_ref().is_some_and(|o| o.file.is_some());
     // The driver's selected source is authoritative. Codex hooks carry policy
     // observations; its rollout is the progress feed, so never emit both.
-    let observations = if file_ingress {
+    let mut observations = if file_ingress {
         Vec::new()
     } else {
         let event = driver.normalize_progress_event(&raw)?;
@@ -145,7 +145,14 @@ pub async fn ingest(journal: &SharedJournal, execution: &ExecutionRecord, bytes:
     };
     let turn_stop = !subagent && raw["hook_event_name"].as_str() == Some("Stop");
     if turn_stop {
-        boss_spoke_worker_api::note_turn_stop(journal, &run)?;
+        let epoch = boss_spoke_worker_api::note_turn_stop(journal, &run)?;
+        for (record, _) in &mut observations {
+            if let Some(record::Body::Event(event)) = &mut record.body
+                && let Some(boss_protocol_spoke::v1::worker_event::Event::Stop(stop)) = &mut event.event
+            {
+                stop.capture_epoch = epoch;
+            }
+        }
     }
     let mut journal = journal
         .lock()

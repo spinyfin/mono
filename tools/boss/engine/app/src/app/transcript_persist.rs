@@ -145,3 +145,52 @@ pub(super) async fn persist_transcript_and_capture_cost(
         }
     }
 }
+
+/// Look up the transcript path the run is currently writing to (via
+/// `WorkRun`), and stat its current byte size so we can use that as
+/// the lower bound for the next reply-extraction read. Returns
+/// `(None, 0)` when the run has no transcript path recorded yet —
+/// the in-flight bookkeeping still tracks the dispatched probe, but
+/// `dispatch_probe_reply_on_stop` will skip emission with a warning
+/// rather than fabricate empty reply text.
+///
+/// The `run_id` argument is the execution id (`exec_*`) carried on
+/// the hook event — the same value
+/// `LiveStatusManager`/`dispatch_live_worker_state` plumb everywhere
+/// in this file. PR #384 flagged this code path as broken (its
+/// "Out of scope" section called out that `work_db.get_run(run_id)`
+/// was joining the wrong namespace). Fixed here alongside the
+/// `TranscriptPathResolver` impl.
+pub(super) async fn transcript_offset_for_run(server_state: &ServerState, run_id: &str) -> (Option<String>, u64) {
+    let path = match server_state.work_db.transcript_path_for_execution(run_id) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::debug!(run_id, ?err, "transcript path lookup failed for probe dispatch",);
+            None
+        }
+    };
+    let Some(path_str) = path else {
+        return (None, 0);
+    };
+    let limit = match boss_engine_runtime::run_cost::transcript_read_limit(
+        &server_state.work_db,
+        std::path::Path::new(&path_str),
+    ) {
+        Ok(limit) => limit,
+        Err(_) => return (None, 0),
+    };
+    let offset = match tokio::fs::metadata(&path_str).await {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => {
+            tracing::warn!(
+                run_id,
+                path = %path_str,
+                ?err,
+                "failed to stat transcript at probe dispatch; treating offset as 0",
+            );
+            0
+        }
+    };
+    (Some(path_str), limit.map_or(offset, |limit| offset.min(limit)))
+}

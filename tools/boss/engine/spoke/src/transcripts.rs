@@ -448,7 +448,14 @@ async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp
     checkpoint.cursor = chunk.cursor;
     checkpoint.eof = chunk.eof;
     if turn_stopped {
-        boss_spoke_worker_api::note_turn_stop(journal, &run)?;
+        let epoch = boss_spoke_worker_api::note_turn_stop(journal, &run)?;
+        for (record, _) in &mut records {
+            if let Some(record::Body::Event(event)) = &mut record.body
+                && let Some(Event::Stop(stop)) = &mut event.event
+            {
+                stop.capture_epoch = epoch;
+            }
+        }
     }
     let mut journal = journal
         .lock()

@@ -1184,3 +1184,163 @@ async fn spoke_ready_host_cleans_the_legacy_store_and_gcs_through_the_provider()
     assert!(calls.iter().any(|call| call == "cleanup_legacy_store"), "{calls:?}");
     assert!(calls.iter().any(|call| call == "gc_cube_repo:repo"), "{calls:?}");
 }
+
+fn run_of(fx: &Fixture) -> boss_protocol_spoke::v1::Run {
+    let assignment = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
+    boss_protocol_spoke::v1::Run {
+        execution_id: assignment.execution_id,
+        run_id: assignment.run_id,
+        assignment_generation: assignment.assignment_generation,
+        spawn_token: assignment.spawn_token,
+    }
+}
+
+fn artifact(
+    kind: boss_protocol_spoke::v1::ArtifactKind,
+    whole: &[u8],
+    output_kind: &str,
+) -> boss_protocol_spoke::v1::ArtifactChunk {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(whole).iter().map(|b| format!("{b:02x}")).collect();
+    boss_protocol_spoke::v1::ArtifactChunk {
+        artifact_id: format!("{}:{digest}", kind as i32),
+        kind: kind as i32,
+        offset: 0,
+        data: whole.to_vec(),
+        sha256: Sha256::digest(whole).to_vec(),
+        eof: true,
+        total_bytes: whole.len() as u64,
+        metadata_json: format!(r#"{{"output_kind":"{output_kind}"}}"#).into_bytes(),
+    }
+}
+
+#[tokio::test]
+async fn a_spoke_runs_transcript_log_and_structured_output_are_answered_from_hub_custody() {
+    use boss_protocol_spoke::v1::ArtifactKind;
+    use boss_spoke_custody::{Custody, Source};
+    use sha2::{Digest, Sha256};
+
+    let fx = Fixture::with(short(500)).await;
+    fx.serve_legacy();
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let unbound = fx.provider_adapter(HOST).await;
+    let _peer = fx.spoke(Box::new(standard), None, 0).await;
+    lease(&adapter).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let custody = Arc::new(Custody::new((*fx.db).clone(), dir.path().join("custody")));
+    let run = run_of(&fx);
+    let source = |sequence| Source {
+        host_id: HOST,
+        run: &run,
+        sequence,
+    };
+    let destination = dir.path().join("out").join("exec_1.pr-url.json");
+    let kind = StructuredOutputKind::PrUrl;
+    let before = fx.legacy_calls().len();
+
+    // Before custody is installed nothing is claimed.
+    assert!(unbound.read_worker_log_tail(PATH, 10).await.unwrap().is_none());
+    assert!(matches!(
+        unbound
+            .collect_structured_output("exec_1", kind, &destination)
+            .await
+            .unwrap(),
+        CollectOutcome::NotAvailable
+    ));
+    fx.provider.install_custody(custody.clone());
+
+    // The transcript: read by the path the run records, which custody owns.
+    let data = b"{\"line\":1}\n{\"line\":2}\n";
+    custody
+        .apply_transcript(
+            &source(1),
+            &boss_protocol_spoke::v1::TranscriptDelta {
+                generation: "0-1".into(),
+                offset: 0,
+                data: data.to_vec(),
+                sha256: Sha256::digest(data).to_vec(),
+                eof: false,
+            },
+        )
+        .unwrap();
+    let (held, _) = custody.latest_transcript("exec_1").unwrap().unwrap();
+    let path = held.path.to_string_lossy().into_owned();
+    assert_eq!(
+        unbound.read_transcript_tail_bytes(&path, 11).await.unwrap().as_deref(),
+        Some("{\"line\":2}\n")
+    );
+    // A path on the host, or one under the custody root custody did not write,
+    // is still not opened on the hub.
+    assert!(
+        unbound
+            .read_transcript_tail_bytes("/host/only/spoke.jsonl", 10)
+            .await
+            .is_err()
+    );
+    let stray = held.path.with_file_name("stray.jsonl");
+    std::fs::write(&stray, b"not recorded").unwrap();
+    assert!(
+        unbound
+            .read_transcript_tail_bytes(&stray.to_string_lossy(), 10)
+            .await
+            .is_err()
+    );
+
+    // The worker log is an artifact the spoke may have sent.
+    assert!(unbound.read_worker_log_tail(PATH, 10).await.unwrap().is_none());
+    custody
+        .apply_artifact(&source(2), &artifact(ArtifactKind::WorkerLog, b"boot ok\nready\n", ""))
+        .unwrap();
+    assert_eq!(
+        unbound.read_worker_log_tail(PATH, 6).await.unwrap().as_deref(),
+        Some("ready\n")
+    );
+
+    // Structured output: absent, then bad, then good, each as the right outcome.
+    assert!(matches!(
+        unbound
+            .collect_structured_output("exec_1", kind, &destination)
+            .await
+            .unwrap(),
+        CollectOutcome::NotAvailable
+    ));
+    custody
+        .apply_artifact(&source(3), &artifact(ArtifactKind::PrUrl, br#"{"pr_url":" "}"#, ""))
+        .unwrap();
+    assert!(
+        matches!(
+            unbound.collect_structured_output("exec_1", kind, &destination).await.unwrap(),
+            CollectOutcome::Failed(reason) if reason.contains("no URL")
+        ),
+        "an output that is positively bad is not 'not available'"
+    );
+    assert!(!destination.exists());
+    custody
+        .apply_artifact(
+            &source(4),
+            &artifact(
+                ArtifactKind::PrUrl,
+                br#"{"pr_url":"https://github.com/o/r/pull/1"}"#,
+                "",
+            ),
+        )
+        .unwrap();
+    assert!(matches!(
+        unbound
+            .collect_structured_output("exec_1", kind, &destination)
+            .await
+            .unwrap(),
+        CollectOutcome::Collected
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        r#"{"pr_url":"https://github.com/o/r/pull/1"}"#
+    );
+    assert_eq!(
+        fx.legacy_calls().len(),
+        before,
+        "a spoke run reached the legacy transport"
+    );
+}

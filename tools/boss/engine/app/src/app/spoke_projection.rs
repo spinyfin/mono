@@ -13,6 +13,10 @@
 //! * a **queued proposal** goes through the same validators, apply pipeline and
 //!   finalization as `SubmitProposal`, and yields the decision the spoke's
 //!   worker is waiting on;
+//! * a run's **transcript** is held on the hub (`boss_spoke_custody`), and the
+//!   run is pointed at that copy, so the live summary, cost capture and
+//!   completion read a file in the hub's custody directory addressed by run
+//!   identity, never a path on the host;
 //! * a **pane observation** is reflected in live state, and nothing more: what
 //!   absence or an exit means for work status stays with the existing liveness
 //!   policy.
@@ -21,9 +25,12 @@
 //! host is enrolled and proven ready.
 
 use async_trait::async_trait;
-use boss_engine_driver::DriverRegistry;
+use boss_engine_driver::{AgentDriver, DriverRegistry};
+use boss_engine_live_worker_state::DriverSignalKind;
 use boss_engine_proposal_validation::{derive_idempotency_key, validate_caller_idempotency_key, validate_payload};
 use boss_engine_runtime::hub::{HubStream, projection};
+use boss_engine_runtime::live_status_loop::{LiveStatusBroadcaster, LiveStatusRun, TranscriptPathResolver};
+use boss_engine_runtime::worker_refresh_liveness::WorkerRefreshPermit;
 use boss_protocol::{
     ArchitecturalMismatchEvidence, FrontendRequest, ProposalErrorCode, ProposalKind, ProposalSubmissionError,
     QueueCiEvidence, WorkerProposal,
@@ -34,7 +41,7 @@ use boss_protocol_spoke::proposal::{
 use boss_protocol_spoke::v1::ResultCode;
 use projection::{
     Applied, Decision, DecisionSettled, EventObservation, Life, ObservationApplier, Origin, PaneObservation,
-    ProjectorConfig, Proposed, Settlement,
+    ProjectorConfig, Proposed, Settlement, TranscriptSource,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -77,12 +84,75 @@ pub(super) fn start(state: &Arc<ServerState>, stream: &HubStream) {
     if let Err(reason) = state.restore_spoke_turns() {
         tracing::warn!(%reason, "cannot restore spoke turn state at projector start; every sweep retries it");
     }
-    let projector = stream.projector(
-        state.work_db.as_ref().clone(),
-        applier(state),
-        ProjectorConfig::default(),
-    );
+    let db = state.work_db.as_ref().clone();
+    // Transcript and artifact bytes live beside the engine's other per-execution
+    // artifacts. Without a state root there is nowhere to hold them, and the
+    // records are received and left alone rather than lost.
+    let projector = match boss_engine_driver::transcript_store::transcript_store_root() {
+        Ok(root) => stream.projector_with_custody(
+            db.clone(),
+            applier(state),
+            ProjectorConfig::default(),
+            Arc::new(boss_engine_runtime::hub::projection::Custody::new(db, root)),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "spoke transcript custody is off: no Boss state root to hold the bytes");
+            stream.projector(db, applier(state), ProjectorConfig::default())
+        }
+    };
     boss_task_scope::spawn(projector.run());
+}
+
+/// Start the live summary for a spoke run's slot. The summarizer reads the run's
+/// transcript, which for a spoke run is the hub's custody copy.
+pub(super) fn start_summary_slot(state: &Arc<ServerState>, slot_id: u8, run_id: &str, driver: Arc<dyn AgentDriver>) {
+    let broadcaster: Arc<dyn LiveStatusBroadcaster> = state.clone();
+    state.live_status_manager.start_slot(
+        slot_id,
+        LiveStatusRun::new(run_id, driver),
+        state.utility_model.clone(),
+        state.live_worker_states.clone(),
+        broadcaster,
+        Arc::new(SpokeSlotResolver(Arc::clone(state))),
+    );
+}
+
+/// Finds a spoke run's transcript like any other run's, but never asks whether
+/// its worker is alive the way a local run's summarizer does. That check looks
+/// for a local tmux session and a local shell pid; a spoke's worker has neither
+/// on this machine, and its liveness is what the spoke reports. Treating the
+/// absence of a local process as death would mark a healthy remote worker
+/// terminated.
+pub(super) struct SpokeSlotResolver(pub(super) Arc<ServerState>);
+
+#[async_trait]
+impl TranscriptPathResolver for SpokeSlotResolver {
+    async fn transcript_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
+        TranscriptPathResolver::transcript_path(self.0.as_ref(), run_id).await
+    }
+
+    async fn transcript_read_limit(&self, path: &std::path::Path) -> Result<u64, String> {
+        let root = boss_engine_driver::transcript_store::transcript_store_root().map_err(|e| e.to_string())?;
+        projection::Custody::new(self.0.work_db.as_ref().clone(), root)
+            .read_limit_at(path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "transcript is not recorded in custody".to_owned())
+    }
+
+    async fn worker_can_refresh(&self, run_id: &str) -> WorkerRefreshPermit {
+        match self.0.work_db.get_execution(run_id) {
+            Ok(execution) if execution.status.is_terminal() => WorkerRefreshPermit::Stop,
+            _ => WorkerRefreshPermit::Refresh,
+        }
+    }
+
+    async fn transcript_containment_root(&self, run_id: &str) -> Option<std::path::PathBuf> {
+        let root = boss_engine_driver::transcript_store::transcript_store_root().ok()?;
+        let assignment = self.0.work_db.spoke_assignment_for_execution(run_id).ok()??;
+        projection::Custody::new(self.0.work_db.as_ref().clone(), root)
+            .run_dir(run_id, &assignment.run_id)
+            .ok()
+    }
 }
 
 impl ServerApplier {
@@ -127,21 +197,22 @@ impl ObservationApplier for ServerApplier {
             }
         };
         // The host's transcript path is a display path on that host. The hub
-        // never opens it, so the event carries none; hub-side transcript custody
-        // supplies transcript reads by run identity instead. Stop-time consumers
-        // that read a transcript therefore see unavailable evidence.
-        if matches!(observation.event, boss_protocol::WorkerEvent::Stop { .. }) {
+        // never opens it: a turn-ending event carries the hub's own copy, held
+        // by run identity, once every byte the spoke named is on the hub.
+        // Without one the Stop-time consumers see unavailable evidence, which
+        // custody has recorded with its reason.
+        if observation.transcript.is_none() && matches!(observation.event, boss_protocol::WorkerEvent::Stop { .. }) {
             tracing::info!(
                 execution_id,
                 from_subagent = observation.from_subagent,
-                "projected spoke Stop carries no hub-local transcript path; Stop-time consumers that read a transcript see unavailable evidence"
+                "projected spoke Stop has no hub transcript copy; Stop-time consumers that read a transcript see unavailable evidence"
             );
         }
         let ingress_seq = state
             .accepted_hook_seq
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+        let mut incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
             driver.as_ref(),
             observation.event.clone(),
             Some(execution_id.to_owned()),
@@ -151,6 +222,11 @@ impl ObservationApplier for ServerApplier {
         .with_subagent_origin(observation.from_subagent)
         .with_ingress_seq(ingress_seq)
         .with_observed_at_ms(observation.origin.observed.wall_unix_ms);
+        if let Some(source) = &observation.transcript {
+            incoming = incoming.with_transcript_source(source.path.to_string_lossy().into_owned(), source.root.clone());
+        } else if matches!(observation.event, boss_protocol::WorkerEvent::Stop { .. }) {
+            incoming = incoming.without_cached_transcript();
+        }
         // Persist the turn state before the fan-out: a failure here retries the
         // record, and a retry must not re-run the fan-out's turn-boundary
         // handling (completion, probes) for a hook it already dispatched.
@@ -162,6 +238,35 @@ impl ObservationApplier for ServerApplier {
             return Applied::Retry(reason);
         }
         dispatch_worker_event_fanout(&state, &incoming).await;
+        Applied::Done
+    }
+
+    async fn transcript_attached(&self, origin: &Origin, source: &TranscriptSource) -> Applied {
+        let state = match self.state() {
+            Ok(state) => state,
+            Err(reason) => return Applied::Retry(reason),
+        };
+        let execution_id = origin.run.execution_id.as_str();
+        let path = source.path.to_string_lossy().into_owned();
+        // A newer generation replaces the pointer; replaying an older one does
+        // not roll it back. Local hooks stay first-writer-wins.
+        match state
+            .transcript_path_cache
+            .record_if_newer(execution_id, &path, &source.generation, || {
+                state.work_db.set_run_transcript_path(execution_id, &path).map(|_| ())
+            }) {
+            Err(error) => return Applied::Retry(format!("{error:#}")),
+            Ok(false) => {
+                if let Err(error) = state.work_db.set_run_transcript_path_if_unset(execution_id, &path) {
+                    return Applied::Retry(format!("{error:#}"));
+                }
+                return Applied::Done;
+            }
+            Ok(true) => {}
+        }
+        state
+            .record_driver_signal(execution_id, DriverSignalKind::TranscriptPath)
+            .await;
         Applied::Done
     }
 

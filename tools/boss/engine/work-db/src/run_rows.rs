@@ -197,6 +197,29 @@ impl WorkDb {
         }
     }
 
+    /// Point the run at `transcript_path`, replacing a path already stored.
+    /// Used when a newer transcript generation of a spoke run attaches; the
+    /// first-writer-wins setter would leave readers on the closed file.
+    pub fn set_run_transcript_path(
+        &self,
+        execution_id: &str,
+        transcript_path: &str,
+    ) -> Result<SetRunTranscriptPathOutcome> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(SetRunTranscriptPathOutcome::RowMissing);
+        };
+        let updated = conn.execute(
+            "UPDATE work_runs SET transcript_path = ?2 WHERE id = ?1",
+            params![run_id, transcript_path],
+        )?;
+        if updated > 0 {
+            Ok(SetRunTranscriptPathOutcome::Updated)
+        } else {
+            Ok(SetRunTranscriptPathOutcome::RowMissing)
+        }
+    }
+
     /// Best-effort rewrite of `work_runs.transcript_path` values that still
     /// point into a per-run Grok or Codex home (`boss-grok-homes` /
     /// `boss-codex-homes`). Those homes are reclaimed; the transcript bytes

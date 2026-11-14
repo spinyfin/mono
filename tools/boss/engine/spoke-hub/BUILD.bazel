@@ -20,6 +20,7 @@ rust_library(
     deps = [
         "//tools/boss/backoff",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-custody",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db",
         "//tools/boss/protocol",
@@ -47,6 +48,7 @@ rust_library(
     deps = [
         "//tools/boss/backoff",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-custody:spoke_custody_test_support",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db:work_db_test_support",
         "//tools/boss/protocol",
@@ -67,6 +69,7 @@ rust_test(
     deps = [
         ":spoke-hub",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-custody",
         "//tools/boss/engine/spoke-stream",
         "//tools/boss/engine/work-db",
         "//tools/boss/protocol",

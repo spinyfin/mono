@@ -378,6 +378,23 @@ mod artifacts {
                 state.capture.attempts = 0;
                 state.capture.exited |= terminal;
             }
+            if !state.capture.pending {
+                let ids: Vec<&str> = state
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        artifact.kind == v1::ArtifactKind::PrUrl as i32
+                            || artifact.kind == v1::ArtifactKind::ReviewResult as i32
+                    })
+                    .map(|artifact| artifact.id.as_str())
+                    .collect();
+                observations.push(gap_record(
+                    &run,
+                    stamp,
+                    format!("output:concluded:{}", state.capture.epoch),
+                    serde_json::to_string(&ids)?,
+                ));
+            }
             journal.commit_source(&run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, observations)
         }
 
@@ -620,6 +637,8 @@ struct State {
 /// Where a run's output capture stands.
 #[derive(Default, Serialize, Deserialize)]
 struct CaptureState {
+    #[serde(default)]
+    epoch: u64,
     /// Output names with an outstanding gap marker. A successful read or a
     /// rejected done reopens them; this never suppresses reading output bytes.
     captured: Vec<String>,
@@ -689,14 +708,14 @@ fn gap_record(run: &v1::Run, stamp: &v1::Stamp, resource: String, reason: String
 /// A turn ended without `propose done` (a Stop observed by hook or transcript
 /// ingestion). A worker may have written its outputs and parked, so the capture
 /// is owed from here on and is retried until it concludes.
-pub fn note_turn_stop(journal: &SharedJournal, run: &v1::Run) -> Result<()> {
+pub fn note_turn_stop(journal: &SharedJournal, run: &v1::Run) -> Result<u64> {
     let mut journal = lock(journal)?;
     let (old, mut state) = state(&journal, run)?;
-    if state.capture.pending {
-        return Ok(());
-    }
+    state.capture.epoch += 1;
     state.capture.pending = true;
-    journal.commit_source(run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, vec![])
+    state.capture.attempts = 0;
+    journal.commit_source(run, STATE, old.as_deref(), &serde_json::to_vec(&state)?, vec![])?;
+    Ok(state.capture.epoch)
 }
 
 /// Whether the gateway has finished capturing this run's outputs: nothing is
@@ -1253,9 +1272,9 @@ impl Gateway {
                     return Ok(FrontendEvent::ProposalRejected { error });
                 }
             }
+            note_turn_stop(&self.journal, &identity(execution))?;
             if let Err(error) = self.capture_boundary(execution, stamp, false) {
                 tracing::warn!(run = execution.run_id, %error, "worker output capture failed at done");
-                note_turn_stop(&self.journal, &identity(execution))?;
             }
         }
         self.enqueue(
@@ -1590,6 +1609,7 @@ impl Gateway {
             canonical_json: queued.canonical,
             transcript_generation,
             transcript_through,
+            capture_epoch: state.capture.epoch,
         };
         proposal.validate()?;
         state.proposals.push(Receipt {

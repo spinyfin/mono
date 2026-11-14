@@ -16,9 +16,10 @@ use boss_protocol::{ProposalKind, WorkerEvent};
 use boss_protocol_spoke::{
     Validate,
     proposal::{self, ProposalJsonEnvelope},
-    v1::{self, PaneState, Run, Stamp, record, spoke_frame},
+    v1::{self, PaneState, Run, Stamp, record, spoke_frame, worker_event::Event as WireEvent},
     worker_event,
 };
+use boss_spoke_custody::{Mark, TranscriptSource};
 use prost::Message;
 use serde_json::Value;
 
@@ -46,6 +47,12 @@ pub struct EventObservation {
     pub event: WorkerEvent,
     /// The event fired inside a subagent, not in the run's main session.
     pub from_subagent: bool,
+    /// The transcript watermark a turn-ending event was recorded with: the
+    /// bytes its completion consumers need before they read.
+    pub mark: Option<Mark>,
+    /// The hub copy of that transcript, set by the projector once custody holds
+    /// every byte through `mark`. Absent when the evidence is unavailable.
+    pub transcript: Option<TranscriptSource>,
 }
 
 /// What a queued proposal asks the hub to do.
@@ -76,6 +83,29 @@ pub struct ProposalObservation {
     pub origin: Origin,
     pub proposal_id: String,
     pub request: ProposalRequest,
+    /// The transcript watermark the proposal was queued with.
+    pub mark: Option<Mark>,
+}
+
+/// A transcript chunk, to be written to the hub's custody copy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptObservation {
+    pub origin: Origin,
+    pub delta: v1::TranscriptDelta,
+}
+
+/// An artifact chunk, to be written to the hub's custody copy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArtifactObservation {
+    pub origin: Origin,
+    pub chunk: v1::ArtifactChunk,
+}
+
+/// The spoke's statement that bytes of a resource will not arrive, or are bad.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GapObservation {
+    pub origin: Origin,
+    pub gap: v1::Gap,
 }
 
 /// A pane the host looked at, from a `PaneState` record or an inventory page.
@@ -124,6 +154,9 @@ pub enum Observation {
     Event(EventObservation),
     Proposal(ProposalObservation),
     Pane(PaneObservation),
+    Transcript(TranscriptObservation),
+    Artifact(ArtifactObservation),
+    Gap(GapObservation),
 }
 
 impl Observation {
@@ -132,6 +165,9 @@ impl Observation {
             Self::Event(observation) => &observation.origin,
             Self::Proposal(observation) => &observation.origin,
             Self::Pane(observation) => &observation.origin,
+            Self::Transcript(observation) => &observation.origin,
+            Self::Artifact(observation) => &observation.origin,
+            Self::Gap(observation) => &observation.origin,
         }
     }
 }
@@ -147,6 +183,8 @@ pub enum Skip {
     LiveOnly,
     /// Real, but another consumer owns its meaning.
     OtherConsumer(&'static str),
+    /// A gap that names no run, so there is no assignment to attach it to.
+    Unattributed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,11 +240,23 @@ pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reducti
             let Some(run) = run else {
                 return Reduction::Quarantine("event record has no run".into());
             };
+            // The wire watermark has no domain counterpart, so it is read here,
+            // before the conversion drops it. A subagent's Stop is not a turn
+            // boundary of the run and carries none.
+            let mark = match &wire.event {
+                Some(WireEvent::Stop(stop)) if !wire.from_subagent => Some(Mark {
+                    capture_epoch: stop.capture_epoch,
+                    ..Mark::new(&stop.transcript_generation, stop.transcript_through)
+                }),
+                _ => None,
+            };
             match worker_event::from_wire(wire) {
                 Ok(decoded) => Reduction::Observations(vec![Observation::Event(EventObservation {
                     origin: origin(run),
                     event: decoded.event,
                     from_subagent: decoded.from_subagent,
+                    mark,
+                    transcript: None,
                 })]),
                 Err(error) => Reduction::Quarantine(format!("worker event is unreadable: {error}")),
             }
@@ -215,10 +265,15 @@ pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reducti
             let Some(run) = run else {
                 return Reduction::Quarantine("proposal record has no run".into());
             };
+            let mark = Mark {
+                capture_epoch: proposal.capture_epoch,
+                ..Mark::new(&proposal.transcript_generation, proposal.transcript_through)
+            };
             Reduction::Observations(vec![Observation::Proposal(ProposalObservation {
                 origin: origin(run),
                 request: proposal_request(&proposal),
                 proposal_id: proposal.proposal_id,
+                mark: Some(mark),
             })])
         }
         record::Body::Pane(pane) => {
@@ -245,9 +300,31 @@ pub fn reduce(host_id: &str, journal_id: &str, row: &SpokeIngressRow) -> Reducti
         record::Body::Result(_) => Reduction::Skip(Skip::SettledAtIngress),
         record::Body::Capture(_) => Reduction::Skip(Skip::LiveOnly),
         record::Body::Capacity(_) => Reduction::Skip(Skip::OtherConsumer("capacity")),
-        record::Body::Transcript(_) => Reduction::Skip(Skip::OtherConsumer("transcript")),
-        record::Body::Artifact(_) => Reduction::Skip(Skip::OtherConsumer("artifact")),
-        record::Body::Gap(_) => Reduction::Skip(Skip::OtherConsumer("gap")),
+        record::Body::Transcript(delta) => {
+            let Some(run) = run else {
+                return Reduction::Quarantine("transcript record has no run".into());
+            };
+            Reduction::Observations(vec![Observation::Transcript(TranscriptObservation {
+                origin: origin(run),
+                delta,
+            })])
+        }
+        // An artifact or gap may describe the host rather than a run; only a
+        // run-bound one has custody to attach to.
+        record::Body::Artifact(chunk) => match run {
+            Some(run) => Reduction::Observations(vec![Observation::Artifact(ArtifactObservation {
+                origin: origin(run),
+                chunk,
+            })]),
+            None => Reduction::Skip(Skip::Unattributed),
+        },
+        record::Body::Gap(gap) => match run {
+            Some(run) => Reduction::Observations(vec![Observation::Gap(GapObservation {
+                origin: origin(run),
+                gap,
+            })]),
+            None => Reduction::Skip(Skip::Unattributed),
+        },
         record::Body::Request(_) => Reduction::Skip(Skip::OtherConsumer("worker-request")),
     }
 }

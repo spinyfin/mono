@@ -4,6 +4,7 @@
 //! hook events live here. Pure structural move — no behavioural change.
 
 use super::transcript_persist::persist_transcript_and_capture_cost;
+pub(super) use super::transcript_persist::transcript_offset_for_run;
 use super::*;
 use boss_engine_driver::{AgentDriver, Capability, ClaudeDriver};
 use boss_engine_live_worker_state::{ApplyEventOutcome, DriverSignalKind, HookOrigin};
@@ -680,6 +681,10 @@ pub(super) async fn dispatch_live_worker_state(
             let _ = server_state.transcript_path_cache.record_if_unset(run_id, &path);
             (Some(path), false)
         }
+        None if incoming.skip_cached_transcript() => {
+            server_state.dispatcher_stats.inc_without_transcript_path();
+            (None, false)
+        }
         None => {
             server_state.dispatcher_stats.inc_without_transcript_path();
             match server_state.transcript_path_cache.get(run_id) {
@@ -762,6 +767,10 @@ pub(super) async fn dispatch_live_worker_state(
     // are gated off so they don't emit a misleading "notify dropped — no
     // per-slot task" warn on every remote hook.
     let is_remote_slot = slot_id >= boss_engine_runtime::worker_registry::REMOTE_SLOT_BASE;
+    // A remote slot has a summarizer only when one was started for it: a spoke
+    // run's transcript is held on the hub, so it can be summarized like a local
+    // one. An SSH run's cannot, and its triggers stay off.
+    let summarizes = !is_remote_slot || server_state.live_status_manager.active_slot_ids().contains(&slot_id);
     // Driver-start verification, second attempt — deliberately AFTER slot
     // resolution as well as before it.
     //
@@ -845,7 +854,7 @@ pub(super) async fn dispatch_live_worker_state(
     // dispatcher recognising a Claude-shaped `Stop`. Checked ahead of the
     // match because the two are disjoint: no event is both a turn boundary
     // and a tool result.
-    if incoming.is_turn_boundary() && !is_remote_slot && !stale_event {
+    if incoming.is_turn_boundary() && summarizes && !stale_event {
         server_state.live_status_manager.notify(slot_id, Trigger::Stop);
     }
     if let boss_protocol::WorkerEvent::PostToolUse {
@@ -855,7 +864,7 @@ pub(super) async fn dispatch_live_worker_state(
         ..
     } = &incoming.event
     {
-        if !is_remote_slot && !stale_event {
+        if summarizes && !stale_event {
             server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
         // Primary-path PR URL capture. Every worker that opens a
@@ -1045,7 +1054,7 @@ pub(super) async fn dispatch_live_worker_state(
             }
         }
     }
-    if !is_remote_slot {
+    if summarizes {
         if let (Some(prior), Some(new)) = (prior_activity, new_activity) {
             if prior != new {
                 server_state
@@ -1150,6 +1159,15 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
             host = %host,
             "live_status: assigned virtual slot to remote worker (no local pane); activity tracks the forwarded hook stream",
         );
+        // A spoke run's transcript is materialized on the hub, so it gets the
+        // live summary a local worker has. Other remote runs have no file the
+        // summarizer could read.
+        if matches!(server_state.work_db.spoke_assignment_for_execution(run_id), Ok(Some(_)))
+            && let Ok(Some(slug)) = server_state.work_db.get_execution_driver_slug(run_id)
+            && let Ok(driver) = boss_engine_driver::DriverRegistry::default().require(&slug)
+        {
+            super::spoke_projection::start_summary_slot(server_state, slot_id, run_id, driver);
+        }
         server_state.broadcast_live_worker_states().await;
     }
     Some(slot_id)
@@ -2455,48 +2473,6 @@ async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str)
         "probe injected into parked worker pane (immediate dispatch)",
     )
     .await
-}
-
-/// Look up the transcript path the run is currently writing to (via
-/// `WorkRun`), and stat its current byte size so we can use that as
-/// the lower bound for the next reply-extraction read. Returns
-/// `(None, 0)` when the run has no transcript path recorded yet —
-/// the in-flight bookkeeping still tracks the dispatched probe, but
-/// `dispatch_probe_reply_on_stop` will skip emission with a warning
-/// rather than fabricate empty reply text.
-///
-/// The `run_id` argument is the execution id (`exec_*`) carried on
-/// the hook event — the same value
-/// `LiveStatusManager`/`dispatch_live_worker_state` plumb everywhere
-/// in this file. PR #384 flagged this code path as broken (its
-/// "Out of scope" section called out that `work_db.get_run(run_id)`
-/// was joining the wrong namespace). Fixed here alongside the
-/// `TranscriptPathResolver` impl.
-pub(super) async fn transcript_offset_for_run(server_state: &ServerState, run_id: &str) -> (Option<String>, u64) {
-    let path = match server_state.work_db.transcript_path_for_execution(run_id) {
-        Ok(path) => path,
-        Err(err) => {
-            tracing::debug!(run_id, ?err, "transcript path lookup failed for probe dispatch",);
-            None
-        }
-    };
-    let Some(path_str) = path else {
-        return (None, 0);
-    };
-    let offset = match tokio::fs::metadata(&path_str).await {
-        Ok(meta) => meta.len(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(err) => {
-            tracing::warn!(
-                run_id,
-                path = %path_str,
-                ?err,
-                "failed to stat transcript at probe dispatch; treating offset as 0",
-            );
-            0
-        }
-    };
-    (Some(path_str), offset)
 }
 
 /// On the driver's turn boundary that follows a probe dispatch, take

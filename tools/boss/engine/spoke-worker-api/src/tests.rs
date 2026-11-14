@@ -653,6 +653,18 @@ async fn done_watermark_is_the_observed_source_not_the_ingested_cursor() {
     let stored = proposals(&gateway);
     assert_eq!(stored[0].transcript_through, 5000);
     assert_eq!(stored[0].transcript_generation, "1-0");
+    assert_eq!(stored[0].capture_epoch, 1);
+    let captured = records(&gateway);
+    let marker = captured
+        .iter()
+        .find(|r| matches!(&r.body, Some(record::Body::Gap(g)) if g.resource == "output:concluded:1"))
+        .unwrap();
+    let proposed = captured
+        .iter()
+        .find(|r| matches!(&r.body, Some(record::Body::Proposal(_))))
+        .unwrap();
+    assert!(marker.sequence < proposed.sequence, "done captures before its proposal");
+
     // An unresolvable source is explicit evidence, never a silent zero.
     std::fs::remove_file(root.path().join("transcript.log")).unwrap();
     success(
@@ -1223,6 +1235,17 @@ async fn a_turn_stop_captures_outputs_while_the_worker_stays_alive() {
     assert!(streamed.last().is_some_and(|c| c.eof));
     assert!(String::from_utf8_lossy(&streamed[0].data).contains("/pull/123"));
     assert!(crate::captures_concluded(&gateway.journal, &execution).unwrap());
+    assert!(records(&gateway).iter().any(|r| matches!(
+        &r.body,
+        Some(record::Body::Gap(g)) if g.resource == "output:concluded:1"
+    )));
+    drop(gateway);
+    let restarted = open(root.path());
+    assert_eq!(crate::note_turn_stop(&restarted.journal, &run).unwrap(), 2);
+    restarted.upkeep(&execution, &stamp().unwrap());
+    assert!(records(&restarted).iter().any(|r| matches!(
+        &r.body, Some(record::Body::Gap(g)) if g.resource == "output:concluded:2"
+    )));
 }
 
 #[tokio::test]

@@ -951,6 +951,10 @@ mod floor_tests {
                 Box::new(|c| driver_allocation::sol_selection::migrate(c).unwrap()),
             ),
             (
+                super::super::spoke_custody::MIGRATION_ID,
+                Box::new(|c| super::super::spoke_custody::migrate(c).unwrap()),
+            ),
+            (
                 super::super::spoke_hub::MIGRATION_ID,
                 Box::new(|c| super::super::spoke_hub::migrate(c).unwrap()),
             ),

@@ -133,6 +133,9 @@ struct DriverHookResolution {
     /// degraded to unrestricted access: a broken containment root must make
     /// transcript consumers refuse the read.
     transcript_containment_root: Result<Option<PathBuf>, String>,
+    /// When set, Stop-time consumers must not fall back to a cached transcript
+    /// path: the hub has no trusted copy for this boundary.
+    skip_cached_transcript: bool,
 }
 
 impl IncomingHookEvent {
@@ -159,6 +162,7 @@ impl IncomingHookEvent {
                     .map_err(|error| format!("{error:#}")),
                 None => Ok(None),
             },
+            skip_cached_transcript: false,
         };
         Self {
             connection: HookConnection {
@@ -172,6 +176,29 @@ impl IncomingHookEvent {
             event,
             driver_resolution,
         }
+    }
+
+    /// Point the event at a transcript the hub itself holds for the run, read
+    /// beneath `containment_root`. A spoke's transcript lives on another host,
+    /// where the driver's own containment root means nothing; the hub's copy is
+    /// confined to the run's custody directory instead.
+    pub fn with_transcript_source(mut self, path: String, containment_root: PathBuf) -> Self {
+        self.transcript_path = Some(path);
+        self.driver_resolution.transcript_containment_root = Ok(Some(containment_root));
+        self
+    }
+
+    /// Do not substitute a previously cached path when this event carries no
+    /// hub transcript copy. A Stop dispatched without a source must surface
+    /// unavailable evidence rather than a copy custody has marked untrustworthy.
+    pub fn without_cached_transcript(mut self) -> Self {
+        self.driver_resolution.skip_cached_transcript = true;
+        self
+    }
+
+    /// Whether Stop-time consumers must not fall back to a cached transcript.
+    pub fn skip_cached_transcript(&self) -> bool {
+        self.driver_resolution.skip_cached_transcript
     }
 
     /// Mark this event as having fired inside a subagent.

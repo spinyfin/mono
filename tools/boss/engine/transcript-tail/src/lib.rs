@@ -238,6 +238,11 @@ impl TranscriptTail {
     /// values. Returns an empty vec if the file does not exist or has
     /// not grown.
     pub async fn poll(&mut self) -> Result<Vec<serde_json::Value>, TailError> {
+        self.poll_through(u64::MAX).await
+    }
+
+    /// Read only the prefix committed by the source ledger.
+    pub async fn poll_through(&mut self, committed: u64) -> Result<Vec<serde_json::Value>, TailError> {
         let mut file = match open_no_follow(&self.path).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -248,7 +253,7 @@ impl TranscriptTail {
         if let Some(containment) = self.containment.as_ref() {
             verify_opened_containment(&self.path, containment, &metadata).await?;
         }
-        let size = metadata.len();
+        let size = metadata.len().min(committed);
         let opened_identity = file_identity(&metadata);
         let replaced = self
             .file_identity
