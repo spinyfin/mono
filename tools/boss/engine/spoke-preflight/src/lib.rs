@@ -104,6 +104,14 @@ pub fn run_storage(config: &Config) -> Vec<Outcome> {
     ]
 }
 
+/// The credential directory inside the state directory, where the installer
+/// leaves the files below for the daemon.
+pub const CREDENTIALS_DIR: &str = "credentials";
+/// The repositories the installer was told to check, NUL-separated.
+pub const REPOS_FILE: &str = "preflight-repos";
+/// Present from enrollment until the installer's preflight has succeeded.
+pub const BOOTSTRAP_PENDING_FILE: &str = "preflight-run-pending";
+
 /// Every check. Probes run one after another, each bounded by [`PROBE_TIMEOUT`].
 pub async fn run(config: &Config) -> Vec<Outcome> {
     let mut outcomes = run_storage(config);
@@ -123,7 +131,7 @@ pub async fn run(config: &Config) -> Vec<Outcome> {
     if let Some(hub) = &config.hub {
         outcomes.push(hub_reachable(hub).await);
     }
-    match std::fs::read_to_string(config.state_dir.join("credentials/preflight-repos")) {
+    match std::fs::read_to_string(config.state_dir.join(CREDENTIALS_DIR).join(REPOS_FILE)) {
         Ok(text) => {
             let mut repos: std::collections::BTreeSet<String> = config.repos.iter().cloned().collect();
             repos.extend(text.split('\0').filter(|repo| !repo.is_empty()).map(str::to_owned));
@@ -143,7 +151,7 @@ pub async fn run(config: &Config) -> Vec<Outcome> {
         )),
     }
     if config.report_bootstrap {
-        match std::fs::symlink_metadata(config.state_dir.join("credentials/preflight-run-pending")) {
+        match std::fs::symlink_metadata(config.state_dir.join(CREDENTIALS_DIR).join(BOOTSTRAP_PENDING_FILE)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => outcomes.push(Outcome::of(
                 "preflight_run",

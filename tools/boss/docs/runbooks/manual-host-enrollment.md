@@ -4,21 +4,21 @@ Install the signed spoke package by hand, enroll the host's identity with a sing
 
 **Enrollment establishes identity and an authenticated management stream; it does not enable dispatch.** Hub host registration, launch-path configuration and promotion to `spoke_ready` have no supported production command yet. Preflight reports are sent to the hub but are not consumed by its scheduler. Do not use this runbook to commission worker capacity.
 
-**Package installation is a one-time step**, and afterwards the host keeps itself current through the update helper the package installs (see [Upgrades](#upgrades)). **Certificate replacement is currently recurring maintenance** because the daemon does not renew its own certificate (see [Certificate lifetime](#certificate-lifetime)). Nobody reinstalls, SSHes in or runs a cron job to update a host.
+**Package installation is a one-time step**, and the package installs an update helper that can apply signed releases (see [Upgrades](#upgrades)). Two pieces are not built yet: the hub does not offer releases, so a host stays on the release it was installed with, and the daemon does not renew its own certificate, so until it does an administrator replaces each host's certificate by hand every 30 days (see [Certificate lifetime](#certificate-lifetime)).
 
 Two people may be involved: the **hub operator** (runs `bossctl` where the hub's credential state lives) and the **host installer** (has root on the new machine). They can be the same person. The only thing that passes between them is the token, which is single use, bound to one host id and valid for 15 minutes.
 
 ## What you need
 
-| Input                                              | Where it comes from                                                                                                                                                              |
-| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A host id, e.g. `build-box-1`                      | You choose it. Starts with a letter or digit, then letters, digits, `.`, `_`, `-`. It never changes after the first install: the host's journal belongs to it.                   |
-| The platform's release assets                      | `boss-spoke-<platform>.tar.gz`, `.manifest.json`, `.manifest.json.sig` and `boss-spoke-package-<platform>` from the spoke release (`macos-arm64`, `linux-amd64`, `linux-arm64`). |
-| The release public key and its fingerprint         | The release owner. Confirm the fingerprint with them before trusting the key.                                                                                                    |
-| The hub's address, e.g. `https://hub.example:7443` | The hub's `BOSS_HUB_LISTEN` address as hosts reach it.                                                                                                                           |
-| The hub's CA, as a PEM file (`hub-ca.pem`)         | The CA that signed the hub's TLS certificate (`BOSS_HUB_TLS_CERT`). It is what the spoke trusts the hub with; it is not the host-credential CA.                                  |
-| An enrollment token                                | The hub operator, step 1.                                                                                                                                                        |
-| Driver and GitHub logins for the service user      | You, step 4.                                                                                                                                                                     |
+| Input                                              | Where it comes from                                                                                                                                                                                                   |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A host id, e.g. `build-box-1`                      | You choose it. Starts with a letter or digit, then letters, digits, `.`, `_`, `-`. It never changes after the first install: the host's journal belongs to it.                                                        |
+| The platform's release assets                      | `boss-spoke-<platform>.tar.gz`, `.manifest.json`, `.manifest.json.sig`, `boss-spoke-package-<platform>` and `boss-spoke-package-<platform>.sig` from the spoke release (`macos-arm64`, `linux-amd64`, `linux-arm64`). |
+| The release public key and its fingerprint         | The release owner. Confirm the fingerprint with them before trusting the key.                                                                                                                                         |
+| The hub's address, e.g. `https://hub.example:7443` | The hub's `BOSS_HUB_LISTEN` address as hosts reach it.                                                                                                                                                                |
+| The hub's CA, as a PEM file (`hub-ca.pem`)         | The CA that signed the hub's TLS certificate (`BOSS_HUB_TLS_CERT`). It is what the spoke trusts the hub with; it is not the host-credential CA.                                                                       |
+| An enrollment token                                | The hub operator, step 1.                                                                                                                                                                                             |
+| Driver and GitHub logins for the service user      | You, step 4.                                                                                                                                                                                                          |
 
 On the hub, the listener must already be configured (`BOSS_HUB_LISTEN`, `BOSS_HUB_CREDENTIALS_DIR`, `BOSS_HUB_TLS_CERT`, `BOSS_HUB_TLS_KEY`; all four or none, see `engine/core/src/hub.rs`). Until they are set the hub accepts no spokes and enrollment cannot succeed.
 
@@ -43,7 +43,7 @@ Move the file to the host over any channel you already trust (console paste, `sc
 
 ## 2. Install the package (host installer, as root)
 
-Everything here runs as root on the new host. Put the five release assets, `release.pub` and `hub-ca.pem` in a scratch directory, owned by root.
+Everything here runs as root on the new host. Put the five release assets (the table above lists them), `release.pub` and `hub-ca.pem` in a scratch directory, owned by root.
 
 **Verify before running anything.** Check the fingerprint of the release key with the release owner, then verify the installer itself against the signed manifest as described under [Verifying the first-run installer](../../spoke-package/README.md#verifying-the-first-run-installer). Then:
 
@@ -168,12 +168,14 @@ Task execution and PR publication cannot be verified through this enrollment flo
 
 ## Upgrades
 
-You do not upgrade a host by hand. The package installs a root-run **update helper** (a systemd path unit on Linux, launchd `WatchPaths` on macOS). When the hub offers a newer signed release, the running daemon asks the helper to apply it. The helper then:
+The package installs a root-run **update helper** (a systemd path unit on Linux, launchd `WatchPaths` on macOS). When the hub offers a newer signed release, the running daemon asks the helper to apply it. The helper then:
 
 1. fetches the manifest, signature and package **only from the origin pinned at install** and verifies them against the **root-pinned release key**;
 2. refuses anything that fails, targets another platform, or would leave the host's journal unreadable;
 3. stages the release, switches `current`, and restarts only the daemon, so tmux workers and the journal stay up;
 4. requires lock, journal, inventory and a management handshake within two minutes, and otherwise **rolls back to `previous` by itself**.
+
+> **Status: the hub does not offer releases yet.** The daemon and helper handle an offer, but no hub code sends one, so a host enrolled with this runbook stays on the release it was installed with. Until the hub side exists, move a host to a newer release by running the signed `install` again with the **same `--host-id`**, hub URL and CA, exactly as in [Disaster recovery](#disaster-recovery) steps 2 to 5; that reinstall is not rolled back automatically if it fails, so do it on one host first.
 
 The `boss-worker` user cannot write release binaries, `current`, the pinned key or the service definitions.
 

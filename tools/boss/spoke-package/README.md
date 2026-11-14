@@ -157,8 +157,10 @@ daemon over a live tmux session).
 
 ### Upgrades
 
-Package installation is one-time, but certificate replacement currently requires
-manual re-enrollment before the 30-day expiry; the daemon does not yet renew.
+Two pieces are not built yet: the hub does not offer releases (nothing sends the
+daemon an `Upgrade`, so a host stays on its installed release), and the daemon
+does not renew its certificate, so certificate replacement currently requires
+manual re-enrollment before the 30-day expiry.
 The first install also writes a root-run helper
 (systemd path unit / launchd WatchPaths) that applies a request the service
 user drops into `update-request/`. The helper claims that file into an

@@ -16,11 +16,13 @@
 //!   [`boss_protocol::WorkerEvent`].
 //! - [`proposal`]: the `proposal-json/1` envelope, run-write contracts, and
 //!   the wire-kind mapping both ends of a queued proposal must share.
+//! - [`enrollment_token`]: the enrollment token text form and the manual job id.
 //! - [`identity`]: the `urn:boss:host:<id>` certificate identity.
 //!
 //! The crate depends on `boss-protocol` for the shared event types and on
 //! nothing in the engine; transport, journal and policy live in later crates.
 
+pub mod enrollment_token;
 pub mod identity;
 pub mod limits;
 pub mod negotiate;

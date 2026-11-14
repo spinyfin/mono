@@ -92,10 +92,7 @@ pub struct HostSummary {
     pub token_expires_at: Option<SystemTime>,
 }
 
-/// The job id every manually minted token is bound to. A manual enrollment has
-/// no provisioning job behind it, so the token names this fixed one; the token
-/// itself is what is single-use and host-bound.
-pub const MANUAL_JOB_ID: &str = "manual-enrollment";
+pub use boss_protocol_spoke::enrollment_token::MANUAL_JOB_ID;
 
 impl HostCredentials {
     /// Opens (creating on first use) the credential state under `dir`: the

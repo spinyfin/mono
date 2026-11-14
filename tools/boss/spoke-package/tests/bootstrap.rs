@@ -19,8 +19,7 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine as _;
 use boss_host_enrollment::{
-    Denial, EnrollmentService, HostAuthorizer as _, HostCredentials, HostState, MANUAL_JOB_ID, Policy, ServiceLimits,
-    SystemClock,
+    Denial, EnrollmentService, HostAuthorizer as _, HostCredentials, HostState, Policy, ServiceLimits, SystemClock,
 };
 use boss_spoke_package::bootstrap::{self, Failure, Options};
 use boss_spoke_package::install::{self, Account, Health, Host, Layout, Request, RunOutput};
@@ -325,8 +324,7 @@ fn authorize(hub: &Hub, der: Vec<u8>) -> Result<boss_host_enrollment::Authorized
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_bootstrap_and_the_hub_agree_on_the_token_format_and_job() {
-    assert_eq!(bootstrap::MANUAL_JOB_ID, MANUAL_JOB_ID);
+fn the_bootstrap_decodes_a_token_the_hub_minted() {
     let hub = Hub::start();
     let text = hub.mint("any-host");
     assert_eq!(bootstrap::decode_token(&format!("{text}\n")).unwrap().len(), 32);
@@ -445,7 +443,7 @@ fn replacing_the_identity_without_repos_keeps_the_persisted_repository_checks() 
     };
     assert!(failed.iter().any(|name| name == "repo_access"), "{failed:?}");
     assert_ne!(host.leaf_der(), before, "the replacement enrolled a new identity");
-    let kept = fs::read(host.credentials().join("preflight-repos")).unwrap();
+    let kept = fs::read(host.credentials().join(boss_spoke_preflight::REPOS_FILE)).unwrap();
     assert_eq!(
         kept,
         repos[0].as_bytes(),

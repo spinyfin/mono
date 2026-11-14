@@ -69,6 +69,7 @@ rust_test(
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/spoke-journal",
         "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/engine/spoke-preflight",
         "//tools/boss/protocol-spoke",
     ] + all_crate_deps(
         normal = True,

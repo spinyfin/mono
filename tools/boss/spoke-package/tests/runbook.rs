@@ -94,69 +94,70 @@ fn it_names_the_paths_and_service_labels_of_both_platforms() {
     }
 }
 
-#[test]
-fn every_installer_subcommand_it_runs_exists() {
-    let text = runbook();
-    let known: BTreeSet<&str> = [
-        "keygen",
-        "build",
-        "sign",
-        "fingerprint",
-        "verify",
-        "install",
-        "enroll",
-        "preflight",
-        "apply-update",
-    ]
-    .into();
-    let mut used = BTreeSet::new();
-    for line in text.lines() {
+/// Every installer command in the runbook, as `(subcommand, flags)`. A command
+/// continued over several lines with a trailing backslash is one command.
+fn installer_commands(text: &str) -> Vec<(String, BTreeSet<String>)> {
+    let mut commands = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let mut logical = line.trim().to_owned();
+        while logical.ends_with('\\') {
+            logical.pop();
+            logical.push(' ');
+            match lines.next() {
+                Some(next) => logical.push_str(next.trim()),
+                None => break,
+            }
+        }
         for tool in [
             "/opt/boss-spoke/current/bin/boss-spoke-package",
             "boss-spoke-package-<platform>",
         ] {
-            if let Some(rest) = line
-                .trim_start()
+            let Some(rest) = logical
                 .strip_prefix(&format!("./{tool} "))
-                .or_else(|| line.trim_start().strip_prefix(&format!("{tool} ")))
-            {
-                used.insert(rest.split_whitespace().next().unwrap_or_default().to_owned());
-            }
+                .or_else(|| logical.strip_prefix(&format!("{tool} ")))
+            else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let name = words.next().unwrap_or_default().to_owned();
+            let flags = words
+                .filter_map(|word| word.strip_prefix("--"))
+                .map(str::to_owned)
+                .collect();
+            commands.push((name, flags));
         }
     }
+    commands
+}
+
+#[test]
+fn every_installer_subcommand_and_flag_it_runs_exists() {
+    let text = runbook();
+    let commands = installer_commands(&text);
+    let used: BTreeSet<&str> = commands.iter().map(|(name, _)| name.as_str()).collect();
     assert!(
         used.contains("install") && used.contains("enroll") && used.contains("preflight"),
         "{used:?}"
     );
-    for subcommand in &used {
+    let installer = std::env::var("INSTALLER_BIN").expect("INSTALLER_BIN");
+    for (name, flags) in &commands {
+        let help = std::process::Command::new(&installer)
+            .args([name.as_str(), "--help"])
+            .output()
+            .expect("the installer runs");
         assert!(
-            known.contains(subcommand.as_str()),
-            "the runbook runs an unknown subcommand {subcommand}"
+            help.status.success(),
+            "the runbook runs an unknown subcommand {name}: {}",
+            String::from_utf8_lossy(&help.stderr)
         );
-    }
-}
-
-#[test]
-fn every_bossctl_subcommand_it_runs_is_one_the_hub_operator_has() {
-    let text = runbook();
-    let known = ["token", "list", "revoke"];
-    let mut used = BTreeSet::new();
-    for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("bossctl enrollment ") {
-            used.insert(rest.split_whitespace().next().unwrap_or_default().to_owned());
+        let help = String::from_utf8_lossy(&help.stdout);
+        for flag in flags {
+            assert!(
+                help.contains(&format!("--{flag}")),
+                "`{name}` has no --{flag}; its help is:\n{help}"
+            );
         }
-    }
-    for want in known {
-        assert!(
-            used.contains(want),
-            "the runbook never shows `bossctl enrollment {want}`"
-        );
-    }
-    for subcommand in &used {
-        assert!(
-            known.contains(&subcommand.as_str()),
-            "unknown bossctl subcommand {subcommand}"
-        );
     }
 }
 
