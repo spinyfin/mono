@@ -42,7 +42,7 @@ pub struct Spec {
 
 impl Spec {
     pub fn credentials_dir(&self) -> PathBuf {
-        self.state_dir.join("credentials")
+        boss_spoke_preflight::credentials_dir(&self.state_dir)
     }
 
     pub fn homes_dir(&self) -> PathBuf {

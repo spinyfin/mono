@@ -70,6 +70,10 @@ impl Layout {
         self.home().join("spoke")
     }
 
+    pub fn credentials_dir(&self) -> PathBuf {
+        boss_spoke_preflight::credentials_dir(&self.state_dir())
+    }
+
     pub fn release_dir(&self, release_id: &str) -> PathBuf {
         self.prefix().join("releases").join(release_id)
     }
@@ -900,7 +904,7 @@ pub(crate) fn resolve_pinned_key(layout: &Layout) -> Result<crate::manifest::Tru
 /// and creates the file through it, so a directory or file the service user
 /// swaps for a symlink cannot redirect the write.
 pub(crate) fn write_credential_file(layout: &Layout, account: &Account, name: &str, bytes: &[u8]) -> Result<()> {
-    let dir = secure_fs::open_dir(layout.base(), &layout.state_dir().join("credentials"))
+    let dir = secure_fs::open_dir(layout.base(), &layout.credentials_dir())
         .context("the credentials directory is missing or was replaced")?;
     secure_fs::verify_user_dir(&dir, account, true, "credentials")?;
     secure_fs::write_file_at(&dir, name, bytes, 0o600, Some(account))?;
@@ -909,7 +913,7 @@ pub(crate) fn write_credential_file(layout: &Layout, account: &Account, name: &s
 
 /// Removes `name` from the credentials directory; absent is fine.
 pub(crate) fn remove_credential_file(layout: &Layout, account: &Account, name: &str) -> Result<()> {
-    let dir = secure_fs::open_dir(layout.base(), &layout.state_dir().join("credentials"))
+    let dir = secure_fs::open_dir(layout.base(), &layout.credentials_dir())
         .context("the credentials directory is missing or was replaced")?;
     secure_fs::verify_user_dir(&dir, account, true, "credentials")?;
     secure_fs::unlink_file_at(&dir, name)

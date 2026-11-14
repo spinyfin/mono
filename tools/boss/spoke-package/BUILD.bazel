@@ -21,6 +21,7 @@ rust_library(
     deps = [
         "//tools/boss/engine/spoke-preflight",
         "//tools/boss/http_retry",
+        "//tools/boss/protocol-spoke",
         "//tools/boss/spoke-credentials",
     ] + all_crate_deps(normal = True),
 )
@@ -178,6 +179,7 @@ rust_test(
     deps = [
         ":spoke-package",
         "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-preflight",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
@@ -190,9 +192,15 @@ rust_test(
     name = "runbook_test",
     size = "small",
     srcs = ["tests/runbook.rs"],
-    data = ["//tools/boss/docs:runbooks/manual-host-enrollment.md"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/docs:runbooks/manual-host-enrollment.md",
+    ],
     edition = "2024",
-    env = {"RUNBOOK": "$(rootpath //tools/boss/docs:runbooks/manual-host-enrollment.md)"},
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "RUNBOOK": "$(rootpath //tools/boss/docs:runbooks/manual-host-enrollment.md)",
+    },
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

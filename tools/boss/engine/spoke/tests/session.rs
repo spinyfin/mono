@@ -192,6 +192,23 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
 }
 
 #[tokio::test]
+async fn actual_daemon_renews_a_near_expiry_certificate_and_reconnects() {
+    let mut hub = Fixture::new().await;
+    let original = std::fs::read(hub.cert_pem()).unwrap();
+    let _daemon = hub.start_checking_renewal();
+    let first = hub.connection().await;
+    first.welcome(0).await;
+    hub.expire_installed_identity();
+    let second = hub.connection().await;
+    second.welcome(0).await;
+    let renewed = std::fs::read(hub.cert_pem()).unwrap();
+    assert_ne!(
+        renewed, original,
+        "renewal must publish a new certificate before reconnecting"
+    );
+}
+
+#[tokio::test]
 async fn actual_daemon_applies_an_upgrade_offer_and_reports_the_running_release() {
     let mut hub = Fixture::new().await;
     std::fs::write(
@@ -1077,16 +1094,24 @@ printf '%s\n' '{"repos":[]}'
 #[tokio::test]
 async fn daemon_reports_pending_then_missing_driver_preflights() {
     let mut hub = Fixture::new().await;
-    std::fs::create_dir_all(hub.root().join("credentials")).unwrap();
-    for dir in [hub.root(), hub.root().join("credentials")] {
+    std::fs::create_dir_all(hub.root().join(boss_spoke_preflight::CREDENTIALS_DIR)).unwrap();
+    for dir in [hub.root(), hub.root().join(boss_spoke_preflight::CREDENTIALS_DIR)] {
         std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     }
     std::fs::write(
-        hub.root().join("credentials/preflight-repos"),
+        hub.root()
+            .join(boss_spoke_preflight::CREDENTIALS_DIR)
+            .join(boss_spoke_preflight::REPOS_FILE),
         "/nonexistent/boss-preflight-repository",
     )
     .unwrap();
-    std::fs::write(hub.root().join("credentials/preflight-run-pending"), "pending").unwrap();
+    std::fs::write(
+        hub.root()
+            .join(boss_spoke_preflight::CREDENTIALS_DIR)
+            .join(boss_spoke_preflight::BOOTSTRAP_PENDING_FILE),
+        "pending",
+    )
+    .unwrap();
     let _daemon = hub.start_without_tools();
     let mut connection = hub.connection().await;
     connection.welcome(0).await;

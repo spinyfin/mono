@@ -94,69 +94,137 @@ fn it_names_the_paths_and_service_labels_of_both_platforms() {
     }
 }
 
-#[test]
-fn every_installer_subcommand_it_runs_exists() {
-    let text = runbook();
-    let known: BTreeSet<&str> = [
-        "keygen",
-        "build",
-        "sign",
-        "fingerprint",
-        "verify",
-        "install",
-        "enroll",
-        "preflight",
-        "apply-update",
-    ]
-    .into();
-    let mut used = BTreeSet::new();
-    for line in text.lines() {
-        for tool in [
-            "/opt/boss-spoke/current/bin/boss-spoke-package",
-            "boss-spoke-package-<platform>",
-        ] {
-            if let Some(rest) = line
-                .trim_start()
-                .strip_prefix(&format!("./{tool} "))
-                .or_else(|| line.trim_start().strip_prefix(&format!("{tool} ")))
-            {
-                used.insert(rest.split_whitespace().next().unwrap_or_default().to_owned());
+fn parse_installer_invocation(text: &str) -> Option<(String, BTreeSet<String>)> {
+    let logical = text.trim();
+    for tool in [
+        "/opt/boss-spoke/current/bin/boss-spoke-package",
+        "boss-spoke-package-<platform>",
+    ] {
+        let Some(rest) = logical
+            .strip_prefix(&format!("./{tool} "))
+            .or_else(|| logical.strip_prefix(&format!("{tool} ")))
+        else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let name = words.next().unwrap_or_default().to_owned();
+        let flags = words
+            .filter_map(|word| word.strip_prefix("--"))
+            .map(str::to_owned)
+            .collect();
+        return Some((name, flags));
+    }
+    None
+}
+
+fn inline_code_spans(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        if rest.starts_with("``") {
+            // A fenced block; skip through the closing fence.
+            rest = rest.trim_start_matches('`');
+            if let Some(end) = rest.find("```") {
+                rest = &rest[end + 3..];
+            } else {
+                break;
+            }
+            continue;
+        }
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        spans.push(&rest[..end]);
+        rest = &rest[end + 1..];
+    }
+    spans
+}
+
+/// Every installer command in the runbook, as `(subcommand, flags)`. A command
+/// continued over several lines with a trailing backslash is one command.
+/// Inline code spans are parsed the same way, so flags documented only in
+/// prose still get checked.
+fn installer_commands(text: &str) -> Vec<(String, BTreeSet<String>)> {
+    let mut commands = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let mut logical = line.trim().to_owned();
+        while logical.ends_with('\\') {
+            logical.pop();
+            logical.push(' ');
+            match lines.next() {
+                Some(next) => logical.push_str(next.trim()),
+                None => break,
             }
         }
+        if let Some(command) = parse_installer_invocation(&logical) {
+            commands.push(command);
+        }
     }
+    for span in inline_code_spans(text) {
+        if let Some(command) = parse_installer_invocation(span) {
+            commands.push(command);
+        } else if let Some(rest) = span.trim().strip_prefix("enroll ") {
+            let flags = rest
+                .split_whitespace()
+                .filter_map(|word| word.strip_prefix("--"))
+                .map(str::to_owned)
+                .collect();
+            commands.push(("enroll".into(), flags));
+        }
+    }
+    commands
+}
+
+/// True when `help` documents `--flag` as its own long option, not as a prefix
+/// of a longer one (`--token` must not match `--token-file`).
+fn help_has_flag(help: &str, flag: &str) -> bool {
+    let needle = format!("--{flag}");
+    help.match_indices(&needle).any(|(index, _)| {
+        help.as_bytes()
+            .get(index + needle.len())
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-')
+    })
+}
+
+#[test]
+fn every_installer_subcommand_and_flag_it_runs_exists() {
+    let text = runbook();
+    let commands = installer_commands(&text);
+    let used: BTreeSet<&str> = commands.iter().map(|(name, _)| name.as_str()).collect();
     assert!(
         used.contains("install") && used.contains("enroll") && used.contains("preflight"),
         "{used:?}"
     );
-    for subcommand in &used {
+    let flags: BTreeSet<&str> = commands
+        .iter()
+        .flat_map(|(_, flags)| flags.iter().map(String::as_str))
+        .collect();
+    for required in ["replace-identity", "token-stdin"] {
         assert!(
-            known.contains(subcommand.as_str()),
-            "the runbook runs an unknown subcommand {subcommand}"
+            flags.contains(required),
+            "the runbook never shows --{required}; collected {flags:?}"
         );
     }
-}
-
-#[test]
-fn every_bossctl_subcommand_it_runs_is_one_the_hub_operator_has() {
-    let text = runbook();
-    let known = ["token", "list", "revoke"];
-    let mut used = BTreeSet::new();
-    for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("bossctl enrollment ") {
-            used.insert(rest.split_whitespace().next().unwrap_or_default().to_owned());
+    let installer = std::env::var("INSTALLER_BIN").expect("INSTALLER_BIN");
+    for (name, flags) in &commands {
+        let help = std::process::Command::new(&installer)
+            .args([name.as_str(), "--help"])
+            .output()
+            .expect("the installer runs");
+        assert!(
+            help.status.success(),
+            "the runbook runs an unknown subcommand {name}: {}",
+            String::from_utf8_lossy(&help.stderr)
+        );
+        let help = String::from_utf8_lossy(&help.stdout);
+        for flag in flags {
+            assert!(
+                help_has_flag(&help, flag),
+                "`{name}` has no --{flag}; its help is:\n{help}"
+            );
         }
-    }
-    for want in known {
-        assert!(
-            used.contains(want),
-            "the runbook never shows `bossctl enrollment {want}`"
-        );
-    }
-    for subcommand in &used {
-        assert!(
-            known.contains(&subcommand.as_str()),
-            "unknown bossctl subcommand {subcommand}"
-        );
     }
 }
 

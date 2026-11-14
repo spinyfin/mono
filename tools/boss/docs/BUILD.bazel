@@ -17,9 +17,13 @@ filegroup(
     visibility = ["//tools/boss/engine/core:__pkg__"],
 )
 
-# The manual enrollment runbook, read by the spoke package's runbook test so the
-# commands, paths and failure codes it documents stay equal to the shipped ones.
+# The manual enrollment runbook, read by the spoke package's runbook test and
+# bossctl's unit tests so the commands, flags, paths and failure codes it
+# documents stay equal to the shipped ones.
 exports_files(
     ["runbooks/manual-host-enrollment.md"],
-    visibility = ["//tools/boss/spoke-package:__pkg__"],
+    visibility = [
+        "//tools/boss/bossctl:__pkg__",
+        "//tools/boss/spoke-package:__pkg__",
+    ],
 )

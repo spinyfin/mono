@@ -112,21 +112,37 @@ pub(crate) fn token(
     json: bool,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let grant = match credentials.issue_manual_token(host_id, ACTOR, reauthorize) {
-        Ok(grant) => grant,
-        Err(CredentialError::Denied(Denial::Revoked)) => bail!(
-            "host {host_id} is revoked; its old certificates stay dead. Pass --reauthorize to open it again and mint a token"
+    // Claim the output file before minting: minting retires the host's earlier
+    // token, so a refused path must not cost the operator a token already in
+    // flight to the host.
+    let mut file = match token_out {
+        Some(path) => Some(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("{} must not already exist", path.display()))?,
         ),
-        Err(error) => return Err(error).with_context(|| format!("minting a token for {host_id}")),
+        None => None,
+    };
+    let minted = credentials.issue_manual_token(host_id, ACTOR, reauthorize);
+    let grant = match minted {
+        Ok(grant) => grant,
+        Err(error) => {
+            if let Some(path) = token_out {
+                let _ = std::fs::remove_file(path);
+            }
+            return match error {
+                CredentialError::Denied(Denial::Revoked) => Err(anyhow::anyhow!(
+                    "host {host_id} is revoked; its old certificates stay dead. Pass --reauthorize to open it again and mint a token"
+                )),
+                error => Err(error).with_context(|| format!("minting a token for {host_id}")),
+            };
+        }
     };
     let text = grant.token.encode();
-    if let Some(path) = token_out {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("{} must not already exist", path.display()))?;
+    if let Some(file) = file.as_mut() {
         writeln!(file, "{text}")?;
     }
     let expires = unix_secs(grant.expires_at);
@@ -165,6 +181,9 @@ pub(crate) fn list(credentials: &HostCredentials, json: bool, out: &mut dyn std:
     let now = SystemTime::now();
     for host in &hosts {
         let certificate = match &host.current {
+            // A revoked host's certificate is still on record but the hub
+            // refuses it, so its remaining validity is not worth reporting.
+            Some(_) if host.state == HostState::Revoked => "certificate revoked".to_owned(),
             Some(cert) => match cert.valid_until.duration_since(now) {
                 Ok(left) => format!("certificate valid for {}", age(left)),
                 Err(_) => "certificate expired".to_owned(),
@@ -216,7 +235,11 @@ fn row_json(host: &HostSummary) -> serde_json::Value {
         "host_id": host.host_id,
         "state": state_name(host.state),
         "certificate_serial": host.current.as_ref().map(|c| c.serial.clone()),
-        "certificate_valid_until": host.current.as_ref().map(|c| unix_secs(c.valid_until)),
+        "certificate_valid_until": host
+            .current
+            .as_ref()
+            .filter(|_| host.state != HostState::Revoked)
+            .map(|c| unix_secs(c.valid_until)),
         "token_expires_at": host.token_expires_at.map(unix_secs),
     })
 }
