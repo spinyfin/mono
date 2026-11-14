@@ -58,7 +58,11 @@ rust_test(
     name = "bossctl_test",
     size = "small",
     crate = ":bossctl",
+    # The manual enrollment runbook, whose `bossctl enrollment` commands and
+    # flags are checked against the clap definitions.
+    data = ["//tools/boss/docs:runbooks/manual-host-enrollment.md"],
     edition = "2024",
+    env = {"RUNBOOK": "$(rootpath //tools/boss/docs:runbooks/manual-host-enrollment.md)"},
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

@@ -1082,11 +1082,19 @@ async fn daemon_reports_pending_then_missing_driver_preflights() {
         std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     }
     std::fs::write(
-        hub.root().join("credentials/preflight-repos"),
+        hub.root()
+            .join(boss_spoke_preflight::CREDENTIALS_DIR)
+            .join(boss_spoke_preflight::REPOS_FILE),
         "/nonexistent/boss-preflight-repository",
     )
     .unwrap();
-    std::fs::write(hub.root().join("credentials/preflight-run-pending"), "pending").unwrap();
+    std::fs::write(
+        hub.root()
+            .join(boss_spoke_preflight::CREDENTIALS_DIR)
+            .join(boss_spoke_preflight::BOOTSTRAP_PENDING_FILE),
+        "pending",
+    )
+    .unwrap();
     let _daemon = hub.start_without_tools();
     let mut connection = hub.connection().await;
     connection.welcome(0).await;

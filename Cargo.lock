@@ -1621,6 +1621,7 @@ dependencies = [
 name = "boss-protocol-spoke"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "boss-protocol",
  "prost",
  "prost-types",
@@ -1822,6 +1823,7 @@ dependencies = [
  "bon",
  "boss-host-enrollment",
  "boss-http-retry",
+ "boss-protocol-spoke",
  "boss-spoke-credentials",
  "boss-spoke-preflight",
  "clap",

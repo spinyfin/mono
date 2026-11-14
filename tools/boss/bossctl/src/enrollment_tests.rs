@@ -79,6 +79,27 @@ fn a_token_file_is_owner_only_and_the_token_is_not_printed() {
 
     let again = token(&credentials, "edge-1", Some(&path), false, false, &mut Vec::new());
     assert!(again.is_err(), "an existing file is never overwritten");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("token file"),
+        stored,
+        "the refused command leaves the first token in place"
+    );
+    // The refused command did not mint, so the first token still enrolls.
+    enroll(
+        &credentials,
+        "edge-1",
+        &EnrollmentToken::decode(&stored).expect("decodable"),
+    );
+}
+
+#[test]
+fn a_failed_mint_leaves_no_token_file_behind() {
+    let (dir, credentials) = hub();
+    token(&credentials, "edge-1", None, false, false, &mut Vec::new()).expect("mint");
+    revoke(&credentials, "edge-1", "retired", false, &mut Vec::new()).expect("revoke");
+    let path = dir.path().join("edge-1.token");
+    token(&credentials, "edge-1", Some(&path), false, false, &mut Vec::new()).expect_err("revoked host");
+    assert!(!path.exists());
 }
 
 #[test]
@@ -185,4 +206,63 @@ fn the_operator_command_will_not_create_a_hub() {
     let error = open(Some(dir.path().to_path_buf())).err().expect("refused");
     assert!(format!("{error:#}").contains("has not initialized"), "{error:#}");
     assert!(!dir.path().join("ca").exists());
+}
+
+#[test]
+fn a_revoked_host_is_not_listed_with_a_valid_certificate() {
+    let (_dir, credentials) = hub();
+    let mut out = Vec::new();
+    token(&credentials, "edge-1", None, false, false, &mut out).expect("mint");
+    enroll(&credentials, "edge-1", &printed_token(&text(out)));
+    revoke(&credentials, "edge-1", "retired", false, &mut Vec::new()).expect("revoke");
+
+    let mut listing = Vec::new();
+    list(&credentials, false, &mut listing).expect("list");
+    let listing = text(listing);
+    assert!(listing.contains("edge-1  revoked  certificate revoked"), "{listing}");
+    assert!(!listing.contains("valid for"), "{listing}");
+
+    let mut json = Vec::new();
+    list(&credentials, true, &mut json).expect("list");
+    let value: serde_json::Value = serde_json::from_slice(&json).expect("json");
+    assert!(value["hosts"][0]["certificate_valid_until"].is_null());
+}
+
+/// Every `bossctl enrollment <subcommand> ...` the runbook shows, with the
+/// `--flags` on it, checked against the real clap definitions.
+#[test]
+fn the_runbooks_bossctl_commands_and_flags_exist() {
+    use clap::CommandFactory as _;
+
+    let runbook = std::fs::read_to_string(std::env::var("RUNBOOK").expect("RUNBOOK")).expect("runbook readable");
+    let cli = crate::Cli::command();
+    let enrollment = cli
+        .find_subcommand("enrollment")
+        .expect("bossctl has an enrollment command");
+    let mut shown = std::collections::BTreeSet::new();
+    for line in runbook.lines() {
+        let Some((_, rest)) = line.split_once("bossctl enrollment ") else {
+            continue;
+        };
+        // Inline code ends at the closing backtick; a fenced line at the end.
+        let command = rest.split('`').next().unwrap_or(rest);
+        let mut words = command.split_whitespace();
+        let name = words.next().expect("a subcommand");
+        let sub = enrollment
+            .find_subcommand(name)
+            .unwrap_or_else(|| panic!("the runbook runs unknown `bossctl enrollment {name}`"));
+        shown.insert(name.to_owned());
+        for flag in words.filter_map(|word| word.strip_prefix("--")) {
+            assert!(
+                sub.get_arguments().any(|arg| arg.get_long() == Some(flag)),
+                "`bossctl enrollment {name}` has no --{flag}"
+            );
+        }
+    }
+    for want in ["token", "list", "revoke"] {
+        assert!(
+            shown.contains(want),
+            "the runbook never shows `bossctl enrollment {want}`"
+        );
+    }
 }

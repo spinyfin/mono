@@ -1,13 +1,11 @@
 //! The single-use enrollment secret.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use boss_protocol_spoke::enrollment_token;
 use rand::RngCore as _;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
-/// Bytes of entropy in an enrollment token (256 bits).
-pub const TOKEN_BYTES: usize = 32;
+pub use boss_protocol_spoke::enrollment_token::TOKEN_BYTES;
 
 const HASH_DOMAIN: &[u8] = b"boss.host-enrollment.token.v1\0";
 
@@ -38,14 +36,13 @@ impl EnrollmentToken {
     /// URL-safe text form, for the owner-only temporary file a provisioner
     /// delivers the secret in.
     pub fn encode(&self) -> String {
-        URL_SAFE_NO_PAD.encode(self.0)
+        enrollment_token::encode_token(&self.0)
     }
 
     /// Inverse of [`EnrollmentToken::encode`]; surrounding whitespace (a file's
     /// trailing newline) is ignored.
     pub fn decode(text: &str) -> Option<Self> {
-        let bytes = URL_SAFE_NO_PAD.decode(text.trim()).ok()?;
-        Self::from_bytes(&bytes)
+        enrollment_token::decode_token(text).map(Self)
     }
 
     /// What the hub stores. The token is already 256 random bits, so a plain

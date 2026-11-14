@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../.."
 
 [dependencies]
+base64 = { workspace = true }
 boss-protocol = { path = "../protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

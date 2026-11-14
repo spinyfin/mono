@@ -28,16 +28,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use boss_protocol_spoke::enrollment_token;
+use boss_protocol_spoke::enrollment_token::MANUAL_JOB_ID;
 use boss_spoke_credentials::{ClientError, EnrollParams, SpokeCredentials, enrollment_client};
 
 use crate::archive::INSTALLER_BINARY;
 use crate::install::{self, Health, Host, InstallRecord, Layout};
-
-/// The job id the hub binds every manually minted token to
-/// (`boss_host_enrollment::MANUAL_JOB_ID`; a test keeps the two equal).
-pub const MANUAL_JOB_ID: &str = "manual-enrollment";
 
 /// The owner-only file, inside the credentials directory, the token is handed
 /// to the service user in.
@@ -47,9 +43,6 @@ pub const TOKEN_FILE: &str = "enroll-token";
 /// until its files are published. Its presence beside a different stored
 /// identity is the evidence of an interrupted replacement.
 pub const REPLACING_MARKER: &str = "replacing-identity";
-
-/// Bytes in an enrollment token.
-const TOKEN_BYTES: usize = 32;
 
 /// Longest token file or stdin we will read; a token is 43 characters.
 pub const MAX_TOKEN_TEXT: u64 = 1024;
@@ -174,10 +167,8 @@ impl std::error::Error for Failure {}
 /// surrounding whitespace ignored). The hub's `EnrollmentToken::encode` is the
 /// other half.
 pub fn decode_token(text: &str) -> Result<Vec<u8>, Failure> {
-    URL_SAFE_NO_PAD
-        .decode(text.trim())
-        .ok()
-        .filter(|bytes| bytes.len() == TOKEN_BYTES)
+    enrollment_token::decode_token(text)
+        .map(|bytes| bytes.to_vec())
         .ok_or_else(|| {
             Failure::TokenInvalid(
                 "not an enrollment token: it must be the 43 characters `bossctl enrollment token` printed".to_owned(),
@@ -448,13 +439,18 @@ pub fn bootstrap(host: &dyn Host, options: &Options<'_>) -> Result<Report, Failu
         install::write_credential_file(
             &layout,
             &account,
-            "preflight-repos",
+            boss_spoke_preflight::REPOS_FILE,
             options.repos.join("\0").as_bytes(),
         )
         .map_err(|error| Failure::CredentialsUnwritable(format!("{error:#}")))?;
     }
-    install::write_credential_file(&layout, &account, "preflight-run-pending", b"pending")
-        .map_err(|error| Failure::CredentialsUnwritable(format!("{error:#}")))?;
+    install::write_credential_file(
+        &layout,
+        &account,
+        boss_spoke_preflight::BOOTSTRAP_PENDING_FILE,
+        b"pending",
+    )
+    .map_err(|error| Failure::CredentialsUnwritable(format!("{error:#}")))?;
     host.restart_service()
         .map_err(|error| Failure::ServiceNotRunning(format!("{error:#}")))?;
     wait_running(host, &options.health, &layout)?;
@@ -566,7 +562,7 @@ pub fn preflight_as_service_user(
         .run_as(&account, &layout.disk_environment(&spec), program, &args)
         .context("run preflight as the service user")?;
     if output.success && !storage_only {
-        install::remove_credential_file(layout, &account, "preflight-run-pending")?;
+        install::remove_credential_file(layout, &account, boss_spoke_preflight::BOOTSTRAP_PENDING_FILE)?;
     }
     let failed = failed_names(&output.output);
     Ok(PreflightRun {
@@ -618,14 +614,9 @@ mod tests {
 
     #[test]
     fn only_a_32_byte_url_safe_token_decodes() {
-        let good = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let good = enrollment_token::encode_token(&[7u8; 32]);
         assert_eq!(decode_token(&format!("{good}\n")).expect("decodes"), vec![7u8; 32]);
-        for bad in [
-            "",
-            "not base64 !",
-            &URL_SAFE_NO_PAD.encode([7u8; 31]),
-            &URL_SAFE_NO_PAD.encode([7u8; 33]),
-        ] {
+        for bad in ["", "not base64 !", "AAAA"] {
             assert_eq!(decode_token(bad).expect_err("rejected").code(), "token_invalid");
         }
     }
