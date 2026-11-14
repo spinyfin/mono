@@ -301,6 +301,28 @@ pub struct ConflictResolution {
     /// row that is not an ended deferral.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferral_end_reason: Option<String>,
+
+    /// Ordered tier decisions, including retries. Stored as a JSON TEXT
+    /// column and decoded by the work-db mapper. `conflicts list --json`
+    /// emits this as an array of objects, not a nested JSON string.
+    /// Absent on historical attempts whose routing was only logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_outcomes: Option<Vec<LadderDecision>>,
+
+    /// Latest mechanical outcome or fall-through reason, preserved when an
+    /// agent is scheduled. For direct worker routing, the scheduling reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_reason: Option<String>,
+}
+
+/// One completed conflict-ladder tier decision. `recorded_at` is the
+/// engine clock string written at persist time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LadderDecision {
+    pub outcome: String,
+    pub reason: String,
+    pub recorded_at: String,
+    pub tier: String,
 }
 
 fn default_review_watch_event_source() -> String {

@@ -5,7 +5,19 @@ use super::support::{ExpectedCommand, FakeRunner};
 use crate::command_runner::RealCommandRunner;
 
 use crate::app::errors::CubeError;
-use crate::app::jj::{is_retryable_network_error, run_jj_push};
+use crate::app::jj::{is_bookkeeping_bookmark, is_retryable_network_error, run_jj_push};
+
+#[test]
+fn is_bookkeeping_bookmark_covers_legacy_pr_aliases_and_engine_pointers() {
+    assert!(is_bookkeeping_bookmark("pr/9"));
+    assert!(is_bookkeeping_bookmark("boss-recovery/x"));
+    assert!(is_bookkeeping_bookmark("boss-base/x"));
+    assert!(is_bookkeeping_bookmark("preserved/x"));
+    assert!(is_bookkeeping_bookmark("preserved-archive/x"));
+    assert!(!is_bookkeeping_bookmark("boss/exec_x"));
+    assert!(!is_bookkeeping_bookmark("stacked-feature"));
+    assert!(!is_bookkeeping_bookmark("main"));
+}
 
 #[test]
 fn is_retryable_network_error_classifies_transient_failures() {

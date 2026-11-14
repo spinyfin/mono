@@ -93,7 +93,18 @@ async fn failed_base_read_preserves_conflict_and_does_not_run_regeneration() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("MODULE.bazel"), "merged inputs\n").unwrap();
     std::fs::write(workspace.path().join("MODULE.bazel.lock"), "<<<<<<< conflict\n").unwrap();
-    let runner = Arc::new(crate::command::FakeCommandRunner::failure("base unavailable"));
+    let runner = Arc::new(crate::command::FakeCommandRunner::sequence(
+        (0..2)
+            .map(|_| {
+                Ok(CommandOutput {
+                    success: false,
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: "base unavailable".into(),
+                })
+            })
+            .collect(),
+    ));
     let resolver = BazelModuleLockResolver::with_runner(runner.clone()).with_base_revision("main@origin".into());
     let outcome = resolver
         .resolve(
@@ -106,7 +117,46 @@ async fn failed_base_read_preserves_conflict_and_does_not_run_regeneration() {
         )
         .await;
     assert!(matches!(outcome, crate::ResolveOutcome::Failed { reason } if reason.contains("base unavailable")));
-    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("MODULE.bazel.lock")).unwrap(),
+        "<<<<<<< conflict\n"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_existing_base_lock_is_not_treated_as_absent() {
+    use crate::DeterministicResolver;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("MODULE.bazel"), "merged inputs\n").unwrap();
+    std::fs::write(workspace.path().join("MODULE.bazel.lock"), "<<<<<<< conflict\n").unwrap();
+    let runner = Arc::new(crate::command::FakeCommandRunner::sequence(vec![
+        Ok(CommandOutput {
+            success: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "object read failed".into(),
+        }),
+        Ok(CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: "MODULE.bazel.lock\n".into(),
+            stderr: String::new(),
+        }),
+    ]));
+    let resolver = BazelModuleLockResolver::with_runner(runner.clone()).with_base_revision("main@origin".into());
+    let result = resolver
+        .resolve(
+            workspace.path(),
+            &ConflictedFile {
+                path: "MODULE.bazel.lock".into(),
+                marker_count: Some(1),
+                shape: "content".into(),
+            },
+        )
+        .await;
+    assert!(matches!(result, crate::ResolveOutcome::Failed { reason } if reason.contains("object read failed")));
+    assert_eq!(runner.calls.lock().unwrap().len(), 2);
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("MODULE.bazel.lock")).unwrap(),
         "<<<<<<< conflict\n"

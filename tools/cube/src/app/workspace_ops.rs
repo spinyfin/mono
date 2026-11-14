@@ -11,7 +11,7 @@ use crate::store::Store;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
-use crate::app::jj::{ENGINE_POINTER_BOOKMARK_PREFIXES, rebase_branch_onto, run_jj, run_jj_network};
+use crate::app::jj::{is_bookkeeping_bookmark, rebase_branch_onto, run_jj, run_jj_network};
 use crate::app::pr::verify_push_reached_github;
 use crate::app::pr_head;
 use crate::app::provision::find_workspace_record;
@@ -21,6 +21,14 @@ use crate::app::reset::resolve_github_remote_for_workspace;
 /// revset (and nothing for clean ones), so an empty result means "no commit
 /// in this range carries jj's conflict flag".
 const CONFLICT_COMMITS_TMPL: &str = r#"if(conflict, commit_id ++ "\n")"#;
+
+/// Bare bookmark names on a commit, local and remote. `jj bookmark list -r`
+/// only considers local targets, so a fetched parent-PR branch with no local
+/// bookmark is invisible even with `--all-remotes`. `local_bookmarks` /
+/// `remote_bookmarks` on `jj log` include those remotes; `.name()` strips
+/// the `@remote` suffix so [`is_bookkeeping_bookmark`] classifies them.
+pub(crate) const BOOKMARK_NAMES_TMPL: &str =
+    r#"local_bookmarks.map(|b| b.name()).join("\n") ++ "\n" ++ remote_bookmarks.map(|b| b.name()).join("\n") ++ "\n""#;
 
 /// Upper bound on collapse iterations in [`try_linearize_replay_conflicts`],
 /// as a multiple of the conflicted-commit count. Each iteration removes at
@@ -501,11 +509,13 @@ fn commit_is_conflicted(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
 /// Which bookmarks on a conflicted ancestor count as a stacked-PR boundary.
 #[derive(Clone, Copy)]
 pub(super) enum BookmarkPolicy<'a> {
-    /// Any bookmark blocks the collapse (the rebase path).
+    /// Rebase path: bookkeeping pointers (`pr/<n>`, engine recovery /
+    /// preserved namespaces) are not stack boundaries, locally or on a
+    /// remote. Any other bookmark still blocks, including a parent-PR
+    /// branch that exists only as a fetched remote ref.
     Strict,
-    /// The push path: the branch about to be advanced to `@` and the engine's
-    /// own pointer namespaces are not stack boundaries. Anything else still
-    /// blocks.
+    /// Push path: same classification as [`Self::Strict`], and the branch
+    /// about to be advanced to `@` is also not a stack boundary.
     PushBranch(&'a str),
 }
 
@@ -514,23 +524,18 @@ pub(super) fn commit_has_blocking_bookmark(
     revision: &str,
     policy: BookmarkPolicy<'_>,
 ) -> Result<bool> {
-    let BookmarkPolicy::PushBranch(branch) = policy else {
-        return commit_has_bookmark(ctx, revision);
+    let skip_branch = match policy {
+        BookmarkPolicy::Strict => None,
+        BookmarkPolicy::PushBranch(branch) => Some(branch),
     };
-    let out = ctx.run(&["bookmark", "list", "-r", revision, "-T", r#"if(!remote, name ++ "\n")"#])?;
+    let out = ctx.run(&["log", "-r", revision, "--no-graph", "-T", BOOKMARK_NAMES_TMPL])?;
     Ok(out.lines().map(str::trim).any(|name| {
         !name.is_empty()
-            && name != branch
-            && !ENGINE_POINTER_BOOKMARK_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            && skip_branch.is_none_or(|branch| name != branch)
+            // These aliases were never publishable and have not been maintained
+            // since mono#3511. A leftover alias is not another PR's branch.
+            && !is_bookkeeping_bookmark(name)
     }))
-}
-
-/// Whether any bookmark points at `revision` — the stacked-PR guard.
-fn commit_has_bookmark(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
-    let out = ctx.run(&["log", "-r", revision, "--no-graph", "-T", "bookmarks"])?;
-    Ok(!out.trim().is_empty())
 }
 
 /// Position the workspace working copy on the head of a PR branch.
