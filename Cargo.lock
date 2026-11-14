@@ -1707,6 +1707,7 @@ dependencies = [
  "boss-protocol-spoke",
  "boss-spoke-custody",
  "boss-spoke-stream",
+ "boss-tmux",
  "boss-work-db",
  "prost",
  "rcgen",
@@ -1941,6 +1942,7 @@ dependencies = [
  "boss-log-files",
  "boss-shell-quote",
  "boss-worker-processes",
+ "serde_json",
  "tokio",
  "which",
 ]

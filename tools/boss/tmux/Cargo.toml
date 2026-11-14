@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../.."
 
 [dependencies]
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 boss-command-runner = { path = "../command-runner" }
 boss-log-files = { path = "../log-files" }

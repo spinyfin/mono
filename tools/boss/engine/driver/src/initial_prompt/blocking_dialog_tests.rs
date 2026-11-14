@@ -75,41 +75,18 @@ check, error = module['check_blocking_dialog'], module['BlockingDialogOnScreen']
 class View:
     def __init__(self, text): self.screen = text
     def text(self): return self.screen
-question = b'Do you want to proceed?'
-dialog = question + b'\n1. Yes\n2. No\nEsc to cancel'
-bordered = (
-    '╭───────────────────────────────────────────────────╮\n'
-    '│ Do you want to proceed?                           │\n'
-    '│ ❯ 1. Yes                                          │\n'
-    '│   2. No                                           │\n'
-    '│ Esc to cancel                                     │\n'
-    '╰───────────────────────────────────────────────────╯\n'
-    '  bypass permissions on'
-).encode()
-bordered_trust = (
-    '╭───────────────────────────────────────────────────╮\n'
-    '│ Quick safety check: Is this a project you created │\n'
-    '│ ❯ No, exit                                        │\n'
-    '│   Yes, I trust this folder                        │\n'
-    '│ Enter to confirm · Esc to cancel                  │\n'
-    '╰───────────────────────────────────────────────────╯\n'
-).encode()
-for screen, marker in [
-    (dialog, question),
-    (bordered, question),
-    (bordered_trust, b'Yes, I trust this folder'),
-    ('❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel'.encode(), b'Yes, I trust this folder'),
-    ('❯ No, exit\nYes, I accept\nEnter to confirm · Esc to cancel'.encode(), b'Yes, I accept'),
-]:
-    try: check(View(screen), [marker])
-    except error: pass
-    else: raise AssertionError('active dialog accepted')
-check(View(question), [question])
-check(View(dialog + b'\nClaude Code\n> status?'), [question])
-check(View("❯ ".encode() + dialog), [question], dialog)
+import json
+for case in json.loads(sys.argv[2]):
+    actual = None
+    try:
+        check(View(case['screen'].encode()), [m.encode() for m in case['markers']], case['payload'].encode())
+    except error as refusal:
+        actual = refusal.marker
+    assert actual == case['expected_marker'], (case['name'], actual, case['expected_marker'])
 "#,
         )
         .arg(temp.path().join("initial-prompt.py"))
+        .arg(include_str!("../../../../tmux/blocking_dialog_cases.json"))
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

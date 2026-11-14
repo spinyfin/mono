@@ -139,7 +139,14 @@ impl SpokeHostAdapter {
         }
         match ResultCode::try_from(result.code) {
             Ok(ResultCode::Ok) => {}
-            Ok(ResultCode::Rejected) => bail!("host {} rejected the spawn: {}", self.host_name(), result.reason),
+            Ok(ResultCode::Rejected) => {
+                if let Some(error) = boss_tmux::BlockingDialogOnScreen::from_rejection_reason(&result.reason) {
+                    return Err(
+                        anyhow::Error::new(error).context(format!("host {} rejected the spawn", self.host_name()))
+                    );
+                }
+                bail!("host {} rejected the spawn: {}", self.host_name(), result.reason)
+            }
             Ok(ResultCode::Absent) => bail!(
                 "the worker's session on host {} was already gone when the spawn finished: {}",
                 self.host_name(),

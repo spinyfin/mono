@@ -122,6 +122,7 @@ pub(crate) const TEST_SPAWN_TOKEN: &str = "tok-test";
 /// tests wait out the verify window instead of matching the engine's own paste.
 #[derive(Clone, Copy)]
 enum CaptureBehavior {
+    AfterInterrupt(&'static str),
     Empty,
     Fixed(&'static str),
     EchoLastPaste,
@@ -211,6 +212,11 @@ impl RecordingPaneRunner {
 
     pub(crate) fn capture_text(mut self, text: &'static str) -> Self {
         self.state.capture = CaptureBehavior::Fixed(text);
+        self
+    }
+
+    pub(crate) fn dialog_after_interrupt(mut self, text: &'static str) -> Self {
+        self.state.capture = CaptureBehavior::AfterInterrupt(text);
         self
     }
 
@@ -331,6 +337,9 @@ impl RecordingPaneRunner {
         }
         if args.iter().any(|arg| arg == "capture-pane") {
             return match self.state.capture {
+                CaptureBehavior::AfterInterrupt(text) => {
+                    Self::success(if self.escape_presses() > 0 { text } else { "" })
+                }
                 CaptureBehavior::Empty => Self::success(""),
                 CaptureBehavior::Fixed(text) => Self::success(text),
                 CaptureBehavior::EchoLastPaste => {

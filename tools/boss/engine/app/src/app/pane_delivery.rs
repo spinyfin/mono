@@ -470,47 +470,6 @@ impl ServerState {
         PaneInputPosture::resolve(activity, self.run_mid_turn_pane_input(run_id))
     }
 
-    /// Resolve the executable that must own the foreground process before any
-    /// text may enter this run's PTY. A missing or unknown driver is not a
-    /// harmless compatibility gap: without a concrete expected process the
-    /// engine cannot distinguish an agent prompt from a shell prompt.
-    ///
-    /// Prefers [`boss_work_db::WorkDb::launched_driver_slug`] — the driver
-    /// actually recorded at launch — over
-    /// [`boss_work_db::WorkDb::get_execution_driver_slug`]'s live-pin
-    /// resolution. The latter re-reads `tasks.driver` /
-    /// `products.default_driver` fresh on every call by design (correct for
-    /// spawn-time routing), so a pin applied after this run's worker already
-    /// launched would otherwise flip the expected binary out from under a
-    /// still-correctly-running worker and cause this boundary to see its
-    /// process as an unexplained mismatch. Falls back to the live
-    /// resolution only when no launch config has been recorded yet
-    /// (`record_execution_launch_config` stamps it immediately after a
-    /// successful spawn, before any pane write can reach this boundary in
-    /// production) — same semantics as before this run's launch config
-    /// existed, not a weakening of the frozen-identity guarantee once it
-    /// does.
-    fn expected_driver_binary(&self, run_id: &str) -> Result<String, PaneSendFailure> {
-        use boss_engine_driver::DriverRegistry;
-
-        let slug = self
-            .work_db
-            .launched_driver_slug(run_id)
-            .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("driver lookup failed: {err:#}")))?;
-        let slug = match slug {
-            Some(slug) => slug,
-            None => self
-                .work_db
-                .get_execution_driver_slug(run_id)
-                .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("driver lookup failed: {err:#}")))?
-                .ok_or_else(|| PaneSendFailure::DriverLivenessUnavailable("no driver recorded for run".to_owned()))?,
-        };
-        DriverRegistry::default()
-            .get(&slug)
-            .map(|driver| driver.descriptor().binary.to_owned())
-            .ok_or_else(|| PaneSendFailure::DriverLivenessUnavailable(format!("driver {slug:?} is not registered")))
-    }
-
     /// Persist and visibly reconcile a driver exit observed at the pane-input
     /// boundary. After terminalizing the execution and freeing the worker-pool
     /// claim, release the mapped pane too.
@@ -651,7 +610,10 @@ impl ServerState {
         slot_id: u8,
         text: &str,
     ) -> Result<(), PaneSendFailure> {
-        let expected_driver_binary = self.expected_driver_binary(run_id)?;
+        let driver = self
+            .pane_input_driver(run_id)
+            .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("{err:#}")))?;
+        let expected_driver_binary = driver.descriptor().binary.to_owned();
         let Some(pane) = self.worker_registry.pane_for_run(run_id) else {
             return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
                 "no worker pane mapped for that run id"
@@ -708,7 +670,18 @@ impl ServerState {
                 )));
             }
         }
-        let tmux = self.guard_pane_input(run_id, tmux).map_err(PaneSendFailure::Tmux)?;
+        if self
+            .work_db
+            .get_execution(run_id)
+            .map_err(PaneSendFailure::Tmux)?
+            .status
+            .is_terminal()
+        {
+            return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
+                "execution is terminal; pane input refused"
+            )));
+        }
+        let tmux = tmux.with_blocking_dialog_markers(driver.blocking_dialog_markers());
         // `send_keys` strips trailing newlines itself and submits
         // with a separate Return, so the caller passes the payload
         // verbatim here.

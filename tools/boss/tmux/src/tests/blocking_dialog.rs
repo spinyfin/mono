@@ -177,3 +177,38 @@ fn shared_remote_rejection_predicate_matches_host_display_envelope() {
     let capture = BlockingDialogOnScreen::delivery_attempt_reason(&"capture failed");
     assert!(!BlockingDialogOnScreen::is_delivery_rejection(&capture));
 }
+
+#[tokio::test]
+async fn shared_dialog_fixture_corpus() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!("../../blocking_dialog_cases.json")).unwrap();
+    for case in cases.as_array().unwrap() {
+        let (tmux, _) = tmux([success(case["screen"].as_str().unwrap())]);
+        let markers = case["markers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|marker| marker.as_str().unwrap().to_owned())
+            .collect();
+        let result = tmux
+            .with_blocking_dialog_markers(markers)
+            .check_blocking_dialog_excluding("worker", case["payload"].as_str().unwrap())
+            .await;
+        let actual = result
+            .err()
+            .map(|error| error.downcast::<BlockingDialogOnScreen>().unwrap().marker);
+        assert_eq!(actual.as_deref(), case["expected_marker"].as_str(), "{}", case["name"]);
+    }
+}
+
+#[test]
+fn spawn_rejection_round_trips_marker_and_rejects_unrelated_errors() {
+    for marker in [MARKER, "quoted \"marker\"", "Unicode ❯", "line\nbreak", "control\u{1b}"] {
+        let error = BlockingDialogOnScreen { marker: marker.into() };
+        assert_eq!(
+            BlockingDialogOnScreen::from_rejection_reason(&error.to_string()),
+            Some(error)
+        );
+    }
+    assert!(BlockingDialogOnScreen::from_rejection_reason("capture failed").is_none());
+    assert!(BlockingDialogOnScreen::from_rejection_reason("BlockingDialogOnScreen: invalid").is_none());
+}

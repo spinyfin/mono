@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-tmux = { path = "../../tmux" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }

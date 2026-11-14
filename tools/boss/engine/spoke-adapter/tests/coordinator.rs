@@ -1133,3 +1133,65 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
 }
 
 mod recovery;
+
+#[tokio::test]
+async fn rejected_dialog_spawn_parks_task_without_bouncing_to_todo() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    let task = fx
+        .db
+        .create_chore(
+            boss_protocol::CreateChoreInput::builder()
+                .product_id(&env.product_id)
+                .name("Dialog refused spawn")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let execution = fx
+        .db
+        .request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(&task.id)
+                .build(),
+        )
+        .unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|command| {
+                if matches!(command.body, Some(command::Body::Spawn(_))) {
+                    let reason = boss_tmux::BlockingDialogOnScreen {
+                        marker: "Do you want to proceed?".into(),
+                    }
+                    .to_string();
+                    Some(refused(command, ResultCode::Rejected, &reason))
+                } else if matches!(command.body, Some(command::Body::Stop(_))) {
+                    Some(ok(command, Some(pane(PaneLife::Exited))))
+                } else {
+                    answer(command)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("dialog spawn to fail", || {
+        fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Failed
+    })
+    .await;
+    let boss_protocol::WorkItem::Chore(task) = fx.db.get_work_item(&task.id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+    assert_eq!(task.dispatch_failed_reason, None);
+    let basis: String = fx.db.connect().unwrap().query_row(
+        "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 AND property = 'blocked_reason' ORDER BY id DESC LIMIT 1",
+        [&task.id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(basis, "blocking_dialog_on_screen");
+    assert!(task.blocked_detail.unwrap().contains("Do you want to proceed?"));
+    drop(peer);
+    env.coordinator.abort_driving_runs();
+}

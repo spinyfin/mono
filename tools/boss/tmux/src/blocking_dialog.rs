@@ -10,8 +10,8 @@ impl std::fmt::Display for BlockingDialogOnScreen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker {:?}",
-            self.marker
+            "BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker {}",
+            serde_json::to_string(&self.marker).map_err(|_| std::fmt::Error)?
         )
     }
 }
@@ -19,6 +19,14 @@ impl std::fmt::Display for BlockingDialogOnScreen {
 impl std::error::Error for BlockingDialogOnScreen {}
 
 impl BlockingDialogOnScreen {
+    /// Restore the typed refusal from the host's spawn result.
+    pub fn from_rejection_reason(reason: &str) -> Option<Self> {
+        let marker = reason.strip_prefix(
+            "BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker ",
+        )?;
+        serde_json::from_str(marker).ok().map(|marker| Self { marker })
+    }
+
     /// Prefix the host writes in front of a deliver-path error.
     pub const DELIVERY_ATTEMPTED_PREFIX: &'static str = "deliver attempted: ";
 

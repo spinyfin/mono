@@ -3,6 +3,11 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
+exports_files(
+    ["blocking_dialog_cases.json"],
+    visibility = ["//tools/boss/engine/driver:__pkg__"],
+)
+
 rust_library(
     name = "tmux",
     srcs = glob(["src/**/*.rs"]),
@@ -22,6 +27,7 @@ rust_library(
 rust_test(
     name = "tmux_test",
     size = "small",
+    compile_data = ["blocking_dialog_cases.json"],
     crate = ":tmux",
     edition = "2024",
     proc_macro_deps = all_crate_deps(

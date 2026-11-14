@@ -19,15 +19,13 @@ impl ServerState {
             !self.work_db.get_execution(run_id)?.status.is_terminal(),
             "execution is terminal; pane input refused"
         );
-        let slug = match self.work_db.launched_driver_slug(run_id)? {
-            Some(slug) => slug,
-            None => self
-                .work_db
-                .get_execution_driver_slug(run_id)?
-                .context("no driver recorded for pane input")?,
-        };
-        let driver = boss_engine_driver::DriverRegistry::default().require(&slug)?;
+        let driver = self.pane_input_driver(run_id)?;
         Ok(tmux.with_blocking_dialog_markers(driver.blocking_dialog_markers()))
+    }
+
+    pub(super) fn pane_input_driver(&self, run_id: &str) -> anyhow::Result<Arc<dyn boss_engine_driver::AgentDriver>> {
+        boss_engine_completion::driver_transcript::driver_for_spawned_execution(&self.work_db, run_id)
+            .context("no spawned driver recorded for pane input")
     }
 
     pub(super) async fn settle_spoke_dialog_failure(
