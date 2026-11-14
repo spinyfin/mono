@@ -24,6 +24,7 @@ pub mod discovery;
 pub mod git_store_guard;
 pub mod hook_settings;
 pub mod initial_prompt;
+pub mod scoped_home;
 pub mod transcript_store;
 
 /// Wall-clock cap, in seconds, on each of the two sequential subprocesses the

@@ -17,11 +17,9 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use super::environment::GrokProcessEnvironment;
-#[cfg(test)]
-use super::environment::resolve_gh_config_dir;
-#[cfg(test)]
-use super::environment::resolve_login_keychain_source;
 use super::preflight::run_worker_preflight;
+#[cfg(test)]
+use crate::scoped_home::{resolve_gh_config_dir, resolve_login_keychain_source};
 use crate::transcript_store::provision_durable_sessions;
 
 /// Env override for the root under which per-run `GROK_HOME` directories live.
@@ -38,7 +36,7 @@ pub const GROK_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_GROK_SKIP_POSTURE_ASSERT";
 
 /// Process-global lock for tests that mutate [`GROK_HOMES_ROOT_ENV`] /
 /// [`GROK_AUTH_SOURCE_ENV`] / [`GROK_SKIP_POSTURE_ASSERT_ENV`].
-pub static GROK_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK as GROK_HOMES_ENV_TEST_LOCK;
 
 /// Default leaf under the system temp when [`GROK_HOMES_ROOT_ENV`] is unset.
 pub(crate) const GROK_HOMES_DIR_NAME: &str = "boss-grok-homes";
