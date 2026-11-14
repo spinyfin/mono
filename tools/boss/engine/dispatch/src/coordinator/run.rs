@@ -682,7 +682,7 @@ impl ExecutionCoordinator {
                         .increment_pre_start_failure_count(!is_slot_busy)
                         .record_last_error(true)
                         .maybe_worker_failure_basis(
-                            blocking_dialog.then_some(crate::work::WorkerFailureBasis::BlockingDialogOnScreen.as_str()),
+                            blocking_dialog.then_some(crate::work::WorkerFailureBasis::BlockingDialogOnScreen),
                         )
                         .maybe_attention(attention)
                         .build(),

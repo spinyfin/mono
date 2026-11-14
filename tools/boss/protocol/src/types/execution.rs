@@ -378,6 +378,101 @@ pub struct CreateRunInput {
     pub transcript_path: Option<String>,
 }
 
+/// Why a worker-failure status write happened.
+///
+/// The shipped `blocked_reason` trigger records a new `worker_failed`
+/// observation for every variant, even when the displayed reason is
+/// unchanged; its repeat-observation list is generated from [`Self::ALL`].
+/// [`Self::OperatorNo`] remains the historical basis for a declined answer
+/// that parked the task; live No answers now redispatch.
+/// A delivery whose conflict resolution cannot be verified is recorded as
+/// [`Self::DeliveredWithoutPr`]: the worker declared delivery that the engine
+/// could not confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailureBasis {
+    BlockingDialogOnScreen,
+    NudgeBreaker,
+    DeclaredBlocked,
+    DeliveredWithoutPr,
+    ForeignPrBinding,
+    OperatorNo,
+}
+
+macro_rules! worker_failure_basis_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl WorkerFailureBasis {
+            /// Every basis, sharing the exhaustive string mapping.
+            pub const ALL: &'static [WorkerFailureBasis] = &[$(WorkerFailureBasis::$variant),+];
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $str),+ }
+            }
+        }
+    };
+}
+
+worker_failure_basis_variants! {
+    BlockingDialogOnScreen => "blocking_dialog_on_screen",
+    NudgeBreaker => "nudge_breaker",
+    DeclaredBlocked => "declared_blocked",
+    DeliveredWithoutPr => "delivered_without_pr",
+    ForeignPrBinding => "foreign_pr_binding",
+    OperatorNo => "operator_no",
+}
+
+impl WorkerFailureBasis {
+    /// Whether a failure with this basis is a worker's declared blocker that
+    /// was never turned into a typed question (design section 2.9): the worker
+    /// stopped and asked for a human without saying what it needs. Such a row
+    /// is not a hold; it is a progression candidate with the
+    /// `progression.stuck_after` grace waived, so it is picked up within one
+    /// sweep interval. The other bases are real failures that age like any other
+    /// stuck state, and `OperatorNo` is the owner's recorded refusal.
+    pub fn waives_progression_grace(self) -> bool {
+        matches!(self, Self::DeclaredBlocked | Self::NudgeBreaker)
+    }
+
+    /// Inverse of [`Self::as_str`]. Unknown strings are rejected so a
+    /// caller cannot stamp an unattributed basis.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|basis| basis.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for WorkerFailureBasis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for WorkerFailureBasis {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| format!("unknown worker failure basis `{s}`"))
+    }
+}
+
+#[cfg(test)]
+mod worker_failure_basis_tests {
+    use super::WorkerFailureBasis;
+    use std::str::FromStr;
+
+    #[test]
+    fn as_str_parse_and_from_str_roundtrip_every_variant() {
+        for basis in WorkerFailureBasis::ALL {
+            assert_eq!(WorkerFailureBasis::parse(basis.as_str()), Some(*basis));
+            assert_eq!(WorkerFailureBasis::from_str(basis.as_str()).unwrap(), *basis);
+            assert_eq!(basis.to_string(), basis.as_str());
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unknown_values() {
+        assert_eq!(WorkerFailureBasis::parse("not_a_basis"), None);
+        assert!(WorkerFailureBasis::from_str("not_a_basis").is_err());
+    }
+}
+
 /// Everything needed to finish the active run of an execution in one atomic
 /// DB transaction (see `WorkDb::finish_execution_run`): the execution's new
 /// status, the run's terminal status and result/error text, whether to clear
@@ -413,12 +508,12 @@ pub struct FinishExecutionRunInput {
     /// left alone.
     #[builder(default)]
     pub record_last_error: bool,
-    /// Optional `WorkerFailureBasis` string recorded on the linked work
-    /// item in this same transaction. A spawn-time blocking-dialog refusal
-    /// uses this so the dispatcher is the only writer that terminalizes
-    /// the execution: the task is parked `blocked` with that audit basis
+    /// Optional worker-failure basis recorded on the linked work item in
+    /// this same transaction. A spawn-time blocking-dialog refusal uses
+    /// this so the dispatcher is the only writer that terminalizes the
+    /// execution: the task is parked `blocked` with that audit basis
     /// rather than demoted back onto the dispatch queue.
-    pub worker_failure_basis: Option<String>,
+    pub worker_failure_basis: Option<WorkerFailureBasis>,
     pub attention: Option<CreateAttentionItemInput>,
 }
 

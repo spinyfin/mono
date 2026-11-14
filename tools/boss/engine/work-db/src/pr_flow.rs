@@ -12,67 +12,20 @@ use boss_protocol::{
 /// silently clearing it.
 pub const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 
-/// Why a worker-failure status write happened.
-///
-/// The shipped `blocked_reason` trigger records a new `worker_failed`
-/// observation for every variant, even when the displayed reason is
-/// unchanged; its repeat-observation list is generated from [`Self::ALL`].
-/// [`Self::OperatorNo`] remains the historical basis for a declined answer
-/// that parked the task; live No answers now redispatch.
-/// A delivery whose conflict resolution cannot be verified is recorded as
-/// [`Self::DeliveredWithoutPr`]: the worker declared delivery that the engine
-/// could not confirm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerFailureBasis {
-    BlockingDialogOnScreen,
-    NudgeBreaker,
-    DeclaredBlocked,
-    DeliveredWithoutPr,
-    ForeignPrBinding,
-    OperatorNo,
-}
+pub use boss_protocol::WorkerFailureBasis;
 
-macro_rules! worker_failure_basis_variants {
-    ($($variant:ident => $str:literal),+ $(,)?) => {
-        impl WorkerFailureBasis {
-            /// Every basis, sharing the exhaustive string mapping.
-            pub const ALL: &'static [WorkerFailureBasis] = &[$(WorkerFailureBasis::$variant),+];
-            pub fn as_str(self) -> &'static str {
-                match self { $(Self::$variant => $str),+ }
-            }
-        }
-    };
-}
-
-impl WorkerFailureBasis {
-    /// Whether a failure with this basis is a worker's declared blocker that
-    /// was never turned into a typed question (design section 2.9): the worker
-    /// stopped and asked for a human without saying what it needs. Such a row
-    /// is not a hold; it is a progression candidate with the
-    /// `progression.stuck_after` grace waived, so it is picked up within one
-    /// sweep interval. The other bases are real failures that age like any other
-    /// stuck state, and `OperatorNo` is the owner's recorded refusal.
-    pub fn waives_progression_grace(self) -> bool {
-        matches!(self, Self::DeclaredBlocked | Self::NudgeBreaker)
-    }
-
-    /// Inverse of [`Self::as_str`]. Unknown strings are rejected so a
-    /// `finish_execution_run` caller cannot stamp an unattributed basis.
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|basis| basis.as_str() == value)
-    }
-}
-
-/// Park an `active` / `todo` work item as `blocked: worker_failed` with
-/// `basis` on the status-audit row. Spawn-time dialog refusals go through
-/// `finish_execution_run` so this write shares that transaction instead of
-/// terminalizing the execution first.
+/// Park a work item for a worker failure (or, when `question` is set, for an
+/// awaiting-operator-answer hold) using the same status-audit writes as
+/// runtime `record_worker_failure_or_question`. Spawn-time dialog refusals
+/// go through `finish_execution_run` so this write shares that transaction
+/// instead of terminalizing the execution first.
 pub(crate) fn park_task_for_worker_failure_basis(
     tx: &rusqlite::Transaction<'_>,
     work_item_id: &str,
     diagnostic: &str,
     basis: WorkerFailureBasis,
     now: &str,
+    question: Option<&boss_protocol::OperatorQuestion>,
 ) -> Result<()> {
     let Some(task) = query_task(tx, work_item_id)?.filter(|task| task.deleted_at.is_none()) else {
         return Ok(());
@@ -85,12 +38,22 @@ pub(crate) fn park_task_for_worker_failure_basis(
                 basis.as_str(),
                 "engine",
                 "UPDATE tasks
-                 SET status = 'blocked', blocked_reason = 'worker_failed', blocked_detail = ?2,
+                 SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
                      autostart = 0, last_status_actor = 'engine', updated_at = ?3,
-                     progression_grace_waived_at = CASE WHEN ?4 THEN strftime('%s','now')
+                     progression_grace_waived_at = CASE WHEN ?5 THEN strftime('%s','now')
                                                         ELSE progression_grace_waived_at END
                  WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
-                params![work_item_id, trimmed, now, basis.waives_progression_grace()],
+                params![
+                    work_item_id,
+                    question.map_or(trimmed, |q| q.text.as_str()),
+                    now,
+                    if question.is_some() {
+                        "awaiting_operator_answer"
+                    } else {
+                        "worker_failed"
+                    },
+                    question.is_none() && basis.waives_progression_grace(),
+                ],
             )?;
         }
         TaskStatus::Blocked
@@ -116,7 +79,9 @@ pub(crate) fn park_task_for_worker_failure_basis(
                     folded,
                     now,
                     task.blocked_reason.as_deref(),
-                    basis.waives_progression_grace() && task.blocked_reason.as_deref() == Some("worker_failed"),
+                    question.is_none()
+                        && basis.waives_progression_grace()
+                        && task.blocked_reason.as_deref() == Some("worker_failed"),
                 ],
             )?;
         }
@@ -125,13 +90,20 @@ pub(crate) fn park_task_for_worker_failure_basis(
     Ok(())
 }
 
-worker_failure_basis_variants! {
-    BlockingDialogOnScreen => "blocking_dialog_on_screen",
-    NudgeBreaker => "nudge_breaker",
-    DeclaredBlocked => "declared_blocked",
-    DeliveredWithoutPr => "delivered_without_pr",
-    ForeignPrBinding => "foreign_pr_binding",
-    OperatorNo => "operator_no",
+/// Re-evaluate dependents once a prereq is a dead `blocked: worker_failed`
+/// halt. Shared by `finish_execution_run` and `record_worker_failure_or_question`.
+pub(crate) fn cascade_dependents_if_worker_failed(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    work_item_id: &str,
+    now: &str,
+) -> Result<()> {
+    if query_task(tx, work_item_id)?.is_some_and(|task| {
+        task.status == TaskStatus::Blocked && task.blocked_reason.as_deref() == Some("worker_failed")
+    }) {
+        cascade_dependents_after_prereq_status_change(pending, tx, work_item_id, "blocked", now)?;
+    }
+    Ok(())
 }
 
 /// A task held in PendingReview with no live pre-merge batch, waiting for
@@ -726,80 +698,18 @@ impl WorkDb {
         } else {
             None
         };
-        match (
+        if let (Some(task), Some(question)) = (
             query_task(&tx, &work_item_id)?.filter(|task| task.deleted_at.is_none()),
             fallback_question,
         ) {
-            (Some(task), Some(question)) => {
-                question_attention = Some(super::attentions::worker_questions::create_in_tx(
-                    &tx,
-                    &task,
-                    execution_id,
-                    question,
-                )?);
-            }
-            (Some(task), _) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
-                // A declared blocker with no typed question waives the progression
-                // grace in the same statement, with the database clock, so the
-                // stamp is never older than the ledger row the same statement
-                // writes (the candidate views compare the two).
-                crate::task_status_audit::execute(
-                    &tx,
-                    basis.as_str(),
-                    "engine",
-                    "UPDATE tasks
-                     SET status = 'blocked', blocked_reason = ?4, blocked_detail = ?2,
-                         autostart = 0, last_status_actor = 'engine', updated_at = ?3,
-                         progression_grace_waived_at = CASE WHEN ?5 THEN strftime('%s','now')
-                                                            ELSE progression_grace_waived_at END
-                     WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
-                    params![
-                        work_item_id,
-                        question.map_or(trimmed, |q| q.text.as_str()),
-                        now,
-                        if question.is_some() {
-                            "awaiting_operator_answer"
-                        } else {
-                            "worker_failed"
-                        },
-                        question.is_none() && basis.waives_progression_grace(),
-                    ],
-                )?;
-            }
-            (Some(task), _)
-                if task.status == TaskStatus::Blocked
-                    && task.blocked_reason.is_some()
-                    && (!trimmed.is_empty() || task.blocked_reason.as_deref() == Some("worker_failed")) =>
-            {
-                let folded = match task.blocked_detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    Some(existing) if trimmed.is_empty() => existing.to_owned(),
-                    Some(existing) => format!("{existing}\n\n{trimmed}"),
-                    None => trimmed.to_owned(),
-                };
-                // A repeat observation of a declared blocker is a fresh episode for
-                // the ledger (see `task_status_audit::install_property_triggers`),
-                // so it re-arms the grace waiver too.
-                crate::task_status_audit::execute(
-                    &tx,
-                    basis.as_str(),
-                    "engine",
-                    "UPDATE tasks
-                     SET blocked_detail = ?2, updated_at = ?3, blocked_reason = ?4,
-                         progression_grace_waived_at = CASE WHEN ?5 THEN strftime('%s','now')
-                                                            ELSE progression_grace_waived_at END
-                     WHERE id = ?1 AND deleted_at IS NULL AND status = 'blocked' AND blocked_reason IS NOT NULL",
-                    params![
-                        work_item_id,
-                        folded,
-                        now,
-                        task.blocked_reason.as_deref(),
-                        question.is_none()
-                            && basis.waives_progression_grace()
-                            && task.blocked_reason.as_deref() == Some("worker_failed"),
-                    ],
-                )?;
-            }
-            _ => {}
+            question_attention = Some(super::attentions::worker_questions::create_in_tx(
+                &tx,
+                &task,
+                execution_id,
+                question,
+            )?);
+        } else {
+            park_task_for_worker_failure_basis(&tx, &work_item_id, trimmed, basis, &now, question)?;
         }
 
         if question.is_some()
@@ -835,12 +745,7 @@ impl WorkDb {
         // execution, `gating_prereqs_for` no longer treats it as a gate;
         // re-evaluate dependents in this transaction so they do not wait
         // for the dep-unblock sweep.
-        if task
-            .as_ref()
-            .is_some_and(|t| t.status == TaskStatus::Blocked && t.blocked_reason.as_deref() == Some("worker_failed"))
-        {
-            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &work_item_id, "blocked", &now)?;
-        }
+        cascade_dependents_if_worker_failed(&mut pending, &tx, &work_item_id, &now)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerFailureCompletion {
             question_attention,
