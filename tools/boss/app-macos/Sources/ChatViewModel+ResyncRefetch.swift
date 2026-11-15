@@ -108,7 +108,8 @@ extension ChatViewModel {
     /// A resync arrived. Nothing is sent here; see [[fireResyncRefetch]].
     func handleResyncRequired() {
         reviewNotifier.suspendDecisionReminders()
-        let now = ContinuousClock.now
+        let clock = refetchClock
+        let now = clock.now()
         let armsTimer = resyncRefetchGate.noteResync(at: now)
         let delay = resyncRefetchGate.delay(at: now)
         // Outside a backoff the product refetch joins the coalesced burst
@@ -123,7 +124,7 @@ extension ChatViewModel {
         guard armsTimer else { return }
         pendingResyncRefetchTask?.cancel()
         pendingResyncRefetchTask = Task { [weak self] in
-            try? await Task.sleep(for: delay)
+            try? await clock.sleep(delay)
             guard !Task.isCancelled else { return }
             self?.fireResyncRefetch()
         }
@@ -161,7 +162,7 @@ extension ChatViewModel {
         guard resyncRefetchGate.isDirty else { return }
         engine.sendSubscribe(topics: ["work.decisions"])
         let productJoined = resyncRefetchGate.productBurstJoined
-        resyncRefetchGate.noteFire(at: .now)
+        resyncRefetchGate.noteFire(at: refetchClock.now())
         refreshRemediationState()
         if activityIsVisible { refreshEngineAttempts() }
         engine.sendListProducts()

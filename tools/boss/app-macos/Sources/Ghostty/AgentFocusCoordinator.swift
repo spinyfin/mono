@@ -17,6 +17,10 @@ final class AgentFocusCoordinator {
         }
     }
 
+    /// How `request` waits between two attempts. Tests replace it, so that
+    /// exhausting the retry budget takes them no real time.
+    var retrySleep: @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+
     func register(_ view: NSView, runId: String) {
         cards.setObject(view, forKey: runId as NSString)
     }
@@ -36,6 +40,7 @@ final class AgentFocusCoordinator {
 
     func request(runId: String, attempt: @escaping @MainActor () -> EngineFocusResult) {
         pending?.cancel()
+        let sleep = retrySleep
         pending = Task { @MainActor [weak self] in
             // Retry readiness for up to one second, rather than assuming a
             // fixed rendering delay. A detached terminal/card reports failure.
@@ -50,7 +55,7 @@ final class AgentFocusCoordinator {
                     self?.report(runId, result)
                     return
                 }
-                do { try await Task.sleep(for: .milliseconds(50)) }
+                do { try await sleep(.milliseconds(50)) }
                 catch { return }
             }
         }

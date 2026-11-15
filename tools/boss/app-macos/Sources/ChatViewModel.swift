@@ -83,6 +83,9 @@ final class ChatViewModel: ObservableObject {
     /// when it fires, keyed by the same product id.
     var pendingRefetchBursts: [String: PendingRefetchBurst] = [:]
     var refetchCoalescingPolicy = RefetchCoalescingPolicy.standard
+    /// The clock the per-product timers above and the resync timer below read
+    /// and sleep on. Tests replace it with one they advance by hand.
+    var refetchClock = RefetchClock.continuous
     /// Coalescing and backoff of `resync_required`, and the timer for the one
     /// refetch it has pending; see `ChatViewModel+ResyncRefetch.swift`.
     var resyncRefetchGate = ResyncRefetchGate()

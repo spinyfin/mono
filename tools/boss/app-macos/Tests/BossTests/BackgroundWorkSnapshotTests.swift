@@ -46,21 +46,40 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         XCTAssertTrue(model.backgroundWork.isEmpty)
     }
 
+    /// Waits for the polls themselves and for the poll loop to return, not
+    /// for an interval in which a number of ticks should fit, so a host whose
+    /// timers fire late makes this slower and nothing else.
     func testTimerKeepsPollingWhileConnectedAndStopsOnDisconnect() async throws {
         let model = makeModel(pollInterval: 0.05)
-        let recorder = installRecorder(on: model)
+        let recorder = PayloadRecorder()
+        // The connect poll is the first; the timer has to fire, and fire
+        // again, to send the third.
+        let thirdPoll = expectation(description: "the timer polled twice after the connect poll")
+        model.outboundRecorder = { [self] payload in
+            recorder.value.append(payload)
+            if isBackgroundPoll(payload), backgroundPolls(in: recorder).count == 3 { thirdPoll.fulfill() }
+        }
 
         model.applyEventForTest(.connected)
         XCTAssertEqual(backgroundPolls(in: recorder).count, 1)
 
-        try await Task.sleep(for: .milliseconds(250))
+        await fulfillment(of: [thirdPoll], timeout: 10)
         let whileConnected = backgroundPolls(in: recorder).count
         XCTAssertGreaterThanOrEqual(whileConnected, 3, "the five-second timer (shortened in tests) must keep polling")
         XCTAssertTrue(model.isBackgroundWorkPolling)
 
+        let pollLoop = try XCTUnwrap(model.backgroundWorkPollTask)
         model.applyEventForTest(.disconnected)
         XCTAssertFalse(model.isBackgroundWorkPolling)
-        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(pollLoop.isCancelled, "disconnect must cancel the timer, not only forget it")
+        // Once the loop has returned no later tick can send, so there is no
+        // interval to wait out and hope nothing arrives in.
+        let loopReturned = expectation(description: "the poll loop returned")
+        Task {
+            await pollLoop.value
+            loopReturned.fulfill()
+        }
+        await fulfillment(of: [loopReturned], timeout: 10)
         XCTAssertEqual(
             backgroundPolls(in: recorder).count,
             whileConnected,
@@ -411,11 +430,13 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
     }
 
     private func backgroundPolls(in recorder: PayloadRecorder) -> [[String: Any]] {
-        recorder.value.filter { payload in
-            payload["type"] as? String == "list_engine_attempts"
-                && intValue(payload, "limit") == 0
-                && payload["include_background_work"] as? Bool == true
-        }
+        recorder.value.filter(isBackgroundPoll)
+    }
+
+    private func isBackgroundPoll(_ payload: [String: Any]) -> Bool {
+        payload["type"] as? String == "list_engine_attempts"
+            && intValue(payload, "limit") == 0
+            && payload["include_background_work"] as? Bool == true
     }
 
     private func intValue(_ payload: [String: Any], _ key: String) -> Int? {

@@ -10,7 +10,8 @@ import XCTest
 ///
 /// These tests run on real timers with a short window and wait for the
 /// first request to appear rather than for a fixed time, so a slow machine
-/// delays them instead of failing them.
+/// delays them instead of failing them. The one that is about when a burst
+/// fires relative to its triggers runs on a `ManualRefetchClock` instead.
 @MainActor
 final class InvalidationRefetchCoalescingTests: XCTestCase {
 
@@ -146,29 +147,34 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
         )
     }
 
+    /// Runs on a clock the test advances, so the spacing of the triggers and
+    /// the instant each timer fires are exact however late the host's own
+    /// timers are. On real timers a late 50 ms sleep let the window close
+    /// between two triggers, or let the last burst fire before the stream
+    /// was counted.
     func testSustainedStreamStillFiresBeforeItEndsAndOnceAfter() async {
-        let (model, recorder) = makeModel(policy: .init(window: .milliseconds(100), maxWait: .milliseconds(300)))
+        let policy = RefetchCoalescingPolicy(window: .milliseconds(100), maxWait: .milliseconds(300))
+        let (model, recorder) = makeModel(policy: policy)
+        let clock = ManualRefetchClock(driving: model)
 
         // Triggers 50 ms apart never leave the 100 ms window quiet.
-        var treesWhileStreaming = 0
+        var treesAfterEachTrigger: [Int] = []
         for _ in 0..<14 {
             model.applyEventForTest(invalidation(itemIDs: ["task_1"]))
-            try? await Task.sleep(for: .milliseconds(50))
-            treesWhileStreaming = recorder.counts["get_work_tree"] ?? 0
+            await clock.advance(by: .milliseconds(50))
+            treesAfterEachTrigger.append(recorder.counts["get_work_tree"] ?? 0)
         }
-        XCTAssertGreaterThanOrEqual(
-            treesWhileStreaming, 1,
-            "the max-wait cap must refresh a board whose invalidations never pause"
+        // So only the cap can have sent anything: 300 ms after the first
+        // trigger of a burst, which is 50 ms after its sixth.
+        XCTAssertEqual(
+            treesAfterEachTrigger, [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2],
+            "the max-wait cap must refresh a board whose invalidations never pause, and the stream is still coalesced"
         )
-        XCTAssertLessThan(treesWhileStreaming, 14, "the stream is still coalesced")
 
-        await waitForBurst(model, recorder)
-        let settled = await model.waitForRefetchBurstsForTest()
-        XCTAssertTrue(settled)
-        XCTAssertGreaterThan(
-            recorder.counts["get_work_tree"] ?? 0, treesWhileStreaming,
-            "the trailing edge fires after the last trigger"
-        )
+        // The stream ends 50 ms into the window of its last trigger.
+        await clock.advance(by: policy.window)
+        XCTAssertEqual(recorder.counts["get_work_tree"], 3, "the trailing edge fires after the last trigger")
+        XCTAssertEqual(clock.timersAsleep, 0, "and nothing further is pending")
     }
 
     // MARK: - Executions consumers
