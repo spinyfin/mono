@@ -831,6 +831,29 @@ async fn grok_state_outside_the_private_root_is_not_owned() {
     assert!(supervisor.check_owned_home(&unknown).is_err());
 }
 
+#[tokio::test]
+async fn agy_state_outside_the_private_root_is_not_owned() {
+    let root = tempfile::tempdir().unwrap();
+    let supervisor = supervisor(root.path(), Arc::new(FakeTmux::default())).await;
+    let state = |home: &Path| {
+        let process_home = home.join("process-home");
+        boss_engine_driver::agy::AgyRuntimeState::builder()
+            .process_home(process_home.clone())
+            .control_dir(home.join("control"))
+            .session_settings_path(home.join("control/session-settings.json"))
+            .log_file(home.join("control/agy.log"))
+            .workspace_path(PathBuf::from("/ws"))
+            .agy_binary(PathBuf::from("/tmp/agy"))
+            .build()
+            .to_driver_runtime_state()
+    };
+    let outside = state(Path::new("/tmp/boss-agy-homes/run-1"));
+    assert!(supervisor.check_owned_home(&outside).unwrap_err().contains("outside"));
+    let inside = state(&supervisor.homes_root.join(".agy").join("run-1"));
+    assert!(supervisor.check_owned_home(&inside).is_ok());
+    assert!(input::owned_home(&inside).unwrap().ends_with("process-home"));
+}
+
 /// Pins Grok's per-run container root, auth source and transcript store for
 /// one test, restoring the previous values on drop.
 struct GrokEnv {

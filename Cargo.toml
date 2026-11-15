@@ -52,6 +52,7 @@ members = [
   "tools/boss/engine/execution-runner",
   "tools/boss/engine/pane-summary",
   "tools/boss/engine/execution-contracts",
+  "tools/boss/engine/agy-home-retention",
   "tools/boss/engine/grok-home-retention",
   "tools/boss/engine/host-enrollment",
   "tools/boss/engine/spoke-stream",

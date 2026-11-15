@@ -2109,6 +2109,19 @@ async fn serve_scoped(
         boss_engine_runtime::grok_home_retention_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic agy-home retention sweep: mirrors the Grok-home sweep
+    // immediately above, reclaiming Boss-owned per-run Antigravity run
+    // containers (`process-home/` + `control/` + `rules-root/`) past
+    // retention policy. Each home carries a SQLite conversation DB and a
+    // `brain/` tree, so unreclaimed homes are a disk-exhaustion risk.
+    // Operates only on paths stored in driver_runtime_state — never scans
+    // ~/.gemini or cwd under cube workspaces. Live (non-terminal)
+    // executions are never touched.
+    let _agy_home_retention_sweep_handle = boss_engine_runtime::agy_home_retention_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        boss_engine_runtime::agy_home_retention_sweep::DEFAULT_INTERVAL,
+    );
+
     // The evidence surface: a loopback HTTP gallery for screenshots workers
     // attached with `boss attach`, and the link a reviewer clicks from a
     // GitHub PR. Bind failure is logged and the engine carries on — see

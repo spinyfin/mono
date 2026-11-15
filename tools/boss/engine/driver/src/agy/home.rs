@@ -18,6 +18,11 @@ use super::environment::{AgyProcessEnvironment, resolve_agy_binary, skip_binary_
 #[cfg(test)]
 use crate::scoped_home::LOGIN_KEYCHAIN_LEAF;
 
+/// Process-global lock for tests that mutate [`AGY_HOMES_ROOT_ENV`]. Shared
+/// with Grok via [`crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK`] so the
+/// two drivers cannot race their homes-root overrides.
+pub use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK as AGY_HOMES_ENV_TEST_LOCK;
+
 /// Env override for the root under which per-run `agy` homes live.
 pub const AGY_HOMES_ROOT_ENV: &str = "BOSS_AGY_HOMES_DIR";
 
