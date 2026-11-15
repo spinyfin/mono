@@ -405,11 +405,8 @@ async fn dispatch_probe_defers_when_worker_not_accepting_input() {
     );
 }
 
-/// When the activity guard passes (worker Idle) but the CLI never
-/// confirms the write, the corrected probe-6 understanding still
-/// applies: do **not** auto-redeliver. Lifecycle is Unconfirmed and a
-/// ProbeDeliveryEscalated push is emitted. This is the post-guard
-/// observability path; mid-turn refusal is covered separately.
+/// An idle write stays pending through bounded Return retries. Failure then
+/// releases its claim and publishes escalation without typing the text again.
 #[tokio::test(start_paused = true)]
 async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
     use boss_protocol::WorkerEvent;
@@ -454,9 +451,26 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
         "the pane write itself must have gone out; calls={:?}",
         runner.calls(),
     );
-    assert!(
-        server_state.take_in_flight_probe(&run_id).is_some(),
-        "unconfirmed delivery keeps the in-flight slot so a later reply is still captured",
+    assert!(server_state.probe_awaiting_turn_start(&run_id, &probe_id));
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Injected),
+    );
+    let retries = crate::app::parked_delivery::RETURN_RETRIES;
+    tokio::time::sleep(
+        crate::app::parked_delivery::TURN_START_CONFIRM_TIMEOUT * (retries + 1) + Duration::from_secs(5),
+    )
+    .await;
+    assert!(!server_state.has_in_flight_probe(&run_id));
+    assert_eq!(runner.return_presses(), 1 + retries as usize);
+    assert_eq!(
+        runner
+            .calls()
+            .iter()
+            .filter(|call| call.iter().any(|arg| arg == "-l"))
+            .count(),
+        1,
+        "Return retries must never type a second copy of the probe",
     );
     assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
