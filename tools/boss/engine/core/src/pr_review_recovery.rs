@@ -481,8 +481,9 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
         }
 
         // A memberless execution left by an older fallback must not take
-        // ownership away from batch recovery. Failed batches also stay on
-        // the batch path: deferred admission replaces them within its cap.
+        // ownership away from batch recovery. Any failed newest batch also
+        // retains ownership, including exhausted or non-remintable failures:
+        // legacy recovery must not circumvent the batch retry limits.
         let batches = work_db
             .resolve_review_cycle_root(&work_item_id)
             .and_then(|root| work_db.review_batches_for_cycle_root(&root));
@@ -492,15 +493,24 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
                     .iter()
                     .filter(|batch| batch.phase == boss_protocol::ReviewBatchPhase::PreMerge);
                 let newest = pre_merge.next();
-                let batch_owns_recovery = newest
-                    .is_some_and(|batch| batch.status != boss_protocol::ReviewBatchStatus::Completed)
-                    || pre_merge.any(|batch| {
-                        !matches!(
-                            batch.status,
-                            boss_protocol::ReviewBatchStatus::Completed | boss_protocol::ReviewBatchStatus::Failed
-                        )
+                let owning_batch = newest
+                    .filter(|batch| batch.status != boss_protocol::ReviewBatchStatus::Completed)
+                    .or_else(|| {
+                        pre_merge.find(|batch| {
+                            !matches!(
+                                batch.status,
+                                boss_protocol::ReviewBatchStatus::Completed | boss_protocol::ReviewBatchStatus::Failed
+                            )
+                        })
                     });
-                if batch_owns_recovery {
+                if let Some(batch) = owning_batch {
+                    tracing::info!(
+                        work_item_id,
+                        dead_execution_id,
+                        batch_id = %batch.id,
+                        batch_status = ?batch.status,
+                        "pr_review recovery: batch owns review; skipping memberless legacy recovery",
+                    );
                     continue;
                 }
             }

@@ -2179,14 +2179,24 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
     )
 }
 
+/// Legacy admission was refused because the batch retains the review hold.
+#[derive(Debug)]
+pub struct LiveReviewBatchOwnsCycle(pub String);
+
+impl std::fmt::Display for LiveReviewBatchOwnsCycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a live pre_merge review batch owns cycle {}", self.0)
+    }
+}
+
+impl std::error::Error for LiveReviewBatchOwnsCycle {}
+
 /// Legacy admission must check batch ownership under the same write lock as
 /// insertion. Sweep-level checks alone race a concurrent batch admission.
 pub(crate) fn ensure_no_live_review_batch(conn: &Connection, work_item_id: &str) -> Result<()> {
     let cycle_root = super::chain_helpers::chain_root(conn, work_item_id)?;
     if super::review_batches::has_live_pre_merge_review_batch_in(conn, &cycle_root)? {
-        bail!(
-            "cannot enqueue a legacy review for {work_item_id}: a live pre_merge review batch owns cycle {cycle_root}"
-        );
+        return Err(LiveReviewBatchOwnsCycle(cycle_root).into());
     }
     Ok(())
 }

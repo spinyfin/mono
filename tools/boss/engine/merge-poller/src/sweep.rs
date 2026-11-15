@@ -2733,6 +2733,8 @@ pub use crate::work::stored_pr_number;
 
 /// Argument bundle for [`sweep_stalled_reviewer`]; `review_result_written`
 /// says the latest review execution recorded an informative `ReviewResult`.
+/// A live pre-merge batch retains the hold even when this is true, regardless
+/// of the fan-out flag; its consolidated verdict owns advancement.
 pub struct StalledReview<'a> {
     pub task_id: &'a str,
     pub product_id: &'a str,
@@ -2749,6 +2751,8 @@ pub struct StalledReview<'a> {
 /// reviewer pass either finished without advancing it (missed Stop hook) or
 /// ran past the stale threshold. A pass with a durable `ReviewResult` may
 /// advance to `in_review`; a pass without one stays in Doing and is re-fired.
+/// A live pre-merge batch suppresses both advancement and re-firing, including
+/// when a prior execution has written a result; the batch owns its verdict.
 ///
 /// Incident (2026-07-04, PR spinyfin/mono#1766): this fallback used
 /// to ONLY unstick the kanban lane, silently leaving the PR with no completed

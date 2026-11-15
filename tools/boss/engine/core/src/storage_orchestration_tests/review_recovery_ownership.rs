@@ -15,7 +15,12 @@ const REPO: &str = "https://github.com/example/repo";
 
 #[tokio::test]
 async fn legacy_recovery_respects_live_ownership_but_not_completed_history() {
-    for completed in [false, true] {
+    for (status, generation, refires) in [
+        ("collecting", 1, false),
+        ("completed", 1, true),
+        ("failed", crate::work::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS, false),
+        ("failed", 1, false),
+    ] {
         let (_dir, db) = open_db();
         let db = Arc::new(db);
         let product = create_test_product_with_repo(&db, "legacy recovery", Some(REPO));
@@ -34,14 +39,12 @@ async fn legacy_recovery_respects_live_ownership_but_not_completed_history() {
                     .build()],
             )
             .unwrap();
-        if completed {
-            raw(&db)
-                .execute(
-                    "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
-                    [&batch.id],
-                )
-                .unwrap();
-        }
+        raw(&db)
+            .execute(
+                "UPDATE pr_review_batches SET status = ?2, generation = ?3 WHERE id = ?1",
+                rusqlite::params![batch.id, status, generation],
+            )
+            .unwrap();
         db.create_execution(
             CreateExecutionInput::builder()
                 .work_item_id(&root.id)
@@ -51,12 +54,12 @@ async fn legacy_recovery_respects_live_ownership_but_not_completed_history() {
         )
         .unwrap();
         let outcome = recover(&db).await;
-        assert_eq!(outcome.refired, usize::from(completed));
+        assert_eq!(outcome.refired, usize::from(refires));
         assert_eq!(outcome.error_skipped, 0);
         assert_eq!(outcome.churn_skipped, 0);
         assert_eq!(
             db.list_executions(Some(&root.id)).unwrap().len(),
-            1 + usize::from(completed)
+            1 + usize::from(refires)
         );
     }
 }
@@ -103,11 +106,13 @@ async fn live_batch_prevents_fallback_minting_a_memberless_reviewer() {
             ExecutionStatus::Orphaned
         );
     }
-    // All leaves died, but the batch still owns their retries. Previously
-    // the fallback saw no live execution and minted a legacy reviewer that
-    // the spawn-time membership check refused.
+    // Every leaf is terminal but the batch still owns their retries, so the
+    // fallback must not enqueue a memberless legacy reviewer.
     for task_id in [&root.id, &revision] {
-        for fanout in [true, false] {
+        for (fanout, review_result_written) in [(true, false), (false, false), (true, true), (false, true)] {
+            raw(&db)
+                .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [task_id])
+                .unwrap();
             let mut outcome = crate::merge_poller::SweepOutcome::default();
             crate::merge_poller::sweep_stalled_reviewer(
                 &db,
@@ -116,7 +121,7 @@ async fn live_batch_prevents_fallback_minting_a_memberless_reviewer() {
                     task_id,
                     product_id: &product.id,
                     pr_url: PR_URL,
-                    review_result_written: false,
+                    review_result_written,
                     skip_unbatched_review_holds: fanout,
                 },
                 &FakePrStateChecker::always(PrOpenState::Open),
@@ -124,6 +129,12 @@ async fn live_batch_prevents_fallback_minting_a_memberless_reviewer() {
             )
             .await;
             assert_eq!(outcome.reviewer_fallback_review_refired, 0);
+            assert_eq!(outcome.reviewer_fallback_advanced, 0);
+            let task = db.get_work_item(task_id).unwrap();
+            let (boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task)) = task else {
+                panic!("expected task");
+            };
+            assert_eq!(task.status, boss_protocol::TaskStatus::Active);
         }
         // Also exercise the atomic guard: a batch may have been admitted
         // after a sweep checked ownership but before it requests a review.

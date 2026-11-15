@@ -119,6 +119,8 @@ impl WorkDb {
     /// Returns `(execution, is_new)`; `is_new = false` means an existing
     /// live/non-terminal `pr_review` execution was reused rather than a
     /// duplicate being created.
+    /// Returns [`LiveReviewBatchOwnsCycle`] when a live batch owns the cycle,
+    /// even if a legacy execution exists; callers must preserve the review hold.
     pub fn create_pr_review_execution_dedup(
         &self,
         work_item_id: &str,
