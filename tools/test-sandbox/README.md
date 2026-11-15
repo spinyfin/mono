@@ -269,16 +269,41 @@ INFO: 21 processes: 314 action cache hit, 13 internal, 16 remote.
 
 Two limits of a remote run are worth knowing:
 
-- Bazel does not set `TMPDIR` for a remote test action, so `MONO_TEST_HOST_TMPDIR` is empty on a worker. The Xcode capability then adds no `NSIRD_xctest_` write exception (stricter than local), and `xcode_capability_retains_the_write_allowlist` has no host temp directory to probe.
 - A run lands on whichever worker the scheduler picks. One green run says nothing about the other workers.
+- Timers fire late on the workers this was measured against. In a test action there, a 50 ms sleep returned after a median of about 180 ms and at most 200 ms, against 55 ms on the client, while a busy loop in the same action got a full CPU. A test that needs real timers to keep a cadence of tens of milliseconds can fail remotely for that reason alone, which says nothing about the sandbox.
+
+### Host tools a single test declares
+
+`@host_lsof//:lsof` and `@worker_zsh//:zsh` are system binaries that one or two tests declare in `data`, kept out of the shared runtime so no other test can run them. Both were `repository_ctx.symlink` links and failed remotely for the reason above, in two different ways:
+
+- `//tools/cube:cube_lib_test` runs the runfile itself. The copy of `/usr/sbin/lsof` was killed at launch, and the test saw an exit status of `None`.
+- The worker shell tests run `/bin/zsh` by that path and declare `@worker_zsh//:zsh` only so the wrapper grants it. Locally the runfile resolved to `/bin/zsh`. On a worker it was a file inside the runfiles tree, nothing granted the real shell, and the tests failed with `/bin/sh: /bin/zsh: Operation not permitted`.
+
+`host_tool_symlink` in `repositories.bzl` now generates both repositories. The label is a rule target that declares one symlink to the absolute host path, so it reaches a worker as a symlink that leaves the runfiles tree, and the wrapper grants its resolved target there as it does for the runtime's `bin/` links. Visibility is unchanged, and so is each repository's behaviour where the tool is absent: `host_lsof` still writes its stub script off macOS, and on a host without `/bin/zsh` `@worker_zsh//:zsh` is still a dangling link, which only macOS targets select.
+
+Each repository also writes a `fingerprint` (OS build and sha256 of the tool) that travels in the target's runfiles, so a test's cache key still follows the binary's contents. It is not in the target's `files`, because consumers expand `$(rootpath ...)` on the label and that needs a single file.
+
+`host_tool_symlink_guard_test.sh` is the local check for both, run as `//tools/cube:host_lsof_symlink_guard_test` and `//tools/boss/engine/worker-bin:worker_zsh_symlink_guard_test`: the runfile must be a symlink straight to the host path.
+
+### The per-user temp directory
+
+Foundation stages an atomic write in `<per-user temp dir>/TemporaryItems/NSIRD_<process>_<id>`, whatever `TMPDIR` says, and the Xcode capability allows exactly `TemporaryItems/NSIRD_xctest_*` there. The wrapper used to take that directory from the `TMPDIR` it was started with. Bazel gives a local action the invoking user's `TMPDIR`, which on macOS is the per-user temp directory. A remote action has only the environment it declares:
+
+- a test that sets only the capability, like `xcode_capability_guard_test`, has no `TMPDIR`;
+- an Apple test target carries `XCODE_TEST_ENV`, so its `TMPDIR` is the literal `__MONO_TEST_PROCESS_TMPDIR__`. Measured on a worker, at wrapper entry: `TMPDIR=[__MONO_TEST_PROCESS_TMPDIR__]`.
+
+Either way no usable exception was written, every atomic write inside the test's own private root failed with `NSCocoaErrorDomain Code=513` / `Operation not permitted`, and seven Apple test targets failed remotely.
+
+When the capability is set and `TMPDIR` is not an absolute path, the wrapper now asks the executing host with `os.confstr(65537)` (`_CS_DARWIN_USER_TEMP_DIR`, what `getconf DARWIN_USER_TEMP_DIR` prints) and fails the action closed with exit 126 if that yields no directory. The exception is the same pattern as before and nothing else is opened. An absolute `TMPDIR` is used exactly as before, so a local profile is unchanged. `MONO_TEST_HOST_TMPDIR` carries the same value, so on a worker `xcode_capability_retains_the_write_allowlist` and `TestSandboxPolicyTests` now probe the real directory and assert that an ordinary write to it is denied.
 
 ### Not yet remote-capable
 
-Only the audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, which the same rule generates) was converted. These repositories still hand a test a copy of a client binary, and tests that depend on them are not expected to pass remotely:
+The audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, which the same rule generates), `host_lsof` and `worker_zsh` were converted. These repositories still hand a test a copy of a client binary:
 
-- `host_tmux`, `host_lsof`, `host_claude` and `codex_probe_runtime` in `repositories.bzl`.
-- `worker_zsh` (`tools/boss/engine/worker-bin/host_shell.bzl`).
-- `jj_test_tools` and `cube_jj_newer` ship a pinned download rather than a system binary; tests that use them have not been tried remotely.
+- `host_tmux`, `host_claude` and `codex_probe_runtime` in `repositories.bzl`. A copy of a system binary (the Codex probe's login shell is usually `/bin/zsh`) will not launch on a worker. A copy of anything else is the client's build, not the worker's.
+- `jj_test_tools` and `cube_jj_newer` ship a pinned download rather than a host binary.
+
+A test tagged `exclusive` cannot be scheduled remotely at all, because the tag also forces local execution. `exclusive-if-local` keeps the serial run locally and lets the test go to a worker.
 
 Linux remote execution is out of scope altogether. The Linux boundary comes from Bazel's local `linux-sandbox`, and a remote executor would have to provide an equivalent.
 
@@ -298,6 +323,9 @@ Linux remote execution is out of scope altogether. The Linux boundary comes from
 | Deleting the wrapper's `unset` block because `.bazelrc` has `--test_env` | `--test_env=KEY=` sets the variable to empty, it does not remove it. The `unset` is load-bearing.                                                                                                                                                                                                                                         |
 | Exposing `bin/<tool>` with `repository_ctx.symlink` again                | Nothing locally. On a remote macOS worker the tools arrive as copies and are killed at launch, so every test fails in the wrapper. `runtime_symlink_guard_test` fails locally first.                                                                                                                                                      |
 | Adding a fallback to `test:remote-tests` (`remote,local`)                | A test that cannot run remotely runs under a local strategy instead and still reports a result. Pinned by `linux_policy_source_test.sh`.                                                                                                                                                                                                  |
+| Exposing a single host tool with `repository_ctx.symlink` again          | Nothing locally. On a remote macOS worker `@host_lsof//:lsof` is killed at launch and `/bin/zsh` is denied. `host_lsof_symlink_guard_test` and `worker_zsh_symlink_guard_test` fail locally first.                                                                                                                                        |
+| Taking the host temp directory from `TMPDIR` alone                       | Nothing locally. A remote Apple test action gets no `NSIRD_xctest_` exception, and every atomic write in its private root fails.                                                                                                                                                                                                          |
+| Widening the `NSIRD_xctest_` exception to the whole temp directory       | Every Xcode-capability test can write a shared host directory. `xcode_capability_retains_the_write_allowlist` and `TestSandboxPolicyTests` fail.                                                                                                                                                                                          |
 | Dropping `fingerprint` from the runtime's files                          | Cached test results survive an OS or Xcode update, because the declared symlinks only carry a path.                                                                                                                                                                                                                                       |
 | Allowing the manifest's paths without resolving them in the wrapper      | On a host where a recorded path is a symlink, Seatbelt sees the physical path and denies the audited tool. Allowing a path that was never checked against `bin/<name>` also drops the fail-closed check for a missing or substituted tool.                                                                                                |
 
@@ -350,6 +378,7 @@ The guard could not have passed on any host, under any configuration. It had sim
 | `hermetic_test_wrapper.sh`                     | The `--run_under` wrapper. Builds the macOS Seatbelt profile, sets the audited `PATH`, unsets credentials, creates the short private temp root, forwards signals, and cleans up the process group. |
 | `repositories.bzl`                             | `test_runtime_repository` — resolves the audited host tools (`bash`, `git`, `python3`, …) and declares them as symlinks, so the wrapper's `PATH` contains only declared inputs.                    |
 | `runtime_symlink_guard_test.sh`                | Asserts every `bin/<tool>` of the runtime is a symlink straight to its audited host path, so a change back to shipped copies is caught without a remote run.                                       |
+| `host_tool_symlink_guard_test.sh`              | The same assertion for one host tool that `host_tool_symlink` declares; the packages allowed to use `@host_lsof` and `@worker_zsh` run it.                                                         |
 | `hermeticity_guard_test.rs`                    | The guards. Every property in the table above is asserted here. Built twice: `hermeticity_guard_test` and `xcode_capability_guard_test` (the latter with `MONO_TEST_XCODE_TOOLCHAIN=1`).           |
 | `linux_policy_source_test.sh`                  | Pins the exact `.bazelrc` / wrapper / `defs.bzl` strings so the policy cannot be silently relaxed.                                                                                                 |
 | `network_opt_in_test.rs`                       | Asserts the opt-in actually reaches the platform sandbox, so `network_enabled_rust_test` is not a no-op.                                                                                           |

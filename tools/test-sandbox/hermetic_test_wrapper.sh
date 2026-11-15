@@ -29,9 +29,6 @@ xcode_bin="${main_runfiles}/tools/test-sandbox"
 host_home="${HOME:?}"
 host_tmpdir="${TMPDIR:-}"
 host_tmpdir_alias=""
-if [[ "${host_tmpdir}" == /var/* ]]; then
-  host_tmpdir_alias="/private${host_tmpdir}"
-fi
 host_user_home=""
 if [[ -n "${USER:-}" && -d "/Users/${USER}" ]]; then
   host_user_home="/Users/${USER}"
@@ -227,6 +224,25 @@ if [[ "${MONO_TEST_XCODE_TOOLCHAIN:-}" == "1" ]]; then
   # As with the manifest: the recorded root may be a symlink on this host.
   developer_dir_grant="$("${runtime_bin}/python3" -c \
     'import os, sys; print(os.path.realpath(sys.argv[1]))' "${developer_dir}")"
+  # Foundation stages atomic writes in the per-user temp directory, wherever
+  # TMPDIR points, and the write exception below is built from that directory.
+  # Bazel gives a local action the invoking user's TMPDIR, which names it. A
+  # remote action has only the environment it declares: no TMPDIR, or for an
+  # Apple test target the unexpanded XCODE_TEST_ENV placeholder. Neither is a
+  # path, so ask the host that is running the action. 65537 is
+  # _CS_DARWIN_USER_TEMP_DIR in <unistd.h>, the value `getconf
+  # DARWIN_USER_TEMP_DIR` prints; os.confstr accepts the number, not the name.
+  if [[ "${host_tmpdir}" != /* ]]; then
+    if ! host_tmpdir="$("${runtime_bin}/python3" -c \
+      'import os; print(os.confstr(65537) or "")')" ||
+      [[ "${host_tmpdir}" != /* || ! -d "${host_tmpdir}" ]]; then
+      printf '%s\n' "the per-user temp directory of this host is unavailable" >&2
+      exit 126
+    fi
+  fi
+  if [[ "${host_tmpdir}" == /var/* ]]; then
+    host_tmpdir_alias="/private${host_tmpdir}"
+  fi
   export MONO_TEST_XCODE_DEVELOPER_DIR="${developer_dir}"
   export MONO_TEST_HOST_TMPDIR="${host_tmpdir}"
   export DEVELOPER_DIR="${developer_dir}"

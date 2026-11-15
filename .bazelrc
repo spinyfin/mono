@@ -99,11 +99,10 @@ test:linux --sandbox_tmpfs_path=/tmp
 # say nothing about the workers. Named alone, a missing or unusable remote
 # executor stops the build.
 #
-# Tests that need host tools declared outside the audited runtime (tmux, lsof,
-# claude, zsh, the Codex probe's login shell) still receive copies of this
-# machine's binaries and are not yet expected to pass remotely; tests that use
-# the pinned jj download have not been tried. See
-# tools/test-sandbox/README.md, "Remote execution on macOS workers".
+# Tests that need tmux, claude or the Codex probe's login shell still receive
+# copies of this machine's binaries, and tests that use jj receive the pinned
+# download. See tools/test-sandbox/README.md, "Remote execution on macOS
+# workers".
 test:remote-tests --strategy=TestRunner=remote
 
 # Keep remote and local test results apart. Bazel's action key does not record

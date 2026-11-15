@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 exports_files(["Cargo.toml"])
 
@@ -37,4 +38,19 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+# @worker_zsh//:zsh must stay a symlink to /bin/zsh: the tests above run the
+# shell by that path, and on a remote worker only a symlink leaving the
+# runfiles tree makes the test wrapper grant it.
+sh_test(
+    name = "worker_zsh_symlink_guard_test",
+    size = "small",
+    srcs = ["//tools/test-sandbox:host_tool_symlink_guard_test.sh"],
+    args = [
+        "$(rootpath @worker_zsh//:zsh)",
+        "/bin/zsh",
+    ],
+    data = ["@worker_zsh//:zsh"],
+    target_compatible_with = ["@platforms//os:macos"],
 )
