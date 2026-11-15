@@ -1,8 +1,8 @@
-//! `AgyDriver` — Google Antigravity (`agy`) agent driver skeleton.
+//! `AgyDriver` — Google Antigravity (`agy`) agent driver.
 //!
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
-//! provisioning, and the `boss-event` progress-forwarder hook wiring.
-//! Interactive TUI spawn still refuses until the guard adapter lands.
+//! provisioning, and PreToolUse authorization. Interactive TUI spawn still
+//! refuses until the startup contract lands.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
@@ -36,6 +36,11 @@ use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, ve
 use home::{
     AgyRuntimeState, agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run,
     process_home_for_run, provision_agy_home, read_workspace_path_stamp, session_settings_path_for_run,
+};
+
+pub use hooks::{
+    AuthorizationProbeReport, adapter_path, attestation_path, hooks_file_path, install_authorization, policy_path,
+    probe_authorization, verify_attestation,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,8 +82,9 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Google Antigravity CLI driver.
 ///
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
-/// the Antigravity driver design. Per-run `HOME` provisioning is live;
-/// interactive TUI spawn still refuses until guard hooks land.
+/// the Antigravity driver design. Per-run `HOME` provisioning and PreToolUse
+/// authorization are live; interactive TUI spawn still refuses until the
+/// startup contract lands.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -119,8 +125,9 @@ impl AgentDriver for AgyDriver {
         //
         // ToolUseInterception is rewrite-or-deny: PreToolUse rewrites
         // arguments through `overwrite` on both measured binaries (hook
-        // surface study, "PreToolUse can rewrite arguments"). The hook adapter
-        // is not implemented; TUI spawn still refuses despite this declaration.
+        // surface study, "PreToolUse can rewrite arguments"). Authorization
+        // is installed by `write_permission_config`; TUI spawn still refuses
+        // until the startup contract lands.
         CapabilitySet::new([
             Capability::Spawn,
             Capability::WorkspaceProvisioning,
@@ -283,10 +290,6 @@ impl AgentDriver for AgyDriver {
         Ok(())
     }
 
-    /// Install the hook wiring into the per-run home's global-root
-    /// `hooks.json`, overwriting the provisioned no-op canary. Posture and
-    /// trust ride in the session settings, not here, and the control
-    /// directory is deliberately not added to `trustedWorkspaces`.
     async fn write_permission_config(
         &self,
         input: &PermissionInput,
@@ -299,26 +302,28 @@ impl AgentDriver for AgyDriver {
             )
         })?;
         if !process_home.exists() {
-            anyhow::bail!(
-                "AgyDriver::write_permission_config: per-run HOME {} does not exist; \
+            bail!(
+                "AgyDriver::write_permission_config: process HOME {} does not exist; \
                  call provision_workspace first",
                 process_home.display()
             );
         }
-        // Refuse to write through a swapped symlink or shared hard link.
+        // Session settings (`--settings`) belong to the per-kind permission
+        // renderer. Hash whatever session-settings file is already on disk.
         home::validate_private_layout(&process_home)?;
-        let config = ProgressObservationConfig {
-            events_socket_path: input.events_socket_path.clone(),
-            lease_id: input.lease_id.clone(),
-            run_id: input.run_id.clone(),
-            workspace_path: input.workspace_path.clone(),
-            forwarder_binary: input.boss_event_path.clone(),
-        };
-        let hooks_path = hooks::write_hooks(&process_home, &config)
-            .with_context(|| format!("writing agy hook wiring under {}", process_home.display()))?;
+        let obs = hooks::observation_from_permission(input);
+        let interception = hooks::interception_from_permission(input);
+        let config_files = hooks::install_authorization(&process_home, input.worker_kind, &obs, &interception)
+            .with_context(|| {
+                format!(
+                    "installing Antigravity PreToolUse authorization under {}",
+                    process_home.display()
+                )
+            })?;
         Ok(PermissionArtifacts {
-            config_files: vec![hooks_path],
-            ..PermissionArtifacts::default()
+            config_files,
+            extra_args: Vec::new(),
+            env: Vec::new(),
         })
     }
 
@@ -330,14 +335,14 @@ impl AgentDriver for AgyDriver {
     }
 
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
-        // Destination is DriverOwned: `write_permission_config` writes this
-        // map to `$HOME/.gemini/config/hooks.json` in the per-run home, which
-        // `agy` discovers with no flag. It must never merge into the Claude
-        // worker settings file `agy` does not read. Must not return
-        // StdoutJsonl — the registry refuses that topology for built-in
-        // drivers.
+        // Destination is DriverOwned: hooks are discovered from
+        // `$HOME/.gemini/config/hooks.json`, never from the Claude worker
+        // settings file. This map declares the PreToolUse authorization
+        // entry; other lifecycle events are installed by the global-root
+        // progress forwarder. Must not return StdoutJsonl — the registry
+        // refuses that topology for built-in drivers.
         ProgressIngress::HookCallback(ProgressObservationWiring {
-            hooks: hooks::forwarder_hooks_map(config),
+            hooks: hooks::authorization_hooks_map(config, None),
             destination: HookWiringDestination::DriverOwned,
         })
     }
@@ -353,6 +358,10 @@ impl AgentDriver for AgyDriver {
     }
 
     fn tool_use_interception_wiring(&self, _config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
+        // Dead in practice for agy: `progress_observation_wiring` declares
+        // `HookWiringDestination::DriverOwned`, so the engine never merges
+        // these entries into a Claude worker settings file. The real
+        // PreToolUse adapter is installed by `write_permission_config`.
         ToolUseInterceptionWiring {
             pre_tool_use_hooks: Vec::new(),
         }
@@ -795,10 +804,118 @@ mod tests {
         match ingress {
             ProgressIngress::HookCallback(wiring) => {
                 assert_eq!(wiring.destination, HookWiringDestination::DriverOwned);
-                assert_eq!(wiring.hooks.len(), 6, "all six measured events are wired");
+                let pre = wiring
+                    .hooks
+                    .get("PreToolUse")
+                    .and_then(|value| value.as_array())
+                    .expect("PreToolUse authorization entry");
+                assert_eq!(pre.len(), 1, "{pre:#?}");
+                let command = pre[0]["hooks"][0]["command"].as_str().unwrap();
+                assert!(command.contains("BOSS_AGY_POLICY="), "{command}");
+                assert!(command.contains("boss-agy-hook-adapter.py"), "{command}");
+                assert_eq!(wiring.hooks.len(), 6);
             }
             other => panic!("expected HookCallback(DriverOwned), got {other:?}"),
         }
         assert_eq!(AgyDriver::default().progress_fidelity(), ProgressFidelity::Rich);
+        assert!(
+            AgyDriver::default()
+                .tool_use_interception_wiring(&ToolUseInterceptionConfig {
+                    data_dir: None,
+                    path_guard_script: None,
+                    checkleft_guard_script: None,
+                    git_store_guard_script: None,
+                    is_revision: false,
+                    is_standard_worker: true,
+                    is_reviewer: false,
+                    is_review_guide: false,
+                    run_id: None,
+                    workspace_path: None,
+                })
+                .pre_tool_use_hooks
+                .is_empty()
+        );
+    }
+
+    fn permission_input(tmp: &TempDir, run_id: &str, workspace: PathBuf) -> PermissionInput {
+        let path_guard = tmp.path().join("boss-path-guard.py");
+        fs::write(
+            &path_guard,
+            "#!/usr/bin/env python3\nimport json\nprint(json.dumps({'decision':'approve'}))\n",
+        )
+        .unwrap();
+        PermissionInput {
+            frontend_socket_path: None,
+            worker_kind: crate::WorkerKind::Standard,
+            workspace_path: workspace,
+            events_socket_path: tmp.path().join("boss-data").join("events.sock"),
+            boss_event_path: tmp.path().join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-1".into(),
+            execution_kind: "task_implementation".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: Some(path_guard),
+            checkleft_guard_script: None,
+            git_store_guard_script: None,
+            codex_sandbox_enforced: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_permission_config_requires_prior_provision() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = env_for_provision(&homes);
+        let input = permission_input(&tmp, "run-no-provision", tmp.path().join("ws"));
+        let err = AgyDriver::default()
+            .write_permission_config(&input, tmp.path())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "expected missing-home error, got {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_permission_config_installs_pre_tool_use_authorization() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let _guard = env_for_provision(&homes);
+        let driver = AgyDriver::default();
+        let run_id = "run-agy-auth-1";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+        let input = permission_input(&tmp, run_id, workspace);
+        let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
+        assert!(
+            artifacts.extra_args.is_empty(),
+            "session --settings belongs to the permission renderer"
+        );
+        let process_home = process_home_for_run(run_id).unwrap();
+        let hooks_path = hooks_file_path(&process_home);
+        let adapter = adapter_path(&process_home);
+        assert!(
+            artifacts.config_files.contains(&hooks_path),
+            "config_files must include hooks.json: {:?}",
+            artifacts.config_files
+        );
+        assert!(
+            artifacts.config_files.contains(&adapter),
+            "config_files must include the adapter: {:?}",
+            artifacts.config_files
+        );
+        let hooks_doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let pre = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1, "{pre:#?}");
+        let command = pre[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.contains(&adapter.display().to_string()), "{command}");
+        assert!(
+            hooks_doc["hooks"].get("SessionStart").is_none(),
+            "provision SessionStart canary must not remain after authorization install: {hooks_doc:#}"
+        );
+        assert!(!driver.launch_ready());
     }
 }
