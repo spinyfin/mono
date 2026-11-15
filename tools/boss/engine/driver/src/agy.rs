@@ -30,6 +30,9 @@ mod model_menu;
 mod test_environment;
 mod transcript;
 
+/// Manual authenticated rules-discovery conformance probe.
+pub mod rules_probe;
+
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
 use home::{
     AgyRuntimeState, agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run,

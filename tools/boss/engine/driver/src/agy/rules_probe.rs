@@ -1,0 +1,148 @@
+//! Authenticated host probe, invoked through the non-test `agy_rules_probe` binary.
+//! Evidence stays in a caller-selected directory, including on failure.
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+use anyhow::{Context, ensure};
+use boss_ssh_transport::shell_quote;
+use serde_json::json;
+
+use super::environment::{AgyProcessEnvironment, run_agy_bounded};
+use super::home::{agent_rules_path_for_run, provision_agy_home};
+
+fn deny_command(attempts: &Path) -> String {
+    format!(
+        "/usr/bin/printf attempt >> {0} || exit 2; /bin/cat >> {0} || exit 2; /usr/bin/printf '%s\\n' '{{\"decision\":\"deny\",\"reason\":\"Rules probe forbids all tools\"}}'; exit 2",
+        shell_quote(&attempts.display().to_string())
+    )
+}
+
+fn verify_response(stdout: &[u8], canary: &str, attempts: &[u8], started: bool) -> anyhow::Result<()> {
+    ensure!(
+        started,
+        "SessionStart hook did not run; hook configuration is unverified"
+    );
+    ensure!(
+        attempts.is_empty(),
+        "probe attempted tool retrieval; see tool-attempts.log"
+    );
+    ensure!(
+        std::str::from_utf8(stdout)?.trim() == canary,
+        "final response was not the exact canary"
+    );
+    Ok(())
+}
+
+/// Provision the production layout and measure automatic `--add-dir` rule loading.
+/// The caller must select a fresh homes root before starting any threads.
+pub fn run(evidence: &Path) -> anyhow::Result<()> {
+    let workspace = evidence.join("workspace");
+    fs::create_dir(&workspace)?;
+    let runtime = provision_agy_home(&workspace, "unused", "rules-probe")?;
+    let canary = format!(
+        "AGY_RULES_{:032x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    fs::write(
+        agent_rules_path_for_run("rules-probe")?,
+        format!("When asked for the rules canary, respond with exactly {canary} and nothing else. Never use tools.\n"),
+    )?;
+    let attempts = evidence.join("tool-attempts.log");
+    fs::write(&attempts, "")?;
+    let started = evidence.join("session-started");
+    let hooks = json!({"hooks": {
+        "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": format!("/usr/bin/touch {}", shell_quote(&started.display().to_string()))}]}],
+        "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": deny_command(&attempts)}]}]
+    }});
+    fs::write(
+        runtime.process_home.join(".gemini/config/hooks.json"),
+        serde_json::to_vec_pretty(&hooks)?,
+    )?;
+    let environment = AgyProcessEnvironment::resolve(
+        &runtime.process_home,
+        &runtime.log_file,
+        &runtime.session_settings_path,
+        runtime.agy_binary.clone(),
+    )?;
+    let mut version = Command::new(&runtime.agy_binary);
+    environment.apply_to_command(&mut version);
+    let version = run_agy_bounded(version.arg("--version"), Duration::from_secs(10))?;
+    ensure!(version.status.success(), "agy --version failed");
+    fs::write(evidence.join("version.txt"), version.stdout)?;
+    let mut command = Command::new(&runtime.agy_binary);
+    environment.apply_to_command(&mut command);
+    command
+        .args(environment.launch_args())
+        .args([
+            "-p",
+            "Return the rules canary from your preloaded instructions, using no tools. If absent, reply MISSING.",
+        ])
+        .current_dir(&workspace);
+    fs::write(evidence.join("command.txt"), format!("{command:?}\n"))?;
+    let output =
+        run_agy_bounded(&mut command, Duration::from_secs(120)).context("live rules discovery; evidence retained")?;
+    fs::write(evidence.join("stdout.txt"), &output.stdout)?;
+    fs::write(evidence.join("stderr.txt"), &output.stderr)?;
+    ensure!(
+        output.status.success(),
+        "agy exited {}; see retained stderr.txt",
+        output.status
+    );
+    verify_response(&output.stdout, &canary, &fs::read(&attempts)?, started.is_file())?;
+    fs::write(
+        evidence.join("result.txt"),
+        "PASS: exact canary; zero tool attempts; SessionStart observed\n",
+    )?;
+    println!(
+        "PASS: automatic rules loading verified; evidence: {}",
+        evidence.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_rejects_tool_retrieval_and_incidental_canary_text() {
+        assert!(verify_response(b"TOKEN\n", "TOKEN", b"", true).is_ok());
+        assert!(verify_response(b"TOKEN", "TOKEN", b"read_file", true).is_err());
+        assert!(verify_response(b"the token is TOKEN", "TOKEN", b"", true).is_err());
+        assert!(verify_response(b"TOKEN", "TOKEN", b"", false).is_err());
+        assert!(verify_response(b"MISSING", "TOKEN", b"", true).is_err());
+    }
+
+    #[test]
+    fn deny_hook_records_attempt_and_fails_closed() {
+        use std::io::Write;
+        use std::process::Stdio;
+        let tmp = tempfile::tempdir().unwrap();
+        let attempts = tmp.path().join("attempts with spaces");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &deny_command(&attempts)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"tool\":\"read_file\"}\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            fs::read_to_string(attempts).unwrap(),
+            "attempt{\"tool\":\"read_file\"}\n"
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reply["decision"], "deny");
+    }
+}

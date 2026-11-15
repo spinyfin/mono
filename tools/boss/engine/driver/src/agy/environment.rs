@@ -26,12 +26,6 @@ pub const AGY_BIN_ENV: &str = "BOSS_AGY_BIN";
 /// Production never sets this; layout tests do.
 pub const AGY_SKIP_BINARY_ASSERT_ENV: &str = "BOSS_AGY_SKIP_BINARY_ASSERT";
 
-/// When set to `1`/`true`, live Antigravity CLI probes must run instead of
-/// soft-skipping. Meaningful only on a signed-in developer machine; CI cannot
-/// authenticate `agy`.
-#[cfg(test)]
-pub const REQUIRE_AGY_CLI_ENV: &str = "BOSS_REQUIRE_AGY_CLI";
-
 /// Minimum qualified `agy` version. `auto_approve` was measured on 1.5.7.
 pub const MIN_QUALIFIED_AGY_VERSION: &str = "1.5.7";
 
