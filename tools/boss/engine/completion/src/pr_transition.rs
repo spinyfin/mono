@@ -537,6 +537,12 @@ impl WorkerCompletionHandler {
                                                             );
                                                             true
                                                         }
+                                                        Err(legacy_error)
+                                                            if legacy_error
+                                                                .is::<crate::work::LiveReviewBatchOwnsCycle>() =>
+                                                        {
+                                                            true
+                                                        }
                                                         Err(legacy_error) => {
                                                             tracing::warn!(
                                                                 execution_id,
@@ -582,6 +588,7 @@ impl WorkerCompletionHandler {
                                         );
                                         true
                                     }
+                                    Err(err) if err.is::<crate::work::LiveReviewBatchOwnsCycle>() => true,
                                     Err(err) => {
                                         tracing::warn!(
                                             execution_id,

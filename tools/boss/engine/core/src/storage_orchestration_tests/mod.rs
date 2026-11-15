@@ -28,6 +28,7 @@ mod project_postmortem;
 mod queue_ci_evidence;
 mod review_guide_jobs;
 mod review_guide_source_capture;
+mod review_recovery_ownership;
 mod review_stage_metadata;
 mod review_verdict_apply_tests;
 mod stalled_reviewer;

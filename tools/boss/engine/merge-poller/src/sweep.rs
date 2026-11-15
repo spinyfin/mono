@@ -2710,6 +2710,8 @@ pub use crate::work::stored_pr_number;
 
 /// Argument bundle for [`sweep_stalled_reviewer`]; `review_result_written`
 /// says the latest review execution recorded an informative `ReviewResult`.
+/// A live pre-merge batch retains the hold even when this is true, regardless
+/// of the fan-out flag; its consolidated verdict owns advancement.
 pub struct StalledReview<'a> {
     pub task_id: &'a str,
     pub product_id: &'a str,
@@ -2726,6 +2728,8 @@ pub struct StalledReview<'a> {
 /// reviewer pass either finished without advancing it (missed Stop hook) or
 /// ran past the stale threshold. A pass with a durable `ReviewResult` may
 /// advance to `in_review`; a pass without one stays in Doing and is re-fired.
+/// A live pre-merge batch suppresses both advancement and re-firing, including
+/// when a prior execution has written a result; the batch owns its verdict.
 ///
 /// Incident (2026-07-04, PR spinyfin/mono#1766): this fallback used
 /// to ONLY unstick the kanban lane, silently leaving the PR with no completed
@@ -2752,12 +2756,26 @@ pub async fn sweep_stalled_reviewer(
         review_result_written,
         skip_unbatched_review_holds,
     } = stalled;
-    if skip_unbatched_review_holds {
-        let cycle_root = work_db.review_cycle_root_id(task_id);
-        let live_batch = work_db.has_live_pre_merge_review_batch(&cycle_root).unwrap_or(false);
-        if !live_batch && !has_nonterminal_pr_review(work_db, task_id, &cycle_root) {
+    let cycle_root = match work_db.resolve_review_cycle_root(task_id) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(task_id, ?error, "reviewer-fallback: failed to resolve review cycle");
             return;
         }
+    };
+    match work_db.has_live_pre_merge_review_batch(&cycle_root) {
+        // Batch recovery owns retries, quorum and the consolidated verdict.
+        // A dead leaf does not authorize a memberless legacy review, even
+        // when every member execution is terminal or fan-out was disabled.
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(task_id, ?error, "reviewer-fallback: failed to check batch ownership");
+            return;
+        }
+    }
+    if skip_unbatched_review_holds && !has_nonterminal_pr_review(work_db, task_id, &cycle_root) {
+        return;
     }
     if review_result_written {
         match work_db.advance_pending_review_task_to_in_review(task_id) {

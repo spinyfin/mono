@@ -411,3 +411,66 @@ async fn recheck_for_pr_defers_an_undeclared_primary_staged_url_instead_of_final
         "the task must not advance while the declaration is still missing"
     );
 }
+
+/// Disabling fan-out does not transfer a live batch's hold to legacy admission.
+#[tokio::test]
+async fn legacy_admission_keeps_live_batch_hold_after_fanout_is_disabled() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    stamp_pending_review_hold(&db, &chore_id, PR_URL);
+    let (batch, _) = db
+        .create_review_batch(
+            crate::work::ReviewBatchCreateInput::builder()
+                .cycle_root_id(&chore_id)
+                .base_sha("base")
+                .target_sha("head")
+                .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+                .pr_url(PR_URL)
+                .pr_number(7000)
+                .classification(
+                    boss_protocol::ReviewClassification::builder()
+                        .changed_files(vec!["src/lib.rs".into()])
+                        .complexity_flags(vec![])
+                        .has_production_code(true)
+                        .metadata_missing(vec![])
+                        .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+                        .profile(boss_protocol::ReviewProfile::Light)
+                        .subsystem_buckets(vec!["src".into()])
+                        .build(),
+                )
+                .build(),
+            &[crate::work::ReviewBatchMemberCreateInput::builder()
+                .attempt(1)
+                .provider_effort("medium")
+                .requested_driver("claude")
+                .resolved_model("test-model")
+                .role(boss_protocol::ReviewBatchMemberRole::ClaudeReviewer)
+                .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+                .build()],
+        )
+        .unwrap();
+    let before = db.list_executions(Some(&chore_id)).unwrap().len();
+    let publisher = RecordingPublisher::default();
+    let verifier = StubBranchVerifier::ok("boss/test");
+    let flags_dir = tempdir().unwrap();
+    let flags = empty_flags(flags_dir.path());
+    let execution = db.get_execution(&execution_id).unwrap();
+    maybe_enqueue_declared_delivery_reviewer(
+        &db,
+        &publisher,
+        verifier.as_ref(),
+        &PanicsIfCalledEnqueuer,
+        &flags,
+        5,
+        0,
+        1,
+        &execution,
+        &chore_id,
+        &execution.repo_remote_url,
+        PR_URL,
+    )
+    .await;
+    assert_eq!(task_status(&db, &chore_id), TaskStatus::Active);
+    assert_eq!(db.list_executions(Some(&chore_id)).unwrap().len(), before);
+    assert_eq!(db.review_batch(&batch.id).unwrap().unwrap().status, batch.status);
+}

@@ -148,6 +148,20 @@ fn failed_batch_is_automatically_remintable_in(conn: &rusqlite::Connection, batc
     Ok(settled.is_none())
 }
 
+pub(crate) fn has_live_pre_merge_review_batch_in(conn: &Connection, cycle_root_id: &str) -> Result<bool> {
+    let found: Option<()> = conn
+        .query_row(
+            "SELECT 1 FROM pr_review_batches
+                 WHERE cycle_root_id = ?1 AND phase = 'pre_merge'
+                   AND status NOT IN ('completed', 'failed')
+                 LIMIT 1",
+            params![cycle_root_id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 /// SQL boolean over a cycle-root id expression (`cycle_root_expr` is spliced
 /// verbatim — pass a column reference, never user input): true when that
 /// root's NEWEST pre-merge batch leaves the PR head needing a fresh review
@@ -366,7 +380,10 @@ fn map_review_batch_member(row: &Row<'_>) -> rusqlite::Result<ReviewBatchMember>
 }
 
 /// Look up the persisted batch member that owns an execution.
-fn member_for_execution_in(conn: &rusqlite::Connection, execution_id: &str) -> Result<Option<ReviewBatchMember>> {
+pub(crate) fn member_for_execution_in(
+    conn: &rusqlite::Connection,
+    execution_id: &str,
+) -> Result<Option<ReviewBatchMember>> {
     conn.query_row(
         "SELECT id, batch_id, attempt, created_at, provider_effort,
                 requested_driver, resolved_model, role, status, updated_at,
@@ -1992,17 +2009,7 @@ impl WorkDb {
     /// batch (`collecting` / `supervising` / `applying`).
     pub fn has_live_pre_merge_review_batch(&self, cycle_root_id: &str) -> Result<bool> {
         let conn = self.connect()?;
-        let found: Option<()> = conn
-            .query_row(
-                "SELECT 1 FROM pr_review_batches
-                 WHERE cycle_root_id = ?1 AND phase = 'pre_merge'
-                   AND status NOT IN ('completed', 'failed')
-                 LIMIT 1",
-                params![cycle_root_id],
-                |_| Ok(()),
-            )
-            .optional()?;
-        Ok(found.is_some())
+        has_live_pre_merge_review_batch_in(&conn, cycle_root_id)
     }
 
     /// Resolve `task_id` to the review-cycle root that owns its PR.

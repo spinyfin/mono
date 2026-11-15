@@ -309,6 +309,73 @@ mod compose_worker_spawn_tests {
     const MEDIUM_ADDENDUM: &str = "Sketch a brief plan before you start editing.";
 
     #[tokio::test]
+    async fn live_batch_still_refuses_a_memberless_reviewer_at_spawn() {
+        use boss_protocol::{ReviewBatchPhase, ReviewClassification, ReviewProfile};
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let product = crate::test_support::create_test_product(&db);
+        let task = crate::test_support::create_test_chore_manual(&db, product.id, "Review target");
+        db.create_review_batch(
+            crate::work::ReviewBatchCreateInput::builder()
+                .cycle_root_id(&task.id)
+                .base_sha("base")
+                .classification(
+                    ReviewClassification::builder()
+                        .changed_files(vec![])
+                        .complexity_flags(vec![])
+                        .has_production_code(true)
+                        .metadata_missing(vec![])
+                        .production_languages(vec![])
+                        .profile(ReviewProfile::Light)
+                        .subsystem_buckets(vec![])
+                        .additions(1)
+                        .deletions(0)
+                        .build(),
+                )
+                .phase(ReviewBatchPhase::PreMerge)
+                .pr_number(42)
+                .pr_url("https://github.com/example/repo/pull/42")
+                .target_sha("head")
+                .build(),
+            &[crate::work::ReviewBatchMemberCreateInput::builder()
+                .attempt(1)
+                .provider_effort("medium")
+                .requested_driver("claude")
+                .resolved_model("test-model")
+                .role(boss_protocol::ReviewBatchMemberRole::ClaudeReviewer)
+                .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+                .build()],
+        )
+        .unwrap();
+        let mut execution = pr_review_execution();
+        execution.work_item_id = task.id.clone();
+        // No PR URL on the execution/task: compose needs no external metadata
+        // to enforce this persisted ownership invariant.
+        execution.pr_url = None;
+        let result = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &db.get_work_item(&task.id).unwrap(),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::builder()
+                .review_signal_checks(|_| &[])
+                .review_batch_fanout_enabled(true)
+                .build(),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("memberless review must never fall back to the legacy pool"),
+        };
+        assert!(
+            error.contains("has no review batch member row; refusing to spawn"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn revision_spawn_places_advisory_notice_after_opening_and_recovery_instructions() {
         use crate::test_support::{create_test_chore_manual, create_test_product_named};
         let workspace = TempDir::new().unwrap();

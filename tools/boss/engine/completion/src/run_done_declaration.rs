@@ -1113,7 +1113,9 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
                         ?err,
                         "run_done post-effects: failed to create legacy reviewer after batch failure",
                     );
-                    release_pending_review_hold_unconditional(work_db, work_item_id);
+                    if !err.is::<crate::work::LiveReviewBatchOwnsCycle>() {
+                        release_pending_review_hold_unconditional(work_db, work_item_id);
+                    }
                 } else {
                     publisher.kick_scheduler();
                 }
@@ -1128,7 +1130,9 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
                     ?err,
                     "run_done post-effects: failed to create legacy pr_review execution"
                 );
-                release_pending_review_hold_unconditional(work_db, work_item_id);
+                if !err.is::<crate::work::LiveReviewBatchOwnsCycle>() {
+                    release_pending_review_hold_unconditional(work_db, work_item_id);
+                }
             }
         }
     }

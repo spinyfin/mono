@@ -1184,21 +1184,11 @@ pub async fn compose_worker_spawn(
     } else {
         None
     };
-    // Fail closed rather than falling back to the legacy Claude pool, but
-    // ONLY when this execution should have had a member row: a live
-    // (non-terminal) pre_merge batch already exists for the work item, so a
-    // memberless `pr_review` execution here is a genuine race (a leaf whose
-    // member-row write raced this read) rather than one of the other
-    // legacy-dispatch paths. Although automatic starts and `bossctl review
-    // start` honor `review_batch_fanout`, the merge poller's reviewer-fallback re-fire,
-    // pr_review_recovery's legacy loop, and pr_transition's own
-    // batch-metadata-failure fallback all still mint memberless legacy
-    // `pr_review` executions with the flag on, matching
-    // docs/designs/multi-agent-code-review.md's rollout clause that "the old
-    // single-reviewer path remains available behind the batch feature
-    // flag". Keying the gate on "no live batch exists for this work item"
-    // instead of "flag is on" lets those genuine legacy executions keep
-    // resolving `pool_dispatch_policy_for_worker_id` below.
+    // Fail closed when persisted batch ownership and this execution disagree.
+    // Legacy admission rejects live batches transactionally, but retain this
+    // last safety check for older inconsistent rows or another producer that
+    // violates that contract. Genuine legacy reviews without a live batch
+    // still resolve their pool policy below.
     if review_batch_fanout_enabled && execution.kind == ExecutionKind::PrReview && batch_member.is_none() {
         let live_batch_exists = work_db
             .review_batches_for_cycle_root(&execution.work_item_id)

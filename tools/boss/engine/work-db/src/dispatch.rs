@@ -119,6 +119,8 @@ impl WorkDb {
     /// Returns `(execution, is_new)`; `is_new = false` means an existing
     /// live/non-terminal `pr_review` execution was reused rather than a
     /// duplicate being created.
+    /// Returns [`LiveReviewBatchOwnsCycle`] when a live batch owns the cycle,
+    /// even if a legacy execution exists; callers must preserve the review hold.
     pub fn create_pr_review_execution_dedup(
         &self,
         work_item_id: &str,
@@ -126,6 +128,7 @@ impl WorkDb {
     ) -> Result<(WorkExecution, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_no_live_review_batch(&tx, work_item_id)?;
         if let Some(existing) = existing_nonterminal_pr_review_execution(&tx, work_item_id)? {
             tx.commit()?;
             return Ok((existing, false));
