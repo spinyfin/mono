@@ -118,6 +118,8 @@ pub mod segment {
     /// Within the annotation: the open positioning-refusal lookup. `rows` is
     /// the cards named from a hold.
     pub const DB_TASK_RUNTIMES_ANNOTATION_HOLDS: &str = "db.task_runtimes.annotation.holds";
+    /// Batched family/input reads and Navigator classification.
+    pub const DB_NAVIGATOR: &str = "db.navigator";
     /// `SELECT` for the product's cross-item dependencies.
     pub const DB_DEPENDENCIES: &str = "db.dependencies";
     /// Batched `IN (...)` query for the "AI reviewing" badge.

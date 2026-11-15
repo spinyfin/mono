@@ -76,16 +76,13 @@ fn exec(db: &WorkDb, id: &str, kind: ExecutionKind, status: &str, run: Option<&s
                 .build(),
         )
         .unwrap();
+    if run.is_some() {
+        db.start_execution_run(&execution.id, "synthetic", "repo", "lease", "ws", "/tmp/ws")
+            .unwrap();
+    }
     set_exec(db, &execution.id, status);
     if let Some(run) = run {
-        db.connect()
-            .unwrap()
-            .execute(
-                "INSERT INTO work_runs(id, execution_id, agent_id, status, created_at)
-                 VALUES (?1, ?2, 'synthetic', ?3, '1')",
-                params![format!("run-{}", execution.id), execution.id, run],
-            )
-            .unwrap();
+        set_run(db, &execution.id, run);
     }
     execution.id
 }
@@ -235,7 +232,7 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
         &revision,
         ExecutionKind::RevisionImplementation,
         "running",
-        Some("running"),
+        Some("active"),
     );
     step(&db, &product, &mut model);
     let working = row(&model, &root);
@@ -269,7 +266,6 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
 
     // Once the agent itself waits on a person, nothing is progressing.
     set_exec(&db, &repair, "waiting_human");
-    set_run(&db, &repair, "waiting_human");
     step(&db, &product, &mut model);
     let waiting_on_person = row(&model, &root);
     assert_eq!(waiting_on_person.section, NavigatorSection::NeedsAttention);
@@ -321,7 +317,7 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
         &stale,
         ExecutionKind::RevisionImplementation,
         "running",
-        Some("running"),
+        Some("active"),
     );
     step(&db, &product, &mut model);
     let landed = row(&model, &root);
@@ -494,7 +490,7 @@ fn engine_order_is_priority_then_start_time_and_automation_work_is_excluded() {
             &format!("UPDATE tasks SET priority = '{priority}', status = 'active' WHERE id = ?1"),
             &id,
         );
-        let execution = exec(&db, &id, ExecutionKind::ChoreImplementation, "running", Some("running"));
+        let execution = exec(&db, &id, ExecutionKind::ChoreImplementation, "running", Some("active"));
         db.connect()
             .unwrap()
             .execute(
@@ -751,4 +747,135 @@ fn archived_family_members_stay_with_their_owner_and_unresolved_chains_fall_back
     );
     step(&db, &product, &mut model);
     assert_eq!(waiting(&model, &tombstoned_child), NavigatorWait::UnavailableParent);
+}
+
+#[test]
+fn archived_broken_ancestor_keeps_visible_revision_fallback() {
+    for deleted in [false, true] {
+        let db = WorkDb::open(temp_db_path("navigator-archived-broken")).unwrap();
+        let product = make_revision_product(&db, "navigator-archived-broken");
+        let owner = make_in_review_chore(&db, &product, PR);
+        let ancestor = insert_revision_row(&db, &product, &owner);
+        let child = insert_revision_row(&db, &product, &ancestor);
+        let mut model = None;
+        step(&db, &product, &mut model);
+        update(&db, "UPDATE tasks SET status = 'archived' WHERE id = ?1", &ancestor);
+        update(&db, "UPDATE tasks SET status = 'todo' WHERE id = ?1", &child);
+        step(&db, &product, &mut model);
+        assert_eq!(projection(&model, &child).root_task_id, owner);
+        if deleted {
+            update(&db, "UPDATE tasks SET deleted_at = '1' WHERE id = ?1", &owner);
+        } else {
+            db.connect()
+                .unwrap()
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = OFF; DELETE FROM tasks WHERE id = '{owner}';"
+                ))
+                .unwrap();
+        }
+        step(&db, &product, &mut model);
+        assert_eq!(projection(&model, &child).root_task_id, child);
+        assert_eq!(row(&model, &child).section, NavigatorSection::Backlog);
+        assert_eq!(waiting(&model, &child), NavigatorWait::UnavailableParent);
+    }
+}
+
+#[test]
+fn active_spawn_and_readopted_runs_are_working() {
+    let db = WorkDb::open(temp_db_path("navigator-spawn-readopt")).unwrap();
+    let product = make_revision_product(&db, "navigator-spawn-readopt");
+    let task = create_test_chore_manual(&db, &product, "live worker").id;
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let mut model = None;
+    step(&db, &product, &mut model);
+    db.start_execution_run(&execution.id, "worker", "repo", "lease", "ws", "/tmp/ws")
+        .unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(row(&model, &task).section, NavigatorSection::Working);
+
+    set_exec(&db, &execution.id, "waiting_human");
+    step(&db, &product, &mut model);
+    assert_eq!(row(&model, &task).section, NavigatorSection::NeedsAttention);
+    db.mark_execution_orphaned(&execution.id, "lost worker").unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(row(&model, &task).section, NavigatorSection::Backlog);
+    db.readopt_inferred_terminal_execution(&execution.id, "hook_after_terminal", None)
+        .unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(row(&model, &task).section, NavigatorSection::Working);
+    assert_eq!(row(&model, &task).activities[0].execution_id, execution.id);
+}
+
+#[test]
+fn project_worker_question_reaches_task_but_design_question_does_not() {
+    let db = WorkDb::open(temp_db_path("navigator-project-question")).unwrap();
+    let product = make_revision_product(&db, "navigator-project-question");
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.clone(),
+            name: "Project".into(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(&product)
+                .project_id(&project.id)
+                .name("Task")
+                .build(),
+        )
+        .unwrap();
+    let execution = spawn_live(&db, &task.id, ExecutionKind::TaskImplementation);
+    let mut model = None;
+    step(&db, &product, &mut model);
+    db.record_worker_awaiting_operator_answer(
+        &execution,
+        "decision needed",
+        &boss_protocol::OperatorQuestion {
+            text: "Use the proposed layout?".into(),
+            answer_type: boss_protocol::OperatorAnswerType::YesNo,
+            explanation: "The layout needs a decision.".into(),
+        },
+    )
+    .unwrap()
+    .expect("live worker failure");
+    assert_eq!(step(&db, &product, &mut model), Refresh::Snapshot("broad_input"));
+    assert_eq!(row(&model, &task.id).section, NavigatorSection::NeedsAttention);
+    assert_eq!(
+        actions(&model, &task.id),
+        [(NavigatorHumanAction::Question, task.id.clone())]
+    );
+    let group: String = db.connect().unwrap().query_row(
+        "SELECT id FROM attention_groups WHERE source_task_id = ?1 AND source_kind = 'task_transcript' AND association_task_id IS NULL",
+        [&task.id], |row| row.get(0)).unwrap();
+    db.dismiss_attention(&group, None).unwrap();
+    db.create_attention(
+        CreateAttentionInput::builder()
+            .kind("question")
+            .association_project_id(&project.id)
+            .source_task_id(&task.id)
+            .group_key("design-question")
+            .source_kind("design_doc")
+            .source_doc_path("docs/design.md")
+            .question_type("yes_no")
+            .prompt_text("Use this design?")
+            .build(),
+    )
+    .unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(row(&model, &task.id).section, NavigatorSection::Backlog);
+    assert!(actions(&model, &task.id).is_empty());
 }

@@ -244,6 +244,26 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
         let tree = db.get_work_tree_instrumented(product, &mut trace).unwrap();
         let bytes = serde_json::to_vec(&tree).unwrap().len();
         totals.push(start.elapsed().as_secs_f64() * 1000.0);
+        let navigator = trace.segment_counts(segment::DB_NAVIGATOR).unwrap();
+        let queries = navigator.2.expect("measured Navigator statement count");
+        assert!((1..=6).contains(&queries), "Navigator ran {queries} statements");
+        // Measure the same adapter at increasing cardinalities on this snapshot;
+        // the trace must report actual statements, including nested helper reads.
+        let conn = db.connect().unwrap();
+        for count in [1, 10, 100] {
+            let mut cards: Vec<_> = tree.tasks.iter().chain(&tree.chores).take(count).cloned().collect();
+            let (result, measured) = crate::db_diagnostics::count_statements(&conn, || {
+                crate::navigator_projection::attach_navigator(&conn, &mut cards, &mut [], &HashMap::new())
+            });
+            result.unwrap();
+            assert_eq!(
+                i64::try_from(measured).unwrap(),
+                queries,
+                "Navigator statements for {count} cards"
+            );
+        }
+        drop(conn);
+        println!("scale navigator={navigator:?}");
         reviews.push(trace.segment_counts(segment::DB_AI_REVIEW_STATE).unwrap().0);
         println!(
             "scale sample={sample} fetch_db_and_serialize_ms={:.3} ai_review_state_ms={:.3}",

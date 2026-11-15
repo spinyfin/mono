@@ -1280,7 +1280,18 @@ impl WorkDb {
         // The Navigator projection reads every derivation above and each
         // card's runtime, so it is the last one attached.
         let runtime_index = task_runtimes.iter().map(|r| (r.work_item_id.as_str(), r)).collect();
-        super::navigator_projection::attach_navigator(conn, &mut tasks, &mut chores, &runtime_index)?;
+        trace.enter_stage(segment::DB_NAVIGATOR);
+        let t = Instant::now();
+        let (result, queries) = super::db_diagnostics::count_statements(conn, || {
+            super::navigator_projection::attach_navigator(conn, &mut tasks, &mut chores, &runtime_index)
+        });
+        result?;
+        trace.record_nplus1(
+            segment::DB_NAVIGATOR,
+            elapsed_ms(t),
+            tasks.len() + chores.len(),
+            queries,
+        );
 
         let ideas = list_ideas_in_tx(conn, product_id, None)?;
         let attention_items = super::attentions::reads::list_items(conn, product_id)?;
