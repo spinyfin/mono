@@ -480,8 +480,8 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
             }
         }
 
-        // A memberless execution left by an older fallback must not take
-        // ownership away from batch recovery. Any failed newest batch also
+        // A memberless execution must not take ownership away from batch recovery.
+        // Any failed newest batch also
         // retains ownership, including exhausted or non-remintable failures:
         // legacy recovery must not circumvent the batch retry limits.
         let batches = work_db

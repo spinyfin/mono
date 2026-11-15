@@ -160,7 +160,7 @@ async fn live_batch_prevents_fallback_minting_a_memberless_reviewer() {
 }
 
 #[tokio::test]
-async fn old_memberless_failure_does_not_preempt_stale_batch_readmission() {
+async fn memberless_failed_review_does_not_preempt_stale_batch_readmission() {
     let (_dir, db) = open_db();
     let db = Arc::new(db);
     let product = create_test_product_with_repo(&db, "batch readmission", Some(REPO));
@@ -187,7 +187,7 @@ async fn old_memberless_failure_does_not_preempt_stale_batch_readmission() {
             [&batch.id],
         )
         .unwrap();
-    // Persist the already-refused legacy row left by the old fallback.
+    // A failed memberless review exists for the cycle root; it must not preempt batch readmission.
     let legacy = db
         .create_execution(
             CreateExecutionInput::builder()
