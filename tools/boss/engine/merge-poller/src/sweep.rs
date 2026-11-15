@@ -2568,6 +2568,17 @@ pub(crate) async fn mark_merged(
             return false;
         }
     };
+    if let Some(prior) = observation.cleared_queue_state.as_deref() {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            prior_merge_queue_state = prior,
+            new_merge_queue_state = Option::<&str>::None,
+            in_merge_queue = probe.in_merge_queue,
+            auto_merge_enabled = probe.auto_merge_enabled,
+            "merge poller: card Merging lane state changed",
+        );
+    }
     let Some(updated) = observation.completed_task else {
         if observation.changed {
             publisher

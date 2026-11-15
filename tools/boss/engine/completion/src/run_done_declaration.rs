@@ -422,7 +422,7 @@ impl WorkerCompletionHandler {
         if !merged && !closed_unmerged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
-                ConflictDeliveryDecision::Moot => merged = true,
+                ConflictDeliveryDecision::Merged => merged = true,
                 ConflictDeliveryDecision::ClosedUnmerged => closed_unmerged = true,
                 ConflictDeliveryDecision::Proceed => {}
             }
@@ -507,11 +507,22 @@ impl WorkerCompletionHandler {
             "run_done finalize: declared `delivered`, bound to a resolvable PR — terminalized at submit",
         );
 
+        if completion.binding_mismatch {
+            self.note_stale_merge_binding_mismatch(
+                &completion.execution,
+                work_item_pr_url(&completion.work_item),
+                &pr_url,
+                "run_done",
+            )
+            .await;
+            merged = false;
+        }
+
         self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
         if merged {
             return StopOutcome::PrMerged { pr_url };
         }
-        if closed_unmerged {
+        if closed_unmerged || completion.binding_mismatch {
             return StopOutcome::PrDetected { pr_url };
         }
         self.spawn_declared_delivery_post_effects(execution, &work_item_id, &pr_url);

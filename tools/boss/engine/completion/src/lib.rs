@@ -2423,6 +2423,13 @@ fn work_item_id(item: &WorkItem) -> String {
     }
 }
 
+fn work_item_pr_url(item: &WorkItem) -> Option<&str> {
+    match item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task.pr_url.as_deref(),
+        _ => None,
+    }
+}
+
 /// Defined in the persistence layer; re-exported here under its original
 /// path — see [`crate::work::should_enqueue_reviewer_for_primary`].
 pub(crate) use crate::work::should_enqueue_reviewer_for_primary;

@@ -67,7 +67,12 @@ fn human_driven_merge_records_evidence_without_completing_the_task() {
         .unwrap()
         .execute("UPDATE tasks SET human_driven = 1 WHERE id = ?1", [&root])
         .unwrap();
-    assert!(db.mark_chore_pr_merged(&root, PR).unwrap().is_none());
+    db.set_task_merge_queue_state(&root, Some("queued"), Some("{}"))
+        .unwrap();
+    let observation = db.observe_chore_pr_merged(&root, PR).unwrap();
+    assert!(observation.completed_task.is_none());
+    assert!(observation.changed);
+    assert_eq!(observation.cleared_queue_state.as_deref(), Some("queued"));
     assert!(db.get_merge_evidence(&root).unwrap().is_some());
     assert_eq!(task_status(&db, &root), "in_review");
     assert_eq!(journal_count(&db, &root), 1);
@@ -190,10 +195,37 @@ fn upgrade_installs_empty_evidence_without_guessing_terminal_history() {
     assert!(db.get_merge_evidence(&root).unwrap().is_none());
     assert_eq!(task_status(&db, &root), "done");
     db.mark_chore_pr_merged(&root, PR).unwrap();
-    let observed = db.get_merge_evidence(&root).unwrap().unwrap();
     // A later trigger refresh must retain evidence's invalidation coverage.
     board_projection_schema::refine_triggers(&db.connect().unwrap()).unwrap();
-    assert_eq!(journal_count(&db, &root), 2);
+    {
+        let conn = db.connect().unwrap();
+        let mut names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'trigger' AND name LIKE 'board_changes_pr_merge_evidence_%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "board_changes_pr_merge_evidence_DELETE",
+                "board_changes_pr_merge_evidence_INSERT",
+                "board_changes_pr_merge_evidence_UPDATE",
+            ]
+        );
+        conn.execute("DELETE FROM pr_merge_evidence WHERE root_task_id = ?1", [&root])
+            .unwrap();
+    }
+    assert_eq!(journal_count(&db, &root), 3);
+    db.mark_chore_pr_merged(&root, PR).unwrap();
+    assert_eq!(journal_count(&db, &root), 4);
+    let observed = db.get_merge_evidence(&root).unwrap().unwrap();
     drop(db);
     let reopened = WorkDb::open(path).unwrap();
     assert_eq!(reopened.get_merge_evidence(&root).unwrap(), Some(observed));
@@ -317,13 +349,50 @@ fn stale_worker_merge_cannot_replace_a_new_pr_binding() {
         .unwrap()
         .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", params![root, OTHER_PR])
         .unwrap();
-    db.record_worker_pr_completion(&execution.id, PR, None, None, WorkerPrCompletionTarget::Done, None)
+    let completion = db
+        .record_worker_pr_completion(&execution.id, PR, None, None, WorkerPrCompletionTarget::Done, None)
         .unwrap()
         .unwrap();
+    assert!(completion.binding_mismatch);
     assert_eq!(
         db.get_execution(&execution.id).unwrap().status,
         ExecutionStatus::Completed
     );
     assert_eq!(task_status(&db, &root), "in_review");
     assert!(db.get_merge_evidence(&root).unwrap().is_none());
+}
+
+#[test]
+fn blank_pr_url_is_unbound_for_a_worker_merge() {
+    let db = WorkDb::open(temp_db_path("blank-worker-merge")).unwrap();
+    for (label, bound) in [("empty", ""), ("whitespace", "   ")] {
+        let root = fixture(&db);
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", params![root, bound])
+            .unwrap();
+        let completion = db
+            .record_worker_pr_completion(&execution.id, PR, None, None, WorkerPrCompletionTarget::Done, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !completion.binding_mismatch,
+            "{label}: a blank binding must be treated as unbound"
+        );
+        assert_eq!(task_status(&db, &root), "done", "{label}");
+        let WorkItem::Chore(task) = completion.work_item else {
+            panic!("{label}: expected a chore");
+        };
+        assert_eq!(task.pr_url.as_deref(), Some(PR), "{label}");
+        assert!(db.get_merge_evidence(&root).unwrap().is_some(), "{label}");
+    }
 }

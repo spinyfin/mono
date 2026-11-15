@@ -137,7 +137,7 @@ impl MergeProbe for MergedProbe {
 }
 
 #[tokio::test]
-async fn conflict_delivery_gate_treats_a_merged_pr_as_moot_not_a_delivery_failure() {
+async fn conflict_delivery_gate_treats_a_merged_pr_as_merged_not_a_delivery_failure() {
     let workspace = tempdir().unwrap();
     let pr = "https://github.com/spinyfin/mono/pull/2070";
     let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
@@ -147,7 +147,7 @@ async fn conflict_delivery_gate_treats_a_merged_pr_as_moot_not_a_delivery_failur
     let execution = db.get_execution(&execution_id).unwrap();
     assert!(matches!(
         handler.conflict_delivery_decision(&execution, Some(pr)).await,
-        ConflictDeliveryDecision::Moot
+        ConflictDeliveryDecision::Merged
     ));
     assert_ne!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
 }
@@ -333,7 +333,10 @@ async fn merged_branch_pr_with_stale_task_binding_releases_execution() {
         }),
     );
     let outcome = handler.on_stop(&execution_id).await;
-    assert!(matches!(outcome, StopOutcome::PrMerged { .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { .. }),
+        "a merged PR that is not the bound PR must not look like a merge of the bound PR: {outcome:?}"
+    );
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Completed
@@ -345,5 +348,12 @@ async fn merged_branch_pr_with_stale_task_binding_releases_execution() {
     assert_eq!(task.pr_url.as_deref(), Some(old_pr));
     assert_ne!(task.status, TaskStatus::Done);
     assert!(db.get_merge_evidence(&root).unwrap().is_none());
+    assert!(
+        db.list_attention_items_for_work_item(&root)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == boss_engine_storage_values::attention_kinds::ATTENTION_KIND_PR_BINDING_REPAIR),
+        "a merged own-branch PR that is not the bound PR must file attention"
+    );
     assert!(!cube.release_calls.lock().await.is_empty());
 }

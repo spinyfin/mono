@@ -503,7 +503,7 @@ impl WorkerCompletionHandler {
             }
             ConflictClearance::Cleared
             | ConflictClearance::Merged
-            | ConflictClearance::NotOpen
+            | ConflictClearance::ClosedUnmerged
             | ConflictClearance::Unavailable => None,
         }
     }

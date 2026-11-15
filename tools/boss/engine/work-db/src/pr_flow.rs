@@ -220,11 +220,17 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             bail!("cannot complete a deleted task: {work_item_id}");
         }
+        // Blank / whitespace `pr_url` is unbound everywhere else in work-db
+        // (`IS NULL OR pr_url = ''`). Treat it the same here so a merged PR
+        // on this execution's branch can bind rather than looking like a
+        // foreign binding.
         let stale_merge = matches!(target, WorkerPrCompletionTarget::Done)
             && task.kind != TaskKind::Revision
             && task
                 .pr_url
                 .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
                 .is_some_and(|bound| !merge_evidence::same_binding(bound, pr_url));
 
         let now = now_string();
@@ -358,6 +364,7 @@ impl WorkDb {
             released_lease_id: original_lease_id,
             released_workspace_id: original_workspace_id,
             filed_attention_item: None,
+            binding_mismatch: stale_merge,
         }))
     }
 
@@ -594,6 +601,7 @@ impl WorkDb {
             released_lease_id: original_lease_id,
             released_workspace_id: original_workspace_id,
             filed_attention_item,
+            binding_mismatch: false,
         }))
     }
 
@@ -1509,6 +1517,7 @@ impl WorkDb {
         let now = now_string();
         let evidence_changed = merge_evidence::record_in_tx(&tx, work_item_id, pr_url, &now)?;
         driver_allocation::sol_selection::record_merge(&tx, work_item_id, &now)?;
+        let prior_queue_state = task.merge_queue_state.clone().filter(|state| !state.is_empty());
         if task.status == TaskStatus::Done || task.status == TaskStatus::Archived || task.human_driven {
             // Human-driven rows close only through the human completion ritual.
             // Already terminal rows need no status transition, but a task that
@@ -1531,6 +1540,7 @@ impl WorkDb {
             return Ok(MergeObservation {
                 completed_task: None,
                 changed: evidence_changed || cleared > 0,
+                cleared_queue_state: (cleared > 0).then_some(prior_queue_state).flatten(),
             });
         }
         // Clearing blocked_reason / blocked_attempt_id is load-bearing
@@ -1599,6 +1609,7 @@ impl WorkDb {
         Ok(MergeObservation {
             completed_task: Some(updated),
             changed: true,
+            cleared_queue_state: prior_queue_state,
         })
     }
 

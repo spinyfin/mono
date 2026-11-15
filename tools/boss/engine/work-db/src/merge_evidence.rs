@@ -52,6 +52,9 @@ pub struct MergeEvidence {
 pub struct MergeObservation {
     pub completed_task: Option<Task>,
     pub changed: bool,
+    /// Prior `merge_queue_state` when this observation actually cleared the
+    /// Merging-lane columns. `None` when those columns were already empty.
+    pub cleared_queue_state: Option<String>,
 }
 
 fn canonical_pr_url(pr_url: &str) -> Option<String> {

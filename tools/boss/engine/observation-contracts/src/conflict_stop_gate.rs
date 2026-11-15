@@ -76,7 +76,7 @@ pub enum ConflictClearance {
     /// The PR merged, so the conflict question is moot.
     Merged,
     /// The PR closed without merging. Completion must not imply a merge.
-    NotOpen,
+    ClosedUnmerged,
     /// The probe itself failed, so the PR's state is unknown. This gate has
     /// no opinion; a caller that must fail closed does so on this variant.
     Unavailable,
@@ -157,7 +157,7 @@ pub async fn verify_mergeability_live(
             // Merged or closed: the conflict question is moot and the
             // caller's own merged/closed handling is the right one.
             PrLifecycleState::Merged => return ConflictClearance::Merged,
-            PrLifecycleState::ClosedUnmerged => return ConflictClearance::NotOpen,
+            PrLifecycleState::ClosedUnmerged => return ConflictClearance::ClosedUnmerged,
         };
         match open.mergeability {
             OpenPrMergeability::Clean => return ConflictClearance::Cleared,
@@ -427,7 +427,7 @@ mod tests {
         let probe = ScriptedProbe::new(vec![PrLifecycleState::ClosedUnmerged]);
         assert_eq!(
             verify_conflict_cleared(&probe, PR, Duration::ZERO).await,
-            ConflictClearance::NotOpen,
+            ConflictClearance::ClosedUnmerged,
         );
     }
 

@@ -8,7 +8,7 @@ pub(super) enum ConflictDeliveryDecision {
     /// Continue with the caller's existing target.
     Proceed,
     /// The PR merged while the revision ran.
-    Moot,
+    Merged,
     /// The PR closed without merging while the revision ran.
     ClosedUnmerged,
     /// Delivery failed and the execution has already been failed.
@@ -47,8 +47,8 @@ impl WorkerCompletionHandler {
         .await;
         let reason = match result {
             Ok(ConflictClearance::Cleared) => return ConflictDeliveryDecision::Proceed,
-            Ok(ConflictClearance::Merged) => return ConflictDeliveryDecision::Moot,
-            Ok(ConflictClearance::NotOpen) => return ConflictDeliveryDecision::ClosedUnmerged,
+            Ok(ConflictClearance::Merged) => return ConflictDeliveryDecision::Merged,
+            Ok(ConflictClearance::ClosedUnmerged) => return ConflictDeliveryDecision::ClosedUnmerged,
             Ok(ConflictClearance::StillConflicting {
                 raw_mergeable,
                 raw_merge_state_status,
