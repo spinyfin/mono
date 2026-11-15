@@ -392,7 +392,8 @@ pub fn tmux_socket_path_beside_db(db_path: &Path) -> Result<PathBuf> {
 /// Read the progression limits from `BOSS_PROGRESSION_*`. Absent variables keep
 /// the design's placeholders; a zero or unparsable value is an error, since a
 /// zero grace, cooldown or interval would make the sweep fire on every item at
-/// once.
+/// once. Runtime calibration derives the sweep cadence from the effective
+/// stuck grace; an explicit sweep interval still takes precedence.
 fn load_progression_settings(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ProgressionSettings> {
     let defaults = ProgressionSettings::default();
     let positive = |name: &str| -> Result<Option<u64>> {
