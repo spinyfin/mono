@@ -121,6 +121,8 @@ final class WorkCardSnapshotTests: XCTestCase {
         "dispatchFailedError",
         "dispatchFailedAt",
         "completionSummary",
+        // Navigator placement is independent of the Kanban card snapshot.
+        "navigator",
         // The parked chip reaches the snapshot as `context.parked` (the stamp
         // may come from the project), so the raw stamp fields are not read.
         "parkedAt",
@@ -301,6 +303,11 @@ final class WorkCardSnapshotTests: XCTestCase {
             }),
             ("completionSummary", { t in
                 var t = t; t.completionSummary = "shipped without agent run"; return t
+            }),
+            ("navigator", { t in
+                var t = t
+                t.navigator = NavigatorProjection(version: 1, rootTaskId: "other_root", root: nil)
+                return t
             }),
             ("parkedAt", { t in
                 var t = t; t.parkedAt = "1799990000"; return t

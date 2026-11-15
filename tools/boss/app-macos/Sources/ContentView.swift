@@ -330,7 +330,8 @@ struct ContentView: View {
 
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.navigationMode == .work {
-                    WorkGroupToolbarMenu(model: model)
+                    WorkViewModePicker(model: model)
+                    if model.navigator.mode == .kanban { WorkGroupToolbarMenu(model: model) }
                 }
             }
 
@@ -954,7 +955,18 @@ struct ContentView: View {
                             retry: { model.refetchBoard(productID: product.id) }
                         )
                         .id(product.id)
-                        workBoard()
+                        ZStack {
+                            workBoard()
+                                .opacity(model.navigator.mode == .kanban ? 1 : 0)
+                                .allowsHitTesting(model.navigator.mode == .kanban)
+                                .disabled(model.navigator.mode != .kanban)
+                                .accessibilityHidden(model.navigator.mode != .kanban)
+                            WorkNavigatorView(model: model)
+                                .opacity(model.navigator.mode == .navigator ? 1 : 0)
+                                .allowsHitTesting(model.navigator.mode == .navigator)
+                                .disabled(model.navigator.mode != .navigator)
+                                .accessibilityHidden(model.navigator.mode != .navigator)
+                        }
                     case .loading:
                         BoardLoadingView(
                             isConnected: model.isConnected,

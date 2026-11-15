@@ -350,7 +350,12 @@ final class ChatViewModel: ObservableObject {
     }
     /// The park confirmation sheet's target, presented from `ContentView`.
     @Published var pendingParkRequest: ParkRequest?
-    @Published var selectedWorkCardID: String?
+    @Published var navigator = WorkNavigatorState()
+    @Published var selectedWorkCardID: String? {
+        didSet {
+            if let id = selectedWorkCardID { selectNavigatorRoot(id) }
+        }
+    }
     /// Task id that the reveal animation is currently highlighting.
     /// Set after viewport confirmation; cleared after 1.5 s. Views observe
     /// this to apply a transient border-glow overlay on the matching
@@ -945,6 +950,7 @@ final class ChatViewModel: ObservableObject {
     private func commonInit() {
         defer { isRestoringWorkSelection = false }
         isWorkSidebarHidden = defaults.bool(forKey: "boss.work.sidebarHidden")
+        navigator.mode = defaults.string(forKey: "boss.work.viewMode").flatMap(WorkViewMode.init(rawValue:)) ?? .kanban
         bindBoardReadObserver()
         bindRemotePaneViewer()
         commentBridge.onSubmissionRejected = { [weak self] action in

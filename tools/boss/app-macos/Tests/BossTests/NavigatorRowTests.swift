@@ -1,0 +1,177 @@
+import AppKit
+import SwiftUI
+import XCTest
+@testable import Boss
+
+@MainActor
+final class NavigatorRowTests: XCTestCase {
+    func testRegisteredBodyRetainsLocalStateAcrossMovementAndTabChanges() {
+        let model = NavigatorTestFixture.model([NavigatorTestFixture.task()])
+        model.selectWorkCard("root")
+        var appearances: [UUID] = []
+        var readOnlyValues: [Bool] = []
+        var registry = NavigatorDetailRegistry()
+        registry.register(.activity) { context in
+            readOnlyValues.append(context.isReadOnly)
+            return AnyView(NavigatorSlotProbe { appearances.append($0) })
+        }
+        let host = NSHostingView(rootView: WorkNavigatorDetail(model: model, registry: registry))
+        host.frame = NSRect(x: 0, y: 0, width: 600, height: 600)
+        func settle() {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        settle()
+        XCTAssertEqual(appearances.count, 1)
+        model.navigator.tab = .history
+        NavigatorTestFixture.snapshot(model, [NavigatorTestFixture.task(section: "landed", detail: "review")])
+        settle()
+        model.navigator.tab = .activity
+        settle()
+        XCTAssertEqual(appearances.count, 1, "Moving into a collapsed section must not recreate the registered body")
+        XCTAssertEqual(readOnlyValues.last, true, "Disconnected integrations must receive read-only context")
+        model.isConnected = true
+        settle()
+        XCTAssertEqual(readOnlyValues.last, false)
+    }
+
+    func testWireDecodingIncludesFoldedUnknownAndOmittedFields() throws {
+        let projection = try XCTUnwrap(NavigatorTestFixture.task().navigator)
+        XCTAssertEqual(projection.root?.activities.first?.executionId, "execution")
+        XCTAssertEqual(projection.root?.commands.first?.kind, "open_pr")
+        XCTAssertNil(NavigatorTestFixture.task("revision", rootID: "root").navigator?.root)
+        let unknown = NavigatorProjection.parse([
+            "version": 1, "root_task_id": "root", "root": [
+                "section": "backlog", "sort_key": "a", "default_detail": "future_detail",
+                "reason": ["type": "future_reason"], "reason_label": "Waiting for something new",
+                "revisions": ["open": 0, "total": 0],
+            ],
+        ])
+        XCTAssertEqual(unknown?.root?.reason.type, "future_reason")
+        XCTAssertEqual(unknown?.root?.actions, [])
+        XCTAssertEqual(unknown?.root?.activities, [])
+        XCTAssertEqual(unknown?.root?.commands, [])
+    }
+
+    func testCompatibilityDoesNotGuessMissingOrUnknownSections() {
+        var legacy = NavigatorTestFixture.task()
+        legacy.navigator = nil
+        let model = NavigatorTestFixture.model([legacy])
+        XCTAssertNotNil(model.navigatorCompatibilityMessage)
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        XCTAssertEqual(model.selectedWorkCardID, "root", "Compatibility fallback must preserve the Kanban selection")
+        model.setWorkViewMode(.kanban)
+        XCTAssertEqual(model.selectedWorkCardID, "root")
+        legacy.sourceAutomationId = "automation"
+        NavigatorTestFixture.snapshot(model, [legacy, NavigatorTestFixture.task("supported")])
+        XCTAssertNil(model.navigatorCompatibilityMessage)
+        XCTAssertEqual(model.navigatorVisibleRows.map(\.id), ["supported"])
+        NavigatorTestFixture.snapshot(model, [NavigatorTestFixture.task(section: "future_section")])
+        XCTAssertNotNil(model.navigatorCompatibilityMessage)
+        XCTAssertTrue(model.navigatorSections.flatMap(\.rows).isEmpty)
+    }
+
+    func testParserCarriesProjectionAndFutureVersionDisablesNavigator() throws {
+        let client = EngineClient(socketPaths: ["/tmp/navigator-parser.sock"])
+        let wire: [String: Any] = [
+            "id": "root", "product_id": "product", "kind": "task", "name": "Root", "description": "Brief",
+            "status": "todo", "created_at": "", "updated_at": "",
+            "navigator": ["version": 2, "root_task_id": "root"],
+        ]
+        let task = try XCTUnwrap(client.parseTask(wire))
+        XCTAssertEqual(task.navigator?.version, 2)
+        XCTAssertNotNil(NavigatorTestFixture.model([task]).navigatorCompatibilityMessage)
+    }
+
+    func testRowsAtNarrowStandardAndWideWidthsKeepAccessibleIndicators() throws {
+        var task = NavigatorTestFixture.task()
+        task.name = "A long task title that must truncate without pushing questions or health out of view"
+        task.prMergeableState = "conflicting"
+        task.ciRequiredState = "fail"
+        task.reviewRequiredState = "changes_requested"
+        let row = NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil)
+        for width: CGFloat in [260, 360, 520] {
+            let presentation = NavigatorRowPresentation(row: row, project: "Navigation", width: width)
+            XCTAssertEqual(presentation.showsSecondaryIndicators, width >= 340)
+            XCTAssertTrue(presentation.accessibilityLabel.contains("Merge conflict"))
+            XCTAssertTrue(presentation.accessibilityLabel.contains("CI fail"))
+            XCTAssertTrue(presentation.accessibilityLabel.contains("Review changes requested"))
+            XCTAssertTrue(presentation.accessibilityLabel.contains("1 questions"))
+            XCTAssertTrue(presentation.accessibilityLabel.contains(task.name))
+            let view = WorkNavigatorRow(row: row, project: "Navigation", width: width, isSelected: true)
+                .frame(width: width).background(Color(nsColor: .windowBackgroundColor))
+            let host = NSHostingView(rootView: view)
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            XCTAssertEqual(host.bounds.width, width, accuracy: 1)
+            XCTAssertEqual(host.bounds.height, 30, accuracy: 1)
+            try capture(host, name: "navigator-row-\(Int(width))")
+        }
+        let large = NSHostingView(rootView: WorkNavigatorRow(row: row, project: "Navigation", width: 260, isSelected: false)
+            .dynamicTypeSize(.accessibility3).frame(width: 260).background(Color(nsColor: .windowBackgroundColor)))
+        large.frame = NSRect(origin: .zero, size: large.fittingSize)
+        XCTAssertEqual(large.bounds.width, 260, accuracy: 1)
+        XCTAssertEqual(large.bounds.height, 52, accuracy: 1)
+        try capture(large, name: "navigator-row-large-text")
+    }
+
+    func testHealthPriorityKeepsSuppressedFactsAccessible() throws {
+        var task = NavigatorTestFixture.task()
+        task.prMergeableState = "conflicting"
+        task.ciRequiredState = "fail"
+        task.reviewRequiredState = "changes_requested"
+        func presentation() throws -> NavigatorRowPresentation {
+            NavigatorRowPresentation(row: NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root),
+                                                       matchingAskID: nil), project: nil, width: 260)
+        }
+        XCTAssertEqual(try presentation().health?.label, "Merge conflict")
+        task.prMergeableState = "mergeable"
+        XCTAssertEqual(try presentation().health?.label, "CI failed")
+        task.ciRequiredState = "in_progress"
+        XCTAssertEqual(try presentation().health?.label, "Review changes requested")
+        task.reviewRequiredState = "approved"
+        XCTAssertEqual(try presentation().health?.label, "CI pending")
+        XCTAssertTrue(try presentation().accessibilityLabel.contains("Review approved"))
+        task.ciRequiredState = "success"
+        XCTAssertEqual(try presentation().health?.label, "Review approved")
+        task.reviewRequiredState = nil
+        XCTAssertEqual(try presentation().health?.label, "CI passed")
+        task.ciRequiredState = "unknown"
+        XCTAssertNil(try presentation().health)
+        XCTAssertTrue(try presentation().accessibilityLabel.contains("CI unknown"))
+    }
+
+    func testDetailSlotsAndNavigatorRenderWithoutProductionEngine() throws {
+        let model = NavigatorTestFixture.model([NavigatorTestFixture.task(), NavigatorTestFixture.task("revision", rootID: "root")])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        for slot in NavigatorDetailSlot.allCases {
+            model.navigator.tab = slot
+            let host = NSHostingView(rootView: WorkNavigatorView(model: model).frame(width: 1000, height: 650))
+            host.frame = NSRect(x: 0, y: 0, width: 1000, height: 650)
+            try capture(host, name: "navigator-\(slot.rawValue)")
+        }
+    }
+
+    private func capture<V: View>(_ host: NSHostingView<V>, name: String) throws {
+        host.appearance = NSAppearance(named: .aqua)
+        for _ in 0..<3 {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        host.layoutSubtreeIfNeeded()
+        let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: rep)
+        let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(data.count, 100)
+        if let output = ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"] {
+            try data.write(to: URL(fileURLWithPath: output).appendingPathComponent(name + ".png"))
+        }
+    }
+}
+
+private struct NavigatorSlotProbe: View {
+    @State private var identity = UUID()
+    let appeared: (UUID) -> Void
+    var body: some View { Text("Registered body").onAppear { appeared(identity) } }
+}

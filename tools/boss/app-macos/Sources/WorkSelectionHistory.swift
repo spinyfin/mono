@@ -16,6 +16,16 @@ struct WorkSelectionHistory {
             .flatMap { try? JSONDecoder().decode(Snapshot.self, from: $0) } ?? Snapshot()
     }
 
+    func root(scope: String) -> String? {
+        (defaults.dictionary(forKey: "boss.work.rootsByScope") as? [String: String])?[scope]
+    }
+
+    func rememberRoot(_ id: String?, scope: String) {
+        var roots = defaults.dictionary(forKey: "boss.work.rootsByScope") as? [String: String] ?? [:]
+        roots[scope] = id
+        defaults.set(roots, forKey: "boss.work.rootsByScope")
+    }
+
     mutating func useProduct(_ id: String) {
         snapshot.products.removeAll { $0 == id }
         snapshot.products.insert(id, at: 0)

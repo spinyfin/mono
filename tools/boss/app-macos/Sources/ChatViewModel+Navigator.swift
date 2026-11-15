@@ -1,0 +1,198 @@
+import Foundation
+
+extension ChatViewModel {
+    var navigatorScopeKey: String {
+        ([selectedWorkProductID ?? ""] + selectedProjectFilterIDs.sorted()).joined(separator: "|")
+            + (filterToChoresOnly ? "|unprojected" : "")
+    }
+
+    var navigatorTasks: [WorkTask] {
+        guard let productID = selectedWorkProductID else { return [] }
+        return tasksByProjectID.values.flatMap { $0 }.filter { $0.productID == productID }
+            + (choresByProductID[productID] ?? [])
+            + (productLevelTasksByProductID[productID] ?? [])
+            + (productLevelRevisionsByProductID[productID] ?? [])
+    }
+
+    func navigatorIncludes(_ task: WorkTask) -> Bool {
+        task.productID == selectedWorkProductID
+            && (!filterToChoresOnly || task.projectID == nil)
+            && (selectedProjectFilterIDs.isEmpty || task.projectID.map(selectedProjectFilterIDs.contains) == true)
+    }
+
+    var navigatorCompatibilityMessage: String? {
+        let population = navigatorTasks.filter { $0.deletedAt == nil && $0.status != "archived" }
+        guard population.allSatisfy({ task in
+            guard let projection = task.navigator else {
+                // Excluded families deliberately have no projection. Revisions
+                // never manufacture rows or resolve ancestry in the client.
+                return task.sourceAutomationId != nil || task.kind == "revision"
+            }
+            guard projection.version == 1 else { return false }
+            return projection.rootTaskId != task.id || projection.root?.knownSection != nil
+        }) else {
+            return "Navigator is unavailable for this engine projection. Use Kanban or update the engine and app."
+        }
+        return nil
+    }
+
+    var navigatorSections: [NavigatorSectionRows] {
+        let tasks = navigatorTasks
+        let roots = tasks.filter { navigatorIncludes($0) && $0.deletedAt == nil && $0.status != "archived" }
+            .compactMap { task -> NavigatorRow? in
+                guard let projection = task.navigator, projection.version == 1,
+                      projection.rootTaskId == task.id, let root = projection.root,
+                      root.knownSection != nil else { return nil }
+                return NavigatorRow(task: task, projection: root, matchingAskID: nil)
+            }
+            .sorted {
+                if $0.projection.sortKey == $1.projection.sortKey { return $0.id < $1.id }
+                return $0.projection.sortKey.utf8.lexicographicallyPrecedes($1.projection.sortKey.utf8)
+            }
+        let query = activeWorkSearchQuery
+        let matchingAsks = tasks.filter { task in
+            guard let query else { return false }
+            return task.name.localizedCaseInsensitiveContains(query)
+                || task.description.localizedCaseInsensitiveContains(query)
+        }.sorted { $0.id < $1.id }
+        return NavigatorSection.allCases.map { section in
+            let all = roots.filter { $0.projection.knownSection == section }
+            let shown = all.compactMap { row -> NavigatorRow? in
+                guard let query else { return row }
+                if row.task.name.localizedCaseInsensitiveContains(query)
+                    || row.task.description.localizedCaseInsensitiveContains(query) { return row }
+                guard let ask = matchingAsks.first(where: { $0.navigator?.rootTaskId == row.id }) else { return nil }
+                return NavigatorRow(task: row.task, projection: row.projection, matchingAskID: ask.id)
+            }
+            return NavigatorSectionRows(section: section, rows: shown, total: all.count)
+        }
+    }
+
+    var navigatorCollapsed: Set<NavigatorSection> {
+        navigator.collapsedByScope[navigatorScopeKey] ?? [.landed]
+    }
+
+    var navigatorVisibleRows: [NavigatorRow] {
+        navigatorSections.filter { !navigatorCollapsed.contains($0.section) }.flatMap(\.rows)
+    }
+
+    var navigatorSelectedTask: WorkTask? {
+        navigator.selectedRootID.flatMap { task(withID: $0) } ?? navigator.retainedTask
+    }
+
+    var navigatorSelectionNotice: String? {
+        guard let id = navigator.selectedRootID, let selected = navigatorSelectedTask else { return nil }
+        guard task(withID: id) != nil, selected.deletedAt == nil, selected.status != "archived" else {
+            return "This task was archived or removed. Showing the last available detail."
+        }
+        if !navigatorSections.flatMap(\.rows).contains(where: { $0.id == id }) {
+            return "This task is hidden by the current search."
+        }
+        if let section = selected.navigator?.root?.knownSection,
+           section != navigator.selectedAtSection || navigatorCollapsed.contains(section) {
+            return "Moved to \(section.title)."
+        }
+        return nil
+    }
+
+    func selectNavigatorRoot(_ taskID: String, askID: String? = nil) {
+        guard let task = task(withID: taskID), let projection = task.navigator, projection.version == 1,
+              let root = self.task(withID: projection.rootTaskId), let detail = root.navigator?.root else {
+            navigator.selectedRootID = nil
+            navigator.retainedTask = nil
+            selectionHistory.rememberRoot(nil, scope: navigatorScopeKey)
+            return
+        }
+        if navigator.selectedRootID != root.id {
+            navigator.selectedRootID = root.id
+            navigator.selectedAtSection = detail.knownSection
+            navigator.tab = NavigatorDetailSlot(rawValue: detail.defaultDetail) ?? .activity
+            navigator.tabs = [.activity, .history, navigator.tab]
+            navigator.askID = askID ?? (task.id != root.id ? task.id : detail.revisions.currentTaskId)
+        } else if let askID {
+            navigator.askID = askID
+        }
+        navigator.retainedTask = root
+        if root.prURL != nil { navigator.tabs.insert(.review) }
+        if !detail.actions.isEmpty { navigator.tabs.insert(.attention) }
+        selectionHistory.rememberRoot(root.id, scope: navigatorScopeKey)
+    }
+
+    func reconcileNavigatorSelection() {
+        if let selected = navigatorSelectedTask, !navigatorIncludes(selected) {
+            navigator.selectedRootID = nil
+            navigator.retainedTask = nil
+        }
+        if let id = navigator.selectedRootID, let selected = task(withID: id) {
+            navigator.retainedTask = selected
+            if selected.prURL != nil { navigator.tabs.insert(.review) }
+            if selected.navigator?.root?.actions.isEmpty == false { navigator.tabs.insert(.attention) }
+        } else if navigator.selectedRootID == nil,
+                  let id = selectionHistory.root(scope: navigatorScopeKey),
+                  let task = task(withID: id), navigatorIncludes(task) {
+            selectNavigatorRoot(id)
+        }
+    }
+
+    /// Called around explicit scope changes, never background row movement.
+    func changeNavigatorScope(_ change: () -> Void) {
+        let previous = navigator.selectedRootID
+        change()
+        if let previous, let task = task(withID: previous), navigatorIncludes(task) {
+            selectNavigatorRoot(previous)
+            selectedWorkCardID = previous
+        } else {
+            navigator.selectedRootID = nil
+            navigator.retainedTask = nil
+            reconcileNavigatorSelection()
+            selectedWorkCardID = navigator.selectedRootID
+        }
+    }
+
+    func setWorkViewMode(_ mode: WorkViewMode) {
+        guard navigator.mode != mode else { return }
+        if let id = selectedWorkCardID { selectNavigatorRoot(id) }
+        if mode == .navigator {
+            navigator.kanbanCardOnExit = selectedWorkCardID
+            if let rootID = navigator.selectedRootID { selectedWorkCardID = rootID }
+        }
+        navigator.mode = mode
+        defaults.set(mode.rawValue, forKey: "boss.work.viewMode")
+        if mode == .kanban, let id = navigator.selectedRootID {
+            selectedWorkCardID = id
+            if id != navigator.kanbanCardOnExit, let task = task(withID: id), isTaskVisible(task) { prepareReveal(id) }
+        }
+    }
+
+    var navigatorProjectAttentionCount: Int {
+        selectedProductOpenAttentionGroups.filter { group in
+            guard let projectID = group.associationProjectID else { return false }
+            return selectedProjectFilterIDs.isEmpty || selectedProjectFilterIDs.contains(projectID)
+        }.count
+    }
+
+    func setNavigatorSection(_ section: NavigatorSection, expanded: Bool) {
+        var collapsed = navigatorCollapsed
+        if expanded { collapsed.remove(section) } else { collapsed.insert(section) }
+        navigator.collapsedByScope[navigatorScopeKey] = collapsed
+    }
+
+    func revealNavigatorSelection() {
+        workSearchText = ""
+        guard let section = navigatorSelectedTask?.navigator?.root?.knownSection else { return }
+        setNavigatorSection(section, expanded: true)
+        navigator.selectedAtSection = section
+        navigator.revealGeneration = UUID()
+    }
+
+    func moveNavigatorSelection(by offset: Int, edge: Bool = false) {
+        let rows = navigatorVisibleRows
+        guard !rows.isEmpty else { return }
+        let current = rows.firstIndex { $0.id == navigator.selectedRootID }
+        let index = edge ? (offset < 0 ? 0 : rows.count - 1)
+            : current.map { min(max($0 + offset, 0), rows.count - 1) } ?? (offset < 0 ? rows.count - 1 : 0)
+        selectWorkCard(rows[index].id)
+        selectNavigatorRoot(rows[index].id, askID: rows[index].matchingAskID)
+        navigator.revealGeneration = UUID()
+    }
+}
