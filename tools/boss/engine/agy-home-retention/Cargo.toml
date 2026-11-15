@@ -6,8 +6,5 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
-bon = { workspace = true }
-walkdir = { workspace = true }
+boss-engine-driver-home-retention = { path = "../driver-home-retention" }
 
-[dev-dependencies]
-tempfile = { workspace = true }

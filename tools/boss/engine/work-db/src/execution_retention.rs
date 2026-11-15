@@ -60,6 +60,10 @@
 //! an on-demand operator verb (`bossctl executions prune`) for manual
 //! cleanup between sweeps.
 //!
+//! Agy rows with an existing or inaccessible run container are kept until
+//! home retention removes the container. This preserves retryable pointers
+//! after failed deletes and honors home windows longer than the row window.
+//!
 //! ## Codex homes and prune ordering
 //!
 //! Codex per-run homes are discovered only from
@@ -176,6 +180,28 @@ fn prune_terminal_executions_on(
             )"
     );
 
+    // Agy containers remain discoverable until the home sweep has removed them.
+    // This applies equally to scheduled pruning and bossctl executions prune;
+    // a longer home window or a failed filesystem delete must retain its pointer.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, driver_runtime_state FROM work_executions WHERE id IN ({candidates_sql})"
+    ))?;
+    let rows = stmt.query_map(params![cutoff, policy.keep_per_work_item], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut protected = Vec::new();
+    for row in rows {
+        let (id, raw) = row?;
+        if raw.as_deref().is_some_and(agy_container_still_exists) {
+            protected.push(format!("'{}'", id.replace('\'', "''")));
+        }
+    }
+    let candidates_sql = if protected.is_empty() {
+        candidates_sql
+    } else {
+        format!("{candidates_sql} AND id NOT IN ({})", protected.join(","))
+    };
+
     if dry_run {
         let count: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM ({candidates_sql})"),
@@ -280,6 +306,19 @@ fn remaining_codex_home_paths(conn: &Connection) -> Result<HashSet<PathBuf>> {
         }
     }
     Ok(paths)
+}
+
+fn agy_container_still_exists(raw: &str) -> bool {
+    let Ok(state) = serde_json::from_str::<boss_protocol::DriverRuntimeState>(raw) else {
+        return false;
+    };
+    let Ok(agy) = boss_engine_driver::agy::AgyRuntimeState::from_driver_runtime_state(&state) else {
+        return false;
+    };
+    // An inaccessible path must keep its row too, so a later sweep can retry.
+    agy.process_home
+        .parent()
+        .is_some_and(|path| path.try_exists().unwrap_or(true))
 }
 
 fn owned_home_from_runtime_state_json(raw: &str) -> Option<PathBuf> {

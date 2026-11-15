@@ -1,6 +1,6 @@
 //! On-demand reclaim of recorded Boss-owned per-run driver homes.
 //!
-//! `bossctl {codex,grok,agy}-homes sweep` — never scans the operator's
+//! `bossctl {codex,grok,agy}-homes sweep` — never scans any
 //! interactive provider home. A running engine already sweeps on a schedule;
 //! these verbs are for cleanup between sweeps or while the engine is stopped.
 

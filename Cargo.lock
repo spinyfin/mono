@@ -603,9 +603,7 @@ name = "boss-engine-agy-home-retention"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bon",
- "tempfile",
- "walkdir",
+ "boss-engine-driver-home-retention",
 ]
 
 [[package]]
@@ -898,6 +896,16 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "boss-engine-driver-home-retention"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]

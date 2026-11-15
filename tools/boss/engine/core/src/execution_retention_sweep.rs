@@ -13,13 +13,10 @@
 //!
 //! ## Ordering vs Codex / agy home reclaim
 //!
-//! Each pass runs the Codex-home and agy-home retention reclaims
-//! **before** pruning execution rows so policy-eligible homes are
-//! reclaimed while their DB pointers still exist. Prune itself also
-//! reclaims any Codex/Claude home that loses its last remaining pointer
-//! (see `execution_retention`), so a race cannot permanently orphan a
-//! reclaimable `CODEX_HOME`. The agy sweep is the reclaim path for
-//! Antigravity run containers.
+//! Each pass runs home retention before row pruning. Prune reclaims
+//! Codex/Claude homes that lose their final pointer and retains rows whose
+//! agy containers still exist, including when the home sweep fails or uses
+//! a longer window. Direct CLI pruning uses the same storage rule.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,7 +63,7 @@ pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::Join
 ///
 /// Order: Codex-home and agy-home reclaim first (while pointers exist),
 /// then row prune (which also reclaims Codex/Claude homes that lose their
-/// last pointer).
+/// last pointer), and retains rows whose agy containers still exist.
 pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
     // Reclaim-before-prune: policy-eligible homes for terminal executions
     // that are about to (or may soon) leave the DB.

@@ -14,7 +14,7 @@ rust_library(
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + ["//tools/boss/engine/driver-home-retention"],
 )
 
 rust_test(

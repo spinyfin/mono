@@ -1233,12 +1233,6 @@ pub mod input {
             }
             return Ok(());
         }
-        if let Some(agy) = agy_state(state) {
-            // Teardown keeps conversation files readable; the retention
-            // sweep fully deletes the container past policy.
-            boss_engine_driver::agy::reclaim_agy_run(&agy.process_home)?;
-            return Ok(());
-        }
         if let Some(home) = boss_engine_driver::initial_prompt::owned_home_from_runtime_state(state) {
             reclaim_home(&home)?;
         }
@@ -1250,18 +1244,11 @@ pub mod input {
         boss_engine_driver::grok::GrokRuntimeState::from_driver_runtime_state(state).ok()
     }
 
-    fn agy_state(state: &DriverRuntimeState) -> Option<boss_engine_driver::agy::AgyRuntimeState> {
-        state.as_value().get("process_home")?;
-        state.as_value().get("agy_binary")?;
-        boss_engine_driver::agy::AgyRuntimeState::from_driver_runtime_state(state).ok()
-    }
-
     /// The per-run home a driver's runtime state owns and holds the delivery
-    /// markers: Codex and Claude via the shared rule, plus a Grok or agy home.
+    /// markers: Codex and Claude via the shared rule, plus a Grok home.
     pub fn owned_home(state: &DriverRuntimeState) -> Option<std::path::PathBuf> {
         boss_engine_driver::initial_prompt::owned_home_from_runtime_state(state)
             .or_else(|| grok_state(state).map(|grok| grok.grok_home))
-            .or_else(|| agy_state(state).map(|agy| agy.process_home))
     }
 
     /// Reclaim an already recorded home after hub retention authorizes it.

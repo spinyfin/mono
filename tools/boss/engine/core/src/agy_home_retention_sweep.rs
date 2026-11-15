@@ -340,10 +340,99 @@ mod tests {
         // Idempotent second pass.
         let outcome2 = run_one_pass_with_policy(&db, &policy, false).await;
         assert_eq!(outcome2.errors, 0, "{outcome2:?}");
+        assert!(!crate::sweep_loop::SweepOutcome::has_activity(&outcome2));
         assert_eq!(
-            outcome2.deleted, 1,
-            "already-gone path still counts as reclaimed: {outcome2:?}"
+            outcome2.deleted, 0,
+            "already-gone paths are not fresh reclaim: {outcome2:?}"
         );
+    }
+
+    #[test]
+    fn prune_keeps_agy_pointers_until_containers_are_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = boss_engine_driver::test_support::agy_homes_override(&root);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (_dir, db) = open_db();
+                let product = create_test_product_with_repo(&db, "retention", Some("https://github.com/test/repo")).id;
+                let now = now_epoch();
+                let day = 86400;
+                let prune_policy = crate::work::ExecutionRetentionPolicy {
+                    max_age_secs: 14 * day,
+                    keep_per_work_item: 0,
+                };
+                for scenario in ["long-window", "recent-finish", "failed-delete"] {
+                    let item = db
+                        .create_chore(
+                            CreateChoreInput::builder()
+                                .product_id(product.clone())
+                                .name(scenario)
+                                .build(),
+                        )
+                        .unwrap()
+                        .id;
+                    let container = root.join(scenario);
+                    if scenario == "failed-delete" {
+                        // remove_dir_all cannot remove a regular file.
+                        std::fs::write(&container, "not a directory").unwrap();
+                    } else {
+                        write_agy_container(&container);
+                    }
+                    let finished = if scenario == "recent-finish" {
+                        now - 60
+                    } else {
+                        now - 30 * day
+                    };
+                    let id = seed_execution_with_home(&db, &item, "failed", finished, &container.join("process-home"));
+                    db.connect()
+                        .unwrap()
+                        .execute(
+                            "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+                            rusqlite::params![id, (now - 30 * day).to_string()],
+                        )
+                        .unwrap();
+                    let days = if scenario == "long-window" { 90 } else { 14 };
+                    let policy = retention::AgyHomeRetentionPolicy::new(Duration::from_secs(days * 86400), u64::MAX);
+                    let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+                    assert_eq!(outcome.deleted, 0, "{scenario}");
+                    if scenario == "failed-delete" {
+                        assert_eq!(outcome.errors, 1);
+                    }
+                    // Both CLI dry-run and real prune must preserve the last pointer.
+                    assert_eq!(
+                        db.prune_terminal_executions(prune_policy, now, true).unwrap().deleted,
+                        0,
+                        "{scenario}"
+                    );
+                    assert_eq!(
+                        db.prune_terminal_executions(prune_policy, now, false).unwrap().deleted,
+                        0,
+                        "{scenario}"
+                    );
+                    assert!(db.get_execution(&id).is_ok());
+                    if scenario == "failed-delete" {
+                        std::fs::remove_file(&container).unwrap();
+                        write_agy_container(&container);
+                    }
+                    let expired = retention::AgyHomeRetentionPolicy::new(Duration::ZERO, u64::MAX);
+                    assert_eq!(
+                        run_one_pass_with_policy(&db, &expired, false).await.deleted,
+                        1,
+                        "{scenario}"
+                    );
+                    assert_eq!(
+                        db.prune_terminal_executions(prune_policy, now, false).unwrap().deleted,
+                        1,
+                        "{scenario}"
+                    );
+                    assert!(db.get_execution(&id).is_err());
+                }
+            });
     }
 
     #[tokio::test]
