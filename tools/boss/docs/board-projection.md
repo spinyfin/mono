@@ -17,6 +17,14 @@ Bounds are explicit:
 - At most four products are retained with least-recently-used eviction, each with at most 16,384 cards and 32 MiB of encoded content. After a snapshot, a conservative byte total is adjusted from the replaced cards, runtimes and dependency list; the retention guard does not serialize the whole board on each update. Parity sequences verify this total against actual encoding (at most six bytes of comma-count slack). Oversized boards are returned intact through full reads and are not retained. These are retention bounds, not a claim that Rust heap usage equals encoded size. In-flight responses and existing per-session wire caches have their own lifetimes.
 - Changes to product/project metadata, ideas, dependencies, product alerts, planner summaries recover from a complete snapshot. They can affect non-card collections or relationships beyond an individual family. Review membership and projected guide columns journal only their owning card families; review status bookkeeping does not invalidate boards. Only the review-verdict watermark is observed in the engine metadata table; unrelated scheduler metadata does not force a snapshot.
 
+## Navigator projection
+
+Each card also carries the engine-computed [Navigator Work-view](designs/navigator-work-view.md) projection (`Task.navigator`): the section, sort key, winning reason, current activity, actionable references and merge evidence of the row the card belongs to, with revisions folded into their root. It is the last derivation attached by both the complete assembly and the incremental card read, over the same whole revision chains, so the existing parity tests compare it field for field; there is no separate cache, subscription or RPC.
+
+Its inputs reuse the coverage above rather than adding to it: task rows and parent links (the `tasks` triggers), runtimes and the live execution and run rows behind them (`board_runtime_epoch`), open operator questions (`operator_questions`), confirmed merge evidence (`pr_merge_evidence`, journaled at the owning root), and typed question attentions (`attention_groups` and `attentions`, the full-snapshot class). Nothing is read from GitHub when a board is assembled. Automation-owned families carry no projection, as they are absent from the board's Work population.
+
+`Task` holds the projection behind a `Box`: the card is copied by value throughout the engine, and an inline projection pushed a deeply nested test over its thread's stack.
+
 New projection inputs must be added to the journal coverage or the full-snapshot class. The input table list lives beside the migration in `tools/boss/engine/work-db/src/board_projection_schema.rs`. No call site may substitute a best-effort invalidation ID for that coverage.
 
 ## Validation and measurement

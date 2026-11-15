@@ -980,6 +980,16 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// Engine-computed Navigator Work-view projection: the section, ordering
+    /// and reason of the row this task belongs to. A derived projection, not a
+    /// stored column, populated by the same assembly (and incremental refresh)
+    /// as the Kanban fields; absent for work the Work view excludes
+    /// (automation-owned tasks) and from engines that predate it. Boxed so the
+    /// card stays small: `Task` is held by value throughout the engine, and an
+    /// inline projection is several hundred bytes on every copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigator: Option<Box<super::NavigatorProjection>>,
+
     /// What *kind of thinking* this work item needs, independent of how big
     /// it is (`effort_level`). See [`ReasoningMode`].
     ///

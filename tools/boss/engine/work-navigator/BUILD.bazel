@@ -8,6 +8,7 @@ rust_library(
     crate_name = "boss_work_navigator",
     crate_root = "src/lib.rs",
     edition = "2024",
+    visibility = ["//tools/boss/engine/work-db:__pkg__"],
 )
 
 rust_test(

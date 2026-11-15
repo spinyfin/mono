@@ -928,6 +928,7 @@ pub mod lock_stats;
 mod mappers;
 pub mod merge_evidence;
 mod metrics_db;
+mod navigator_projection;
 mod output_types;
 mod planner_runs;
 mod pr_binding;

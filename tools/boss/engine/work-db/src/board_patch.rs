@@ -298,7 +298,7 @@ pub(super) fn read_cards(
     // A patch names a few chains; recomputing their owners is cheaper
     // than a cache pass, and keeps the patch a pure function of the
     // snapshot.
-    let tasks = attach_board_derivations(
+    let mut tasks = attach_board_derivations(
         conn,
         tasks,
         &mut chores,
@@ -308,6 +308,9 @@ pub(super) fn read_cards(
         &mut trace,
         None,
     );
+    // Same final step, over the same whole families, as the complete tree.
+    let runtime_index = runtimes.iter().map(|(id, runtime)| (id.as_str(), runtime)).collect();
+    super::navigator_projection::attach_navigator(conn, &mut tasks, &mut chores, &runtime_index)?;
 
     let present: HashSet<&str> = tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
     let absent = requested
