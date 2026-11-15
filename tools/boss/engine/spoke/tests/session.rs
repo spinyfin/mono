@@ -140,10 +140,28 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
         ..Default::default()
     };
     second.send(hub_frame::Body::Command(command.clone())).await;
-    assert!(matches!(
-        second.next().await,
-        spoke_frame::Body::CommandReceipt(v1::Cursor { through: 1, .. })
-    ));
+    // Hold the daemon at a known state before the kill: wait until it has
+    // received the command (receipt) and finished it (result spooled), and
+    // never receipt that result. The two frames may arrive in either order.
+    // Killing earlier races the executor tick, which would leave the command
+    // either unstarted or interrupted (see the next test).
+    let mut command_receipted = false;
+    let mut result_seen = false;
+    while !(command_receipted && result_seen) {
+        match second.next().await {
+            spoke_frame::Body::CommandReceipt(v1::Cursor { through: 1, .. }) => command_receipted = true,
+            spoke_frame::Body::Record(record) => {
+                if let Some(record::Body::Result(result)) = &record.body {
+                    assert_eq!(result.command_id, "one");
+                    assert_eq!(result.code, v1::ResultCode::Rejected as i32);
+                    result_seen = true;
+                } else {
+                    second.receipt(record.sequence).await;
+                }
+            }
+            _ => panic!("unexpected frame"),
+        }
+    }
     drop(daemon); // SIGKILL: no orderly database close or daemon cleanup.
     drop(second);
     let _restarted = hub.start();
@@ -155,7 +173,9 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
     third.send(hub_frame::Body::Command(command)).await;
     let mut result_count = 0;
     let mut receipt_seen = false;
-    for _ in 0..3 {
+    // Bounded by the per-frame timeout in `next`; the daemon may also emit
+    // fresh capacity records around the replayed result.
+    while !(receipt_seen && result_count == 1) {
         match third.next().await {
             spoke_frame::Body::CommandReceipt(cursor) => {
                 assert_eq!(cursor.through, 1);
@@ -170,9 +190,6 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
                 third.receipt(record.sequence).await;
             }
             _ => panic!("unexpected frame"),
-        }
-        if receipt_seen && result_count == 1 {
-            break;
         }
     }
     assert!(receipt_seen);
@@ -189,6 +206,55 @@ async fn actual_daemon_reconnects_replays_and_recovers_command_receipt_after_sig
         after = stored.sequence;
     }
     assert_eq!(results, 1, "duplicate command never creates another result");
+}
+
+/// A command whose effect had begun when the daemon died may already have
+/// happened, so replay must report it as uncertain rather than rejected. The
+/// journal is seeded with the command already claimed (attempting) so the
+/// state is exact, not a race against the executor tick.
+#[tokio::test]
+async fn actual_daemon_reports_a_command_interrupted_mid_attempt_as_uncertain() {
+    let mut hub = Fixture::new().await;
+    let command = v1::Command {
+        sequence: 1,
+        command_id: "one".into(),
+        not_after_unix_ms: i64::MAX,
+        body: Some(command::Body::Inventory(v1::Empty {})),
+        ..Default::default()
+    };
+    let mut journal = Journal::open(&hub.root(), "host", Limits::default()).unwrap();
+    let (_, journal_id) = journal.identity().unwrap();
+    journal
+        .welcome(&v1::Welcome {
+            epoch: 1,
+            hub_id: "hub".into(),
+            authority_generation: "authority".into(),
+            connection_generation: 1,
+            received_records: Some(v1::Cursor { journal_id, through: 0 }),
+            command_journal_id: "commands".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    journal
+        .receive_command(&<v1::Command as prost::Message>::encode_to_vec(&command))
+        .unwrap();
+    let (claimed, interrupted) = journal.begin_pending().unwrap().unwrap();
+    assert_eq!(claimed.command_id, "one");
+    assert!(!interrupted, "first claim is not an interruption");
+    let _daemon = hub.start_after_journal(journal);
+    let mut connection = hub.connection().await;
+    assert_eq!(connection.hello.received_commands.as_ref().unwrap().through, 1);
+    connection.welcome(0).await;
+    let result = loop {
+        if let spoke_frame::Body::Record(record) = connection.next().await {
+            connection.receipt(record.sequence).await;
+            if let Some(record::Body::Result(result)) = record.body {
+                break result;
+            }
+        }
+    };
+    assert_eq!(result.command_id, "one");
+    assert_eq!(result.code, v1::ResultCode::OutcomeUncertain as i32);
 }
 
 #[tokio::test]
