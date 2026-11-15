@@ -194,6 +194,48 @@ final class NavigatorSelectionTests: XCTestCase {
         XCTAssertTrue(model.navigatorSelectionNotice?.contains("removed") == true)
     }
 
+    func testDeletedRootThenSnapshotKeepsRetainedDetail() {
+        let model = NavigatorTestFixture.model([NavigatorTestFixture.task()])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        model.navigator.tab = .history
+        model.applyEventForTest(.workItemDeleted(id: "root"))
+        XCTAssertNil(model.selectedWorkCardID)
+        XCTAssertEqual(model.navigator.selectedRootID, "root")
+        XCTAssertEqual(model.navigator.retainedTask?.id, "root")
+        NavigatorTestFixture.snapshot(model, [])
+        XCTAssertEqual(model.selectedWorkCardID, "root")
+        XCTAssertEqual(model.navigator.selectedRootID, "root")
+        XCTAssertEqual(model.navigatorSelectedTask?.id, "root")
+        XCTAssertEqual(model.navigator.tab, .history)
+        XCTAssertTrue(model.navigatorSelectionNotice?.contains("removed") == true)
+    }
+
+    func testRevealNonCurrentRevisionSetsAskFromEmptySelection() {
+        let root = NavigatorTestFixture.task()
+        let current = NavigatorTestFixture.task("revision", rootID: "root")
+        let older = NavigatorTestFixture.task("older", rootID: "root")
+        let model = NavigatorTestFixture.model([root, current, older])
+        model.setWorkViewMode(.navigator)
+        XCTAssertNil(model.navigator.selectedRootID)
+        XCTAssertEqual(model.revealWorkCard("older", productID: "product"), .revealed(cardID: "root"))
+        XCTAssertEqual(model.navigator.selectedRootID, "root")
+        XCTAssertEqual(model.navigator.askID, "older")
+    }
+
+    func testRevealNonCurrentRevisionSetsAskWhenRootAlreadySelected() {
+        let root = NavigatorTestFixture.task()
+        let current = NavigatorTestFixture.task("revision", rootID: "root")
+        let older = NavigatorTestFixture.task("older", rootID: "root")
+        let model = NavigatorTestFixture.model([root, current, older])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        XCTAssertEqual(model.navigator.askID, "revision")
+        XCTAssertEqual(model.revealWorkCard("older", productID: "product"), .revealed(cardID: "root"))
+        XCTAssertEqual(model.navigator.selectedRootID, "root")
+        XCTAssertEqual(model.navigator.askID, "older")
+    }
+
     func testAcknowledgementDoesNotSpeculateAboutPlacement() {
         let model = NavigatorTestFixture.model([NavigatorTestFixture.task()])
         var acknowledgement = NavigatorTestFixture.task(section: "landed")

@@ -52,6 +52,28 @@ final class NavigatorModeRegressionTests: XCTestCase {
         XCTAssertEqual(model.revealScrollTarget, task.id)
     }
 
+    func testKanbanSwitchPreservesSearchAndNoProjectScopeWhenCardIsVisible() {
+        let chore = NavigatorTestFixture.task(kind: "chore")
+        let model = NavigatorTestFixture.model([chore])
+        model.setWorkViewMode(.navigator)
+        model.setFilterToChoresOnly(true)
+        model.selectWorkCard("root")
+        model.workSearchText = "navigation"
+        XCTAssertTrue(model.filterToChoresOnly)
+        XCTAssertTrue(model.navigatorScopeKey.contains("unprojected"))
+        XCTAssertTrue(model.isTaskVisible(chore))
+        XCTAssertEqual(model.navigator.selectedRootID, "root")
+        model.setWorkViewMode(.kanban)
+        XCTAssertTrue(model.filterToChoresOnly)
+        XCTAssertEqual(model.workSearchText, "navigation")
+        XCTAssertFalse(model.showBlockedOnly)
+        XCTAssertTrue(model.includeChores)
+        XCTAssertTrue(model.navigatorScopeKey.contains("unprojected"))
+        XCTAssertEqual(model.selectedWorkCardID, "root")
+        XCTAssertEqual(model.revealScrollTarget, "root")
+        XCTAssertTrue(model.isTaskVisible(chore))
+    }
+
     func testKanbanHandoffClearsFiltersThatHideRoot() {
         for filter in ["blocked", "chores", "search"] {
             let chore = NavigatorTestFixture.task(kind: "chore")

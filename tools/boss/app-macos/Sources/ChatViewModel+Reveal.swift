@@ -8,7 +8,7 @@ extension ChatViewModel {
                projection.version == 1, let root = self.task(withID: projection.rootTaskId),
                root.navigator?.root?.knownSection != nil, navigatorIncludes(root) {
                 selectedWorkCardID = root.id
-                selectNavigatorRoot(taskID)
+                selectNavigatorRoot(root.id, askID: taskID != root.id ? taskID : nil)
                 navigatorRevealRootID = root.id
                 revealNavigatorSelection()
                 armRevealDeadline(taskID: taskID, waitingForTree: false)

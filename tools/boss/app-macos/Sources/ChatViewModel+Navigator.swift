@@ -132,6 +132,10 @@ extension ChatViewModel {
     func reconcileNavigatorSelection() {
         defer {
             if navigator.mode == .navigator, selectedWorkCardID != navigator.selectedRootID {
+                // Align the shared card id even when the root has left the
+                // store. selectedWorkCardID's didSet skips selectNavigatorRoot
+                // for a missing task, so a retained/removed root is not
+                // re-resolved and wiped.
                 selectedWorkCardID = navigator.selectedRootID
             }
         }
@@ -184,10 +188,38 @@ extension ChatViewModel {
             if let id = navigator.selectedRootID {
                 selectionHistory.rememberRoot(id, scope: navigatorScopeKey)
             }
-        } else if let root = navigatorSelectedTask {
-            revealWorkCard(root.id, productID: root.productID)
+        } else {
+            revealKanbanSelectionAfterNavigator()
+        }
+    }
+
+    /// Switch onto the Kanban card for the Navigator root, or the card that
+    /// was selected on the last Kanban visit. A card already rendered under
+    /// the current filters is selected and scrolled to in place: search,
+    /// No-project scope, and Kanban toggles stay put, and the work tree is
+    /// not refetched. Hidden cards still go through reveal so the filters
+    /// that hide them can be cleared.
+    private func revealKanbanSelectionAfterNavigator() {
+        let target: WorkTask?
+        if let root = navigatorSelectedTask {
+            target = root
         } else if let id = navigator.kanbanCardOnExit, let task = task(withID: id), navigatorIncludes(task) {
-            revealWorkCard(id, productID: task.productID)
+            target = task
+        } else {
+            target = nil
+        }
+        guard let target else { return }
+        if isKanbanCardRendered(target) {
+            prepareReveal(target.id)
+        } else {
+            revealWorkCard(target.id, productID: target.productID)
+        }
+    }
+
+    private func isKanbanCardRendered(_ task: WorkTask) -> Bool {
+        guard isTaskVisible(task) else { return false }
+        return WorkBoardColumnKey.allCases.contains { column in
+            workSections(in: column).contains { $0.items.contains { $0.id == task.id } }
         }
     }
 

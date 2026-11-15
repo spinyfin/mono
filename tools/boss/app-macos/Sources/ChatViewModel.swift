@@ -354,7 +354,11 @@ final class ChatViewModel: ObservableObject {
     @Published var navigator = WorkNavigatorState()
     @Published var selectedWorkCardID: String? {
         didSet {
-            if let id = selectedWorkCardID { selectNavigatorRoot(id) }
+            // A retained Navigator root can outlive the task store after a
+            // deletion event. Re-resolving that id would wipe retainedTask
+            // and the removal notice.
+            guard let id = selectedWorkCardID, task(withID: id) != nil else { return }
+            selectNavigatorRoot(id)
         }
     }
     /// Task id that the reveal animation is currently highlighting.
