@@ -126,6 +126,7 @@ impl WorkDb {
     ) -> Result<(WorkExecution, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_no_live_review_batch(&tx, work_item_id)?;
         if let Some(existing) = existing_nonterminal_pr_review_execution(&tx, work_item_id)? {
             tx.commit()?;
             return Ok((existing, false));

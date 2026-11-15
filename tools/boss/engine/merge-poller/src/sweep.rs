@@ -2775,12 +2775,26 @@ pub async fn sweep_stalled_reviewer(
         review_result_written,
         skip_unbatched_review_holds,
     } = stalled;
-    if skip_unbatched_review_holds {
-        let cycle_root = work_db.review_cycle_root_id(task_id);
-        let live_batch = work_db.has_live_pre_merge_review_batch(&cycle_root).unwrap_or(false);
-        if !live_batch && !has_nonterminal_pr_review(work_db, task_id, &cycle_root) {
+    let cycle_root = match work_db.resolve_review_cycle_root(task_id) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(task_id, ?error, "reviewer-fallback: failed to resolve review cycle");
             return;
         }
+    };
+    match work_db.has_live_pre_merge_review_batch(&cycle_root) {
+        // Batch recovery owns retries, quorum and the consolidated verdict.
+        // A dead leaf does not authorize a memberless legacy review, even
+        // when every member execution is terminal or fan-out was disabled.
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(task_id, ?error, "reviewer-fallback: failed to check batch ownership");
+            return;
+        }
+    }
+    if skip_unbatched_review_holds && !has_nonterminal_pr_review(work_db, task_id, &cycle_root) {
+        return;
     }
     if review_result_written {
         match work_db.advance_pending_review_task_to_in_review(task_id) {

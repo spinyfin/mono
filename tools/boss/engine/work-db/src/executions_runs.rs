@@ -482,6 +482,8 @@ impl WorkDb {
     /// `cancelled`, `completed`, `failed` or `abandoned`. A resume there would
     /// restart cancelled work or duplicate finished work. Only an `orphaned`
     /// predecessor (another recovery path got there first) still resumes.
+    /// For a batch-owned review, orphans the stopped predecessor and returns
+    /// `None` without a successor: role-scoped review recovery owns its retry.
     pub fn request_resume_execution(
         &self,
         dead_execution_id: &str,
@@ -536,6 +538,19 @@ impl WorkDb {
              WHERE id = ?1",
             params![dead_execution_id, reason],
         )?;
+
+        // Batch retries must preserve the role and its bounded attempt
+        // policy. The generic resume INSERT has no member row; orphan the
+        // stopped predecessor and let review recovery retry it instead.
+        if dead.kind == ExecutionKind::PrReview {
+            let cycle_root = super::chain_helpers::chain_root(&tx, &dead.work_item_id)?;
+            if super::review_batches::member_for_execution_in(&tx, dead_execution_id)?.is_some()
+                || super::review_batches::has_live_pre_merge_review_batch_in(&tx, &cycle_root)?
+            {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
 
         // Another reconciler can settle the run while teardown is in flight.
         // Adopt the successor it created, but only the row that is genuinely

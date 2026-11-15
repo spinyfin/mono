@@ -643,13 +643,13 @@ async fn process_state(
             match work_db.request_resume_execution(&execution_id, attempt as i64, dispatch_not_before, &reason) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    // Cancelled, completed or abandoned while its work was
-                    // being preserved: resuming would restart finished work.
+                    // Settled during teardown, or owned by batch recovery:
+                    // neither case permits a generic resume execution.
                     tracing::info!(
                         execution_id,
                         work_item_id = %work_item_id,
-                        "transient-recovery: execution was settled while its work was being \
-                         preserved; no resume execution created",
+                        "transient-recovery: execution settled or batch recovery owns its retry; \
+                         no resume execution created",
                     );
                     return;
                 }

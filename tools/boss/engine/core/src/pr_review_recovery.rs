@@ -480,6 +480,41 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
             }
         }
 
+        // A memberless execution left by an older fallback must not take
+        // ownership away from batch recovery. Failed batches also stay on
+        // the batch path: deferred admission replaces them within its cap.
+        let batches = work_db
+            .resolve_review_cycle_root(&work_item_id)
+            .and_then(|root| work_db.review_batches_for_cycle_root(&root));
+        match batches {
+            Ok(batches) => {
+                let mut pre_merge = batches
+                    .iter()
+                    .filter(|batch| batch.phase == boss_protocol::ReviewBatchPhase::PreMerge);
+                let newest = pre_merge.next();
+                let batch_owns_recovery = newest
+                    .is_some_and(|batch| batch.status != boss_protocol::ReviewBatchStatus::Completed)
+                    || pre_merge.any(|batch| {
+                        !matches!(
+                            batch.status,
+                            boss_protocol::ReviewBatchStatus::Completed | boss_protocol::ReviewBatchStatus::Failed
+                        )
+                    });
+                if batch_owns_recovery {
+                    continue;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id,
+                    ?error,
+                    "pr_review recovery: failed to check batch ownership"
+                );
+                outcome.error_skipped += 1;
+                continue;
+            }
+        }
+
         // Churn guard: a work item whose *reviews* keep failing to produce
         // an informative result is almost certainly hitting something
         // structural (a persistently broken host, like the incident's
