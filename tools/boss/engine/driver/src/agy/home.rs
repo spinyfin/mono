@@ -35,7 +35,7 @@ const ONBOARDING_JSON: &str = r#"{"consumerOnboardingComplete": true, "enterpris
 "#;
 
 /// Check existing paths before creating or overwriting any run state.
-fn validate_private_layout(process_home: &Path) -> anyhow::Result<()> {
+pub(super) fn validate_private_layout(process_home: &Path) -> anyhow::Result<()> {
     let root = agy_homes_root();
     let relative = process_home
         .strip_prefix(&root)

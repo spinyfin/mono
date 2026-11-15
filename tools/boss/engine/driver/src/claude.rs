@@ -952,22 +952,10 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
-        // Inline-prefix every env var the `boss-event` shim needs. `BOSS_RUN_ID`
-        // is load-bearing: without it the shim can't splice `_boss_run_id` and
-        // the engine drops the event, pinning the worker at `Spawning`.
-        // `BOSS_WORKSPACE` tells the shim where to buffer events when the
-        // engine is unreachable. Setting them here (rather than relying on env
-        // inheritance from the worker pane through Claude into the hook
-        // subprocess) guarantees the shim sees them regardless of how Claude
-        // propagates env.
-        let command = format!(
-            "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
-            socket = shell_quote(&config.events_socket_path.display().to_string()),
-            lease = shell_quote(&config.lease_id),
-            run_id = shell_quote(&config.run_id),
-            workspace = shell_quote(&config.workspace_path.display().to_string()),
-            shim = shell_quote(&config.forwarder_binary.display().to_string()),
-        );
+        // Inline-prefixed env vars (see `forwarder_command`): setting them here
+        // rather than relying on env inheritance from the worker pane through
+        // Claude into the hook subprocess guarantees the shim sees them.
+        let command = crate::hook_settings::forwarder_command(config);
 
         // Every hook event fires this same forwarder hook (matcher `*`). The
         // caller may extend the `PreToolUse` array with interception guards —
