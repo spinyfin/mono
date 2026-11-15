@@ -385,15 +385,21 @@ Reclaim per-run `agy` homes on the same pattern as `grok_home_retention_sweep.rs
 Compose the interactive pane command as the existing initial-brief launcher running `agy` with `--model`, `--effort`, `--settings <file>` and the scoped-`HOME` env directives — **not** `agy -i` and no `--add-dir` (the launcher delivered a 50 KB brief in the study, Q1; `-i` runs behind the trust dialog). Supply the `PaneMonitorSpec` agent / busy / starting / prompt markers from the study's "Proposed `PaneMonitorSpec`" section, so the app's fallback status pill works before the first hook event arrives. Creates the Boss-owned control directory outside the repo for the initial prompt and session settings, and writes agent-rules to whichever outside-the-repo location provisioning settled. Confirm hook liveness and inspect settings logs before delivery; refuse input on blocking dialogs, including the launcher's first brief and spawn-confirmation retries (permission study, §§2, 8).
 
 - **Effort:** medium
-- **Dependencies:** Per-run `HOME` provisioning and credential delegation; Ghostty pane viability spike for `agy`
+- **Dependencies:** Per-run `HOME` provisioning and credential delegation; Ghostty pane viability spike for `agy`; permission config rendering; global-root hook wiring and guard adapter; verified pre-prompt startup contract. These enforcement prerequisites must land before pane launch.
 - Scope: in-scope
+
+### Pre-prompt authorization verification
+
+The pane launcher must call `agy::verify_startup_authorization` after permission installation and immediately before launch, supplying the expected observation configuration and worker kind. The check validates private-home posture, content-bound artifacts, expected run/kind identity, and the exact six-event wiring (including lease and socket). It then reuses the installed adapter's harmless positive, structural-deny, and reused-guard-deny probes and rechecks the binding afterward. The forwarder probe uses a private sink rather than publishing synthetic worker activity. No cached result, loaded-hook count, or native `SessionStart` is readiness proof: `SessionStart` only fires when the first prompt begins.
+
+This is the host-side enforcement prerequisite, not proof that the CLI discovered the hooks. `launch_ready` remains false. Pane launch must qualify CLI discovery and review-mode failure behavior and inspect the initialized settings log before delivering any brief; it must not wait for native `SessionStart` to send that first brief.
 
 ### Global-root hook wiring: `boss-event` progress forwarder
 
 Write `$HOME/.gemini/config/hooks.json` in the per-run home wiring `SessionStart`, `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, and `Stop` to the unchanged `boss-event` shim with the same `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID` / `BOSS_RUN_ID` / `BOSS_WORKSPACE` env prefix Claude and Grok use, and declare `ProgressIngress::HookCallback` with `HookWiringDestination::DriverOwned`. Raw payloads forward unchanged; decoding is the engine-side normaliser's job. Keep progress stdout silent and route the final authorization reply through the single adapter; never treat silent forwarding as approval. Surface delivery failures and qualify the combined path in review mode, including large payloads and missing hooks (permission study, §7; shared-HOME study, §2). Discovery from the global root is measured (study, Q3); the out-of-repo `--add-dir` control directory is the fallback.
 
 - **Effort:** medium
-- **Dependencies:** Pane spawn invocation and `PaneMonitorSpec`; Hook surface characterisation
+- **Dependencies:** Per-run `HOME` provisioning and credential delegation; Hook surface characterisation. Wiring uses the provisioned home and must not depend on pane launch.
 - Scope: in-scope
 
 ### Hook payload adapter and `PreToolUse` guards
@@ -425,7 +431,7 @@ Map `Stop` to `TurnEnd` **only when the event carries the claimed parent's `conv
 Implement the permission posture above as run-private JSON passed by `PermissionArtifacts::extra_args = ["--settings", <file>]`: explicit `agentMode: ""`, `toolPermission: request-review`, exact `trustedWorkspaces`, per-kind `permissions.allow`, native-file denies only, and no ask rules. Mirror the exhaustive worker-kind policy without changing eligibility. Validate rule grammar before spawn and check the private log for ignored entries after initialization. Structural command denies belong in the adapter, not this settings renderer (permission study, §§1–2, 5, 7, 10).
 
 - **Effort:** large
-- **Dependencies:** Per-run `HOME` provisioning and credential delegation; Permission, trust, and soft-deny characterisation. **Co-edits `agy.rs`'s trait impl with the pane-spawn entry — land after it and forward-port its changes preservingly.**
+- **Dependencies:** Per-run `HOME` provisioning and credential delegation; Permission, trust, and soft-deny characterisation. **Land before pane spawn and control verbs; later edits to `agy.rs` must preserve the permission renderer.**
 - Scope: in-scope
 
 ### Soft-deny and no-op-worker detection

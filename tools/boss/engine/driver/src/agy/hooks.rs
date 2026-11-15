@@ -67,6 +67,10 @@ const _: () = assert!(FORWARDER_HOOK_TIMEOUT_SEC >= 12 + 3);
 
 const ADAPTER_SCRIPT: &str = include_str!("adapter.py");
 
+#[path = "startup.rs"]
+mod startup;
+pub use startup::verify_startup_authorization;
+
 /// Outer hook timeout for the PreToolUse authorization entry. One value for
 /// every worker kind, so the entry the progress wiring declares (which cannot
 /// see whether a checkleft guard is armed) is always the entry installed. It

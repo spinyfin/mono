@@ -662,3 +662,6 @@ mod edge_tests;
 
 #[path = "review_regression_tests.rs"]
 mod review_regression_tests;
+
+#[path = "startup_tests.rs"]
+mod startup_tests;
