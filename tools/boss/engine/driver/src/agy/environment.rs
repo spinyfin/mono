@@ -36,6 +36,21 @@ pub const AGY_CODESIGN_IDENTIFIER: &str = "cli";
 #[cfg(any(target_os = "macos", test))]
 pub const AGY_CODESIGN_TEAM: &str = "EQHXZ8M8AV";
 
+/// Wall-clock limit for the short local probes (`agy --version`, `codesign`).
+pub(crate) const AGY_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Wall-clock limit for `agy models`, which may reach the network.
+pub(crate) const AGY_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run a vendor subprocess with a timeout, killing its process group on expiry.
+/// Shares Grok's in-flight registry so engine shutdown reaps it too. A timeout
+/// is an error naming the command.
+pub(crate) fn run_agy_bounded(
+    command: &mut Command,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    crate::grok::preflight::run_bounded_as(command, timeout, "Antigravity provisioning failed")
+}
+
 const DISABLE_AUTO_UPDATE_ENV: &str = "AGY_CLI_DISABLE_AUTO_UPDATE";
 const HIDE_ACCOUNT_INFO_ENV: &str = "AGY_CLI_HIDE_ACCOUNT_INFO";
 
@@ -344,7 +359,9 @@ pub(super) fn verify_agy_binary_with(
 #[cfg(target_os = "macos")]
 fn verify_agy_codesign(path: &Path) -> anyhow::Result<()> {
     verify_codesign_with(path, |args| {
-        Command::new("/usr/bin/codesign").args(args).arg(path).output()
+        let mut command = Command::new("/usr/bin/codesign");
+        command.args(args).arg(path);
+        run_agy_bounded(&mut command, AGY_VERSION_TIMEOUT).map_err(|err| std::io::Error::other(format!("{err:#}")))
     })
 }
 
@@ -407,12 +424,13 @@ fn read_agy_version(path: &Path) -> anyhow::Result<String> {
                 .as_nanos()
         ));
     fs::create_dir(&probe_home)?;
-    let output = Command::new(path)
+    let mut command = Command::new(path);
+    command
         .env("HOME", &probe_home)
         .env(DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE)
         .env(HIDE_ACCOUNT_INFO_ENV, "true")
-        .arg("--version")
-        .output();
+        .arg("--version");
+    let output = run_agy_bounded(&mut command, AGY_VERSION_TIMEOUT);
     let cleanup = fs::remove_dir_all(&probe_home);
     let output = output.with_context(|| format!("running {} --version", path.display()))?;
     cleanup.context("reclaiming agy version-probe HOME")?;

@@ -48,7 +48,7 @@ mod hooks;
 mod model_menu;
 mod oauth_refresh;
 mod permissions;
-mod preflight;
+pub(crate) mod preflight;
 mod progress;
 mod transcript;
 mod turn_end_recovery;

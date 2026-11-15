@@ -165,6 +165,8 @@ Identical on both versions.
 - A control directory outside the repo **works** when passed with `--add-dir` (d3, d4), and is ignored when not passed (d5).
 - The **global customization root** `$HOME/.gemini/config/hooks.json` works with no flag (d6). Under a Boss-owned per-run `HOME` that file is Boss-owned.
 
+**Scope of this measurement:** Q3 recorded only whether `hooks.json` fired. It did not measure whether `.agents/rules/*.md` under an `--add-dir` root is loaded as agent rules. The per-run `rules-root/.agents/rules/boss.md` placement therefore remains unverified; it needs a live check on a signed-in machine (plant a canary rule in `rules-root` and confirm the agent follows it) before spawn relies on it. If agy does not load rules from added directories, move the rules file to a global-root location under the per-run `HOME`.
+
 The global root is the better home for Boss's hooks. `--add-dir` puts the control directory in the agent's workspace (`workspaceDirs=[repo control]`), which invites the agent to read and edit it. The global root adds nothing to the workspace and needs no extra argument.
 
 ## Q4 — Does workspace trust independently gate discovery?

@@ -136,7 +136,7 @@ const PREFLIGHT_FAILURE_PREFIX: &str = "Grok worker preflight failed";
 /// same process-group kill, same in-flight registry (so an engine shutdown
 /// still reaps the child) — with `failure_prefix` naming that caller in the
 /// timeout error instead of the preflight.
-pub(super) fn run_bounded_as(command: &mut Command, timeout: Duration, failure_prefix: &str) -> anyhow::Result<Output> {
+pub(crate) fn run_bounded_as(command: &mut Command, timeout: Duration, failure_prefix: &str) -> anyhow::Result<Output> {
     run_bounded_in(&IN_FLIGHT, command, timeout, failure_prefix)
 }
 

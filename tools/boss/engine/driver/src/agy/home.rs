@@ -384,9 +384,7 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
     let mut command = Command::new(environment.agy_binary());
     command.args(environment.launch_args()).arg("models");
     environment.apply_to_command(&mut command);
-    let output = command
-        .output()
-        .with_context(|| format!("running {} models", environment.agy_binary().display()))?;
+    let output = super::environment::run_agy_bounded(&mut command, super::environment::AGY_MODELS_TIMEOUT)?;
     if !output.status.success() {
         bail!(
             "agy models failed under scoped HOME {} (status {}): stdout={} stderr={}",
@@ -399,29 +397,48 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove run state while keeping conversation paths readable after teardown.
+/// Remove run state while keeping conversation and transcript paths readable
+/// after teardown. `conversations/` is the conversation store; `brain/` holds
+/// `<cid>/.system_generated/logs/transcript_full.jsonl`, the path the Stop
+/// payload's transcriptPath stamps.
 pub fn reclaim_agy_run(process_home: &Path) -> anyhow::Result<()> {
     let container = process_home.parent().context("agy run container")?;
     assert_agy_home_safe_to_delete(container)?;
     validate_private_layout(process_home)?;
-    retain_conversations(
-        container,
-        &["process-home", ".gemini", "antigravity-cli", "conversations"],
-    )
+    let base = ["process-home", ".gemini", "antigravity-cli"];
+    let keep: Vec<Vec<&str>> = ["conversations", "brain"]
+        .iter()
+        .map(|leaf| base.iter().copied().chain([*leaf]).collect())
+        .collect();
+    retain_paths(container, &keep)
 }
 
-fn retain_conversations(path: &Path, keep: &[&str]) -> anyhow::Result<()> {
-    if keep.is_empty() || !path.exists() {
+/// Delete everything under `path` except the given relative component paths
+/// (and their contents).
+fn retain_paths(path: &Path, keep: &[Vec<&str>]) -> anyhow::Result<()> {
+    if !path.exists() {
         return Ok(());
     }
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        if entry.file_name() == keep[0] {
-            retain_conversations(&entry.path(), &keep[1..])?;
-        } else if entry.file_type()?.is_dir() {
-            fs::remove_dir_all(entry.path())?;
+        let name = entry.file_name();
+        let matching: Vec<&[&str]> = keep
+            .iter()
+            .filter(|k| k.first().is_some_and(|first| name == *first))
+            .map(|k| &k[1..])
+            .collect();
+        if matching.iter().any(|rest| rest.is_empty()) {
+            continue;
+        }
+        if matching.is_empty() {
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
         } else {
-            fs::remove_file(entry.path())?;
+            let rest: Vec<Vec<&str>> = matching.iter().map(|r| r.to_vec()).collect();
+            retain_paths(&entry.path(), &rest)?;
         }
     }
     Ok(())
