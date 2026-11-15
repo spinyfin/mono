@@ -98,11 +98,18 @@ fn load_off_board_family_members(conn: &Connection, tasks: &[Task], chores: &[Ta
             .map(|task| task.id.as_str())
             .collect::<Vec<_>>(),
     );
+    let sql = family_members_sql();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([visible], map_task_with_external_ref_parent_source_and_provenance)?;
+    collect_rows(rows)
+}
+
+fn family_members_sql() -> String {
     // UNION deduplicates the frontier, including cycles. Walk the whole set
     // together rather than issuing an owner/descendant query for each card.
     // Only missing cards are materialized; live cards retain their derivations.
     // Product and deletion checks apply at every edge.
-    let sql = format!(
+    format!(
         "WITH RECURSIVE family(id, product_id, kind, parent_task_id) AS (
             SELECT id, product_id, kind, parent_task_id FROM tasks
             WHERE id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL
@@ -112,17 +119,14 @@ fn load_off_board_family_members(conn: &Connection, tasks: &[Task], chores: &[Ta
             WHERE f.kind = 'revision' AND p.product_id = f.product_id AND p.deleted_at IS NULL
             UNION
             SELECT c.id, c.product_id, c.kind, c.parent_task_id
-            FROM tasks c JOIN family f ON c.parent_task_id = f.id
+            FROM tasks c INDEXED BY idx_tasks_parent_kind_id JOIN family f ON c.parent_task_id = f.id
             WHERE c.kind = 'revision' AND c.product_id = f.product_id AND c.deleted_at IS NULL
         )
         SELECT {} FROM tasks
         WHERE id IN (SELECT id FROM family)
           AND id NOT IN (SELECT value FROM json_each(?1))",
         super::board_patch::BOARD_TASK_COLUMNS
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([visible], map_task_with_external_ref_parent_source_and_provenance)?;
-    collect_rows(rows)
+    )
 }
 
 fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task], extras: &'a [Task]) -> BTreeMap<&'a str, FamilyCards<'a>> {
@@ -147,6 +151,7 @@ fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task], extras: &'a [Task])
             continue;
         }
         let mut top = task;
+        let mut visible_top = task;
         let mut owner = None;
         for _ in 0..chain_helpers::MAX_CHAIN_DEPTH {
             match top.parent_task_id.as_deref().and_then(|parent| cards.get(parent)) {
@@ -155,7 +160,12 @@ fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task], extras: &'a [Task])
                     owner = Some(*parent);
                     break;
                 }
-                Some(parent) => top = parent,
+                Some(parent) => {
+                    top = parent;
+                    if visible.contains(top.id.as_str()) {
+                        visible_top = top;
+                    }
+                }
                 None => break,
             }
         }
@@ -170,12 +180,14 @@ fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task], extras: &'a [Task])
                 .revisions
                 .push(task),
             None if visible.contains(task.id.as_str()) => {
-                let family = families.entry(top.id.as_str()).or_insert_with(|| FamilyCards {
-                    root: top,
+                // Archived off-board revisions cannot carry diagnostic rows.
+                // Keep the visible revision nearest the broken parent edge.
+                let family = families.entry(visible_top.id.as_str()).or_insert_with(|| FamilyCards {
+                    root: visible_top,
                     revisions: Vec::new(),
                     fallback: true,
                 });
-                if top.id != task.id {
+                if visible_top.id != task.id {
                     family.revisions.push(task);
                 }
             }
@@ -1113,6 +1125,27 @@ fn encode_sort_key(key: &nav::SortKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn family_descent_uses_parent_index() {
+        // Use the real schema, including the parent index and task columns.
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("navigator-plan.db")).unwrap();
+        let conn = db.connect().unwrap();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", family_members_sql()))
+            .unwrap()
+            .query_map(["[]"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("idx_tasks_parent_kind_id (parent_task_id=?"), "{plan}");
+        assert!(
+            !plan.lines().any(|line| line == "SCAN c" || line == "SCAN tasks"),
+            "{plan}"
+        );
+    }
 
     #[test]
     fn sort_key_encoding_preserves_classifier_order() {

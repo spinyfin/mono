@@ -750,6 +750,37 @@ fn archived_family_members_stay_with_their_owner_and_unresolved_chains_fall_back
 }
 
 #[test]
+fn archived_broken_ancestor_keeps_visible_revision_fallback() {
+    for deleted in [false, true] {
+        let db = WorkDb::open(temp_db_path("navigator-archived-broken")).unwrap();
+        let product = make_revision_product(&db, "navigator-archived-broken");
+        let owner = make_in_review_chore(&db, &product, PR);
+        let ancestor = insert_revision_row(&db, &product, &owner);
+        let child = insert_revision_row(&db, &product, &ancestor);
+        let mut model = None;
+        step(&db, &product, &mut model);
+        update(&db, "UPDATE tasks SET status = 'archived' WHERE id = ?1", &ancestor);
+        update(&db, "UPDATE tasks SET status = 'todo' WHERE id = ?1", &child);
+        step(&db, &product, &mut model);
+        assert_eq!(projection(&model, &child).root_task_id, owner);
+        if deleted {
+            update(&db, "UPDATE tasks SET deleted_at = '1' WHERE id = ?1", &owner);
+        } else {
+            db.connect()
+                .unwrap()
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = OFF; DELETE FROM tasks WHERE id = '{owner}';"
+                ))
+                .unwrap();
+        }
+        step(&db, &product, &mut model);
+        assert_eq!(projection(&model, &child).root_task_id, child);
+        assert_eq!(row(&model, &child).section, NavigatorSection::Backlog);
+        assert_eq!(waiting(&model, &child), NavigatorWait::UnavailableParent);
+    }
+}
+
+#[test]
 fn active_spawn_and_readopted_runs_are_working() {
     let db = WorkDb::open(temp_db_path("navigator-spawn-readopt")).unwrap();
     let product = make_revision_product(&db, "navigator-spawn-readopt");
