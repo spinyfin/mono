@@ -13,6 +13,11 @@
 # and boss-release.sh.
 set -euo pipefail
 
+# This step may execute its bazel actions on the remote macOS workers; ci-env.sh
+# decides whether it does (see remote-execution.sh). It qualifies because
+# nothing it passes to bazel is a credential and its build and
+# test commands are run only for their result.
+CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [integrity-bazel] verifying"
@@ -24,9 +29,9 @@ echo "[integrity-bazel] agent: $(uname -a)"
 tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 
 echo "--- [integrity-bazel] bazel build //..."
-bazel build --verbose_failures --keep_going //...
+bazel_verify_only build --verbose_failures --keep_going //...
 
 echo "--- [integrity-bazel] bazel test //..."
-bazel test --test_output=errors --keep_going //...
+bazel_verify_only test --test_output=errors --keep_going //...
 
 echo "[integrity-bazel] ok"

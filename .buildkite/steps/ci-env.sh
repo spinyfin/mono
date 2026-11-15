@@ -26,14 +26,48 @@ if ! CI_DISK_CACHE_DIR="$(ci_disk_cache_path "$OS_TYPE" "$CI_BAZELRC")" \
 fi
 echo "--- [ci-env] disk cache ${CI_DISK_CACHE_DIR}: filesystem is $((CI_DISK_CACHE_FS_TOTAL_KB / 1048576)) GB, GC cap ${CI_DISK_CACHE_GC_MAX_SIZE} (${CI_DISK_CACHE_GC_PERCENT}%)"
 
+# Decide whether this step's bazel actions execute on the remote macOS workers
+# or on this agent. The conditions (the step opted in with
+# CI_REMOTE_EXECUTION_ALLOWED=1, the agent is a Mac whose environment names an
+# endpoint, and the endpoint answers) and the reasons for them are in
+# remote-execution.sh, tested by //.buildkite/steps/tests. A step that does not
+# qualify runs exactly as before.
+# shellcheck source=remote-execution.sh
+source "$(dirname "${BASH_SOURCE[0]}")/remote-execution.sh"
+if ! ci_remote_execution_decide "$OS_TYPE"; then
+  echo "^^^ +++"
+  echo "[ci-env] error: could not decide where this step's bazel actions execute (see above). Fix or remove CI_BAZEL_REMOTE_EXECUTOR in this agent's environment hook." >&2
+  exit 1
+fi
+echo "--- [ci-env] remote execution ${CI_REMOTE_EXECUTION}: ${CI_REMOTE_EXECUTION_REASON}"
+if [[ "$CI_REMOTE_EXECUTION_FELL_BACK" == "1" ]] && command -v buildkite-agent > /dev/null 2>&1; then
+  # Building on the agent is correct but slow, and it puts the load back on a
+  # host that also serves as a worker. Make it visible on the build page.
+  buildkite-agent annotate --style warning --context "ci-remote-execution-${BUILDKITE_JOB_ID:-fallback}" \
+    "${BUILDKITE_LABEL:-A step} built on its agent: ${CI_REMOTE_EXECUTION_REASON}." || true
+fi
+
 # CI_BAZEL_FLAGS is the single source of truth for the per-command bazel flags
-# every CI invocation passes: the OS's CI config plus the per-host disk-cache GC
-# cap computed above. The two must travel together -- any invocation that
-# selects --config=ci-<os> without the cap puts the fleet-wide 3T cap back in
-# force for the GC pass that follows it. The bazel() wrapper below and repobin
-# (via REPOBIN_BAZEL_FLAGS) both read from here.
-export CI_BAZEL_FLAGS="--config=ci-${OS_TYPE} --experimental_disk_cache_gc_max_size=${CI_DISK_CACHE_GC_MAX_SIZE}"
+# every CI invocation passes: the OS's CI config, the per-host disk-cache GC
+# cap computed above and, when this step executes remotely, the remote config
+# and endpoint. The config and the cap must travel together -- any invocation
+# that selects --config=ci-<os> without the cap puts the fleet-wide 3T cap back
+# in force for the GC pass that follows it. The remote flags add to the OS
+# config and replace none of it: the disk cache stays on in front of the remote
+# cache (see build:ci-remote in .ci.bazelrc for why). The bazel() wrapper below
+# and repobin (via REPOBIN_BAZEL_FLAGS) both read from here.
+export CI_BAZEL_FLAGS="--config=ci-${OS_TYPE} --experimental_disk_cache_gc_max_size=${CI_DISK_CACHE_GC_MAX_SIZE}${CI_REMOTE_BAZEL_FLAGS:+ ${CI_REMOTE_BAZEL_FLAGS}}"
 export REPOBIN_BAZEL_FLAGS="$CI_BAZEL_FLAGS"
+
+# CI_BAZEL_VERIFY_ONLY_FLAGS (set by ci_remote_execution_decide) is for a build
+# or test command that is run only for its result: nothing afterwards reads its
+# outputs from bazel-bin. When the step executes remotely it is
+# --remote_download_minimal, so the agent does not pull gigabytes of binaries
+# it will never open (test.log and test.xml still arrive, so the artifact
+# upload is unaffected). It is empty otherwise. It is deliberately not part of
+# CI_BAZEL_FLAGS: repobin, checkleft and the release steps build a target and
+# then run or upload the file, which needs the default of downloading
+# top-level outputs. Step scripts reach it through bazel_verify_only, below.
 
 # Bazel daemon idle TTL for every CI pipeline and OS: 30 minutes, so idle
 # servers on shared CI hosts (e.g. 16 GB Macs) release their memory. Local
@@ -114,6 +148,19 @@ bazel() {
 
   rm -f "$tmplog"
   return 1
+}
+
+# bazel_verify_only <build|test> <args...>
+#
+# The bazel() wrapper for a command whose outputs this step never reads from
+# disk afterwards: `bazel build //...` and `bazel test //...` run for their
+# pass/fail result. Adds CI_BAZEL_VERIFY_ONLY_FLAGS (see above) after the CI
+# flags. Do not use it for a build whose output is then executed, uploaded or
+# inspected -- on a remotely executing step that file will not be on the agent.
+bazel_verify_only() {
+  local subcommand="$1"
+  shift
+  bazel "$subcommand" $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
 }
 
 # Shared by the release step scripts (checkleft-release.sh, release-release.sh)

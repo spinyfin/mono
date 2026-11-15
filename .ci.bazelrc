@@ -61,4 +61,28 @@ build:ci-darwin --disk_cache=/Volumes/ssd/bazel/disk_cache
 build:ci-darwin --xcode_version=27.2.0.27B52
 common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-27.2.0.app/Contents/Developer
 
+# ==========================================
+# REMOTE EXECUTION (macOS)
+# ==========================================
+# Selected by .buildkite/steps/ci-env.sh, after --config=ci-darwin, together
+# with --remote_executor and --remote_cache. The endpoint is not written here
+# on purpose: it comes from the agent's environment, and the conditions under
+# which a step executes remotely are in .buildkite/steps/remote-execution.sh.
+# Do not pass --config=ci-remote by hand without an executor: the test strategy
+# below names `remote` alone, so every test would fail to schedule.
+#
+# The disk cache from build:ci-darwin stays on, in front of the remote cache.
+# Do not switch it off here. One output base serves both kinds of step, and a
+# step that built on the agent leaves outputs that exist only as entries in
+# the disk cache. With the disk cache off, a remote step that needs one fails
+# with "Lost inputs no longer available remotely" and Bazel starts the build
+# again; with it on, the blob is found and uploaded.
+# The agent's own core count no longer bounds the build; the workers do.
+build:ci-remote --jobs=64
+# A remote failure fails the step. ci-env.sh decides once per step whether to
+# execute remotely, so a step never mixes worker results with agent results.
+build:ci-remote --noremote_local_fallback
+# Tests execute on the workers too; see `test:remote-tests` in .bazelrc.
+test:ci-remote --config=remote-tests
+
 
