@@ -1,0 +1,18 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "work-navigator",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_work_navigator",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+)
+
+rust_test(
+    name = "work-navigator_test",
+    size = "small",
+    crate = ":work-navigator",
+    edition = "2024",
+)

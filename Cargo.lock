@@ -2047,6 +2047,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-work-navigator"
+version = "0.1.0"
+
+[[package]]
 name = "boss-worker-processes"
 version = "0.1.0"
 dependencies = [
