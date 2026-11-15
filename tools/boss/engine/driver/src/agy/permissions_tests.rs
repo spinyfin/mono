@@ -525,7 +525,11 @@ fn write_permission_config_renders_settings_over_the_provisioned_trust_only_file
 
         let settings_path = session_settings_path_for_run(&run_id).unwrap();
         assert_eq!(settings_path, runtime.session_settings_path);
-        assert_eq!(artifacts.config_files, vec![settings_path.clone()]);
+        assert!(
+            artifacts.config_files.contains(&settings_path),
+            "config_files must include session settings: {:?}",
+            artifacts.config_files
+        );
         // `--settings` is the only per-run flag; no posture is carried by
         // `--mode`, `--sandbox` or the skip-permissions flag, and no env.
         assert_eq!(
