@@ -60,7 +60,10 @@ rust_test(
         "src/initial_prompt.py",
     ],
     crate = ":driver",
-    data = [":codex_test_binary"],
+    data = [
+        ":codex_test_binary",
+        "@driver_signature_test_tools//:runtime",
+    ],
     edition = "2024",
     env = {"BOSS_TEST_CODEX": "$(rootpath :codex_test_binary)"},
     proc_macro_deps = all_crate_deps(

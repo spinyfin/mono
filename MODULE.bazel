@@ -72,6 +72,16 @@ test_runtime_repository = use_repo_rule(
 
 test_runtime_repository(name = "test_runtime_tools")
 
+# The driver signature contract test reads an Apple-signed fixture with codesign.
+# Keep this tool out of the shared runtime and declare it only for driver tests.
+test_runtime_repository(
+    name = "driver_signature_test_tools",
+    required = ["true"],
+    runtime_visibility = ["@@//tools/boss/engine/driver:__pkg__"],
+    tools = ["true"],
+    tools_by_os = {"mac os x": ["codesign"]},
+)
+
 host_tmux_repository = use_repo_rule(
     "//tools/test-sandbox:repositories.bzl",
     "host_tmux_repository",

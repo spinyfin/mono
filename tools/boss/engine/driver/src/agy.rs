@@ -1,18 +1,20 @@
 //! `AgyDriver` — Google Antigravity (`agy`) agent driver skeleton.
 //!
-//! Descriptor, capability set, and Gemini-family model menu.
-//! Spawn attempts fail until per-run HOME isolation and guard hooks are implemented.
+//! Descriptor, capability set, Gemini-family model menu, and per-run `HOME`
+//! provisioning. Interactive TUI spawn still refuses until guard hooks land.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
 //! 2026-11-14).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{NormalizeError, WorkerEvent};
+use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
+use boss_ssh_transport::shell_quote;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
@@ -21,8 +23,18 @@ use super::{
     ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 
+mod environment;
+mod home;
 mod model_menu;
+#[cfg(test)]
+mod test_environment;
 mod transcript;
+
+use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
+use home::{
+    AgyRuntimeState, agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run,
+    process_home_for_run, provision_agy_home, read_workspace_path_stamp, session_settings_path_for_run,
+};
 
 // ---------------------------------------------------------------------------
 // Descriptor
@@ -36,9 +48,10 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     name: "agy",
     label: "Antigravity",
     binary: "agy",
-    // Boss-owned control directory for the initial-prompt launcher, matching
-    // Grok's `.grok`. `agy` itself has no config-dir flag; per-run state
-    // requires a scoped HOME, which is not provisioned yet.
+    // Workspace-local leaf used only as the descriptor's config-dir name.
+    // Per-run `agy` state lives under the Boss-owned process HOME; the
+    // initial-prompt launcher lives in that run's `control/` directory.
+    // Agent rules go to `<control>/.agents/rules/boss.md`.
     config_dir: ".agy",
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
@@ -62,16 +75,23 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Google Antigravity CLI driver.
 ///
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
-/// the Antigravity driver design. Spawn, provisioning, and hook wiring are
-/// unimplemented; spawn attempts exit with a not-ready error.
+/// the Antigravity driver design. Per-run `HOME` provisioning is live;
+/// interactive TUI spawn still refuses until guard hooks land.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
 }
 
-/// Refuse launch until per-run HOME isolation and guard hooks are available.
-pub fn build_agy_pane_command(_request: &SpawnRequest<'_>) -> String {
-    "printf '%s\n' 'agy driver is not spawnable yet (no HOME isolation or guard hooks)' >&2; exit 1\n".into()
+/// Refuse launch while guard hooks are unavailable.
+pub fn refuse_agy_spawn(reason: &str) -> String {
+    format!("printf '%s\\n' {} >&2; exit 1\n", shell_quote(reason))
+}
+
+fn refuse_agy_plan(env: Vec<crate::EnvDirective>, reason: &str) -> SpawnPlan {
+    SpawnPlan {
+        env,
+        command: refuse_agy_spawn(reason),
+    }
 }
 
 #[async_trait]
@@ -98,7 +118,7 @@ impl AgentDriver for AgyDriver {
         // ToolUseInterception is rewrite-or-deny: PreToolUse rewrites
         // arguments through `overwrite` on both measured binaries (hook
         // surface study, "PreToolUse can rewrite arguments"). The hook adapter
-        // is not implemented; spawn attempts fail despite this declaration.
+        // is not implemented; TUI spawn still refuses despite this declaration.
         CapabilitySet::new([
             Capability::Spawn,
             Capability::WorkspaceProvisioning,
@@ -131,28 +151,133 @@ impl AgentDriver for AgyDriver {
         ])
     }
 
+    fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
+        // Measured in `docs/investigations/ghostty-agy-pane-viability.md`
+        // ("Proposed PaneMonitorSpec"). Needed here so provision can write
+        // the initial-prompt launcher config; TUI spawn still refuses.
+        Some(PaneMonitorSpec {
+            agent_markers: vec![
+                "? for shortcuts".into(),
+                "esc to cancel".into(),
+                "Press up to edit queued messages".into(),
+            ],
+            busy_markers: vec![
+                "esc to cancel".into(),
+                "Press up to edit queued messages".into(),
+                "task(s) · /tasks".into(),
+            ],
+            starting_markers: vec!["Signing in...".into()],
+            prompt_prefixes: vec![">".into()],
+            idle_debounce_polls: 2,
+            blocking_dialog_markers: vec![],
+        })
+    }
+
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        vec![
+            "Welcome to Antigravity CLI!".into(),
+            "Choose your color scheme".into(),
+            "Terms of Service & Data Use".into(),
+            "Accessing workspace:".into(),
+            "Do you trust the contents of this project?".into(),
+            "You are currently not signed in".into(),
+            "Select login method:".into(),
+        ]
+    }
+
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
-        SpawnPlan {
-            env: Vec::new(),
-            command: build_agy_pane_command(&request),
+        let Some(run_id) = request.run_id.filter(|id| !id.is_empty()) else {
+            return refuse_agy_plan(
+                Vec::new(),
+                "agy spawn refused: missing run_id; per-run HOME cannot be resolved",
+            );
+        };
+
+        let process_home = match process_home_for_run(run_id) {
+            Ok(path) => path,
+            Err(error) => {
+                return refuse_agy_plan(
+                    Vec::new(),
+                    &format!("agy spawn refused: cannot resolve per-run HOME: {error:#}"),
+                );
+            }
+        };
+        let log_file = log_file_for_run(run_id).unwrap_or_else(|_| process_home.join("../control/agy.log"));
+        let session_settings = session_settings_path_for_run(run_id)
+            .unwrap_or_else(|_| process_home.join("../control/session-settings.json"));
+        let agy_binary = peek_agy_binary(&agy_homes_root()).unwrap_or_else(|_| PathBuf::from("/nonexistent/agy"));
+
+        let environment = match AgyProcessEnvironment::resolve(&process_home, &log_file, &session_settings, agy_binary)
+        {
+            Ok(environment) => environment,
+            Err(error) => {
+                tracing::error!(run_id, error = %error, "refusing to spawn agy worker with unresolved host tool environment");
+                return refuse_agy_plan(
+                    Vec::new(),
+                    &format!("agy worker environment resolution failed: {error:#}"),
+                );
+            }
+        };
+        let env = environment.directives();
+        let workspace_stamp = control_dir_for_run(run_id)
+            .ok()
+            .and_then(|dir| read_workspace_path_stamp(&dir).ok());
+        tracing::debug!(
+            run_id,
+            log_file = %environment.log_file().display(),
+            session_settings = %environment.session_settings_path().display(),
+            workspace = %workspace_stamp.as_deref().unwrap_or(Path::new(".")).display(),
+            "agy spawn environment resolved"
+        );
+
+        if !process_home.exists() {
+            return refuse_agy_plan(env, "agy spawn refused: per-run HOME is not provisioned");
         }
+        if let Err(error) =
+            home::assert_agy_posture(&process_home, workspace_stamp.as_deref().unwrap_or(Path::new(".")))
+        {
+            return refuse_agy_plan(env, &format!("agy spawn refused: private HOME posture: {error:#}"));
+        }
+        if !skip_binary_assert()
+            && let Err(error) = verify_cached_agy_binary(environment.agy_binary())
+        {
+            return refuse_agy_plan(
+                env,
+                &format!("agy spawn refused: Boss-owned binary identity check failed: {error:#}"),
+            );
+        }
+
+        // HOME is isolated; the TUI still waits on guard-hook wiring.
+        refuse_agy_plan(env, "agy driver is not spawnable yet (guard hooks are not wired)")
     }
 
     async fn provision_workspace(
         &self,
-        _workspace: &Path,
-        _prompt_text: &str,
-        _run_id: &str,
+        workspace: &Path,
+        prompt_text: &str,
+        run_id: &str,
     ) -> anyhow::Result<Option<DriverRuntimeState>> {
-        Ok(None)
+        let (workspace_owned, prompt_owned, run_id_owned) =
+            (workspace.to_path_buf(), prompt_text.to_owned(), run_id.to_owned());
+        let runtime =
+            tokio::task::spawn_blocking(move || provision_agy_home(&workspace_owned, &prompt_owned, &run_id_owned))
+                .await
+                .context("agy workspace provisioning task did not complete")?
+                .with_context(|| format!("provisioning Boss-owned agy HOME for run_id {run_id:?}"))?;
+        Ok(Some(runtime.to_driver_runtime_state()))
     }
 
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
         _run_id: &str,
-        _runtime_state: Option<&DriverRuntimeState>,
+        runtime_state: Option<&DriverRuntimeState>,
     ) -> anyhow::Result<()> {
+        let Some(state) = runtime_state else {
+            return Ok(());
+        };
+        let runtime = AgyRuntimeState::from_driver_runtime_state(state)?;
+        home::reclaim_agy_run(&runtime.process_home)?;
         Ok(())
     }
 
@@ -201,6 +326,16 @@ impl AgentDriver for AgyDriver {
 
     fn agent_rules_preamble(&self) -> &'static str {
         AGY_AGENT_RULES_PREAMBLE
+    }
+
+    /// Route Boss worker rules to `<rules-root>/.agents/rules/boss.md` under the
+    /// per-run container, added to the CLI workspace with `--add-dir`.
+    fn agent_rules_destination(&self, _workspace: &Path, run_id: &str) -> PathBuf {
+        agent_rules_path_for_run(run_id).unwrap_or_else(|_| {
+            agy_homes_root()
+                .join("unknown-run")
+                .join("rules-root/.agents/rules/boss.md")
+        })
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
@@ -255,18 +390,24 @@ impl AgentDriver for AgyDriver {
 mod tests {
     use super::*;
     use crate::AbsenceDisposition;
+    use crate::EnvDirective;
+    use crate::test_support::home_override;
     use boss_protocol::{EffortLevel, ReasoningMode, ReviewModelTier};
+    use std::fs;
+    use tempfile::TempDir;
 
-    fn spawn_request<'a>(model: &'a str, effort: Option<&'a str>) -> SpawnRequest<'a> {
+    fn spawn_request<'a>(model: &'a str, effort: Option<&'a str>, run_id: Option<&'a str>) -> SpawnRequest<'a> {
         SpawnRequest {
             model,
             effort,
             settings_path: None,
             non_opus_auto_mode: false,
             permission_mode_override: None,
-            run_id: None,
+            run_id,
         }
     }
+
+    use super::test_environment::{env_for_provision, env_for_provision_with_home_override};
 
     #[test]
     fn descriptor_matches_the_seed_contract() {
@@ -369,8 +510,8 @@ mod tests {
     }
 
     #[test]
-    fn skeleton_spawn_exits_without_launching_agy() {
-        let plan = AgyDriver::default().spawn_invocation(spawn_request(model_menu::STRONG_FAMILY, Some("xhigh")));
+    fn spawn_without_run_id_refuses_without_host_home() {
+        let plan = AgyDriver::default().spawn_invocation(spawn_request(model_menu::STRONG_FAMILY, Some("xhigh"), None));
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(&plan.command)
@@ -378,12 +519,182 @@ mod tests {
             .output()
             .expect("run refusal command without any agy executable");
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(
-            String::from_utf8(output.stderr).unwrap(),
-            "agy driver is not spawnable yet (no HOME isolation or guard hooks)\n"
-        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("missing run_id"), "{stderr}");
         assert!(output.stdout.is_empty());
         assert!(plan.env.is_empty());
+    }
+
+    #[test]
+    fn spawn_without_provision_exports_scoped_home_and_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = env_for_provision(&homes);
+        let plan = AgyDriver::default().spawn_invocation(spawn_request(
+            model_menu::FAMILY_CARBON,
+            Some("xhigh"),
+            Some("run-unprovisioned"),
+        ));
+        assert_eq!(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&plan.command)
+                .env("PATH", "/nonexistent")
+                .output()
+                .unwrap()
+                .status
+                .code(),
+            Some(1)
+        );
+        let home = plan.env.iter().find_map(|d| match d {
+            EnvDirective::Set(k, v) if k == "HOME" => Some(v.as_str()),
+            _ => None,
+        });
+        let home = home.expect("must export scoped HOME");
+        assert!(home.contains("run-unprovisioned"), "HOME={home}");
+        assert!(home.contains("process-home"), "HOME={home}");
+        assert!(
+            plan.env
+                .iter()
+                .any(|d| matches!(d, EnvDirective::Set(k, v) if k == "AGY_CLI_DISABLE_AUTO_UPDATE" && v == "true")),
+            "must disable the updater: {:?}",
+            plan.env
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_workspace_creates_owned_home_and_exports_env() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let real_home = tmp.path().join("real-home");
+        let keychain_dir = real_home.join("Library/Keychains");
+        fs::create_dir_all(&keychain_dir).unwrap();
+        fs::write(keychain_dir.join("login.keychain-db"), b"dummy-keychain").unwrap();
+        let _home = home_override(&real_home);
+        let _guard = env_for_provision_with_home_override(&homes);
+
+        let driver = AgyDriver::default();
+        let state = driver
+            .provision_workspace(&workspace, "hello prompt", "run-prov-agy")
+            .await
+            .expect("provision")
+            .expect("agy must return runtime state");
+        let runtime = AgyRuntimeState::from_driver_runtime_state(&state).unwrap();
+        assert!(runtime.process_home.starts_with(&homes));
+        assert_ne!(runtime.process_home, real_home);
+        assert!(
+            runtime
+                .process_home
+                .join(".gemini/antigravity-cli/settings.json")
+                .is_file()
+        );
+        assert!(!runtime.process_home.join(".gemini/settings.json").exists());
+        let bridged = runtime.process_home.join("Library/Keychains/login.keychain-db");
+        assert!(fs::symlink_metadata(&bridged).unwrap().file_type().is_symlink());
+
+        let plan = driver.spawn_invocation(spawn_request(
+            model_menu::FAMILY_CARBON,
+            Some("xhigh"),
+            Some("run-prov-agy"),
+        ));
+        assert!(plan.env.iter().any(
+            |d| matches!(d, EnvDirective::Set(k, v) if k == "HOME" && v == &runtime.process_home.display().to_string())
+        ));
+        assert!(
+            plan.env
+                .iter()
+                .any(|d| matches!(d, EnvDirective::Set(k, v) if k == "AGY_CLI_DISABLE_AUTO_UPDATE" && v == "true"))
+        );
+        let stderr = String::from_utf8(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&plan.command)
+                .output()
+                .unwrap()
+                .stderr,
+        )
+        .unwrap();
+        assert!(stderr.contains("guard hooks are not wired"), "{stderr}");
+        let fallback = runtime.process_home.join(".gemini/antigravity-cli/fallback-token.json");
+        fs::write(&fallback, "private token").unwrap();
+        let transcript = runtime
+            .process_home
+            .join(".gemini/antigravity-cli/conversations/session/transcript_full.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "conversation").unwrap();
+        driver
+            .teardown_workspace(Some(&workspace), "run-prov-agy", Some(&state))
+            .await
+            .unwrap();
+        assert!(!fallback.exists());
+        assert!(!runtime.control_dir.exists());
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), "conversation");
+        assert_eq!(
+            fs::read(keychain_dir.join("login.keychain-db")).unwrap(),
+            b"dummy-keychain"
+        );
+    }
+
+    #[test]
+    fn spawn_refuses_unqualified_override_and_changed_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = env_for_provision(&homes);
+        provision_agy_home(tmp.path(), "prompt", "run-old").unwrap();
+        let script = tmp.path().join("old-agy");
+        fs::write(&script, "#!/bin/sh\necho 1.5.5\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _binary_env = test_environment::EnvGuard::set_with_lock(
+            &[
+                (environment::AGY_SKIP_BINARY_ASSERT_ENV, "0"),
+                (environment::AGY_BIN_ENV, script.to_str().unwrap()),
+            ],
+            None,
+        );
+        let plan = AgyDriver::default().spawn_invocation(spawn_request("model", None, Some("run-old")));
+        assert!(
+            plan.command.contains("binary identity check failed"),
+            "{}",
+            plan.command
+        );
+        let owned = homes.join("bin/agy");
+        fs::create_dir_all(owned.parent().unwrap()).unwrap();
+        fs::write(&owned, "#!/bin/sh\necho 1.5.7\n").unwrap();
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o555)).unwrap();
+        environment::verify_agy_binary_with(&owned, |_| Ok(())).unwrap();
+        fs::set_permissions(owned.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
+        let qualified = AgyDriver::default().spawn_invocation(spawn_request("model", None, Some("run-old")));
+        assert!(
+            qualified.command.contains("guard hooks are not wired"),
+            "{}",
+            qualified.command
+        );
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&owned, "#!/bin/sh\necho 1.5.5\n").unwrap();
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o555)).unwrap();
+        let changed = AgyDriver::default().spawn_invocation(spawn_request("model", None, Some("run-old")));
+        assert!(changed.command.contains("identity changed"), "{}", changed.command);
+        fs::set_permissions(owned.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn agent_rules_destination_is_rules_only_directory() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = env_for_provision(tmp.path());
+        let workspace = tmp.path().join("ws");
+        let dest = AgyDriver::default().agent_rules_destination(&workspace, "run-agents-1");
+        assert!(dest.ends_with("rules-root/.agents/rules/boss.md"), "dest={dest:?}");
+        assert!(
+            !dest.components().any(|c| c.as_os_str() == ".agy"),
+            "must not write under workspace .agy: {dest:?}"
+        );
+        assert!(
+            !dest.starts_with(&workspace),
+            "must not write agent rules into the cube workspace: {dest:?}"
+        );
     }
 
     #[test]

@@ -17,6 +17,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 
 use crate::EnvDirective;
+use crate::scoped_home::HostToolPaths;
+#[cfg(test)]
+use crate::scoped_home::{
+    HostCachePaths, HostVcsPaths, resolve_cube_config_dir, resolve_cube_data_dir, resolve_gh_config_dir,
+};
 
 /// Longest a preflight waits for a live Grok refresh to release its pidfile.
 const AUTH_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,37 +32,6 @@ pub const GROK_AUTH_PATH_ENV: &str = "GROK_AUTH_PATH";
 const GROK_DISABLE_API_KEY_AUTH_ENV: &str = "GROK_DISABLE_API_KEY_AUTH";
 const GROK_AMBIENT_AUTH_ENV: &str = "GROK_AUTH";
 const XAI_API_KEY_ENV: &str = "XAI_API_KEY";
-
-const GH_DEFAULT_CONFIG_LEAF: &str = ".config/gh";
-const CUBE_DEFAULT_DATA_LEAF: &str = ".local/share/cube";
-const CUBE_DEFAULT_CONFIG_LEAF: &str = ".config/cube";
-const LOGIN_KEYCHAIN_LEAF: &str = "Library/Keychains/login.keychain-db";
-
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
-struct HostToolPaths {
-    gh_config_dir: PathBuf,
-    cube_data_dir: PathBuf,
-    cube_config_dir: PathBuf,
-    login_keychain: Option<PathBuf>,
-    vcs: HostVcsPaths,
-    caches: HostCachePaths,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HostVcsPaths {
-    jj_config: Option<PathBuf>,
-    git_config_global: Option<PathBuf>,
-    ssh_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HostCachePaths {
-    xdg_cache_home: PathBuf,
-    repobin_cache_dir: PathBuf,
-    bazelisk_home: PathBuf,
-    bazel_output_root: PathBuf,
-}
 
 /// One resolved environment contract, applied identically to live preflight
 /// commands and the worker pane.
@@ -77,27 +51,7 @@ pub struct GrokProcessEnvironment {
 
 impl GrokProcessEnvironment {
     pub fn resolve(grok_home: &Path, process_home: &Path, auth_path: &Path) -> anyhow::Result<Self> {
-        let host_tools = HostToolPaths::builder()
-            .gh_config_dir(resolve_gh_config_dir().context(
-                "resolving host gh config for scoped Grok HOME; set GH_CONFIG_DIR or ensure HOME is available",
-            )?)
-            .cube_data_dir(resolve_cube_data_dir().context(
-                "resolving host Cube data for scoped Grok HOME; set CUBE_DATA_DIR or ensure HOME is available",
-            )?)
-            .cube_config_dir(resolve_cube_config_dir().context(
-                "resolving host Cube config for scoped Grok HOME; set CUBE_CONFIG_DIR or ensure HOME is available",
-            )?)
-            .maybe_login_keychain(resolve_login_keychain_source())
-            .vcs(HostVcsPaths {
-                jj_config: resolve_jj_config(),
-                git_config_global: resolve_git_config_global(),
-                ssh_dir: resolve_ssh_dir(),
-            })
-            .caches(
-                resolve_host_cache_paths()
-                    .context("resolving host tool caches for scoped Grok HOME; ensure HOME is available")?,
-            )
-            .build();
+        let host_tools = HostToolPaths::resolve().context("resolving host tool paths for scoped Grok HOME")?;
         Ok(Self {
             grok_home: grok_home.to_path_buf(),
             process_home: process_home.to_path_buf(),
@@ -159,48 +113,8 @@ impl GrokProcessEnvironment {
             EnvDirective::Set("GROK_HOME".to_owned(), self.grok_home.display().to_string()),
             shared_credential_directive(&self.auth_path),
             EnvDirective::Set("HOME".to_owned(), self.process_home.display().to_string()),
-            EnvDirective::Set(
-                "GH_CONFIG_DIR".to_owned(),
-                self.host_tools.gh_config_dir.display().to_string(),
-            ),
-            EnvDirective::Set(
-                "CUBE_DATA_DIR".to_owned(),
-                self.host_tools.cube_data_dir.display().to_string(),
-            ),
-            EnvDirective::Set(
-                "CUBE_CONFIG_DIR".to_owned(),
-                self.host_tools.cube_config_dir.display().to_string(),
-            ),
         ];
-        if let Some(path) = &self.host_tools.vcs.jj_config {
-            directives.push(EnvDirective::Set("JJ_CONFIG".to_owned(), path.display().to_string()));
-        }
-        if let Some(path) = &self.host_tools.vcs.git_config_global {
-            directives.push(EnvDirective::Set(
-                "GIT_CONFIG_GLOBAL".to_owned(),
-                path.display().to_string(),
-            ));
-        }
-        directives.extend([
-            EnvDirective::Set(
-                "XDG_CACHE_HOME".to_owned(),
-                self.host_tools.caches.xdg_cache_home.display().to_string(),
-            ),
-            EnvDirective::Set(
-                "REPOBIN_CACHE_DIR".to_owned(),
-                self.host_tools.caches.repobin_cache_dir.display().to_string(),
-            ),
-            EnvDirective::Set(
-                "BAZELISK_HOME".to_owned(),
-                self.host_tools.caches.bazelisk_home.display().to_string(),
-            ),
-            // Bazel uses TEST_TMPDIR as its explicit output_user_root. This
-            // preserves the same server/cache tree non-Grok workers use.
-            EnvDirective::Set(
-                "TEST_TMPDIR".to_owned(),
-                self.host_tools.caches.bazel_output_root.display().to_string(),
-            ),
-        ]);
+        directives.extend(self.host_tools.env_directives());
         directives.extend(oauth_only_directives());
         // A host value of 0 ungates project hooks/MCP.
         directives.push(EnvDirective::Unset("GROK_FOLDER_TRUST".to_owned()));
@@ -225,68 +139,7 @@ impl GrokProcessEnvironment {
     /// GH_CONFIG_DIR and CUBE_DATA_DIR, so startup checks and real tool calls
     /// must also work through these default paths.
     pub fn provision_home_delegates(&self) -> anyhow::Result<()> {
-        optional_delegate(
-            &self.host_tools.gh_config_dir,
-            &self.process_home.join(GH_DEFAULT_CONFIG_LEAF),
-            "gh configuration",
-        )?;
-        optional_delegate(
-            &self.host_tools.cube_data_dir,
-            &self.process_home.join(CUBE_DEFAULT_DATA_LEAF),
-            "Cube workspace registry",
-        )?;
-        optional_delegate(
-            &self.host_tools.cube_config_dir,
-            &self.process_home.join(CUBE_DEFAULT_CONFIG_LEAF),
-            "Cube configuration",
-        )?;
-        if let Some(source) = &self.host_tools.login_keychain {
-            require_delegate(
-                source,
-                &self.process_home.join(LOGIN_KEYCHAIN_LEAF),
-                "macOS login keychain",
-            )?;
-        }
-        if let Some(source) = &self.host_tools.vcs.jj_config {
-            let destination = if cfg!(target_os = "macos") {
-                self.process_home.join("Library/Application Support/jj/config.toml")
-            } else {
-                self.process_home.join(".config/jj/config.toml")
-            };
-            require_delegate(source, &destination, "jj user configuration")?;
-        }
-        if let Some(source) = &self.host_tools.vcs.git_config_global {
-            require_delegate(source, &self.process_home.join(".gitconfig"), "git user configuration")?;
-        }
-        if let Some(source) = &self.host_tools.vcs.ssh_dir {
-            require_delegate(source, &self.process_home.join(".ssh"), "SSH configuration")?;
-        }
-        optional_delegate(
-            &self.host_tools.caches.repobin_cache_dir,
-            &self.process_home.join(".cache/repobin"),
-            "repobin cache",
-        )?;
-        let bazelisk_destination = if cfg!(target_os = "macos") {
-            self.process_home.join("Library/Caches/bazelisk")
-        } else {
-            self.process_home.join(".cache/bazelisk")
-        };
-        optional_delegate(
-            &self.host_tools.caches.bazelisk_home,
-            &bazelisk_destination,
-            "Bazelisk cache",
-        )?;
-        let bazel_destination = if cfg!(target_os = "macos") {
-            self.process_home.join("Library/Caches/bazel")
-        } else {
-            self.process_home.join(".cache/bazel")
-        };
-        optional_delegate(
-            &self.host_tools.caches.bazel_output_root,
-            &bazel_destination,
-            "Bazel output root",
-        )?;
-        Ok(())
+        self.host_tools.provision_into(&self.process_home)
     }
 
     /// Reproduce the environment visible to Grok terminal tools: HOME stays
@@ -345,6 +198,7 @@ impl GrokProcessEnvironment {
                     repobin_cache_dir: PathBuf::from("/host/cache/repobin"),
                     bazelisk_home: PathBuf::from("/host/cache/bazelisk"),
                     bazel_output_root: PathBuf::from("/host/cache/bazel"),
+                    bazel_disk_cache: PathBuf::from("/host/cache/bazelcache"),
                 },
             },
         }
@@ -538,157 +392,6 @@ fn ensure_auth_file_ready_for_probe(auth_path: &Path) -> anyhow::Result<()> {
         bail!("Grok OAuth credential {} must be a JSON object", auth_path.display());
     }
     Ok(())
-}
-
-fn require_delegate(source: &Path, destination: &Path, capability: &str) -> anyhow::Result<()> {
-    if !source.exists() {
-        bail!(
-            "cannot delegate {capability} into scoped Grok HOME: source {} does not exist",
-            source.display()
-        );
-    }
-    replace_with_symlink(source, destination, capability)
-}
-
-fn optional_delegate(source: &Path, destination: &Path, capability: &str) -> anyhow::Result<()> {
-    if !source.exists() {
-        return Ok(());
-    }
-    replace_with_symlink(source, destination, capability)
-}
-
-fn replace_with_symlink(source: &Path, destination: &Path, capability: &str) -> anyhow::Result<()> {
-    let parent = destination
-        .parent()
-        .with_context(|| format!("resolving parent for {} delegate", destination.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("creating delegate parent {}", parent.display()))?;
-    match fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(destination)
-            .with_context(|| format!("replacing prior {capability} delegate {}", destination.display()))?,
-        Ok(_) => bail!(
-            "refusing to replace non-symlink {capability} path in scoped Grok HOME: {}",
-            destination.display()
-        ),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("stat {}", destination.display())),
-    }
-    std::os::unix::fs::symlink(source, destination).with_context(|| {
-        format!(
-            "symlinking {capability} from {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })
-}
-
-/// Resolve gh's non-secret configuration using gh's documented precedence.
-pub fn resolve_gh_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = nonempty_env("GH_CONFIG_DIR") {
-        return Some(dir);
-    }
-    if let Some(dir) = nonempty_env("XDG_CONFIG_HOME") {
-        return Some(dir.join("gh"));
-    }
-    nonempty_env("HOME").map(|home| home.join(GH_DEFAULT_CONFIG_LEAF))
-}
-
-/// Resolve Cube's machine-global workspace registry using Cube's own
-/// precedence from `tools/cube/src/paths.rs`.
-pub fn resolve_cube_data_dir() -> Option<PathBuf> {
-    if let Some(dir) = nonempty_env("CUBE_DATA_DIR") {
-        return Some(dir);
-    }
-    if let Some(dir) = nonempty_env("XDG_DATA_HOME") {
-        return Some(dir.join("cube"));
-    }
-    nonempty_env("HOME").map(|home| home.join(CUBE_DEFAULT_DATA_LEAF))
-}
-
-/// Resolve Cube's user configuration using Cube's own precedence from
-/// `tools/cube/src/config.rs`.
-pub fn resolve_cube_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = nonempty_env("CUBE_CONFIG_DIR") {
-        return Some(dir);
-    }
-    if let Some(dir) = nonempty_env("XDG_CONFIG_HOME") {
-        return Some(dir.join("cube"));
-    }
-    nonempty_env("HOME").map(|home| home.join(CUBE_DEFAULT_CONFIG_LEAF))
-}
-
-fn resolve_jj_config() -> Option<PathBuf> {
-    if let Some(path) = nonempty_env("JJ_CONFIG") {
-        return Some(path);
-    }
-    let home = nonempty_env("HOME")?;
-    let legacy = home.join(".jjconfig.toml");
-    if legacy.is_file() {
-        return Some(legacy);
-    }
-    let platform = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/jj/config.toml")
-    } else if let Some(xdg) = nonempty_env("XDG_CONFIG_HOME") {
-        xdg.join("jj/config.toml")
-    } else {
-        home.join(".config/jj/config.toml")
-    };
-    platform.is_file().then_some(platform)
-}
-
-fn resolve_git_config_global() -> Option<PathBuf> {
-    if let Some(path) = nonempty_env("GIT_CONFIG_GLOBAL") {
-        return Some(path);
-    }
-    let home = nonempty_env("HOME")?;
-    let home_config = home.join(".gitconfig");
-    if home_config.is_file() {
-        return Some(home_config);
-    }
-    let xdg_config = nonempty_env("XDG_CONFIG_HOME")?.join("git/config");
-    xdg_config.is_file().then_some(xdg_config)
-}
-
-fn resolve_ssh_dir() -> Option<PathBuf> {
-    let path = nonempty_env("HOME")?.join(".ssh");
-    path.is_dir().then_some(path)
-}
-
-fn resolve_host_cache_paths() -> Option<HostCachePaths> {
-    let home = nonempty_env("HOME")?;
-    let xdg_cache_home = nonempty_env("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
-    let repobin_cache_dir = nonempty_env("REPOBIN_CACHE_DIR").unwrap_or_else(|| xdg_cache_home.join("repobin"));
-    let bazelisk_home = nonempty_env("BAZELISK_HOME").unwrap_or_else(|| {
-        if cfg!(target_os = "macos") {
-            home.join("Library/Caches/bazelisk")
-        } else {
-            xdg_cache_home.join("bazelisk")
-        }
-    });
-    let bazel_output_root = nonempty_env("TEST_TMPDIR").unwrap_or_else(|| {
-        if cfg!(target_os = "macos") {
-            home.join("Library/Caches/bazel")
-        } else {
-            xdg_cache_home.join("bazel")
-        }
-    });
-    Some(HostCachePaths {
-        xdg_cache_home,
-        repobin_cache_dir,
-        bazelisk_home,
-        bazel_output_root,
-    })
-}
-
-/// Resolve the host login keychain file bridged into the scoped HOME for gh.
-pub fn resolve_login_keychain_source() -> Option<PathBuf> {
-    let path = nonempty_env("HOME")?.join(LOGIN_KEYCHAIN_LEAF);
-    path.exists().then_some(path)
-}
-
-fn nonempty_env(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
 }
 
 #[cfg(test)]
