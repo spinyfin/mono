@@ -130,3 +130,18 @@ impl WorkDb {
         read_current(&tx, work_item_id)
     }
 }
+
+/// Stage the root invalidation alongside newly recorded evidence.
+pub(crate) fn record_and_stage(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    work_item_id: &str,
+    pr_url: &str,
+    observed_at: &str,
+) -> Result<()> {
+    if record_in_tx(tx, work_item_id, pr_url, observed_at)? {
+        let root = chain_helpers::chain_root(tx, work_item_id)?;
+        board_notifications::stage_task_board_change(pending, tx, &root)?;
+    }
+    Ok(())
+}

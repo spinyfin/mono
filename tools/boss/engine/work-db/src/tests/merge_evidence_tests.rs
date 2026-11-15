@@ -200,8 +200,8 @@ fn upgrade_installs_empty_evidence_without_guessing_terminal_history() {
     drop(dir);
 }
 
-#[test]
-fn worker_merge_observation_records_root_even_after_execution_is_terminal() {
+#[tokio::test]
+async fn worker_merge_observation_records_root_even_after_execution_is_terminal() {
     let db = WorkDb::open(temp_db_path("worker-merge")).unwrap();
     let root = fixture(&db);
     let execution = db
@@ -216,6 +216,9 @@ fn worker_merge_observation_records_root_even_after_execution_is_terminal() {
     db.record_worker_pr_completion(&execution.id, PR, None, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap();
     assert!(db.get_merge_evidence(&root).unwrap().is_none());
+    let mut sub = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::WorkItemChanged,
+    ));
     assert!(
         db.record_worker_pr_completion(&execution.id, PR, None, None, WorkerPrCompletionTarget::Done, None)
             .unwrap()
@@ -223,6 +226,11 @@ fn worker_merge_observation_records_root_even_after_execution_is_terminal() {
     );
     assert!(db.get_merge_evidence(&root).unwrap().is_some());
     assert_eq!(journal_count(&db, &root), 1);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, boss_event_bus::Event::WorkItemChanged { task_id, .. } if task_id == root));
 }
 
 #[test]
@@ -309,13 +317,12 @@ fn stale_worker_merge_cannot_replace_a_new_pr_binding() {
         .unwrap()
         .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", params![root, OTHER_PR])
         .unwrap();
-    let error = db
-        .record_worker_pr_completion(&execution.id, PR, None, None, WorkerPrCompletionTarget::Done, None)
-        .unwrap_err();
-    assert!(error.to_string().contains("no longer matches"));
+    db.record_worker_pr_completion(&execution.id, PR, None, None, WorkerPrCompletionTarget::Done, None)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         db.get_execution(&execution.id).unwrap().status,
-        ExecutionStatus::Running
+        ExecutionStatus::Completed
     );
     assert_eq!(task_status(&db, &root), "in_review");
     assert!(db.get_merge_evidence(&root).unwrap().is_none());

@@ -981,6 +981,10 @@ impl WorkerCompletionHandler {
                 "pr completion: PR already merged; moved work item to done"
             );
             StopOutcome::PrMerged { pr_url }
+        } else if matches!(target, WorkerPrCompletionTarget::DoneUnmerged) {
+            tracing::info!(execution_id, work_item_id = %work_item_id, pr_url = %pr_url, source,
+                "pr completion: PR closed without merging; moved work item to done");
+            StopOutcome::PrDetected { pr_url }
         } else if enqueued_reviewer {
             tracing::info!(
                 execution_id,

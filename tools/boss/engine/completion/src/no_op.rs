@@ -142,13 +142,13 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
+        let mut confirmed_merged_pr = None;
         if execution.kind == ExecutionKind::RevisionImplementation {
             let pr_url = self.resolve_bound_pr_url(execution);
             match self.conflict_delivery_decision(execution, pr_url.as_deref()).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
-                ConflictDeliveryDecision::Moot
-                | ConflictDeliveryDecision::ClosedUnmerged
-                | ConflictDeliveryDecision::Proceed => {}
+                ConflictDeliveryDecision::Moot => confirmed_merged_pr = pr_url,
+                ConflictDeliveryDecision::ClosedUnmerged | ConflictDeliveryDecision::Proceed => {}
             }
         }
         // Captured before `record_worker_no_op_completion` below nulls
@@ -179,6 +179,7 @@ impl WorkerCompletionHandler {
         let completion = match self.work_db.record_declared_worker_no_op_completion(
             &execution.id,
             &declaration_id,
+            confirmed_merged_pr.as_deref(),
             detail,
             attention,
         ) {

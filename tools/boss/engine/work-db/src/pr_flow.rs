@@ -198,8 +198,9 @@ impl WorkDb {
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status.is_terminal() {
             if matches!(target, WorkerPrCompletionTarget::Done) {
-                merge_evidence::record_in_tx(&tx, &execution.work_item_id, pr_url, &now_string())?;
-                tx.commit()?;
+                let mut pending = PendingEvents::new();
+                merge_evidence::record_and_stage(&mut pending, &tx, &execution.work_item_id, pr_url, &now_string())?;
+                commit_and_publish(tx, pending, &self.event_bus)?;
             }
             return Ok(None);
         }
@@ -219,15 +220,12 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             bail!("cannot complete a deleted task: {work_item_id}");
         }
-        if matches!(target, WorkerPrCompletionTarget::Done)
+        let stale_merge = matches!(target, WorkerPrCompletionTarget::Done)
             && task.kind != TaskKind::Revision
             && task
                 .pr_url
                 .as_deref()
-                .is_some_and(|bound| !merge_evidence::same_binding(bound, pr_url))
-        {
-            bail!("merge observation no longer matches the task's bound PR");
-        }
+                .is_some_and(|bound| !merge_evidence::same_binding(bound, pr_url));
 
         let now = now_string();
         // Compute the new status. The chore can only advance — if it
@@ -235,6 +233,7 @@ impl WorkDb {
         // keep the existing status. `PendingReview` holds the task in
         // its current status so the reviewer pass runs before human Review.
         let new_status = match target {
+            _ if stale_merge => task.status.clone(),
             _ if task.status == TaskStatus::Done || task.status == TaskStatus::Archived => task.status.clone(),
             WorkerPrCompletionTarget::InReview if task.status == TaskStatus::InReview => task.status.clone(),
             WorkerPrCompletionTarget::InReview => TaskStatus::InReview,
@@ -260,11 +259,12 @@ impl WorkDb {
             WorkerPrCompletionTarget::BlockedDeletionSignoff => Some(DELETION_SIGNOFF_BLOCKED_REASON),
             _ => None,
         };
-        crate::task_status_audit::execute(
-            &tx,
-            "record_worker_pr_completion",
-            "engine",
-            "UPDATE tasks
+        if !stale_merge {
+            crate::task_status_audit::execute(
+                &tx,
+                "record_worker_pr_completion",
+                "engine",
+                "UPDATE tasks
              SET status             = ?2,
                  pr_url             = ?3,
                  updated_at         = ?4,
@@ -273,18 +273,19 @@ impl WorkDb {
                  blocked_attempt_id = NULL,
                  completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?4 END)
              WHERE id = ?1",
-            params![
-                task.id,
-                new_status.as_str(),
-                pr_url_for_task,
-                now,
-                blocked_reason_for_task
-            ],
-        )?;
+                params![
+                    task.id,
+                    new_status.as_str(),
+                    pr_url_for_task,
+                    now,
+                    blocked_reason_for_task
+                ],
+            )?;
+        }
 
         // A worker that finds its PR already merged lands here with `Done`;
         // the merge poller never sees these tasks again.
-        if matches!(target, WorkerPrCompletionTarget::Done) {
+        if matches!(target, WorkerPrCompletionTarget::Done) && !stale_merge {
             merge_evidence::record_in_tx(&tx, &task.id, pr_url, &now)?;
             driver_allocation::sol_selection::record_merge(&tx, &task.id, &now)?;
         }
@@ -402,7 +403,7 @@ impl WorkDb {
         detail: &str,
         attention: Option<CreateAttentionItemInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
-        self.record_worker_no_op_completion_inner(execution_id, detail, attention, None)
+        self.record_worker_no_op_completion_inner(execution_id, detail, attention, None, None)
     }
 
     /// Complete only while this exact proposal remains the applied no-op
@@ -412,10 +413,17 @@ impl WorkDb {
         &self,
         execution_id: &str,
         declaration_id: &str,
+        confirmed_merged_pr: Option<&str>,
         detail: &str,
         attention: Option<CreateAttentionItemInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
-        self.record_worker_no_op_completion_inner(execution_id, detail, attention, Some(declaration_id))
+        self.record_worker_no_op_completion_inner(
+            execution_id,
+            detail,
+            attention,
+            Some(declaration_id),
+            confirmed_merged_pr,
+        )
     }
 
     fn record_worker_no_op_completion_inner(
@@ -424,6 +432,7 @@ impl WorkDb {
         detail: &str,
         attention: Option<CreateAttentionItemInput>,
         declaration_id: Option<&str>,
+        confirmed_merged_pr: Option<&str>,
     ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -514,6 +523,9 @@ impl WorkDb {
         )?;
 
         let mut pending = PendingEvents::new();
+        if let Some(pr_url) = confirmed_merged_pr {
+            merge_evidence::record_and_stage(&mut pending, &tx, &task.id, pr_url, &now)?;
+        }
         if new_status != task.status {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
         }

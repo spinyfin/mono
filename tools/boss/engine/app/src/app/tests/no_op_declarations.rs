@@ -274,7 +274,7 @@ async fn terminal_write_requires_the_exact_current_no_op_proposal() {
     assert!(
         state
             .work_db
-            .record_declared_worker_no_op_completion(&execution_id, &old.id, "stale declaration", None)
+            .record_declared_worker_no_op_completion(&execution_id, &old.id, None, "stale declaration", None)
             .unwrap()
             .is_none()
     );
@@ -283,7 +283,7 @@ async fn terminal_write_requires_the_exact_current_no_op_proposal() {
     assert!(
         state
             .work_db
-            .record_declared_worker_no_op_completion(&execution_id, &old.id, "superseded declaration", None)
+            .record_declared_worker_no_op_completion(&execution_id, &old.id, None, "superseded declaration", None)
             .unwrap()
             .is_none()
     );
@@ -291,14 +291,14 @@ async fn terminal_write_requires_the_exact_current_no_op_proposal() {
     assert!(
         state
             .work_db
-            .record_declared_worker_no_op_completion(&execution_id, &current.id, "current declaration", None)
+            .record_declared_worker_no_op_completion(&execution_id, &current.id, None, "current declaration", None)
             .unwrap()
             .is_some()
     );
     assert!(
         state
             .work_db
-            .record_declared_worker_no_op_completion(&execution_id, &current.id, "replayed declaration", None)
+            .record_declared_worker_no_op_completion(&execution_id, &current.id, None, "replayed declaration", None)
             .unwrap()
             .is_none()
     );
