@@ -6,9 +6,9 @@ enum NavigatorTestFixture {
     static let product = WorkProduct(id: "product", name: "Navigator", slug: "navigator", description: "",
                                     repoRemoteURL: nil, status: "active", createdAt: "", updatedAt: "")
     static func task(_ id: String = "root", section: String = "working", order: String = "0",
-                     project: String? = nil, rootID: String? = nil, detail: String = "activity") -> WorkTask {
+                     project: String? = nil, rootID: String? = nil, detail: String = "activity", kind: String? = nil) -> WorkTask {
         var task = WorkTask(id: id, productID: product.id, projectID: project,
-                            kind: rootID == nil ? "task" : "revision", name: "Improve navigation \(id)",
+                            kind: kind ?? (rootID == nil ? "task" : "revision"), name: "Improve navigation \(id)",
                             description: "A readable **brief** for \(id).", status: "active", priority: "medium",
                             ordinal: nil, prURL: "https://github.com/spinyfin/mono/pull/3629", deletedAt: nil,
                             createdAt: "", updatedAt: "")
@@ -61,7 +61,7 @@ final class NavigatorSelectionTests: XCTestCase {
         model.selectWorkCard("automation")
         model.setWorkViewMode(.navigator)
         XCTAssertNil(model.navigator.selectedRootID)
-        XCTAssertEqual(model.selectedWorkCardID, "automation")
+        XCTAssertNil(model.selectedWorkCardID)
         NavigatorTestFixture.snapshot(model, [root, excluded])
         XCTAssertNil(model.navigator.selectedRootID)
     }
@@ -165,6 +165,7 @@ final class NavigatorSelectionTests: XCTestCase {
     func testScopeChangesPreserveIncludedSelectionAndRestoreExcludedRoot() {
         let model = NavigatorTestFixture.model([NavigatorTestFixture.task(project: "alpha"),
                                                 NavigatorTestFixture.task("other", project: "beta")])
+        model.setWorkViewMode(.navigator)
         model.selectWorkCard("root")
         model.toggleProjectFilter("alpha")
         XCTAssertEqual(model.navigator.selectedRootID, "root")

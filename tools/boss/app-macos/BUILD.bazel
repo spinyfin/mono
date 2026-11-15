@@ -197,6 +197,7 @@ _RENDER_SHARD_SRCS = [
 
 _NAVIGATOR_SHARD_SRCS = [
     "Tests/BossTests/NavigatorSelectionTests.swift",
+    "Tests/BossTests/NavigatorModeRegressionTests.swift",
     "Tests/BossTests/NavigatorRowTests.swift",
 ]
 

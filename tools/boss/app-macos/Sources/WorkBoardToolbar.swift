@@ -1,6 +1,7 @@
 import AppKit
 import os.log
 import SwiftUI
+import UpdateCore
 
 struct WorkViewModePicker: View {
     @ObservedObject var model: ChatViewModel
@@ -16,7 +17,6 @@ struct WorkViewModePicker: View {
         .frame(width: 180)
     }
 }
-import UpdateCore
 
 /// Whether a collapsible board section is currently showing its cards.
 ///

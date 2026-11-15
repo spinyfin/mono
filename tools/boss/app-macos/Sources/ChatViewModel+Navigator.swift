@@ -2,7 +2,7 @@ import Foundation
 
 extension ChatViewModel {
     var navigatorScopeKey: String {
-        ([selectedWorkProductID ?? ""] + selectedProjectFilterIDs.sorted()).joined(separator: "|")
+        ([selectedWorkProductID ?? ""] + visibleSelectedProjectFilterIDs.sorted()).joined(separator: "|")
             + (filterToChoresOnly ? "|unprojected" : "")
     }
 
@@ -17,10 +17,17 @@ extension ChatViewModel {
     func navigatorIncludes(_ task: WorkTask) -> Bool {
         task.productID == selectedWorkProductID
             && (!filterToChoresOnly || task.projectID == nil)
-            && (selectedProjectFilterIDs.isEmpty || task.projectID.map(selectedProjectFilterIDs.contains) == true)
+            && (visibleSelectedProjectFilterIDs.isEmpty || task.projectID.map(visibleSelectedProjectFilterIDs.contains) == true)
     }
 
     var navigatorCompatibilityMessage: String? {
+        if let cachedNavigatorCompatibility { return cachedNavigatorCompatibility.message }
+        let message = computeNavigatorCompatibilityMessage()
+        cachedNavigatorCompatibility = (message, true)
+        return message
+    }
+
+    private func computeNavigatorCompatibilityMessage() -> String? {
         let population = navigatorTasks.filter { $0.deletedAt == nil && $0.status != "archived" }
         guard population.allSatisfy({ task in
             guard let projection = task.navigator else {
@@ -37,6 +44,7 @@ extension ChatViewModel {
     }
 
     var navigatorSections: [NavigatorSectionRows] {
+        if let cachedNavigatorSections { return cachedNavigatorSections }
         let tasks = navigatorTasks
         let roots = tasks.filter { navigatorIncludes($0) && $0.deletedAt == nil && $0.status != "archived" }
             .compactMap { task -> NavigatorRow? in
@@ -55,17 +63,20 @@ extension ChatViewModel {
             return task.name.localizedCaseInsensitiveContains(query)
                 || task.description.localizedCaseInsensitiveContains(query)
         }.sorted { $0.id < $1.id }
-        return NavigatorSection.allCases.map { section in
+        let asksByRoot = Dictionary(grouping: matchingAsks, by: { $0.navigator?.rootTaskId ?? $0.id })
+        let sections = NavigatorSection.allCases.map { section in
             let all = roots.filter { $0.projection.knownSection == section }
             let shown = all.compactMap { row -> NavigatorRow? in
                 guard let query else { return row }
                 if row.task.name.localizedCaseInsensitiveContains(query)
                     || row.task.description.localizedCaseInsensitiveContains(query) { return row }
-                guard let ask = matchingAsks.first(where: { $0.navigator?.rootTaskId == row.id }) else { return nil }
+                guard let ask = asksByRoot[row.id]?.first else { return nil }
                 return NavigatorRow(task: row.task, projection: row.projection, matchingAskID: ask.id)
             }
             return NavigatorSectionRows(section: section, rows: shown, total: all.count)
         }
+        cachedNavigatorSections = sections
+        return sections
     }
 
     var navigatorCollapsed: Set<NavigatorSection> {
@@ -100,7 +111,7 @@ extension ChatViewModel {
               let root = self.task(withID: projection.rootTaskId), let detail = root.navigator?.root else {
             navigator.selectedRootID = nil
             navigator.retainedTask = nil
-            selectionHistory.rememberRoot(nil, scope: navigatorScopeKey)
+            if navigator.mode == .navigator { selectionHistory.rememberRoot(nil, scope: navigatorScopeKey) }
             return
         }
         if navigator.selectedRootID != root.id {
@@ -115,10 +126,15 @@ extension ChatViewModel {
         navigator.retainedTask = root
         if root.prURL != nil { navigator.tabs.insert(.review) }
         if !detail.actions.isEmpty { navigator.tabs.insert(.attention) }
-        selectionHistory.rememberRoot(root.id, scope: navigatorScopeKey)
+        if navigator.mode == .navigator { selectionHistory.rememberRoot(root.id, scope: navigatorScopeKey) }
     }
 
     func reconcileNavigatorSelection() {
+        defer {
+            if navigator.mode == .navigator, selectedWorkCardID != navigator.selectedRootID {
+                selectedWorkCardID = navigator.selectedRootID
+            }
+        }
         if let selected = navigatorSelectedTask, !navigatorIncludes(selected) {
             navigator.selectedRootID = nil
             navigator.retainedTask = nil
@@ -138,6 +154,7 @@ extension ChatViewModel {
     func changeNavigatorScope(_ change: () -> Void) {
         let previous = navigator.selectedRootID
         change()
+        guard navigator.mode == .navigator else { return }
         if let previous, let task = task(withID: previous), navigatorIncludes(task) {
             selectNavigatorRoot(previous)
             selectedWorkCardID = previous
@@ -151,23 +168,42 @@ extension ChatViewModel {
 
     func setWorkViewMode(_ mode: WorkViewMode) {
         guard navigator.mode != mode else { return }
-        if let id = selectedWorkCardID { selectNavigatorRoot(id) }
         if mode == .navigator {
             navigator.kanbanCardOnExit = selectedWorkCardID
-            if let rootID = navigator.selectedRootID { selectedWorkCardID = rootID }
+            if let id = selectedWorkCardID, let task = task(withID: id), navigatorIncludes(task) {
+                selectNavigatorRoot(id)
+            } else {
+                navigator.selectedRootID = nil
+                navigator.retainedTask = nil
+            }
         }
         navigator.mode = mode
         defaults.set(mode.rawValue, forKey: "boss.work.viewMode")
-        if mode == .kanban, let id = navigator.selectedRootID {
-            selectedWorkCardID = id
-            if id != navigator.kanbanCardOnExit, let task = task(withID: id), isTaskVisible(task) { prepareReveal(id) }
+        if mode == .navigator {
+            reconcileNavigatorSelection()
+            if let id = navigator.selectedRootID {
+                selectionHistory.rememberRoot(id, scope: navigatorScopeKey)
+            }
+        } else if let root = navigatorSelectedTask {
+            revealWorkCard(root.id, productID: root.productID)
+        } else if let id = navigator.kanbanCardOnExit, let task = task(withID: id), navigatorIncludes(task) {
+            revealWorkCard(id, productID: task.productID)
         }
+    }
+
+    func isWorkCardPopoverPresented(_ id: String) -> Bool {
+        navigator.mode == .kanban && selectedTask?.id == id
+    }
+
+    func dismissWorkCardPopover() {
+        guard navigator.mode == .kanban else { return }
+        selectWorkCard(nil)
     }
 
     var navigatorProjectAttentionCount: Int {
         selectedProductOpenAttentionGroups.filter { group in
             guard let projectID = group.associationProjectID else { return false }
-            return selectedProjectFilterIDs.isEmpty || selectedProjectFilterIDs.contains(projectID)
+            return visibleSelectedProjectFilterIDs.isEmpty || visibleSelectedProjectFilterIDs.contains(projectID)
         }.count
     }
 
@@ -183,6 +219,12 @@ extension ChatViewModel {
         setNavigatorSection(section, expanded: true)
         navigator.selectedAtSection = section
         navigator.revealGeneration = UUID()
+    }
+
+    func confirmNavigatorReveal(rootID: String) {
+        guard navigator.mode == .navigator, navigator.selectedRootID == rootID,
+              navigatorRevealRootID == rootID, navigatorVisibleRows.contains(where: { $0.id == rootID }) else { return }
+        finishReveal(.success)
     }
 
     func moveNavigatorSelection(by offset: Int, edge: Bool = false) {

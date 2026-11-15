@@ -60,7 +60,7 @@ final class NavigatorRowTests: XCTestCase {
         XCTAssertNotNil(model.navigatorCompatibilityMessage)
         model.selectWorkCard("root")
         model.setWorkViewMode(.navigator)
-        XCTAssertEqual(model.selectedWorkCardID, "root", "Compatibility fallback must preserve the Kanban selection")
+        XCTAssertNil(model.selectedWorkCardID, "Unsupported tasks have no Navigator selection")
         model.setWorkViewMode(.kanban)
         XCTAssertEqual(model.selectedWorkCardID, "root")
         legacy.sourceAutomationId = "automation"
@@ -142,7 +142,11 @@ final class NavigatorRowTests: XCTestCase {
     }
 
     func testDetailSlotsAndNavigatorRenderWithoutProductionEngine() throws {
-        let model = NavigatorTestFixture.model([NavigatorTestFixture.task(), NavigatorTestFixture.task("revision", rootID: "root")])
+        var root = NavigatorTestFixture.task()
+        root.prMergeableState = "conflicting"
+        root.ciRequiredState = "fail"
+        root.reviewRequiredState = "changes_requested"
+        let model = NavigatorTestFixture.model([root, NavigatorTestFixture.task("revision", rootID: "root")])
         model.setWorkViewMode(.navigator)
         model.selectWorkCard("root")
         for slot in NavigatorDetailSlot.allCases {

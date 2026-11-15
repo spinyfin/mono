@@ -225,7 +225,7 @@ extension ChatViewModel {
         if taskID == nil {
             navigator.selectedRootID = nil
             navigator.retainedTask = nil
-            selectionHistory.rememberRoot(nil, scope: navigatorScopeKey)
+            if navigator.mode == .navigator { selectionHistory.rememberRoot(nil, scope: navigatorScopeKey) }
         }
         if let taskID, let task = task(withID: taskID) { selectedWorkProductID = task.productID }
         selectedWorkCardID = taskID

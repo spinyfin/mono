@@ -28,6 +28,17 @@ struct WorkNavigatorDetail: View {
                 Text(root.name).font(.title2).textSelection(.enabled)
                 Text([model.projectName(for: root.projectID), root.navigator?.root?.reasonLabel]
                     .compactMap { $0 }.joined(separator: " · ")).foregroundStyle(.secondary)
+                if let pr = root.prURL, let url = URL(string: pr) {
+                    Link("Open pull request", destination: url)
+                }
+                if let evidence = root.navigator?.root?.mergeEvidence {
+                    Text(evidence.mergedAt.map { "Merged: \($0)" } ?? "Merge observed: \(evidence.observedAt)")
+                        .font(.caption)
+                }
+                if let projection = root.navigator?.root {
+                    let facts = NavigatorRowPresentation(row: NavigatorRow(task: root, projection: projection, matchingAskID: nil), project: nil, width: 520).healthFacts
+                    Text(facts.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
+                }
                 if let notice = model.navigatorSelectionNotice {
                     HStack {
                         Text(notice).font(.callout)
@@ -102,14 +113,6 @@ private struct NavigatorFallbackDetail: View {
                     Button("Use Kanban") { context.model.setWorkViewMode(.kanban) }
                     Button("Open Notifications") { openWindow(id: "attentions") }
                 }
-            }
-            if let pr = context.root.prURL, let url = URL(string: pr) {
-                Link("Open pull request", destination: url)
-            }
-            if let health = context.root.ciRequiredState { Text("CI: \(health)").font(.caption) }
-            if let evidence = context.root.navigator?.root?.mergeEvidence {
-                Text(evidence.mergedAt.map { "Merged: \($0)" } ?? "Merge observed: \(evidence.observedAt)")
-                    .font(.caption)
             }
             if let ask = context.ask, ask.id != context.root.id {
                 Text("Current ask: \(ask.name)").font(.headline)

@@ -961,11 +961,9 @@ struct ContentView: View {
                                 .allowsHitTesting(model.navigator.mode == .kanban)
                                 .disabled(model.navigator.mode != .kanban)
                                 .accessibilityHidden(model.navigator.mode != .kanban)
-                            WorkNavigatorView(model: model)
-                                .opacity(model.navigator.mode == .navigator ? 1 : 0)
-                                .allowsHitTesting(model.navigator.mode == .navigator)
-                                .disabled(model.navigator.mode != .navigator)
-                                .accessibilityHidden(model.navigator.mode != .navigator)
+                            if model.navigator.mode == .navigator {
+                                WorkNavigatorView(model: model)
+                            }
                         }
                     case .loading:
                         BoardLoadingView(

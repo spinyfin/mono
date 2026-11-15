@@ -44,6 +44,7 @@ struct WorkNavigatorView: View {
 
     private var navigator: some View {
         let scope = model.navigatorScopeKey
+        let sections = model.navigatorSections
         return VStack(spacing: 8) {
             scopePicker
             TextField("Search tasks and revision asks", text: $model.workSearchText)
@@ -52,7 +53,7 @@ struct WorkNavigatorView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(model.navigatorSections) { section in
+                            ForEach(sections) { section in
                                 sectionHeader(section)
                                 if !model.navigatorCollapsed.contains(section.section) {
                                     if section.rows.isEmpty {
@@ -65,7 +66,7 @@ struct WorkNavigatorView: View {
                                             focus = .row(row.id)
                                         } label: {
                                             WorkNavigatorRow(row: row,
-                                                project: model.selectedProjectFilterIDs.count == 1 ? nil : model.projectName(for: row.task.projectID),
+                                                project: model.visibleSelectedProjectFilterIDs.count == 1 ? nil : model.projectName(for: row.task.projectID),
                                                 width: geometry.size.width,
                                                 isSelected: model.navigator.selectedRootID == row.id)
                                         }
@@ -84,8 +85,17 @@ struct WorkNavigatorView: View {
                         get: { model.navigator.scrollByScope[scope] },
                         set: { model.navigator.scrollByScope[scope] = $0 }
                     ), anchor: .top)
+                    .onAppear {
+                        if let id = model.navigatorRevealRootID {
+                            proxy.scrollTo(id)
+                            model.confirmNavigatorReveal(rootID: id)
+                        }
+                    }
                     .onChange(of: model.navigator.revealGeneration) { _, _ in
-                        if let id = model.navigator.selectedRootID { proxy.scrollTo(id) }
+                        if let id = model.navigator.selectedRootID {
+                            proxy.scrollTo(id)
+                            model.confirmNavigatorReveal(rootID: id)
+                        }
                     }
                     .onKeyPress(keys: [.upArrow, .downArrow, .home, .end, .leftArrow, .rightArrow, .return]) { press in
                         handleKey(press.key)
@@ -102,8 +112,8 @@ struct WorkNavigatorView: View {
             Picker("Scope", selection: Binding(
                 get: {
                     if model.filterToChoresOnly { return "unprojected" }
-                    if model.selectedProjectFilterIDs.count > 1 { return "multiple" }
-                    return model.selectedProjectFilterIDs.first ?? ""
+                    if model.visibleSelectedProjectFilterIDs.count > 1 { return "multiple" }
+                    return model.visibleSelectedProjectFilterIDs.first ?? ""
                 },
                 set: { id in
                     guard id != "multiple" else { return }
@@ -117,8 +127,8 @@ struct WorkNavigatorView: View {
             )) {
                 Text(model.selectedProduct?.name ?? "All projects").tag("")
                 Text("No project").tag("unprojected")
-                if model.selectedProjectFilterIDs.count > 1 {
-                    Text("\(model.selectedProjectFilterIDs.count) projects").tag("multiple")
+                if model.visibleSelectedProjectFilterIDs.count > 1 {
+                    Text("\(model.visibleSelectedProjectFilterIDs.count) projects").tag("multiple")
                 }
                 ForEach(model.projectsForSelectedProduct) { project in Text(project.name).tag(project.id) }
             }
