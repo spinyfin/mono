@@ -241,19 +241,20 @@ _BOX_PREFIXES = (b"|", "│".encode(), "┃".encode(), "║".encode())
 
 
 def _strip_box_glyphs(row):
-    for prefix in _BOX_PREFIXES:
-        if row.startswith(prefix):
-            row = row[len(prefix):].lstrip()
-            break
-    for prefix in _BOX_PREFIXES:
-        if row.endswith(prefix):
-            row = row[:-len(prefix)].rstrip()
-            break
-    return row
+    while row.startswith(_BOX_PREFIXES):
+        prefix = next(prefix for prefix in _BOX_PREFIXES if row.startswith(prefix))
+        row = row[len(prefix):]
+    while row.endswith(_BOX_PREFIXES):
+        prefix = next(prefix for prefix in _BOX_PREFIXES if row.endswith(prefix))
+        row = row[:-len(prefix)]
+    return row.strip()
 
 
 def _dialog_line(line):
-    return _strip_box_glyphs(line.strip()).lstrip(PROMPT_MARK).strip()
+    row = _strip_box_glyphs(line.strip())
+    while row.startswith(PROMPT_MARK):
+        row = row[len(PROMPT_MARK):]
+    return row.strip()
 
 
 def _is_later_composer(line):
@@ -273,16 +274,16 @@ def check_blocking_dialog(view, markers, payload=b""):
     if any(_is_later_composer(row) for row in lines[footer + 1:]):
         return
     lines = lines[:footer + 1]
-    for index, line in enumerate(lines):
-        question = _dialog_line(line)
-        window = lines[max(0, index - 2):]
-        tail = [_dialog_line(row) for row in window]
-        numbered = any(row.startswith(b"1.") for row in tail) and any(row.startswith(b"2.") for row in tail)
-        trust = (b"No, exit" in tail
-                 and (b"Yes, I trust this folder" in tail or b"Yes, I accept" in tail)
-                 and any(PROMPT_MARK in row for row in window))
-        if len(lines) - index <= 12 and (numbered or trust):
-            for marker in markers:
+    for marker in markers:
+        for index, line in enumerate(lines):
+            question = _dialog_line(line)
+            window = lines[max(0, index - 2):]
+            tail = [_dialog_line(row) for row in window]
+            numbered = any(row.startswith(b"1.") for row in tail) and any(row.startswith(b"2.") for row in tail)
+            trust = (b"No, exit" in tail
+                     and (b"Yes, I trust this folder" in tail or b"Yes, I accept" in tail)
+                     and any(PROMPT_MARK in row for row in window))
+            if len(lines) - index <= 12 and (numbered or trust):
                 if marker and question.startswith(marker):
                     raise BlockingDialogOnScreen(marker)
 

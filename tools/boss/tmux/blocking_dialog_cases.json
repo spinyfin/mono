@@ -1,0 +1,93 @@
+[
+  {
+    "name": "approval reconstruction",
+    "screen": "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": "Do you want to proceed?"
+  },
+  {
+    "name": "live trust capture",
+    "screen": "Accessing workspace:\nQuick safety check: Is this a project you created or one you trust?\n\n❯ No, exit\n  Yes, I trust this folder\n\nEnter to confirm · Esc to cancel",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": "Yes, I trust this folder"
+  },
+  {
+    "name": "live bypass capture",
+    "screen": "WARNING: Claude Code running in Bypass Permissions mode\n❯ No, exit\n  Yes, I accept\nEnter to confirm · Esc to cancel",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": "Yes, I accept"
+  },
+  {
+    "name": "boxed approval with status",
+    "screen": "╭────────╮\n│ Do you want to proceed? │\n│ ❯ 1. Yes │\n│   2. No │\n│ Esc to cancel │\n╰────────╯\n  bypass permissions on",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": "Do you want to proceed?"
+  },
+  {
+    "name": "repeated mixed borders",
+    "screen": "│┃║Do you want to proceed?║┃│\n│┃║❯ 1. Yes║┃│\n│┃║  2. No║┃│\n│┃║Esc to cancel║┃│",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": "Do you want to proceed?"
+  },
+  {
+    "name": "transcript followed by composer",
+    "screen": "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel\nClaude Code\n❯ status?",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "transcript followed by ascii composer",
+    "screen": "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel\n> status?",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "payload in composer",
+    "screen": "Claude Code\n❯ Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    "expected_marker": null
+  },
+  {
+    "name": "payload plus live dialog",
+    "screen": "❯ Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    "expected_marker": "Do you want to proceed?"
+  },
+  {
+    "name": "question without footer",
+    "screen": "Do you want to proceed?",
+    "markers": ["Do you want to proceed?", "Yes, I trust this folder", "Yes, I accept"],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "unicode marker retains leading glyph",
+    "screen": "➜ approval\n1. Yes\n2. No\nEsc to cancel",
+    "markers": ["➜ approval"],
+    "payload": "",
+    "expected_marker": "➜ approval"
+  },
+  {
+    "name": "empty marker",
+    "screen": "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    "markers": [""],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "marker priority",
+    "screen": "Yes, I accept\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    "markers": ["Yes, I accept", "Do you want to proceed?"],
+    "payload": "",
+    "expected_marker": "Yes, I accept"
+  }
+]

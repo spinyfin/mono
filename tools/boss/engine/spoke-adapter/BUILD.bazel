@@ -22,6 +22,7 @@ rust_library(
         "//tools/boss/engine/work-db",
         "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
+        "//tools/boss/tmux",
     ] + all_crate_deps(normal = True),
 )
 
@@ -50,6 +51,7 @@ rust_test(
         "//tools/boss/engine/work-db",
         "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
+        "//tools/boss/tmux",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
@@ -79,5 +81,6 @@ rust_library(
         "//tools/boss/engine/work-db:work_db_test_support",
         "//tools/boss/protocol",
         "//tools/boss/protocol-spoke",
+        "//tools/boss/tmux",
     ] + all_crate_deps(normal = True),
 )

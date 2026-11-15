@@ -79,6 +79,12 @@ impl HostAdapter for Remote {
     ) -> Result<RunOutcome> {
         unreachable!()
     }
+    async fn interrupt_worker(&self, _: &str) -> Result<ControlOutcome> {
+        Ok(self.outcome.clone())
+    }
+    async fn probe_remote_worker_alive(&self, _: i64) -> Result<Option<bool>> {
+        Ok(Some(false))
+    }
     async fn deliver_worker_input(&self, _: &str, kind: WorkerInputKind, _: &str) -> Result<ControlOutcome> {
         self.calls.lock().unwrap().push(kind);
         Ok(self.outcome.clone())
@@ -348,4 +354,64 @@ async fn releasing_a_terminal_spoke_run_settles_queued_and_in_flight_probes() {
         state.probe_lifecycle_state(&in_flight),
         Some(ProbeDeliveryState::Orphaned)
     );
+}
+
+#[tokio::test]
+async fn spoke_dialog_refusals_fail_run_release_slot_and_abandon_probes() {
+    use boss_engine_runtime::test_support::{create_active_chore, create_old_execution, create_product};
+    for path in ["nudge", "interrupt", "probe"] {
+        let reason = boss_tmux::BlockingDialogOnScreen::delivery_attempt_reason(&boss_tmux::BlockingDialogOnScreen {
+            marker: "Do you want to proceed?".into(),
+        });
+        let remote = Arc::new(Remote {
+            outcome: ControlOutcome::Rejected { reason, pane: None },
+            calls: Mutex::new(vec![]),
+        });
+        let (state, _dir) = spoke_state(remote);
+        let product = create_product(&state.work_db);
+        let task = create_active_chore(&state.work_db, &product, "Dialog refusal");
+        let run = create_old_execution(&state.work_db, &task);
+        state.work_db.reserve_spoke_assignment(&run, "spoke").unwrap();
+        state
+            .work_db
+            .start_execution_run_on_host(&run, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws", "spoke")
+            .unwrap();
+        state.work_db.set_run_remote_pid_for_execution(&run, 42).unwrap();
+        state
+            .worker_registry
+            .register_run_slot(&run, boss_protocol::REMOTE_SLOT_BASE);
+        state.record_spoke_turn_event(&run, &stop(), false).unwrap();
+        let probe = state.queue_probe(run.clone(), "status?".into(), false);
+        match path {
+            "nudge" => {
+                assert!(state.send_input_to_worker(&run, "status?".into()).await.is_err());
+            }
+            "interrupt" => {
+                assert!(state.interrupt_worker_pane(&run).await.is_err());
+            }
+            "probe" => {
+                assert_eq!(
+                    dispatch_probe_now(&state, &run).await,
+                    ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            state.work_db.get_execution(&run).unwrap().status,
+            boss_protocol::ExecutionStatus::Failed,
+            "{path}"
+        );
+        assert!(state.worker_registry.slot_for_run(&run).is_none(), "{path}");
+        assert_eq!(
+            state.probe_lifecycle_state(&probe),
+            Some(ProbeDeliveryState::Abandoned),
+            "{path}"
+        );
+        let basis: String = state.work_db.connect().unwrap().query_row(
+            "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 AND property = 'blocked_reason' ORDER BY id DESC LIMIT 1",
+            [&task], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(basis, "blocking_dialog_on_screen", "{path}");
+    }
 }

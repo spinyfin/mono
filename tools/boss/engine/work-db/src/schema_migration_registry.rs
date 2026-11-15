@@ -399,6 +399,14 @@ pub(super) fn all() -> Vec<Migration> {
             apply: execution_recovery_rearm::migrate_fresh_start,
         },
         Migration {
+            id: "20261114_1800_refresh_blocked_reason_audit_trigger".into(),
+            legacy_version: None,
+            apply: |conn| {
+                conn.execute_batch("DROP TRIGGER IF EXISTS task_status_audit_update_blocked_reason")?;
+                task_status_audit::install_property_triggers(conn, "blocked_reason")
+            },
+        },
+        Migration {
             id: "20261030_0900_sol_default_full_share".into(),
             legacy_version: None,
             apply: driver_allocation::sol_selection::migrate_default_full_share,

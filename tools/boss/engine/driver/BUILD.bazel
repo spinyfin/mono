@@ -9,6 +9,7 @@ rust_library(
     name = "driver",
     srcs = glob(["src/**/*.rs"]),
     compile_data = glob(["src/grok/testdata/**"]) + [
+        "//tools/boss/tmux:blocking_dialog_cases.json",
         "src/codex-tmux.conf",
         "src/initial_prompt.py",
     ],
@@ -54,6 +55,7 @@ rust_test(
     name = "driver_test",
     size = "small",
     compile_data = glob(["src/grok/testdata/**"]) + [
+        "//tools/boss/tmux:blocking_dialog_cases.json",
         "src/codex-tmux.conf",
         "src/initial_prompt.py",
     ],
