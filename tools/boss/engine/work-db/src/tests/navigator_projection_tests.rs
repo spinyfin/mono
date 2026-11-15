@@ -57,7 +57,7 @@ fn actions(model: &Model, id: &str) -> Vec<(NavigatorHumanAction, String)> {
         .into_iter()
         .filter_map(|action| match action {
             NavigatorAction::Attention { kind, task_id, .. } => Some((kind, task_id)),
-            NavigatorAction::OpenInput { .. } => None,
+            NavigatorAction::OpenInput { .. } | NavigatorAction::Unknown => None,
         })
         .collect()
 }
@@ -254,12 +254,9 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
     step(&db, &product, &mut model);
     assert_eq!(
         row(&model, &root).section,
-        NavigatorSection::Backlog,
-        "an exited run is not activity"
+        NavigatorSection::Working,
+        "a completed dispatch run under a live execution is still working"
     );
-    set_run(&db, &repair, "running");
-    step(&db, &product, &mut model);
-    assert_eq!(row(&model, &root).section, NavigatorSection::Working);
 
     // A question from the running revision stays visible without moving the row.
     ask(&db, &revision, &repair);
@@ -390,7 +387,8 @@ fn relationship_changes_reproject_every_family_they_touch() {
     step(&db, &product, &mut model);
     assert_eq!(row(&model, &second).revisions.total, 1);
 
-    // A revision whose root left the board is surfaced, not dropped.
+    // Archiving the root removes it from the Work population; its live
+    // revisions do not become independent rows. Restoring it folds them again.
     update(&db, "UPDATE tasks SET status = 'archived' WHERE id = ?1", &second);
     step(&db, &product, &mut model);
     assert!(
@@ -402,9 +400,10 @@ fn relationship_changes_reproject_every_family_they_touch() {
             .iter()
             .any(|task| task.id == second)
     );
-    let orphan = row(&model, &revision);
-    assert_eq!(orphan.section, NavigatorSection::Backlog);
-    assert_eq!(waiting(&model, &revision), NavigatorWait::UnavailableParent);
+    assert!(
+        !has_projection(&model, &revision),
+        "revisions of an archived root are not independent rows"
+    );
     update(&db, "UPDATE tasks SET status = 'in_review' WHERE id = ?1", &second);
     step(&db, &product, &mut model);
     assert_eq!(projection(&model, &revision).root_task_id, second);
@@ -580,4 +579,176 @@ fn typed_question_attentions_reach_the_owning_family_until_actioned_or_dismissed
     assert_eq!(step(&db, &product, &mut model), Refresh::Snapshot("broad_input"));
     assert!(actions(&model, &root).is_empty(), "a dismissed group is history");
     assert_eq!(row(&model, &root).section, NavigatorSection::Backlog);
+}
+
+fn in_review_named(db: &WorkDb, product_id: &str, name: &str, pr_url: &str) -> String {
+    let id = create_test_chore_manual(db, product_id, name).id;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            params![id, pr_url],
+        )
+        .unwrap();
+    id
+}
+
+fn spawn_live(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> String {
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(kind)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (execution, run) = db
+        .start_execution_run(&execution.id, "synthetic", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&execution.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::Running)
+            .run_status("completed")
+            .build(),
+    )
+    .unwrap();
+    execution.id
+}
+
+#[test]
+fn a_completed_dispatch_run_under_a_live_execution_is_working_then_waiting_then_gone() {
+    let db = WorkDb::open(temp_db_path("navigator-live-run")).unwrap();
+    let product = make_revision_product(&db, "navigator-live-run");
+    let root = create_test_chore_manual(&db, product.clone(), "live worker").id;
+    let mut model = None;
+    step(&db, &product, &mut model);
+
+    let execution = spawn_live(&db, &root, ExecutionKind::ChoreImplementation);
+    assert!(matches!(step(&db, &product, &mut model), Refresh::Incremental(_)));
+    let working = row(&model, &root);
+    assert_eq!(working.section, NavigatorSection::Working);
+    assert_eq!(working.activities.len(), 1);
+    assert_eq!(working.activities[0].execution_id, execution);
+
+    set_exec(&db, &execution, "waiting_human");
+    step(&db, &product, &mut model);
+    let waiting_on_person = row(&model, &root);
+    assert_eq!(waiting_on_person.section, NavigatorSection::NeedsAttention);
+    assert!(
+        waiting_on_person
+            .actions
+            .iter()
+            .any(|action| matches!(action, NavigatorAction::OpenInput { .. })),
+        "a waiting_human execution with a completed dispatch run is still an input wait"
+    );
+
+    set_exec(&db, &execution, "completed");
+    step(&db, &product, &mut model);
+    assert_eq!(row(&model, &root).section, NavigatorSection::Backlog);
+    assert!(row(&model, &root).activities.is_empty());
+}
+
+#[test]
+fn archived_family_members_stay_with_their_owner_and_unresolved_chains_fall_back() {
+    let db = WorkDb::open(temp_db_path("navigator-archive")).unwrap();
+    let product = make_revision_product(&db, "navigator-archive");
+    let root = make_in_review_chore(&db, &product, PR);
+    let archived_child = insert_revision_row(&db, &product, &root);
+    let live_child = insert_revision_row(&db, &product, &root);
+    let intermediate = insert_revision_row(&db, &product, &root);
+    let descendant = insert_revision_row(&db, &product, &intermediate);
+    let mut model = None;
+    step(&db, &product, &mut model);
+    assert_eq!(row(&model, &root).revisions.total, 4);
+
+    update(
+        &db,
+        "UPDATE tasks SET status = 'archived' WHERE id = ?1",
+        &archived_child,
+    );
+    step(&db, &product, &mut model);
+    assert_eq!(
+        row(&model, &root).revisions.total,
+        4,
+        "an archived child stays in the family"
+    );
+    assert_eq!(projection(&model, &live_child).root_task_id, root);
+    assert!(
+        !model
+            .as_ref()
+            .unwrap()
+            .tree()
+            .tasks
+            .iter()
+            .any(|task| task.id == archived_child)
+    );
+
+    update(&db, "UPDATE tasks SET status = 'archived' WHERE id = ?1", &intermediate);
+    update(&db, "UPDATE tasks SET status = 'active' WHERE id = ?1", &descendant);
+    let nested_worker = spawn_live(&db, &descendant, ExecutionKind::RevisionImplementation);
+    step(&db, &product, &mut model);
+    let through_archive = row(&model, &root);
+    assert_eq!(through_archive.revisions.total, 4);
+    assert_eq!(projection(&model, &descendant).root_task_id, root);
+    assert_eq!(through_archive.section, NavigatorSection::Working);
+    assert_eq!(through_archive.activities[0].execution_id, nested_worker);
+    assert!(
+        model
+            .as_ref()
+            .unwrap()
+            .tree()
+            .tasks
+            .iter()
+            .all(|task| task.id != intermediate)
+    );
+
+    let other = in_review_named(&db, &product, "other root", OTHER_PR);
+    let orphan = insert_revision_row(&db, &product, &other);
+    step(&db, &product, &mut model);
+    update(&db, "UPDATE tasks SET status = 'archived' WHERE id = ?1", &other);
+    step(&db, &product, &mut model);
+    assert!(
+        !has_projection(&model, &orphan),
+        "archiving a root does not mint Parent unavailable rows"
+    );
+    update(&db, "UPDATE tasks SET status = 'in_review' WHERE id = ?1", &other);
+    step(&db, &product, &mut model);
+    assert_eq!(projection(&model, &orphan).root_task_id, other);
+    assert!(projection(&model, &orphan).root.is_none());
+
+    let missing_parent = in_review_named(
+        &db,
+        &product,
+        "missing parent",
+        "https://github.com/spinyfin/mono/pull/9",
+    );
+    let missing_child = insert_revision_row(&db, &product, &missing_parent);
+    step(&db, &product, &mut model);
+    db.connect()
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF; DELETE FROM tasks WHERE id = '{missing_parent}';"
+        ))
+        .unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(waiting(&model, &missing_child), NavigatorWait::UnavailableParent);
+
+    let tombstoned_parent = in_review_named(
+        &db,
+        &product,
+        "tombstoned parent",
+        "https://github.com/spinyfin/mono/pull/10",
+    );
+    let tombstoned_child = insert_revision_row(&db, &product, &tombstoned_parent);
+    step(&db, &product, &mut model);
+    update(
+        &db,
+        "UPDATE tasks SET deleted_at = '1' WHERE id = ?1",
+        &tombstoned_parent,
+    );
+    step(&db, &product, &mut model);
+    assert_eq!(waiting(&model, &tombstoned_child), NavigatorWait::UnavailableParent);
 }

@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the meaning of an existing field changes, never for an additive one.
+/// Adding a variant is additive: each client-facing enum has an `Unknown`
+/// catch-all so an older Rust client keeps decoding the rest of the card.
 pub const NAVIGATOR_PROJECTION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +68,8 @@ pub enum NavigatorSection {
     NeedsAttention,
     Backlog,
     Landed,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -75,6 +79,8 @@ pub enum NavigatorDetail {
     Attention,
     Review,
     History,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -85,6 +91,8 @@ pub enum NavigatorActivityKind {
     FixingCi,
     ResolvingConflict,
     Reviewing,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,6 +103,8 @@ pub enum NavigatorHumanAction {
     Intervention,
     Review,
     Merge,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -107,16 +117,28 @@ pub enum NavigatorCommandKind {
     CancelMerge,
     GenerateGuide,
     OpenPr,
+    #[serde(other)]
+    Unknown,
 }
 
 /// The single winning explanation for the row's section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NavigatorReason {
-    Merged { evidence: NavigatorMergeEvidence },
-    Active { activity: NavigatorActivityKind },
-    Human { action: NavigatorHumanAction },
-    Waiting { wait: NavigatorWait },
+    Merged {
+        evidence: NavigatorMergeEvidence,
+    },
+    Active {
+        activity: NavigatorActivityKind,
+    },
+    Human {
+        action: NavigatorHumanAction,
+    },
+    Waiting {
+        wait: NavigatorWait,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a Backlog row is not moving. `Diagnostic` carries the engine's own
@@ -161,6 +183,8 @@ pub enum NavigatorWait {
     },
     CompletedWithoutPr,
     MergeUnverified,
+    #[serde(other)]
+    Unknown,
 }
 
 impl NavigatorWait {
@@ -196,6 +220,7 @@ impl NavigatorWait {
             Self::Diagnostic { label } => label.clone(),
             Self::CompletedWithoutPr => "Completed without PR".to_owned(),
             Self::MergeUnverified => "Completed; merge unverified".to_owned(),
+            Self::Unknown => "Unknown".to_owned(),
         }
     }
 }
@@ -208,6 +233,7 @@ impl NavigatorHumanAction {
             Self::Intervention => "Intervention",
             Self::Review => "Review",
             Self::Merge => "Ready to merge",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -220,6 +246,7 @@ impl NavigatorActivityKind {
             Self::FixingCi => "Fixing CI",
             Self::ResolvingConflict => "Resolving conflict",
             Self::Reviewing => "Reviewing",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -246,6 +273,8 @@ pub enum NavigatorAction {
     /// An agent blocked on a person with no structured question; the client
     /// opens the agent's terminal.
     OpenInput { activity: NavigatorActivityRef },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,5 +379,42 @@ mod tests {
     fn deferred_conflict_without_a_sibling_omits_the_blocker() {
         let value = serde_json::to_value(NavigatorWait::DeferredConflict { blocker: None }).unwrap();
         assert_eq!(value, serde_json::json!({"kind": "deferred_conflict"}));
+    }
+
+    #[test]
+    fn unknown_wire_variants_keep_the_projection_decodable() {
+        assert_eq!(
+            serde_json::from_value::<NavigatorSection>(serde_json::json!("future_section")).unwrap(),
+            NavigatorSection::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<NavigatorWait>(serde_json::json!({"kind": "future_wait"})).unwrap(),
+            NavigatorWait::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<NavigatorReason>(serde_json::json!({"type": "future_reason"})).unwrap(),
+            NavigatorReason::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<NavigatorCommandKind>(serde_json::json!("future_command")).unwrap(),
+            NavigatorCommandKind::Unknown
+        );
+        let value = serde_json::json!({
+            "version": 1,
+            "root_task_id": "task_root",
+            "root": {
+                "default_detail": "future_detail",
+                "reason": {"type": "future_reason"},
+                "reason_label": "Tomorrow",
+                "revisions": {"open": 0, "total": 0},
+                "section": "future_section",
+                "sort_key": "0"
+            }
+        });
+        let projection = serde_json::from_value::<NavigatorProjection>(value).unwrap();
+        let root = projection.root.unwrap();
+        assert_eq!(root.section, NavigatorSection::Unknown);
+        assert_eq!(root.default_detail, NavigatorDetail::Unknown);
+        assert_eq!(root.reason, NavigatorReason::Unknown);
     }
 }

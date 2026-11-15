@@ -3,11 +3,18 @@
 //!
 //! The Navigator row is one original task plus every revision linked beneath
 //! it. [`attach_navigator`] runs as the last derivation step of both the full
-//! work-tree assembly and the incremental card re-read, over exactly the cards
-//! those paths already loaded, so a card re-read through the journal gets the
-//! projection a complete assembly would have given it. Both callers hand it
-//! whole revision chains (the journal's relationship closure guarantees that),
-//! which is what lets a family be classified from its slice of the board alone.
+//! work-tree assembly and the incremental card re-read. Family membership is
+//! resolved from the same snapshot independently of the visible card set: the
+//! parent walk and the descendant collection include archived ancestors and
+//! children, so an archived intermediate does not split a live descendant off
+//! its owner, and an archived child still counts in the revision summary.
+//! Archived roots stay out of the Work population and their revisions never
+//! become independent rows. A chain that cannot be resolved (deleted, missing
+//! or cross-product parent, depth or cycle overflow) becomes a diagnostic
+//! fallback row rather than being dropped. Both callers already hand it the
+//! live members of each chain (the journal's relationship closure guarantees
+//! that), and this adapter loads any off-board family members those filters
+//! hid.
 //!
 //! Inputs are read from the caller's snapshot and each is covered by an
 //! existing durable invalidation:
@@ -45,11 +52,14 @@ use boss_protocol::{
     NAVIGATOR_PROJECTION_VERSION, NavigatorProjection, NavigatorRoot, Task, TaskKind, TaskRuntime, TaskStatus,
 };
 use boss_work_navigator as nav;
+use rusqlite::OptionalExtension;
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-/// Run-level states a `work_runs.status` string maps onto.
-const RUN_TERMINAL: [&str; 5] = ["completed", "failed", "abandoned", "cancelled", "orphaned"];
+/// Run-level states that are authoritative evidence the worker has exited.
+/// `completed` is not among them: the dispatch path marks the spawn run
+/// completed while the execution stays live (see `record_run_completion`).
+const RUN_EXITED: [&str; 4] = ["failed", "abandoned", "cancelled", "orphaned"];
 
 /// Complete the Navigator projection of every family in the given cards.
 /// `runtimes` is keyed by work item id and covers every card. Cards the Work
@@ -68,22 +78,114 @@ pub(crate) fn attach_navigator(
 }
 
 /// A row's revisions, however the chain was minted. A revision whose chain does
-/// not reach an owner on the board becomes the root of a fallback family, so it
-/// is surfaced rather than silently dropped.
+/// not reach a non-deleted owner in the same product becomes the root of a
+/// fallback family, so it is surfaced rather than silently dropped. Archived
+/// owners are valid family roots: the classifier then excludes them, and their
+/// revisions get no independent row.
 struct FamilyCards<'a> {
     root: &'a Task,
     revisions: Vec<&'a Task>,
     fallback: bool,
 }
 
-fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task]) -> BTreeMap<&'a str, FamilyCards<'a>> {
+/// Off-board (typically archived) members of the families represented by the
+/// visible cards, loaded from the same snapshot. Deleted and cross-product
+/// rows are not included: those chains stay unresolved.
+fn load_off_board_family_members(conn: &Connection, tasks: &[Task], chores: &[Task]) -> Result<Vec<Task>> {
+    let visible: HashSet<&str> = tasks.iter().chain(chores).map(|task| task.id.as_str()).collect();
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    for task in tasks.iter().chain(chores) {
+        if task.kind != TaskKind::Revision {
+            for id in chain_helpers::collect_chain_revision_ids(conn, &task.id)? {
+                if !visible.contains(id.as_str()) {
+                    needed.insert(id);
+                }
+            }
+            continue;
+        }
+        let Some(owner) = resolved_owner(conn, task)? else {
+            continue;
+        };
+        if visible.contains(owner.as_str()) {
+            continue;
+        }
+        needed.insert(owner.clone());
+        for id in chain_helpers::collect_chain_revision_ids(conn, &owner)? {
+            if !visible.contains(id.as_str()) {
+                needed.insert(id);
+            }
+        }
+    }
+    load_tasks_by_id(conn, &needed)
+}
+
+/// The non-revision owner of `task`, walking through archived ancestors.
+/// `None` when the chain is unresolved: missing, tombstoned or cross-product
+/// parent, a revision with no parent, or depth/cycle overflow.
+fn resolved_owner(conn: &Connection, task: &Task) -> Result<Option<String>> {
+    if task.kind != TaskKind::Revision {
+        return Ok(Some(task.id.clone()));
+    }
+    let product_id = task.product_id.as_str();
+    let mut next = task.parent_task_id.clone();
+    let mut seen = HashSet::from([task.id.clone()]);
+    for _ in 0..chain_helpers::MAX_CHAIN_DEPTH {
+        let Some(id) = next.take() else {
+            return Ok(None);
+        };
+        if !seen.insert(id.clone()) {
+            return Ok(None);
+        }
+        let row: Option<(String, Option<String>, String, Option<String>)> = conn
+            .query_row(
+                "SELECT kind, parent_task_id, product_id, deleted_at FROM tasks WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((kind, parent, product, deleted_at)) = row else {
+            return Ok(None);
+        };
+        if deleted_at.is_some() || product != product_id {
+            return Ok(None);
+        }
+        if kind != "revision" {
+            return Ok(Some(id));
+        }
+        next = parent;
+    }
+    Ok(None)
+}
+
+fn load_tasks_by_id(conn: &Connection, ids: &BTreeSet<String>) -> Result<Vec<Task>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {} FROM tasks WHERE id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL",
+        super::board_patch::BOARD_TASK_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([id_array(ids.iter().map(String::as_str))?], |row| {
+        map_task_with_external_ref_parent_source_and_provenance(row)
+    })?;
+    let mut tasks = Vec::new();
+    for row in rows {
+        tasks.push(row?);
+    }
+    Ok(tasks)
+}
+
+fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task], extras: &'a [Task]) -> BTreeMap<&'a str, FamilyCards<'a>> {
+    let visible: HashSet<&str> = tasks.iter().chain(chores).map(|task| task.id.as_str()).collect();
     let cards: HashMap<&str, &Task> = tasks
         .iter()
         .chain(chores)
+        .chain(extras)
         .map(|task| (task.id.as_str(), task))
         .collect();
     let mut families: BTreeMap<&str, FamilyCards<'_>> = BTreeMap::new();
-    for task in tasks.iter().chain(chores) {
+    for task in tasks.iter().chain(chores).chain(extras) {
         if task.kind != TaskKind::Revision {
             families
                 .entry(task.id.as_str())
@@ -117,7 +219,7 @@ fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task]) -> BTreeMap<&'a str
                 })
                 .revisions
                 .push(task),
-            None => {
+            None if visible.contains(task.id.as_str()) => {
                 let family = families.entry(top.id.as_str()).or_insert_with(|| FamilyCards {
                     root: top,
                     revisions: Vec::new(),
@@ -127,6 +229,7 @@ fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task]) -> BTreeMap<&'a str
                     family.revisions.push(task);
                 }
             }
+            None => {}
         }
     }
     for family in families.values_mut() {
@@ -286,7 +389,8 @@ fn project(
     chores: &[Task],
     runtimes: &HashMap<&str, &TaskRuntime>,
 ) -> Result<HashMap<String, NavigatorProjection>> {
-    let families = group_families(tasks, chores);
+    let extras = load_off_board_family_members(conn, tasks, chores)?;
+    let families = group_families(tasks, chores, &extras);
     let inputs = read_inputs(conn, &families)?;
     let mut projections = HashMap::new();
     for family in families.values() {
@@ -415,12 +519,28 @@ fn execution_status(status: &ExecutionStatus) -> nav::ExecutionStatus {
     }
 }
 
-fn run_state(status: Option<&str>) -> nav::RunState {
+/// Classifier run state from the durable execution and its latest run.
+///
+/// A `completed` run under a live execution is the production dispatch shape
+/// (the WorkRun tracks the spawn action, not the worker's lifetime) and is
+/// treated as Running, or WaitingInput when the execution is waiting on a
+/// person. Failed/abandoned/cancelled/orphaned runs stay Exited even if the
+/// execution has not yet been reconciled, and `suspended` stays Suspended.
+fn run_state(execution: &ExecutionStatus, status: Option<&str>) -> nav::RunState {
     match status {
-        Some("running") => nav::RunState::Running,
-        Some("waiting_human" | "waiting_input") => nav::RunState::WaitingInput,
         Some("suspended") => nav::RunState::Suspended,
-        Some(terminal) if RUN_TERMINAL.contains(&terminal) => nav::RunState::Exited,
+        Some("waiting_human" | "waiting_input") => nav::RunState::WaitingInput,
+        Some("running") => nav::RunState::Running,
+        Some("completed") if execution.is_live() => match execution {
+            ExecutionStatus::WaitingHuman => nav::RunState::WaitingInput,
+            _ => nav::RunState::Running,
+        },
+        Some("completed") => nav::RunState::Exited,
+        Some(exited) if RUN_EXITED.contains(&exited) => nav::RunState::Exited,
+        None if execution.is_live() => match execution {
+            ExecutionStatus::WaitingHuman => nav::RunState::WaitingInput,
+            _ => nav::RunState::Running,
+        },
         _ => nav::RunState::Unavailable,
     }
 }
@@ -479,7 +599,7 @@ fn activities(task: &Task, runtime: Option<&TaskRuntime>, inputs: &Inputs) -> Ve
                 kind: activity_kind(task, &live.kind)?,
                 runtime: nav::Runtime {
                     execution: execution_status(&live.status),
-                    run: run_state(live.run_status.as_deref()),
+                    run: run_state(&live.status, live.run_status.as_deref()),
                     current,
                 },
                 started_at: live.started_at,
@@ -502,7 +622,7 @@ fn activities(task: &Task, runtime: Option<&TaskRuntime>, inputs: &Inputs) -> Ve
             kind: nav::ActivityKind::Implementing,
             runtime: nav::Runtime {
                 execution: execution_status(status),
-                run: run_state(runtime.run_status.as_deref()),
+                run: run_state(status, runtime.run_status.as_deref()),
                 current,
             },
             started_at: 0,
@@ -853,14 +973,10 @@ fn priority_rank(priority: &str) -> i32 {
 /// An unparsable value is 0 rather than an error: a malformed timestamp must
 /// not take a board down, and every consumer treats it as "oldest".
 fn epoch(raw: &str) -> i64 {
-    raw.trim()
-        .parse::<i64>()
+    let raw = raw.trim();
+    raw.parse::<i64>()
         .ok()
-        .or_else(|| {
-            chrono::DateTime::parse_from_rfc3339(raw.trim())
-                .ok()
-                .map(|at| at.timestamp())
-        })
+        .or_else(|| boss_engine_utils::iso8601::parse_iso8601_lenient(raw))
         .unwrap_or(0)
 }
 
@@ -1007,6 +1123,7 @@ fn reason_label(reason: &boss_protocol::NavigatorReason) -> String {
         boss_protocol::NavigatorReason::Active { activity } => activity.label().to_owned(),
         boss_protocol::NavigatorReason::Human { action } => action.label().to_owned(),
         boss_protocol::NavigatorReason::Waiting { wait } => wait.label(),
+        boss_protocol::NavigatorReason::Unknown => "Unknown".to_owned(),
     }
 }
 
@@ -1093,12 +1210,48 @@ mod tests {
 
     #[test]
     fn run_states_cover_the_run_vocabulary() {
-        assert_eq!(run_state(Some("running")), nav::RunState::Running);
-        assert_eq!(run_state(Some("waiting_human")), nav::RunState::WaitingInput);
-        for terminal in RUN_TERMINAL {
-            assert_eq!(run_state(Some(terminal)), nav::RunState::Exited, "{terminal}");
+        assert_eq!(
+            run_state(&ExecutionStatus::Running, Some("running")),
+            nav::RunState::Running
+        );
+        assert_eq!(
+            run_state(&ExecutionStatus::WaitingHuman, Some("waiting_human")),
+            nav::RunState::WaitingInput
+        );
+        assert_eq!(
+            run_state(&ExecutionStatus::Running, Some("completed")),
+            nav::RunState::Running,
+            "a completed dispatch run under a live execution is still running"
+        );
+        assert_eq!(
+            run_state(&ExecutionStatus::WaitingHuman, Some("completed")),
+            nav::RunState::WaitingInput
+        );
+        assert_eq!(run_state(&ExecutionStatus::Running, None), nav::RunState::Running);
+        assert_eq!(
+            run_state(&ExecutionStatus::Completed, Some("completed")),
+            nav::RunState::Exited
+        );
+        for exited in RUN_EXITED {
+            assert_eq!(
+                run_state(&ExecutionStatus::Running, Some(exited)),
+                nav::RunState::Exited,
+                "{exited}"
+            );
+            assert_eq!(
+                run_state(&ExecutionStatus::Completed, Some(exited)),
+                nav::RunState::Exited,
+                "{exited}"
+            );
         }
-        assert_eq!(run_state(None), nav::RunState::Unavailable);
-        assert_eq!(run_state(Some("unrecognised")), nav::RunState::Unavailable);
+        assert_eq!(
+            run_state(&ExecutionStatus::Running, Some("suspended")),
+            nav::RunState::Suspended
+        );
+        assert_eq!(run_state(&ExecutionStatus::Completed, None), nav::RunState::Unavailable);
+        assert_eq!(
+            run_state(&ExecutionStatus::Completed, Some("unrecognised")),
+            nav::RunState::Unavailable
+        );
     }
 }
