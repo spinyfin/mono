@@ -188,4 +188,45 @@ impl WorkerCompletionHandler {
             );
         }
     }
+
+    /// A worker observed a merge of a PR on its own branch, but the work item
+    /// is bound to a different PR. The DB write left the binding and status
+    /// unchanged; callers must not treat this as a merge of the bound PR.
+    pub(super) async fn note_stale_merge_binding_mismatch(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: Option<&str>,
+        observed_pr_url: &str,
+        source: &str,
+    ) {
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            bound_pr_url = bound_pr_url.unwrap_or(""),
+            observed_pr_url,
+            source,
+            "pr completion: worker observed a merged PR that is not the work item's bound PR; \
+             leaving the binding and status unchanged",
+        );
+        let bound = bound_pr_url.unwrap_or("(unbound)");
+        let body = format!(
+            "Execution `{}` observed that {observed_pr_url} has merged, but this work item is bound to {bound}. \
+             The engine left the binding and status unchanged so a merged PR on the execution's own branch is not \
+             silently dropped. Re-bind this row with `boss task update --pr-url` if {observed_pr_url} is the \
+             deliverable, or inspect why the worker observed a different PR.",
+            execution.id,
+        );
+        if let Err(err) = self.work_db.upsert_external_tracker_attention(
+            &execution.work_item_id,
+            boss_engine_storage_values::attention_kinds::ATTENTION_KIND_PR_BINDING_REPAIR,
+            "Merged PR is not the work item's bound PR",
+            &body,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "pr completion: failed to file binding-mismatch attention item",
+            );
+        }
+    }
 }

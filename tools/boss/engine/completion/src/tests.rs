@@ -2130,6 +2130,8 @@ impl MergeProbe for FixedMergeabilityProbe {
 }
 
 #[cfg(test)]
+mod binding_mismatch;
+#[cfg(test)]
 mod conflict_delivery;
 #[cfg(test)]
 mod local_teardown;

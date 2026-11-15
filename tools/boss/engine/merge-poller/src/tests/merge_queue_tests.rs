@@ -1499,6 +1499,7 @@ async fn update_pr_poll_state_keeps_github_intent_queued_through_ci_fail_and_rec
 /// and notify the board even though they do not complete the row.
 #[tokio::test]
 async fn mark_merged_clears_human_driven_merging_lane_and_publishes() {
+    let logs = log_capture::install();
     let (_dir, db) = open_db();
     let product = create_test_product_with_repo(&db, "HumanMergedLane", Some("git@github.com:foo/bar.git"));
     let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/5");
@@ -1529,6 +1530,15 @@ async fn mark_merged_clears_human_driven_merging_lane_and_publishes() {
             .await
             .iter()
             .any(|(_, item_id, reason)| item_id == &task && reason == "pr_merge_observed")
+    );
+    let text = String::from_utf8(logs.lock().clone()).unwrap();
+    assert!(
+        text.contains("merge poller: card Merging lane state changed"),
+        "clearing the Merging lane must leave a forensic trace: {text}"
+    );
+    assert!(
+        text.contains("prior_merge_queue_state") && text.contains("queued"),
+        "the forensic line must name the lane state that was cleared: {text}"
     );
 }
 

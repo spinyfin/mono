@@ -221,7 +221,8 @@ pub struct HostBoundExecution {
 /// the same lease/pane-releasing way without a fresh PR). Carries the cube
 /// lease/workspace ids that were attached to the execution so the caller can
 /// drive cube release out-of-band.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkerPrCompletion {
     pub execution: WorkExecution,
     pub work_item: WorkItem,
@@ -232,6 +233,13 @@ pub struct WorkerPrCompletion {
     /// transaction as the terminal transition. `None` for every other
     /// caller, and for a no-op completion that didn't request one.
     pub filed_attention_item: Option<WorkAttentionItem>,
+    /// `true` when the completion target was [`WorkerPrCompletionTarget::Done`]
+    /// but the work item is already bound to a different PR. The execution
+    /// is completed and this observed URL is recorded on it; the task row
+    /// is left untouched. Callers must not treat this as a merge of the
+    /// bound PR.
+    #[builder(default)]
+    pub binding_mismatch: bool,
 }
 
 /// Result of a successful [`WorkDb::record_worker_failure`] call.

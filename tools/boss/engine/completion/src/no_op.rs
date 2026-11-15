@@ -147,7 +147,7 @@ impl WorkerCompletionHandler {
             let pr_url = self.resolve_bound_pr_url(execution);
             match self.conflict_delivery_decision(execution, pr_url.as_deref()).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
-                ConflictDeliveryDecision::Moot => confirmed_merged_pr = pr_url,
+                ConflictDeliveryDecision::Merged => confirmed_merged_pr = pr_url,
                 ConflictDeliveryDecision::ClosedUnmerged | ConflictDeliveryDecision::Proceed => {}
             }
         }

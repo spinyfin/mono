@@ -219,7 +219,7 @@ impl WorkerCompletionHandler {
         if !merged && let Ok(execution) = execution_result.as_ref() {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
-                ConflictDeliveryDecision::Moot => {
+                ConflictDeliveryDecision::Merged => {
                     target = WorkerPrCompletionTarget::Done;
                     merged = true;
                 }
@@ -688,6 +688,17 @@ impl WorkerCompletionHandler {
             teardown,
         )
         .await;
+        let binding_mismatch = completion.binding_mismatch;
+        if binding_mismatch {
+            self.note_stale_merge_binding_mismatch(
+                &completion.execution,
+                work_item_pr_url(&completion.work_item),
+                &pr_url,
+                source,
+            )
+            .await;
+            merged = false;
+        }
         let product_id = completion.work_item.product_id().to_string();
         let work_item_id = work_item_id(&completion.work_item);
         let publish_reason = match (merged, source) {
@@ -745,14 +756,14 @@ impl WorkerCompletionHandler {
                 "doc-detection: routing PR completion"
             );
 
-            if merged {
+            if merged && !binding_mismatch {
                 // Worker merged directly during its session; the detector
                 // fetches base_ref_name from the PR (unknown here).
                 self.collaborators
                     .design_detection
                     .on_task_doc_pr_merged(&self.work_db, &task.id, &task.product_id, &pr_url, None)
                     .await;
-            } else {
+            } else if !binding_mismatch {
                 self.collaborators
                     .design_detection
                     .on_task_doc_pr_detected(&self.work_db, &task.id, &task.product_id, &pr_url)
@@ -780,7 +791,7 @@ impl WorkerCompletionHandler {
             && matches!(task.kind, TaskKind::Design | TaskKind::DesignPostmortem)
             && let Some(ref project_id) = task.project_id
         {
-            if merged {
+            if merged && !binding_mismatch {
                 // Worker merged directly during its session; update
                 // the branch to main (base_ref_name unknown here,
                 // so the detector will fetch it from the PR).
@@ -831,7 +842,7 @@ impl WorkerCompletionHandler {
                     )
                     .await;
                 }
-            } else {
+            } else if !binding_mismatch {
                 self.collaborators
                     .design_detection
                     .on_design_pr_detected(&self.work_db, &task.id, &task.product_id, project_id, &pr_url)
@@ -972,7 +983,9 @@ impl WorkerCompletionHandler {
         // reaping.
         crate::structured_output::clear_all(&self.structured_output_dir, execution_id);
 
-        if merged {
+        if binding_mismatch {
+            StopOutcome::PrDetected { pr_url }
+        } else if merged {
             tracing::info!(
                 execution_id,
                 work_item_id = %work_item_id,

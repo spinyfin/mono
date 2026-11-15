@@ -1922,7 +1922,7 @@ async fn handle_trunk_queue_eviction(
                         }
                         ConflictClearance::Indeterminate
                         | ConflictClearance::Merged
-                        | ConflictClearance::NotOpen
+                        | ConflictClearance::ClosedUnmerged
                         | ConflictClearance::Unavailable => {
                             // A read that never resolves is not evidence of
                             // anything — least of all "safe to mint a CI
