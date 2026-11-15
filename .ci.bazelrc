@@ -58,7 +58,7 @@ build:ci-darwin --disk_cache=/Volumes/ssd/bazel/disk_cache
 # at analysis/toolchain-config time instead of half-building.
 #
 # When the fleet's Xcode is upgraded, bump BOTH flags together.
-build:ci-darwin --xcode_version=26.5.0.17F42
-common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-26.5.0.app/Contents/Developer
+build:ci-darwin --xcode_version=27.2.0.27B52
+common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-27.2.0.app/Contents/Developer
 
 
