@@ -1,0 +1,5 @@
+[package]
+name = "boss-work-navigator"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
