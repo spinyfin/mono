@@ -17,6 +17,8 @@ test --sandbox_default_allow_network=false
 test:macos --strategy=TestRunner=local
 test:linux --strategy=TestRunner=linux-sandbox
 test:linux --sandbox_tmpfs_path=/tmp
+test:remote-tests --strategy=TestRunner=remote   # opt-in, see "Remote execution" below
+test:remote-tests --test_env=MONO_TEST_REMOTE_EXECUTION=1
 test --run_under=//tools/test-sandbox:hermetic_test_wrapper
 # Align build's analysis config with cquery (which inherits test --run_under
 # on Bazel 9.x). Empty cquery --run_under= is invalid; without this, every
@@ -27,7 +29,7 @@ run --run_under=/usr/bin/env
 test --test_env=ANTHROPIC_API_KEY=          # (and six more)
 ```
 
-`--enable_platform_specific_config` is what makes `test:macos` and `test:linux` apply from the host platform; nothing passes `--config=` for these.
+`--enable_platform_specific_config` is what makes `test:macos` and `test:linux` apply from the host platform; nothing passes `--config=` for these. The `test:remote-tests` lines are the only ones here that apply only when asked for.
 
 ### Linux: Bazel does the isolation, the wrapper does the environment
 
@@ -177,6 +179,8 @@ A loud failure on a misconfigured agent is the desired outcome. A green build th
 - `test:linux --strategy=TestRunner=linux-sandbox`
 - `test:linux --sandbox_tmpfs_path=/tmp`
 - `test --sandbox_default_allow_network=false`
+- `test:remote-tests --strategy=TestRunner=remote`, and that it is the only strategy line on that config
+- `test:remote-tests --test_env=MONO_TEST_REMOTE_EXECUTION=1`
 - `network_tags.append("requires-network")` in `defs.bzl`
 - `mktemp" -d /tmp/mono-test.XXXXXX` in the wrapper
 - the three `BOSS_SHAKE_*` `--test_env` lines, and their presence in the wrapper's `unset` block
@@ -188,6 +192,95 @@ It does **not** pin `--run_under`, `test:macos --strategy=TestRunner=local`, `co
 `linux-sandbox` requires unprivileged user namespaces. Ubuntu 23.10+ blocks these by default via `kernel.apparmor_restrict_unprivileged_userns=1`, which makes Bazel's sandbox-support probe fail silently at server startup so the strategy is never registered — surfacing much later as the `no strategy with that identifier was registered` error above.
 
 The host configuration, the diagnosis procedure (including the trap that running the probe under `sudo` always succeeds and proves nothing), the remedy, the persistence drop-in, the accepted security tradeoff, and the required Bazel server restart are all in **[`.buildkite/linux-agents-runbook.md`](../../.buildkite/linux-agents-runbook.md)**. That is the operational source of truth; do not duplicate it here.
+
+## Remote execution on macOS workers (opt-in)
+
+`--config=remote-tests` is two lines:
+
+```
+test:remote-tests --strategy=TestRunner=remote
+test:remote-tests --test_env=MONO_TEST_REMOTE_EXECUTION=1
+```
+
+Passed on the command line together with a `--remote_executor`, the first overrides `test:macos --strategy=TestRunner=local`, and the test action runs on a remote macOS worker. The same wrapper runs on the worker, and its Seatbelt profile is still the entire boundary there. Without the flag, tests run on the local machine exactly as described above.
+
+The second line keeps the two kinds of result apart. Bazel's action key does not record where an action ran. Before the line existed, a plain local `bazel test //tools/test-sandbox/...` straight after a remote run reported six of the eight tests in this package, `hermeticity_guard_test` among them, as `(cached) PASSED` with the durations of the remote run: results a worker had produced, on a different OS build. Nothing reads the variable; it only makes the remote test action a different action.
+
+The strategy is `remote` alone for the same reason `test:linux` names one strategy. With no usable executor the build stops instead of running the test somewhere else. Measured with `--config=remote-tests` and no `--remote_executor`:
+
+```
+ERROR: Testing //tools/test-sandbox:linux_policy_source_test failed: TestRunner spawn cannot be
+executed with any of the available strategies: [remote].
+```
+
+### What it relies on
+
+- **The executor adds no sandbox of its own.** The farm this was built against runs NativeLink, which on macOS starts an action directly in its work directory. Seatbelt profiles do not nest (fact two, above), so an executor that wrapped actions in a profile of its own would make the wrapper's `sandbox-exec` fail, and every test with it.
+- **The workers have the audited runtime where the client recorded it.** The runtime repository is configured on the client, so the paths in `manifest` and `developer_dir` are the client's. A worker needs the same system tools at the same paths and Xcode reachable at the client's `DEVELOPER_DIR`. Reachable through a symlink is enough: on the workers `/Applications/Xcode.app` is a symlink to `/Applications/Xcode-27.2.0.app`, and the wrapper allows the resolved location.
+- **An unresolved symlink travels as a symlink.** Measured with Bazel 9.1.0 and NativeLink: a symlink a rule declares arrives on the worker as a symlink with the same target.
+- **`USER` names the account the action runs as.** Bazel's `test-setup.sh` sets `USER` from `whoami` on the worker when the action does not carry one, and the wrapper's Keychain denial for `/Users/$USER` is built from it.
+
+### Why the runtime tools are symlinks
+
+`test_runtime_repository` used to expose each tool with `repository_ctx.symlink(path, "bin/" + tool)`. To Bazel such a link is a source file: it follows it, digests the contents, and uploads them. A worker therefore received a _copy_ of the client's `/bin/mkdir`, and macOS will not launch a copy of a platform binary. The first remote test run failed inside the wrapper:
+
+```
+hermetic_test_wrapper: line 66: 45844 Killed: 9   "${runtime_bin}/mkdir" -p "${HOME}" "${TMPDIR}"
+```
+
+On a worker, copies of `/bin/mkdir`, `/usr/bin/mktemp`, `/bin/rm`, `/bin/sleep`, `/usr/bin/find`, `/bin/sh` and `/usr/bin/sed` all exit 137, and the system log says `AMFI: Launch Constraint Violation (enforcing)`.
+
+The repository rule still discovers the tools and writes `manifest` and `developer_dir`. It no longer creates `bin/`. It writes a small rule into the generated repository (`runtime.bzl`), and that rule's `:runtime` target declares each `bin/<tool>` with `ctx.actions.declare_symlink` and `ctx.actions.symlink(target_path = <resolved host path>)`. A declared symlink is shipped as a symlink, so `bin/mkdir` on a worker points at the worker's own `/bin/mkdir`. The runfiles layout the wrapper sees (`bin/<tool>`, `manifest`, `developer_dir`) is unchanged.
+
+A copy and a symlink behave the same locally, so only a remote run would notice a change back to copies. `runtime_symlink_guard_test` closes that gap. Bazel stages a declared symlink verbatim, so `bin/<tool>` in a test's runfiles points straight at the host path the manifest records; a source file is instead linked to a path inside Bazel's own trees. The guard asserts the first shape for every manifest entry, on every platform. Run against the old repository rule it fails for all 45 tools.
+
+### The wrapper resolves paths where the test runs
+
+The process-exec allow-list used to be the manifest's paths, taken as recorded. The wrapper now resolves each entry on the host that executes the action, before it writes the profile:
+
+- For a tool, `bin/<name>` and the recorded path must resolve (full `realpath`) to the same existing file. That file is what the profile allows.
+- For a `*-tree` entry and for `developer_dir`, the profile allows the `realpath` of the recorded directory.
+- If an entry is missing or does not match, the action fails closed with exit 126 and names the entry:
+
+```
+zz-missing: /nonexistent/zz-missing does not exist on this host
+audited Bazel test runtime does not match this host
+```
+
+On a worker this produces, for example, `(allow process-exec (subpath "/Applications/Xcode-27.2.0.app/Contents/Developer/usr/libexec/git-core"))` from a manifest that records `/Applications/Xcode.app/...`. Locally the recorded paths are already final, and the profile is the one the wrapper wrote before: the generated profiles for a plain test and an Xcode-capability test were compared before and after this change and differ only in the random temp-root name.
+
+One more input differs remotely. The wrapper also grants every executable in the target's runfiles `MANIFEST`, resolved to its physical path. A remote executor stages the runfiles tree itself and no `MANIFEST`. When that file is absent the wrapper reads the staged tree instead: files inside it are already covered by the `TEST_SRCDIR` grant, so what it adds are declared symlinks that leave the tree, such as `@checkleft_node_test_tools//:runtime`'s `bin/tar`. Nothing in this step reads a path that was recorded on the client.
+
+### The fingerprint
+
+The source-file symlinks carried each tool's content digest into every test action's cache key, so a host OS update invalidated cached test results. A declared symlink carries only its target path. `fingerprint` restores the property explicitly: the repository rule writes the OS build and a sha256 for every resolved tool, and the file is one of the runtime's inputs. Nothing executes or parses it. The repository rule also `watch`es each resolved tool, so replacing one under a running Bazel server refetches the repository and rewrites the file.
+
+It describes the machine that configured the repository, which is the client. A worker's OS update does not change it. Treat a remote cache hit for a test accordingly, and use `--nocache_test_results` for any run whose point is the worker.
+
+### The gate
+
+**`hermeticity_guard_test` passing on a remote worker is the gate for trusting any other remote test result.** The profile is built per action, on whichever worker claims it, from that worker's filesystem. A worker that lacks a recorded tool fails closed, but only the guards show that the boundary held where a test actually ran. Before believing a remote result, run the guards the same way, uncached, and check that the process summary reports them as remote and nothing as local:
+
+```console
+$ bazel test //tools/test-sandbox/... --config=remote-tests --remote_executor=... --nocache_test_results
+INFO: 21 processes: 314 action cache hit, 13 internal, 16 remote.
+//tools/test-sandbox:hermeticity_guard_test                              PASSED in 0.3s
+```
+
+Two limits of a remote run are worth knowing:
+
+- Bazel does not set `TMPDIR` for a remote test action, so `MONO_TEST_HOST_TMPDIR` is empty on a worker. The Xcode capability then adds no `NSIRD_xctest_` write exception (stricter than local), and `xcode_capability_retains_the_write_allowlist` has no host temp directory to probe.
+- A run lands on whichever worker the scheduler picks. One green run says nothing about the other workers.
+
+### Not yet remote-capable
+
+Only the audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, which the same rule generates) was converted. These repositories still hand a test a copy of a client binary, and tests that depend on them are not expected to pass remotely:
+
+- `host_tmux`, `host_lsof`, `host_claude` and `codex_probe_runtime` in `repositories.bzl`.
+- `worker_zsh` (`tools/boss/engine/worker-bin/host_shell.bzl`).
+- `jj_test_tools` and `cube_jj_newer` ship a pinned download rather than a system binary; tests that use them have not been tried remotely.
+
+Linux remote execution is out of scope altogether. The Linux boundary comes from Bazel's local `linux-sandbox`, and a remote executor would have to provide an equivalent.
 
 ## If you are tempted to change this
 
@@ -203,6 +296,10 @@ The host configuration, the diagnosis procedure (including the trap that running
 | Tagging a test `flaky`                                                   | Retries convert a real hermeticity violation — which is often load- or ordering-dependent — into an intermittent pass.                                                                                                                                                                                                                    |
 | Re-pinning CI to macOS-only agents                                       | Makes the whole `test:linux` block dead code again. That is the original defect, below.                                                                                                                                                                                                                                                   |
 | Deleting the wrapper's `unset` block because `.bazelrc` has `--test_env` | `--test_env=KEY=` sets the variable to empty, it does not remove it. The `unset` is load-bearing.                                                                                                                                                                                                                                         |
+| Exposing `bin/<tool>` with `repository_ctx.symlink` again                | Nothing locally. On a remote macOS worker the tools arrive as copies and are killed at launch, so every test fails in the wrapper. `runtime_symlink_guard_test` fails locally first.                                                                                                                                                      |
+| Adding a fallback to `test:remote-tests` (`remote,local`)                | A test that cannot run remotely runs under a local strategy instead and still reports a result. Pinned by `linux_policy_source_test.sh`.                                                                                                                                                                                                  |
+| Dropping `fingerprint` from the runtime's files                          | Cached test results survive an OS or Xcode update, because the declared symlinks only carry a path.                                                                                                                                                                                                                                       |
+| Allowing the manifest's paths without resolving them in the wrapper      | On a host where a recorded path is a symlink, Seatbelt sees the physical path and denies the audited tool. Allowing a path that was never checked against `bin/<name>` also drops the fail-closed check for a missing or substituted tool.                                                                                                |
 
 If one of these genuinely should change, change it _and_ update the guards and `linux_policy_source_test.sh` in the same commit, so the next reader sees a deliberate decision rather than a silent hole.
 
@@ -251,7 +348,8 @@ The guard could not have passed on any host, under any configuration. It had sim
 | File                                           | Purpose                                                                                                                                                                                            |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `hermetic_test_wrapper.sh`                     | The `--run_under` wrapper. Builds the macOS Seatbelt profile, sets the audited `PATH`, unsets credentials, creates the short private temp root, forwards signals, and cleans up the process group. |
-| `repositories.bzl`                             | `test_runtime_repository` — snapshots the audited host tools (`bash`, `git`, `python3`, …) into a Bazel repository so the wrapper's `PATH` contains only declared inputs.                          |
+| `repositories.bzl`                             | `test_runtime_repository` — resolves the audited host tools (`bash`, `git`, `python3`, …) and declares them as symlinks, so the wrapper's `PATH` contains only declared inputs.                    |
+| `runtime_symlink_guard_test.sh`                | Asserts every `bin/<tool>` of the runtime is a symlink straight to its audited host path, so a change back to shipped copies is caught without a remote run.                                       |
 | `hermeticity_guard_test.rs`                    | The guards. Every property in the table above is asserted here. Built twice: `hermeticity_guard_test` and `xcode_capability_guard_test` (the latter with `MONO_TEST_XCODE_TOOLCHAIN=1`).           |
 | `linux_policy_source_test.sh`                  | Pins the exact `.bazelrc` / wrapper / `defs.bzl` strings so the policy cannot be silently relaxed.                                                                                                 |
 | `network_opt_in_test.rs`                       | Asserts the opt-in actually reaches the platform sandbox, so `network_enabled_rust_test` is not a no-op.                                                                                           |

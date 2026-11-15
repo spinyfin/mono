@@ -45,6 +45,15 @@ network_enabled_rust_test(
     srcs = ["network_opt_in_test.rs"],
 )
 
+# Fails if any bin/<tool> of the audited runtime is not a symlink straight to
+# the host path its manifest records. It inspects the runtime every test gets
+# from the run_under wrapper's runfiles, so it needs no data of its own.
+sh_test(
+    name = "runtime_symlink_guard_test",
+    size = "small",
+    srcs = ["runtime_symlink_guard_test.sh"],
+)
+
 sh_binary(
     name = "cleanup_child",
     srcs = ["cleanup_child.sh"],
