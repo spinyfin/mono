@@ -5,15 +5,14 @@
 
 use super::*;
 
-impl WorkerCompletionHandler {
-    /// Undo a nudge that was counted against the circuit breaker but never
-    /// reached the pane. Probe dispatch calls this when delivery is
-    /// undeliverable so three failed injections cannot park a worker for
-    /// ignoring messages it never received.
-    pub fn revert_undelivered_nudge(&self, execution_id: &str) {
-        self.nudge_breaker.revert_undelivered(execution_id);
-    }
+use crate::nudge_breaker::NUDGE_DELIVERY_DEADLINE;
 
+/// Why a nudge given up at [`NUDGE_DELIVERY_DEADLINE`] was not delivered, as
+/// recorded on the withdrawn probe and in the failure reason.
+const OVERDUE_NUDGE_DETAIL: &str = "the nudge could not be written into the worker's pane within the delivery \
+     deadline after it was issued, and was withdrawn; each refused or failed attempt is in the engine log";
+
+impl WorkerCompletionHandler {
     /// Generic auto-nudge gate. Records the intent to nudge `execution`
     /// against the circuit breaker (keyed by `fingerprint`, which must
     /// encode the work state so an unchanged state counts as
@@ -25,6 +24,12 @@ impl WorkerCompletionHandler {
     ///   and returns [`StopOutcome::NudgeBreakerParked`] (the breaker
     ///   tripped — `max_unproductive_nudges` consecutive nudges fired
     ///   with no state change).
+    ///
+    /// Before any of that it settles the previous nudge
+    /// ([`ProbeQueuer::nudge_delivery`]): one that has not reached the worker
+    /// yet holds the ladder where it is, one that never arrived comes back
+    /// off the count, and a run of failed deliveries ends the attempt through
+    /// [`Self::fail_for_undeliverable_nudges`].
     ///
     /// This is the single choke point for the nudge loop: bounding it
     /// here makes the breaker generic to *every* auto-nudge, not just
@@ -276,7 +281,119 @@ impl WorkerCompletionHandler {
                 );
             }
         }
-        let outcome = match self.nudge_breaker.record(
+        // Settle the prior delivery before charging another nudge.
+        let outcome = if let Some(outcome) = self.nudge_delivery_gate(execution, bound_pr_url).await {
+            outcome
+        } else {
+            self.record_nudge(execution, probe_text, fingerprint, bound_pr_url, &proceed_outcome)
+                .await
+        };
+        // A debounced Stop carries no evidence the worker resumed — the
+        // nudge simply didn't fire this round because of the fingerprint
+        // debounce window — so the intent must stay observable for the
+        // recurring background-nudge recheck sweep
+        // (`pending_background_nudge_execution_ids`) to re-evaluate later.
+        // Re-record with fresh context (a new watermark, in particular) so
+        // the recheck compares against current state, not stale state from
+        // whenever this intent was first captured. Every other outcome
+        // means the nudge/park path actually concluded (or an early
+        // `BackgroundChildrenPending`/similar suppression above already
+        // returned), so any tracked intent is stale and safe to drop.
+        //
+        // Tagged `Debounced`, and that tag is load-bearing: this record is
+        // the ONLY thing that can ever move this execution again. Its
+        // worker's turn just ended, and the sole producer of the "next
+        // Stop" this arm is waiting for is a probe — which is exactly what
+        // the debounce declined to send. Retiring it on hook activity (the
+        // `BackgroundChildren` rule) leaves nothing scheduled to look at the
+        // execution again; see [`NudgeHold::Debounced`].
+        //
+        // A nudge that was just issued is tracked too, as `AwaitingDelivery`.
+        // The boundary path relies on the worker's reply to produce the next
+        // Stop, and that only holds for a nudge the worker receives: one left
+        // queued, or written into a pane that starts no turn, produces no
+        // Stop at all. The recheck retires this hold once the nudge is known
+        // to have arrived, and otherwise is what re-delivers it, re-issues it
+        // or ends the attempt as a delivery failure.
+        let hold = if matches!(outcome, StopOutcome::NudgeDebounced) {
+            Some(NudgeHold::Debounced)
+        } else if Self::nudge_queued_a_probe(&outcome) {
+            Some(NudgeHold::AwaitingDelivery)
+        } else {
+            None
+        };
+        match hold {
+            Some(hold) => self.background_children_tracker.record_intent(
+                &execution.id,
+                BackgroundNudgeIntent {
+                    probe_text: probe_text.to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                    bound_pr_url: bound_pr_url.map(str::to_owned),
+                    proceed_outcome,
+                    activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                    hold,
+                },
+            ),
+            None => self.background_children_tracker.forget_intent(&execution.id),
+        }
+        outcome
+    }
+
+    /// Hold pending delivery and hand failed deliveries back before any
+    /// auto-nudge path consults the shared breaker.
+    pub(super) async fn nudge_delivery_gate(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: Option<&str>,
+    ) -> Option<StopOutcome> {
+        match self.probe_queuer.nudge_delivery(&execution.id) {
+            NudgeDelivery::Settled => self.nudge_breaker.delivery_confirmed(&execution.id),
+            NudgeDelivery::Pending { .. } => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    "auto-nudge: held — the previous nudge has not reached the worker yet (still \
+                     queued, or written and awaiting a driver turn); not issuing another and not \
+                     counting one",
+                );
+                return Some(StopOutcome::NudgeDebounced);
+            }
+            NudgeDelivery::Withdrawn { nudge_id } => {
+                self.nudge_breaker.settle_undelivered(&execution.id, &nudge_id, false);
+            }
+            NudgeDelivery::Failed { nudge_id, detail } => {
+                let failures = self.nudge_breaker.settle_undelivered(&execution.id, &nudge_id, true);
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    nudge_id,
+                    consecutive_delivery_failures = failures,
+                    max = self.max_unproductive_nudges,
+                    detail,
+                    "auto-nudge: the previous nudge was not delivered; it is not counted against \
+                     the worker",
+                );
+                if failures >= self.max_unproductive_nudges {
+                    return Some(
+                        self.fail_for_undeliverable_nudges(execution, failures, bound_pr_url, &detail)
+                            .await,
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// Consult the breaker for a nudge whose predecessor has been settled,
+    /// and queue the probe when it allows one. The second half of
+    /// [`Self::nudge_or_park`].
+    async fn record_nudge(
+        &self,
+        execution: &crate::work::WorkExecution,
+        probe_text: &str,
+        fingerprint: &str,
+        bound_pr_url: Option<&str>,
+        proceed_outcome: &StopOutcome,
+    ) -> StopOutcome {
+        match self.nudge_breaker.record(
             &execution.id,
             fingerprint,
             self.max_unproductive_nudges,
@@ -317,42 +434,7 @@ impl WorkerCompletionHandler {
                 self.fail_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
                     .await
             }
-        };
-        // A debounced Stop carries no evidence the worker resumed — the
-        // nudge simply didn't fire this round because of the fingerprint
-        // debounce window — so the intent must stay observable for the
-        // recurring background-nudge recheck sweep
-        // (`pending_background_nudge_execution_ids`) to re-evaluate later.
-        // Re-record with fresh context (a new watermark, in particular) so
-        // the recheck compares against current state, not stale state from
-        // whenever this intent was first captured. Every other outcome
-        // means the nudge/park path actually concluded (or an early
-        // `BackgroundChildrenPending`/similar suppression above already
-        // returned), so any tracked intent is stale and safe to drop.
-        //
-        // Tagged `Debounced`, and that tag is load-bearing: this record is
-        // the ONLY thing that can ever move this execution again. Its
-        // worker's turn just ended, and the sole producer of the "next
-        // Stop" this arm is waiting for is a probe — which is exactly what
-        // the debounce declined to send. Retiring it on hook activity (the
-        // `BackgroundChildren` rule) leaves nothing scheduled to look at the
-        // execution again; see [`NudgeHold::Debounced`].
-        if matches!(outcome, StopOutcome::NudgeDebounced) {
-            self.background_children_tracker.record_intent(
-                &execution.id,
-                BackgroundNudgeIntent {
-                    probe_text: probe_text.to_owned(),
-                    fingerprint: fingerprint.to_owned(),
-                    bound_pr_url: bound_pr_url.map(str::to_owned),
-                    proceed_outcome,
-                    activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
-                    hold: NudgeHold::Debounced,
-                },
-            );
-        } else {
-            self.background_children_tracker.forget_intent(&execution.id);
         }
-        outcome
     }
 
     /// Whether `outcome` means [`Self::nudge_or_park`] actually put a probe
@@ -429,7 +511,12 @@ impl WorkerCompletionHandler {
                 // the only thing left that can re-drive it. So re-record
                 // against the CURRENT watermark and defer — activity defers,
                 // quiescence advances.
-                NudgeHold::Debounced | NudgeHold::WorkerWait => {
+                //
+                // A nudge still awaiting delivery defers the same way: the
+                // worker is busy, so the boundary that carries a queued nudge
+                // is coming, and the record must survive until the nudge is
+                // known to have arrived.
+                NudgeHold::Debounced | NudgeHold::WorkerWait | NudgeHold::AwaitingDelivery => {
                     tracing::debug!(
                         execution_id,
                         hold = ?intent.hold,
@@ -526,7 +613,13 @@ impl WorkerCompletionHandler {
         // that is still genuinely working. Same signal the staged-PR reap
         // path uses; returns false when no registry is wired, so unit tests
         // that do not model live activity are unaffected.
-        if matches!(hold, NudgeHold::Debounced | NudgeHold::WorkerWait) && self.observed_mid_turn(execution_id) {
+        let mid_turn = self.observed_mid_turn(execution_id);
+        if mid_turn
+            && matches!(
+                hold,
+                NudgeHold::Debounced | NudgeHold::WorkerWait | NudgeHold::AwaitingDelivery
+            )
+        {
             tracing::debug!(
                 execution_id,
                 "auto-nudge: debounced nudge deferred another interval — worker is mid-turn \
@@ -541,6 +634,70 @@ impl WorkerCompletionHandler {
             );
             return Some(StopOutcome::NudgeDebounced);
         }
+        // What became of the previous nudge decides what this pass may do.
+        match (hold, self.probe_queuer.nudge_delivery(execution_id)) {
+            // Not shown to the worker yet, and past the point where it could
+            // still be on its way: every attempt to write it is failing. Give
+            // it up as a failed delivery, so a pane that cannot be written to
+            // still ends the attempt instead of holding the ladder forever.
+            (_, NudgeDelivery::Pending { nudge_id }) if !mid_turn && self.give_up_overdue_nudge(execution_id) => {
+                let failures = self.nudge_breaker.settle_undelivered(execution_id, &nudge_id, true);
+                tracing::warn!(
+                    execution_id,
+                    nudge_id,
+                    consecutive_delivery_failures = failures,
+                    max = self.max_unproductive_nudges,
+                    "auto-nudge: the previous nudge could not be written within the delivery deadline; \
+                     withdrawn and counted as a delivery failure",
+                );
+                if failures >= self.max_unproductive_nudges {
+                    return Some(
+                        self.fail_for_undeliverable_nudges(
+                            &execution,
+                            failures,
+                            intent.bound_pr_url.as_deref(),
+                            OVERDUE_NUDGE_DETAIL,
+                        )
+                        .await,
+                    );
+                }
+                // Under the bound: `nudge_or_park` issues the replacement.
+            }
+            // Not shown to the worker yet. Issuing another would stack it
+            // behind the first and count a nudge nobody received, so hold
+            // the ladder where it is. An idle worker emits no hook to carry
+            // a queued probe, so ask for delivery again; a busy one reaches
+            // a boundary on its own.
+            (_, NudgeDelivery::Pending { .. }) => {
+                if !mid_turn {
+                    self.probe_queuer.deliver_queued_probes_now(execution_id);
+                }
+                tracing::debug!(
+                    execution_id,
+                    ?hold,
+                    mid_turn,
+                    "auto-nudge: held — the previous nudge has not reached the worker yet; ladder not \
+                     advanced, delivery requested again",
+                );
+                self.background_children_tracker.record_intent(
+                    execution_id,
+                    BackgroundNudgeIntent {
+                        activity_watermark: current_watermark,
+                        ..intent
+                    },
+                );
+                return Some(StopOutcome::NudgeDebounced);
+            }
+            // The boundary-path nudge arrived, so the worker's reply produces
+            // the Stop that re-evaluates from scratch. Nothing left to watch.
+            (NudgeHold::AwaitingDelivery, NudgeDelivery::Settled) => {
+                self.background_children_tracker.forget_intent(execution_id);
+                return None;
+            }
+            // Arrived on a sweep-driven ladder, or never arrived at all:
+            // `nudge_or_park` settles it and decides the next step.
+            _ => {}
+        }
         let replay = intent.clone();
         let outcome = self
             .nudge_or_park(
@@ -551,20 +708,12 @@ impl WorkerCompletionHandler {
                 intent.proceed_outcome,
             )
             .await;
-        if !matches!(
-            outcome,
-            StopOutcome::BackgroundChildrenPending { .. }
-                | StopOutcome::BuildWaitPending { .. }
-                | StopOutcome::EscalationPending { .. }
-                | StopOutcome::Held { .. }
-                | StopOutcome::WorkerWaitPending { .. }
-                | StopOutcome::NudgeDebounced
-        ) {
-            self.background_children_tracker.forget_intent(execution_id);
-        }
+        // `nudge_or_park` has already recorded or dropped the intent for its
+        // own outcome; a nudge it issued is tracked as `AwaitingDelivery`.
+        //
         // A `Debounced` hold re-driven from here must survive its own
-        // successful nudge. `nudge_or_park` drops the intent whenever the
-        // nudge actually fires, which is correct on the Stop path — the
+        // successful nudge with its tag intact. `AwaitingDelivery` is retired
+        // once the nudge arrives, which is correct on the Stop path — the
         // worker was handed a probe on a live boundary and its reply
         // produces the next Stop. It is wrong here: this execution reached
         // this path precisely because it emits no further Stops, so dropping
@@ -599,9 +748,9 @@ impl WorkerCompletionHandler {
             // `dispatch_probe_on_stop` / `dispatch_probe_on_post_tool_use`
             // only run on a worker hook event, and this whole path exists
             // precisely because no further hook is coming. Without an
-            // explicit delivery the probe sits in the FIFO forever while the
-            // breaker counts it as an unproductive nudge the worker was
-            // never actually shown.
+            // explicit delivery the probe sits in the FIFO forever. The
+            // delivery gate keeps such a probe from being counted, and asks
+            // again on every pass until it lands or is settled as failed.
             self.probe_queuer.deliver_queued_probes_now(execution_id);
             if retained_hold {
                 NUDGE_LADDER_SWEEP_ADVANCED.inc(&self.metrics);
@@ -620,6 +769,17 @@ impl WorkerCompletionHandler {
         Some(outcome)
     }
 
+    /// Whether the nudge outstanding for `execution_id` has gone unshown past
+    /// [`NUDGE_DELIVERY_DEADLINE`], and was taken back. `false` leaves
+    /// everything as it was, including for a nudge the queuer would not
+    /// withdraw because its write is already under way.
+    fn give_up_overdue_nudge(&self, execution_id: &str) -> bool {
+        self.nudge_breaker
+            .since_last_nudge(execution_id, (self.now_fn)())
+            .is_some_and(|waited| waited >= NUDGE_DELIVERY_DEADLINE)
+            && self.probe_queuer.withdraw_nudge(execution_id, OVERDUE_NUDGE_DETAIL)
+    }
+
     /// Fail an unproductive attempt, releasing its slot and recording a visible
     /// task failure before any terminal event can trigger orphan recovery.
     pub(super) async fn fail_for_unproductive_nudges(
@@ -629,15 +789,59 @@ impl WorkerCompletionHandler {
         bound_pr_url: Option<&str>,
         detail: &str,
     ) -> StopOutcome {
-        let pr_clause = match bound_pr_url {
-            Some(url) => format!("A PR already exists for this work: {url}."),
-            None => "No PR was produced.".to_owned(),
-        };
         let reason = format!(
             "Execution `{}` failed: auto-nudge circuit breaker stopped the attempt after \
-             {nudge_count} nudges: {detail}. {pr_clause} No automatic replacement will be started.",
-            execution.id
+             {nudge_count} nudges: {detail}. {} No automatic replacement will be started.",
+            execution.id,
+            Self::pr_clause(bound_pr_url),
         );
+        self.fail_nudge_ladder(execution, reason, "Worker failed: auto-nudge loop bounded")
+            .await
+    }
+
+    /// Fail an attempt whose nudges keep failing to arrive.
+    ///
+    /// The same terminal as [`Self::fail_for_unproductive_nudges`], reached
+    /// for the opposite reason, and worded so the two cannot be confused: a
+    /// worker that was shown nothing has not been unresponsive, and reporting
+    /// "no new commit, PR, or state change" for it would send whoever reads
+    /// the failure to the worker's transcript instead of to its pane.
+    /// `detail` is the last delivery failure, as the delivery path recorded
+    /// it.
+    async fn fail_for_undeliverable_nudges(
+        &self,
+        execution: &crate::work::WorkExecution,
+        failures: u32,
+        bound_pr_url: Option<&str>,
+        detail: &str,
+    ) -> StopOutcome {
+        let reason = format!(
+            "Execution `{}` failed: auto-nudge delivery failed {failures} times in a row, so the \
+             worker was never shown those nudges and had no chance to answer them. Last delivery \
+             failure: {detail}. This is a delivery failure, not an unresponsive worker. {} No \
+             automatic replacement will be started.",
+            execution.id,
+            Self::pr_clause(bound_pr_url),
+        );
+        self.fail_nudge_ladder(execution, reason, "Worker failed: auto-nudges could not be delivered")
+            .await
+    }
+
+    fn pr_clause(bound_pr_url: Option<&str>) -> String {
+        match bound_pr_url {
+            Some(url) => format!("A PR already exists for this work: {url}."),
+            None => "No PR was produced.".to_owned(),
+        }
+    }
+
+    /// Terminal shared by both ways the nudge ladder ends an attempt: commit
+    /// the failure with `reason`, then file one attention item for it.
+    async fn fail_nudge_ladder(
+        &self,
+        execution: &crate::work::WorkExecution,
+        reason: String,
+        attention_title: &str,
+    ) -> StopOutcome {
         if !self
             .finalize_worker_failure(execution, &reason, WorkerFailureBasis::NudgeBreaker)
             .await
@@ -659,12 +863,7 @@ impl WorkerCompletionHandler {
             .is_some();
         if !already_filed
             && let Err(err) = self
-                .file_execution_attention(
-                    execution,
-                    NUDGE_BREAKER_ATTENTION_KIND,
-                    "Worker failed: auto-nudge loop bounded",
-                    reason.clone(),
-                )
+                .file_execution_attention(execution, NUDGE_BREAKER_ATTENTION_KIND, attention_title, reason.clone())
                 .await
         {
             tracing::warn!(

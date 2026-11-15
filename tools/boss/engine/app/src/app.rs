@@ -114,6 +114,7 @@ mod pane_ops;
 mod pane_viewers;
 mod panes;
 mod panic_hook;
+mod parked_delivery;
 mod pid_file;
 mod planner_ops;
 mod pr_status;

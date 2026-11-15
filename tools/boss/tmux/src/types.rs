@@ -117,6 +117,9 @@ pub enum DisplayField {
     PaneDead,
     PaneDeadStatus,
     PaneCurrentCommand,
+    /// `1` while the pane is in a tmux mode (copy-mode and friends), where
+    /// tmux itself consumes keys instead of the pane's application.
+    PaneInMode,
     WindowActivity,
 }
 
@@ -128,6 +131,7 @@ impl DisplayField {
             Self::PaneDead => "#{pane_dead}",
             Self::PaneDeadStatus => "#{pane_dead_status}",
             Self::PaneCurrentCommand => "#{pane_current_command}",
+            Self::PaneInMode => "#{pane_in_mode}",
             Self::WindowActivity => "#{window_activity}",
         }
     }

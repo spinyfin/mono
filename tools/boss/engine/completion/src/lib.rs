@@ -1203,12 +1203,11 @@ pub trait ProbeQueuer: Send + Sync {
     /// (`dispatch_probe_on_stop` / `dispatch_probe_on_post_tool_use`) or by a
     /// human's `ProbeRun` RPC. An idle worker emits neither, so a probe the
     /// engine queues for one on a recurring sweep is written to the FIFO and
-    /// never leaves it — the engine "nudges" into a void, scores the silence
-    /// as an unproductive nudge, and the worker is never actually asked
-    /// anything. This is the seam that lets a sweep-driven nudge reach a
-    /// parked pane, so a re-driven ladder is honest: the worker really does
-    /// get the probe, and really does get the chance to answer with the
-    /// sanctioned terminal declaration.
+    /// never leaves it, and the worker is never actually asked anything.
+    /// This is the seam that lets a sweep-driven nudge reach a parked pane.
+    /// It requests delivery and reports nothing back: whether the worker was
+    /// shown the nudge is read from [`Self::nudge_delivery`], and a nudge
+    /// that was not is neither counted nor followed by another.
     ///
     /// Fail-closed and best-effort, exactly like the hook-driven paths it
     /// shares an implementation with: a pane whose `(activity, driver)`
@@ -1216,6 +1215,33 @@ pub trait ProbeQueuer: Send + Sync {
     /// opportunity rather than dropping it. Defaults to a no-op so
     /// test/stub queuers are unaffected.
     fn deliver_queued_probes_now(&self, _run_id: &str) {}
+
+    /// What became of the most recent nudge queued for `run_id` through
+    /// [`Self::queue_probe`].
+    ///
+    /// The nudge ladder asks this before every decision, because a nudge is
+    /// only evidence about the worker once the worker has been shown it. A
+    /// pure read: asking twice gives the same answer, and it is the caller
+    /// that makes settling a nudge idempotent.
+    ///
+    /// Defaults to [`NudgeDelivery::Settled`], which is the right answer for
+    /// a queuer that delivers nothing and for one with no way to observe
+    /// delivery: the ladder then behaves as if every nudge arrived.
+    fn nudge_delivery(&self, _run_id: &str) -> NudgeDelivery {
+        NudgeDelivery::Settled
+    }
+
+    /// Take back the most recent nudge for `run_id` if it is still queued,
+    /// recording `reason` against it. Returns whether it was withdrawn.
+    ///
+    /// For a nudge that has stayed unwritten past
+    /// [`crate::nudge_breaker::NUDGE_DELIVERY_DEADLINE`]: the ladder gives it
+    /// up, and it must not then be delivered late on top of its replacement.
+    /// A nudge that is already being written, or is written and waiting for
+    /// its turn, is not withdrawn; that delivery settles itself.
+    fn withdraw_nudge(&self, _run_id: &str, _reason: &str) -> bool {
+        false
+    }
 
     /// Drop every not-yet-delivered probe queued for `run_id`.
     ///
@@ -1239,6 +1265,40 @@ pub trait ProbeQueuer: Send + Sync {
     /// it happened and why. A discard that leaves the probe reading `queued`
     /// is the silent-drop defect this parameter exists to prevent.
     fn clear_pending_probes(&self, run_id: &str, reason: &str);
+}
+
+/// Whether the most recent nudge reached the worker. See
+/// [`ProbeQueuer::nudge_delivery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NudgeDelivery {
+    /// Nothing is outstanding: no nudge has been queued, or the last one
+    /// reached the worker (its driver started a turn on it, or it sits in a
+    /// mid-turn composer that the driver buffers).
+    Settled,
+    /// The last nudge has not been shown to the worker yet: it is still
+    /// queued, or it was written into the pane and the driver has not yet
+    /// started a turn on it. The engine still intends to deliver it.
+    Pending {
+        /// Identifies the nudge, so giving it up is settled once.
+        nudge_id: String,
+    },
+    /// The nudge was never written and will not be: the engine discarded it
+    /// (the worker turned out to be blocked), or the busy worker it was meant
+    /// for could not be interrupted to take it. It was never shown to the
+    /// worker, and no write failed.
+    Withdrawn {
+        /// Identifies the nudge, so it is settled once.
+        nudge_id: String,
+    },
+    /// Delivery was attempted and did not succeed: the write could not be
+    /// made, or it was made and no turn started on it.
+    Failed {
+        /// Identifies the nudge, so it is settled once.
+        nudge_id: String,
+        /// Why delivery failed, in words fit for the failure reason shown on
+        /// the task.
+        detail: String,
+    },
 }
 
 /// `ProbeQueuer` that drops everything — used when the test harness
@@ -1289,6 +1349,14 @@ enum NudgeHold {
     /// that may emit no further Stop until we re-nudge after expiry. The
     /// recurring recheck is what resumes the ladder once the wait ends.
     WorkerWait,
+    /// A nudge was issued at a turn boundary and its delivery has not been
+    /// confirmed yet. On the boundary path the worker's reply produces the
+    /// next Stop, so this hold is retired as soon as the nudge is known to
+    /// have arrived. It exists for the nudge that does not arrive: one left
+    /// queued, or written into a pane that started no turn, produces no Stop
+    /// at all, and the recurring recheck is then the only thing that can
+    /// re-deliver it, re-issue it, or end the attempt as a delivery failure.
+    AwaitingDelivery,
 }
 
 // Six fields, so the project's builder convention applies. The three
