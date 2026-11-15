@@ -329,6 +329,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: legacy_store_cleanup::migrate,
         },
         Migration {
+            id: merge_evidence::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: merge_evidence::migrate,
+        },
+        Migration {
             id: conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID.into(),
             legacy_version: None,
             apply: conflict_mismatch::migrate_operator_forced_admission,

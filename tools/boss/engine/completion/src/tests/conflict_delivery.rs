@@ -100,6 +100,29 @@ async fn conflict_delivery_fails_closed_when_github_is_unavailable() {
 
 struct MergedProbe;
 
+#[tokio::test]
+async fn closed_revision_completion_never_records_merge_evidence() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/2070";
+    let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_merge_probe(Arc::new(ClosedUnmergedProbe));
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(matches!(
+        handler.conflict_delivery_decision(&execution, Some(pr)).await,
+        ConflictDeliveryDecision::ClosedUnmerged
+    ));
+    handler
+        .finalize_pr_transition(&execution_id, pr.into(), WorkerPrCompletionTarget::InReview, "test")
+        .await;
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert!(db.get_merge_evidence(&execution.work_item_id).unwrap().is_none());
+}
+
 #[async_trait]
 impl MergeProbe for MergedProbe {
     async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
@@ -183,7 +206,8 @@ async fn conflict_declared_delivery_treats_a_closed_unmerged_pr_as_moot() {
     let outcome = handler
         .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
         .await;
-    assert!(matches!(outcome, StopOutcome::PrMerged { .. }), "{outcome:?}");
+    assert!(matches!(outcome, StopOutcome::PrDetected { .. }), "{outcome:?}");
+    assert!(db.get_merge_evidence(&revision).unwrap().is_none());
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Completed
@@ -210,7 +234,8 @@ async fn conflict_declared_delivery_treats_a_lifecycle_close_between_probes_as_m
     let outcome = handler
         .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
         .await;
-    assert!(matches!(outcome, StopOutcome::PrMerged { .. }), "{outcome:?}");
+    assert!(matches!(outcome, StopOutcome::PrDetected { .. }), "{outcome:?}");
+    assert!(db.get_merge_evidence(&revision).unwrap().is_none());
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Completed

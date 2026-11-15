@@ -896,6 +896,10 @@ mod floor_tests {
                 Box::new(|c| legacy_store_cleanup::migrate(c).unwrap()),
             ),
             (
+                merge_evidence::MIGRATION_ID,
+                Box::new(|c| merge_evidence::migrate(c).unwrap()),
+            ),
+            (
                 super::super::conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID,
                 Box::new(|c| super::super::conflict_mismatch::migrate_operator_forced_admission(c).unwrap()),
             ),

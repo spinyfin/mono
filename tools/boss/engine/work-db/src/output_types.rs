@@ -12,6 +12,8 @@ use super::*;
 pub enum WorkerPrCompletionTarget {
     InReview,
     Done,
+    /// A closed-unmerged PR makes the revision moot, but is not merge evidence.
+    DoneUnmerged,
     /// Task `pr_url` is stamped; task `status` is unchanged. The independent
     /// reviewer pass drives the subsequent `active → in_review`
     /// transition once the review pass resolves (or the timeout fires).

@@ -2556,50 +2556,8 @@ pub(crate) async fn mark_merged(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {
-    let updated = match work_db.mark_chore_pr_merged(&candidate.work_item_id, &candidate.pr_url) {
-        Ok(Some(task)) => task,
-        Ok(None) => {
-            // Human-driven rows deliberately remain in Review after their PR
-            // merges, but a terminal GitHub observation must still clear an
-            // earlier Merging projection. Otherwise an intent would retire
-            // while the card remained stranded in the Merging subsection.
-            let prior_merge_queue_state =
-                work_db
-                    .get_work_item(&candidate.work_item_id)
-                    .ok()
-                    .and_then(|item| match item {
-                        WorkItem::Task(task) | WorkItem::Chore(task) => task.merge_queue_state,
-                        _ => None,
-                    });
-            match work_db.set_task_merge_queue_state(&candidate.work_item_id, None, None) {
-                Ok(true) => {
-                    tracing::info!(
-                        work_item_id = %candidate.work_item_id,
-                        pr_url = %candidate.pr_url,
-                        prior_merge_queue_state = prior_merge_queue_state.as_deref(),
-                        new_merge_queue_state = Option::<&str>::None,
-                        in_merge_queue = false,
-                        auto_merge_enabled = false,
-                        "merge poller: card Merging lane state changed",
-                    );
-                    publisher
-                        .publish_work_item_changed(
-                            &candidate.product_id,
-                            &candidate.work_item_id,
-                            "pr_merged_queue_state_cleared",
-                        )
-                        .await;
-                }
-                Ok(false) => {}
-                Err(err) => tracing::warn!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    ?err,
-                    "merge poller: failed to clear Merging state after terminal PR observation",
-                ),
-            }
-            return false;
-        }
+    let observation = match work_db.observe_chore_pr_merged(&candidate.work_item_id, &candidate.pr_url) {
+        Ok(observation) => observation,
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
@@ -2609,6 +2567,14 @@ pub(crate) async fn mark_merged(
             );
             return false;
         }
+    };
+    let Some(updated) = observation.completed_task else {
+        if observation.changed {
+            publisher
+                .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "pr_merge_observed")
+                .await;
+        }
+        return false;
     };
     publisher
         .publish_work_item_changed(&candidate.product_id, &updated.id, "pr_merged")

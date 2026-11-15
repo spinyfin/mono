@@ -7,9 +7,10 @@ pub(super) enum ConflictDeliveryDecision {
     /// Not a revision, or GitHub reports the conflict cleared.
     /// Continue with the caller's existing target.
     Proceed,
-    /// The PR merged or closed while the revision ran. Finalize through
-    /// the existing merged/moot (`Done`) handling.
+    /// The PR merged while the revision ran.
     Moot,
+    /// The PR closed without merging while the revision ran.
+    ClosedUnmerged,
     /// Delivery failed and the execution has already been failed.
     Failed(StopOutcome),
 }
@@ -46,7 +47,8 @@ impl WorkerCompletionHandler {
         .await;
         let reason = match result {
             Ok(ConflictClearance::Cleared) => return ConflictDeliveryDecision::Proceed,
-            Ok(ConflictClearance::NotOpen) => return ConflictDeliveryDecision::Moot,
+            Ok(ConflictClearance::Merged) => return ConflictDeliveryDecision::Moot,
+            Ok(ConflictClearance::NotOpen) => return ConflictDeliveryDecision::ClosedUnmerged,
             Ok(ConflictClearance::StillConflicting {
                 raw_mergeable,
                 raw_merge_state_status,

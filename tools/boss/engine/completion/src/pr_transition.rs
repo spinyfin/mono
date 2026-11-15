@@ -223,6 +223,9 @@ impl WorkerCompletionHandler {
                     target = WorkerPrCompletionTarget::Done;
                     merged = true;
                 }
+                ConflictDeliveryDecision::ClosedUnmerged => {
+                    target = WorkerPrCompletionTarget::DoneUnmerged;
+                }
                 ConflictDeliveryDecision::Proceed => {}
             }
         }

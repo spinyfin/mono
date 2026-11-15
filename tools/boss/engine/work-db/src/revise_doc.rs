@@ -809,6 +809,14 @@ mod tests {
         };
         assert_eq!(task_kind, "chore");
 
+        db.update_work_item(
+            &task_id,
+            WorkItemPatch {
+                pr_url: Some("https://github.com/o/r/pull/9".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         db.mark_chore_pr_merged(&task_id, "https://github.com/o/r/pull/9")
             .unwrap();
 
@@ -1152,6 +1160,14 @@ mod tests {
         let ReviseDocOutcome::Created { task_id, .. } = outcome else {
             panic!("expected Created, got {outcome:?}");
         };
+        db.update_work_item(
+            &task_id,
+            WorkItemPatch {
+                pr_url: Some("https://github.com/o/r/pull/9".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         db.mark_chore_pr_merged(&task_id, "https://github.com/o/r/pull/9")
             .unwrap();
 

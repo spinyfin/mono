@@ -146,7 +146,9 @@ impl WorkerCompletionHandler {
             let pr_url = self.resolve_bound_pr_url(execution);
             match self.conflict_delivery_decision(execution, pr_url.as_deref()).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
-                ConflictDeliveryDecision::Moot | ConflictDeliveryDecision::Proceed => {}
+                ConflictDeliveryDecision::Moot
+                | ConflictDeliveryDecision::ClosedUnmerged
+                | ConflictDeliveryDecision::Proceed => {}
             }
         }
         // Captured before `record_worker_no_op_completion` below nulls
