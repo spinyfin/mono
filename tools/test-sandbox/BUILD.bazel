@@ -6,6 +6,16 @@ load(":macos_direct_test_runner.bzl", "macos_direct_test_runner")
 
 exports_files(["macos_direct_test_runner.template.sh"])
 
+# Run by the packages that may use a single-tool host repository, against
+# their own label; see the script.
+exports_files(
+    ["host_tool_symlink_guard_test.sh"],
+    visibility = [
+        "//tools/boss/engine/worker-bin:__pkg__",
+        "//tools/cube:__pkg__",
+    ],
+)
+
 macos_direct_test_runner(
     name = "macos_direct_test_runner",
     visibility = ["//visibility:public"],

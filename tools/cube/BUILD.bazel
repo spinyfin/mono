@@ -45,6 +45,7 @@ sh_test(
         "$(rootpath testdata/gc_store.json)",
         "$(rootpath testdata/gc_store.sh)",
         "$(rootpath //tools/boss/engine/recovery:jj_repository.bzl)",
+        "$(rootpath testdata/gc_store_archive.py)",
     ],
     data = [
         "testdata/gc_store.json",
@@ -52,6 +53,20 @@ sh_test(
         "testdata/gc_store_archive.py",
         "//tools/boss/engine/recovery:jj_repository.bzl",
     ],
+)
+
+# @host_lsof//:lsof must stay a symlink to the host's lsof: a remote macOS
+# worker cannot launch a copy of it. Off macOS the label is a stub script.
+sh_test(
+    name = "host_lsof_symlink_guard_test",
+    size = "small",
+    srcs = ["//tools/test-sandbox:host_tool_symlink_guard_test.sh"],
+    args = [
+        "$(rootpath @host_lsof//:lsof)",
+        "/usr/sbin/lsof",
+    ],
+    data = ["@host_lsof//:lsof"],
+    target_compatible_with = ["@platforms//os:macos"],
 )
 
 rust_test(

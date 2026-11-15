@@ -9,11 +9,16 @@ import tarfile
 import tempfile
 import unittest
 
+MANIFEST, GENERATOR, JJ_PIN, ARCHIVE_MODULE = map(Path, sys.argv[1:5])
+del sys.argv[1:5]
+
+# The module under test is a declared data file, named by the target like the
+# other inputs. Python itself only searches the directory of this script, and
+# that is the module's directory only where the script is a symlink into the
+# source tree. A remote executor stages it as a file at the test's own path.
+sys.path.insert(0, str(ARCHIVE_MODULE.parent.absolute()))
+
 from gc_store_archive import check_manifest, pack
-
-
-MANIFEST, GENERATOR, JJ_PIN = map(Path, sys.argv[1:4])
-del sys.argv[1:4]
 
 
 class ArchiveTest(unittest.TestCase):
