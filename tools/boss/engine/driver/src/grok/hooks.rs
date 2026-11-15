@@ -91,23 +91,8 @@ const GROK_HOOK_EVENTS: &[&str] = &[
 /// `tools/boss/event-shim`'s retry budget.
 pub const FORWARDER_HOOK_TIMEOUT_SEC: u64 = 15;
 
-/// Build the `boss-event` forwarder command line — byte-for-byte the same
-/// env-prefix shape [`crate::claude::ClaudeDriver`]'s
-/// `progress_observation_wiring` uses. The raw Grok payload is forwarded
-/// unchanged (see module docs for why).
-fn forwarder_command(config: &ProgressObservationConfig) -> String {
-    format!(
-        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
-        socket = shell_quote(&config.events_socket_path.display().to_string()),
-        lease = shell_quote(&config.lease_id),
-        run_id = shell_quote(&config.run_id),
-        workspace = shell_quote(&config.workspace_path.display().to_string()),
-        shim = shell_quote(&config.forwarder_binary.display().to_string()),
-    )
-}
-
 /// The forwarder-only hooks map: every [`GROK_HOOK_EVENTS`] entry wired to
-/// [`forwarder_command`], matcher `*`. Returned both by
+/// [`crate::hook_settings::forwarder_command`], matcher `*`. Returned both by
 /// [`super::GrokDriver::progress_observation_wiring`] (so the capability's
 /// declared wiring reflects what is actually installed) and used as the
 /// starting point for [`write_hooks`], which appends the guard entries onto
@@ -118,7 +103,7 @@ pub fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_json::Ma
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": forwarder_command(config),
+            "command": crate::hook_settings::forwarder_command(config),
             // Explicit on every event — critical on Stop, which otherwise
             // inherits Grok's 600s stop-gate default and can freeze the pane.
             "timeout": FORWARDER_HOOK_TIMEOUT_SEC,

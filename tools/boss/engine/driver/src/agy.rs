@@ -1,9 +1,10 @@
 //! `AgyDriver` — Google Antigravity (`agy`) agent driver skeleton.
 //!
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
-//! provisioning, and per-kind permission rendering (`--settings`). Interactive
-//! TUI spawn still refuses until guard hooks land. Retention preserves
-//! transcript evidence in the per-run HOME.
+//! provisioning, per-kind permission rendering (`--settings`), and the
+//! `boss-event` progress-forwarder hook wiring. Interactive TUI spawn still
+//! refuses until the guard adapter lands. Retention preserves transcript
+//! evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -27,6 +28,7 @@ use super::{
 
 mod environment;
 mod home;
+mod hooks;
 mod model_menu;
 pub mod permissions;
 #[cfg(test)]
@@ -303,24 +305,53 @@ impl AgentDriver for AgyDriver {
     }
 
     /// Render the run's session settings (posture, trust, native-file rules)
-    /// into its control directory and return `--settings <file>` as the one
-    /// per-run flag. `dest_dir` is unused: like Grok, the artifacts live in the
+    /// into its control directory (`--settings <file>`) and install the hook
+    /// wiring into the per-run home's global-root `hooks.json`, overwriting the
+    /// provisioned no-op canary. `dest_dir` is unused: the artifacts live in the
     /// driver's own per-run container, outside the checkout and outside any
     /// engine settings directory, so the retention sweep reclaims them with the
-    /// run. Hook wiring is separate work and is not written here.
+    /// run. The control directory is deliberately not added to
+    /// `trustedWorkspaces`.
     async fn write_permission_config(
         &self,
         input: &PermissionInput,
         _dest_dir: &Path,
     ) -> anyhow::Result<PermissionArtifacts> {
-        let input = input.clone();
+        let render_input = input.clone();
         let run_id = input.run_id.clone();
-        tokio::task::spawn_blocking(move || permissions::write_session_settings(&input))
-            .await
-            .context("agy permission rendering task did not complete")?
-            .with_context(|| {
-                format!("AgyDriver::write_permission_config: rendering session settings for run_id {run_id:?}")
-            })
+        let mut artifacts =
+            tokio::task::spawn_blocking(move || permissions::write_session_settings(&render_input))
+                .await
+                .context("agy permission rendering task did not complete")?
+                .with_context(|| {
+                    format!("AgyDriver::write_permission_config: rendering session settings for run_id {run_id:?}")
+                })?;
+        let process_home = process_home_for_run(&input.run_id).with_context(|| {
+            format!(
+                "AgyDriver::write_permission_config: resolving per-run HOME for run_id {:?}",
+                input.run_id
+            )
+        })?;
+        if !process_home.exists() {
+            anyhow::bail!(
+                "AgyDriver::write_permission_config: per-run HOME {} does not exist; \
+                 call provision_workspace first",
+                process_home.display()
+            );
+        }
+        // Refuse to write through a swapped symlink or shared hard link.
+        home::validate_private_layout(&process_home)?;
+        let config = ProgressObservationConfig {
+            events_socket_path: input.events_socket_path.clone(),
+            lease_id: input.lease_id.clone(),
+            run_id: input.run_id.clone(),
+            workspace_path: input.workspace_path.clone(),
+            forwarder_binary: input.boss_event_path.clone(),
+        };
+        let hooks_path = hooks::write_hooks(&process_home, &config)
+            .with_context(|| format!("writing agy hook wiring under {}", process_home.display()))?;
+        artifacts.config_files.push(hooks_path);
+        Ok(artifacts)
     }
 
     fn progress_fidelity(&self) -> ProgressFidelity {
@@ -330,14 +361,15 @@ impl AgentDriver for AgyDriver {
         ProgressFidelity::Rich
     }
 
-    fn progress_observation_wiring(&self, _config: &ProgressObservationConfig) -> ProgressIngress {
-        // Destination is DriverOwned: hooks are discovered from
-        // `$HOME/.gemini/config/hooks.json`, never from the Claude worker
-        // settings file. The map is empty because progress hooks are not wired.
-        // Must not return StdoutJsonl — the registry
-        // refuses that topology for built-in drivers.
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
+        // Destination is DriverOwned: `write_permission_config` writes this
+        // map to `$HOME/.gemini/config/hooks.json` in the per-run home, which
+        // `agy` discovers with no flag. It must never merge into the Claude
+        // worker settings file `agy` does not read. Must not return
+        // StdoutJsonl — the registry refuses that topology for built-in
+        // drivers.
         ProgressIngress::HookCallback(ProgressObservationWiring {
-            hooks: serde_json::Map::new(),
+            hooks: hooks::forwarder_hooks_map(config),
             destination: HookWiringDestination::DriverOwned,
         })
     }
@@ -807,7 +839,7 @@ mod tests {
         match ingress {
             ProgressIngress::HookCallback(wiring) => {
                 assert_eq!(wiring.destination, HookWiringDestination::DriverOwned);
-                assert!(wiring.hooks.is_empty(), "skeleton has no hook map yet");
+                assert_eq!(wiring.hooks.len(), 6, "all six measured events are wired");
             }
             other => panic!("expected HookCallback(DriverOwned), got {other:?}"),
         }
