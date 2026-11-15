@@ -12,6 +12,7 @@ mod answer_agent;
 mod checkleft_guard;
 mod claude_md;
 mod deny_rules;
+mod driver_mirrors;
 mod guard_script_isolation;
 mod heal;
 mod launch_guard;

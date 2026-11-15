@@ -33,6 +33,8 @@ pub const AGY_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_AGY_SKIP_POSTURE_ASSERT";
 pub(crate) const AGY_HOMES_DIR_NAME: &str = "boss-agy-homes";
 
 const PROCESS_HOME_LEAF: &str = "process-home";
+/// Global-root hook directory, relative to the per-run `HOME`.
+const HOOKS_DIR_RELATIVE: &str = ".gemini/config";
 const CONTROL_LEAF: &str = "control";
 const WORKSPACE_PATH_FILENAME: &str = "boss-workspace-path";
 
@@ -86,7 +88,7 @@ fn validate_private_layout(process_home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn check_private_entry(path: &Path) -> anyhow::Result<()> {
+pub(super) fn check_private_entry(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() || (meta.is_file() && meta.nlink() != 1) => {
@@ -155,6 +157,10 @@ pub fn agy_run_container_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
 
 pub fn process_home_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
     Ok(agy_run_container_for_run(run_id)?.join(PROCESS_HOME_LEAF))
+}
+
+pub fn hooks_dir_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(process_home_for_run(run_id)?.join(HOOKS_DIR_RELATIVE))
 }
 
 pub fn control_dir_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
@@ -272,8 +278,8 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     let antigravity = gemini.join("antigravity-cli");
     fs::create_dir_all(antigravity.join("cache"))
         .with_context(|| format!("creating antigravity-cli cache under {}", antigravity.display()))?;
-    fs::create_dir_all(gemini.join("config"))
-        .with_context(|| format!("creating .gemini/config under {}", gemini.display()))?;
+    let hooks_dir = process_home.join(HOOKS_DIR_RELATIVE);
+    fs::create_dir_all(&hooks_dir).with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
     // Onboarding screen skip. This is not a data-collection consent answer:
     // enableTelemetry is not written, and the Terms checkbox is not ticked.
@@ -284,8 +290,8 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
         .with_context(|| format!("writing private CLI settings under {}", antigravity.display()))?;
     fs::write(&session_settings_path, render_session_settings_json(workspace))
         .with_context(|| format!("writing session settings {}", session_settings_path.display()))?;
-    fs::write(gemini.join("config/hooks.json"), render_provision_hooks_json())
-        .with_context(|| format!("writing provision hooks under {}", gemini.display()))?;
+    fs::write(hooks_dir.join("hooks.json"), render_provision_hooks_json())
+        .with_context(|| format!("writing provision hooks under {}", hooks_dir.display()))?;
     // Do not write `.gemini/settings.json` or `trustedFolders.json`: neither
     // is read by agy.
 

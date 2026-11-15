@@ -49,7 +49,7 @@
 /// post one reply to the run's own target comment thread. Do NOT give it
 /// side-effecting flags (arbitrary `--comment-id`, `--status`, a `--body-file`
 /// that reads any path, etc.); anything it accepts is inside the sandbox.
-pub const THREAD_REPLY_COMMAND: &str = "boss comment reply";
+pub const THREAD_REPLY_COMMAND: &str = crate::driver::capability_rules::ANSWER_AGENT_THREAD_REPLY_COMMAND;
 
 /// Render the read-only agent-rules file (`CLAUDE.md`) for an answer-agent
 /// worker. Modeled on [`crate::pr_review::render_reviewer_claude_md`] but for

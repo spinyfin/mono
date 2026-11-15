@@ -115,13 +115,11 @@ pub fn triage_deny_rules() -> Vec<String> {
 ///
 /// Every entry MUST be read-only or the single reply command. Adding a
 /// mutating entry here is a capability escalation and must be reviewed as such.
+///
+/// The table is shared with the Antigravity driver, which translates it into
+/// its own rule grammar; see [`crate::driver::capability_rules`].
 pub fn answer_agent_allow_rules() -> Vec<String> {
-    vec![
-        "Read".to_owned(),
-        "Grep".to_owned(),
-        "Glob".to_owned(),
-        format!("Bash({}:*)", crate::answer_agent::THREAD_REPLY_COMMAND),
-    ]
+    crate::driver::capability_rules::answer_agent_allow_rules()
 }
 
 /// Defense-in-depth `permissions.deny` belt for [`WorkerKind::AnswerAgent`],

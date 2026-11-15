@@ -1,0 +1,621 @@
+//! Per-run `agy` session settings: permission posture, trust, and native-file
+//! rules, rendered into one JSON file passed as `--settings <file>`.
+//!
+//! The posture is the one the permission study recommends
+//! (`docs/investigations/agy-permission-trust-soft-deny.md`, §§1, 7, 10) and
+//! the driver design adopts, identical in shape for every worker kind:
+//!
+//! - `agentMode: ""` — pinned explicitly. With the key absent both qualified
+//!   releases start in Auto mode, which approves workspace edits and sandboxed
+//!   commands on its own.
+//! - `toolPermission: "request-review"` — the only level under which a hook
+//!   verdict decides a call without raising an approval dialog. `strict`
+//!   ignores its allowlist and raises a dialog on every call, and
+//!   `always-proceed` fails open when the hook is missing. Neither, nor
+//!   `--mode plan`, `--sandbox` or `--dangerously-skip-permissions`, is ever
+//!   rendered for any kind.
+//! - `trustedWorkspaces` — exactly the symlink-resolved workspace path. Matching
+//!   is exact: a parent directory or an unresolved spelling does not count. The
+//!   control directory is not trusted.
+//! - `permissions.deny` — **native file tools only** (`read_file` /
+//!   `write_file`; a `write_file` rule also covers `edit_file`): the Boss data
+//!   directory, the run's own hook and control directories (write), and, for
+//!   kinds that must not write, the workspaces root. Command-level denies
+//!   (`bossctl`, `sudo`, `rm -rf`, publication) are *not* rendered here: a
+//!   command rule is a prefix match on the command as typed, so an absolute
+//!   path, a `sh -c` wrapper or a flag between two rule words gets past it, and
+//!   next to a `read_file` deny it stopped working altogether (6 of 6 probes).
+//!   Those denies belong to the `PreToolUse` hook adapter. [`validate_rule`]
+//!   refuses a `command(...)` deny so the combination cannot be reintroduced by
+//!   accident.
+//! - `permissions.allow` — only for the deny-by-default kinds
+//!   ([`permission_mode_for_worker_kind`] is `Some`). The hook answers
+//!   `deny_unless_prior_grant` for them, so this list is the whole set of
+//!   calls that can run once the guards have passed.
+//! - No `permissions.ask`: an ask rule overrides a hook `auto_approve` and
+//!   raises a dialog nobody is there to answer.
+//!
+//! A malformed rule is dropped by `agy` with only a log warning, and a dropped
+//! deny rule fails open. So every rendered rule is validated here before it is
+//! written, and [`verify_settings_log`] checks the CLI's own log after spawn.
+
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, bail};
+use serde::{Deserialize, Serialize};
+
+use super::home::{check_private_entry, control_dir_for_run, hooks_dir_for_run, session_settings_path_for_run};
+use crate::scoped_home::trust_path_variants;
+use crate::{PermissionArtifacts, PermissionInput, WorkerKind};
+
+/// `agentMode` rendered for every kind: the documented default mode, pinned
+/// because an absent key means Auto on 1.5.7 and later.
+pub const AGENT_MODE: &str = "";
+
+/// `toolPermission` rendered for every kind.
+pub const TOOL_PERMISSION: &str = "request-review";
+
+/// The one per-run CLI flag the posture needs.
+const SETTINGS_FLAG: &str = "--settings";
+
+// ---------------------------------------------------------------------------
+// Worker-kind posture
+// ---------------------------------------------------------------------------
+
+/// The permission mode the engine forces for `worker_kind`, if any.
+///
+/// A driver-local mirror of `WorkerKind::forced_permission_mode` in
+/// `boss-engine-execution-contracts`, kept here (as `grok/permissions.rs`
+/// does) because this crate cannot depend on it. `Some("dontAsk")` marks the
+/// capability-restricted, deny-by-default kinds. `agy` has no such flag; the
+/// value decides whether the kind is rendered with an allowlist and answered
+/// with `deny_unless_prior_grant`, so a restricted kind cannot be silently
+/// downgraded to an allow-by-default posture. The match is exhaustive: a new
+/// kind must choose a posture here.
+pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'static str> {
+    match worker_kind {
+        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
+    }
+}
+
+/// How the hook adapter must answer a call for a kind, and so whether the
+/// settings carry an allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictPosture {
+    /// Allow-by-default behind guards: `auto_approve` once the guards pass.
+    GuardedApproval,
+    /// Deny-by-default: `deny_unless_prior_grant`, with `permissions.allow`.
+    GuardedAllowlist,
+}
+
+/// The verdict posture for `worker_kind`, derived from the forced mode so the
+/// two cannot disagree.
+pub fn verdict_posture_for_worker_kind(worker_kind: WorkerKind) -> VerdictPosture {
+    match permission_mode_for_worker_kind(worker_kind) {
+        Some(_) => VerdictPosture::GuardedAllowlist,
+        None => VerdictPosture::GuardedApproval,
+    }
+}
+
+/// Kinds that must not write files. The file fence for them is the workspaces
+/// root (see [`file_fences`]); the hook denies every native write on top.
+fn forbids_file_writes(worker_kind: WorkerKind) -> bool {
+    match worker_kind {
+        WorkerKind::Standard => false,
+        WorkerKind::Reviewer
+        | WorkerKind::Triage
+        | WorkerKind::AnswerAgent
+        | WorkerKind::ReviewGuide
+        | WorkerKind::Progression => true,
+    }
+}
+
+/// The Claude-grammar allowlist the kind's posture is translated from. Each
+/// table is the same one Claude (and, for progression, Grok) renders, so there
+/// is exactly one allowlist per posture. Empty for allow-by-default kinds.
+fn claude_allowlist(worker_kind: WorkerKind) -> Vec<String> {
+    match worker_kind {
+        WorkerKind::AnswerAgent => crate::capability_rules::answer_agent_allow_rules(),
+        WorkerKind::ReviewGuide => crate::codex::review_guide_allow_rules(),
+        WorkerKind::Progression => crate::capability_rules::progression_allow_rules(),
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings document
+// ---------------------------------------------------------------------------
+
+/// The `--settings` document. `deny_unknown_fields` on both levels is the
+/// same strictness the CLI applies through `--settings`, so a typo cannot
+/// survive a round trip through [`parse_rendered`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionSettings {
+    agent_mode: String,
+    tool_permission: String,
+    trusted_workspaces: Vec<String>,
+    permissions: Permissions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Permissions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<String>>,
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+impl SessionSettings {
+    /// Render the document, refusing anything that is not exactly the posture
+    /// this module renders.
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        self.validate()?;
+        Ok(serde_json::to_string_pretty(self).context("serialising agy session settings")? + "\n")
+    }
+
+    /// Exactly the posture this module renders — nothing looser.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.agent_mode != AGENT_MODE {
+            bail!(
+                "agy agentMode must be pinned to {AGENT_MODE:?}, got {:?}",
+                self.agent_mode
+            );
+        }
+        if self.tool_permission != TOOL_PERMISSION {
+            bail!(
+                "agy toolPermission must be {TOOL_PERMISSION:?}, got {:?}",
+                self.tool_permission
+            );
+        }
+        match self.trusted_workspaces.as_slice() {
+            [workspace] if Path::new(workspace).is_absolute() => {}
+            other => bail!("agy trustedWorkspaces must hold exactly one absolute workspace path, got {other:?}"),
+        }
+        if self.permissions.deny.is_empty() {
+            bail!(
+                "agy permissions.deny is empty; every posture fences the run's own wiring out of the native file tools"
+            );
+        }
+        validate_rules(RuleList::Deny, &self.permissions.deny)?;
+        if let Some(allow) = &self.permissions.allow {
+            validate_rules(RuleList::Allow, allow)?;
+        }
+        Ok(())
+    }
+
+    /// The rendered `permissions.allow` list (empty for allow-by-default kinds).
+    pub fn allow_rules(&self) -> &[String] {
+        self.permissions.allow.as_deref().unwrap_or_default()
+    }
+
+    /// The rendered `permissions.deny` list.
+    pub fn deny_rules(&self) -> &[String] {
+        &self.permissions.deny
+    }
+}
+
+/// Inputs the document is derived from, already resolved. Separated from
+/// [`PermissionInput`] so rendering is a pure function of paths.
+#[derive(Debug, Clone)]
+pub struct SettingsPlan<'a> {
+    pub worker_kind: WorkerKind,
+    /// Absolute, symlink-resolved workspace path.
+    pub workspace: &'a Path,
+    /// The Boss engine data directory, `None` for remote workers (their
+    /// events socket is a forwarded `/tmp` socket, not a data directory).
+    pub boss_data_dir: Option<&'a Path>,
+    /// The run's global-root hook directory (`$HOME/.gemini/config`).
+    pub hooks_dir: &'a Path,
+    /// The run's Boss-owned control directory (session settings, launcher, log).
+    pub control_dir: &'a Path,
+}
+
+/// Build and validate the document for one run.
+pub fn render_settings(plan: &SettingsPlan<'_>) -> anyhow::Result<SessionSettings> {
+    let deny = deny_rules(plan);
+    let allow = match verdict_posture_for_worker_kind(plan.worker_kind) {
+        VerdictPosture::GuardedApproval => None,
+        VerdictPosture::GuardedAllowlist => Some(allow_rules(plan.worker_kind, plan.workspace)?),
+    };
+    reject_self_fencing(plan, &deny)?;
+    let settings = SessionSettings {
+        agent_mode: AGENT_MODE.to_owned(),
+        tool_permission: TOOL_PERMISSION.to_owned(),
+        trusted_workspaces: vec![plan.workspace.display().to_string()],
+        permissions: Permissions { allow, deny },
+    };
+    settings.validate()?;
+    Ok(settings)
+}
+
+/// Parse a settings file this module wrote and re-validate it.
+pub fn parse_rendered(text: &str) -> anyhow::Result<SessionSettings> {
+    let settings: SessionSettings = serde_json::from_str(text).context("parsing rendered agy session settings")?;
+    settings.validate()?;
+    Ok(settings)
+}
+
+// ---------------------------------------------------------------------------
+// Native-file deny rules
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileAction {
+    Read,
+    Write,
+}
+
+impl FileAction {
+    fn rule_action(self) -> &'static str {
+        match self {
+            FileAction::Read => "read_file",
+            FileAction::Write => "write_file",
+        }
+    }
+}
+
+/// Directories the native file tools are fenced out of, per kind.
+///
+/// - The Boss data directory (state database, events socket, dispatch log) is
+///   unreadable and unwritable for every kind, as the permission study renders
+///   it. Absent for remote workers.
+/// - The run's own hook directory and control directory are unwritable. A
+///   native write there could rewrite the hook wiring that guards the run, or
+///   the settings and launcher that configure it. Only writes are fenced: the
+///   CLI keeps its own conversation artifacts under the same `HOME`, and
+///   reading them back is ordinary. Protecting the rest of the private state
+///   is the hook adapter's job, by canonical path.
+/// - Kinds that must not write files get a write fence on the workspaces
+///   root — the parent of the workspace, which also keeps one worker out of
+///   its siblings' checkouts. It is scoped rather than blanket, as the
+///   Reviewer's is on Claude, so a result file written outside the checkout
+///   stays possible; Claude's blanket `Edit(**)` has no measured `agy`
+///   spelling, and the hook denies every native write for these kinds anyway.
+fn file_fences(plan: &SettingsPlan<'_>) -> Vec<(FileAction, PathBuf)> {
+    let mut fences = Vec::new();
+    if let Some(dir) = plan.boss_data_dir {
+        fences.push((FileAction::Read, dir.to_path_buf()));
+        fences.push((FileAction::Write, dir.to_path_buf()));
+    }
+    fences.push((FileAction::Write, plan.hooks_dir.to_path_buf()));
+    fences.push((FileAction::Write, plan.control_dir.to_path_buf()));
+    if forbids_file_writes(plan.worker_kind) {
+        let root = plan.workspace.parent().unwrap_or(plan.workspace);
+        fences.push((FileAction::Write, root.to_path_buf()));
+    }
+    fences
+}
+
+/// Every spelling of every fence, in a stable order. Spelling variants
+/// (`/tmp` and `/private/tmp`, `/var` and `/private/var`) are all denied: a
+/// deny that misses a spelling fails open.
+fn deny_rules(plan: &SettingsPlan<'_>) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    for (action, dir) in file_fences(plan) {
+        for spelling in trust_path_variants(&dir) {
+            let rule = format!("{}({spelling})", action.rule_action());
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+    }
+    rules
+}
+
+/// Refuse a posture whose own fences take the workspace away from the worker:
+/// no kind may have its workspace read-denied, and a kind that writes
+/// (Standard) may not have it write-denied. A misconfigured layout (for
+/// example a homes root that contains the checkout) should fail the spawn with
+/// a reason, not produce a worker that can do nothing.
+fn reject_self_fencing(plan: &SettingsPlan<'_>, deny: &[String]) -> anyhow::Result<()> {
+    let workspace_spellings = trust_path_variants(plan.workspace);
+    for rule in deny {
+        let Ok((action, target)) = split_rule(rule) else {
+            continue;
+        };
+        let covers_workspace = workspace_spellings.iter().any(|ws| Path::new(ws).starts_with(target));
+        let blocks_needed_access = match action {
+            "read_file" => true,
+            "write_file" => !forbids_file_writes(plan.worker_kind),
+            _ => false,
+        };
+        if covers_workspace && blocks_needed_access {
+            bail!(
+                "agy posture for {:?} would deny the worker its own workspace {} ({rule}); \
+                 refusing to render settings for an overlapping layout",
+                plan.worker_kind,
+                plan.workspace.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Allowlist translation
+// ---------------------------------------------------------------------------
+
+/// Translate a kind's shared Claude-grammar allowlist into `agy` rules.
+///
+/// - `Read` / `Grep` / `Glob` → `read_file(<workspace>)`. Narrower than
+///   Claude's unscoped tool grant: nothing outside the workspace is allowed.
+/// - `Bash(<prefix>:*)` → `command(<prefix>)`. `agy` matches a command rule as
+///   a word-by-word prefix, which is what the `:*` form means.
+///
+/// Anything else is an error rather than a silent drop or a widening: the
+/// tables are static, so a new entry shape fails the tests that translate
+/// every table instead of quietly changing a worker's capabilities. An allow
+/// rule is not a write barrier (a redirect or a substitution rides on an
+/// allowed command), which is why the hook's guards decide first.
+fn allow_rules(worker_kind: WorkerKind, workspace: &Path) -> anyhow::Result<Vec<String>> {
+    let mut rules: Vec<String> = Vec::new();
+    for claude_rule in claude_allowlist(worker_kind) {
+        let translated = translate_claude_allow_rule(&claude_rule, workspace)
+            .with_context(|| format!("translating allow rule {claude_rule:?} for {worker_kind:?}"))?;
+        if !rules.contains(&translated) {
+            rules.push(translated);
+        }
+    }
+    Ok(rules)
+}
+
+fn translate_claude_allow_rule(rule: &str, workspace: &Path) -> anyhow::Result<String> {
+    if matches!(rule, "Read" | "Grep" | "Glob") {
+        return Ok(format!("read_file({})", workspace.display()));
+    }
+    if let Some(inner) = rule.strip_prefix("Bash(").and_then(|rest| rest.strip_suffix(":*)")) {
+        return Ok(format!("command({inner})"));
+    }
+    bail!("no agy equivalent for allow rule {rule:?}; extend the translation deliberately")
+}
+
+// ---------------------------------------------------------------------------
+// Rule validation
+// ---------------------------------------------------------------------------
+
+/// Which `permissions` list a rule belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleList {
+    Allow,
+    Deny,
+}
+
+impl RuleList {
+    fn label(self) -> &'static str {
+        match self {
+            RuleList::Allow => "allow",
+            RuleList::Deny => "deny",
+        }
+    }
+}
+
+fn validate_rules(list: RuleList, rules: &[String]) -> anyhow::Result<()> {
+    for (index, rule) in rules.iter().enumerate() {
+        validate_rule(list, rule)?;
+        if rules[..index].contains(rule) {
+            bail!("duplicate agy {} rule {rule:?}", list.label());
+        }
+    }
+    Ok(())
+}
+
+/// Split `action(target)` with no space before the parenthesis.
+fn split_rule(rule: &str) -> anyhow::Result<(&str, &str)> {
+    let Some((action, rest)) = rule.split_once('(') else {
+        bail!("invalid grant string {rule:?}: expected action(target)");
+    };
+    let Some(target) = rest.strip_suffix(')') else {
+        bail!("invalid grant string {rule:?}: missing closing parenthesis");
+    };
+    Ok((action, target))
+}
+
+/// Check one rule against the grammar `agy` accepts, mirroring the failures it
+/// would otherwise only log: an unknown action, a missing parenthesis, a space
+/// before it, or a bare action name. Stricter than the CLI where its behaviour
+/// is unmeasured: only the actions the permission study exercised are allowed,
+/// a path rule needs an absolute path, and a `command` rule may not be a
+/// regular expression (regex denies were measured not to be a substring
+/// filter).
+///
+/// Deny rules are file rules only; see the module documentation.
+pub fn validate_rule(list: RuleList, rule: &str) -> anyhow::Result<()> {
+    let (action, target) = split_rule(rule)?;
+    let allowed = matches!(
+        (list, action),
+        (RuleList::Deny, "read_file" | "write_file") | (RuleList::Allow, "command" | "read_file" | "write_file")
+    );
+    if !allowed {
+        bail!(
+            "agy {} rule {rule:?}: action {action:?} is not permitted here (deny rules are native file rules only)",
+            list.label()
+        );
+    }
+    if target.is_empty() || target.trim() != target {
+        bail!(
+            "agy {} rule {rule:?}: empty target or surrounding whitespace",
+            list.label()
+        );
+    }
+    if target.chars().any(|c| c.is_control() || c == '(' || c == ')') {
+        bail!(
+            "agy {} rule {rule:?}: target contains a control character or parenthesis",
+            list.label()
+        );
+    }
+    match action {
+        "command" => {
+            if target.starts_with("regex:") {
+                bail!("agy allow rule {rule:?}: regular-expression command rules are not used");
+            }
+        }
+        _ => {
+            let path = Path::new(target);
+            if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+                bail!(
+                    "agy {} rule {rule:?}: path must be absolute with no `..` component",
+                    list.label()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
+/// Resolve the symlink-free workspace path trust and allow rules are keyed on.
+fn resolved_workspace(workspace: &Path) -> anyhow::Result<PathBuf> {
+    fs::canonicalize(workspace).with_context(|| {
+        format!(
+            "resolving agy workspace {} (trust matches the exact resolved path)",
+            workspace.display()
+        )
+    })
+}
+
+/// Render the run's session settings, write them into the run's control
+/// directory, and return the artifacts the spawn flow applies.
+///
+/// `extra_args` is the only genuinely per-run flag the posture needs:
+/// `--settings <file>`. The flag overrides the private `settings.json`, is
+/// never saved, and exits non-zero on an unknown key, which is why posture and
+/// trust travel there and not in the file the CLI itself rewrites.
+pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<PermissionArtifacts> {
+    let control_dir = control_dir_for_run(&input.run_id)
+        .with_context(|| format!("resolving agy control dir for run_id {:?}", input.run_id))?;
+    if !control_dir.is_dir() {
+        bail!(
+            "agy control dir {} does not exist; call provision_workspace first",
+            control_dir.display()
+        );
+    }
+    let settings_path = session_settings_path_for_run(&input.run_id)?;
+    if !settings_path.is_absolute() {
+        bail!("agy session settings path {} is not absolute", settings_path.display());
+    }
+
+    let workspace = resolved_workspace(&input.workspace_path)?;
+    let boss_data_dir = if input.is_remote {
+        None
+    } else {
+        input
+            .events_socket_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    };
+    let hooks_dir = hooks_dir_for_run(&input.run_id)?;
+    let settings = render_settings(&SettingsPlan {
+        worker_kind: input.worker_kind,
+        workspace: &workspace,
+        boss_data_dir: boss_data_dir.as_deref(),
+        hooks_dir: &hooks_dir,
+        control_dir: &control_dir,
+    })?;
+    let body = settings.to_json()?;
+
+    // Refuse a symlink or shared hard link planted where the file goes.
+    check_private_entry(&control_dir)?;
+    check_private_entry(&settings_path)?;
+    fs::write(&settings_path, body)
+        .with_context(|| format!("writing agy session settings {}", settings_path.display()))?;
+
+    Ok(PermissionArtifacts {
+        config_files: vec![settings_path.clone()],
+        extra_args: vec![SETTINGS_FLAG.to_owned(), settings_path.display().to_string()],
+        env: Vec::new(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Post-spawn log check
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`verify_settings_log`] when nothing is wrong yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsLogCheck {
+    /// The CLI has not logged its settings yet. Not a failure: ask again.
+    NotYetInitialized,
+    /// Every initialisation line matches the rendered settings and no rule has
+    /// been reported invalid *so far*. The grant store reports malformed
+    /// entries on a separate, later line (about a second after initialisation
+    /// in the study), so this is not final: the caller must check again right
+    /// before it delivers input, and treat a later failure as fatal.
+    ConsistentSoFar,
+}
+
+/// The text the CLI logs after `CLI settings initialized: ` for `settings`,
+/// as Go formats the struct: space-separated slices, `Ask` empty.
+fn expected_initialized_fragment(settings: &SessionSettings) -> String {
+    format!(
+        "permissions=&{{Allow:[{}] Deny:[{}] Ask:[]}}, toolPermission={}",
+        settings.allow_rules().join(" "),
+        settings.deny_rules().join(" "),
+        settings.tool_permission
+    )
+}
+
+/// Check the `agy` log of a spawned run against the settings rendered for it.
+///
+/// Fails when the log reports any `ignoring invalid` entry (a dropped deny
+/// rule fails open), or when any `CLI settings initialized` line differs from
+/// what was rendered — which also catches a settings source other than
+/// `--settings` (or a later rewrite) changing the effective posture.
+/// `rendered_settings` is the file written by [`write_session_settings`]; it is
+/// re-parsed and re-validated, so a tampered file fails here too.
+pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result<SettingsLogCheck> {
+    let settings = parse_rendered(rendered_settings)?;
+    let invalid: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("ignoring invalid"))
+        .map(str::trim)
+        .collect();
+    if !invalid.is_empty() {
+        bail!(
+            "agy dropped rendered permission rules as invalid; a dropped deny rule fails open: {}",
+            invalid.join(" | ")
+        );
+    }
+
+    let expected = expected_initialized_fragment(&settings);
+    let mut initialised = false;
+    for line in log.lines().filter(|line| line.contains("CLI settings initialized")) {
+        initialised = true;
+        if !line.contains(&expected) {
+            bail!(
+                "agy initialised settings that differ from the rendered posture; \
+                 expected `{expected}`, log line `{}`",
+                line.trim()
+            );
+        }
+    }
+    Ok(if initialised {
+        SettingsLogCheck::ConsistentSoFar
+    } else {
+        SettingsLogCheck::NotYetInitialized
+    })
+}
+
+/// [`verify_settings_log`] over the run's files. A log that does not exist yet
+/// is [`SettingsLogCheck::NotYetInitialized`].
+pub fn verify_settings_log_files(settings_path: &Path, log_path: &Path) -> anyhow::Result<SettingsLogCheck> {
+    let rendered = fs::read_to_string(settings_path)
+        .with_context(|| format!("reading rendered agy settings {}", settings_path.display()))?;
+    let log = match fs::read_to_string(log_path) {
+        Ok(log) => log,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(SettingsLogCheck::NotYetInitialized),
+        Err(error) => return Err(error).with_context(|| format!("reading agy log {}", log_path.display())),
+    };
+    verify_settings_log(&rendered, &log)
+}
+
+#[cfg(test)]
+#[path = "permissions_tests.rs"]
+mod tests;
