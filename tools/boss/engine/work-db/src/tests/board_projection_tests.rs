@@ -6,7 +6,7 @@ use crate::{
 };
 use boss_metrics::population_timing::PopulationTrace;
 
-fn check(db: &WorkDb, product: &str, model: &mut Option<Projection>, now: i64) -> Refresh {
+pub(super) fn check(db: &WorkDb, product: &str, model: &mut Option<Projection>, now: i64) -> Refresh {
     let (tree, refresh) = db
         .refresh_board_projection(
             product,

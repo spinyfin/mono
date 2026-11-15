@@ -1267,7 +1267,7 @@ impl WorkDb {
         // Derived per-card fields (revision projections, review/CI flags,
         // badges, doc links). Shared with the runtime patch so a patched
         // card is the card this tree would have produced.
-        let tasks = super::board_patch::attach_board_derivations(
+        let mut tasks = super::board_patch::attach_board_derivations(
             conn,
             tasks,
             &mut chores,
@@ -1277,6 +1277,10 @@ impl WorkDb {
             trace,
             review_cache,
         );
+        // The Navigator projection reads every derivation above and each
+        // card's runtime, so it is the last one attached.
+        let runtime_index = task_runtimes.iter().map(|r| (r.work_item_id.as_str(), r)).collect();
+        super::navigator_projection::attach_navigator(conn, &mut tasks, &mut chores, &runtime_index)?;
 
         let ideas = list_ideas_in_tx(conn, product_id, None)?;
         let attention_items = super::attentions::reads::list_items(conn, product_id)?;

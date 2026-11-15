@@ -543,6 +543,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         ready_for_review: false,
         review_section: None,
         pr_updated_at: None,
+        navigator: None,
         doc_link_state: None,
         review_guide_lifecycle: None,
         review_guide_readable_version_id: None,
@@ -648,6 +649,7 @@ mod design_doc_contention_tests;
 
 mod board_projection_scale;
 mod board_projection_tests;
+mod navigator_projection_tests;
 
 mod task_status_audit_tests;
 

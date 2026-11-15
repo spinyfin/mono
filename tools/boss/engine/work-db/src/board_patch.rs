@@ -23,7 +23,7 @@ use boss_protocol::WorkRuntimePatchItem;
 
 /// Columns the board reads for every task and chore row. Shared by the tree
 /// queries and the patch query so a card cannot be read two different ways.
-const BOARD_TASK_COLUMNS: &str = "id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question";
+pub(super) const BOARD_TASK_COLUMNS: &str = "id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question";
 
 /// The board's tasks lane: every project-member kind plus chores and
 /// follow-ups carrying a project id.
@@ -298,7 +298,7 @@ pub(super) fn read_cards(
     // A patch names a few chains; recomputing their owners is cheaper
     // than a cache pass, and keeps the patch a pure function of the
     // snapshot.
-    let tasks = attach_board_derivations(
+    let mut tasks = attach_board_derivations(
         conn,
         tasks,
         &mut chores,
@@ -308,6 +308,9 @@ pub(super) fn read_cards(
         &mut trace,
         None,
     );
+    // Same final step, over the same whole families, as the complete tree.
+    let runtime_index = runtimes.iter().map(|(id, runtime)| (id.as_str(), runtime)).collect();
+    super::navigator_projection::attach_navigator(conn, &mut tasks, &mut chores, &runtime_index)?;
 
     let present: HashSet<&str> = tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
     let absent = requested

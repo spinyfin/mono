@@ -2026,6 +2026,7 @@ dependencies = [
  "boss-protocol-spoke",
  "boss-review-guide",
  "boss-task-scope",
+ "boss-work-navigator",
  "boss-write-batch",
  "chrono",
  "fastrand 2.4.1",
