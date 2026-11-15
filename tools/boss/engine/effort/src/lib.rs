@@ -2212,18 +2212,78 @@ mod tests {
     // --- reasoning: the capability lever, independent of effort ---
 
     #[test]
-    fn agy_investigation_large_records_concrete_catalogue_id() {
-        let cfg = resolve_spawn_config(
-            &SpawnResolutionInput::builder()
-                .task_driver("agy")
-                .effort_level(EffortLevel::Large)
-                .kind(&TaskKind::Chore)
-                .reasoning(ReasoningMode::Investigation)
-                .build(),
-        )
-        .unwrap();
-        assert_eq!(cfg.model, "gemini-4-carbon-high");
-        assert_eq!(cfg.effort_value, Some("high"));
+    fn agy_spawn_model_and_effort_agree() {
+        let mut cases = Vec::new();
+        for reasoning in [ReasoningMode::Standard, ReasoningMode::Investigation] {
+            for (level, rung) in [
+                (EffortLevel::Trivial, "low"),
+                (EffortLevel::Small, "medium"),
+                (EffortLevel::Medium, "high"),
+                (EffortLevel::Large, "xhigh"),
+                (EffortLevel::Max, "xhigh"),
+            ] {
+                let menu = menu_for_driver_in(&DriverRegistry::default(), "agy").unwrap();
+                let family = (menu.model_for_reasoning)(reasoning);
+                let rung = if rung == "xhigh" && family != "gemini-4-hydrogen" {
+                    "high"
+                } else {
+                    rung
+                };
+                cases.push((reasoning, Some(level), None, false, format!("{family}-{rung}"), rung));
+            }
+        }
+        cases.extend([
+            (
+                ReasoningMode::Standard,
+                None,
+                Some("gemini-4-hydrogen"),
+                false,
+                "gemini-4-hydrogen-medium".into(),
+                "medium",
+            ),
+            (
+                ReasoningMode::Investigation,
+                None,
+                Some("gemini-4-carbon"),
+                false,
+                "gemini-4-carbon-medium".into(),
+                "medium",
+            ),
+            (
+                ReasoningMode::Standard,
+                Some(EffortLevel::Large),
+                Some("gemini-4-carbon-low"),
+                false,
+                "gemini-4-carbon-low".into(),
+                "low",
+            ),
+            (
+                ReasoningMode::Investigation,
+                Some(EffortLevel::Small),
+                Some("gemini-4-carbon"),
+                true,
+                "gemini-4-carbon-high".into(),
+                "high",
+            ),
+        ]);
+        for (reasoning, level, model, design, expected_model, expected_effort) in cases {
+            let cfg = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .task_driver("agy")
+                    .maybe_effort_level(level)
+                    .maybe_model_override(model)
+                    .kind(if design { &TaskKind::Design } else { &TaskKind::Chore })
+                    .reasoning(reasoning)
+                    .design_reasoning_effort_xhigh(design)
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(
+                (cfg.model.as_str(), cfg.effort_value),
+                (expected_model.as_str(), Some(expected_effort)),
+                "{reasoning:?} {level:?} pin={model:?} design={design}"
+            );
+        }
     }
 
     #[test]

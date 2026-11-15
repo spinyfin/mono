@@ -1869,6 +1869,11 @@ pub trait AgentDriver: Send + Sync {
             .unwrap_or_default()
     }
 
+    /// Whether unpinned traffic can launch on this driver. Skeletons opt out.
+    fn launch_ready(&self) -> bool {
+        true
+    }
+
     /// Explicit remote-spawn declaration. Drivers default to host-local until
     /// they prove their per-run state can be provisioned remotely.
     fn remote_spawn_host_independent(&self) -> bool {
@@ -2400,6 +2405,24 @@ pub trait AgentDriver: Send + Sync {
     /// error: an absent payload is a normal outcome the caller already
     /// handles.
     fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate>;
+}
+
+macro_rules! agent_rules_preamble {
+    ($observation:literal, $extra:literal) => {
+        concat!(
+            "You are running inside a managed worker session. The engine\n\
+     spawned you in a leased cube workspace and observes this session\n\
+     ",
+            $observation,
+            "\n\
+     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
+     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+     strong stated justification.\n\
+     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
+     in a shell `timeout`.",
+            $extra
+        )
+    };
 }
 
 pub mod agy;

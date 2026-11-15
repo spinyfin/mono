@@ -701,14 +701,7 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// `boss_engine::worker_setup::render_claude_md`.
-const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
-     spawned you in a leased cube workspace and observes this session\n\
-     via claude hooks.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
-     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
-     in a shell `timeout`.";
+const CLAUDE_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!("via claude hooks.", "");
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///

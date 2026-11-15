@@ -796,7 +796,7 @@ fn interrupt_plan_defaults_to_none_and_agrees_with_the_transport() {
     assert_eq!(stub.interrupt(), InterruptDelivery::Unsupported);
 }
 
-/// Every registered driver must declare an interrupt plan that its own
+/// Every launch-ready driver must declare an interrupt plan that its own
 /// transport declaration agrees with, and the plan must be able to run at all
 /// (at least one press, at least one attempt).
 ///
@@ -804,10 +804,15 @@ fn interrupt_plan_defaults_to_none_and_agrees_with_the_transport() {
 /// driver added tomorrow is covered the day it is registered rather than the
 /// day someone remembers to extend this list.
 #[test]
-fn every_registered_driver_declares_a_runnable_interrupt_plan() {
+fn launch_ready_drivers_have_plans_and_skeletons_declare_unsupported() {
     let registry = registry::DriverRegistry::default();
     for slug in registry.slugs() {
         let driver = registry.require(slug).expect("slug came from the registry");
+        if !driver.launch_ready() {
+            assert_eq!(driver.interrupt(), InterruptDelivery::Unsupported, "{slug}");
+            assert!(driver.interrupt_plan().is_none(), "{slug}");
+            continue;
+        }
         let plan = driver
             .interrupt_plan()
             .unwrap_or_else(|| panic!("driver {slug} declares no interrupt plan"));
@@ -864,10 +869,6 @@ fn a_recovery_observer_plan_comes_with_a_recovery_implementation() {
         let cancellation_records = [
             serde_json::json!({"type": "turn_ended", "outcome": "cancelled"}),
             serde_json::json!({"type": "turn.aborted", "reason": "interrupted"}),
-            serde_json::json!({
-                "type": "log",
-                "message": "Cancelling in-progress response for conversation 00000000-0000-0000-0000-000000000000",
-            }),
         ];
         assert!(
             cancellation_records

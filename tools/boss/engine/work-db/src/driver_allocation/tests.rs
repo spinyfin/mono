@@ -121,8 +121,8 @@ fn unparseable_or_invalid_persisted_split_falls_back_to_the_default() {
     }
 }
 
-/// Eligibility is the dispatch capability gate, not a list this module
-/// keeps. Asserted against `check_dispatch` itself for every kind, so a
+/// Eligibility combines driver launch readiness with the dispatch capability
+/// gate. Asserted against `check_dispatch` for every kind, so a
 /// `KindRequirements` or `CapabilitySet` change moves both together or
 /// fails here.
 ///
@@ -133,7 +133,7 @@ fn unparseable_or_invalid_persisted_split_falls_back_to_the_default() {
 /// (`ConflictResolution` / `CiRemediation`) are covered separately by
 /// `conflict_resolution_and_ci_remediation_are_never_allocated`.
 #[test]
-fn eligibility_is_exactly_what_the_dispatch_gate_says() {
+fn eligibility_requires_launch_readiness_and_the_dispatch_gate() {
     let registry = boss_engine_driver::DriverRegistry::default();
     let execution_kind = ExecutionKind::ChoreImplementation;
     for kind in TaskKind::ALL {
@@ -146,8 +146,8 @@ fn eligibility_is_exactly_what_the_dispatch_gate_says() {
                 .is_some_and(|resolver| resolver.check_dispatch(kind, Some(&execution_kind)).is_ok());
             assert_eq!(
                 eligible.contains(&driver),
-                gate_ok,
-                "{driver} eligibility for {kind} must be the gate's answer, not a local rule",
+                gate_ok && registry.get(driver).is_some_and(|driver| driver.launch_ready()),
+                "{driver} eligibility for {kind} must require both readiness and the gate",
             );
         }
     }
@@ -694,29 +694,20 @@ fn allocation_renormalises_four_shares_and_never_revives_zero_agy() {
     assert!(err.to_string().contains("agy=0"));
 }
 
-/// Once `agy` is registered, a non-zero share actually lands on it. The
-/// default split still ships `agy = 0`; this covers the Settings path
-/// that raises the share after the driver exists.
+/// Old shares are redistributed among launchable drivers.
 #[test]
-fn registered_agy_share_is_allocated() {
-    let registry = boss_engine_driver::DriverRegistry::default();
-    assert!(
-        registry.get(DRIVER_SLUG_AGY).is_some(),
-        "agy must be a registered driver for a non-zero share to be reachable",
-    );
-    let registered: Vec<_> = registry.slugs().collect();
-
+fn unready_agy_share_is_redistributed() {
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 30, 40))
         .unwrap();
     let product = create_test_product(&db);
-    let mut saw_agy = false;
-    for driver in allocated_drivers(&db, &product.id, 200) {
-        let slug = driver.expect("an allocated row always names a driver");
-        saw_agy |= slug == DRIVER_SLUG_AGY;
-        assert!(registered.contains(&slug.as_str()), "{slug} is not a registered driver",);
+    let drivers = allocated_drivers(&db, &product.id, 200);
+    for slug in &drivers {
+        assert!(matches!(slug.as_deref(), Some("claude" | "codex" | "grok")));
     }
-    assert!(saw_agy, "agy's 40% share must receive some eligible chores");
+    for expected in ["claude", "codex", "grok"] {
+        assert!(drivers.iter().any(|slug| slug.as_deref() == Some(expected)));
+    }
 }
 
 /// A leftover `agy` share next to a funded registered driver must not
@@ -759,37 +750,33 @@ fn conflict_resolution_and_ci_remediation_fail_loudly_when_claude_is_at_zero_eve
 }
 
 #[test]
-fn whole_share_sits_on_unregistered_drivers_requires_eligible_set_and_all_registered_at_zero() {
+fn whole_share_sits_on_unavailable_drivers_requires_eligible_set_and_all_registered_at_zero() {
     let agy_partial = DriverTrafficSplit::new(0, 0, 90, 10);
     let agy_all = DriverTrafficSplit::new(0, 0, 0, 100);
     let no_agy = DriverTrafficSplit::new(0, 0, 100, 0);
 
     assert!(
-        !whole_share_sits_on_unregistered_drivers(&agy_partial, &[DRIVER_SLUG_CLAUDE]),
+        !whole_share_sits_on_unavailable_drivers(&agy_partial, &[DRIVER_SLUG_CLAUDE]),
         "a leftover agy share with funded registered drivers is not the whole-share fallback",
     );
     assert!(
-        !whole_share_sits_on_unregistered_drivers(&agy_partial, &[]),
+        !whole_share_sits_on_unavailable_drivers(&agy_partial, &[]),
         "an empty eligible set is NoEligibleDriver, not a fallback",
     );
     assert!(
-        !whole_share_sits_on_unregistered_drivers(&agy_all, &[]),
+        !whole_share_sits_on_unavailable_drivers(&agy_all, &[]),
         "agy = 100 must not convert an empty eligible set into default routing",
     );
     assert!(
-        !whole_share_sits_on_unregistered_drivers(&agy_all, &[DRIVER_SLUG_CLAUDE]),
-        "agy is registered, so agy = 100 is a real share rather than an unregistered fallback",
+        whole_share_sits_on_unavailable_drivers(&agy_all, &[DRIVER_SLUG_CLAUDE]),
+        "agy cannot launch, so its whole share falls back",
     );
-    assert!(!whole_share_sits_on_unregistered_drivers(
-        &no_agy,
-        &[DRIVER_SLUG_CLAUDE]
-    ));
+    assert!(!whole_share_sits_on_unavailable_drivers(&no_agy, &[DRIVER_SLUG_CLAUDE]));
 }
 
-/// `agy = 100` with the driver registered sends every eligible chore to
-/// agy rather than falling through to the engine default.
+/// An old agy-only share falls through to the engine default.
 #[test]
-fn agy_at_one_hundred_allocates_to_agy() {
+fn agy_at_one_hundred_uses_engine_default() {
     assert!(
         boss_engine_driver::DriverRegistry::default()
             .get(DRIVER_SLUG_AGY)
@@ -803,8 +790,7 @@ fn agy_at_one_hundred_allocates_to_agy() {
     let chore = create_test_chore(&db, &product.id, "agy 100 registered");
     let execution = create_ready_chore_execution(&db, &chore.id);
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.reason, REASON_ALLOCATION);
-    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_AGY));
+    assert_eq!(decision, DriverDecision::default_no_override());
 }
 
 /// Restricting to a subset keeps allocation inside that subset for every
@@ -853,7 +839,7 @@ fn a_driver_at_zero_receives_no_rows_end_to_end() {
 
 /// Three of four at zero: every eligible row goes to the funded registered driver.
 #[test]
-fn three_drivers_at_zero_send_everything_to_the_funded_registered_driver() {
+fn sole_funded_driver_is_allocated_only_when_launch_ready() {
     for (split, expected) in [
         (DriverTrafficSplit::new(100, 0, 0, 0), DRIVER_SLUG_GROK),
         (DriverTrafficSplit::new(0, 100, 0, 0), DRIVER_SLUG_CLAUDE),
@@ -863,8 +849,16 @@ fn three_drivers_at_zero_send_everything_to_the_funded_registered_driver() {
         let (_dir, db) = open_db();
         db.set_driver_traffic_split(split).unwrap();
         let product = create_test_product(&db);
-        for driver in allocated_drivers(&db, &product.id, 50) {
-            assert_eq!(driver.as_deref(), Some(expected), "under {split:?}");
+        for i in 0..50 {
+            let chore = create_test_chore(&db, &product.id, format!("sole share {i}"));
+            let execution = create_ready_chore_execution(&db, &chore.id);
+            let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+            if expected == DRIVER_SLUG_AGY {
+                assert_eq!(decision, DriverDecision::default_no_override());
+            } else {
+                assert_eq!(decision.reason, REASON_ALLOCATION);
+                assert_eq!(decision.driver.as_deref(), Some(expected), "under {split:?}");
+            }
         }
     }
 }
