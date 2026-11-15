@@ -242,6 +242,13 @@ fn measure(db: &WorkDb, product: &str, expected: Option<usize>) {
         let start = Instant::now();
         let mut trace = PopulationTrace::new(product, "scale", Some(i64::try_from(sample).unwrap()), start);
         let tree = db.get_work_tree_instrumented(product, &mut trace).unwrap();
+        let navigator = trace.segment_counts(segment::DB_NAVIGATOR).unwrap();
+        assert_eq!(
+            navigator.2,
+            Some(4),
+            "Navigator query count is independent of card count"
+        );
+        println!("scale navigator={navigator:?}");
         let bytes = serde_json::to_vec(&tree).unwrap().len();
         totals.push(start.elapsed().as_secs_f64() * 1000.0);
         reviews.push(trace.segment_counts(segment::DB_AI_REVIEW_STATE).unwrap().0);

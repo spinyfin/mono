@@ -52,14 +52,13 @@ use boss_protocol::{
     NAVIGATOR_PROJECTION_VERSION, NavigatorProjection, NavigatorRoot, Task, TaskKind, TaskRuntime, TaskStatus,
 };
 use boss_work_navigator as nav;
-use rusqlite::OptionalExtension;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 /// Run-level states that are authoritative evidence the worker has exited.
 /// `completed` is not among them: the dispatch path marks the spawn run
 /// completed while the execution stays live (see `record_run_completion`).
-const RUN_EXITED: [&str; 4] = ["failed", "abandoned", "cancelled", "orphaned"];
+const RUN_EXITED: [&str; 2] = ["failed", "orphaned"];
 
 /// Complete the Navigator projection of every family in the given cards.
 /// `runtimes` is keyed by work item id and covers every card. Cards the Work
@@ -92,88 +91,38 @@ struct FamilyCards<'a> {
 /// visible cards, loaded from the same snapshot. Deleted and cross-product
 /// rows are not included: those chains stay unresolved.
 fn load_off_board_family_members(conn: &Connection, tasks: &[Task], chores: &[Task]) -> Result<Vec<Task>> {
-    let visible: HashSet<&str> = tasks.iter().chain(chores).map(|task| task.id.as_str()).collect();
-    let mut needed: BTreeSet<String> = BTreeSet::new();
-    for task in tasks.iter().chain(chores) {
-        if task.kind != TaskKind::Revision {
-            for id in chain_helpers::collect_chain_revision_ids(conn, &task.id)? {
-                if !visible.contains(id.as_str()) {
-                    needed.insert(id);
-                }
-            }
-            continue;
-        }
-        let Some(owner) = resolved_owner(conn, task)? else {
-            continue;
-        };
-        if visible.contains(owner.as_str()) {
-            continue;
-        }
-        needed.insert(owner.clone());
-        for id in chain_helpers::collect_chain_revision_ids(conn, &owner)? {
-            if !visible.contains(id.as_str()) {
-                needed.insert(id);
-            }
-        }
-    }
-    load_tasks_by_id(conn, &needed)
-}
-
-/// The non-revision owner of `task`, walking through archived ancestors.
-/// `None` when the chain is unresolved: missing, tombstoned or cross-product
-/// parent, a revision with no parent, or depth/cycle overflow.
-fn resolved_owner(conn: &Connection, task: &Task) -> Result<Option<String>> {
-    if task.kind != TaskKind::Revision {
-        return Ok(Some(task.id.clone()));
-    }
-    let product_id = task.product_id.as_str();
-    let mut next = task.parent_task_id.clone();
-    let mut seen = HashSet::from([task.id.clone()]);
-    for _ in 0..chain_helpers::MAX_CHAIN_DEPTH {
-        let Some(id) = next.take() else {
-            return Ok(None);
-        };
-        if !seen.insert(id.clone()) {
-            return Ok(None);
-        }
-        let row: Option<(String, Option<String>, String, Option<String>)> = conn
-            .query_row(
-                "SELECT kind, parent_task_id, product_id, deleted_at FROM tasks WHERE id = ?1",
-                [&id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        let Some((kind, parent, product, deleted_at)) = row else {
-            return Ok(None);
-        };
-        if deleted_at.is_some() || product != product_id {
-            return Ok(None);
-        }
-        if kind != "revision" {
-            return Ok(Some(id));
-        }
-        next = parent;
-    }
-    Ok(None)
-}
-
-fn load_tasks_by_id(conn: &Connection, ids: &BTreeSet<String>) -> Result<Vec<Task>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
+    let visible = id_array(
+        &tasks
+            .iter()
+            .chain(chores)
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+    );
+    // UNION deduplicates the frontier, including cycles. Walk the whole set
+    // together rather than issuing an owner/descendant query for each card.
+    // Only missing cards are materialized; live cards retain their derivations.
+    // Product and deletion checks apply at every edge.
     let sql = format!(
-        "SELECT {} FROM tasks WHERE id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL",
+        "WITH RECURSIVE family(id, product_id, kind, parent_task_id) AS (
+            SELECT id, product_id, kind, parent_task_id FROM tasks
+            WHERE id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL
+            UNION
+            SELECT p.id, p.product_id, p.kind, p.parent_task_id
+            FROM tasks p JOIN family f ON f.parent_task_id = p.id
+            WHERE f.kind = 'revision' AND p.product_id = f.product_id AND p.deleted_at IS NULL
+            UNION
+            SELECT c.id, c.product_id, c.kind, c.parent_task_id
+            FROM tasks c JOIN family f ON c.parent_task_id = f.id
+            WHERE c.kind = 'revision' AND c.product_id = f.product_id AND c.deleted_at IS NULL
+        )
+        SELECT {} FROM tasks
+        WHERE id IN (SELECT id FROM family)
+          AND id NOT IN (SELECT value FROM json_each(?1))",
         super::board_patch::BOARD_TASK_COLUMNS
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([id_array(ids.iter().map(String::as_str))?], |row| {
-        map_task_with_external_ref_parent_source_and_provenance(row)
-    })?;
-    let mut tasks = Vec::new();
-    for row in rows {
-        tasks.push(row?);
-    }
-    Ok(tasks)
+    let rows = stmt.query_map([visible], map_task_with_external_ref_parent_source_and_provenance)?;
+    collect_rows(rows)
 }
 
 fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task], extras: &'a [Task]) -> BTreeMap<&'a str, FamilyCards<'a>> {
@@ -201,6 +150,7 @@ fn group_families<'a>(tasks: &'a [Task], chores: &'a [Task], extras: &'a [Task])
         let mut owner = None;
         for _ in 0..chain_helpers::MAX_CHAIN_DEPTH {
             match top.parent_task_id.as_deref().and_then(|parent| cards.get(parent)) {
+                Some(parent) if parent.product_id != task.product_id => break,
                 Some(parent) if parent.kind != TaskKind::Revision => {
                     owner = Some(*parent);
                     break;
@@ -264,32 +214,31 @@ struct Inputs {
     evidence: HashMap<String, Vec<(String, String)>>,
 }
 
-fn id_array<'a>(ids: impl Iterator<Item = &'a str>) -> Result<String> {
-    Ok(serde_json::to_string(&ids.collect::<Vec<_>>())?)
-}
-
 fn read_inputs(conn: &Connection, families: &BTreeMap<&str, FamilyCards<'_>>) -> Result<Inputs> {
     let mut inputs = Inputs::default();
     let open_members = id_array(
-        families
+        &families
             .values()
             .flat_map(|family| std::iter::once(family.root).chain(family.revisions.iter().copied()))
             .filter(|task| !task.status.is_terminal())
-            .map(|task| task.id.as_str()),
-    )?;
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+    );
     let questions_for = id_array(
-        families
+        &families
             .values()
             .flat_map(|family| std::iter::once(family.root).chain(family.revisions.iter().copied()))
             .filter(|task| task.status != TaskStatus::Archived)
-            .map(|task| task.id.as_str()),
-    )?;
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+    );
     let roots = id_array(
-        families
+        &families
             .values()
             .filter(|family| !family.fallback)
-            .map(|family| family.root.id.as_str()),
-    )?;
+            .map(|family| family.root.id.as_str())
+            .collect::<Vec<_>>(),
+    );
 
     let mut stmt = conn.prepare(
         "SELECT e.id, e.work_item_id, e.kind, e.status, e.created_at, e.started_at,
@@ -338,9 +287,10 @@ fn read_inputs(conn: &Connection, families: &BTreeMap<&str, FamilyCards<'_>>) ->
     }
 
     let mut stmt = conn.prepare(
-        "SELECT association_task_id, id, state, created_at FROM attention_groups
+        "SELECT COALESCE(association_task_id, source_task_id), id, state, created_at FROM attention_groups
          WHERE kind = 'question' AND state IN ('open', 'partially_answered')
-           AND association_task_id IN (SELECT value FROM json_each(?1))
+           AND (association_task_id IN (SELECT value FROM json_each(?1))
+                OR (source_kind = 'task_transcript' AND source_task_id IN (SELECT value FROM json_each(?1))))
          ORDER BY created_at ASC, id ASC",
     )?;
     let rows = stmt.query_map([&questions_for], |row| {
@@ -524,14 +474,11 @@ fn execution_status(status: &ExecutionStatus) -> nav::ExecutionStatus {
 /// A `completed` run under a live execution is the production dispatch shape
 /// (the WorkRun tracks the spawn action, not the worker's lifetime) and is
 /// treated as Running, or WaitingInput when the execution is waiting on a
-/// person. Failed/abandoned/cancelled/orphaned runs stay Exited even if the
-/// execution has not yet been reconciled, and `suspended` stays Suspended.
+/// person. An `active` spawn or re-adopted run uses the same execution state.
+/// Failed/orphaned runs stay Exited even before execution reconciliation.
 fn run_state(execution: &ExecutionStatus, status: Option<&str>) -> nav::RunState {
     match status {
-        Some("suspended") => nav::RunState::Suspended,
-        Some("waiting_human" | "waiting_input") => nav::RunState::WaitingInput,
-        Some("running") => nav::RunState::Running,
-        Some("completed") if execution.is_live() => match execution {
+        Some("active" | "completed") if execution.is_live() => match execution {
             ExecutionStatus::WaitingHuman => nav::RunState::WaitingInput,
             _ => nav::RunState::Running,
         },
@@ -1211,11 +1158,11 @@ mod tests {
     #[test]
     fn run_states_cover_the_run_vocabulary() {
         assert_eq!(
-            run_state(&ExecutionStatus::Running, Some("running")),
+            run_state(&ExecutionStatus::Running, Some("active")),
             nav::RunState::Running
         );
         assert_eq!(
-            run_state(&ExecutionStatus::WaitingHuman, Some("waiting_human")),
+            run_state(&ExecutionStatus::WaitingHuman, Some("active")),
             nav::RunState::WaitingInput
         );
         assert_eq!(
@@ -1244,10 +1191,6 @@ mod tests {
                 "{exited}"
             );
         }
-        assert_eq!(
-            run_state(&ExecutionStatus::Running, Some("suspended")),
-            nav::RunState::Suspended
-        );
         assert_eq!(run_state(&ExecutionStatus::Completed, None), nav::RunState::Unavailable);
         assert_eq!(
             run_state(&ExecutionStatus::Completed, Some("unrecognised")),
