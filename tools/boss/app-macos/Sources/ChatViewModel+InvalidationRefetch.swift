@@ -47,6 +47,22 @@ struct RefetchCoalescingPolicy: Equatable, Sendable {
     static let standard = RefetchCoalescingPolicy(window: .milliseconds(150), maxWait: .seconds(1))
 }
 
+/// Where the coalesced refetch timers read the time and how they wait: the
+/// one timer per product behind [[ChatViewModel.scheduleRefetch]] and the
+/// resync timer in `ChatViewModel+ResyncRefetch.swift`. The app runs them on
+/// the continuous clock. A test substitutes a clock it advances by hand, so
+/// what it asserts does not depend on when the host fires a timer.
+struct RefetchClock: Sendable {
+    var now: @Sendable () -> ContinuousClock.Instant
+    /// Suspends for the duration, or throws if the task is cancelled first.
+    var sleep: @MainActor @Sendable (Duration) async throws -> Void
+
+    static let continuous = RefetchClock(
+        now: { ContinuousClock.now },
+        sleep: { try await Task.sleep(for: $0) }
+    )
+}
+
 /// Triggers collected for one product while its timer is pending.
 struct PendingRefetchBurst {
     let firstTriggerAt: ContinuousClock.Instant
@@ -115,7 +131,8 @@ extension ChatViewModel {
         itemIDs: [String] = [],
         includesAllOpenConsumers: Bool = false
     ) {
-        let now = ContinuousClock.now
+        let clock = refetchClock
+        let now = clock.now()
         var burst = pendingRefetchBursts[productID] ?? PendingRefetchBurst(firstTriggerAt: now, flow: flow)
         burst.flow = flow
         burst.scope.formUnion(scope)
@@ -128,7 +145,7 @@ extension ChatViewModel {
         let delay = min(policy.window, untilCap)
         pendingWorkTreeRefetchTasks[productID]?.cancel()
         pendingWorkTreeRefetchTasks[productID] = Task { [weak self] in
-            try? await Task.sleep(for: delay)
+            try? await clock.sleep(delay)
             guard !Task.isCancelled else { return }
             self?.fireRefetchBurst(productID: productID)
         }

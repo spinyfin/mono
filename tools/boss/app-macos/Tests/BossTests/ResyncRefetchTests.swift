@@ -9,7 +9,9 @@ import XCTest
 ///
 /// The exponential schedule is tested on the gate with explicit instants, so
 /// no assertion depends on a clock. The model-level tests use real timers
-/// with short windows and wait for the requests rather than for a fixed time.
+/// with short windows and wait for the requests rather than for a fixed time,
+/// except those about when something is sent relative to something else:
+/// they run on a `ManualRefetchClock`.
 @MainActor
 final class ResyncRefetchTests: XCTestCase {
 
@@ -199,18 +201,24 @@ final class ResyncRefetchTests: XCTestCase {
 
     // MARK: - Model: joining a pending burst
 
+    /// On a clock the test advances: a real 50 ms sleep that came back late
+    /// put the resync after the invalidation's window, where it rightly
+    /// costs a second tree fetch.
     func testResyncMidWindowOfAnInvalidationSharesOneProductRefetch() async {
         let (model, recorder) = makeModel()
         model.refetchCoalescingPolicy = .init(window: .milliseconds(150), maxWait: .seconds(2))
+        let clock = ManualRefetchClock(driving: model)
 
         model.applyEventForTest(.workInvalidated(topic: "work.product.prod_a", productId: "prod_a", itemIds: []))
-        try? await Task.sleep(for: .milliseconds(50))
+        await clock.advance(by: .milliseconds(50))
+        XCTAssertTrue(recorder.sent.isEmpty, "the invalidation's window is still open when the resync arrives")
         model.applyEventForTest(.resyncRequired)
-        await waitForSet(model, recorder)
+        await clock.advance(by: .milliseconds(150))
 
         XCTAssertEqual(recorder.counts["get_work_tree"], 1, "invalidation and resync in one window cost one tree fetch")
         XCTAssertEqual(recorder.counts["list_deferred_scope_attentions"], 1)
         XCTAssertEqual(recorder.counts["list_products"], 1)
+        XCTAssertEqual(clock.timersAsleep, 0, "and nothing further is pending")
     }
 
     func testInvalidationAfterResyncSharesOneProductRefetch() async {
@@ -346,23 +354,22 @@ final class ResyncRefetchTests: XCTestCase {
         let (model, recorder) = makeModel(policy: .init(
             window: .milliseconds(20), initialBackoff: backoff, maxBackoff: .seconds(5), quietReset: .seconds(60)
         ))
+        let clock = ManualRefetchClock(driving: model)
 
         model.applyEventForTest(.resyncRequired)
-        await waitForSet(model, recorder)
-        let firstSetAt = ContinuousClock.now
+        await clock.advance(by: .milliseconds(20))
         XCTAssertEqual(recorder.counts["list_products"], 1)
 
         // A storm continues right after the first set: it must neither send
         // anything inside the backoff nor be dropped.
         for _ in 0..<10 { model.applyEventForTest(.resyncRequired) }
-        try? await Task.sleep(for: .milliseconds(20))
+        await clock.advance(by: backoff - .milliseconds(1))
         XCTAssertEqual(recorder.counts["list_products"], 1, "no second set inside the backoff")
         XCTAssertTrue(model.resyncRefetchGate.isDirty, "the resyncs are remembered")
 
-        await waitUntil(recorder, verb: "list_products", count: 2)
-        let secondSetAfter = firstSetAt.duration(to: .now)
-        XCTAssertGreaterThanOrEqual(secondSetAfter, backoff - .milliseconds(50), "the trailing set honours the backoff")
-        _ = await model.waitForRefetchBurstsForTest()
+        await clock.advance(by: .milliseconds(1))
+        XCTAssertEqual(recorder.counts["list_products"], 2, "the trailing set goes out as the backoff ends")
+        await clock.advance(by: .seconds(5))
         XCTAssertEqual(recorder.counts["list_products"], 2, "ten resyncs in the backoff cost one trailing set")
         XCTAssertFalse(model.resyncRefetchGate.isDirty)
     }
@@ -385,14 +392,16 @@ final class ResyncRefetchTests: XCTestCase {
         let (model, recorder) = makeModel(policy: .init(
             window: .milliseconds(10), initialBackoff: .milliseconds(80), maxBackoff: .seconds(5), quietReset: .seconds(60)
         ))
+        let clock = ManualRefetchClock(driving: model)
 
         for _ in 0..<30 {
             model.applyEventForTest(.resyncRequired)
-            try? await Task.sleep(for: .milliseconds(5))
+            await clock.advance(by: .milliseconds(5))
         }
         // The last resync lands inside a backoff; its refetch still has to come.
-        let settled = await model.waitForRefetchBurstsForTest()
-        XCTAssertTrue(settled)
+        XCTAssertTrue(model.resyncRefetchGate.isDirty)
+        await clock.advance(by: .seconds(5))
+        XCTAssertEqual(clock.timersAsleep, 0)
         XCTAssertFalse(model.resyncRefetchGate.isDirty, "a storm never ends with an unserved resync")
         let sets = recorder.counts["list_products"] ?? 0
         XCTAssertGreaterThanOrEqual(sets, 2, "the storm outlasted the first backoff, so a trailing set was needed")

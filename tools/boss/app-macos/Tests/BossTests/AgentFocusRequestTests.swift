@@ -54,6 +54,8 @@ final class AgentFocusRequestTests: XCTestCase {
 
     func testRetryWaitsForReadinessAndReportsActualResult() async {
         let coordinator = AgentFocusCoordinator()
+        var waits: [Duration] = []
+        coordinator.retrySleep = { waits.append($0) }
         let finished = expectation(description: "focused")
         var attempts = 0
         coordinator.report = { runId, result in
@@ -67,6 +69,7 @@ final class AgentFocusRequestTests: XCTestCase {
         }
         await fulfillment(of: [finished], timeout: 3)
         XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(waits, [.milliseconds(50), .milliseconds(50)], "it waits between attempts, and not after the one that succeeds")
     }
 
     func testNewRequestCancelsOldFocus() async {
@@ -84,6 +87,12 @@ final class AgentFocusRequestTests: XCTestCase {
     func testViewerlessRevealRequestsCardFocusAndReportsMissingWindow() async {
         let workspace = WorkersWorkspaceModel()
         workspace.agentsRevealHandler = { _ in .revealed }
+        // The card never mounts, so the request reports only after its whole
+        // retry budget. The waits are recorded instead of served: at 20 real
+        // 50 ms sleeps the report took a second, and longer than this test's
+        // timeout on a host whose timers fire three to four times late.
+        var waits: [Duration] = []
+        workspace.agentFocus.retrySleep = { waits.append($0) }
         let finished = expectation(description: "card focus attempted")
         workspace.agentFocus.report = { runId, result in
             XCTAssertEqual(runId, "viewerless")
@@ -97,6 +106,10 @@ final class AgentFocusRequestTests: XCTestCase {
             return XCTFail("reveal should succeed")
         }
         await fulfillment(of: [finished], timeout: 3)
+        XCTAssertEqual(
+            waits.reduce(.zero, +), .seconds(1),
+            "an unmounted card is retried for one second before the failure is reported"
+        )
     }
 
     private func makeModel() -> ChatViewModel {
