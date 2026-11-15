@@ -895,9 +895,8 @@ impl ServerState {
     /// [`PaneInjectOutcome::Buffered`]. Neither is an error, and neither is
     /// proof of loss — see the module docs for why callers must not
     /// auto-redeliver. Callers that already proved the worker is parked
-    /// (the interrupting probe path) treat `Unconfirmed` as the same
-    /// parked-write consumption the Stop-boundary path records, rather than
-    /// as a delivery failure.
+    /// hand `Unconfirmed` and `PaneEcho` to the parked-delivery watch
+    /// rather than treating the write as delivered.
     pub(super) async fn inject_pane_text_verified(&self, req: PaneInjectRequest<'_>) -> PaneInjectOutcome {
         let PaneInjectRequest {
             run_id,

@@ -826,11 +826,9 @@ pub(super) async fn dispatch_live_worker_state(
         return;
     }
     let stale_event = matches!(applied.outcome, ApplyEventOutcome::Stale { .. });
-    // The main session started a turn: a probe written into this worker's
-    // parked pane was taken. `resumed_after` is the ordering-aware reading; a
-    // prompt submission is one even for a slot with no boundary on record.
-    let prompt_submitted = matches!(incoming.event, boss_protocol::WorkerEvent::UserPromptSubmit { .. });
-    if applied.resumed_after.is_some() || (prompt_submitted && !stale_event && !incoming.connection.from_subagent) {
+    // Codex announces task_started before its user message reaches the rollout.
+    // Later main-session events (including Stop) must retry transcript evidence.
+    if !stale_event && !incoming.connection.from_subagent {
         let prompt = match &incoming.event {
             boss_protocol::WorkerEvent::UserPromptSubmit { prompt, .. } => Some(prompt.as_str()),
             _ => None,
@@ -2246,7 +2244,10 @@ async fn inject_probe_mid_turn(
             server_state.set_probe_submission(&probe_id, true, Some(ProbeResumeEvidence::Confirmed));
             ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed)
         }
-        PaneInjectOutcome::PaneEcho => {
+        outcome
+            if matches!(outcome, PaneInjectOutcome::PaneEcho)
+                || (matches!(outcome, PaneInjectOutcome::Unconfirmed) && !posture.is_mid_turn()) =>
+        {
             // The worker parked before the write. Verify submission with
             // the same bounded watch as any other parked pane write.
             server_state.mark_in_flight_probe_awaiting_turn_start(run_id, &probe_id, &probe.text);
@@ -2256,7 +2257,7 @@ async fn inject_probe_mid_turn(
                 slot_id,
                 &probe_id,
                 ProbeDeliveryState::Injected,
-                "probe pane echo observed; awaiting submission evidence",
+                "probe written into parked pane; awaiting submission evidence",
             )
             .await;
             if !state.is_undeliverable() {
@@ -2285,7 +2286,7 @@ async fn inject_probe_mid_turn(
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Buffered);
             ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Buffered)
         }
-        PaneInjectOutcome::Unconfirmed => {
+        PaneInjectOutcome::Unconfirmed | PaneInjectOutcome::PaneEcho => {
             tracing::warn!(
                 run_id,
                 slot_id,

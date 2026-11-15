@@ -77,14 +77,9 @@ const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// interrupting probe fail on a worker that visibly stopped.
 const PANE_TEXT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long the post-interrupt write waits for a consumption-confirming
-/// signal (`UserPromptSubmit` or transcript) before falling back to the
-/// parked-write contract. A pane capture is only an echo of our write and
-/// still takes that liveness-gated contract; a successful `send_keys` into a
-/// pane whose turn we already proved ended, with the process still alive, is
-/// `Consumed` — the same evidence the Stop-boundary parked path records
-/// without waiting at all. The window is for the stronger signals to win
-/// when they are fast, not a bound on whether the write counted.
+/// How long the post-interrupt write waits for prompt or transcript confirmation
+/// before handing it to the parked-delivery watch, which confirms the turn,
+/// presses Return again, or settles the write Unconfirmed.
 const POST_INTERRUPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// How long to wait for another dispatcher that already claimed this probe
@@ -705,7 +700,7 @@ async fn inject_after_interrupt(
 /// The answer given here is provisional in one direction: the write is
 /// watched for the turn it should start ([`super::parked_delivery`]), and a
 /// write that starts none is taken back to `Unconfirmed` and surfaced.
-async fn settle_unconfirmed_write(
+pub(super) async fn settle_unconfirmed_write(
     server_state: &ServerState,
     run_id: &str,
     slot_id: u8,
@@ -750,7 +745,7 @@ async fn settle_unconfirmed_write(
 /// its way, which holds the ladder without counting, and an abandoned one is
 /// handed back when the ladder next reads its fate
 /// ([`boss_engine_completion::ProbeQueuer::nudge_delivery`]).
-async fn requeue_after_write_declined(
+pub(super) async fn requeue_after_write_declined(
     server_state: &ServerState,
     run_id: &str,
     probe: PendingProbe,
@@ -760,7 +755,14 @@ async fn requeue_after_write_declined(
 ) -> InterruptingDelivery {
     let probe_id = probe.probe_id.clone();
     server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
-    if server_state.release_probe_reservation(run_id, probe) {
+    let deferred_completion = server_state
+        .take_in_flight_probe_if(run_id, &probe_id, |_| true)
+        .is_some_and(|claim| claim.deferred_completion);
+    let requeued = server_state.requeue_probe_front(run_id.to_owned(), probe);
+    if deferred_completion {
+        server_state.completion_handler.on_stop(run_id).await;
+    }
+    if requeued {
         tracing::warn!(
             run_id,
             probe_id = %probe_id,
@@ -801,7 +803,9 @@ async fn settle_interrupt_failure(
     // Drop the claim without re-queuing: the probe is settled terminally, and
     // leaving it in the pending queue would have a later boundary deliver
     // text the caller has already been told did not arrive.
-    server_state.take_in_flight_probe_if(run_id, &probe_id, |_| true);
+    let deferred_completion = server_state
+        .take_in_flight_probe_if(run_id, &probe_id, |_| true)
+        .is_some_and(|claim| claim.deferred_completion);
     let state = if failure.worker_gone {
         ProbeDeliveryState::Abandoned
     } else {
@@ -820,6 +824,9 @@ async fn settle_interrupt_failure(
     server_state
         .surface_undelivered_probe(run_id, &probe_id, state, &failure.detail)
         .await;
+    if deferred_completion {
+        server_state.completion_handler.on_stop(run_id).await;
+    }
     InterruptingDelivery::failed(failure.outcome, failure.attempts, failure.detail)
 }
 

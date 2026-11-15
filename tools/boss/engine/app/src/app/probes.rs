@@ -471,7 +471,6 @@ impl ServerState {
             .lock()
             .expect("in_flight_probes mutex poisoned")
             .get_mut(run_id)
-            .filter(|claim| claim.awaiting_turn_start)
         {
             claim.deferred_completion = true;
         }

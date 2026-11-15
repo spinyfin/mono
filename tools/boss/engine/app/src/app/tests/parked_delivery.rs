@@ -532,14 +532,12 @@ async fn confirmation_during_final_diagnostics_prevents_failure() {
     confirmation_during_capture(2 * RETURN_RETRIES, RETURN_RETRIES as usize).await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn mid_turn_dispatch_that_finds_a_parked_pane_watches_the_echo() {
+async fn mid_turn_parked_write(capture: &'static str) {
     let (server, _dir) = test_server_state();
     let run = register_idle_worker_with_driver(&server, SLOT, Some("claude"));
     server.worker_registry.register_tmux_run_slot(&run, SLOT, "boss-6");
     register_tmux_identity_for_test(&server, &run, "boss-6", super::tmux_stub::TEST_SPAWN_TOKEN);
-    let runner =
-        Arc::new(super::tmux_stub::RecordingPaneRunner::new("boss-6").capture_text("[nudge] push your branch"));
+    let runner = Arc::new(super::tmux_stub::RecordingPaneRunner::new("boss-6").capture_text(capture));
     *server.pane_delivery_tmux_override.write().unwrap() = Some(super::tmux_stub::tmux_with_runner(runner.clone()));
     let probe = server.queue_probe(run.clone(), "push your branch".into(), false);
     let event = hook(
@@ -562,6 +560,16 @@ async fn mid_turn_dispatch_that_finds_a_parked_pane_watches_the_echo() {
     assert!(!server.has_in_flight_probe(&run));
     assert_eq!(runner.return_presses(), 1 + RETURN_RETRIES as usize);
     assert_eq!(undelivered_probe_attentions(&server, &run).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_turn_dispatch_that_finds_a_parked_pane_watches_the_echo() {
+    mid_turn_parked_write("[nudge] push your branch").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_turn_dispatch_that_finds_a_parked_pane_watches_without_echo() {
+    mid_turn_parked_write("").await;
 }
 
 struct CompletionDetector(std::sync::atomic::AtomicUsize);
@@ -653,8 +661,19 @@ async fn a_codex_write_with_quotes_is_confirmed_from_the_escaped_rollout() {
     let probe = written_parked_probe(&server, &run, PROBE_NO_PR, &rollout);
     watch_parked_write(&server, &run, SLOT, &probe, PROBE_NO_PR.to_owned());
 
-    std::fs::write(&rollout, rollout_user_message(PROBE_NO_PR)).unwrap();
     dispatch_live_worker_state(&server, &codex_turn_started(&run)).await;
+    assert!(server.probe_awaiting_turn_start(&run, &probe));
+    std::fs::write(&rollout, rollout_user_message(PROBE_NO_PR)).unwrap();
+    let event = hook(
+        WorkerEvent::PostToolUse {
+            session_id: "sess".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+        &run,
+    );
+    dispatch_live_worker_state(&server, &event).await;
 
     let record = server.probe_record(&probe).unwrap();
     assert_eq!(record.state, ProbeDeliveryState::Consumed);
@@ -760,4 +779,65 @@ async fn a_confirmation_after_the_turns_stop_releases_the_claim() {
         Some(second.as_str()),
         "the confirmed probe's claim is released and the next probe dispatched",
     );
+}
+
+async fn failed_interrupt_replays_stop(declined: bool) {
+    use crate::app::probe_interrupt::{requeue_after_write_declined, settle_unconfirmed_write};
+    use boss_protocol::ProbeInterruptOutcome;
+
+    let detector = Arc::new(CompletionDetector(std::sync::atomic::AtomicUsize::new(0)));
+    let (server, _dir) = test_server_state_with_fakes_and_pr_detector(detector.clone(), None);
+    let (run, _) = parked_codex_worker(&server);
+    let probe_id = server.queue_probe(run.clone(), "push your branch".into(), false);
+    let probe = server
+        .try_reserve_specific_probe_for_delivery(&run, &probe_id, None, 0)
+        .unwrap();
+    assert!(server.probe_claimed_ahead_of_its_write(&run));
+    dispatch_completion_on_stop(&server, &stop(&run), true).await;
+    assert_eq!(detector.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    if declined {
+        let outcome = requeue_after_write_declined(
+            &server,
+            &run,
+            probe,
+            ProbeInterruptOutcome::Interrupted,
+            1,
+            "write declined",
+        )
+        .await;
+        assert_eq!(outcome.state, ProbeDeliveryState::Queued);
+    } else {
+        server.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Injected);
+        settle_unconfirmed_write(
+            &server,
+            &run,
+            SLOT,
+            &probe,
+            "write unconfirmed",
+            ProbeInterruptOutcome::Interrupted,
+            1,
+        )
+        .await;
+        assert!(server.parked_probe_snapshot(&run).unwrap().deferred_completion);
+        tokio::time::sleep(one_failed_delivery()).await;
+        assert_eq!(
+            server.probe_lifecycle_state(&probe_id),
+            Some(ProbeDeliveryState::Unconfirmed)
+        );
+    }
+    assert!(
+        detector.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "a failed interrupting write must replay the withheld PR decision",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_interrupt_write_replays_the_deferred_stop() {
+    failed_interrupt_replays_stop(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_declined_interrupt_write_replays_the_deferred_stop() {
+    failed_interrupt_replays_stop(true).await;
 }
