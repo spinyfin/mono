@@ -1,4 +1,5 @@
 use super::*;
+mod merge_evidence_tests;
 
 use crate::test_support::*;
 /// Returns the `:memory:` sentinel so `WorkDb::open` allocates a

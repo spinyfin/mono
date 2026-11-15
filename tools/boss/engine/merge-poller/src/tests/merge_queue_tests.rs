@@ -1528,7 +1528,7 @@ async fn mark_merged_clears_human_driven_merging_lane_and_publishes() {
             .lock()
             .await
             .iter()
-            .any(|(_, item_id, reason)| item_id == &task && reason == "pr_merged_queue_state_cleared")
+            .any(|(_, item_id, reason)| item_id == &task && reason == "pr_merge_observed")
     );
 }
 

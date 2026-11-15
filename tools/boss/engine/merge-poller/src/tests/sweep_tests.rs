@@ -13,6 +13,9 @@ async fn merged_pr_is_promoted_and_publishes_invalidation() {
 
     let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.merged, 1);
+    let evidence = db.get_merge_evidence(&chore_id).unwrap().unwrap();
+    assert_eq!(evidence.canonical_pr_url, pr);
+    assert_eq!(evidence.root_task_id, chore_id);
 
     let item = db.get_work_item(&chore_id).unwrap();
     match item {
@@ -33,6 +36,74 @@ async fn merged_pr_is_promoted_and_publishes_invalidation() {
         !publisher.runtime_reasons().await.contains(&"pr_merged".to_owned()),
         "a merge moves the card between lanes: it must stay a full-board invalidation"
     );
+}
+
+#[tokio::test]
+async fn late_merge_probe_records_evidence_for_a_manually_completed_task() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1";
+    let (product_id, chore_id) = make_chore_in_review(&db, "late merge", pr);
+    let candidate = PendingMergeCheck {
+        work_item_id: chore_id.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&chore_id])
+        .unwrap();
+    assert!(db.get_merge_evidence(&chore_id).unwrap().is_none());
+    let mut probe = probe_ci_clean(pr, "merged-head");
+    probe.state = PrLifecycleState::Merged;
+    let publisher = RecordingPublisher::default();
+    assert!(!crate::sweep::mark_merged(&db, &publisher, None, &candidate, &probe).await);
+    let evidence = db.get_merge_evidence(&chore_id).unwrap().unwrap();
+    assert!(!crate::sweep::mark_merged(&db, &publisher, None, &candidate, &probe).await);
+    assert_eq!(db.get_merge_evidence(&chore_id).unwrap(), Some(evidence));
+    assert_eq!(
+        publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, id, reason)| id == &chore_id && reason == "pr_merge_observed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_merge_probe_preserves_the_rebound_pr_and_queue() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let old_pr = "https://github.com/foo/bar/pull/1";
+    let new_pr = "https://github.com/foo/bar/pull/2";
+    let (product_id, chore_id) = make_chore_in_review(&db, "rebound", old_pr);
+    let candidate = PendingMergeCheck {
+        work_item_id: chore_id.clone(),
+        product_id,
+        pr_url: old_pr.to_owned(),
+    };
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2, merge_queue_state = 'queued' WHERE id = ?1",
+            rusqlite::params![chore_id, new_pr],
+        )
+        .unwrap();
+    let mut probe = probe_ci_clean(old_pr, "old-head");
+    probe.state = PrLifecycleState::Merged;
+    let publisher = RecordingPublisher::default();
+    assert!(!crate::sweep::mark_merged(&db, &publisher, None, &candidate, &probe).await);
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.pr_url.as_deref(), Some(new_pr));
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_eq!(task.merge_queue_state.as_deref(), Some("queued"));
+    assert!(db.get_merge_evidence(&chore_id).unwrap().is_none());
+    assert!(publisher.events.lock().await.is_empty());
 }
 
 #[tokio::test]

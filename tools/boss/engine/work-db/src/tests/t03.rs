@@ -1112,6 +1112,13 @@ fn cyclic_edges_do_not_loop_the_cascade() {
     // Drive B to `done` via the merge poller's path — the same
     // entry point the production bug reported. Must return
     // promptly; if the cascade looped, this would hang.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://example.test/pr/1' WHERE id = ?1",
+            [&b.id],
+        )
+        .unwrap();
     let updated = db.mark_chore_pr_merged(&b.id, "https://example.test/pr/1").unwrap();
     assert!(
         updated.is_some(),
@@ -1136,6 +1143,13 @@ fn mark_chore_pr_merged_clears_stale_merge_queue_state() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let chore = create_test_chore(&db, product.id.clone(), "A");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://example.test/pr/1' WHERE id = ?1",
+            [&chore.id],
+        )
+        .unwrap();
 
     db.update_task_pr_poll_state(
         &chore.id,

@@ -383,11 +383,11 @@ impl WorkerCompletionHandler {
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
     pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
-        let (pr_url, merged) = match self.resolve_declared_pr_url(execution).await {
-            DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged),
+        let (pr_url, mut merged, mut closed_unmerged) = match self.resolve_declared_pr_url(execution).await {
+            DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged, false),
             DeclaredPrResolution::ClosedUnmerged { pr_url } => {
                 if self.is_merge_conflict_revision(execution) {
-                    (pr_url, true)
+                    (pr_url, false, true)
                 } else {
                     return self
                         .finalize_declared_delivery_without_pr(
@@ -419,11 +419,11 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        let mut merged = merged;
-        if !merged {
+        if !merged && !closed_unmerged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
                 ConflictDeliveryDecision::Moot => merged = true,
+                ConflictDeliveryDecision::ClosedUnmerged => closed_unmerged = true,
                 ConflictDeliveryDecision::Proceed => {}
             }
         }
@@ -440,10 +440,13 @@ impl WorkerCompletionHandler {
         // merged is done, not reviewable — the same target the Stop path
         // uses for `PrStatus::Merged`.
         let reviewer_triggering = !merged
+            && !closed_unmerged
             && (should_enqueue_reviewer_for_primary(&execution.kind)
                 || (execution.kind == ExecutionKind::RevisionImplementation && self.enable_revision_triggered_reviews));
         let target = if merged {
             WorkerPrCompletionTarget::Done
+        } else if closed_unmerged {
+            WorkerPrCompletionTarget::DoneUnmerged
         } else if reviewer_triggering {
             WorkerPrCompletionTarget::PendingReview
         } else {
@@ -507,6 +510,9 @@ impl WorkerCompletionHandler {
         self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
         if merged {
             return StopOutcome::PrMerged { pr_url };
+        }
+        if closed_unmerged {
+            return StopOutcome::PrDetected { pr_url };
         }
         self.spawn_declared_delivery_post_effects(execution, &work_item_id, &pr_url);
 

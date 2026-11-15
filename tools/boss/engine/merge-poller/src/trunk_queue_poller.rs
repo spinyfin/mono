@@ -1921,6 +1921,7 @@ async fn handle_trunk_queue_eviction(
                             TrunkEvictionCause::TestFailure
                         }
                         ConflictClearance::Indeterminate
+                        | ConflictClearance::Merged
                         | ConflictClearance::NotOpen
                         | ConflictClearance::Unavailable => {
                             // A read that never resolves is not evidence of
