@@ -114,8 +114,13 @@ def _boss_pkg_unsigned_impl(ctx):
         command = command,
         mnemonic = "BossPkgBuild",
         progress_message = "Building unsigned Boss installer .pkg",
-        # pkgbuild/productbuild are macOS-only and must run locally
-        execution_requirements = {"local": "1"},
+        # pkgbuild/productbuild are macOS-only, so this needs a Mac, but not
+        # the Mac that invoked the build: a remote macOS worker can run it and
+        # its result can be cached. It still runs outside the sandbox.
+        execution_requirements = {
+            "no-sandbox": "1",
+            "requires-darwin": "",
+        },
     )
 
     return [DefaultInfo(files = depset([output_dir]))]
