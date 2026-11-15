@@ -20,6 +20,7 @@ use boss_protocol::{
     WorkerEvent,
 };
 
+mod bounded_command;
 pub mod discovery;
 pub mod git_store_guard;
 pub mod hook_settings;

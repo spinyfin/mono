@@ -26,6 +26,12 @@ pub const AGY_BIN_ENV: &str = "BOSS_AGY_BIN";
 /// Production never sets this; layout tests do.
 pub const AGY_SKIP_BINARY_ASSERT_ENV: &str = "BOSS_AGY_SKIP_BINARY_ASSERT";
 
+/// When set to `1`/`true`, live Antigravity CLI probes must run instead of
+/// soft-skipping. Meaningful only on a signed-in developer machine; CI cannot
+/// authenticate `agy`.
+#[cfg(test)]
+pub const REQUIRE_AGY_CLI_ENV: &str = "BOSS_REQUIRE_AGY_CLI";
+
 /// Minimum qualified `agy` version. `auto_approve` was measured on 1.5.7.
 pub const MIN_QUALIFIED_AGY_VERSION: &str = "1.5.7";
 
@@ -42,13 +48,13 @@ pub(crate) const AGY_VERSION_TIMEOUT: std::time::Duration = std::time::Duration:
 pub(crate) const AGY_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run a vendor subprocess with a timeout, killing its process group on expiry.
-/// Shares Grok's in-flight registry so engine shutdown reaps it too. A timeout
-/// is an error naming the command.
+/// Shares the crate-wide in-flight registry so engine shutdown reaps it too.
+/// A timeout is an error naming the command.
 pub(crate) fn run_agy_bounded(
     command: &mut Command,
     timeout: std::time::Duration,
 ) -> anyhow::Result<std::process::Output> {
-    crate::grok::preflight::run_bounded_as(command, timeout, "Antigravity provisioning failed")
+    crate::bounded_command::run_bounded_as(command, timeout, "Antigravity provisioning failed")
 }
 
 const DISABLE_AUTO_UPDATE_ENV: &str = "AGY_CLI_DISABLE_AUTO_UPDATE";

@@ -41,8 +41,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, bail};
 
 use super::environment::{oauth_only_directives, shared_credential_directive, wait_for_grok_auth_refresh_with_timeout};
-use super::preflight::run_bounded_as;
 use crate::EnvDirective;
+use crate::bounded_command::run_bounded_as;
 
 /// The line `grok models` prints when the shared credential is usable (after
 /// refreshing it if it had to). Shared with the worker preflight's assertion.

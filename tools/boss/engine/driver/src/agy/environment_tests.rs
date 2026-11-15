@@ -1,4 +1,6 @@
 use super::*;
+use crate::AgentDriver;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn output(success: bool, stderr: &str) -> std::process::Output {
@@ -168,6 +170,116 @@ fn directives_scope_home_and_disable_the_updater() {
 fn skip_binary_assert_accepts_a_missing_file() {
     let _guard = EnvGuard::set(&[(AGY_SKIP_BINARY_ASSERT_ENV, "1")]);
     verify_agy_binary(Path::new("/definitely/missing/agy")).unwrap();
+}
+
+#[test]
+fn run_agy_bounded_timeout_names_the_command() {
+    let mut command = Command::new("/bin/sleep");
+    command.arg("60");
+    let error = run_agy_bounded(&mut command, Duration::from_millis(300))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Antigravity provisioning failed"), "{error}");
+    assert!(error.contains("`/bin/sleep 60`"), "{error}");
+    assert!(error.contains("did not complete within"), "{error}");
+}
+
+/// Live probe: plant a canary in the production `rules-root/.agents/rules/boss.md`
+/// layout, launch `agy` with the production `--add-dir` arrangement, and assert
+/// the response follows the canary.
+///
+/// Soft-skips when `agy` is absent. Set `BOSS_REQUIRE_AGY_CLI=1` on a signed-in
+/// developer machine to execute it; CI cannot authenticate `agy`.
+#[test]
+fn rules_root_add_dir_loads_agent_rules_when_agy_cli_is_required() {
+    // A live model turn is manual: it needs a signed-in developer machine and
+    // must not run in the default `bazel test` suite. The gate is
+    // `BOSS_REQUIRE_AGY_CLI`; without it this test returns immediately.
+    if !crate::scoped_home::env_flag(REQUIRE_AGY_CLI_ENV) {
+        eprintln!(
+            "skipping rules-root --add-dir probe (set {REQUIRE_AGY_CLI_ENV}=1 on a signed-in \
+             developer machine to execute it)"
+        );
+        return;
+    }
+    let Some(agy) = host_agy_binary() else {
+        panic!("{REQUIRE_AGY_CLI_ENV} is set but agy is not on PATH");
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&workspace).unwrap();
+    let _guard = super::super::test_environment::env_for_provision(&homes);
+    let runtime = super::super::home::provision_agy_home(&workspace, "unused", "run-rules-canary").unwrap();
+    let canary = format!(
+        "AGY_ADD_DIR_CANARY_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let rules_path = super::super::home::agent_rules_path_for_run("run-rules-canary").unwrap();
+    assert_eq!(
+        super::super::AgyDriver::default().agent_rules_destination(&workspace, "run-rules-canary"),
+        rules_path
+    );
+    fs::write(
+        &rules_path,
+        format!(
+            "# Boss canary rule\n\nWhen asked for the rules-root canary token, reply with exactly \
+             this token and no other words:\n\n{canary}\n"
+        ),
+    )
+    .unwrap();
+
+    let environment = AgyProcessEnvironment::resolve(
+        &runtime.process_home,
+        &runtime.log_file,
+        &runtime.session_settings_path,
+        agy.clone(),
+    )
+    .unwrap();
+    let prompt = "What is the rules-root canary token from your agent rules? Reply with only that \
+                  token. If you have no such rule, reply with the single word MISSING.";
+    let mut command = Command::new(&agy);
+    command.args(environment.launch_args());
+    command
+        .arg("--dangerously-skip-permissions")
+        .arg("-p")
+        .arg(prompt)
+        .current_dir(&workspace);
+    environment.apply_to_command(&mut command);
+
+    let output = run_agy_bounded(&mut command, Duration::from_secs(45)).unwrap_or_else(|err| {
+        panic!("{REQUIRE_AGY_CLI_ENV} is set but the rules-root --add-dir probe errored: {err:#}")
+    });
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{REQUIRE_AGY_CLI_ENV} is set but the rules-root --add-dir probe failed \
+         (status {}): stdout={stdout:?} stderr={stderr:?}",
+        output.status
+    );
+    assert!(
+        stdout.contains(&canary),
+        "agy did not follow the rules-root canary; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+fn host_agy_binary() -> Option<PathBuf> {
+    let output = Command::new("which").arg("agy").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
 }
 
 #[cfg(target_os = "macos")]

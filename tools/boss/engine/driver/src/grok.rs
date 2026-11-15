@@ -48,7 +48,7 @@ mod hooks;
 mod model_menu;
 mod oauth_refresh;
 mod permissions;
-pub(crate) mod preflight;
+mod preflight;
 mod progress;
 mod transcript;
 mod turn_end_recovery;
@@ -61,11 +61,11 @@ pub use home::{
     resolve_grok_auth_source, trust_path_variants,
 };
 
+pub use crate::bounded_command::abandon_in_flight_commands as abandon_in_flight_preflight_commands;
 use classify_error::classify_grok_error;
 use environment::GrokProcessEnvironment;
 use home::{provision_grok_home, read_session_id, read_workspace_path_stamp};
 pub use oauth_refresh::{GROK_LOGIN_AFFIRMATION, GrokOauthLiveness, refresh_shared_oauth_credential_blocking};
-pub use preflight::abandon_in_flight_preflight_commands;
 use progress::GrokProgressSession;
 use transcript::GrokTranscriptSession;
 use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
