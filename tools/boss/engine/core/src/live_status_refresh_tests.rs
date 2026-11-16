@@ -389,15 +389,35 @@ async fn first_summary_deadline_survives_sparse_tool_events() {
     })
     .await
     .unwrap();
+    // The Working wake starts a refresh that skips an empty transcript.
+    // Wait until that attempt has finished so it cannot poll the later
+    // write and record a non-timer summary.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snap = manager.debug_store().snapshot_for(1);
+            if snap.last_trigger_kind.as_deref() == Some("activity_changed") && snap.last_outcome_tag.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     for _ in 0..2 {
         advance(20).await;
         manager.notify(1, Trigger::PostToolUse);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     append_action(&transcript, "claude", "inspecting");
-    advance(21).await;
+    // One full floor after the empty attempt, so a pause/advance that
+    // landed while the loop was not sleeping still expires the timer.
+    advance(61).await;
     tokio::time::timeout(Duration::from_secs(3), async {
-        while manager.debug_store().snapshot_for(1).last_outcome_tag.is_none() {
+        loop {
+            let snap = manager.debug_store().snapshot_for(1);
+            if snap.last_outcome_tag.is_some() && snap.last_synthetic_trigger_at_epoch_s.is_some() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
