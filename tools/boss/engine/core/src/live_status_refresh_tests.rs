@@ -389,15 +389,9 @@ async fn first_summary_deadline_survives_sparse_tool_events() {
     })
     .await
     .unwrap();
-    // The Working wake starts a refresh that skips an empty transcript.
-    // Wait until that attempt has finished so it cannot poll the later
-    // write and record a non-timer summary.
+    // Observe completion after poll_through, before appending any content.
     tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let snap = manager.debug_store().snapshot_for(1);
-            if snap.empty_transcript_polls > 0 {
-                break;
-            }
+        while manager.debug_store().snapshot_for(1).empty_transcript_polls == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

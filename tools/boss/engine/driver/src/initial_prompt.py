@@ -288,8 +288,26 @@ def check_blocking_dialog(view, markers, payload=b""):
                     raise BlockingDialogOnScreen(marker)
 
 
+def settings_log_ready(check_path):
+    check = json.loads(check_path.read_text())
+    try:
+        log = Path(check["log_path"]).read_text()
+    except FileNotFoundError:
+        return False
+    initialized = False
+    for line in log.splitlines():
+        if "ignoring invalid" in line:
+            raise RuntimeError(f"agy dropped rendered permission rules: {line}")
+        if "CLI settings initialized" in line:
+            if check["expected"] not in line:
+                raise RuntimeError(f"agy initialized settings that differ from rendered posture: {line}")
+            initialized = True
+    return initialized
+
+
 def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
-        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None, blocking_dialog_markers=()):
+        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None, blocking_dialog_markers=(),
+        settings_check=None):
     if b"\x1b[201~" in prompt or b"\0" in prompt:
         raise ValueError("initial brief contains a terminal paste terminator or NUL")
     outer_tty = os.isatty(0)
@@ -346,6 +364,9 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             tty.setraw(0, termios.TCSANOW)
         while True:
             now = time.monotonic()
+            settings_ready = settings_check is None or settings_log_ready(settings_check)
+            if paste_started and not settings_ready:
+                raise RuntimeError("agy settings initialization evidence disappeared")
             if exit_status is None:
                 # A descendant can hold the pty slave open after the driver
                 # exits, so EOF alone never ends the relay. Once the
@@ -408,7 +429,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                         paste_enabled = enable > disable
             if not paste_started:
                 raw = not termios.tcgetattr(master)[3] & termios.ICANON
-                if ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
+                if settings_ready and ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
                     if ready_since is None:
                         ready_since = now
                     elif now - ready_since >= 0.2:
@@ -422,6 +443,8 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             if 0 in readable:
                 data = os.read(0, 65536)
                 if data:
+                    if not settings_ready:
+                        raise RuntimeError("agy settings have not initialized; input refused")
                     pending += data
                 else:
                     stdin_open = False
@@ -534,7 +557,9 @@ def main():
     # A retried launch starts its own record.
     write_marker(DELIVERY_LOG)
     return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery,
-               blocking_dialog_markers=[s.encode() for s in config.get("blocking_dialog_markers", [])])
+               blocking_dialog_markers=[s.encode() for s in config.get("blocking_dialog_markers", [])],
+               settings_check=Path(__file__).with_name("settings-log-check.json")
+               if config.get("check_settings_log") else None)
 
 
 if __name__ == "__main__":

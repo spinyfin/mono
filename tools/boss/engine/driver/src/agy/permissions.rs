@@ -552,6 +552,16 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
     // Refuse a symlink or shared hard link planted where the file goes.
     check_private_entry(&control_dir)?;
     check_private_entry(&settings_path)?;
+    // The PTY relay gates the initial brief using the same expectation as the
+    // host-side checker, even before the host observes the pane.
+    crate::initial_prompt::write_private(
+        &control_dir.join("settings-log-check.json"),
+        serde_json::to_string(&serde_json::json!({
+            "log_path": super::home::log_file_for_run(&input.run_id)?,
+            "expected": expected_initialized_fragment(&settings),
+        }))?
+        .as_bytes(),
+    )?;
     fs::write(&settings_path, body)
         .with_context(|| format!("writing agy session settings {}", settings_path.display()))?;
 
@@ -599,11 +609,6 @@ fn expected_initialized_fragment(settings: &SessionSettings) -> String {
 /// `rendered_settings` is the file written by [`write_session_settings`]; it is
 /// re-parsed and re-validated, so a tampered file fails here too.
 ///
-/// TODO(pane-spawn): this has no production caller yet. The pane-spawn
-/// admission path MUST call it after the CLI initializes and again before each
-/// input delivery; a clean result only means "consistent so far". Until then
-/// no run fails on an `ignoring invalid` warning or a mismatched
-/// `CLI settings initialized` line.
 pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result<SettingsLogCheck> {
     let settings = parse_rendered(rendered_settings)?;
     let invalid: Vec<&str> = log
@@ -653,3 +658,7 @@ pub fn verify_settings_log_files(settings_path: &Path, log_path: &Path) -> anyho
 #[cfg(test)]
 #[path = "permissions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "permissions_relay_tests.rs"]
+mod relay_tests;

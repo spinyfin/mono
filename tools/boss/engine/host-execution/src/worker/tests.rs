@@ -1,5 +1,7 @@
 use super::worker_paths::outputs_root;
 use super::*;
+
+mod permissions_tests;
 use crate::cube::CubeJsonTransport;
 use async_trait::async_trait;
 use boss_tmux::{CommandOutput, CommandRunner};
@@ -1006,7 +1008,7 @@ async fn live_pane_without_a_delivered_brief_is_not_a_successful_delivery() {
     live(&fake);
     let supervisor = supervisor(root.path(), fake).await;
     seed(&supervisor.store, Phase::Alive);
-    let pane = supervisor.wait_for_brief(&stored(&supervisor.store)).await;
+    let pane = supervisor.wait_for_brief(&stored(&supervisor.store)).await.unwrap();
     assert_eq!(pane_life(&pane), PaneLife::BriefNotDelivered);
 }
 
