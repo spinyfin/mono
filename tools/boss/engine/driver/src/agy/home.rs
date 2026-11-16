@@ -400,6 +400,12 @@ pub fn assert_agy_posture(process_home: &Path, workspace: &Path) -> anyhow::Resu
 }
 
 fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
+    let environment = AgyProcessEnvironment::resolve(
+        environment.process_home(),
+        &environment.log_file().with_file_name("agy-models-probe.log"),
+        environment.session_settings_path(),
+        environment.agy_binary().to_path_buf(),
+    )?;
     let mut command = Command::new(environment.agy_binary());
     command.args(environment.launch_args()).arg("models");
     environment.apply_to_command(&mut command);

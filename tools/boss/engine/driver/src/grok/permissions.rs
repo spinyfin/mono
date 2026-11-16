@@ -200,13 +200,9 @@ pub fn structural_deny_rules(
 
 /// The `--permission-mode <mode>` value to force, if any.
 ///
-/// Mirrors `boss_engine::worker_setup::WorkerKind::forced_permission_mode`:
-/// `Some("dontAsk")` only for the capability-restricted answer agent, so its
-/// (not-yet-built for Grok — T-31) allowlist posture cannot be silently
-/// downgraded. Every other kind returns `None` — the pane already carries
-/// `--always-approve` (reported as `permissionMode: "bypassPermissions"` per
-/// the pane-viability spike), and forcing a redundant `--permission-mode`
-/// value alongside it is an interaction the investigation never exercised.
+/// Delegates to the shared mirror: AnswerAgent, ReviewGuide and Progression
+/// force `Some("dontAsk")`. Other kinds return `None` because the pane
+/// already carries `--always-approve`.
 pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'static str> {
     crate::capability_rules::forced_permission_mode(worker_kind)
 }

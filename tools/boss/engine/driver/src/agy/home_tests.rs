@@ -223,3 +223,51 @@ fn safe_to_delete_refuses_host_home() {
         .to_string();
     assert!(err.contains("outside"), "{err}");
 }
+
+#[test]
+fn models_probe_initialization_cannot_contaminate_session_log() {
+    use super::super::permissions::{SettingsLogCheck, SettingsPlan, render_settings, verify_settings_log_files};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let _guard = env_for_provision(tmp.path());
+    let binary = tmp.path().join("fake-agy");
+    fs::write(
+        &binary,
+        r#"#!/bin/sh
+test "$1" = "--log-file" || exit 1
+printf '%s\n' 'CLI settings initialized: permissions=&{Allow:[] Deny:[] Ask:[]}, toolPermission=request-review' >> "$2"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = tmp.path().join("agy.log");
+    let settings_path = tmp.path().join("session-settings.json");
+    let environment =
+        AgyProcessEnvironment::resolve(&tmp.path().join("process-home"), &log, &settings_path, binary).unwrap();
+    probe_agy_models(&environment).unwrap();
+    assert!(!log.exists());
+    let probe_log = fs::read_to_string(tmp.path().join("agy-models-probe.log")).unwrap();
+    let settings = render_settings(&SettingsPlan {
+        worker_kind: crate::WorkerKind::Triage,
+        workspace: Path::new("/workspace"),
+        boss_data_dir: None,
+        hooks_dir: &tmp.path().join("hooks"),
+        control_dir: &tmp.path().join("control"),
+        rules_root: &tmp.path().join("rules-root"),
+    })
+    .unwrap();
+    fs::write(&settings_path, settings.to_json().unwrap()).unwrap();
+    assert!(super::super::permissions::verify_settings_log(&settings.to_json().unwrap(), &probe_log).is_err());
+    fs::write(
+        &log,
+        format!(
+            "CLI settings initialized: permissions=&{{Allow:[] Deny:[{}] Ask:[]}}, toolPermission=request-review",
+            settings.deny_rules().join(" "),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        verify_settings_log_files(&settings_path, &log).unwrap(),
+        SettingsLogCheck::ConsistentSoFar
+    );
+}

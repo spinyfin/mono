@@ -19,8 +19,9 @@
 //!   control directory is not trusted.
 //! - `permissions.deny` — **native file tools only** (`read_file` /
 //!   `write_file`; a `write_file` rule also covers `edit_file`): the Boss data
-//!   directory, the run's own hook and control directories (write), and, for
-//!   kinds that must not write, the workspaces root. Command-level denies
+//!   directory and the run's hook, control and rules directories (write).
+//!   Reviewer fences the workspaces root to permit its external artifact;
+//!   other non-writing kinds fence all native writes. Command-level denies
 //!   (`bossctl`, `sudo`, `rm -rf`, publication) are *not* rendered here: a
 //!   command rule is a prefix match on the command as typed, so an absolute
 //!   path, a `sh -c` wrapper or a flag between two rule words gets past it, and
@@ -100,8 +101,7 @@ pub fn verdict_posture_for_worker_kind(worker_kind: WorkerKind) -> VerdictPostur
     }
 }
 
-/// Kinds that must not write files. The file fence for them is the workspaces
-/// root (see [`file_fences`]); the hook denies every native write on top.
+/// Kinds requiring native write fences; only Reviewer may write an external artifact.
 fn forbids_file_writes(worker_kind: WorkerKind) -> bool {
     match worker_kind {
         WorkerKind::Standard => false,
@@ -201,7 +201,8 @@ impl SessionSettings {
 
 /// Inputs the document is derived from, already resolved. Separated from
 /// [`PermissionInput`] so rendering is a pure function of paths.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct SettingsPlan<'a> {
     pub worker_kind: WorkerKind,
     /// Absolute, symlink-resolved workspace path.
@@ -213,6 +214,8 @@ pub struct SettingsPlan<'a> {
     pub hooks_dir: &'a Path,
     /// The run's Boss-owned control directory (session settings, launcher, log).
     pub control_dir: &'a Path,
+    /// Boss-owned rules exposed through --add-dir.
+    pub rules_root: &'a Path,
 }
 
 /// Build and validate the document for one run.
@@ -284,12 +287,17 @@ fn file_fences(plan: &SettingsPlan<'_>) -> Vec<(FileAction, PathBuf)> {
     }
     fences.push((FileAction::Write, plan.hooks_dir.to_path_buf()));
     fences.push((FileAction::Write, plan.control_dir.to_path_buf()));
+    fences.push((FileAction::Write, plan.rules_root.to_path_buf()));
     // The private CLI settings.json is where the CLI stores its own grants
     // (it saves always-allow rules there) and it is read at every session
     // start in this HOME, so a native write must not be able to plant one.
     fences.push((FileAction::Write, cli_settings_path_for_hooks_dir(plan.hooks_dir)));
     if forbids_file_writes(plan.worker_kind) {
-        let root = plan.workspace.parent().unwrap_or(plan.workspace);
+        let root = if plan.worker_kind == WorkerKind::Reviewer {
+            plan.workspace.parent().unwrap_or(plan.workspace)
+        } else {
+            Path::new("/")
+        };
         fences.push((FileAction::Write, root.to_path_buf()));
     }
     fences
@@ -527,13 +535,18 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
             .map(Path::to_path_buf)
     };
     let hooks_dir = hooks_dir_for_run(&input.run_id)?;
-    let settings = render_settings(&SettingsPlan {
-        worker_kind: input.worker_kind,
-        workspace: &workspace,
-        boss_data_dir: boss_data_dir.as_deref(),
-        hooks_dir: &hooks_dir,
-        control_dir: &control_dir,
-    })?;
+    let rules_path = super::home::agent_rules_path_for_run(&input.run_id)?;
+    let rules_root = rules_path.ancestors().nth(3).context("rules root")?;
+    let settings = render_settings(
+        &SettingsPlan::builder()
+            .worker_kind(input.worker_kind)
+            .workspace(&workspace)
+            .maybe_boss_data_dir(boss_data_dir.as_deref())
+            .hooks_dir(&hooks_dir)
+            .control_dir(&control_dir)
+            .rules_root(rules_root)
+            .build(),
+    )?;
     let body = settings.to_json()?;
 
     // Refuse a symlink or shared hard link planted where the file goes.

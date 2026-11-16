@@ -395,7 +395,7 @@ async fn first_summary_deadline_survives_sparse_tool_events() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let snap = manager.debug_store().snapshot_for(1);
-            if snap.last_trigger_kind.as_deref() == Some("activity_changed") && snap.last_outcome_tag.is_none() {
+            if snap.empty_transcript_polls > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -409,9 +409,9 @@ async fn first_summary_deadline_survives_sparse_tool_events() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     append_action(&transcript, "claude", "inspecting");
-    // One full floor after the empty attempt, so a pause/advance that
-    // landed while the loop was not sleeping still expires the timer.
-    advance(61).await;
+    // End after the original 60s floor, before a reset at the last tool (100s).
+    assert!(manager.debug_store().snapshot_for(1).last_outcome_tag.is_none());
+    advance(21).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let snap = manager.debug_store().snapshot_for(1);
