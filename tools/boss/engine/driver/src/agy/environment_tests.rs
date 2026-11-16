@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn output(success: bool, stderr: &str) -> std::process::Output {
@@ -168,6 +169,18 @@ fn directives_scope_home_and_disable_the_updater() {
 fn skip_binary_assert_accepts_a_missing_file() {
     let _guard = EnvGuard::set(&[(AGY_SKIP_BINARY_ASSERT_ENV, "1")]);
     verify_agy_binary(Path::new("/definitely/missing/agy")).unwrap();
+}
+
+#[test]
+fn run_agy_bounded_timeout_names_the_command() {
+    let mut command = Command::new("/bin/sleep");
+    command.arg("60");
+    let error = run_agy_bounded(&mut command, Duration::from_millis(300))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Antigravity provisioning failed"), "{error}");
+    assert!(error.contains("`/bin/sleep 60`"), "{error}");
+    assert!(error.contains("did not complete within"), "{error}");
 }
 
 #[cfg(target_os = "macos")]

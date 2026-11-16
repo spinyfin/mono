@@ -1288,7 +1288,7 @@ mod tests {
         let host = tmp.path().join("host");
         let cache = host.join(".cache/bazelcache");
         fs::create_dir_all(&cache).unwrap();
-        let _guard = MultiEnvGuard::set_and_clear(&[("HOME", &host)], &["BAZEL_DISK_CACHE"]);
+        let _guard = MultiEnvGuard::set_and_clear(&[("HOME", &host)], &[]);
         let process_home = tmp.path().join("process-home");
         let environment =
             GrokProcessEnvironment::resolve(&tmp.path().join("grok"), &process_home, &tmp.path().join("auth.json"))

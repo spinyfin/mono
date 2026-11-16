@@ -182,6 +182,39 @@ fn process_home_for_run_with(homes: &Path, run_id: &str) -> PathBuf {
 }
 
 #[test]
+fn reclaim_keeps_conversations_and_brain_and_removes_the_rest() {
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let _guard = env_for_provision(&homes);
+    let process_home = process_home_for_run("run-retain-1").unwrap();
+    let container = process_home.parent().unwrap();
+    let cli = process_home.join(".gemini/antigravity-cli");
+    let conversations = cli.join("conversations/session.json");
+    let brain = cli.join("brain/cid/.system_generated/logs/transcript_full.jsonl");
+    fs::create_dir_all(conversations.parent().unwrap()).unwrap();
+    fs::create_dir_all(brain.parent().unwrap()).unwrap();
+    fs::write(&conversations, b"keep-conversations").unwrap();
+    fs::write(&brain, b"keep-brain").unwrap();
+    fs::write(cli.join("settings.json"), b"drop-settings").unwrap();
+    fs::write(cli.join("log"), b"drop-log").unwrap();
+    let rules_root = container.join("rules-root/.agents/rules");
+    fs::create_dir_all(&rules_root).unwrap();
+    fs::write(rules_root.join("boss.md"), b"drop-rules").unwrap();
+    let control = container.join("control");
+    fs::create_dir_all(&control).unwrap();
+    fs::write(control.join("session-settings.json"), b"drop-control").unwrap();
+
+    reclaim_agy_run(&process_home).unwrap();
+
+    assert_eq!(fs::read_to_string(&conversations).unwrap(), "keep-conversations");
+    assert_eq!(fs::read_to_string(&brain).unwrap(), "keep-brain");
+    assert!(!cli.join("settings.json").exists());
+    assert!(!cli.join("log").exists());
+    assert!(!container.join("rules-root").exists());
+    assert!(!control.exists());
+}
+
+#[test]
 fn safe_to_delete_refuses_host_home() {
     let tmp = TempDir::new().unwrap();
     let _guard = env_for_provision(&tmp.path().join("homes"));

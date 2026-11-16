@@ -6,8 +6,8 @@
 //! keychain is a filesystem symlink of that one keychain file — never a
 //! keychain API, never the macOS security CLI, and never a copied token.
 //!
-//! Behaviour of [`HostToolPaths::provision_into`] is the Grok bridge lifted
-//! into this module so both drivers call the same helper.
+//! Grok and Antigravity both call [`HostToolPaths::provision_into`], so their
+//! login-keychain bridge and host-tool delegates are identical.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -325,7 +325,7 @@ fn resolve_host_cache_paths() -> Option<HostCachePaths> {
             xdg_cache_home.join("bazel")
         }
     });
-    let bazel_disk_cache = nonempty_env("BAZEL_DISK_CACHE").unwrap_or_else(|| home.join(BAZEL_DISK_CACHE_LEAF));
+    let bazel_disk_cache = home.join(BAZEL_DISK_CACHE_LEAF);
     Some(HostCachePaths {
         xdg_cache_home,
         repobin_cache_dir,
@@ -425,7 +425,7 @@ mod tests {
         }
     }
 
-    fn host_clear() -> [&'static str; 12] {
+    fn host_clear() -> [&'static str; 11] {
         [
             "GH_CONFIG_DIR",
             "XDG_CONFIG_HOME",
@@ -438,7 +438,6 @@ mod tests {
             "REPOBIN_CACHE_DIR",
             "BAZELISK_HOME",
             "TEST_TMPDIR",
-            "BAZEL_DISK_CACHE",
         ]
     }
 

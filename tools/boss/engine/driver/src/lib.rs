@@ -20,6 +20,7 @@ use boss_protocol::{
     WorkerEvent,
 };
 
+mod bounded_command;
 pub mod discovery;
 pub mod git_store_guard;
 pub mod hook_settings;
@@ -2452,6 +2453,7 @@ pub mod registry;
 // Also available in-module for trait signatures (pub use is an import + re-export).
 pub use agy::AgyDriver;
 pub use boss_protocol::DriverRuntimeState;
+pub use bounded_command::abandon_in_flight_commands;
 pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;
 pub use grok::GrokDriver;

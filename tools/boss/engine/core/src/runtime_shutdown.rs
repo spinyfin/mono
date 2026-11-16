@@ -53,13 +53,14 @@ pub fn shutdown_runtime(runtime: Runtime, timeout: Duration, reap: impl FnOnce()
     }
 }
 
-/// [`shutdown_runtime`] for the engine: reaps any worker-preflight
-/// subprocesses still in flight.
+/// [`shutdown_runtime`] for the engine: reaps bounded vendor subprocesses
+/// still in flight (Grok preflight, Antigravity `models` / `--version` /
+/// `codesign` probes, and the rules-discovery probe).
 pub fn shutdown_engine_runtime(runtime: Runtime) -> RuntimeShutdown {
     shutdown_runtime(
         runtime,
         RUNTIME_SHUTDOWN_TIMEOUT,
-        boss_engine_driver::grok::abandon_in_flight_preflight_commands,
+        boss_engine_driver::abandon_in_flight_commands,
     )
 }
 

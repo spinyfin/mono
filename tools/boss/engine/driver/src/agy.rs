@@ -30,6 +30,9 @@ mod model_menu;
 mod test_environment;
 mod transcript;
 
+/// Manual authenticated rules-discovery conformance probe.
+pub mod rules_probe;
+
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
 use home::{
     AgyRuntimeState, agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run,
@@ -51,7 +54,8 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     // Workspace-local leaf used only as the descriptor's config-dir name.
     // Per-run `agy` state lives under the Boss-owned process HOME; the
     // initial-prompt launcher lives in that run's `control/` directory.
-    // Agent rules go to `<control>/.agents/rules/boss.md`.
+    // Agent rules go to `<run container>/rules-root/.agents/rules/boss.md`, a rules-only
+    // directory passed to agy with --add-dir.
     config_dir: ".agy",
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
@@ -621,7 +625,7 @@ mod tests {
         fs::write(&fallback, "private token").unwrap();
         let transcript = runtime
             .process_home
-            .join(".gemini/antigravity-cli/conversations/session/transcript_full.jsonl");
+            .join(".gemini/antigravity-cli/brain/cid/.system_generated/logs/transcript_full.jsonl");
         fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         fs::write(&transcript, "conversation").unwrap();
         driver
