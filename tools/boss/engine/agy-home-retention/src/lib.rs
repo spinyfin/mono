@@ -18,7 +18,7 @@ pub const MAX_AGE_DAYS_ENV: &str = "BOSS_AGY_HOME_RETENTION_DAYS";
 /// Env var overriding [`DEFAULT_MAX_TOTAL_BYTES`].
 pub const MAX_TOTAL_BYTES_ENV: &str = "BOSS_AGY_HOME_MAX_BYTES";
 
-/// Tunable retention bound. See the module doc for the rule.
+/// Tunable retention bound. See [`RetentionPolicy`] for the shared retention rule.
 #[derive(Debug, Clone, Copy)]
 pub struct AgyHomeRetentionPolicy {
     pub max_age: Duration,

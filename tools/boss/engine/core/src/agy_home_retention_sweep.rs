@@ -35,6 +35,8 @@ pub struct AgyHomeRetentionSweepOutcome {
     #[builder(default)]
     pub deleted: u64,
     #[builder(default)]
+    pub already_absent: u64,
+    #[builder(default)]
     pub deleted_bytes: u64,
     #[builder(default)]
     pub skipped_live: u64,
@@ -53,6 +55,7 @@ impl crate::sweep_loop::SweepOutcome for AgyHomeRetentionSweepOutcome {
         tracing::info!(
             scanned = self.scanned,
             deleted = self.deleted,
+            already_absent = self.already_absent,
             deleted_bytes = self.deleted_bytes,
             skipped_live = self.skipped_live,
             kept_in_policy = self.kept_in_policy,
@@ -148,6 +151,7 @@ pub async fn run_one_pass_with_policy(
             AgyHomeRetentionSweepOutcome {
                 scanned: report.scanned as u64,
                 deleted: report.deleted.len() as u64,
+                already_absent: report.already_absent.len() as u64,
                 deleted_bytes: report.deleted_bytes,
                 skipped_live: report.skipped_live as u64,
                 kept_in_policy: report.kept_in_policy as u64,
@@ -340,6 +344,10 @@ mod tests {
         // Idempotent second pass.
         let outcome2 = run_one_pass_with_policy(&db, &policy, false).await;
         assert_eq!(outcome2.errors, 0, "{outcome2:?}");
+        assert_eq!(
+            outcome2.already_absent, 1,
+            "the missing container is reported separately"
+        );
         assert!(!crate::sweep_loop::SweepOutcome::has_activity(&outcome2));
         assert_eq!(
             outcome2.deleted, 0,

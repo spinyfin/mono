@@ -97,37 +97,21 @@ pub async fn codex_homes_sweep(
         max_total_bytes,
     );
     let outcome = boss_engine::codex_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "scanned": outcome.scanned,
-                "deleted": outcome.deleted,
-                "deleted_bytes": outcome.deleted_bytes,
-                "skipped_live": outcome.skipped_live,
-                "kept_in_policy": outcome.kept_in_policy,
-                "errors": outcome.errors,
-                "dry_run": dry_run,
-                "older_than_days": older_than_days,
-                "max_total_bytes": max_total_bytes,
-            })
-        );
-    } else if dry_run {
-        println!(
-            "would reclaim {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
-            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
-        );
-    } else {
-        println!(
-            "reclaimed {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
-            outcome.deleted,
-            outcome.deleted_bytes,
-            outcome.scanned,
-            outcome.skipped_live,
-            outcome.kept_in_policy,
-            outcome.errors
-        );
-    }
+    print_home_sweep(
+        "Codex",
+        json,
+        dry_run,
+        older_than_days,
+        max_total_bytes,
+        HomeSweepCounts::builder()
+            .scanned(outcome.scanned)
+            .deleted(outcome.deleted)
+            .deleted_bytes(outcome.deleted_bytes)
+            .skipped_live(outcome.skipped_live)
+            .kept_in_policy(outcome.kept_in_policy)
+            .errors(outcome.errors)
+            .build(),
+    );
     Ok(())
 }
 
@@ -147,37 +131,21 @@ pub async fn grok_homes_sweep(
         max_total_bytes,
     );
     let outcome = boss_engine::grok_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "scanned": outcome.scanned,
-                "deleted": outcome.deleted,
-                "deleted_bytes": outcome.deleted_bytes,
-                "skipped_live": outcome.skipped_live,
-                "kept_in_policy": outcome.kept_in_policy,
-                "errors": outcome.errors,
-                "dry_run": dry_run,
-                "older_than_days": older_than_days,
-                "max_total_bytes": max_total_bytes,
-            })
-        );
-    } else if dry_run {
-        println!(
-            "would reclaim {} recorded Grok home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
-            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
-        );
-    } else {
-        println!(
-            "reclaimed {} recorded Grok home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
-            outcome.deleted,
-            outcome.deleted_bytes,
-            outcome.scanned,
-            outcome.skipped_live,
-            outcome.kept_in_policy,
-            outcome.errors
-        );
-    }
+    print_home_sweep(
+        "Grok",
+        json,
+        dry_run,
+        older_than_days,
+        max_total_bytes,
+        HomeSweepCounts::builder()
+            .scanned(outcome.scanned)
+            .deleted(outcome.deleted)
+            .deleted_bytes(outcome.deleted_bytes)
+            .skipped_live(outcome.skipped_live)
+            .kept_in_policy(outcome.kept_in_policy)
+            .errors(outcome.errors)
+            .build(),
+    );
     Ok(())
 }
 
@@ -197,36 +165,63 @@ pub async fn agy_homes_sweep(
         max_total_bytes,
     );
     let outcome = boss_engine::agy_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
+    print_home_sweep(
+        "agy",
+        json,
+        dry_run,
+        older_than_days,
+        max_total_bytes,
+        HomeSweepCounts::builder()
+            .scanned(outcome.scanned)
+            .deleted(outcome.deleted)
+            .deleted_bytes(outcome.deleted_bytes)
+            .skipped_live(outcome.skipped_live)
+            .kept_in_policy(outcome.kept_in_policy)
+            .errors(outcome.errors)
+            .already_absent(outcome.already_absent)
+            .build(),
+    );
+    Ok(())
+}
+
+#[derive(serde::Serialize, bon::Builder)]
+#[builder(on(String, into))]
+struct HomeSweepCounts {
+    scanned: u64,
+    deleted: u64,
+    deleted_bytes: u64,
+    skipped_live: u64,
+    kept_in_policy: u64,
+    errors: u64,
+    #[builder(default)]
+    already_absent: u64,
+}
+
+fn print_home_sweep(
+    driver: &str,
+    json: bool,
+    dry_run: bool,
+    older_than_days: u64,
+    max_total_bytes: u64,
+    counts: HomeSweepCounts,
+) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "scanned": outcome.scanned,
-                "deleted": outcome.deleted,
-                "deleted_bytes": outcome.deleted_bytes,
-                "skipped_live": outcome.skipped_live,
-                "kept_in_policy": outcome.kept_in_policy,
-                "errors": outcome.errors,
-                "dry_run": dry_run,
-                "older_than_days": older_than_days,
-                "max_total_bytes": max_total_bytes,
-            })
-        );
-    } else if dry_run {
-        println!(
-            "would reclaim {} recorded agy home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
-            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
-        );
+        let mut output = serde_json::to_value(&counts).expect("sweep counts serialize");
+        output["dry_run"] = dry_run.into();
+        output["older_than_days"] = older_than_days.into();
+        output["max_total_bytes"] = max_total_bytes.into();
+        println!("{output}");
     } else {
+        let action = if dry_run { "would reclaim" } else { "reclaimed" };
         println!(
-            "reclaimed {} recorded agy home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
-            outcome.deleted,
-            outcome.deleted_bytes,
-            outcome.scanned,
-            outcome.skipped_live,
-            outcome.kept_in_policy,
-            outcome.errors
+            "{action} {} recorded {driver} home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, already_absent={}, errors={}",
+            counts.deleted,
+            counts.deleted_bytes,
+            counts.scanned,
+            counts.skipped_live,
+            counts.kept_in_policy,
+            counts.already_absent,
+            counts.errors
         );
     }
-    Ok(())
 }

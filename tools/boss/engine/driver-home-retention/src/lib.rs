@@ -1,4 +1,8 @@
 //! Shared retention planning and reclaim for recorded driver homes.
+//!
+//! Live homes are never reclaimed. Terminal homes past max_age are deleted,
+//! then the oldest remaining homes go first until their total size is at most
+//! max_total_bytes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -37,9 +41,7 @@ impl RetentionPolicy {
 
 /// One Boss-owned driver run-container candidate. Built by the engine from
 /// recorded `driver_runtime_state` + execution status — never by scanning a
-/// default provider home. `path` is the run **container** (parent of
-/// `process-home/`), not the process `HOME` alone, so a reclaim removes
-/// `control/` and `rules-root/` along with it.
+/// default provider home. `path` is the driver run container to reclaim as a unit.
 #[derive(Debug, Clone)]
 pub struct OwnedHome {
     pub path: PathBuf,
@@ -173,9 +175,8 @@ pub fn plan_reclaim(homes: &[OwnedHome], now_epoch: i64, policy: &RetentionPolic
 /// function itself only fails on a pre-plan hard error (none today).
 ///
 /// Deletion never follows symlinks: `std::fs::remove_dir_all` unlinks a
-/// symlink entry it encounters rather than descending into its target. This
-/// remains important for the login-keychain bridge under
-/// `process-home/Library/Keychains/login.keychain-db`.
+/// symlink entry it encounters rather than descending into its target. Symlinks
+/// inside a container are unlinked; their targets are never touched.
 pub fn execute_reclaim(
     homes: &[OwnedHome],
     now_epoch: i64,

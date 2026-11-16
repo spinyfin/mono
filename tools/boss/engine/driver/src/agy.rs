@@ -31,13 +31,10 @@ mod test_environment;
 mod transcript;
 
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
-pub use home::{
-    AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AGY_SKIP_POSTURE_ASSERT_ENV, AgyRuntimeState, agy_homes_root,
-    agy_run_container_for_run, assert_agy_home_safe_to_delete, process_home_for_run, reclaim_agy_run,
-};
+pub use home::{AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AgyRuntimeState, assert_agy_home_safe_to_delete};
 use home::{
-    agent_rules_path_for_run, control_dir_for_run, log_file_for_run, provision_agy_home, read_workspace_path_stamp,
-    session_settings_path_for_run,
+    agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run, process_home_for_run,
+    provision_agy_home, read_workspace_path_stamp, session_settings_path_for_run,
 };
 
 // ---------------------------------------------------------------------------
