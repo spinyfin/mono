@@ -1077,6 +1077,13 @@ pub async fn on_conflict_detected_with(
                     attempt_id = %a.id,
                     "conflict_watch: mechanical rebase ladder disabled (no cube client); spawning worker directly (rung 3)",
                 );
+                conflict_ladder::record_tier(
+                    work_db,
+                    a,
+                    "engine_rebase",
+                    "skipped",
+                    "conflict_ladder_mechanical_rebase feature flag is off; no cube client",
+                );
                 conflict_ladder::log_routing_verdict(
                     &candidate.work_item_id,
                     stored_pr_number(&candidate.pr_url).map(|n| n as u64),
@@ -1579,6 +1586,11 @@ async fn maybe_spawn_conflict_revision(
     attempt: &crate::work::ConflictResolution,
     use_small_agent_profile: bool,
 ) -> bool {
+    let tier = if use_small_agent_profile {
+        "small_agent"
+    } else {
+        "full_agent"
+    };
     if work_db
         .has_live_conflict_revision_for_pr(&candidate.pr_url)
         .unwrap_or(true)
@@ -1589,6 +1601,13 @@ async fn maybe_spawn_conflict_revision(
             attempt_id = %attempt.id,
             "conflict_watch: a conflict revision for this PR is still running or queued; \
              not spawning another",
+        );
+        conflict_ladder::record_tier(
+            work_db,
+            attempt,
+            tier,
+            "deferred",
+            "a conflict revision is already live, or its absence could not be verified",
         );
         return false;
     }
@@ -1631,6 +1650,13 @@ async fn maybe_spawn_conflict_revision(
                 error = %format!("{err:#}"),
                 "conflict_watch: create_revision failed (parent likely no longer revisable); abandoning attempt",
             );
+            conflict_ladder::record_tier(
+                work_db,
+                attempt,
+                tier,
+                "spawn_failed",
+                &format!("create revision: {err:#}"),
+            );
             if let Err(abandon_err) = work_db.mark_conflict_resolution_abandoned(&attempt.id, "revision_create_failed")
             {
                 tracing::warn!(
@@ -1643,6 +1669,17 @@ async fn maybe_spawn_conflict_revision(
         }
     };
 
+    conflict_ladder::record_tier(
+        work_db,
+        attempt,
+        tier,
+        "spawned",
+        if use_small_agent_profile {
+            "one residual file qualifies for the small agent"
+        } else {
+            "residue is unbounded or mechanical rungs were unavailable"
+        },
+    );
     // Stamp the reverse link. This is the idempotency latch (repeat probes
     // at the same base sha find it set and skip) and the marker that tells
     // the dormant backfill/rescue paths to leave this row alone.

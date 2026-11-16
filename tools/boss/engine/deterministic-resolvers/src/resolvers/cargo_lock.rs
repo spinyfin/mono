@@ -41,7 +41,7 @@ impl CargoLockResolver {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             runner,

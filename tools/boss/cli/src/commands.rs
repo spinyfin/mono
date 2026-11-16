@@ -1682,7 +1682,7 @@ pub(crate) struct EngineCiMarkNoopArgs {
 pub(crate) enum EngineConflictsCommand {
     /// List `conflict_resolutions` rows, freshest first. Filters are
     /// AND-ed; omit them all to see every attempt. Human output is a
-    /// table; `--json` emits the full row vector.
+    /// table; `--json` emits rows, with `ladder_outcomes` as objects.
     List(EngineConflictsListArgs),
     /// Show a single `conflict_resolutions` row by id. Carries every
     /// column the engine has for the attempt, including the structured

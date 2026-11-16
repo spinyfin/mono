@@ -24,6 +24,8 @@ TEST_ALIASES = {
     "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
     "//tools/boss/engine/spoke-hub": "boss_spoke_hub_production",
     "//tools/boss/engine/spoke-hub:spoke_hub_test_support": "boss_spoke_hub",
+    "//tools/boss/engine/deterministic-resolvers": "boss_deterministic_resolvers_production",
+    "//tools/boss/engine/deterministic-resolvers:deterministic_resolvers_test_support": "boss_deterministic_resolvers",
 }
 
 TEST_SWAPS = [
@@ -36,6 +38,7 @@ TEST_SWAPS = [
     "//tools/boss/engine/observation-contracts",
     "//tools/boss/engine/spoke-hub",
     "//tools/boss/engine/work-db",
+    "//tools/boss/engine/deterministic-resolvers",
 ]
 
 TEST_DEPS = [
@@ -48,6 +51,7 @@ TEST_DEPS = [
     "//tools/boss/engine/observation-contracts:observation_contracts_test_support",
     "//tools/boss/engine/spoke-hub:spoke_hub_test_support",
     "//tools/boss/engine/work-db:work_db_test_support",
+    "//tools/boss/engine/deterministic-resolvers:deterministic_resolvers_test_support",
 ]
 
 def runtime_libraries():

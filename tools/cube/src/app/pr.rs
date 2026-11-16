@@ -14,7 +14,7 @@ use crate::app::change::resolve_body_file;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
-use crate::app::jj::{ENGINE_POINTER_BOOKMARK_PREFIXES, run_jj, run_jj_push};
+use crate::app::jj::{is_bookkeeping_bookmark, run_jj, run_jj_push};
 use crate::app::stage::run_stage;
 
 /// Resolved context for a PR create/update operation: the workspace, the
@@ -522,14 +522,7 @@ fn infer_branch_from_ancestry(runner: &dyn CommandRunner, cwd: &Path) -> Result<
     output
         .lines()
         .map(str::trim)
-        .find(|name| {
-            !name.is_empty()
-                && !matches!(*name, "main" | "master")
-                && !pr_bookmark::is_pr_bookmark(name)
-                && !ENGINE_POINTER_BOOKMARK_PREFIXES
-                    .iter()
-                    .any(|prefix| name.starts_with(prefix))
-        })
+        .find(|name| !name.is_empty() && !matches!(*name, "main" | "master") && !is_bookkeeping_bookmark(name))
         .map(str::to_string)
         .ok_or_else(|| {
             CubeError::InvalidArgument(

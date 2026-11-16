@@ -22,7 +22,9 @@
 //! Attempts deduplicate identical base/head states, and the churn guard
 //! bounds attempts across changing states.
 
-use boss_deterministic_resolvers::{ConflictedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
+use boss_deterministic_resolvers::{
+    ConflictedFile, DeclinedFile, FailedFile, RegistryResolution, ResolvedFile, ResolverRegistry,
+};
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
@@ -198,6 +200,54 @@ pub(crate) fn log_routing_verdict(
     );
 }
 
+/// Persist decisions for CLI inspection and bounded tier/outcome counters.
+/// A blank `reason` is replaced with `{tier} {outcome}` so every ladder exit
+/// writes a non-null history entry even when per-file details were empty.
+pub(crate) fn record_tier(work_db: &WorkDb, attempt: &ConflictResolution, tier: &str, outcome: &str, reason: &str) {
+    let fallback;
+    let reason = if reason.trim().is_empty() {
+        fallback = format!("{tier} {outcome}");
+        fallback.as_str()
+    } else {
+        reason
+    };
+    if let Err(err) = work_db.record_conflict_ladder_outcome(&attempt.id, tier, outcome, reason) {
+        tracing::error!(attempt_id = %attempt.id, tier, outcome, ?err, "conflict_ladder: could not persist tier decision");
+    }
+}
+
+fn format_declined_file(file: &DeclinedFile) -> String {
+    if file.matched_resolver {
+        format!("{}: resolver ran and declined: {}", file.path, file.reason)
+    } else {
+        format!("{}: no resolver applies to this file", file.path)
+    }
+}
+
+/// Record a rung-0 registry decline/failure. Empty per-file lists still
+/// persist `reason` rather than leaving `ladder_reason` NULL.
+pub(crate) fn record_rung0_registry_decline(
+    work_db: &WorkDb,
+    attempt: &ConflictResolution,
+    declined: &[DeclinedFile],
+    failed: &[FailedFile],
+    reason: &str,
+) {
+    let details = declined
+        .iter()
+        .map(format_declined_file)
+        .chain(failed.iter().map(|f| format!("{}: {}", f.path, f.reason)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    record_tier(
+        work_db,
+        attempt,
+        "deterministic",
+        if failed.is_empty() { "declined" } else { "failed" },
+        if details.is_empty() { reason } else { &details },
+    );
+}
+
 /// Rung 2 eligibility: a bounded set of residual conflicted files is
 /// "genuine semantic overlap" a small focused agent may attempt; zero files
 /// means rung 1 never actually left a residue to hand off (a lease/goto/
@@ -243,6 +293,7 @@ pub(crate) async fn try_mechanical_rungs_with(
         );
         let reason = "could not parse a PR number from pr_url; mechanical rungs skipped";
         log_routing_verdict(&candidate.work_item_id, None, &[], "generic", reason);
+        record_tier(work_db, attempt, "engine_rebase", "fell_through", reason);
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason,
@@ -275,6 +326,17 @@ pub(crate) async fn try_mechanical_rungs_with(
                 "skip",
                 "a worker is live on this PR's chain; engine rebase deferred until it finishes",
             );
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "deferred",
+                if writers.trim().is_empty() {
+                    "a worker is live on this PR's chain; engine rebase deferred until it finishes"
+                } else {
+                    &writers
+                },
+            );
             return LadderOutcome::DeferredForLiveWriter;
         }
     };
@@ -302,6 +364,7 @@ pub(crate) async fn try_mechanical_rungs_with(
             );
             let reason = "no repo_remote_url resolves for this work item; mechanical rungs skipped";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(work_db, attempt, "engine_rebase", "fell_through", reason);
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -315,6 +378,13 @@ pub(crate) async fn try_mechanical_rungs_with(
             );
             let reason = "failed to resolve repo_remote_url; mechanical rungs skipped";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "fell_through",
+                &format!("{reason}: {err:#}"),
+            );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -333,6 +403,13 @@ pub(crate) async fn try_mechanical_rungs_with(
             );
             let reason = "ensure_repo failed; mechanical rungs skipped";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "fell_through",
+                &format!("{reason}: {err:#}"),
+            );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -362,6 +439,13 @@ pub(crate) async fn try_mechanical_rungs_with(
                 "skip",
                 "could not lease a workspace for rung 1 after one retry; mechanical rungs unavailable \
                  this attempt, ladder will retry on the next conflict_watch tick",
+            );
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "unavailable",
+                &format!("workspace lease failed after retry: {err:#}"),
             );
             return LadderOutcome::MechanicalRungsUnavailable;
         }
@@ -493,6 +577,13 @@ pub(crate) async fn run_rung1_in_lease_with(
         );
         let reason = "goto_workspace failed; mechanical rungs unavailable";
         log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+        record_tier(
+            work_db,
+            attempt,
+            "engine_rebase",
+            "fell_through",
+            &format!("{reason}: {err:#}"),
+        );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason,
@@ -510,6 +601,13 @@ pub(crate) async fn run_rung1_in_lease_with(
             );
             let reason = "engine-direct rebase (rung 1) failed; mechanical rungs unavailable";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "fell_through",
+                &format!("{reason}: {err:#}"),
+            );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -562,12 +660,24 @@ pub(crate) async fn run_rung1_in_lease_with(
         );
         let reason = "rung 1 rebased clean but the push was skipped upstream; mechanical resolution not landed";
         log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+        record_tier(work_db, attempt, "engine_rebase", "fell_through", reason);
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason,
         };
     }
 
+    record_tier(
+        work_db,
+        attempt,
+        "engine_rebase",
+        "residual_conflicts",
+        &format!(
+            "residual files: {}; replay collapse: {}",
+            rebase.conflicted_files.join(", "),
+            rebase.linearize_decline.as_deref().unwrap_or("not reported")
+        ),
+    );
     // Residual conflicts after the structural rebase are genuine overlap.
     // Try rung 0 (deterministic resolvers) first — controlled by
     // RUNG0_APPLY_LIVE (see its doc comment). `attempt_rung0` itself
@@ -635,6 +745,13 @@ pub(crate) async fn run_rung1_in_lease_with(
             residual_conflicts = rebase.conflicted_files.len(),
             rung0_apply_live = RUNG0_APPLY_LIVE,
             "conflict_ladder: rung 0 (deterministic resolvers) gated off; not attempted — climbing to rung 2/3",
+        );
+        record_tier(
+            work_db,
+            attempt,
+            "deterministic",
+            "skipped",
+            "deterministic resolvers disabled",
         );
         "rung 0 compile-gated off (RUNG0_APPLY_LIVE=false); falling through to rung 2/3"
     };
@@ -819,6 +936,13 @@ pub(crate) async fn attempt_rung0_with(
             pr_url = %candidate.pr_url,
             "conflict_ladder: rung 0 could not parse PR number; declining",
         );
+        record_tier(
+            work_db,
+            attempt,
+            "deterministic",
+            "fell_through",
+            "could not parse PR number",
+        );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason: "rung 0 could not parse a PR number from pr_url",
@@ -857,16 +981,7 @@ pub(crate) async fn attempt_rung0_with(
             // no-resolver-applies file means the residue is simply out of
             // rung 0's coverage. Per-file reasons make either case
             // answerable straight from this trace line.
-            let per_file: Vec<String> = declined
-                .iter()
-                .map(|d| {
-                    if d.matched_resolver {
-                        format!("{}: resolver ran and declined: {}", d.path, d.reason)
-                    } else {
-                        format!("{}: no resolver applies to this file", d.path)
-                    }
-                })
-                .collect();
+            let per_file: Vec<String> = declined.iter().map(format_declined_file).collect();
             // Tell the truth in the verdict: a resolver that *matched and
             // ran* but whose command failed operationally (e.g. `bazel mod
             // deps` erroring in a cold workspace because a gitignored
@@ -900,6 +1015,7 @@ pub(crate) async fn attempt_rung0_with(
                 "rung 0 attempted but a resolver failed operationally (environment/tooling issue, \
                  not a decline)"
             };
+            record_rung0_registry_decline(work_db, attempt, &declined, &failed, reason);
             if files
                 .iter()
                 .all(|file| boss_deterministic_resolvers::is_generated_lockfile(&file.path))
@@ -926,6 +1042,13 @@ pub(crate) async fn attempt_rung0_with(
             pr = pr_number,
             error = %format!("{err:#}"),
             "conflict_ladder: rung 0 resolved every residual file but the push failed; climbing to worker",
+        );
+        record_tier(
+            work_db,
+            attempt,
+            "deterministic",
+            "push_failed",
+            &format!("resolution push/gate failed: {err:#}"),
         );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
@@ -992,6 +1115,13 @@ async fn retire_attempt_at_rung(
         &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
     );
 
+    record_tier(
+        work_db,
+        attempt,
+        if rung == 0 { "deterministic" } else { "engine_rebase" },
+        "retired",
+        "resolution pushed and deletion tripwire passed",
+    );
     clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
 
     // The parent was flipped to `blocked: merge_conflict` upfront by
@@ -1146,6 +1276,13 @@ async fn halt_attempt_for_deletion_signoff(
         ),
     );
 
+    record_tier(
+        work_db,
+        attempt,
+        if rung == 0 { "deterministic" } else { "engine_rebase" },
+        "halted_for_signoff",
+        &format!("deletion tripwire: {}", deletions.join("; ")),
+    );
     if let Err(err) = work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
         tracing::warn!(
             attempt_id = %attempt.id,

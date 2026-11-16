@@ -38,7 +38,8 @@ impl BazelModuleLockResolver {
         self
     }
 
-    #[cfg(test)]
+    /// Supply command execution for a hermetic ladder fixture.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             runner,
