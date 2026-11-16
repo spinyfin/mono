@@ -212,9 +212,16 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         LEASE_UNRELEASED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "A finished run's lease is held (worker death is unconfirmed, process cleanup failed or left \
-         occupants, the owning host was unreachable, or a remote worker could not be confirmed gone). \
+         occupants, or a remote worker could not be confirmed gone). \
          The release path resolves it when the lease returns; a run starting elsewhere proves nothing \
          about this lease.",
+    ),
+    entry(
+        LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The owning host or cube workspace registry could not be reached while recovering a finished \
+         run's lease. Filed separately from occupancy-keep evidence so a transient fault cannot erase \
+         retry authorization. The release path resolves it when the lease returns.",
     ),
     entry(
         LEASE_RELEASE_FAILED_ATTENTION_KIND,

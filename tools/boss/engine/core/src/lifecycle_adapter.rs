@@ -36,6 +36,73 @@ impl CoreLifecycleServices {
             occupancy_rechecks: Default::default(),
         })
     }
+
+    async fn reconcile_absent_live_lease(
+        &self,
+        execution: &WorkExecution,
+        lease_id: &str,
+        adapter: Arc<dyn HostAdapter>,
+    ) -> anyhow::Result<LeaseReleaseOutcome> {
+        use crate::workspace_lease_release::{
+            HostOccupancy, LEASE_UNRELEASED_ATTENTION_KIND, Occupancy, OwningHostOccupancy, bound_unowned_occupants,
+            refresh_attention,
+        };
+        if adapter.host_id() != "local" {
+            let occupancy = match execution.workspace_path.as_deref() {
+                Some(path) => bound_unowned_occupants(
+                    &self.work_db,
+                    execution,
+                    adapter
+                        .cleanup_execution_processes(&execution.id, Path::new(path))
+                        .await,
+                )
+                .unwrap_or_else(|err| {
+                    refresh_attention(
+                        &self.work_db,
+                        execution,
+                        LEASE_UNRELEASED_ATTENTION_KIND,
+                        "Remote workspace recovery needs process cleanup",
+                        &format!(
+                            "Lease {lease_id} on {}: {err:#}. Inspect the named processes or restore host connectivity, then retry recovery.",
+                            adapter.host_id()
+                        ),
+                    );
+                    Occupancy::Unknown
+                }),
+                None => Occupancy::Unknown,
+            };
+            return crate::workspace_lease_release::reconcile_absent_lease(
+                &self.work_db,
+                execution,
+                lease_id,
+                Some(adapter.as_ref()),
+                None,
+                Some(&OwningHostOccupancy(occupancy)),
+                None,
+            )
+            .await;
+        }
+        let db = Arc::clone(&self.work_db);
+        let execution = execution.clone();
+        let lease_id = lease_id.to_owned();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                crate::workspace_lease_release::reconcile_absent_lease(
+                    &db,
+                    &execution,
+                    &lease_id,
+                    Some(adapter.as_ref()),
+                    None,
+                    Some(&HostOccupancy),
+                    None,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap_or_else(|err| Err(anyhow::anyhow!("workspace occupancy recheck failed: {err}")))
+    }
 }
 
 fn map_pid_status(status: crate::dead_pid_sweep::PidStatus) -> PidStatus {
@@ -216,7 +283,10 @@ impl LifecycleServices for CoreLifecycleServices {
         local: Arc<dyn HostAdapter>,
         at_bound: bool,
     ) {
-        use crate::workspace_lease_release::{LEASE_UNRELEASED_ATTENTION_KIND, refresh_attention, retry_pane_status};
+        use crate::workspace_lease_release::{
+            LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND, LEASE_UNRELEASED_ATTENTION_KIND, WorkspaceTipSource,
+            refresh_attention, retry_pane_status, workspace_tip_source_from_listing,
+        };
         let is_live = live.is_some_and(|live| live.snapshot().iter().any(|state| state.run_id == execution.id));
         if !execution.status.is_terminal() || is_live {
             return;
@@ -232,6 +302,7 @@ impl LifecycleServices for CoreLifecycleServices {
             }
             attempts.insert(execution.id.clone(), (std::time::Instant::now(), at_bound));
         }
+        crate::workspace_lease_release::previous_occupancy_keep(&self.work_db, execution);
         let adapter = async {
             match self.work_db.latest_run_host_for_execution(&execution.id)?.as_deref() {
                 None | Some("local") => Ok(local),
@@ -247,7 +318,7 @@ impl LifecycleServices for CoreLifecycleServices {
                 refresh_attention(
                     &self.work_db,
                     execution,
-                    LEASE_UNRELEASED_ATTENTION_KIND,
+                    LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
                     "Workspace recovery cannot reach its owning host",
                     &format!("Host resolution failed: {err:#}"),
                 );
@@ -274,15 +345,28 @@ impl LifecycleServices for CoreLifecycleServices {
         }
         match adapter.list_workspaces().await {
             Ok(rows) if !rows.iter().any(|row| row.lease_id.as_deref() == Some(lease_id)) => {
-                if let Err(err) = crate::workspace_lease_release::reconcile_absent_lease(
-                    &self.work_db,
+                let (tip_source, _) = workspace_tip_source_from_listing(
                     execution,
-                    lease_id,
-                    Some(adapter.as_ref()),
-                    None,
-                )
-                .await
-                {
+                    self.work_db.workspace_lease_boundary(&execution.id).ok().flatten(),
+                    self.work_db.workspace_lease_generation(&execution.id).ok().flatten(),
+                    &rows,
+                );
+                let outcome = if matches!(tip_source, WorkspaceTipSource::Live) {
+                    self.reconcile_absent_live_lease(execution, lease_id, Arc::clone(&adapter))
+                        .await
+                } else {
+                    crate::workspace_lease_release::reconcile_absent_lease(
+                        &self.work_db,
+                        execution,
+                        lease_id,
+                        Some(adapter.as_ref()),
+                        None,
+                        None,
+                        Some(&rows),
+                    )
+                    .await
+                };
+                if let Err(err) = outcome {
                     refresh_attention(
                         &self.work_db,
                         execution,
@@ -298,14 +382,14 @@ impl LifecycleServices for CoreLifecycleServices {
                 refresh_attention(
                     &self.work_db,
                     execution,
-                    LEASE_UNRELEASED_ATTENTION_KIND,
+                    LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
                     "Workspace lease registry is unavailable",
                     &format!("Could not confirm cube lease {lease_id}: {err:#}"),
                 );
                 return;
             }
         }
-        if !crate::workspace_lease_release::previous_occupancy_keep(&self.work_db, &execution.id) {
+        if !crate::workspace_lease_release::previous_occupancy_keep(&self.work_db, execution) {
             return;
         }
         let db = Arc::clone(&self.work_db);

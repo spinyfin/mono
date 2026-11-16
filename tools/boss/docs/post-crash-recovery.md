@@ -67,16 +67,21 @@ pid — and the successor stays held behind it rather than abandoning the work.
 A successor retry checks the owning-host registry after confirming worker death.
 If the lease is already absent, it preserves the predecessor's work before
 clearing the stale engine record. An unchanged claim counter on a free workspace
-allows live preservation; an absent or reassigned workspace uses the recorded
-lease boundary. No workspace is reset or released during this reconciliation.
-Preservation failure or unresolved inspection keeps the successor held, with
-the workspace path in the diagnostic, until recovery succeeds or the wait bound
-fails the successor. Cube's lease-not-found release result remains idempotent.
+allows live preservation after occupancy agrees the workspace is empty; an
+absent or reassigned workspace uses the recorded lease boundary. No workspace
+is reset or released during this reconciliation. Failing to run preservation
+(jj, unreachable host, missing recovery record or path) keeps the successor
+held, with the workspace path in the diagnostic, until recovery succeeds or
+the wait bound fails the successor. Completing preservation with an inspection
+still reconciles, matching the held-lease path. Cube's lease-not-found release
+result remains idempotent.
 An occupancy hold has distinct durable evidence that the pane gate passed.
 Open legacy cleanup items titled "Workspace recovery needs process cleanup",
 "Workspace recovery could not release its lease", or "Remote workspace recovery
-needs process cleanup" also supply that evidence. "Terminal worker still holds
-its workspace" never authorizes a no-pid retry.
+needs process cleanup" also supply that evidence; the first match converts them
+into the occupancy-kept marker. Host-resolution and cube-registry faults file a
+separate recovery-unavailable item so they cannot rewrite those titles.
+"Terminal worker still holds its workspace" never authorizes a no-pid retry.
 The sweep and dispatch both require absence from the live registry and
 confirmed death of any recorded shell PID before retrying. Remote retries
 resolve and validate the owning host adapter and confirm any recorded remote

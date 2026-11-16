@@ -893,6 +893,38 @@ async fn sweep_retries_occupancy_kept_never_started_row_after_occupants_leave() 
 }
 
 #[tokio::test]
+async fn legacy_occupancy_keep_survives_a_transient_registry_fault() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-legacy");
+    raise_attention(
+        &db,
+        &execution,
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        "Workspace recovery needs process cleanup",
+        "Workspace processes have not exited",
+    );
+    assert!(previous_occupancy_keep(&db, &execution));
+    assert!(
+        db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .any(|item| item.status == "open" && item.kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND)
+    );
+    refresh_attention(
+        &db,
+        &execution,
+        LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
+        "Workspace lease registry is unavailable",
+        "Could not confirm cube lease lease-legacy: cube registry unavailable",
+    );
+    assert!(previous_occupancy_keep(&db, &execution));
+    assert_eq!(
+        retry_pane_status(&db, false, &db.get_execution(&execution.id).unwrap()),
+        PaneStatus::Gone
+    );
+}
+
+#[tokio::test]
 async fn occupancy_keep_attention_quotes_the_latest_cleanup() {
     let (_dir, db) = open_db();
     let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-fresh");

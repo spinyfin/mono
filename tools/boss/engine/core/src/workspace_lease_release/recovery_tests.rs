@@ -309,15 +309,11 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
             EmptyOccupancy
         })
         .await;
-        assert_eq!(
-            outcome.released,
-            usize::from(state != "unlisted"),
-            "{state}: {outcome:?}"
-        );
-        assert_eq!(outcome.kept, usize::from(state == "unlisted"), "{state}: {outcome:?}");
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.is_some(),
-            state == "unlisted"
+        assert_eq!(outcome.released, 1, "{state}: {outcome:?}");
+        assert_eq!(outcome.kept, 0, "{state}: {outcome:?}");
+        assert!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.is_none(),
+            "{state}"
         );
         assert_eq!(db.preserved_tip(&execution.id).unwrap().unwrap().commit_id, ours);
         // Another holder's stack is reported only when cube shows no evidence
@@ -965,11 +961,8 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
             EmptyOccupancy
         })
         .await;
-        assert_eq!((outcome.released, outcome.kept), (0, 1), "{outcome:?}");
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease")
-        );
+        assert_eq!((outcome.released, outcome.kept), (1, 0), "{outcome:?}");
+        assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
         let preserved = preserved_files(&repo, &execution);
         assert!(
             !preserved.contains("theirs"),
@@ -1040,10 +1033,10 @@ async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_late
             EmptyOccupancy
         })
         .await;
-        assert_eq!((outcome.released, outcome.kept), (0, 1), "{action}: {outcome:?}");
-        assert_eq!(
-            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
-            Some("lease")
+        assert_eq!((outcome.released, outcome.kept), (1, 0), "{action}: {outcome:?}");
+        assert!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.is_none(),
+            "{action}"
         );
         if action == "edit" {
             assert!(db.preserved_tip(&execution.id).unwrap().is_none());
@@ -1087,4 +1080,97 @@ async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_late
             "{action}: post-boundary work was dropped silently"
         );
     }
+}
+
+/// A free workspace whose claim counter has not moved is Live preservation.
+/// Occupancy must run first so a lingering occupant cannot be snapshotted.
+#[tokio::test]
+async fn absent_lease_live_waits_for_occupancy_before_preserving() {
+    let (dir, db) = open_db();
+    let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
+    let execution = orphaned_worker(&db, &repo).await;
+    std::fs::write(repo.worker.join("ours"), "original worker").unwrap();
+    db.confirm_workspace_lease(
+        &execution.id,
+        "lease",
+        boss_engine_utils::epoch_time::now_epoch_ms() as i64,
+    )
+    .unwrap();
+    db.record_workspace_lease_generation(&execution.id, "lease", 1).unwrap();
+    kill_worker(&db, &execution);
+    let registry = HandoffRegistry(vec![registry_row(&repo.worker, "free", None, Some(1))]);
+    let occupied = || async {
+        ProcessSnapshot {
+            cwds: vec![(std::process::id() + 1, repo.worker.canonicalize().unwrap())],
+            complete: true,
+        }
+    };
+    let first = run_one_pass_with_occupancy(&db, &registry, &LiveWorkerStateRegistry::new(), occupied).await;
+    assert_eq!((first.released, first.kept), (0, 1), "{first:?}");
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+        Some("lease")
+    );
+    assert!(db.preserved_tip(&execution.id).unwrap().is_none());
+    let kinds = open_kinds(&db, &execution.id);
+    assert!(
+        kinds.contains(&LEASE_OCCUPANCY_KEPT_ATTENTION_KIND.to_owned()),
+        "{kinds:?}"
+    );
+    let items = db.list_attention_items(&execution.id).unwrap();
+    assert!(
+        items.iter().any(|item| {
+            item.kind == LEASE_UNRELEASED_ATTENTION_KIND && item.body_markdown.contains("process_in_workspace")
+        }),
+        "{items:?}"
+    );
+    let second = run_one_pass_with_occupancy(&db, &registry, &LiveWorkerStateRegistry::new(), || async {
+        EmptyOccupancy
+    })
+    .await;
+    assert_eq!(second.released, 1, "{second:?}");
+    assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
+    assert!(db.preserved_tip(&execution.id).unwrap().is_some());
+}
+
+/// Two absent-lease candidates share one registry listing per pass.
+#[tokio::test]
+async fn leftover_sweep_lists_cube_workspaces_once_per_pass() {
+    struct CountingCube(std::sync::atomic::AtomicUsize);
+    crate::stub_cube_client! { CountingCube {
+        async fn release_workspace(&self, _: &str) -> Result<()> { Ok(()) }
+        async fn list_workspaces(&self) -> Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    } }
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    for name in ["first", "second"] {
+        let chore = create_test_chore(&db, product.id.clone(), name);
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Failed)
+                    .cube_lease_id(format!("lease-{name}"))
+                    .cube_workspace_id(format!("workspace-{name}"))
+                    .workspace_path("/tmp/never-started-workspace")
+                    .build(),
+            )
+            .unwrap();
+        raise_attention(
+            &db,
+            &execution,
+            LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+            "Workspace is waiting for remaining processes to exit",
+            "settled",
+        );
+    }
+    let cube = CountingCube(std::sync::atomic::AtomicUsize::new(0));
+    let outcome =
+        run_one_pass_with_occupancy(&db, &cube, &LiveWorkerStateRegistry::new(), || async { EmptyOccupancy }).await;
+    assert_eq!(outcome.released, 2, "{outcome:?}");
+    assert_eq!(cube.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

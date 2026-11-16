@@ -303,6 +303,11 @@ pub const LEASE_UNRELEASED_ATTENTION_KIND: &str = "workspace_lease_unreleased";
 /// Confirms that a release attempt passed the pane gate and was kept by occupancy.
 pub const LEASE_OCCUPANCY_KEPT_ATTENTION_KIND: &str = "workspace_lease_occupancy_kept";
 
+/// Host or cube-registry faults while recovering a finished run's lease.
+/// Separate from [`LEASE_UNRELEASED_ATTENTION_KIND`] so a transient error
+/// cannot rewrite occupancy-keep evidence titles of that kind.
+pub const LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND: &str = "workspace_lease_recovery_unavailable";
+
 /// Attention kind filed when every gate passed but cube's own release call
 /// failed. Together with [`LEASE_OCCUPANCY_KEPT_ATTENTION_KIND`] it is durable
 /// evidence that the run had settled, which is what lets the leftover-lease

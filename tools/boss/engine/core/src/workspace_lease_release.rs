@@ -350,6 +350,7 @@ pub(crate) fn retry_pane_status(db: &WorkDb, is_live: bool, execution: &WorkExec
     if !execution.status.is_terminal() || is_live {
         return PaneStatus::Present;
     }
+    promote_legacy_occupancy_keep(db, execution);
     // Cancelled and failed rows go through durable death evidence: a recorded
     // worker pid that is dead. A cancelled in-flight spawn (no pid recorded
     // yet) and a failed viewer abort (pid still alive) therefore stay held.
@@ -387,8 +388,29 @@ fn occupancy_keep_evidence(kind: &str, title: &str) -> bool {
             ))
 }
 
-pub(crate) fn previous_occupancy_keep(db: &WorkDb, execution_id: &str) -> bool {
-    db.list_attention_items(execution_id).is_ok_and(|items| {
+fn promote_legacy_occupancy_keep(db: &WorkDb, execution: &WorkExecution) {
+    let Ok(items) = db.list_attention_items(&execution.id) else {
+        return;
+    };
+    if !items.iter().any(|item| {
+        item.status == "open"
+            && item.kind == LEASE_UNRELEASED_ATTENTION_KIND
+            && occupancy_keep_evidence(&item.kind, &item.title)
+    }) {
+        return;
+    }
+    raise_attention(
+        db,
+        execution,
+        LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+        "Workspace is waiting for remaining processes to exit",
+        "The worker has exited. The engine will check the workspace again and return its lease automatically once it is empty.",
+    );
+}
+
+pub(crate) fn previous_occupancy_keep(db: &WorkDb, execution: &WorkExecution) -> bool {
+    promote_legacy_occupancy_keep(db, execution);
+    db.list_attention_items(&execution.id).is_ok_and(|items| {
         items
             .iter()
             .any(|item| item.status == "open" && occupancy_keep_evidence(&item.kind, &item.title))
@@ -472,6 +494,7 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
     };
     let mut occupancy = None;
     let mut capture = Some(capture);
+    let mut listing = None;
     for execution in candidates {
         let Some(lease_id) = execution.cube_lease_id.clone() else {
             continue;
@@ -508,14 +531,37 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
             outcome.held += 1;
             continue;
         }
+        if listing.is_none() {
+            listing = Some(cube_client.list_workspaces().await);
+        }
         // An expired or reassigned lease must preserve successfully before
         // dropping the engine's recovery record. Never release its new holder.
-        if let Ok(rows) = cube_client.list_workspaces().await
+        // A listing error falls through to apply_release.
+        if let Some(Ok(rows)) = listing.as_ref()
             && !rows
                 .iter()
                 .any(|row| row.lease_id.as_deref() == Some(lease_id.as_str()))
         {
-            match reconcile_absent_lease(work_db, &execution, &lease_id, None, Some(cube_client)).await {
+            let (tip_source, _) = workspace_tip_source_from_listing(
+                &execution,
+                work_db.workspace_lease_boundary(&execution.id).ok().flatten(),
+                work_db.workspace_lease_generation(&execution.id).ok().flatten(),
+                rows,
+            );
+            if matches!(tip_source, WorkspaceTipSource::Live) && occupancy.is_none() {
+                occupancy = Some(capture.take().expect("one scan per pass")().await);
+            }
+            match reconcile_absent_lease(
+                work_db,
+                &execution,
+                &lease_id,
+                None,
+                Some(cube_client),
+                occupancy.as_ref().map(|probe| probe as &dyn WorkspaceOccupancy),
+                Some(rows.as_slice()),
+            )
+            .await
+            {
                 Ok(LeaseReleaseOutcome::Released) => outcome.released += 1,
                 Ok(LeaseReleaseOutcome::NoLease) => {}
                 _ => outcome.kept += 1,

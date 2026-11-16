@@ -18,8 +18,9 @@ use crate::transient_recovery::{
     NoopWorkerNudger, RecoveryContext, TransientRecoveryOutcome, TransientRecoveryReaper, run_one_pass_with_occupancy,
 };
 use crate::workspace_lease_release::{
-    DbPreservation, EmptyOccupancy, HostOccupancy, KeepReason, LEASE_UNRELEASED_ATTENTION_KIND, LeaseReleaseOutcome,
-    Occupancy, PaneStatus, ReleaseEvidence, TerminalCause, WorkspaceOccupancy, apply_release,
+    DbPreservation, EmptyOccupancy, HostOccupancy, KeepReason, LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+    LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND, LEASE_UNRELEASED_ATTENTION_KIND, LeaseReleaseOutcome, Occupancy,
+    PaneStatus, ReleaseEvidence, TerminalCause, WorkspaceOccupancy, apply_release,
 };
 use boss_engine_recovery::execution_bookmark::{self as recovery, LocalJj};
 use boss_engine_test_git::jj::JjRepo;
@@ -1293,7 +1294,7 @@ async fn remote_retry_rejects_a_provider_that_routes_to_local() {
         .list_attention_items(&s.stalled_id)
         .unwrap()
         .into_iter()
-        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .find(|item| item.kind == LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND)
         .unwrap();
     assert!(item.body_markdown.contains("reports host 'local'"), "{item:?}");
     assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
@@ -1321,6 +1322,102 @@ fn legacy_occupancy_evidence(s: &Stalled) {
         LEASE_UNRELEASED_ATTENTION_KIND,
         "Workspace recovery needs process cleanup",
         "Workspace processes have not exited",
+    );
+}
+
+#[tokio::test]
+async fn absent_lease_inspection_still_lets_the_successor_start() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    legacy_occupancy_evidence(&s);
+    JjRepo::snapshot(&s.repo.worker);
+    let boundary = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    s.db()
+        .confirm_workspace_lease(&s.stalled_id, "lease-old", boundary)
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    JjRepo::run(&s.repo.worker, &["new", "root()", "-m", "Intervening holder"]);
+    std::fs::write(s.repo.worker.join("theirs"), "intervening").unwrap();
+    s.cube.active_leases.lock().await.clear();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert!(s.stalled().cube_lease_id.is_none());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert!(
+        s.db()
+            .list_attention_items(&s.stalled_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "preserved_work_needs_inspection" && item.status == "open")
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
+    );
+}
+
+#[tokio::test]
+async fn legacy_occupancy_keep_survives_a_transient_registry_fault() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    legacy_occupancy_evidence(&s);
+    s.cube.list_workspaces_fail.store(true, Ordering::SeqCst);
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    let items = s.db().list_attention_items(&s.stalled_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND && item.status == "open"),
+        "{items:?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item.kind == LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND
+                && item.title == "Workspace lease registry is unavailable"
+        }),
+        "{items:?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item.kind == LEASE_UNRELEASED_ATTENTION_KIND && item.title == "Workspace recovery needs process cleanup"
+        }),
+        "{items:?}"
+    );
+    s.cube.list_workspaces_fail.store(false, Ordering::SeqCst);
+    let swept =
+        crate::workspace_lease_release::run_one_pass(s.db(), s.cube.as_ref(), &LiveWorkerStateRegistry::new()).await;
+    assert_eq!(swept.released, 1, "{swept:?}");
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert!(s.stalled().cube_lease_id.is_none());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
     );
 }
 
