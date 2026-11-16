@@ -46,8 +46,6 @@ impl RevisionOrigin {
 #[builder(on(String, into))]
 pub struct RootTask {
     pub name: String,
-    /// Plain-words kind of work, e.g. "chore" or "project task".
-    pub kind: String,
     pub description: Option<String>,
 }
 
@@ -129,7 +127,6 @@ pub fn render_guide_context(context: &GuideContext) -> String {
     );
 
     out.push_str("#### Original change\n\n");
-    let _ = writeln!(out, "- Kind of work: {}", context.root.kind);
     let _ = writeln!(out, "- Title: {}", one_line(&context.root.name));
     out.push_str("- Task description:\n\n");
     out.push_str(&quote_description(context.root.description.as_deref()));
@@ -253,7 +250,6 @@ mod tests {
     fn root() -> RootTask {
         RootTask::builder()
             .name("Add retry backoff")
-            .kind("project task")
             .description("Retries should back off exponentially.\n## Not a heading")
             .build()
     }
@@ -261,7 +257,7 @@ mod tests {
     #[test]
     fn primary_change_has_no_revision_structure() {
         let rendered = render_guide_context(&GuideContext::builder().root(root()).build());
-        assert!(rendered.contains("- Kind of work: project task"));
+        assert!(!rendered.contains("Kind of work:"));
         assert!(rendered.contains("- Title: Add retry backoff"));
         assert!(rendered.contains("> Retries should back off exponentially."));
         assert!(rendered.contains("#### Revisions filed against this PR\n\nNone."));

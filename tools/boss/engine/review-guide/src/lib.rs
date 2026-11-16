@@ -74,7 +74,7 @@ Keep (or, if the previous guide has no `## Orientation`, add) `## Orientation` a
         #[test]
         fn update_template_is_versioned_and_pinned() {
             assert_eq!(UPDATE_PROMPT_VERSION, "review-guide-update-v6");
-            assert_eq!(crate::PROMPT_VERSION, "review-guide-v11");
+            assert_eq!(crate::PROMPT_VERSION, "review-guide-v12");
             assert_eq!(
                 format!("{:x}", Sha256::digest(UPDATE_PROMPT_TEMPLATE.as_bytes())),
                 "880793c09faf6c9c7d9a100c75bb2a1adb7a3b2ed87bd1cc1b68164475a47e78"
@@ -124,7 +124,7 @@ use boss_pr_review_sources::{SourcePacket, SourceSide};
 /// version constant and prompt id — the desired-comparison key an attempt
 /// binds to includes the prompt version, so a prompt change never silently
 /// reinterprets an already-captured comparison's existing readable version.
-pub const PROMPT_VERSION: &str = "review-guide-v11";
+pub const PROMPT_VERSION: &str = "review-guide-v12";
 
 /// The exact production prompt template, byte-identical to the fenced block
 /// in `automatic-pr-review-guides.md`'s "Prompt contract" section. Only the
@@ -138,17 +138,19 @@ pub const PROMPT_VERSION: &str = "review-guide-v11";
 pub const PROMPT_TEMPLATE: &str = "I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
 
 0. a section headed exactly `## Orientation`, placed first, directly after the title, that orients a reader who knows nothing about this change or the system around it (see the orientation requirements below).
-1. a general overview of the change, framed by its kind: for a new feature or capability, what is being built and how it behaves; for a bug fix, the broken behaviour and the corrected behaviour; for a refactor, cleanup, or infrastructure change, what is restructured and what that enables.
+1. a general overview of the change, framed by the type of change: for a new feature or capability, what is being built and how it behaves; for a bug fix, the broken behaviour and the corrected behaviour; for a refactor, cleanup, or infrastructure change, what is restructured and what that enables.
 2. a general overview of the core implementation.
 3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that implements the new behaviour or fix.
 4. a summary of what tests were added, and what test infrastructure was modified to support it.
 5. a section headed exactly `## Evidence` reporting the validation the change's authors performed, as they reported it: the commands they ran and the results they gave, or the tests they added. If the authors report no validation, say \"No validation reported.\"
 
+Determine the type of change from the task description and the diff; do not comment on how the work was filed or categorised.
+
 This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
 
 Orientation requirements. Write `## Orientation` in plain language for a reader with no prerequisite knowledge, and keep it short: a few paragraphs, no code excerpts, no diff detail. It must:
 - Lead with the goal in the reader's terms: the observable symptom or user-facing outcome that motivated the work (what a person using the product saw, felt, or could not do), taken from the originating task's description in the Task context. For a revision, use the original change's description, not the revision's. State it before any internal mechanism. If the originating description is itself purely mechanical, say in plain words what effect the change has on the running system. Only then explain the mechanism, and do not use internal terms such as a queue, cache, or marker before that observable effect has been stated.
-- Say what the change does in a few sentences, framed by the kind of change rather than always as a fix. For a new feature or capability, describe what is being built, what it lets someone do, and how it behaves. For a bug fix, describe the broken behaviour and how it behaves now. For a refactor, cleanup, or infrastructure change, describe what is restructured and what that enables. Do not force every change into a \"what problem does this solve?\" framing. Also say where it lives, naming the subsystem or component in plain words.
+- Say what the change does in a few sentences, framed by the type of change rather than always as a fix. For a new feature or capability, describe what is being built, what it lets someone do, and how it behaves. For a bug fix, describe the broken behaviour and how it behaves now. For a refactor, cleanup, or infrastructure change, describe what is restructured and what that enables. Do not force every change into a \"what problem does this solve?\" framing. Also say where it lives, naming the subsystem or component in plain words.
 - When the Task context names a containing project, explain how the change fits the bigger picture: what the project as a whole is building, which part of it this PR delivers, which earlier pieces it builds on, and which later pieces it enables. Draw these from the project summary, the design document (read it from the checkout when its path is given), and the other project work listed in the Task context; do not name pieces those sources do not support. When the Task context says there is no containing project, do not describe one.
 - Explain, in one line, each term, internal concept, or acronym that the rest of the guide relies on, in plain language where it is first used.
 - When the Task context lists revisions filed against this PR (review findings, CI fixes, merge-conflict resolutions, or human-requested changes), first summarize the PR as a whole (what the original change does and why, as above) and only then say what the revisions change relative to it and why, for example which review findings they address. A reader who has not seen the original PR or any earlier guide must be able to follow the guide from the Orientation alone. When the Task context lists no revisions, describe the change itself.
@@ -182,7 +184,7 @@ Submit the finished Markdown guide using `\"$BOSS_BIN\" propose review-guide --b
 /// newline) — matches the value recorded in the design doc, computed
 /// independently from the doc's own fenced block as a second source of
 /// truth. See `prompt_template_hash_is_pinned`.
-pub const PROMPT_TEMPLATE_SHA256: &str = "5a22f8ec5eee654ad71b2c606d32fbc6b48f12f1d1e1b6eb04b9cdadf30ab945";
+pub const PROMPT_TEMPLATE_SHA256: &str = "5d6b6acbad43304b90e405f48419ecbcf4edca2f0052280a570f9f27d92d972c";
 
 /// The metadata substituted into [`PROMPT_TEMPLATE`] for one comparison.
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -715,7 +717,6 @@ mod tests {
             .root(
                 RootTask::builder()
                     .name("Fix retry backoff")
-                    .kind("chore")
                     .description("Retries never stop; cap them.")
                     .build(),
             )
@@ -727,7 +728,6 @@ mod tests {
             .root(
                 RootTask::builder()
                     .name("Add retry backoff")
-                    .kind("project task")
                     .description("Make the client retry with exponential backoff.")
                     .build(),
             )
@@ -759,13 +759,14 @@ mod tests {
     }
 
     /// Orientation requirements that hold for every guide, primary or revision.
-    const ORIENTATION_REQUIREMENTS: [&str; 11] = [
+    const ORIENTATION_REQUIREMENTS: [&str; 12] = [
         "Lead with the goal in the reader's terms: the observable symptom or user-facing outcome that motivated the work",
         "State it before any internal mechanism",
+        "do not comment on how the work was filed or categorised",
         "say in plain words what effect the change has on the running system",
         "a section headed exactly `## Orientation`, placed first, directly after the title",
         "plain language for a reader with no prerequisite knowledge",
-        "framed by the kind of change rather than always as a fix",
+        "framed by the type of change rather than always as a fix",
         "For a new feature or capability, describe what is being built, what it lets someone do, and how it behaves",
         "For a bug fix, describe the broken behaviour and how it behaves now",
         "For a refactor, cleanup, or infrastructure change, describe what is restructured and what that enables",
@@ -842,7 +843,7 @@ mod tests {
     fn symptom_led_orientation_inputs_precede_mechanism_for_a_review_revision() {
         let symptom = "The app felt sluggish and kept reloading everything. The engine was sending the sign-in status tens of thousands of times a minute, and the app discarded what it had and re-requested all its data hundreds of times in three minutes.";
         let context = GuideContext::builder()
-            .root(RootTask::builder().name("Coalesce pending session-wide snapshot pushes").kind("chore").description(symptom).build())
+            .root(RootTask::builder().name("Coalesce pending session-wide snapshot pushes").description(symptom).build())
             .revisions(vec![
                 Revision::builder()
                     .origin(RevisionOrigin::ReviewFindings)
@@ -1007,7 +1008,7 @@ mod tests {
 
     #[test]
     fn prompt_directs_the_model_to_its_pinned_workspace() {
-        assert_eq!(PROMPT_VERSION, "review-guide-v11");
+        assert_eq!(PROMPT_VERSION, "review-guide-v12");
         assert!(PROMPT_TEMPLATE.contains("read-only checkout of the repository"));
         assert!(PROMPT_TEMPLATE.contains("git --git-dir {{GIT_DIR}} show {{BASE_SHA}}:<path>"));
         assert!(PROMPT_TEMPLATE.contains(

@@ -30,10 +30,6 @@ fn revision_origin(created_via: &str) -> RevisionOrigin {
     }
 }
 
-fn kind_label(kind: &TaskKind) -> String {
-    kind.as_str().replace('_', " ")
-}
-
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Gather the orientation inputs for the guide on `root_task_id`'s PR,
@@ -119,7 +115,6 @@ impl WorkDb {
             .root(
                 RootTask::builder()
                     .name(root.name)
-                    .kind(kind_label(&root.kind))
                     .description(root.description)
                     .build(),
             )
@@ -223,5 +218,59 @@ impl WorkDb {
                 "a design document is recorded but cannot be located ({reason})"
             )),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{create_product, open_db};
+
+    #[test]
+    fn rendered_context_omits_work_item_kind_labels() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product_id.clone(),
+                name: "Resilient transport".to_owned(),
+                description: None,
+                goal: None,
+                autostart: true,
+                no_design_task: false,
+                design_reasoning_effort_xhigh: false,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id.clone())
+                    .name("Cap retry attempts")
+                    .description("Retries never stop; cap them.")
+                    .build(),
+            )
+            .unwrap();
+        let project_task = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(product_id)
+                    .project_id(project.id)
+                    .name("Add retry backoff")
+                    .description("Space out retries after failures.")
+                    .build(),
+            )
+            .unwrap();
+        for root in [chore, project_task] {
+            let context = db
+                .review_guide_task_context(&root.id, "https://github.com/acme/widget/pull/4", "head")
+                .unwrap();
+            let rendered = boss_review_guide::render_guide_context(&context);
+            assert!(rendered.contains(&format!("- Title: {}", root.name)));
+            assert!(rendered.contains(root.description.as_str()));
+            let lower = rendered.to_ascii_lowercase();
+            for label in ["kind of work:", "chore", "project task", "project_task", "- kind: task"] {
+                assert!(!lower.contains(label), "{label} leaked into {rendered}");
+            }
+        }
     }
 }
