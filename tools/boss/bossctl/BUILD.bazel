@@ -15,6 +15,7 @@ rust_binary(
         "src/enrollment.rs",
         "src/enrollment_tests.rs",
         "src/focus.rs",
+        "src/homes.rs",
         "src/hosts.rs",
         "src/logs.rs",
         "src/main.rs",

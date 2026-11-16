@@ -1,0 +1,13 @@
+[package]
+name = "boss-engine-driver-home-retention"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+bon = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

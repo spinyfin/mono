@@ -60,6 +60,10 @@
 //! an on-demand operator verb (`bossctl executions prune`) for manual
 //! cleanup between sweeps.
 //!
+//! Agy rows with an existing or inaccessible container under the current homes root are kept until
+//! home retention removes the container. This preserves retryable pointers
+//! after failed deletes and honors home windows longer than the row window.
+//!
 //! ## Codex homes and prune ordering
 //!
 //! Codex per-run homes are discovered only from
@@ -176,6 +180,28 @@ fn prune_terminal_executions_on(
             )"
     );
 
+    // Agy containers remain discoverable until the home sweep has removed them.
+    // This applies equally to scheduled pruning and bossctl executions prune;
+    // a longer home window or a failed filesystem delete must retain its pointer.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, driver_runtime_state FROM work_executions WHERE id IN ({candidates_sql})"
+    ))?;
+    let rows = stmt.query_map(params![cutoff, policy.keep_per_work_item], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut protected = Vec::new();
+    for row in rows {
+        let (id, raw) = row?;
+        if raw.as_deref().is_some_and(agy_container_still_exists) {
+            protected.push(format!("'{}'", id.replace('\'', "''")));
+        }
+    }
+    let candidates_sql = if protected.is_empty() {
+        candidates_sql
+    } else {
+        format!("{candidates_sql} AND id NOT IN ({})", protected.join(","))
+    };
+
     if dry_run {
         let count: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM ({candidates_sql})"),
@@ -280,6 +306,20 @@ fn remaining_codex_home_paths(conn: &Connection) -> Result<HashSet<PathBuf>> {
         }
     }
     Ok(paths)
+}
+
+fn agy_container_still_exists(raw: &str) -> bool {
+    let Ok(state) = serde_json::from_str::<boss_protocol::DriverRuntimeState>(raw) else {
+        return false;
+    };
+    let Ok(agy) = boss_engine_driver::agy::AgyRuntimeState::from_driver_runtime_state(&state) else {
+        return false;
+    };
+    // Keep retryable pointers only within the current sweep root. Homes from
+    // an old root cannot be reclaimed by the sweep and must not pin rows.
+    agy.process_home.parent().is_some_and(|path| {
+        boss_engine_driver::agy::assert_agy_home_safe_to_delete(path).is_ok() && path.try_exists().unwrap_or(true)
+    })
 }
 
 fn owned_home_from_runtime_state_json(raw: &str) -> Option<PathBuf> {
@@ -704,6 +744,42 @@ mod tests {
         };
         let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
         assert_eq!(outcome.deleted, 0, "all rows are inside the age bound");
+    }
+
+    #[test]
+    fn prunes_agy_row_outside_current_homes_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("current-homes");
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = boss_engine_driver::test_support::agy_homes_override(&root);
+        let container = tmp.path().join("previous-homes/run");
+        std::fs::create_dir_all(container.join("process-home")).unwrap();
+        let db = open_db();
+        let product = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo"));
+        let item = create_chore(&db, &product.id, "old home");
+        let now = 1_800_000_000;
+        let execution = insert_execution(&db, &item, "abandoned", now - 20 * DAY);
+        let state = boss_engine_driver::agy::AgyRuntimeState::builder()
+            .process_home(container.join("process-home"))
+            .control_dir(container.join("control"))
+            .session_settings_path(container.join("control/session-settings.json"))
+            .log_file(container.join("control/agy.log"))
+            .workspace_path(PathBuf::from("/tmp/ws"))
+            .agy_binary(PathBuf::from("/tmp/agy"))
+            .build()
+            .to_driver_runtime_state();
+        db.set_driver_runtime_state(&execution, Some(&state)).unwrap();
+        let policy = ExecutionRetentionPolicy {
+            max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+            keep_per_work_item: 0,
+        };
+        let preview = db.prune_terminal_executions(policy, now, true).unwrap();
+        assert_eq!(preview.deleted, 1);
+        assert_eq!(db.list_executions(Some(&item)).unwrap().len(), 1);
+        let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert!(db.list_executions(Some(&item)).unwrap().is_empty());
+        assert!(container.exists(), "pruning must not delete outside the current root");
     }
 
     #[test]

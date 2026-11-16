@@ -599,6 +599,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-agy-home-retention"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-engine-driver-home-retention",
+]
+
+[[package]]
 name = "boss-engine-app"
 version = "0.1.0"
 dependencies = [
@@ -891,6 +899,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-driver-home-retention"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
 name = "boss-engine-driver-quota"
 version = "0.1.0"
 dependencies = [
@@ -1083,6 +1101,7 @@ dependencies = [
  "boss-dispatch-events",
  "boss-dispatch-reader",
  "boss-editorial",
+ "boss-engine-agy-home-retention",
  "boss-engine-attachments",
  "boss-engine-automation-schedule",
  "boss-engine-codex-rollout-retention",

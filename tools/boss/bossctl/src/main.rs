@@ -30,6 +30,7 @@ mod dispatch_stats;
 mod doctor;
 mod enrollment;
 mod focus;
+mod homes;
 mod hosts;
 mod logs;
 mod pause;
@@ -288,7 +289,7 @@ enum Command {
     /// stopped.
     CodexHomes {
         #[command(subcommand)]
-        action: CodexHomesAction,
+        action: homes::CodexHomesAction,
     },
     /// Reclaim Boss-owned per-run Grok home containers past retention
     /// policy. Mirrors `codex-homes` — see that verb's doc for the shared
@@ -304,7 +305,24 @@ enum Command {
     /// followed to its target.
     GrokHomes {
         #[command(subcommand)]
-        action: GrokHomesAction,
+        action: homes::GrokHomesAction,
+    },
+    /// Reclaim Boss-owned per-run Antigravity (`agy`) home containers past
+    /// retention policy. Mirrors `grok-homes` — see that verb's doc for the
+    /// shared shape (only recorded roots are candidates, live executions
+    /// are never touched, a running engine already sweeps on its own
+    /// schedule and this verb is for on-demand cleanup between sweeps or
+    /// while the engine is stopped).
+    ///
+    /// An `agy` "home" is a run **container** holding `process-home/` (the
+    /// scoped worker `HOME`, with a SQLite conversation DB and a `brain/`
+    /// tree), `control/`, and `rules-root/`; a reclaim removes the whole
+    /// container. The login-keychain symlink under
+    /// `process-home/Library/Keychains/login.keychain-db` is removed as a
+    /// directory entry, never followed to its target.
+    AgyHomes {
+        #[command(subcommand)]
+        action: homes::AgyHomesAction,
     },
     /// Inspect and reclaim stored screenshot evidence (`boss attach`).
     ///
@@ -1154,53 +1172,6 @@ enum ExecutionsAction {
 }
 
 #[derive(Subcommand, Debug)]
-enum CodexHomesAction {
-    /// Reclaim recorded Boss-owned `CODEX_HOME` trees past the retention
-    /// policy (age, with a total-bytes backstop). Only roots stored on
-    /// execution rows are candidates; live executions are never touched.
-    Sweep {
-        /// Only reclaim homes whose execution age anchor (`finished_at`,
-        /// else `created_at`) is older than this many days.
-        #[arg(long, default_value_t = boss_engine::codex_rollout_retention::DEFAULT_MAX_AGE_DAYS)]
-        older_than_days: u64,
-        /// Total-bytes backstop across retained terminal homes: once
-        /// exceeded, the oldest are reclaimed first regardless of age.
-        #[arg(long, default_value_t = boss_engine::codex_rollout_retention::DEFAULT_MAX_TOTAL_BYTES)]
-        max_total_bytes: u64,
-        /// Preview what would be deleted without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum GrokHomesAction {
-    /// Reclaim recorded Boss-owned Grok run-container trees past the
-    /// retention policy (age, with a total-bytes backstop). Only roots
-    /// stored on execution rows are candidates; live executions are never
-    /// touched.
-    Sweep {
-        /// Only reclaim homes whose execution age anchor (`finished_at`,
-        /// else `created_at`) is older than this many days.
-        #[arg(long, default_value_t = boss_engine::grok_home_retention::DEFAULT_MAX_AGE_DAYS)]
-        older_than_days: u64,
-        /// Total-bytes backstop across retained terminal homes: once
-        /// exceeded, the oldest are reclaimed first regardless of age.
-        #[arg(long, default_value_t = boss_engine::grok_home_retention::DEFAULT_MAX_TOTAL_BYTES)]
-        max_total_bytes: u64,
-        /// Preview what would be deleted without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum AttachmentsAction {
     /// List stored evidence, newest first, with the run that produced each
     /// image and whether retention has reclaimed its bytes.
@@ -1584,22 +1555,31 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => executions_prune(cli.json, state_root, older_than_days, keep_per_work_item, dry_run),
         Command::CodexHomes {
             action:
-                CodexHomesAction::Sweep {
+                homes::CodexHomesAction::Sweep {
                     older_than_days,
                     max_total_bytes,
                     dry_run,
                     state_root,
                 },
-        } => codex_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
+        } => homes::codex_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
         Command::GrokHomes {
             action:
-                GrokHomesAction::Sweep {
+                homes::GrokHomesAction::Sweep {
                     older_than_days,
                     max_total_bytes,
                     dry_run,
                     state_root,
                 },
-        } => grok_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
+        } => homes::grok_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
+        Command::AgyHomes {
+            action:
+                homes::AgyHomesAction::Sweep {
+                    older_than_days,
+                    max_total_bytes,
+                    dry_run,
+                    state_root,
+                },
+        } => homes::agy_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
         Command::Attachments {
             action: AttachmentsAction::List { work_item, state_root },
         } => attachments_list(cli.json, state_root, work_item),
@@ -2073,107 +2053,6 @@ fn executions_prune(
     Ok(())
 }
 
-/// `bossctl codex-homes sweep` — on-demand reclaim of recorded Boss-owned
-/// CODEX_HOME trees past retention. Never scans `~/.codex`.
-async fn codex_homes_sweep(
-    json: bool,
-    state_root: Option<PathBuf>,
-    older_than_days: u64,
-    max_total_bytes: u64,
-    dry_run: bool,
-) -> Result<()> {
-    let db = open_state_db(state_root)?;
-    let policy = boss_engine::codex_rollout_retention::CodexHomeRetentionPolicy::new(
-        std::time::Duration::from_secs(older_than_days.saturating_mul(24 * 60 * 60)),
-        max_total_bytes,
-    );
-    let outcome = boss_engine::codex_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "scanned": outcome.scanned,
-                "deleted": outcome.deleted,
-                "deleted_bytes": outcome.deleted_bytes,
-                "skipped_live": outcome.skipped_live,
-                "kept_in_policy": outcome.kept_in_policy,
-                "errors": outcome.errors,
-                "dry_run": dry_run,
-                "older_than_days": older_than_days,
-                "max_total_bytes": max_total_bytes,
-            })
-        );
-    } else if dry_run {
-        println!(
-            "would reclaim {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
-            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
-        );
-    } else {
-        println!(
-            "reclaimed {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
-            outcome.deleted,
-            outcome.deleted_bytes,
-            outcome.scanned,
-            outcome.skipped_live,
-            outcome.kept_in_policy,
-            outcome.errors
-        );
-    }
-    Ok(())
-}
-
-/// `bossctl grok-homes sweep` — on-demand reclaim of recorded Boss-owned
-/// Grok run-container trees past retention. Never scans `~/.grok`. Mirrors
-/// [`codex_homes_sweep`].
-async fn grok_homes_sweep(
-    json: bool,
-    state_root: Option<PathBuf>,
-    older_than_days: u64,
-    max_total_bytes: u64,
-    dry_run: bool,
-) -> Result<()> {
-    let db = open_state_db(state_root)?;
-    let policy = boss_engine::grok_home_retention::GrokHomeRetentionPolicy::new(
-        std::time::Duration::from_secs(older_than_days.saturating_mul(24 * 60 * 60)),
-        max_total_bytes,
-    );
-    let outcome = boss_engine::grok_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "scanned": outcome.scanned,
-                "deleted": outcome.deleted,
-                "deleted_bytes": outcome.deleted_bytes,
-                "skipped_live": outcome.skipped_live,
-                "kept_in_policy": outcome.kept_in_policy,
-                "errors": outcome.errors,
-                "dry_run": dry_run,
-                "older_than_days": older_than_days,
-                "max_total_bytes": max_total_bytes,
-            })
-        );
-    } else if dry_run {
-        println!(
-            "would reclaim {} recorded Grok home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
-            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
-        );
-    } else {
-        println!(
-            "reclaimed {} recorded Grok home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
-            outcome.deleted,
-            outcome.deleted_bytes,
-            outcome.scanned,
-            outcome.skipped_live,
-            outcome.kept_in_policy,
-            outcome.errors
-        );
-    }
-    Ok(())
-}
-
 /// `bossctl attachments list` — stored screenshot evidence, newest first.
 ///
 /// Reads `state.db` directly like every other direct-DB verb, so it answers
@@ -2225,7 +2104,7 @@ fn attachments_list(json: bool, state_root: Option<PathBuf>, work_item: Option<S
 }
 
 /// `bossctl attachments sweep` — on-demand evidence retention. Mirrors
-/// [`grok_homes_sweep`]: same age + total-bytes policy shape, same
+/// [`homes::grok_homes_sweep`]: same age + total-bytes policy shape, same
 /// `--dry-run`, same "a running engine already does this on a schedule".
 async fn attachments_sweep(
     json: bool,

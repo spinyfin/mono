@@ -11,13 +11,12 @@
 //! accumulated `redundant_spawn` pre-spawn aborts) — there is no separate migration
 //! step. Every subsequent pass just keeps the stock bounded going forward.
 //!
-//! ## Ordering vs Codex home reclaim
+//! ## Ordering vs Codex / agy home reclaim
 //!
-//! Each pass runs the codex-home retention reclaim **before** pruning
-//! execution rows so policy-eligible homes are reclaimed while their DB
-//! pointers still exist. Prune itself also reclaims any home that loses
-//! its last remaining pointer (see `execution_retention`), so a race
-//! cannot permanently orphan a reclaimable `CODEX_HOME`.
+//! Each pass runs home retention before row pruning. Prune reclaims
+//! Codex/Claude homes that lose their final pointer and retains rows whose
+//! agy containers still exist, including when the home sweep fails or uses
+//! a longer window. Direct CLI pruning uses the same storage rule.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,12 +61,14 @@ pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::Join
 /// Run a single retention pass with the default policy. Returns a summary;
 /// callers may log it.
 ///
-/// Order: codex-home reclaim first (while pointers exist), then row prune
-/// (which also reclaims homes that lose their last pointer).
+/// Order: Codex-home and agy-home reclaim first (while pointers exist),
+/// then row prune (which also reclaims Codex/Claude homes that lose their
+/// last pointer), and retains rows whose agy containers still exist.
 pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
     // Reclaim-before-prune: policy-eligible homes for terminal executions
     // that are about to (or may soon) leave the DB.
     let _ = crate::codex_home_retention_sweep::run_one_pass(work_db, false).await;
+    let _ = crate::agy_home_retention_sweep::run_one_pass(work_db, false).await;
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
     prune_spoke_commands(work_db, now_epoch);

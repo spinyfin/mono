@@ -182,6 +182,41 @@ impl Drop for GrokHomesOverride {
     }
 }
 
+/// RAII override of [`crate::agy::AGY_HOMES_ROOT_ENV`], obtained from
+/// [`agy_homes_override`]. Mirrors [`GrokHomesOverride`] — see that type
+/// and [`codex_homes_override`] for the lock-and-set-together rationale.
+pub struct AgyHomesOverride {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+}
+
+/// Point per-run `agy` HOME resolution at `root` for as long as the
+/// returned guard lives. Mirrors [`grok_homes_override`].
+pub fn agy_homes_override(root: &Path) -> AgyHomesOverride {
+    let lock = crate::agy::AGY_HOMES_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prior = std::env::var_os(crate::agy::AGY_HOMES_ROOT_ENV);
+    // SAFETY: `lock` is held for the lifetime of the returned guard and
+    // is the process-wide gate on this key, so no other thread is
+    // reading or writing it concurrently. The prior value is restored
+    // in `Drop` before the lock is released.
+    unsafe { std::env::set_var(crate::agy::AGY_HOMES_ROOT_ENV, root) };
+    AgyHomesOverride { _lock: lock, prior }
+}
+
+impl Drop for AgyHomesOverride {
+    fn drop(&mut self) {
+        // SAFETY: same as in `agy_homes_override` — the lock this guard
+        // owns is still held, and is released only after this body
+        // returns.
+        match self.prior.as_ref() {
+            Some(value) => unsafe { std::env::set_var(crate::agy::AGY_HOMES_ROOT_ENV, value) },
+            None => unsafe { std::env::remove_var(crate::agy::AGY_HOMES_ROOT_ENV) },
+        }
+    }
+}
+
 /// RAII override of `HOME`, obtained from [`home_override`].
 ///
 /// Holds [`crate::grok::GROK_HOMES_ENV_TEST_LOCK`] for its whole lifetime
