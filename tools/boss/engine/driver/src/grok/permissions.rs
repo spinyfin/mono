@@ -208,10 +208,7 @@ pub fn structural_deny_rules(
 /// the pane-viability spike), and forcing a redundant `--permission-mode`
 /// value alongside it is an interaction the investigation never exercised.
 pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'static str> {
-    match worker_kind {
-        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
-        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
-    }
+    crate::capability_rules::forced_permission_mode(worker_kind)
 }
 
 /// Assemble the full `extra_args` the spawn flow must append: `--sandbox`,

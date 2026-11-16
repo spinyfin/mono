@@ -1,7 +1,8 @@
 //! `AgyDriver` — Google Antigravity (`agy`) agent driver skeleton.
 //!
-//! Descriptor, capability set, Gemini-family model menu, and per-run `HOME`
-//! provisioning. Interactive TUI spawn still refuses until guard hooks land.
+//! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
+//! provisioning, and per-kind permission rendering (`--settings`). Interactive
+//! TUI spawn still refuses until guard hooks land.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -26,6 +27,7 @@ use super::{
 mod environment;
 mod home;
 mod model_menu;
+pub mod permissions;
 #[cfg(test)]
 mod test_environment;
 mod transcript;
@@ -80,8 +82,9 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Google Antigravity CLI driver.
 ///
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
-/// the Antigravity driver design. Per-run `HOME` provisioning is live;
-/// interactive TUI spawn still refuses until guard hooks land.
+/// the Antigravity driver design. Per-run `HOME` provisioning and permission
+/// rendering are live; interactive TUI spawn still refuses until guard hooks
+/// land.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -286,12 +289,25 @@ impl AgentDriver for AgyDriver {
         Ok(())
     }
 
+    /// Render the run's session settings (posture, trust, native-file rules)
+    /// into its control directory and return `--settings <file>` as the one
+    /// per-run flag. `dest_dir` is unused: like Grok, the artifacts live in the
+    /// driver's own per-run container, outside the checkout and outside any
+    /// engine settings directory, so the retention sweep reclaims them with the
+    /// run. Hook wiring is separate work and is not written here.
     async fn write_permission_config(
         &self,
-        _input: &PermissionInput,
+        input: &PermissionInput,
         _dest_dir: &Path,
     ) -> anyhow::Result<PermissionArtifacts> {
-        Ok(PermissionArtifacts::default())
+        let input = input.clone();
+        let run_id = input.run_id.clone();
+        tokio::task::spawn_blocking(move || permissions::write_session_settings(&input))
+            .await
+            .context("agy permission rendering task did not complete")?
+            .with_context(|| {
+                format!("AgyDriver::write_permission_config: rendering session settings for run_id {run_id:?}")
+            })
     }
 
     fn progress_fidelity(&self) -> ProgressFidelity {

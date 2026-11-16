@@ -2482,6 +2482,49 @@ pub mod capability_rules {
     //! both consumers, so there is exactly one table per posture. All functions are
     //! pure string-list builders.
 
+    /// The permission mode the engine forces for `worker_kind`, if any.
+    ///
+    /// The single driver-side mirror of `WorkerKind::forced_permission_mode`
+    /// in `boss-engine-execution-contracts` (this crate cannot depend on it);
+    /// the Grok and Antigravity drivers both delegate here, and the engine's
+    /// drift test pins this function. `Some("dontAsk")` marks the
+    /// capability-restricted, deny-by-default kinds. The match is exhaustive:
+    /// a new kind must choose a posture.
+    pub fn forced_permission_mode(worker_kind: crate::WorkerKind) -> Option<&'static str> {
+        use crate::WorkerKind;
+        match worker_kind {
+            WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
+            WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
+        }
+    }
+
+    /// The one state-mutating command the answer agent may run: posting its
+    /// thread reply. Shared by the answer-agent allowlist
+    /// ([`answer_agent_allow_rules`]) and the reply handler and prompt in
+    /// `execution-runner` (which re-exports it as `THREAD_REPLY_COMMAND`), so
+    /// the allowlist and the command it admits cannot drift apart.
+    pub const ANSWER_AGENT_THREAD_REPLY_COMMAND: &str = "boss comment reply";
+
+    /// The `permissions.allow` allowlist for `WorkerKind::AnswerAgent` — the
+    /// hard-coded reduced tool table.
+    ///
+    /// Under the forced `dontAsk` permission mode this is the ENTIRE set of
+    /// non-read-only actions the answer agent can take. It deliberately holds
+    /// only the read-only inspection tools (`Read`/`Grep`/`Glob`, which must be
+    /// listed because `dontAsk` only auto-approves read-only *Bash*) and the
+    /// single reply command ([`ANSWER_AGENT_THREAD_REPLY_COMMAND`]).
+    ///
+    /// Every entry MUST be read-only or the single reply command. Adding a
+    /// mutating entry is a capability escalation and must be reviewed as such.
+    pub fn answer_agent_allow_rules() -> Vec<String> {
+        vec![
+            "Read".to_owned(),
+            "Grep".to_owned(),
+            "Glob".to_owned(),
+            format!("Bash({ANSWER_AGENT_THREAD_REPLY_COMMAND}:*)"),
+        ]
+    }
+
     /// The `permissions.allow` allowlist for `WorkerKind::Progression`.
     ///
     /// Under the forced `dontAsk` mode this is the ENTIRE set of non-read-only
