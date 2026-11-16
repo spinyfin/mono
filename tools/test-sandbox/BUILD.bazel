@@ -124,3 +124,13 @@ sh_test(
         "//:.bazelrc",
     ],
 )
+
+sh_test(
+    name = "dev_remote_source_test",
+    size = "small",
+    srcs = ["dev_remote_source_test.sh"],
+    data = [
+        "//:.bazelrc",
+        "//:.ci.bazelrc",
+    ],
+)

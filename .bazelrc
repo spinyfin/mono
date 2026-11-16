@@ -7,7 +7,14 @@
 startup --max_idle_secs=7200
 
 build --jobs=200
-build --disk_cache=~/.cache/bazelcache
+# A `common` line, and above `common --enable_platform_specific_config`, on
+# purpose. `dev-remote` further down switches the disk cache off, and it is
+# reached through the platform config, which Bazel applies where that `common`
+# line stands: before every plain `build` line in this file. Written as
+# `build --disk_cache=...` this line would be applied after `dev-remote` and
+# switch the cache back on. tools/test-sandbox/dev_remote_source_test.sh pins
+# the order.
+common --disk_cache=~/.cache/bazelcache
 # Off-CI GC limits (coordinator laptop, cube worker workspaces). CI overrides
 # these via .ci.bazelrc (60d) and .buildkite/steps/ci-env.sh (a size cap
 # computed from each host's cache disk, passed via CI_BAZEL_FLAGS), and keeps
@@ -74,7 +81,82 @@ test --sandbox_default_allow_network=false
 # Bazel's macOS sandbox profile always permits writes to shared host temp and
 # cache directories. Run repository-owned test code under the stricter profile
 # in hermetic_test_wrapper instead.
-test:macos --strategy=TestRunner=local
+#
+# This is a `build:macos` line, not a `test:macos` one, because of where it has
+# to sit. Within one config Bazel applies every `build:` line before any
+# `test:` line, whatever their order in this file. `dev-remote` below replaces
+# this strategy and is reached from a `build:macos` line, so a `test:macos`
+# line here would always be applied after it and win. Only test actions have
+# the TestRunner mnemonic, so the line changes nothing for a plain build.
+build:macos --strategy=TestRunner=local
+
+# Remote execution from a developer's Mac.
+#
+# A Mac whose ~/.bazelrc names a remote endpoint builds and tests on the remote
+# macOS workers instead of on its own cores, with no flag on the command line
+# and no wrapper script. Bazel reads ~/.bazelrc after this file and adds up the
+# lines for one config across rc files, so the machine fills in the config that
+# the `build:macos` line below selects:
+#
+#   build:dev-remote-endpoint --remote_executor=grpc://<host>:<port>
+#   build:dev-remote-endpoint --remote_cache=grpc://<host>:<port>
+#   build:dev-remote-endpoint --config=dev-remote
+#
+# The endpoint is machine configuration and is deliberately not written here.
+# Without those lines `dev-remote-endpoint` is the two empty defaults below and
+# nothing changes. That is the case on every CI agent, where
+# .buildkite/steps/remote-execution.sh makes its own decision per step and
+# passes its flags on the command line, and on any Mac that has not opted in.
+# To take a machine back to local builds, comment the lines out of ~/.bazelrc.
+# See tools/test-sandbox/README.md, "Remote execution from a developer's Mac".
+build:macos --config=dev-remote-endpoint
+build:dev-remote-endpoint --remote_executor=
+build:dev-remote-endpoint --remote_cache=
+
+# What a machine that names an endpoint gets. `dev-remote` is selected only by
+# the third ~/.bazelrc line above, so none of it applies without an endpoint.
+# Never pass --config=dev-remote by hand, and never select it from a line that
+# is not reached through `build:macos`: see the test strategy below.
+#
+# No disk cache in front of the remote cache. Bazel does not download what a
+# cache hit produced, and it assumes a remote action can be given any such
+# output from the remote cache. An output that came from the disk cache, where
+# this machine's own earlier builds put it, is not there, and the remote action
+# fails with "Lost inputs no longer available remotely". Bazel restarts the
+# build, but the restart goes back to the disk cache and loses a different
+# input: measured on a laptop with a well-used disk cache, `bazel test //...`
+# gave up after its five restarts. With the remote cache alone there is one
+# answer to "is this output available", and it is right. The first remote
+# build in a checkout that has built locally still restarts once.
+build:dev-remote --disk_cache=
+# If the endpoint cannot be reached, build on this machine instead of failing.
+# A laptop is not always on the workers' network.
+build:dev-remote --remote_local_fallback
+# Results of actions this machine ran itself (after a fallback, or because the
+# action cannot run remotely) stay on this machine and are not uploaded. The
+# shared cache then only ever holds what the workers or CI produced.
+build:dev-remote --noremote_upload_local_results
+# Tests run on the workers too. Unlike `remote-tests` below, `local` is named
+# as a second choice, so a test that cannot run remotely still runs, the way it
+# does on a Mac without any of this: under the wrapper's Seatbelt profile. That
+# is acceptable only on macOS. On Linux `local` is no sandbox at all.
+test:dev-remote --strategy=TestRunner=remote,local
+# The same key as `remote-tests`, for the reason given there. A test that fell
+# back to this machine is recorded under it as well, but only on this machine:
+# --noremote_upload_local_results above keeps it out of the shared cache.
+test:dev-remote --test_env=MONO_TEST_REMOTE_EXECUTION=1
+
+# `bazel test --config=dev-local //...` runs one command on this machine when
+# its ~/.bazelrc has an endpoint, for example to see whether a test that fails
+# on a worker fails here too. It only undoes `dev-remote`: with no executor the
+# `remote,local` strategy above runs the test locally, the disk cache is the
+# one at the top of this file again, and removing the variable puts the result
+# under the key every other local run uses. It deliberately names no strategy,
+# so it is harmless on Linux and on a machine with no endpoint.
+build:dev-local --remote_executor=
+build:dev-local --remote_cache=
+build:dev-local --disk_cache=~/.cache/bazelcache
+test:dev-local --test_env==MONO_TEST_REMOTE_EXECUTION
 
 # Linux test actions must use the namespace-capable sandbox. Naming the
 # strategy explicitly prevents Bazel from silently falling back to
