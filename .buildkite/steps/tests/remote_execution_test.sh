@@ -173,6 +173,7 @@ expect_equal "" "$CI_REMOTE_BAZEL_FLAGS" "malformed endpoint: CI_REMOTE_BAZEL_FL
 real_rc="${workspace}/.ci.bazelrc"
 for line in \
   "build:ci-remote --noremote_local_fallback" \
+  "build:ci-remote --remote_cache_compression" \
   "test:ci-remote --config=remote-tests"; do
   if ! grep -qxF -- "$line" "$real_rc"; then
     fail ".ci.bazelrc lacks the line '${line}'"

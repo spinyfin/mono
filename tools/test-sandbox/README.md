@@ -320,6 +320,14 @@ build:dev-remote-endpoint --config=dev-remote
 
 Bazel reads `~/.bazelrc` after the repository's `.bazelrc` and adds up the lines for one config across rc files. `.bazelrc` selects `dev-remote-endpoint` from a `build:macos` line and gives it two empty defaults, so a machine without those lines builds exactly as before. That includes every CI agent, where `.buildkite/steps/remote-execution.sh` decides per step and passes its own flags on the command line. The endpoint is machine configuration and is not in the repository. A checkout whose `.bazelrc` predates the config never selects it, and neither does any other repository, so the three lines are inert there. Commenting them out takes the machine back to local builds.
 
+If the endpoint advertises zstd compression, a fourth line makes blobs travel compressed between the Mac and the remote cache:
+
+```
+build:dev-remote-endpoint --remote_cache_compression
+```
+
+It goes with the endpoint, not in `dev-remote`, because Bazel 9.1 does not quietly fall back to uncompressed transfers when the server lacks support: the first action that touches the remote cache fails with `--remote_cache_compression requested but remote does not support compression`.
+
 The third line selects `dev-remote`, which `.bazelrc` defines:
 
 ```

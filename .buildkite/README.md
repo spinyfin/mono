@@ -79,7 +79,9 @@ On a Mac agent the verification steps do not build and test on the agent's own c
 
 Each step logs the outcome as its `[ci-env] remote execution on|off: <reason>` group.
 
-When a step executes remotely, `CI_BAZEL_FLAGS` gains `--config=ci-remote --remote_executor=<endpoint> --remote_cache=<endpoint>`. `build:ci-remote` in `.ci.bazelrc` raises `--jobs`, forbids local fallback inside the step, and selects `.bazelrc`'s `remote-tests` config so tests execute on the workers as well. The disk cache stays on, in front of the remote cache.
+When a step executes remotely, `CI_BAZEL_FLAGS` gains `--config=ci-remote --remote_executor=<endpoint> --remote_cache=<endpoint>`. `build:ci-remote` in `.ci.bazelrc` raises `--jobs`, forbids local fallback inside the step, selects `.bazelrc`'s `remote-tests` config so tests execute on the workers as well, and turns on `--remote_cache_compression`, so blobs travel between the agent and the remote cache zstd-compressed. The disk cache stays on, in front of the remote cache.
+
+Compression makes zstd support a requirement of the endpoint. Against an endpoint that does not advertise it, Bazel 9.1 fails the first action that touches the remote cache with `--remote_cache_compression requested but remote does not support compression`, so compression has to stay on at the endpoint for as long as `ci-remote` asks for it.
 
 Things to know when changing a step or a test:
 
