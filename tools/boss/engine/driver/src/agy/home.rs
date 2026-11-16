@@ -163,6 +163,14 @@ pub fn hooks_dir_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
     Ok(process_home_for_run(run_id)?.join(HOOKS_DIR_RELATIVE))
 }
 
+/// The private CLI `settings.json` (trusted workspaces; the CLI also saves
+/// its own always-allow grants here) for the HOME whose hook directory is
+/// `hooks_dir` (`<process-home>/.gemini/config`).
+pub fn cli_settings_path_for_hooks_dir(hooks_dir: &Path) -> PathBuf {
+    let gemini = hooks_dir.parent().unwrap_or(hooks_dir);
+    gemini.join("antigravity-cli").join("settings.json")
+}
+
 pub fn control_dir_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
     Ok(agy_run_container_for_run(run_id)?.join(CONTROL_LEAF))
 }

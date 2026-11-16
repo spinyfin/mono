@@ -30,16 +30,15 @@ const ALL_KINDS: [WorkerKind; 6] = [
 ];
 
 #[test]
-fn agy_driver_mirrors_forced_permission_mode_for_every_kind() {
-    use crate::driver::agy::permissions::{
-        VerdictPosture, permission_mode_for_worker_kind, verdict_posture_for_worker_kind,
-    };
+fn drivers_mirror_forced_permission_mode_for_every_kind() {
+    use crate::driver::agy::permissions::{VerdictPosture, verdict_posture_for_worker_kind};
+    use crate::driver::capability_rules::forced_permission_mode;
     for kind in ALL_KINDS {
         let mirrored = driver_kind(&kind);
         assert_eq!(
-            permission_mode_for_worker_kind(mirrored),
+            forced_permission_mode(mirrored),
             kind.forced_permission_mode(),
-            "{kind:?}: the agy driver's mirror of forced_permission_mode drifted"
+            "{kind:?}: the drivers' shared mirror of forced_permission_mode drifted"
         );
         // The deny-by-default kinds are exactly the ones answered with an
         // allowlist, so a restricted kind cannot render an allow-by-default

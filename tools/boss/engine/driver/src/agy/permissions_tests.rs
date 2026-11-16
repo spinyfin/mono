@@ -21,6 +21,7 @@ const WORKSPACE: &str = "/boss-test-absent/workspaces/ws-1";
 const WORKSPACES_ROOT: &str = "/boss-test-absent/workspaces";
 const DATA_DIR: &str = "/boss-test-absent/Library/Application Support/Boss";
 const HOOKS_DIR: &str = "/boss-test-absent/agy-homes/run-1/process-home/.gemini/config";
+const CLI_SETTINGS: &str = "/boss-test-absent/agy-homes/run-1/process-home/.gemini/antigravity-cli/settings.json";
 const CONTROL_DIR: &str = "/boss-test-absent/agy-homes/run-1/control";
 
 fn plan(worker_kind: WorkerKind, boss_data_dir: Option<&'static str>) -> SettingsPlan<'static> {
@@ -274,8 +275,11 @@ fn every_shared_allowlist_entry_translates_to_a_valid_rule() {
         for claude_rule in &claude {
             let translated = translate_claude_allow_rule(claude_rule, Path::new(WORKSPACE))
                 .unwrap_or_else(|error| panic!("{kind:?}: {error:#}"));
-            validate_rule(RuleList::Allow, &translated).unwrap();
-            assert!(allow.allow_rules().contains(&translated), "{kind:?}: {translated}");
+            assert!(!translated.is_empty(), "{kind:?}: {claude_rule}");
+            for rule in &translated {
+                validate_rule(RuleList::Allow, rule).unwrap();
+                assert!(allow.allow_rules().contains(rule), "{kind:?}: {rule}");
+            }
         }
     }
 }
@@ -666,7 +670,7 @@ fn log_check_matches_the_study_line_shape_exactly() {
     let file = settings.to_json().unwrap();
     let line = init_line(
         "",
-        &format!("write_file({HOOKS_DIR}) write_file({CONTROL_DIR})"),
+        &format!("write_file({HOOKS_DIR}) write_file({CONTROL_DIR}) write_file({CLI_SETTINGS})"),
         "request-review",
     );
     assert_eq!(
@@ -799,4 +803,37 @@ fn log_check_reads_the_run_files_and_treats_a_missing_log_as_not_yet_initialised
         SettingsLogCheck::ConsistentSoFar
     );
     assert!(verify_settings_log_files(&tmp.path().join("absent.json"), &log_path).is_err());
+}
+
+#[test]
+fn allow_reads_cover_every_spelling_of_a_var_or_tmp_rooted_workspace() {
+    for workspace in ["/var/folders/xx/T/ws-1", "/tmp/ws-1"] {
+        let settings = render_settings(&SettingsPlan {
+            worker_kind: WorkerKind::Progression,
+            workspace: Path::new(workspace),
+            boss_data_dir: Some(Path::new(DATA_DIR)),
+            hooks_dir: Path::new(HOOKS_DIR),
+            control_dir: Path::new(CONTROL_DIR),
+        })
+        .unwrap();
+        let allow = settings.allow_rules();
+        let spellings = trust_path_variants(Path::new(workspace));
+        assert!(spellings.len() >= 2, "{workspace}: {spellings:?}");
+        for spelling in &spellings {
+            assert!(
+                allow.contains(&format!("read_file({spelling})")),
+                "{workspace}: {allow:?}"
+            );
+        }
+        let unique: BTreeSet<&String> = allow.iter().collect();
+        assert_eq!(unique.len(), allow.len(), "allow rules must be deduplicated: {allow:?}");
+    }
+}
+
+#[test]
+fn private_cli_settings_file_is_write_fenced_for_every_kind() {
+    let fence = "write_file(/boss-test-absent/agy-homes/run-1/process-home/.gemini/antigravity-cli/settings.json)";
+    for kind in ALL_KINDS {
+        assert!(rendered(kind).deny_rules().iter().any(|rule| rule == fence), "{kind:?}");
+    }
 }

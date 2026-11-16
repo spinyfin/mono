@@ -2482,6 +2482,22 @@ pub mod capability_rules {
     //! both consumers, so there is exactly one table per posture. All functions are
     //! pure string-list builders.
 
+    /// The permission mode the engine forces for `worker_kind`, if any.
+    ///
+    /// The single driver-side mirror of `WorkerKind::forced_permission_mode`
+    /// in `boss-engine-execution-contracts` (this crate cannot depend on it);
+    /// the Grok and Antigravity drivers both delegate here, and the engine's
+    /// drift test pins this function. `Some("dontAsk")` marks the
+    /// capability-restricted, deny-by-default kinds. The match is exhaustive:
+    /// a new kind must choose a posture.
+    pub fn forced_permission_mode(worker_kind: crate::WorkerKind) -> Option<&'static str> {
+        use crate::WorkerKind;
+        match worker_kind {
+            WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
+            WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
+        }
+    }
+
     /// The one state-mutating command the answer agent may run: posting its
     /// thread reply. Shared by the answer-agent allowlist
     /// ([`answer_agent_allow_rules`]) and the reply handler and prompt in

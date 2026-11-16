@@ -45,7 +45,10 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use super::home::{check_private_entry, control_dir_for_run, hooks_dir_for_run, session_settings_path_for_run};
+use super::home::{
+    check_private_entry, cli_settings_path_for_hooks_dir, control_dir_for_run, hooks_dir_for_run,
+    session_settings_path_for_run,
+};
 use crate::scoped_home::trust_path_variants;
 use crate::{PermissionArtifacts, PermissionInput, WorkerKind};
 
@@ -65,19 +68,17 @@ const SETTINGS_FLAG: &str = "--settings";
 
 /// The permission mode the engine forces for `worker_kind`, if any.
 ///
-/// A driver-local mirror of `WorkerKind::forced_permission_mode` in
-/// `boss-engine-execution-contracts`, kept here (as `grok/permissions.rs`
-/// does) because this crate cannot depend on it. `Some("dontAsk")` marks the
+/// Delegates to [`crate::capability_rules::forced_permission_mode`], the one
+/// driver-side mirror of `WorkerKind::forced_permission_mode` in
+/// `boss-engine-execution-contracts` (this crate cannot depend on it), shared
+/// with Grok and pinned by the engine's drift test. `Some("dontAsk")` marks the
 /// capability-restricted, deny-by-default kinds. `agy` has no such flag; the
 /// value decides whether the kind is rendered with an allowlist and answered
 /// with `deny_unless_prior_grant`, so a restricted kind cannot be silently
 /// downgraded to an allow-by-default posture. The match is exhaustive: a new
 /// kind must choose a posture here.
 pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'static str> {
-    match worker_kind {
-        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
-        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
-    }
+    crate::capability_rules::forced_permission_mode(worker_kind)
 }
 
 /// How the hook adapter must answer a call for a kind, and so whether the
@@ -283,6 +284,10 @@ fn file_fences(plan: &SettingsPlan<'_>) -> Vec<(FileAction, PathBuf)> {
     }
     fences.push((FileAction::Write, plan.hooks_dir.to_path_buf()));
     fences.push((FileAction::Write, plan.control_dir.to_path_buf()));
+    // The private CLI settings.json is where the CLI stores its own grants
+    // (it saves always-allow rules there) and it is read at every session
+    // start in this HOME, so a native write must not be able to plant one.
+    fences.push((FileAction::Write, cli_settings_path_for_hooks_dir(plan.hooks_dir)));
     if forbids_file_writes(plan.worker_kind) {
         let root = plan.workspace.parent().unwrap_or(plan.workspace);
         fences.push((FileAction::Write, root.to_path_buf()));
@@ -356,19 +361,29 @@ fn allow_rules(worker_kind: WorkerKind, workspace: &Path) -> anyhow::Result<Vec<
     for claude_rule in claude_allowlist(worker_kind) {
         let translated = translate_claude_allow_rule(&claude_rule, workspace)
             .with_context(|| format!("translating allow rule {claude_rule:?} for {worker_kind:?}"))?;
-        if !rules.contains(&translated) {
-            rules.push(translated);
+        for rule in translated {
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
         }
     }
     Ok(rules)
 }
 
-fn translate_claude_allow_rule(rule: &str, workspace: &Path) -> anyhow::Result<String> {
+/// One Claude rule becomes one or more `agy` rules. A read grant is emitted
+/// once per spelling of the workspace (`/var` and `/private/var`, `/tmp` and
+/// `/private/tmp`), mirroring the deny side: allow-path matching is not known
+/// to be spelling-insensitive, and every spelling names the same directory,
+/// so this does not widen the grant.
+fn translate_claude_allow_rule(rule: &str, workspace: &Path) -> anyhow::Result<Vec<String>> {
     if matches!(rule, "Read" | "Grep" | "Glob") {
-        return Ok(format!("read_file({})", workspace.display()));
+        return Ok(trust_path_variants(workspace)
+            .into_iter()
+            .map(|spelling| format!("read_file({spelling})"))
+            .collect());
     }
     if let Some(inner) = rule.strip_prefix("Bash(").and_then(|rest| rest.strip_suffix(":*)")) {
-        return Ok(format!("command({inner})"));
+        return Ok(vec![format!("command({inner})")]);
     }
     bail!("no agy equivalent for allow rule {rule:?}; extend the translation deliberately")
 }
@@ -570,6 +585,12 @@ fn expected_initialized_fragment(settings: &SessionSettings) -> String {
 /// `--settings` (or a later rewrite) changing the effective posture.
 /// `rendered_settings` is the file written by [`write_session_settings`]; it is
 /// re-parsed and re-validated, so a tampered file fails here too.
+///
+/// TODO(pane-spawn): this has no production caller yet. The pane-spawn
+/// admission path MUST call it after the CLI initializes and again before each
+/// input delivery; a clean result only means "consistent so far". Until then
+/// no run fails on an `ignoring invalid` warning or a mismatched
+/// `CLI settings initialized` line.
 pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result<SettingsLogCheck> {
     let settings = parse_rendered(rendered_settings)?;
     let invalid: Vec<&str> = log
