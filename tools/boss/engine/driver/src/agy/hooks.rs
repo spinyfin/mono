@@ -433,10 +433,7 @@ fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result
         .context("run container")?
         .join("control/session-settings.json");
     let settings: Value = serde_json::from_slice(&fs::read(settings_path)?)?;
-    let expected: Value = serde_json::from_str(&super::home::render_session_settings_json(&workspace))?;
-    if settings != expected {
-        bail!("session settings do not match the trust-only renderer contract");
-    }
+    validate_session_settings(&settings, &workspace)?;
     let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
     let entry = &hooks["boss"]["PreToolUse"];
     let command = policy["authorization_command"]
@@ -448,6 +445,80 @@ fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result
     }]);
     if entry != &expected_entry || hooks.as_object().is_none_or(|groups| groups.len() != 1) {
         bail!("PreToolUse configuration does not match the wildcard command contract");
+    }
+    Ok(())
+}
+
+/// Validate the final session contract, rather than the provisioning trust seed.
+fn validate_session_settings(settings: &Value, workspace: &Path) -> anyhow::Result<()> {
+    let object = settings.as_object().context("session settings must be an object")?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "agentMode" | "toolPermission" | "trustedWorkspaces" | "permissions"
+        )
+    }) || settings["agentMode"] != ""
+        || settings["toolPermission"] != "request-review"
+    {
+        bail!("session settings must explicitly select the default agent mode and request-review");
+    }
+    let workspace = fs::canonicalize(workspace)?;
+    if settings["trustedWorkspaces"] != json!([workspace]) {
+        bail!("session settings must trust exactly the canonical workspace");
+    }
+    let permissions = settings["permissions"]
+        .as_object()
+        .context("permissions must be an object")?;
+    if permissions
+        .keys()
+        .any(|key| !matches!(key.as_str(), "allow" | "deny" | "ask"))
+        || permissions
+            .get("ask")
+            .is_some_and(|ask| ask.as_array().is_none_or(|rules| !rules.is_empty()))
+    {
+        bail!("session permissions must not contain ask rules or unknown keys");
+    }
+    for key in ["allow", "deny"] {
+        if key == "allow" && !permissions.contains_key(key) {
+            continue;
+        }
+        let rules = permissions
+            .get(key)
+            .and_then(Value::as_array)
+            .context("permission rules must be arrays")?;
+        if key == "deny" && rules.is_empty() {
+            bail!("session settings must fence native file access");
+        }
+        for rule in rules {
+            let rule = rule.as_str().context("permission rules must be strings")?;
+            let (action, target) = rule
+                .split_once('(')
+                .context("permission rule requires action(target)")?;
+            let target = target
+                .strip_suffix(')')
+                .context("permission rule requires closing parenthesis")?;
+            let actions = if key == "deny" {
+                &["read_file", "write_file"][..]
+            } else {
+                &["command", "read_file", "write_file"][..]
+            };
+            if !actions.contains(&action)
+                || target.is_empty()
+                || target.trim() != target
+                || target.chars().any(|c| c.is_control() || matches!(c, '(' | ')'))
+                || (action == "command" && target.starts_with("regex:"))
+            {
+                bail!("invalid session permission rule: {rule}");
+            }
+            if matches!(action, "read_file" | "write_file")
+                && (!Path::new(target).is_absolute()
+                    || Path::new(target)
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir))
+            {
+                bail!("native file permission paths must be absolute");
+            }
+        }
     }
     Ok(())
 }

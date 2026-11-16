@@ -245,6 +245,7 @@ async fn write_permission_config_installs_the_forwarder_under_the_per_run_home()
         .unwrap();
     let runtime = crate::agy::home::AgyRuntimeState::from_driver_runtime_state(&state).unwrap();
 
+    crate::agy::test_environment::write_final_settings("run-wpc", &workspace, WorkerKind::Standard);
     let artifacts = driver
         .write_permission_config(&permission_input("run-wpc", &workspace), tmp.path())
         .await

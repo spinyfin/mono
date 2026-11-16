@@ -670,7 +670,7 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
 /// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
 pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
     shell_command_tokenizer_fragment!(),
-    "BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin','checkleft'}\n",
+    crate::render_reviewer_blocked_programs!(),
     "matched=None\n",
     "for group in command_groups(cmd):\n",
     "    rest=strip_prefixes(group)\n",
@@ -687,7 +687,7 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
     "        matched='cargo execution subcommand'\n",
     "    elif base=='go' and subcommands.intersection({'build','test','run','generate','install'}):\n",
     "        matched='go execution subcommand'\n",
-    "    elif base in BLOCKED:\n",
+    "    elif base in REVIEWER_BLOCKED:\n",
     "        matched=base\n",
     "    elif prog.startswith('./') or prog.startswith('../') or '/bazel-bin/' in prog or '/target/' in prog:\n",
     "        matched=prog\n",

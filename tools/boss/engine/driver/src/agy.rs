@@ -889,6 +889,7 @@ mod tests {
         let driver = AgyDriver::default();
         let run_id = "run-agy-auth-1";
         driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+        test_environment::write_final_settings(run_id, &workspace, crate::WorkerKind::Standard);
         let input = permission_input(&tmp, run_id, workspace);
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
         assert!(

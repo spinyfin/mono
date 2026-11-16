@@ -86,10 +86,11 @@ impl Fixture {
     }
 
     fn install(&self, kind: WorkerKind) -> Vec<PathBuf> {
-        install_authorization(&self.process_home, kind, &self.obs(), &self.interception(|_| {})).unwrap()
+        self.install_with(kind, |_| {})
     }
 
     fn install_with(&self, kind: WorkerKind, overrides: impl FnOnce(&mut ToolUseInterceptionConfig)) -> Vec<PathBuf> {
+        super::super::test_environment::write_final_settings(&self.run_id, &self.workspace(), kind);
         install_authorization(&self.process_home, kind, &self.obs(), &self.interception(overrides)).unwrap()
     }
 }

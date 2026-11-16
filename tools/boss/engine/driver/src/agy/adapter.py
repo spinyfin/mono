@@ -290,11 +290,14 @@ def authorized(policy, overwrite=None):
     emit(policy["approval"], overwrite=overwrite)
 
 
+# REVIEWER_BLOCKED_FRAGMENT
 # COMMAND_TOKENIZER_FRAGMENT
 
 
 def nested_shell_bodies(group):
     rest = strip_prefixes(group)
+    if rest and any(c in rest[0] for c in "<>"):
+        fail_closed("unsupported redirection attached to an executable")
     base = os.path.basename(rest[0]) if rest else ""
     if base in {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "case", "esac", "{", "}", "!", "eval", "source", "."}:
         fail_closed("unsupported shell control or dynamic execution")
@@ -318,11 +321,32 @@ def nested_shell_bodies(group):
     return []
 
 
+def has_substitution(command):
+    quote, escaped = None, False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == chr(92) and quote != chr(39):
+            escaped = True
+            continue
+        if char in (chr(34), chr(39)):
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+        if quote != chr(39) and (char == chr(96) or command[index:index + 2] == "$("):
+            return True
+    return False
+
+
 def inspected_commands(command, depth=0):
     if depth > 4:
         fail_closed("shell nesting exceeds the inspected depth")
     if any(group.error for group in command_records(command)):
         fail_closed("incomplete shell syntax cannot be inspected")
+    if has_substitution(command):
+        fail_closed("command substitution is structurally denied")
     yield command
     for group in command_groups(command):
         for body in nested_shell_bodies(group):
@@ -355,7 +379,9 @@ def has_redirect(command):
 
 def resolve_path(path, policy, cwd=None):
     home = policy["process_home"]
-    path = path.replace(chr(36) + "{HOME}", home).replace("$HOME", home)
+    path = re.sub(r"\$(?:HOME\b|\{HOME\})", lambda _: home, path)
+    if "$" in path or path.startswith(("~-", "~+")):
+        fail_closed("unresolved shell path expansion")
     if path == "~" or path.startswith("~/"):
         path = home + path[1:]
     if not os.path.isabs(path):
@@ -377,17 +403,19 @@ def command_touches_protected(command, policy, cwd):
     for group in command_groups(command):
         rest = strip_prefixes(group)
         for token in group:
-            candidate = token.lstrip("<>")
+            candidate = token.split("=", 1)[1] if ASSIGNMENT_RE.match(token) else token
+            candidate = re.sub(r"^(?:[0-9]+|&)?[<>]+", "", candidate)
             expanded = resolve_path(candidate, policy, current)
             if any(c in candidate for c in "*?["):
                 static = re.split(r"[\*\?\[]", expanded, 1)[0].rstrip(os.sep)
-                home = os.path.realpath(policy["process_home"])
-                if home.startswith(static + os.sep) or static == home or static.startswith(home + os.sep):
-                    return True
+                for root in policy["protected_paths"]:
+                    root = os.path.realpath(root)
+                    if root.startswith(static) or static.startswith(root + os.sep):
+                        return True
             if path_is_protected(candidate, policy, current):
                 return True
         if rest and rest[0] in ("cd", "pushd", "popd"):
-            if len(rest) != 2 or any(c in rest[1] for c in "$`*?["):
+            if len(rest) != 2 or rest[1] == "-" or rest[1].startswith(("~-", "~+")) or any(c in rest[1] for c in "$`*?["):
                 return True
             current = resolve_path(rest[1], policy, current)
         for body in nested_shell_bodies(group):
@@ -434,26 +462,10 @@ def is_recursive_rm(rest):
 
 
 def structural_command_reason(command, policy, worker_kind, cwd):
-    # Substitutions execute before argv exists; fail closed instead of
-    # pretending their contents are ordinary arguments.
-    quote, escaped = None, False
-    for index, char in enumerate(command):
-        if escaped:
-            escaped = False
-            continue
-        if char == chr(92) and quote != chr(39):
-            escaped = True
-            continue
-        if char in (chr(34), chr(39)):
-            if quote == char:
-                quote = None
-            elif quote is None:
-                quote = char
-        if quote != chr(39) and (char == chr(96) or command[index:index + 2] == "$("):
-            return "command substitution is structurally denied"
     for group in iter_groups(command):
         rest = strip_prefixes(group)
-        prefixes = group[:len(group) - len(rest)]
+        normalized = without_redirections(group)
+        prefixes = normalized[:len(normalized) - len(rest)]
         if any(os.path.basename(token) == "sudo" for token in prefixes):
             return "sudo is structurally denied for Antigravity workers"
         if not rest:
@@ -478,12 +490,16 @@ def structural_command_reason(command, policy, worker_kind, cwd):
             if not rest:
                 continue
             prog = os.path.basename(rest[0])
-            if prog in ("python", "python3", "perl", "ruby", "node"):
+            if prog in REVIEWER_BLOCKED or prog == "osascript" or prog.startswith("pypy") or re.fullmatch(r"python[0-9.]*", prog):
                 return "%s workers must not execute uninspectable interpreter bodies" % worker_kind
             if vcs_mutation(rest):
                 return "%s workers must not mutate repository or GitHub state" % worker_kind
-            if prog in ("patch",) or (prog == "sed" and any(t == "--in-place" or t.startswith("-i") or t.startswith("--in-place=") for t in rest[1:])) or (prog in ("awk", "gawk") and any(t == "inplace" or t.startswith("--inplace") for t in rest[1:])):
-                return "%s workers must not edit files in place" % worker_kind
+            if prog == "find" and any(t == "-delete" or t.startswith(("-fprint", "-fls")) for t in rest[1:]):
+                return "%s workers must not write find results" % worker_kind
+            if prog == "sort" and any(t == "--output" or t.startswith(("-o", "--output=")) for t in rest[1:]):
+                return "%s workers must not write sort output" % worker_kind
+            if prog in ("patch", "sed", "awk", "gawk"):
+                return "%s workers must not execute file-mutating text scripts" % worker_kind
     return None
 
 
@@ -555,10 +571,17 @@ def run_bounded(argv, **kwargs):
 
 def run_guards(policy, canonical, rewrites=0, synthetic=False):
     if not synthetic and canonical.get("tool_name") == "Bash":
-        for body in list(inspected_commands(canonical["tool_input"]["command"]))[1:]:
-            nested = dict(canonical)
-            nested["tool_input"] = dict(canonical["tool_input"], command=body)
-            run_guards(policy, nested, rewrites, synthetic=True)
+        original = canonical["tool_input"]["command"]
+        for body in inspected_commands(original):
+            commands = [body] if body != original else []
+            for group in command_groups(body):
+                normalized = without_redirections(group)
+                if normalized and normalized != list(group):
+                    commands.append(shlex.join(normalized))
+            for command in commands:
+                nested = dict(canonical)
+                nested["tool_input"] = dict(canonical["tool_input"], command=command)
+                run_guards(policy, nested, rewrites, synthetic=True)
     guards = policy.get("guards")
     if not isinstance(guards, list) or not guards:
         fail_closed("authorization policy guards must be a nonempty array")
