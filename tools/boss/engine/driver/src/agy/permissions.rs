@@ -576,18 +576,7 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
 // Post-spawn log check
 // ---------------------------------------------------------------------------
 
-/// Outcome of [`verify_settings_log`] when nothing is wrong yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsLogCheck {
-    /// The CLI has not logged its settings yet. Not a failure: ask again.
-    NotYetInitialized,
-    /// Every initialisation line matches the rendered settings and no rule has
-    /// been reported invalid *so far*. The grant store reports malformed
-    /// entries on a separate, later line (about a second after initialisation
-    /// in the study), so this is not final: the caller must check again right
-    /// before it delivers input, and treat a later failure as fatal.
-    ConsistentSoFar,
-}
+pub use crate::SettingsLogCheck;
 
 /// The text the CLI logs after `CLI settings initialized: ` for `settings`,
 /// as Go formats the struct: space-separated slices, `Ask` empty.
@@ -608,7 +597,6 @@ fn expected_initialized_fragment(settings: &SessionSettings) -> String {
 /// `--settings` (or a later rewrite) changing the effective posture.
 /// `rendered_settings` is the file written by [`write_session_settings`]; it is
 /// re-parsed and re-validated, so a tampered file fails here too.
-///
 pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result<SettingsLogCheck> {
     let settings = parse_rendered(rendered_settings)?;
     let invalid: Vec<&str> = log
@@ -653,6 +641,13 @@ pub fn verify_settings_log_files(settings_path: &Path, log_path: &Path) -> anyho
         Err(error) => return Err(error).with_context(|| format!("reading agy log {}", log_path.display())),
     };
     verify_settings_log(&rendered, &log)
+}
+
+/// [`verify_settings_log_files`] over the paths recorded in this driver's
+/// runtime state. Used as [`crate::SettingsLogCheckSpec::verify`].
+pub fn verify_runtime_state(state: &crate::DriverRuntimeState) -> anyhow::Result<SettingsLogCheck> {
+    let runtime = super::home::AgyRuntimeState::from_driver_runtime_state(state)?;
+    verify_settings_log_files(&runtime.session_settings_path, &runtime.log_file)
 }
 
 #[cfg(test)]

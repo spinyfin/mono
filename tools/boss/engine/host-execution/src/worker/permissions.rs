@@ -1,26 +1,25 @@
 //! Check the CLI's effective permission posture before admitting input.
 
 use super::*;
-use boss_engine_driver::agy::{
-    AgyRuntimeState,
-    permissions::{SettingsLogCheck, verify_settings_log_files},
-};
+use boss_engine_driver::SettingsLogCheck;
 
 pub(super) fn check(record: &ExecutionRecord) -> Result<bool> {
-    if record.driver_id != "agy" {
+    let registry = DriverRegistry::default();
+    let Some(driver) = registry.get(&record.driver_id) else {
         return Ok(true);
-    }
-    let state = AgyRuntimeState::from_driver_runtime_state(
-        record
-            .runtime_state
-            .as_ref()
-            .context("agy permission check requires runtime state")?,
-    )?;
-    Ok(verify_settings_log_files(&state.session_settings_path, &state.log_file)? == SettingsLogCheck::ConsistentSoFar)
+    };
+    let Some(spec) = driver.settings_log_check() else {
+        return Ok(true);
+    };
+    let state = record
+        .runtime_state
+        .as_ref()
+        .context("settings-log admission requires runtime state")?;
+    Ok((spec.verify)(state)? == SettingsLogCheck::ConsistentSoFar)
 }
 
 pub(super) fn require_ready(record: &ExecutionRecord) -> Result<()> {
-    ensure!(check(record)?, "agy settings have not initialized; input refused");
+    ensure!(check(record)?, "settings have not initialized; input refused");
     Ok(())
 }
 

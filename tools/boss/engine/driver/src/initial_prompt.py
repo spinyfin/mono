@@ -33,6 +33,16 @@ REPLIES = {
     b">c": b"\x1b[>0;0;0c", b">0c": b"\x1b[>0;0;0c",
     b"?u": b"\x1b[?0u", b"?2026$p": b"\x1b[?2026;2$y",
 }
+# Reply shapes for the queries above. A real attached terminal reports the
+# actual cursor position, not the synthesized 1;1 used when outer_tty is false.
+REPLY = re.compile(
+    rb"\x1b\[(?:\??\d+;\d+R|\??[\d;]*c|>[\d;]*c|\?\d+u|\?\d+;\d+\$y)"
+)
+REPLY_BODY = {
+    b"?": frozenset(b"0123456789;$"),
+    b">": frozenset(b"0123456789;"),
+    None: frozenset(b"0123456789;?$"),
+}
 
 
 class TerminalTail:
@@ -288,21 +298,109 @@ def check_blocking_dialog(view, markers, payload=b""):
                     raise BlockingDialogOnScreen(marker)
 
 
-def settings_log_ready(check_path):
-    check = json.loads(check_path.read_text())
-    try:
-        log = Path(check["log_path"]).read_text()
-    except FileNotFoundError:
+def take_terminal_replies(data, buffer):
+    """Split stdin into recognised terminal replies vs other input.
+
+    Returns (forwarded, remaining_buffer, refused). Incomplete CSI that could
+    still become a reply stays in remaining_buffer.
+    """
+    buffer += data
+    forwarded = bytearray()
+    while buffer:
+        match = REPLY.match(buffer)
+        if match:
+            forwarded += match.group(0)
+            buffer = buffer[match.end():]
+            continue
+        if _reply_prefix(buffer):
+            return bytes(forwarded), buffer, False
+        return bytes(forwarded), buffer, True
+    return bytes(forwarded), b"", False
+
+
+def _reply_prefix(buffer):
+    if buffer in (b"", b"\x1b", b"\x1b["):
+        return True
+    if not buffer.startswith(b"\x1b[") or len(buffer) >= 32:
         return False
-    initialized = False
-    for line in log.splitlines():
+    rest = buffer[2:]
+    allowed = REPLY_BODY.get(rest[:1], REPLY_BODY[None])
+    body = rest[1:] if rest[:1] in REPLY_BODY else rest
+    return not body or all(byte in allowed for byte in body)
+
+
+SETTINGS_LOG_POLL = 0.25
+SETTINGS_SETTLE = 2
+
+
+class SettingsLogWatcher:
+    """Incremental, throttled admission against a CLI settings log.
+
+    Loads the check JSON once. Remembers initialization and only reads new
+    log bytes. A truncated or missing log after initialization is fatal.
+    """
+
+    def __init__(self, check_path):
+        check = json.loads(Path(check_path).read_text())
+        self.log_path = Path(check["log_path"])
+        self.expected = check["expected"]
+        self.offset = 0
+        self.buf = b""
+        self.initialized = False
+        self.initialized_at = None
+        self.last_poll = None
+        self.ready = False
+
+    def poll(self, now):
+        if self.last_poll is not None and now - self.last_poll < SETTINGS_LOG_POLL:
+            return self.ready
+        self.last_poll = now
+        try:
+            size = self.log_path.stat().st_size
+        except FileNotFoundError:
+            self._disappeared()
+            return False
+        if size < self.offset:
+            self._disappeared()
+            return False
+        with self.log_path.open("rb") as log:
+            log.seek(self.offset)
+            chunk = log.read()
+        self.offset += len(chunk)
+        self.buf += chunk
+        while True:
+            index = self.buf.find(b"\n")
+            if index < 0:
+                break
+            line = self.buf[:index].decode("utf-8", "replace")
+            self.buf = self.buf[index + 1:]
+            self._consume(line, now)
+        if self.buf:
+            self._consume(self.buf.decode("utf-8", "replace"), now)
+        self.ready = bool(
+            self.initialized and self.initialized_at is not None
+            and now - self.initialized_at >= SETTINGS_SETTLE
+        )
+        return self.ready
+
+    def _consume(self, line, now):
         if "ignoring invalid" in line:
             raise RuntimeError(f"agy dropped rendered permission rules: {line}")
         if "CLI settings initialized" in line:
-            if check["expected"] not in line:
-                raise RuntimeError(f"agy initialized settings that differ from rendered posture: {line}")
-            initialized = True
-    return initialized
+            if self.expected not in line:
+                raise RuntimeError(
+                    f"agy initialized settings that differ from rendered posture: {line}"
+                )
+            if not self.initialized:
+                self.initialized = True
+                self.initialized_at = now
+
+    def _disappeared(self):
+        if self.initialized:
+            raise RuntimeError("agy settings initialization evidence disappeared")
+        self.offset = 0
+        self.buf = b""
+        self.ready = False
 
 
 def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
@@ -341,6 +439,8 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
     pending = b""
     screen = b""
     query_buffer = b""
+    stdin_reply_buf = b""
+    settings_watch = None if settings_check is None else SettingsLogWatcher(settings_check)
     delivered = False
     paste_started = False
     submitting = False
@@ -364,7 +464,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             tty.setraw(0, termios.TCSANOW)
         while True:
             now = time.monotonic()
-            settings_ready = settings_check is None or settings_log_ready(settings_check)
+            settings_ready = settings_watch is None or settings_watch.poll(now)
             if paste_started and not settings_ready:
                 raise RuntimeError("agy settings initialization evidence disappeared")
             if exit_status is None:
@@ -443,9 +543,16 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             if 0 in readable:
                 data = os.read(0, 65536)
                 if data:
-                    if not settings_ready:
-                        raise RuntimeError("agy settings have not initialized; input refused")
-                    pending += data
+                    if settings_watch is not None and not settings_ready:
+                        replies, stdin_reply_buf, refused = take_terminal_replies(data, stdin_reply_buf)
+                        pending += replies
+                        if refused:
+                            raise RuntimeError("agy settings have not initialized; input refused")
+                    else:
+                        if stdin_reply_buf:
+                            pending += stdin_reply_buf
+                            stdin_reply_buf = b""
+                        pending += data
                 else:
                     stdin_open = False
             if master in writable:

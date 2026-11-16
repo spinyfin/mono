@@ -33,6 +33,11 @@ pub const STAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `initial_prompt.py`, which records the measurements behind the value.
 pub const LANDING_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// How long the relay waits after a matching settings-initialization line
+/// before the first paste, so a later grant-store warning can arrive.
+/// Mirrors `SETTINGS_SETTLE` in `initial_prompt.py`.
+pub const SETTINGS_SETTLE: Duration = Duration::from_secs(2);
+
 /// The longest a launcher that is still working can take to send Return:
 /// three bounded stages plus the landing wait. A launcher that has reported
 /// neither marker after this long is not going to.
@@ -179,7 +184,7 @@ pub fn launcher_config(driver: &dyn crate::AgentDriver) -> Result<String> {
         "agent_markers": spec.agent_markers,
         "starting_markers": starting_markers,
         "paste_landed_markers": driver.paste_landed_markers(),
-        "check_settings_log": driver.descriptor().name == "agy",
+        "check_settings_log": driver.settings_log_check().is_some(),
     }))?)
 }
 
@@ -382,8 +387,25 @@ launcher.run([sys.executable, str(root / "stub.py")], sys.argv[2].encode(), [b"C
                 .unwrap()
         };
         assert_eq!(python_seconds("LANDING_TIMEOUT = "), LANDING_TIMEOUT.as_secs());
+        assert_eq!(python_seconds("SETTINGS_SETTLE = "), SETTINGS_SETTLE.as_secs());
         assert_eq!(python_seconds("readiness_timeout="), STAGE_TIMEOUT.as_secs());
         assert_eq!(DELIVERY_BUDGET, 3 * STAGE_TIMEOUT + LANDING_TIMEOUT);
+    }
+
+    #[test]
+    fn launcher_config_takes_settings_log_check_from_the_driver() {
+        use crate::AgentDriver;
+        let registry = crate::DriverRegistry::default();
+        for slug in registry.slugs() {
+            let driver = registry.require(slug).unwrap();
+            let config: serde_json::Value = serde_json::from_str(&launcher_config(driver.as_ref()).unwrap()).unwrap();
+            assert_eq!(
+                config["check_settings_log"].as_bool().unwrap(),
+                driver.settings_log_check().is_some(),
+                "{slug}"
+            );
+        }
+        assert!(crate::AgyDriver::default().settings_log_check().is_some());
     }
 
     #[test]
