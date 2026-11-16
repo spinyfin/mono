@@ -61,7 +61,6 @@ pub use home::{
     resolve_grok_auth_source, trust_path_variants,
 };
 
-pub use crate::bounded_command::abandon_in_flight_commands as abandon_in_flight_preflight_commands;
 use classify_error::classify_grok_error;
 use environment::GrokProcessEnvironment;
 use home::{provision_grok_home, read_session_id, read_workspace_path_stamp};

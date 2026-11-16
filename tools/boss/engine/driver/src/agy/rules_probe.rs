@@ -20,6 +20,17 @@ fn deny_command(attempts: &Path) -> String {
     )
 }
 
+/// Probe-local session settings that pin review mode for the print-mode run.
+fn probe_settings_json(workspace: &Path) -> String {
+    serde_json::to_string_pretty(&json!({
+        "agentMode": "",
+        "toolPermission": "request-review",
+        "trustedWorkspaces": crate::scoped_home::trust_path_variants(workspace),
+    }))
+    .expect("probe session settings are serializable")
+        + "\n"
+}
+
 fn verify_response(stdout: &[u8], canary: &str, attempts: &[u8], started: bool) -> anyhow::Result<()> {
     ensure!(
         started,
@@ -74,10 +85,14 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
     let version = run_agy_bounded(version.arg("--version"), Duration::from_secs(10))?;
     ensure!(version.status.success(), "agy --version failed");
     fs::write(evidence.join("version.txt"), version.stdout)?;
+    let settings = evidence.join("session-settings.json");
+    fs::write(&settings, probe_settings_json(&workspace))?;
     let mut command = Command::new(&runtime.agy_binary);
     environment.apply_to_command(&mut command);
     command
         .args(environment.launch_args())
+        .arg("--settings")
+        .arg(&settings)
         .args([
             "-p",
             "Return the rules canary from your preloaded instructions, using no tools. If absent, reply MISSING.",
@@ -108,6 +123,19 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_settings_pin_review_mode() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&probe_settings_json(Path::new("/tmp/rules-probe-ws"))).unwrap();
+        assert_eq!(parsed["agentMode"], "");
+        assert_eq!(parsed["toolPermission"], "request-review");
+        assert!(
+            parsed["trustedWorkspaces"]
+                .as_array()
+                .is_some_and(|paths| !paths.is_empty())
+        );
+    }
 
     #[test]
     fn verdict_rejects_tool_retrieval_and_incidental_canary_text() {
