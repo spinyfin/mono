@@ -102,6 +102,12 @@ build:macos --strategy=TestRunner=local
 #   build:dev-remote-endpoint --remote_cache=grpc://<host>:<port>
 #   build:dev-remote-endpoint --config=dev-remote
 #
+# A fourth line, `build:dev-remote-endpoint --remote_cache_compression`, makes
+# blobs travel zstd-compressed. It belongs with the endpoint and not in
+# `dev-remote` below because only an endpoint that advertises zstd accepts it:
+# against any other, Bazel 9.1 fails the first action that touches the remote
+# cache.
+#
 # The endpoint is machine configuration and is deliberately not written here.
 # Without those lines `dev-remote-endpoint` is the two empty defaults below and
 # nothing changes. That is the case on every CI agent, where

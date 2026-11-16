@@ -86,5 +86,12 @@ build:ci-remote --jobs=64
 build:ci-remote --noremote_local_fallback
 # Tests execute on the workers too; see `test:remote-tests` in .bazelrc.
 test:ci-remote --config=remote-tests
+# Blobs travel between the agent and the remote cache zstd-compressed. The
+# endpoint has to advertise zstd in its capabilities: against one that does
+# not, Bazel 9.1 fails the first action that touches the remote cache with
+# "--remote_cache_compression requested but remote does not support
+# compression". So do not switch compression off on the endpoint while this
+# line is here.
+build:ci-remote --remote_cache_compression
 
 
