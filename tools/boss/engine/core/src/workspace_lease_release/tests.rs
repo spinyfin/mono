@@ -375,9 +375,17 @@ async fn preservation_does_not_run_while_a_gate_keeps_the_lease() {
         }
     );
     let items = db.list_attention_items(&execution.id).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].kind, LEASE_UNRELEASED_ATTENTION_KIND);
-    assert!(!items[0].body_markdown.contains("must not be attempted"));
+    assert_eq!(items.len(), 2);
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND)
+    );
+    let diagnostic = items
+        .iter()
+        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .unwrap();
+    assert!(!diagnostic.body_markdown.contains("must not be attempted"));
 }
 
 #[tokio::test]
@@ -704,7 +712,7 @@ async fn lease_not_found_is_success_without_attention() {
             TerminalCause::ProvenCompleted,
             Occupancy::Empty,
             Ok(()),
-            Err(error.into())
+            Err(anyhow::Error::new(error).context("cube release command failed"))
         )
         .await,
         LeaseReleaseOutcome::Released
@@ -944,4 +952,33 @@ async fn occupancy_keep_attention_quotes_the_latest_cleanup() {
         open[0].body_markdown
     );
     assert_eq!(open[0].created_at, original.created_at);
+}
+
+#[tokio::test]
+async fn legacy_unconfirmed_death_does_not_authorize_a_no_pid_release() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Cancelled, "legacy-held");
+    raise_attention(
+        &db,
+        &execution,
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        "Terminal worker still holds its workspace",
+        "Death could not be confirmed",
+    );
+    for _ in 0..2 {
+        let outcome = run_one_pass_with_occupancy(&db, &SweepCube, &LiveWorkerStateRegistry::new(), || {
+            forbidden_occupancy_scan()
+        })
+        .await;
+        assert_eq!(outcome.held, 1);
+        assert_eq!(outcome.released, 0);
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+            Some("legacy-held")
+        );
+    }
+}
+
+async fn forbidden_occupancy_scan() -> EmptyOccupancy {
+    panic!("unconfirmed death must not scan occupancy")
 }

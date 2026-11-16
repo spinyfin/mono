@@ -429,7 +429,7 @@ impl ExecutionCoordinator {
         // and this call. Starting from trunk here would strand the work, so it
         // refuses rather than guess. A pending preservation leaves the row
         // ready; a hold that outlasts its bound terminalizes it with a retry reason.
-        self.refresh_occupancy_kept_predecessor(execution).await;
+        self.refresh_predecessor_lease(execution).await;
         let hold = match self.predecessor_lease_hold(execution) {
             None => return Ok(()),
             Some(hold) => hold,

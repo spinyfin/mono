@@ -19,7 +19,7 @@ use crate::transient_recovery::{
 };
 use crate::workspace_lease_release::{
     DbPreservation, EmptyOccupancy, HostOccupancy, KeepReason, LEASE_UNRELEASED_ATTENTION_KIND, LeaseReleaseOutcome,
-    Occupancy, PaneStatus, ReleaseEvidence, TerminalCause, WorkspaceOccupancy, apply_release, run_one_pass,
+    Occupancy, PaneStatus, ReleaseEvidence, TerminalCause, WorkspaceOccupancy, apply_release,
 };
 use boss_engine_recovery::execution_bookmark::{self as recovery, LocalJj};
 use boss_engine_test_git::jj::JjRepo;
@@ -462,6 +462,15 @@ async fn keep_lease_with_occupants(s: &Stalled) -> LeaseReleaseOutcome {
 
 #[tokio::test]
 async fn occupancy_kept_lease_releases_on_recheck_and_successor_dispatches() {
+    release_after_occupants_exit(true).await;
+}
+
+#[tokio::test]
+async fn dispatch_recheck_releases_empty_workspace_without_a_sweep() {
+    release_after_occupants_exit(false).await;
+}
+
+async fn release_after_occupants_exit(run_sweep_first: bool) {
     let s = Stalled::new(true).await;
     s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
     let successor = s
@@ -494,8 +503,15 @@ async fn occupancy_kept_lease_releases_on_recheck_and_successor_dispatches() {
 
     drop(occupant);
     assert_eq!(wait_until_empty(&s.repo.worker), Occupancy::Empty);
-    let swept = run_one_pass(s.db(), s.cube.as_ref(), &LiveWorkerStateRegistry::new()).await;
-    assert_eq!(swept.released, 1, "{swept:?}");
+    if run_sweep_first {
+        let swept =
+            crate::workspace_lease_release::run_one_pass(s.db(), s.cube.as_ref(), &LiveWorkerStateRegistry::new())
+                .await;
+        assert_eq!(swept.released, 1, "{swept:?}");
+    } else {
+        age_predecessor(&s);
+        s.coordinator.drain_ready_queue_for_test().await;
+    }
     assert!(s.db().get_execution(&s.stalled_id).unwrap().cube_lease_id.is_none());
     assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
 
@@ -852,10 +868,9 @@ fn age_waits(s: &Stalled) {
 }
 
 #[tokio::test]
-async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_after_the_bound() {
-    // A remote predecessor that was never probed leaves no attention item; the
-    // gate itself must still end the wait. A local one with no item has simply
-    // not been swept yet and keeps waiting however long ago it ended.
+async fn terminal_remote_predecessor_with_unreachable_host_fails_the_successor_after_the_bound() {
+    // Missing cleanup evidence begins a bounded wait. A failed owning-host
+    // lookup then supplies durable diagnostics without extending its clock.
     let s = Stalled::new(true).await;
     s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
     let successor = s
@@ -891,9 +906,11 @@ async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_af
         ExecutionStatus::Ready
     );
 
+    // Reaching the bound forces a fresh host lookup and records its error.
+    age_waits(&s);
+    s.coordinator.drain_ready_queue_for_test().await;
     // A freshly filed release failure is still being retried: it keeps the
     // successor waiting however old the remote evidence and its hold are.
-    age_waits(&s);
     crate::workspace_lease_release::raise_attention(
         s.db(),
         &s.stalled(),
@@ -911,11 +928,12 @@ async fn terminal_remote_predecessor_with_no_cleanup_item_fails_the_successor_af
         .connect()
         .unwrap()
         .execute(
-            "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1",
+            "UPDATE work_attention_items SET status = 'resolved' WHERE execution_id = ?1 AND kind = 'workspace_lease_release_failed'",
             [&s.stalled_id],
         )
         .unwrap();
 
+    age_predecessor(&s);
     s.coordinator.drain_ready_queue_for_test().await;
     assert_eq!(
         s.db().get_execution(&successor.id).unwrap().status,
@@ -1018,4 +1036,316 @@ impl boss_execution_contracts::HostAdapterProvider for NoHosts {
     ) -> anyhow::Result<std::sync::Arc<dyn boss_execution_contracts::HostAdapter>> {
         anyhow::bail!("unexpected adapter request for host {}", host.id)
     }
+}
+
+#[tokio::test]
+async fn successor_never_signals_a_recorded_live_shell() {
+    for occupancy_evidence in [false, true] {
+        let s = Stalled::new(true).await;
+        let mut shell = spawn_workspace_occupant(&s.repo.worker, Some(&s.stalled_id));
+        s.db()
+            .set_run_shell_pid_for_execution(&s.stalled_id, i64::from(shell.pid()))
+            .unwrap();
+        s.db()
+            .mark_execution_orphaned(&s.stalled_id, "abort unconfirmed")
+            .unwrap();
+        crate::workspace_lease_release::raise_attention(
+            s.db(),
+            &s.stalled(),
+            LEASE_UNRELEASED_ATTENTION_KIND,
+            "Terminal worker still holds its workspace",
+            "Shell death unconfirmed",
+        );
+        if occupancy_evidence {
+            crate::workspace_lease_release::raise_attention(
+                s.db(),
+                &s.stalled(),
+                crate::workspace_lease_release::LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+                "Prior occupancy hold",
+                "Pane previously gone",
+            );
+        }
+        let successor = s
+            .db()
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(s.stalled().work_item_id)
+                    .build(),
+            )
+            .unwrap();
+        s.coordinator.drain_ready_queue_for_test().await;
+        assert_eq!(
+            s.db().get_execution(&successor.id).unwrap().status,
+            ExecutionStatus::Ready
+        );
+        assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+        assert!(shell.0.try_wait().unwrap().is_none(), "the shell must not be signalled");
+        assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn no_pid_unconfirmed_death_has_a_bounded_successor_wait() {
+    let s = Stalled::new(true).await;
+    s.db()
+        .mark_execution_orphaned(&s.stalled_id, "spawn cancelled")
+        .unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    let outcome =
+        crate::workspace_lease_release::run_one_pass(s.db(), s.cube.as_ref(), &LiveWorkerStateRegistry::new()).await;
+    assert_eq!(outcome.held, 1);
+    assert!(
+        s.db()
+            .list_attention_items(&s.stalled_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+    );
+    s.coordinator.drain_ready_queue_for_test().await;
+    age_predecessor(&s);
+    let err = s
+        .coordinator
+        .force_dispatch(&successor.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("death is unconfirmed"), "{err:#}");
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+}
+
+struct ChangingRemoteOccupants {
+    error: std::sync::Mutex<String>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+crate::stub_host_adapter! { ChangingRemoteOccupants {
+    fn host_id(&self) -> &str { "remote" }
+    async fn list_workspaces(&self) -> anyhow::Result<Vec<CubeWorkspaceStatus>> {
+        Ok(vec![CubeWorkspaceStatus::builder().workspace_id("workspace-old").workspace_path("/remote/workspace".into()).state("leased").lease_id("lease-old").build()])
+    }
+    async fn probe_remote_worker_alive(&self, _: i64) -> anyhow::Result<Option<bool>> { Ok(Some(false)) }
+    async fn cleanup_execution_processes(&self, _: &str, _: &Path) -> anyhow::Result<Occupancy> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("{}", self.error.lock().unwrap())
+    }
+} }
+
+struct ChangingRemoteProvider(Arc<ChangingRemoteOccupants>);
+#[async_trait]
+impl boss_execution_contracts::HostAdapterProvider for ChangingRemoteProvider {
+    async fn adapter_for(
+        &self,
+        _: &crate::host_registry::Host,
+    ) -> anyhow::Result<Arc<dyn boss_execution_contracts::HostAdapter>> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn remote_successor_failure_quotes_only_the_latest_occupants() {
+    let mut s = Stalled::new(true).await;
+    let adapter = Arc::new(ChangingRemoteOccupants {
+        error: std::sync::Mutex::new("original-occupant".to_owned()),
+        calls: Default::default(),
+    });
+    Arc::get_mut(&mut s.coordinator)
+        .unwrap()
+        .set_host_adapter_provider(Arc::new(ChangingRemoteProvider(adapter.clone())));
+    s.db().add_host("remote", "user@remote", 4, &[]).unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET host_id = 'remote', remote_pid = 4242 WHERE execution_id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET host_id = 'remote' WHERE id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    boss_engine_completion::workspace_lease_release::release_remote_lease(
+        s.db(),
+        adapter.as_ref(),
+        &s.stalled_id,
+        PaneStatus::Gone,
+        |_| async { panic!("occupied lease must stay held") },
+    )
+    .await;
+    s.coordinator.drain_ready_queue_for_test().await;
+    let calls = adapter.calls.load(std::sync::atomic::Ordering::SeqCst);
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        adapter.calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls,
+        "ordinary drains must throttle remote cleanup"
+    );
+    *adapter.error.lock().unwrap() = "current-occupant".to_owned();
+    age_predecessor(&s);
+    let created_at = s
+        .db()
+        .list_attention_items(&s.stalled_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .unwrap()
+        .created_at;
+    let err = s
+        .coordinator
+        .force_dispatch(&successor.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("current-occupant"), "{text}");
+    assert!(!text.contains("original-occupant"), "{text}");
+    let item = s
+        .db()
+        .list_attention_items(&s.stalled_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .unwrap();
+    assert_eq!(item.created_at, created_at, "refresh must preserve the hold clock");
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+}
+
+struct WrongHostProvider(Arc<dyn boss_execution_contracts::HostAdapter>);
+#[async_trait]
+impl boss_execution_contracts::HostAdapterProvider for WrongHostProvider {
+    async fn adapter_for(
+        &self,
+        _: &crate::host_registry::Host,
+    ) -> anyhow::Result<Arc<dyn boss_execution_contracts::HostAdapter>> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn remote_retry_rejects_a_provider_that_routes_to_local() {
+    let mut s = Stalled::new(true).await;
+    let local = s.coordinator.host_adapter();
+    Arc::get_mut(&mut s.coordinator)
+        .unwrap()
+        .set_host_adapter_provider(Arc::new(WrongHostProvider(local)));
+    s.db().add_host("remote", "user@remote", 4, &[]).unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET host_id = 'remote', remote_pid = 4242 WHERE execution_id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET host_id = 'remote' WHERE id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    crate::workspace_lease_release::raise_attention(
+        s.db(),
+        &s.stalled(),
+        crate::workspace_lease_release::LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+        "Prior occupancy hold",
+        "Pane previously gone",
+    );
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    s.coordinator.drain_ready_queue_for_test().await;
+    let item = s
+        .db()
+        .list_attention_items(&s.stalled_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .unwrap();
+    assert!(item.body_markdown.contains("reports host 'local'"), "{item:?}");
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn externally_released_lease_is_reconciled_without_preserving_the_free_workspace() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(s.wait_reason(&successor.id).as_deref(), Some(HOLD_REASON));
+    // Cube has already returned the workspace, but the engine still records its lease.
+    s.cube.active_leases.lock().await.clear();
+    s.cube.list_workspaces_response.lock().await.push(
+        CubeWorkspaceStatus::builder()
+            .workspace_id("workspace-old")
+            .workspace_path(s.repo.worker.clone())
+            .state("free")
+            .build(),
+    );
+    age_predecessor(&s);
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert!(s.stalled().cube_lease_id.is_none());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
+    assert!(!s.repo.replacement.join("fix").exists());
+    assert_eq!(
+        std::fs::read_to_string(s.repo.worker.join("fix")).unwrap(),
+        "unpublished fix"
+    );
+    let items = s.db().list_attention_items(&s.stalled_id).unwrap();
+    assert!(items.iter().any(|item| {
+        item.kind == "preserved_work_needs_inspection"
+            && item
+                .body_markdown
+                .contains("No workspace work was preserved during reconciliation")
+    }));
+    assert!(!items.iter().any(
+        |item| item.kind == crate::workspace_lease_release::LEASE_RELEASE_FAILED_ATTENTION_KIND
+            && item.status == "open"
+    ));
 }

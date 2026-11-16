@@ -24,7 +24,9 @@ use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 
 use crate::work::WorkDb;
 
-pub use boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::{
+    LEASE_OCCUPANCY_KEPT_ATTENTION_KIND, LEASE_UNRELEASED_ATTENTION_KIND,
+};
 
 pub use boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND;
 
@@ -384,6 +386,13 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
     match decide(cause, pane, occupancy_status) {
         LeaseReleaseDecision::Keep(reason) => {
             if pane == PaneStatus::Gone {
+                raise_attention(
+                    db,
+                    execution,
+                    LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+                    "Workspace occupancy kept the lease",
+                    "The pane gate passed; occupancy must be checked again before release.",
+                );
                 let (title, body) = occupancy_keep_attention(lease_id, reason, occupancy_detail.as_deref());
                 if occupancy_detail.is_some() {
                     refresh_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND, title, &body);
@@ -521,6 +530,33 @@ impl Preservation for NoPreservation {
     }
 }
 
+/// Reconcile an authoritative cube registry absence without reading or resetting
+/// the workspace. A positioned run must retain a durable preservation-gap record.
+pub fn reconcile_absent_lease(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    record_preservation_gap: bool,
+) -> Result<LeaseReleaseOutcome> {
+    let current = db.get_execution(&execution.id)?;
+    if current.cube_lease_id.as_deref() != Some(lease_id) {
+        return Ok(LeaseReleaseOutcome::NoLease);
+    }
+    if record_preservation_gap {
+        db.refresh_teardown_preservation_attention(
+            &execution.id,
+            Some(&format!("Cube no longer holds lease `{lease_id}`. No workspace work was preserved during reconciliation; the workspace was neither read nor reset. Any previously preserved work remains recorded.")),
+            "cube lease already absent",
+        )?;
+    }
+    if !db.claim_execution_workspace_release(&execution.id, lease_id)? {
+        return Ok(LeaseReleaseOutcome::NoLease);
+    }
+    db.finish_execution_workspace_release(execution)?;
+    resolve_unreleased_attention(db, &execution.id);
+    Ok(LeaseReleaseOutcome::Released)
+}
+
 /// Pre-start helper: the worker never started, so occupancy is not scanned.
 pub async fn release_lease_after_proven_never_started(
     work_db: &WorkDb,
@@ -543,24 +579,11 @@ pub async fn release_lease_after_proven_never_started(
     if let Ok(workspaces) = adapter.list_workspaces().await
         && !workspaces.iter().any(|ws| ws.lease_id.as_deref() == Some(lease_id))
     {
-        return match work_db.claim_execution_workspace_release(&execution.id, lease_id) {
-            Ok(true) => {
-                if let Err(err) = work_db.finish_execution_workspace_release(execution) {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        lease_id,
-                        error = %format!("{err:#}"),
-                        "failed to clear released workspace metadata",
-                    );
-                }
-                resolve_unreleased_attention(work_db, &execution.id);
-                LeaseReleaseOutcome::Released
-            }
-            Ok(false) => LeaseReleaseOutcome::NoLease,
-            Err(err) => LeaseReleaseOutcome::CubeFailed {
+        return reconcile_absent_lease(work_db, execution, lease_id, false).unwrap_or_else(|err| {
+            LeaseReleaseOutcome::CubeFailed {
                 error: format!("{err:#}"),
-            },
-        };
+            }
+        });
     }
     apply_release(
         work_db,
@@ -698,7 +721,7 @@ pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title
 /// Refresh an open occupancy-keep item with the latest scan. `created_at`
 /// stays put so a successor's hold bound is not reset; the body is what
 /// later failure messages quote.
-fn refresh_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
+pub fn refresh_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
     if let Err(err) = db.upsert_execution_attention(&execution.id, kind, title, body) {
         tracing::error!(
             execution_id = %execution.id,
@@ -710,7 +733,11 @@ fn refresh_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: 
 
 /// The lease these items describe is gone, so they no longer say anything true.
 pub fn resolve_unreleased_attention(db: &WorkDb, execution_id: &str) {
-    for kind in [LEASE_UNRELEASED_ATTENTION_KIND, LEASE_RELEASE_FAILED_ATTENTION_KIND] {
+    for kind in [
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        LEASE_RELEASE_FAILED_ATTENTION_KIND,
+        LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+    ] {
         if let Err(err) = db.resolve_attention_kind_for_execution(execution_id, kind) {
             tracing::warn!(
                 execution_id,
@@ -806,7 +833,7 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
                 .await,
         )
         .unwrap_or_else(|err| {
-                raise_attention(work_db, &execution, LEASE_UNRELEASED_ATTENTION_KIND,
+                refresh_attention(work_db, &execution, LEASE_UNRELEASED_ATTENTION_KIND,
                     "Remote workspace recovery needs process cleanup", &format!("Lease {lease_id} on {}: {err:#}. Inspect the named processes or restore host connectivity, then retry recovery.", host.host_id()));
                 tracing::debug!(
                     execution_id,

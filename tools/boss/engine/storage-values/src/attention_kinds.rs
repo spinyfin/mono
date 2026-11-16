@@ -300,8 +300,11 @@ pub const WORKER_BLOCKED_ATTENTION_KIND: &str = "worker_blocked";
 /// Attention kind filed when a lease is kept because a gate failed.
 pub const LEASE_UNRELEASED_ATTENTION_KIND: &str = "workspace_lease_unreleased";
 
+/// Confirms that a release attempt passed the pane gate and was kept by occupancy.
+pub const LEASE_OCCUPANCY_KEPT_ATTENTION_KIND: &str = "workspace_lease_occupancy_kept";
+
 /// Attention kind filed when every gate passed but cube's own release call
-/// failed. Together with [`LEASE_UNRELEASED_ATTENTION_KIND`] it is durable
+/// failed. Together with [`LEASE_OCCUPANCY_KEPT_ATTENTION_KIND`] it is durable
 /// evidence that the run had settled, which is what lets the leftover-lease
 /// sweep retry a row that recorded no pid.
 pub const LEASE_RELEASE_FAILED_ATTENTION_KIND: &str = "workspace_lease_release_failed";

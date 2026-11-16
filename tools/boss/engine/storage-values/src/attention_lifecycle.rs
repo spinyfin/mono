@@ -204,9 +204,14 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Teardown released the lease and deleted nothing, but could not safely preserve the workspace: teardown could not run the preservation at all (the recovery record, workspace path, owning host or cube registry was unavailable, or jj failed), the tip and the existing work could not be combined (the existing bookmark is kept unless it contains a change rejected as unsafe, which is then kept only under the unsafe archive), no lease boundary or journaled tip at it was available, a lease-boundary journal walk exhausted its operation-view budget, unpublished registered work was absent from the boundary tip (the boundary tip is still bookmarked), the boundary change was rewritten afterwards, snapshotting a free workspace hid the boundary commit, or the boundary commit is still a reassigned workspace's working-copy commit. Depending on the trigger the item names both tips, one, or none. Work rejected as unsafe is retained only under inspection-only `preserved-archive/<exec>/unsafe/<change>/<commit>` references, which are never restored automatically. A later restage of the old tip does not recover work the item names.",
     ),
     entry(
+        LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "A release passed the pane gate but occupancy kept the lease. The release path clears this evidence when the lease returns.",
+    ),
+    entry(
         LEASE_UNRELEASED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "A gate kept a finished run's lease after its pane was gone (process cleanup failed or left \
+        "A finished run's lease is held (worker death is unconfirmed, process cleanup failed or left \
          occupants, the owning host was unreachable, or a remote worker could not be confirmed gone). \
          The release path resolves it when the lease returns; a run starting elsewhere proves nothing \
          about this lease.",

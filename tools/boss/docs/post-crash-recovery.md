@@ -64,8 +64,20 @@ cannot be confirmed, or a cube failure; the leftover sweep keeps retrying —
 including a fresh occupancy scan for a lease that was kept because the
 workspace was occupied, even when the finished run never recorded a worker
 pid — and the successor stays held behind it rather than abandoning the work.
-When a successor is waiting on such a lease, dispatch re-scans occupancy
-before holding or failing it: an empty workspace (or one that holds only
+A successor retry first checks cube's owning-host registry. If the lease is
+already absent, it clears the engine's stale lease record, records that no
+workspace work was preserved during reconciliation, and admits the successor.
+It does not read or reset the free workspace. Cube's lease-not-found release
+result is likewise treated as an already completed release.
+An occupancy hold has distinct durable evidence that the pane gate passed;
+unconfirmed-death items, including legacy items, never supply that evidence.
+The sweep and dispatch both require absence from the live registry and
+confirmed death of any recorded shell PID before retrying. Remote retries
+resolve and validate the owning host adapter and confirm any recorded remote
+PID is dead. Routing errors keep the lease and appear in the cleanup evidence.
+When a successor is waiting on such a lease, dispatch re-scans occupancy at
+most once per minute, with a fresh check at the failure bound. Blocking scans
+run off the async executor. After a scan: an empty workspace (or one that holds only
 unowned occupants past the existing bound) is preserved and released so the
 successor can start, and a still-occupied workspace fails with the occupants
 seen on that scan. A

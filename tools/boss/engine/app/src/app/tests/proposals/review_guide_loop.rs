@@ -155,7 +155,9 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     let attempts = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let attempts = db.live_pr_review_guide_attempts_for_series(&series).unwrap();
-            if attempts.first().is_some_and(|a| a.execution_id.is_some()) {
+            if let Some(execution_id) = attempts.first().and_then(|attempt| attempt.execution_id.as_deref())
+                && db.get_execution(execution_id).unwrap().status == ExecutionStatus::Running
+            {
                 break attempts;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -177,15 +179,6 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     assert_eq!(capture.packet.head_sha, "revised-head");
 
     let guide_execution = attempts[0].execution_id.as_deref().unwrap();
-    db.start_execution_run(
-        guide_execution,
-        "review-1",
-        "mono",
-        "guide-lease",
-        "guide-ws",
-        dir.path().to_str().unwrap(),
-    )
-    .unwrap();
     db.record_execution_launch_config(guide_execution, "codex", "gpt-6-astra", None)
         .unwrap();
     assert_eq!(

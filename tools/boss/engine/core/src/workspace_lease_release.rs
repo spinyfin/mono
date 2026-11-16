@@ -339,7 +339,15 @@ fn proc_uid(proc_dir: &Path) -> Option<u32> {
 }
 
 fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &WorkExecution) -> PaneStatus {
-    if live.snapshot().iter().any(|state| state.run_id == execution.id) {
+    retry_pane_status(
+        db,
+        live.snapshot().iter().any(|state| state.run_id == execution.id),
+        execution,
+    )
+}
+
+pub(crate) fn retry_pane_status(db: &WorkDb, is_live: bool, execution: &WorkExecution) -> PaneStatus {
+    if !execution.status.is_terminal() || is_live {
         return PaneStatus::Present;
     }
     // Cancelled and failed rows go through durable death evidence: a recorded
@@ -367,11 +375,12 @@ fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &Wo
     }
 }
 
-fn previous_release_passed_pane_gate(db: &WorkDb, execution_id: &str) -> bool {
+pub(crate) fn previous_release_passed_pane_gate(db: &WorkDb, execution_id: &str) -> bool {
     db.list_attention_items(execution_id).is_ok_and(|items| {
         items.iter().any(|item| {
             item.status == "open"
-                && (item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND || item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+                && (item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND
+                    || item.kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND)
         })
     })
 }
@@ -453,20 +462,26 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
         // pane gate (so occupancy can be scanned again).
         let pane = sweep_pane_status(work_db, live_states, &execution);
         if pane == PaneStatus::Present {
-            // A recorded PID is what an operator can inspect. A never-started
-            // row has none; occupancy-keep attention (if any) is what lets
-            // the next pass retry the scan rather than this unconfirmed-death
-            // item, which would otherwise pin the pane as present forever.
-            if !live_states.snapshot().iter().any(|state| state.run_id == execution.id)
-                && let Ok(Some(pid)) = work_db.latest_local_shell_pid_for_execution(&execution.id)
-            {
+            // Unconfirmed death is diagnostic evidence only. It never
+            // authorizes a later pass to skip the pane gate.
+            if !live_states.snapshot().iter().any(|state| state.run_id == execution.id) {
+                let pid = work_db
+                    .latest_local_shell_pid_for_execution(&execution.id)
+                    .ok()
+                    .flatten();
+                let death = match pid {
+                    Some(pid) => {
+                        format!("recorded shell PID {pid} has no live execution registration and death is unconfirmed")
+                    }
+                    None => "no shell PID was recorded and death is unconfirmed".to_owned(),
+                };
                 raise_attention(
                     work_db,
                     &execution,
                     LEASE_UNRELEASED_ATTENTION_KIND,
                     "Terminal worker still holds its workspace",
                     &format!(
-                        "Lease {lease_id} cannot be preserved safely: recorded shell PID {pid} has no live execution registration and death is unconfirmed. Inspect this PID on the owning host and retry recovery; the workspace has not been reset.",
+                        "Lease {lease_id} cannot be preserved safely: {death}. Confirm the worker has stopped on the owning host and retry recovery; the workspace has not been reset.",
                     ),
                 );
             }

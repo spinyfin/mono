@@ -780,7 +780,10 @@ async fn occupied_workspace_is_not_preserved() {
     assert!(db.preserved_tip(&execution.id).unwrap().is_none());
     assert_eq!(
         open_kinds(&db, &execution.id),
-        vec![LEASE_UNRELEASED_ATTENTION_KIND.to_owned()]
+        vec![
+            LEASE_OCCUPANCY_KEPT_ATTENTION_KIND.to_owned(),
+            LEASE_UNRELEASED_ATTENTION_KIND.to_owned()
+        ]
     );
 }
 
