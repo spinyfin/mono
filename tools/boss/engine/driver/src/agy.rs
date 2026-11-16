@@ -21,8 +21,8 @@ use boss_ssh_transport::shell_quote;
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
     InterruptDelivery, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput,
-    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, SpawnPlan, SpawnRequest,
-    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, SettingsLogCheckSpec,
+    SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 
 mod environment;
@@ -196,6 +196,12 @@ impl AgentDriver for AgyDriver {
             "You are currently not signed in".into(),
             "Select login method:".into(),
         ]
+    }
+
+    fn settings_log_check(&self) -> Option<SettingsLogCheckSpec> {
+        Some(SettingsLogCheckSpec {
+            verify: permissions::verify_runtime_state,
+        })
     }
 
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
@@ -458,6 +464,7 @@ mod tests {
         assert_eq!(d.config_dir, ".agy");
         assert_eq!(d.agent_rules_filename, "AGENTS.md");
         assert_eq!(d.initial_prompt_filename, "initial-prompt.txt");
+        assert!(driver.settings_log_check().is_some());
         assert_eq!(d.model_menu.engine_default, model_menu::STANDARD_FAMILY);
         assert_eq!(
             (d.model_menu

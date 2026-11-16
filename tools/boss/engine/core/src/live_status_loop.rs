@@ -88,7 +88,8 @@ pub struct SlotDebugSnapshot {
     /// Outcome tag of the most recent summarizer call (the four
     /// distinguishable cases from [`SummarizerOutcome::tag`]).
     pub last_outcome_tag: Option<String>,
-    /// Completed attempts skipped because the transcript buffer was empty.
+    /// Completed attempts skipped because the transcript buffer was empty
+    /// (no content after polling).
     pub empty_transcript_polls: u64,
     /// Human-readable detail for the most recent summarizer call.
     pub last_outcome_detail: Option<String>,

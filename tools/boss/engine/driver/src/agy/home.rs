@@ -328,6 +328,12 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     )
     .with_context(|| format!("writing {}", workspace_path_stamp(&control_dir).display()))?;
 
+    // A relaunch must observe this CLI's initialization, never an old log.
+    match fs::remove_file(&log_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing previous agy launch log"),
+    }
     crate::initial_prompt::provision(&control_dir, &control_dir, prompt_text, &super::AgyDriver::default())
         .context("provisioning agy initial-prompt launcher under the Boss-owned control directory")?;
 

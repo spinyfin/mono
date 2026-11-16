@@ -33,6 +33,16 @@ REPLIES = {
     b">c": b"\x1b[>0;0;0c", b">0c": b"\x1b[>0;0;0c",
     b"?u": b"\x1b[?0u", b"?2026$p": b"\x1b[?2026;2$y",
 }
+# Reply shapes for the queries above. A real attached terminal reports the
+# actual cursor position, not the synthesized 1;1 used when outer_tty is false.
+REPLY = re.compile(
+    rb"\x1b\[(?:\??\d+;\d+R|\??[\d;]*c|>[\d;]*c|\?\d+u|\?\d+;\d+\$y)"
+)
+REPLY_BODY = {
+    b"?": frozenset(b"0123456789;$"),
+    b">": frozenset(b"0123456789;"),
+    None: frozenset(b"0123456789;?$"),
+}
 
 
 class TerminalTail:
@@ -288,8 +298,117 @@ def check_blocking_dialog(view, markers, payload=b""):
                     raise BlockingDialogOnScreen(marker)
 
 
+def take_terminal_replies(data, buffer):
+    """Split stdin into recognised terminal replies vs other input.
+
+    Returns (forwarded, remaining_buffer, refused). Incomplete CSI that could
+    still become a reply stays in remaining_buffer.
+    """
+    buffer += data
+    forwarded = bytearray()
+    while buffer:
+        match = REPLY.match(buffer)
+        if match:
+            forwarded += match.group(0)
+            buffer = buffer[match.end():]
+            continue
+        if _reply_prefix(buffer):
+            return bytes(forwarded), buffer, False
+        return bytes(forwarded), buffer, True
+    return bytes(forwarded), b"", False
+
+
+def _reply_prefix(buffer):
+    if buffer in (b"", b"\x1b", b"\x1b["):
+        return True
+    if not buffer.startswith(b"\x1b[") or len(buffer) >= 32:
+        return False
+    rest = buffer[2:]
+    allowed = REPLY_BODY.get(rest[:1], REPLY_BODY[None])
+    body = rest[1:] if rest[:1] in REPLY_BODY else rest
+    return not body or all(byte in allowed for byte in body)
+
+
+SETTINGS_LOG_POLL = 0.25
+SETTINGS_SETTLE = 2
+
+
+class SettingsLogWatcher:
+    """Incremental, throttled admission against a CLI settings log.
+
+    Loads the check JSON once. Remembers initialization and only reads new
+    log bytes. A truncated or missing log after initialization is fatal.
+    """
+
+    def __init__(self, check_path):
+        check = json.loads(Path(check_path).read_text())
+        self.log_path = Path(check["log_path"])
+        self.expected = check["expected"]
+        self.offset = 0
+        self.buf = b""
+        self.initialized = False
+        self.initialized_at = None
+        self.last_poll = None
+        self.ready = False
+
+    def poll(self, now):
+        if self.last_poll is not None and now - self.last_poll < SETTINGS_LOG_POLL:
+            return self.ready
+        self.last_poll = now
+        try:
+            size = self.log_path.stat().st_size
+        except FileNotFoundError:
+            self._disappeared()
+            return False
+        if size < self.offset:
+            self._disappeared()
+            return False
+        with self.log_path.open("rb") as log:
+            log.seek(self.offset)
+            chunk = log.read()
+        self.offset += len(chunk)
+        self.buf += chunk
+        while True:
+            index = self.buf.find(b"\n")
+            if index < 0:
+                break
+            line = self.buf[:index].decode("utf-8", "replace")
+            self.buf = self.buf[index + 1:]
+            self._consume(line, now, terminated=True)
+        if self.buf:
+            # A read can land mid-write: only the invalid-rule check is safe
+            # on an unterminated tail; the initialization line is judged once
+            # its newline arrives.
+            self._consume(self.buf.decode("utf-8", "replace"), now, terminated=False)
+        self.ready = bool(
+            self.initialized and self.initialized_at is not None
+            and now - self.initialized_at >= SETTINGS_SETTLE
+        )
+        return self.ready
+
+    def _consume(self, line, now, terminated):
+        if "ignoring invalid" in line:
+            raise RuntimeError(f"agy dropped rendered permission rules: {line}")
+        if terminated and "CLI settings initialized" in line:
+            if self.expected not in line:
+                raise RuntimeError(
+                    f"agy initialized settings that differ from rendered posture: {line}"
+                )
+            if not self.initialized:
+                self.initialized = True
+                self.initialized_at = now
+
+    def _disappeared(self):
+        if self.initialized:
+            raise RuntimeError("agy settings initialization evidence disappeared")
+        self.offset = 0
+        self.buf = b""
+        self.ready = False
+
+
 def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
-        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None, blocking_dialog_markers=()):
+        landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None, blocking_dialog_markers=(),
+        settings_check=None):
     if b"\x1b[201~" in prompt or b"\0" in prompt:
         raise ValueError("initial brief contains a terminal paste terminator or NUL")
     outer_tty = os.isatty(0)
@@ -323,6 +442,8 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
     pending = b""
     screen = b""
     query_buffer = b""
+    stdin_reply_buf = b""
+    settings_watch = None if settings_check is None else SettingsLogWatcher(settings_check)
     delivered = False
     paste_started = False
     submitting = False
@@ -346,6 +467,9 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             tty.setraw(0, termios.TCSANOW)
         while True:
             now = time.monotonic()
+            settings_ready = settings_watch is None or settings_watch.poll(now)
+            if paste_started and not settings_ready:
+                raise RuntimeError("agy settings initialization evidence disappeared")
             if exit_status is None:
                 # A descendant can hold the pty slave open after the driver
                 # exits, so EOF alone never ends the relay. Once the
@@ -408,7 +532,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                         paste_enabled = enable > disable
             if not paste_started:
                 raw = not termios.tcgetattr(master)[3] & termios.ICANON
-                if ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
+                if settings_ready and ready_for_prompt(view, raw, paste_enabled, markers, starting_markers):
                     if ready_since is None:
                         ready_since = now
                     elif now - ready_since >= 0.2:
@@ -422,7 +546,16 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             if 0 in readable:
                 data = os.read(0, 65536)
                 if data:
-                    pending += data
+                    if settings_watch is not None and not settings_ready:
+                        replies, stdin_reply_buf, refused = take_terminal_replies(data, stdin_reply_buf)
+                        pending += replies
+                        if refused:
+                            raise RuntimeError("agy settings have not initialized; input refused")
+                    else:
+                        if stdin_reply_buf:
+                            pending += stdin_reply_buf
+                            stdin_reply_buf = b""
+                        pending += data
                 else:
                     stdin_open = False
             if master in writable:
@@ -534,7 +667,9 @@ def main():
     # A retried launch starts its own record.
     write_marker(DELIVERY_LOG)
     return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery,
-               blocking_dialog_markers=[s.encode() for s in config.get("blocking_dialog_markers", [])])
+               blocking_dialog_markers=[s.encode() for s in config.get("blocking_dialog_markers", [])],
+               settings_check=Path(__file__).with_name("settings-log-check.json")
+               if config.get("check_settings_log") else None)
 
 
 if __name__ == "__main__":

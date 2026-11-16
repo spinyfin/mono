@@ -552,6 +552,16 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
     // Refuse a symlink or shared hard link planted where the file goes.
     check_private_entry(&control_dir)?;
     check_private_entry(&settings_path)?;
+    // The PTY relay gates the initial brief using the same expectation as the
+    // host-side checker, even before the host observes the pane.
+    crate::initial_prompt::write_private(
+        &control_dir.join("settings-log-check.json"),
+        serde_json::to_string(&serde_json::json!({
+            "log_path": super::home::log_file_for_run(&input.run_id)?,
+            "expected": expected_initialized_fragment(&settings),
+        }))?
+        .as_bytes(),
+    )?;
     fs::write(&settings_path, body)
         .with_context(|| format!("writing agy session settings {}", settings_path.display()))?;
 
@@ -566,18 +576,7 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
 // Post-spawn log check
 // ---------------------------------------------------------------------------
 
-/// Outcome of [`verify_settings_log`] when nothing is wrong yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsLogCheck {
-    /// The CLI has not logged its settings yet. Not a failure: ask again.
-    NotYetInitialized,
-    /// Every initialisation line matches the rendered settings and no rule has
-    /// been reported invalid *so far*. The grant store reports malformed
-    /// entries on a separate, later line (about a second after initialisation
-    /// in the study), so this is not final: the caller must check again right
-    /// before it delivers input, and treat a later failure as fatal.
-    ConsistentSoFar,
-}
+pub use crate::SettingsLogCheck;
 
 /// The text the CLI logs after `CLI settings initialized: ` for `settings`,
 /// as Go formats the struct: space-separated slices, `Ask` empty.
@@ -598,12 +597,6 @@ fn expected_initialized_fragment(settings: &SessionSettings) -> String {
 /// `--settings` (or a later rewrite) changing the effective posture.
 /// `rendered_settings` is the file written by [`write_session_settings`]; it is
 /// re-parsed and re-validated, so a tampered file fails here too.
-///
-/// TODO(pane-spawn): this has no production caller yet. The pane-spawn
-/// admission path MUST call it after the CLI initializes and again before each
-/// input delivery; a clean result only means "consistent so far". Until then
-/// no run fails on an `ignoring invalid` warning or a mismatched
-/// `CLI settings initialized` line.
 pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result<SettingsLogCheck> {
     let settings = parse_rendered(rendered_settings)?;
     let invalid: Vec<&str> = log
@@ -650,6 +643,17 @@ pub fn verify_settings_log_files(settings_path: &Path, log_path: &Path) -> anyho
     verify_settings_log(&rendered, &log)
 }
 
+/// [`verify_settings_log_files`] over the paths recorded in this driver's
+/// runtime state. Used as [`crate::SettingsLogCheckSpec::verify`].
+pub fn verify_runtime_state(state: &crate::DriverRuntimeState) -> anyhow::Result<SettingsLogCheck> {
+    let runtime = super::home::AgyRuntimeState::from_driver_runtime_state(state)?;
+    verify_settings_log_files(&runtime.session_settings_path, &runtime.log_file)
+}
+
 #[cfg(test)]
 #[path = "permissions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "permissions_relay_tests.rs"]
+mod relay_tests;

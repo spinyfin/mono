@@ -1834,6 +1834,28 @@ pub fn render_env_directive(directive: &EnvDirective) -> String {
     }
 }
 
+/// Outcome of a post-spawn settings-log check when nothing is wrong yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsLogCheck {
+    /// The CLI has not logged its settings yet. Not a failure: ask again.
+    NotYetInitialized,
+    /// Every initialisation line matches the rendered settings and no rule has
+    /// been reported invalid *so far*. The grant store reports malformed
+    /// entries on a separate, later line (observed roughly a second after the
+    /// initialisation line with agy, which is why `SETTINGS_SETTLE` is 2s), so this is not final: the caller must check again right
+    /// before it delivers input, and treat a later failure as fatal.
+    ConsistentSoFar,
+}
+
+/// Driver-owned admission against a CLI settings log.
+///
+/// The launcher and host supervisor query this through [`AgentDriver`] so
+/// neither names a driver. `verify` reads that driver's runtime state.
+#[derive(Clone, Copy)]
+pub struct SettingsLogCheckSpec {
+    pub verify: fn(&DriverRuntimeState) -> anyhow::Result<SettingsLogCheck>,
+}
+
 /// What [`AgentDriver::spawn_invocation`] produces for [`Capability::Spawn`]:
 /// the environment adjustments and command line the spawn flow applies to
 /// the worker pane, verbatim and in order. A driver owns both its command
@@ -1924,6 +1946,14 @@ pub trait AgentDriver: Send + Sync {
     /// input in order, so its first output after the paste is evidence enough.
     fn paste_landed_markers(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Optional post-spawn settings-log admission. When `Some`, the
+    /// initial-brief launcher waits for a matching initialization line
+    /// (plus a settle period) before pasting, and the host supervisor
+    /// verifies the same log before admitting later input.
+    fn settings_log_check(&self) -> Option<SettingsLogCheckSpec> {
+        None
     }
 
     // ── WorkspaceProvisioning capability ────────────────────────────────────

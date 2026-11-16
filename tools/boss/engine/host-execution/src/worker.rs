@@ -1,5 +1,6 @@
 //! Token-identified tmux worker sessions: Spawn, Adopt, Deliver, Stop.
 
+mod permissions;
 #[path = "worker_paths.rs"]
 mod worker_paths;
 use worker_paths::{OUTPUT_ENV_NAMES, hex_token, insert_output_environment};
@@ -378,7 +379,10 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         adopt_pid(&mut record, pid);
         record.phase = Phase::Alive;
         self.persist(&record)?;
-        let pane = self.wait_for_brief(&record).await;
+        let pane = match self.wait_for_brief(&record).await {
+            Ok(pane) => pane,
+            Err(error) => return self.permission_failed(command, record, error).await,
+        };
         // Reclaim removes the launcher's log, so retain the refusal first.
         let dialog = record.home.as_deref().and_then(initial_prompt::blocking_dialog_marker);
         self.settle(&mut record, &pane).await?;
@@ -694,6 +698,9 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 Some(self.observe(&record).await),
             ));
         }
+        if let Err(error) = permissions::require_ready(&record) {
+            return self.permission_failed(command, record, error).await;
+        }
         let gesture = match self.gesture(&record, deliver) {
             Ok(gesture) => gesture,
             Err(error) => return Ok(outcome(command, ResultCode::Rejected, error.to_string(), None)),
@@ -930,20 +937,21 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         Ok(row.status.workspace_path)
     }
 
-    async fn wait_for_brief(&self, record: &ExecutionRecord) -> PaneState {
+    async fn wait_for_brief(&self, record: &ExecutionRecord) -> Result<PaneState> {
         let deadline = Instant::now() + self.brief_budget;
         loop {
+            let settings_ready = permissions::check(record)?;
             let pane = self.observe(record).await;
             let delivered = record.home.as_deref().is_some_and(delivered_marker_present);
             match pane_life(&pane) {
-                PaneLife::BriefNotDelivered | PaneLife::Exited | PaneLife::Missing => return pane,
-                PaneLife::Alive if delivered => return pane,
+                PaneLife::BriefNotDelivered | PaneLife::Exited | PaneLife::Missing => return Ok(pane),
+                PaneLife::Alive if delivered && settings_ready => return Ok(pane),
                 // A failed query may be transient; keep looking until the budget ends.
                 _ => {}
             }
             if Instant::now() >= deadline {
                 let mut pane = pane;
-                if pane_life(&pane) == PaneLife::Alive && !delivered {
+                if pane_life(&pane) == PaneLife::Alive && (!delivered || !settings_ready) {
                     pane.life = match self
                         .tmux
                         .kill_session_verified(&record.session, &record.spawn_token)
@@ -955,7 +963,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                         _ => PaneLife::Indeterminate.into(),
                     };
                 }
-                return pane;
+                return Ok(pane);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
