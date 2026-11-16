@@ -13,3 +13,18 @@ sh_test(
         "//.buildkite/steps:disk-cache-gc-cap.sh",
     ],
 )
+
+# Script-level test for the decision ci-env.sh makes about where a step's
+# bazel actions execute: a step that has not opted in, a Linux agent, an agent
+# without an endpoint and an endpoint that does not answer all build on the
+# agent; a malformed endpoint fails loudly; and the flags for the remote case
+# select a config that .ci.bazelrc really defines.
+sh_test(
+    name = "remote_execution_test",
+    size = "small",
+    srcs = ["remote_execution_test.sh"],
+    data = [
+        "//:.ci.bazelrc",
+        "//.buildkite/steps:remote-execution.sh",
+    ],
+)

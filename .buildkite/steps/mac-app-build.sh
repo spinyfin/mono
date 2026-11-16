@@ -5,6 +5,11 @@
 # depends on //tools/boss/app-macos:Boss and therefore requires macOS.
 set -euo pipefail
 
+# This step may execute its bazel actions on the remote macOS workers; ci-env.sh
+# decides whether it does (see remote-execution.sh). It qualifies because
+# nothing it passes to bazel is a credential and its build and
+# test commands are run only for their result.
+CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [mac-app-build] building"
@@ -15,13 +20,13 @@ echo "--- [mac-app-build] building"
 # for the full rationale). Materialize a parse-only stub if it's absent.
 tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 
-bazel build //tools/boss/app-macos/... //tools/boss/installer/...
+bazel_verify_only build //tools/boss/app-macos/... //tools/boss/installer/...
 # Run every macOS Swift test target, not just BossTests, so the UpdateCore
 # module's tests (UpdateChecker / UpdateDownloader — the self-update download,
 # verification, quarantine-strip, and staging logic) gate merges too. The `...`
 # wildcard picks up both //tools/boss/app-macos:BossTests and
 # //tools/boss/app-macos/Tests/UpdateCore:UpdateTests.
-bazel test --test_output=errors //tools/boss/app-macos/...
+bazel_verify_only test --test_output=errors //tools/boss/app-macos/...
 
 # Gate the bundled-engine layout: boss_pkg_payload_contains_engine_binary_test
 # asserts the packaged .pkg payload actually contains the engine binary at the
@@ -29,6 +34,6 @@ bazel test --test_output=errors //tools/boss/app-macos/...
 # //tools/boss/installer/... entirely (its boss_pkg_payload rule needs the
 # Swift/macOS toolchain this step provides), so this is the only CI step that
 # can run it.
-bazel test --test_output=errors //tools/boss/installer/...
+bazel_verify_only test --test_output=errors //tools/boss/installer/...
 
 echo "[mac-app-build] ok"
