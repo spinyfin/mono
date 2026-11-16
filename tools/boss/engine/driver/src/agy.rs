@@ -2,7 +2,8 @@
 //!
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
 //! provisioning, and per-kind permission rendering (`--settings`). Interactive
-//! TUI spawn still refuses until guard hooks land.
+//! TUI spawn still refuses until guard hooks land. Retention preserves
+//! transcript evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -36,7 +37,11 @@ mod transcript;
 pub mod rules_probe;
 
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
-pub use home::{AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AgyRuntimeState, assert_agy_home_safe_to_delete};
+pub(crate) use home::AGY_HOMES_DIR_NAME;
+pub use home::{
+    AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AGY_TRANSCRIPT_PATHS, AgyRuntimeState, assert_agy_home_safe_to_delete,
+    contains_agy_transcripts,
+};
 use home::{
     agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run, process_home_for_run,
     provision_agy_home, read_workspace_path_stamp, session_settings_path_for_run,
@@ -84,7 +89,7 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning and permission
 /// rendering are live; interactive TUI spawn still refuses until guard hooks
-/// land.
+/// land. Retention preserves per-run transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -255,7 +260,9 @@ impl AgentDriver for AgyDriver {
             );
         }
 
-        // HOME is isolated; the TUI still waits on guard-hook wiring.
+        // HOME is isolated; spawn stays refused until guard hooks land.
+        // Retention preserves containers holding brain/ or conversations/
+        // evidence while agy lacks durable transcript storage.
         refuse_agy_plan(env, "agy driver is not spawnable yet (guard hooks are not wired)")
     }
 
@@ -362,11 +369,22 @@ impl AgentDriver for AgyDriver {
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
         // `agy` stamps `transcriptPath` on the Stop payload (pane study).
         // Empty strings are treated as missing, matching Claude/Grok.
+        // `persistable_transcript_path` rewrites onto the durable store
+        // when one exists, and warns when the stamp is still under a
+        // per-run home that reclaim will delete.
         let s = raw
             .get("transcriptPath")
             .or_else(|| raw.get("transcript_path"))
             .and_then(|v| v.as_str())?;
-        if s.is_empty() { None } else { Some(s.to_owned()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(
+                crate::transcript_store::persistable_transcript_path(Path::new(s))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {

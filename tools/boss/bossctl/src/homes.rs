@@ -110,6 +110,7 @@ pub async fn codex_homes_sweep(
             .skipped_live(outcome.skipped_live)
             .kept_in_policy(outcome.kept_in_policy)
             .errors(outcome.errors)
+            .already_absent(outcome.already_absent)
             .build(),
     );
     Ok(())
@@ -144,6 +145,7 @@ pub async fn grok_homes_sweep(
             .skipped_live(outcome.skipped_live)
             .kept_in_policy(outcome.kept_in_policy)
             .errors(outcome.errors)
+            .already_absent(outcome.already_absent)
             .build(),
     );
     Ok(())
@@ -177,6 +179,8 @@ pub async fn agy_homes_sweep(
             .deleted_bytes(outcome.deleted_bytes)
             .skipped_live(outcome.skipped_live)
             .kept_in_policy(outcome.kept_in_policy)
+            .kept_for_transcripts(outcome.kept_for_transcripts)
+            .kept_for_transcripts_bytes(outcome.kept_for_transcripts_bytes)
             .errors(outcome.errors)
             .already_absent(outcome.already_absent)
             .build(),
@@ -195,6 +199,10 @@ struct HomeSweepCounts {
     errors: u64,
     #[builder(default)]
     already_absent: u64,
+    #[builder(default)]
+    kept_for_transcripts: u64,
+    #[builder(default)]
+    kept_for_transcripts_bytes: u64,
 }
 
 fn print_home_sweep(
@@ -214,14 +222,16 @@ fn print_home_sweep(
     } else {
         let action = if dry_run { "would reclaim" } else { "reclaimed" };
         println!(
-            "{action} {} recorded {driver} home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, already_absent={}, errors={}",
+            "{action} {} recorded {driver} home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, already_absent={}, errors={}, kept_for_transcripts={}, kept_for_transcripts_bytes={}",
             counts.deleted,
             counts.deleted_bytes,
             counts.scanned,
             counts.skipped_live,
             counts.kept_in_policy,
             counts.already_absent,
-            counts.errors
+            counts.errors,
+            counts.kept_for_transcripts,
+            counts.kept_for_transcripts_bytes
         );
     }
 }

@@ -222,8 +222,9 @@ impl WorkDb {
 
     /// Best-effort rewrite of `work_runs.transcript_path` values that still
     /// point into a per-run Grok or Codex home (`boss-grok-homes` /
-    /// `boss-codex-homes`). Those homes are reclaimed; the transcript bytes
-    /// live under the durable store. Returns the number of rows updated.
+    /// `boss-codex-homes`). Those homes are reclaimed; the
+    /// transcript bytes live under the durable store when one was
+    /// provisioned. Returns the number of rows updated.
     ///
     /// Idempotent: a second pass is a no-op. Does not invent a path when the
     /// stamped location cannot be rewritten — those rows stay as they are so
@@ -234,6 +235,8 @@ impl WorkDb {
     /// with a dead one that no longer matches this backfill's query, making
     /// the missing transcript permanently invisible.
     pub fn backfill_durable_transcript_paths(&self) -> Result<BackfillDurableTranscriptPathsOutcome> {
+        // Only select layouts that persistable_transcript_path can rewrite.
+        // Agy paths remain ephemeral and are protected by agy retention.
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, transcript_path FROM work_runs
@@ -287,7 +290,7 @@ impl WorkDb {
             Err(err) => tracing::warn!(
                 error = %format!("{err:#}"),
                 "failed to rewrite ephemeral work_runs.transcript_path values; \
-                 grok/codex diagnosis may still see dead pointers"
+                 grok/codex/agy diagnosis may still see dead pointers"
             ),
         }
     }

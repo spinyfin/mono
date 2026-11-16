@@ -12,6 +12,7 @@ use anyhow::{Context, bail};
 // Default leaf names of the per-run homes roots, reused directly so a rename
 // of either original cannot silently desync this rewrite from where the homes
 // actually live.
+use crate::agy::AGY_HOMES_DIR_NAME as AGY_HOMES_DIR_MARKER;
 use crate::codex::CODEX_HOMES_DIR_NAME as CODEX_HOMES_DIR_MARKER;
 use crate::grok::GROK_HOMES_DIR_NAME as GROK_HOMES_DIR_MARKER;
 
@@ -185,7 +186,7 @@ fn rewrite_known_ephemeral_layout(path: &Path) -> Option<PathBuf> {
 
 fn looks_like_ephemeral_agent_home(path: &Path) -> bool {
     path.iter()
-        .any(|c| c == GROK_HOMES_DIR_MARKER || c == CODEX_HOMES_DIR_MARKER)
+        .any(|c| c == GROK_HOMES_DIR_MARKER || c == CODEX_HOMES_DIR_MARKER || c == AGY_HOMES_DIR_MARKER)
 }
 
 /// Resolve and verify a provisioned `home/sessions` link against its
@@ -354,6 +355,36 @@ mod tests {
     fn persistable_path_leaves_claude_stamps_unchanged() {
         let claude = Path::new("/home/u/.claude/projects/foo/sess-1.jsonl");
         assert_eq!(persistable_transcript_path(claude), claude);
+    }
+
+    #[test]
+    fn ephemeral_home_markers_include_agy_grok_and_codex() {
+        assert!(looks_like_ephemeral_agent_home(
+            &PathBuf::from("/tmp")
+                .join(AGY_HOMES_DIR_MARKER)
+                .join("run/process-home/x")
+        ));
+        assert!(looks_like_ephemeral_agent_home(
+            &PathBuf::from("/tmp")
+                .join(GROK_HOMES_DIR_MARKER)
+                .join("run/grok-home/x")
+        ));
+        assert!(looks_like_ephemeral_agent_home(
+            &PathBuf::from("/tmp")
+                .join(CODEX_HOMES_DIR_MARKER)
+                .join("run/sessions/x")
+        ));
+        assert!(!looks_like_ephemeral_agent_home(Path::new(
+            "/home/u/.claude/projects/foo/sess-1.jsonl"
+        )));
+    }
+
+    #[test]
+    fn persistable_path_leaves_agy_stamps_unchanged_until_durable_store_exists() {
+        let stamped = PathBuf::from("/tmp")
+            .join(AGY_HOMES_DIR_MARKER)
+            .join("exec-1/process-home/.gemini/antigravity-cli/brain/cid/.system_generated/logs/transcript_full.jsonl");
+        assert_eq!(persistable_transcript_path(&stamped), stamped);
     }
 
     #[test]
