@@ -2,7 +2,8 @@
 //!
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
 //! provisioning, and per-kind permission rendering (`--settings`). Interactive
-//! TUI spawn still refuses until guard hooks land.
+//! TUI spawn still refuses until guard hooks land and durable transcript
+//! storage exists.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -36,6 +37,7 @@ mod transcript;
 pub mod rules_probe;
 
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
+pub(crate) use home::AGY_HOMES_DIR_NAME;
 pub use home::{AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AgyRuntimeState, assert_agy_home_safe_to_delete};
 use home::{
     agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run, process_home_for_run,
@@ -84,13 +86,14 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning and permission
 /// rendering are live; interactive TUI spawn still refuses until guard hooks
-/// land.
+/// land and durable transcript storage exists.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
 }
 
-/// Refuse launch while guard hooks are unavailable.
+/// Refuse launch while guard hooks or the durable transcript store are
+/// unavailable.
 pub fn refuse_agy_spawn(reason: &str) -> String {
     format!("printf '%s\\n' {} >&2; exit 1\n", shell_quote(reason))
 }
@@ -255,8 +258,15 @@ impl AgentDriver for AgyDriver {
             );
         }
 
-        // HOME is isolated; the TUI still waits on guard-hook wiring.
-        refuse_agy_plan(env, "agy driver is not spawnable yet (guard hooks are not wired)")
+        // HOME is isolated; spawn stays refused until guard hooks land and a
+        // durable transcript store exists. Teardown keeps `brain/` and
+        // `conversations/` readable, but the retention sweep still deletes
+        // the whole container after the age/byte policy, so enabling spawn
+        // before that store lands would leave dead transcript_path values.
+        refuse_agy_plan(
+            env,
+            "agy driver is not spawnable yet (guard hooks are not wired; durable transcript store is not provisioned)",
+        )
     }
 
     async fn provision_workspace(
@@ -362,11 +372,22 @@ impl AgentDriver for AgyDriver {
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
         // `agy` stamps `transcriptPath` on the Stop payload (pane study).
         // Empty strings are treated as missing, matching Claude/Grok.
+        // `persistable_transcript_path` rewrites onto the durable store
+        // when one exists, and warns when the stamp is still under a
+        // per-run home that reclaim will delete.
         let s = raw
             .get("transcriptPath")
             .or_else(|| raw.get("transcript_path"))
             .and_then(|v| v.as_str())?;
-        if s.is_empty() { None } else { Some(s.to_owned()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(
+                crate::transcript_store::persistable_transcript_path(Path::new(s))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {

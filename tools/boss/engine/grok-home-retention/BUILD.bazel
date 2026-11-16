@@ -10,11 +10,8 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = [
-        "//tools/boss/bossctl:__pkg__",
-        "//tools/boss/engine/core:__pkg__",
-    ],
-    deps = all_crate_deps(normal = True),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = all_crate_deps(normal = True) + ["//tools/boss/engine/driver-home-retention"],
 )
 
 rust_test(

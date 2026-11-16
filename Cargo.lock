@@ -740,10 +740,9 @@ name = "boss-engine-codex-rollout-retention"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bon",
+ "boss-engine-driver-home-retention",
  "serde_json",
  "tempfile",
- "tracing",
  "walkdir",
 ]
 
@@ -948,11 +947,7 @@ name = "boss-engine-grok-home-retention"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bon",
- "serde_json",
- "tempfile",
- "tracing",
- "walkdir",
+ "boss-engine-driver-home-retention",
 ]
 
 [[package]]

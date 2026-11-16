@@ -84,6 +84,11 @@ pub async fn run_one_pass_with_policy(
     policy: &retention::AgyHomeRetentionPolicy,
     dry_run: bool,
 ) -> AgyHomeRetentionSweepOutcome {
+    // Rewrite pointers into per-run homes before those homes are deleted.
+    // Covers Grok, Codex, and agy rows: this pass also runs from
+    // `bossctl agy-homes`, which is not the engine-start path.
+    work_db.apply_durable_transcript_path_backfill();
+
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
     let executions = match work_db.list_executions_with_driver_runtime_state() {
@@ -353,6 +358,57 @@ mod tests {
             outcome2.deleted, 0,
             "already-gone paths are not fresh reclaim: {outcome2:?}"
         );
+    }
+
+    #[test]
+    fn sweep_refuses_recorded_container_outside_homes_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-agy-homes");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let _env_guard = boss_engine_driver::test_support::agy_homes_override(&homes_root);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(sweep_refuses_recorded_container_outside_homes_root_body(outside.path()));
+    }
+
+    async fn sweep_refuses_recorded_container_outside_homes_root_body(outside_root: &Path) {
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let item = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("agy-outside-root".to_owned())
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let now = now_epoch();
+        let rogue = outside_root.join("rogue-run");
+        write_agy_container(&rogue);
+        let marker = rogue.join("marker");
+        std::fs::write(&marker, "must-survive").unwrap();
+        seed_execution_with_home(
+            &db,
+            &item,
+            "completed",
+            now - 40 * 24 * 60 * 60,
+            &rogue.join("process-home"),
+        );
+
+        let policy = retention::AgyHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
+        let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+        assert_eq!(outcome.errors, 1, "out-of-root container must be refused: {outcome:?}");
+        assert_eq!(
+            outcome.deleted, 0,
+            "out-of-root container must not be deleted: {outcome:?}"
+        );
+        assert!(marker.is_file(), "marker outside the homes root must survive");
+        assert!(rogue.is_dir(), "out-of-root container must still exist");
     }
 
     #[test]

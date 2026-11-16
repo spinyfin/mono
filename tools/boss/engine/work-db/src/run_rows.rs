@@ -221,9 +221,10 @@ impl WorkDb {
     }
 
     /// Best-effort rewrite of `work_runs.transcript_path` values that still
-    /// point into a per-run Grok or Codex home (`boss-grok-homes` /
-    /// `boss-codex-homes`). Those homes are reclaimed; the transcript bytes
-    /// live under the durable store. Returns the number of rows updated.
+    /// point into a per-run Grok, Codex, or agy home (`boss-grok-homes` /
+    /// `boss-codex-homes` / `boss-agy-homes`). Those homes are reclaimed; the
+    /// transcript bytes live under the durable store when one was
+    /// provisioned. Returns the number of rows updated.
     ///
     /// Idempotent: a second pass is a no-op. Does not invent a path when the
     /// stamped location cannot be rewritten — those rows stay as they are so
@@ -239,7 +240,8 @@ impl WorkDb {
             "SELECT id, transcript_path FROM work_runs
              WHERE transcript_path IS NOT NULL
                AND (instr(transcript_path, '/boss-grok-homes/') > 0
-                 OR instr(transcript_path, '/boss-codex-homes/') > 0)",
+                 OR instr(transcript_path, '/boss-codex-homes/') > 0
+                 OR instr(transcript_path, '/boss-agy-homes/') > 0)",
         )?;
         let rows: Vec<(String, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -287,7 +289,7 @@ impl WorkDb {
             Err(err) => tracing::warn!(
                 error = %format!("{err:#}"),
                 "failed to rewrite ephemeral work_runs.transcript_path values; \
-                 grok/codex diagnosis may still see dead pointers"
+                 grok/codex/agy diagnosis may still see dead pointers"
             ),
         }
     }

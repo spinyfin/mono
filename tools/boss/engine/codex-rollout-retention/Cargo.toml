@@ -6,9 +6,8 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
-bon = { workspace = true }
+boss-engine-driver-home-retention = { path = "../driver-home-retention" }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]

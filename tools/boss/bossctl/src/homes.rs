@@ -110,6 +110,7 @@ pub async fn codex_homes_sweep(
             .skipped_live(outcome.skipped_live)
             .kept_in_policy(outcome.kept_in_policy)
             .errors(outcome.errors)
+            .already_absent(outcome.already_absent)
             .build(),
     );
     Ok(())
@@ -144,6 +145,7 @@ pub async fn grok_homes_sweep(
             .skipped_live(outcome.skipped_live)
             .kept_in_policy(outcome.kept_in_policy)
             .errors(outcome.errors)
+            .already_absent(outcome.already_absent)
             .build(),
     );
     Ok(())

@@ -142,7 +142,7 @@ pub fn plan_reclaim(homes: &[OwnedHome], now_epoch: i64, policy: &RetentionPolic
     // terminal evidence first.
     terminal.sort_by_key(|(_, age, _)| *age);
 
-    let max_age_secs = policy.max_age.as_secs() as i64;
+    let max_age_secs = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
     let mut remaining_bytes: u64 = terminal.iter().map(|(_, _, size)| *size).sum();
     let mut to_delete = Vec::new();
     let mut deleted_bytes = 0u64;
@@ -371,6 +371,19 @@ mod tests {
     }
 
     #[test]
+    fn path_level_live_guard_is_order_independent() {
+        let now = 1_800_000_000i64;
+        let path = "/tmp/boss-agy-homes/shared";
+        let homes = vec![
+            home(path, "e-live", true, now - DAY, 1_000),
+            home(path, "e-terminal-old", false, now - 40 * DAY, 1_000),
+        ];
+        let plan = plan_reclaim(&homes, now, &RetentionPolicy::new(Duration::from_secs(1), 0));
+        assert!(plan.to_delete.is_empty(), "{plan:?}");
+        assert_eq!(plan.skipped_live, 1);
+    }
+
+    #[test]
     fn duplicate_terminal_paths_are_collapsed_not_double_counted() {
         let now = 1_800_000_000i64;
         let path = "/tmp/boss-agy-homes/dup";
@@ -400,6 +413,26 @@ mod tests {
         let plan = plan_reclaim(&[], 1_800_000_000, &RetentionPolicy::new(Duration::from_secs(1), 0));
         assert!(plan.to_delete.is_empty());
         assert_eq!(plan.scanned, 0);
+    }
+
+    #[test]
+    fn huge_max_age_does_not_wrap_and_reclaim_every_terminal_home() {
+        // `Duration::from_secs(u64::MAX)` is what `from_env` saturates a
+        // u64::MAX-day override to (`days.saturating_mul(86400)`). Casting
+        // that to i64 used to wrap to -1 and match every terminal home.
+        let now = 1_800_000_000i64;
+        let homes = vec![home("/tmp/h/recent", "e1", false, now - DAY, 1_000)];
+        let plan = plan_reclaim(
+            &homes,
+            now,
+            &RetentionPolicy::new(Duration::from_secs(u64::MAX), u64::MAX),
+        );
+        assert!(
+            plan.to_delete.is_empty(),
+            "u64::MAX-second max_age must not wrap negative and reclaim: {plan:?}"
+        );
+        assert_eq!(plan.kept_in_policy, 1);
+        assert_eq!(plan.deleted_bytes, 0);
     }
 
     #[test]
