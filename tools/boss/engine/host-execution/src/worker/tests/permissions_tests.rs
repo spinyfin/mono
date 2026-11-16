@@ -19,6 +19,7 @@ fn agy_state(root: &std::path::Path) -> (AgyRuntimeState, String) {
         boss_data_dir: None,
         hooks_dir: &state.process_home.join(".gemini/config"),
         control_dir: &state.control_dir,
+        rules_root: &root.join("rules-root"),
     })
     .unwrap();
     let body = settings.to_json().unwrap();

@@ -88,7 +88,8 @@ pub struct SlotDebugSnapshot {
     /// Outcome tag of the most recent summarizer call (the four
     /// distinguishable cases from [`SummarizerOutcome::tag`]).
     pub last_outcome_tag: Option<String>,
-    /// Completed attempts skipped because the transcript buffer was empty.
+    /// Completed attempts skipped because the transcript buffer was empty
+    /// (no content after polling).
     pub empty_transcript_polls: u64,
     /// Human-readable detail for the most recent summarizer call.
     pub last_outcome_detail: Option<String>,
@@ -100,8 +101,6 @@ pub struct SlotDebugSnapshot {
     /// Resolved transcript path the loop is tailing, or `None` if the
     /// resolver has not returned a path yet.
     pub transcript_path: Option<String>,
-    /// Completed refresh attempts that found no content after polling.
-    pub empty_transcript_polls: u64,
     /// Bytes of redacted prompt text fed to the most recent
     /// summarizer call. Helpful for telling "transcript is empty" from
     /// "transcript is huge".

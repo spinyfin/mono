@@ -12,6 +12,7 @@ fn relay_checks_settings_before_brief_and_rechecks_after_initialization() {
         boss_data_dir: None,
         hooks_dir: Path::new("/private/hooks"),
         control_dir: Path::new("/private/control"),
+        rules_root: Path::new("/rules-root"),
     })
     .unwrap();
     let expected = expected_initialized_fragment(&settings);
@@ -139,6 +140,7 @@ fn relay_forwards_terminal_query_replies_before_settings_initialize() {
         boss_data_dir: None,
         hooks_dir: Path::new("/private/hooks"),
         control_dir: Path::new("/private/control"),
+        rules_root: Path::new("/rules-root"),
     })
     .unwrap();
     let expected = expected_initialized_fragment(&settings);
@@ -248,6 +250,7 @@ fn relay_refuses_keyboard_input_before_settings_initialize() {
         boss_data_dir: None,
         hooks_dir: Path::new("/private/hooks"),
         control_dir: Path::new("/private/control"),
+        rules_root: Path::new("/rules-root"),
     })
     .unwrap();
     let expected = expected_initialized_fragment(&settings);
