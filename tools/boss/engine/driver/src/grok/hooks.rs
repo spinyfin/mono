@@ -441,8 +441,8 @@ mod tests {
             "checkleft hook must outlive a contended Bazel compile"
         );
         assert!(
-            guards.iter().take(3).all(|g| g.timeout_sec == Some(30)),
-            "ordinary shared guards have an explicit bounded timeout"
+            guards.iter().take(3).all(|g| g.timeout_sec.is_none()),
+            "ordinary guards retain the CLI default timeout"
         );
     }
 

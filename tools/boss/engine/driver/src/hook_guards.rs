@@ -35,7 +35,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
                 script = shell_quote(&guard_script.display().to_string()),
             ),
             matcher: "*",
-            timeout_sec: Some(30),
+            timeout_sec: None,
         });
     }
 
@@ -46,7 +46,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref()),
             matcher: "Bash",
-            timeout_sec: Some(30),
+            timeout_sec: None,
         });
     }
 
@@ -54,7 +54,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
     out.push(Guard {
         command: BOSS_LAUNCH_GUARD_COMMAND.to_owned(),
         matcher: "Bash",
-        timeout_sec: Some(30),
+        timeout_sec: None,
     });
 
     // 3. PR-redirect guard. Standard workers only (local + remote).
@@ -62,7 +62,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: pr_redirect_guard_command(config.is_revision),
             matcher: "Bash",
-            timeout_sec: Some(30),
+            timeout_sec: None,
         });
     }
 
@@ -86,7 +86,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND.to_owned(),
             matcher: "Bash",
-            timeout_sec: Some(30),
+            timeout_sec: None,
         });
     }
 
@@ -95,7 +95,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         out.push(Guard {
             command: REVISION_PR_GUARD_COMMAND.to_owned(),
             matcher: "Bash",
-            timeout_sec: Some(30),
+            timeout_sec: None,
         });
     }
 
@@ -106,7 +106,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
                 shell_quote(&crate::codex::codex_review_guide_guard_script())
             ),
             matcher: ".*",
-            timeout_sec: Some(30),
+            timeout_sec: None,
         });
     }
     out

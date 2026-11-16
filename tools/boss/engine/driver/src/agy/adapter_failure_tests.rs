@@ -208,7 +208,9 @@ fn protected_state_reads_expansions_and_symlinks_are_denied() {
         "cat ~/.gemini/config/hooks.json",
         "cat ../process-home/.gemini/config/hooks.json",
     ] {
-        assert_deny(&authorize(&fx.process_home, &run_command_payload(command), false).1);
+        let mut payload = run_command_payload(command);
+        payload["toolCall"]["args"]["Cwd"] = json!(fx.process_home.parent().unwrap().join("control"));
+        assert_deny(&authorize(&fx.process_home, &payload, false).1);
     }
     std::os::unix::fs::symlink(fx.process_home.join(".gemini"), fx.workspace().join("config-link")).unwrap();
     for (cwd, path) in [
@@ -369,7 +371,7 @@ fn probe_tests_the_installed_command_and_reused_guard_deny() {
         probe_authorization(&fx.process_home)
             .unwrap_err()
             .to_string()
-            .contains("installed authorization command failed")
+            .contains("PreToolUse configuration does not match")
     );
     fs::write(hooks_path, original).unwrap();
     fx.install(WorkerKind::Standard);

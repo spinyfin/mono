@@ -301,6 +301,8 @@ pub fn install_authorization(
         .collect();
     let policy = json!({
         "version": 1,
+        "authorization_command": authorization_command(process_home, obs),
+        "hook_timeout_sec": hook_timeout_sec(interception),
         "required_artifacts": required_artifacts,
         "run_id": obs.run_id,
         "worker_kind": worker_kind_name(worker_kind),
@@ -323,6 +325,7 @@ pub fn install_authorization(
         json!([pre_tool_use_entry(process_home, obs, interception)]),
     );
     write_hooks_document(process_home, &json!({ HOOK_GROUP: hooks }))?;
+    validate_configuration(process_home, &policy)?;
 
     // Every declared artifact must exist; missing guards/settings never shrink
     // the binding to a misleadingly healthy subset.
@@ -355,6 +358,7 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
     let attestation: AuthorizationAttestation =
         serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
     let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
+    validate_configuration(process_home, &policy)?;
     let required = policy["required_artifacts"]
         .as_object()
         .context("policy missing required artifact set")?;
@@ -422,6 +426,32 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
     Ok(attestation)
 }
 
+fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result<()> {
+    let workspace = PathBuf::from(policy["workspace_path"].as_str().context("workspace path")?);
+    let settings_path = process_home
+        .parent()
+        .context("run container")?
+        .join("control/session-settings.json");
+    let settings: Value = serde_json::from_slice(&fs::read(settings_path)?)?;
+    let expected: Value = serde_json::from_str(&super::home::render_session_settings_json(&workspace))?;
+    if settings != expected {
+        bail!("session settings do not match the trust-only renderer contract");
+    }
+    let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
+    let entry = &hooks["boss"]["PreToolUse"];
+    let command = policy["authorization_command"]
+        .as_str()
+        .context("expected authorization command")?;
+    let expected_entry = json!([{
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": command, "timeout": policy["hook_timeout_sec"]}]
+    }]);
+    if entry != &expected_entry || hooks.as_object().is_none_or(|groups| groups.len() != 1) {
+        bail!("PreToolUse configuration does not match the wildcard command contract");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn python3_available() -> bool {
     Command::new("python3")
@@ -435,6 +465,13 @@ fn python3_available() -> bool {
 /// launch a pane. Native SessionStart cannot establish this; hook counts cannot
 /// either.
 pub fn probe_authorization(process_home: &Path) -> anyhow::Result<AuthorizationProbeReport> {
+    probe_authorization_with_timeout(process_home, std::time::Duration::from_secs(60))
+}
+
+fn probe_authorization_with_timeout(
+    process_home: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<AuthorizationProbeReport> {
     verify_attestation(process_home)?;
     let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
     let command = hooks
@@ -446,18 +483,22 @@ pub fn probe_authorization(process_home: &Path) -> anyhow::Result<AuthorizationP
     }
     let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
     let run = |payload: Value| -> anyhow::Result<Value> {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", command])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .context("probe stdin")?
-            .write_all(payload.to_string().as_bytes())?;
-        let output = child.wait_with_output()?;
+        // The shared process runner kills the entire probe process group on
+        // expiry rather than waiting indefinitely for adapter output.
+        let (input, mut writer) = std::os::unix::net::UnixStream::pair()?;
+        writer.write_all(payload.to_string().as_bytes())?;
+        drop(writer);
+        let input: std::os::fd::OwnedFd = input.into();
+        let output = boss_command_runner::output_blocking_timeout_in_group(
+            Command::new("/bin/sh")
+                .args(["-c", command])
+                .env("BOSS_AGY_PROBE", "1")
+                .stdin(Stdio::from(input))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            timeout,
+            |_| {},
+        )?;
         if !output.status.success() {
             bail!(
                 "installed authorization command failed: {}",

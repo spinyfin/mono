@@ -18,6 +18,9 @@ import shlex
 import signal
 import subprocess
 import sys
+import socket
+import tempfile
+import threading
 
 TOOL_NAME_MAP = {
     "run_command": "Bash",
@@ -292,25 +295,43 @@ def authorized(policy, overwrite=None):
 
 def nested_shell_bodies(group):
     rest = strip_prefixes(group)
+    base = os.path.basename(rest[0]) if rest else ""
+    if base in {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "case", "esac", "{", "}", "!", "eval", "source", "."}:
+        fail_closed("unsupported shell control or dynamic execution")
     if rest and os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
         for index, arg in enumerate(rest[1:], 1):
             if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
                 return [rest[index + 1]]
-    if len(rest) >= 3 and os.path.basename(rest[0]) in ("python", "python3") and rest[1] == "-c":
-        return [rest[2]]
+        fail_closed("shell stdin or script execution cannot be inspected")
+    if base in ("python", "python3"):
+        if getattr(group, "body", ""):
+            fail_closed("interpreter stdin bodies cannot be inspected")
+        if len(rest) >= 3 and rest[1] == "-c":
+            return [rest[2]]
+    if base == "find":
+        bodies = []
+        for index, arg in enumerate(rest):
+            if arg in ("-exec", "-execdir", "-ok", "-okdir"):
+                end = next((i for i in range(index + 1, len(rest)) if rest[i] in (";", "+")), len(rest))
+                bodies.append(shlex.join(rest[index + 1:end]))
+        return bodies
     return []
 
 
-def iter_groups(command, depth=0):
+def inspected_commands(command, depth=0):
     if depth > 4:
         fail_closed("shell nesting exceeds the inspected depth")
     if any(group.error for group in command_records(command)):
         fail_closed("incomplete shell syntax cannot be inspected")
+    yield command
     for group in command_groups(command):
-        yield group
         for body in nested_shell_bodies(group):
-            for nested in iter_groups(body, depth + 1):
-                yield nested
+            yield from inspected_commands(body, depth + 1)
+
+
+def iter_groups(command):
+    for body in inspected_commands(command):
+        yield from command_groups(body)
 
 
 def basename_of(group):
@@ -321,13 +342,13 @@ def basename_of(group):
 
 
 def has_redirect(command):
-    lexer = shlex.shlex(command, posix=False, punctuation_chars="><")
+    lexer = shlex.shlex(command, posix=False, punctuation_chars="><|")
     lexer.whitespace_split = True
     tokens = list(lexer)
     for index, token in enumerate(tokens):
-        if token in (">", ">>"):
-            target = tokens[index + 1].strip(chr(34) + chr(39)) if index + 1 < len(tokens) else ""
-            if target != "/dev/null":
+        if token in (">", ">>", ">|", "<>"):
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if target.strip(chr(34) + chr(39)) != "/dev/null" and not re.fullmatch(r"&(?:[0-9]+|-)", target):
                 return True
     return False
 
@@ -352,16 +373,25 @@ def path_is_protected(path, policy, cwd=None):
 
 
 def command_touches_protected(command, policy, cwd):
-    # Enforcement leaf names also cover commands that change directory first,
-    # and reads: disclosure of policy is as sensitive as modifying the hook.
-    leaves = ("hooks.json", "session-settings.json", "boss-agy-auth-policy.json",
-              "boss-agy-auth-attestation.json", "boss-agy-hook-adapter.py")
-    for group in iter_groups(command):
+    current = cwd
+    for group in command_groups(command):
+        rest = strip_prefixes(group)
         for token in group:
-            if any(leaf in token for leaf in leaves):
-                return True
             candidate = token.lstrip("<>")
-            if path_is_protected(candidate, policy, cwd):
+            expanded = resolve_path(candidate, policy, current)
+            if any(c in candidate for c in "*?["):
+                static = re.split(r"[\*\?\[]", expanded, 1)[0].rstrip(os.sep)
+                home = os.path.realpath(policy["process_home"])
+                if home.startswith(static + os.sep) or static == home or static.startswith(home + os.sep):
+                    return True
+            if path_is_protected(candidate, policy, current):
+                return True
+        if rest and rest[0] in ("cd", "pushd", "popd"):
+            if len(rest) != 2 or any(c in rest[1] for c in "$`*?["):
+                return True
+            current = resolve_path(rest[1], policy, current)
+        for body in nested_shell_bodies(group):
+            if command_touches_protected(body, policy, current):
                 return True
     return False
 
@@ -438,7 +468,7 @@ def structural_command_reason(command, policy, worker_kind, cwd):
     if command_touches_protected(command, policy, cwd):
         return "command accesses protected Antigravity or Boss state"
     if worker_kind in ("reviewer", "triage"):
-        if has_redirect(command):
+        if any(has_redirect(body) for body in inspected_commands(command)):
             return "%s workers must not perform shell-mediated writes" % (worker_kind,)
         for group in iter_groups(command):
             base = basename_of(group)
@@ -448,6 +478,8 @@ def structural_command_reason(command, policy, worker_kind, cwd):
             if not rest:
                 continue
             prog = os.path.basename(rest[0])
+            if prog in ("python", "python3", "perl", "ruby", "node"):
+                return "%s workers must not execute uninspectable interpreter bodies" % worker_kind
             if vcs_mutation(rest):
                 return "%s workers must not mutate repository or GitHub state" % worker_kind
             if prog in ("patch",) or (prog == "sed" and any(t == "--in-place" or t.startswith("-i") or t.startswith("--in-place=") for t in rest[1:])) or (prog in ("awk", "gawk") and any(t == "inplace" or t.startswith("--inplace") for t in rest[1:])):
@@ -507,18 +539,26 @@ def run_bounded(argv, **kwargs):
     data = kwargs.pop("input")
     timeout = kwargs.pop("timeout")
     kwargs.pop("capture_output", None)
+    # The Rust probe owns a bounded process group. Keep probe descendants in
+    # that group so its outer deadline also kills a hung forwarder or guard.
+    new_session = os.environ.get("BOSS_AGY_PROBE") != "1"
     child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, start_new_session=True, **kwargs)
+                             stderr=subprocess.PIPE, start_new_session=new_session, **kwargs)
     try:
         stdout, stderr = child.communicate(data, timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
+        os.killpg(child.pid if new_session else os.getpgrp(), signal.SIGKILL)
         child.communicate()
         raise
     return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
 
 
-def run_guards(policy, canonical, rewrites=0):
+def run_guards(policy, canonical, rewrites=0, synthetic=False):
+    if not synthetic and canonical.get("tool_name") == "Bash":
+        for body in list(inspected_commands(canonical["tool_input"]["command"]))[1:]:
+            nested = dict(canonical)
+            nested["tool_input"] = dict(canonical["tool_input"], command=body)
+            run_guards(policy, nested, rewrites, synthetic=True)
     guards = policy.get("guards")
     if not isinstance(guards, list) or not guards:
         fail_closed("authorization policy guards must be a nonempty array")
@@ -568,6 +608,8 @@ def run_guards(policy, canonical, rewrites=0):
             emit("deny", reason=reason or "guard denied the tool call")
         if decision in ("approve", "allow"):
             if rewrite is not None:
+                if synthetic:
+                    fail_closed("nested guard rewrites cannot be applied to the native command")
                 before = dict(canonical["_native_args"])
                 apply_rewrite(policy, canonical, rewrite)
                 if before != canonical["_native_args"]:
@@ -615,9 +657,30 @@ def forward_progress(raw_stdin, policy):
         fail_closed("authorization policy is missing the progress forwarder")
     if not os.path.isfile(forwarder) or not os.access(forwarder, os.X_OK):
         fail_closed("progress forwarder is missing or not executable: %s" % (forwarder,))
+    env = os.environ.copy()
+    if env.get("BOSS_AGY_PROBE") == "1":
+        # Exercise the real forwarder against a private sink, including its
+        # executable bit and transport, without publishing synthetic activity.
+        temporary = tempfile.TemporaryDirectory(prefix="agy-probe-")
+        sink = socket.socket(socket.AF_UNIX)
+        sink.bind(temporary.name + "/events.sock")
+        sink.listen(1)
+        sink.settimeout(16)
+        env.update(BOSS_EVENTS_SOCKET=temporary.name + "/events.sock",
+                   BOSS_EVENT_SPOOL=temporary.name, BOSS_WORKSPACE=temporary.name)
+        def drain():
+            try:
+                connection, _ = sink.accept()
+                with connection:
+                    while connection.recv(65536):
+                        pass
+            except OSError:
+                pass
+        threading.Thread(target=drain, daemon=True).start()
     try:
         result = run_bounded(
             [forwarder, "PreToolUse"],
+            env=env,
             input=raw_stdin,
             capture_output=True,
             text=True,

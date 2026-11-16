@@ -649,3 +649,6 @@ fn never_emits_allow_ask_or_force_ask() {
 
 #[path = "adapter_failure_tests.rs"]
 mod failure_tests;
+
+#[path = "authorization_edge_tests.rs"]
+mod edge_tests;
