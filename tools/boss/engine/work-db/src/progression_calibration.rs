@@ -103,16 +103,18 @@ impl WorkDb {
                 64,
             ),
             Descriptor::new(
-                SWEEP_INTERVAL_SECS_SETTING,
-                measurement("ledger_interval_p99_secs").map(|v| v.saturating_mul(10)),
-                "10 * p99 ledger interval",
-                3600,
-            ),
-            Descriptor::new(
                 STUCK_AFTER_SECS_SETTING,
                 triple("automatic_pause_p99_secs"),
                 "3 * p99 automatic remediation scheduling pause",
                 DAY as u64,
+            ),
+            // Resolve the grace first: sweep latency follows its effective
+            // value, including overrides, rather than idle ledger gaps.
+            Descriptor::new(
+                SWEEP_INTERVAL_SECS_SETTING,
+                None,
+                "effective stuck grace / 10, rounded down; at least the 300-second placeholder",
+                3600,
             ),
             Descriptor::new(
                 COOLDOWN_SECS_SETTING,
@@ -155,14 +157,24 @@ impl WorkDb {
         for descriptor in &descriptors {
             let setting = descriptor.setting;
             let key = setting.key;
+            let computed = if key == SWEEP_INTERVAL_SECS_SETTING.key {
+                report.limits.get(STUCK_AFTER_SECS_SETTING.key).and_then(|grace| {
+                    (grace.source != "fallback")
+                        .then_some(grace.value)
+                        .flatten()
+                        .map(|v| v / 10)
+                })
+            } else {
+                descriptor.computed
+            };
             let default = (setting.value)(&defaults);
             let configured = (setting.value)(&settings);
             let overridden = settings.explicit_overrides & setting.override_bit != 0 || configured != default;
             let (value, source, basis) = if overridden {
                 (configured, "overridden", "explicit configuration".to_owned())
-            } else if enough && descriptor.computed.is_some() {
+            } else if enough && computed.is_some() {
                 (
-                    descriptor.computed.map(|v| {
+                    computed.map(|v| {
                         if descriptor.default_is_ceiling {
                             v.min(default.unwrap_or(u64::MAX))
                         } else {

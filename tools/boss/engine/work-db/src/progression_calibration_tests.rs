@@ -6,6 +6,9 @@ use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, StuckB
 #[path = "progression_calibration_identity_tests.rs"]
 mod identity;
 
+#[path = "progression_calibration_sweep_tests.rs"]
+mod sweep;
+
 const NOW: i64 = 20_000 * DAY;
 fn db() -> WorkDb {
     WorkDb::open(PathBuf::from(":memory:")).unwrap()
@@ -186,7 +189,7 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
     let report = db.calibrate_progression(NOW).unwrap();
     for (key, expected) in [
         ("pool_size", 3),
-        ("sweep_interval_secs", 100000),
+        ("sweep_interval_secs", 3000),
         ("stuck_after_secs", 30000),
         ("cooldown_secs", 60000),
         ("max_creates_per_item_window", 6),
@@ -204,7 +207,7 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
     // ceiling, so the reminder stays at three days here.
     assert_eq!(value(&report, "remind_after_secs"), Some(3 * DAY as u64));
     assert_eq!(report.limits["remind_after_secs"].source, "computed");
-    assert!(report.limits["sweep_interval_secs"].basis.contains("WARNING"));
+    assert!(!report.limits["sweep_interval_secs"].basis.contains("WARNING"));
     assert_eq!(report.inputs["automatic_pause_p99_secs"], 10000);
     assert_eq!(report.inputs["engine_ladder_questions"], 2);
     assert_eq!(report.inputs["progression_questions"], 3);
