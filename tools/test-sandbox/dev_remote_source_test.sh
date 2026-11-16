@@ -67,17 +67,24 @@ line_number 'build:dev-remote-endpoint --remote_cache=' > /dev/null
 
 # What an opted-in machine gets.
 #
-# No disk cache in front of the remote cache: with one, an output that only the
-# disk cache holds is lost to every remote action that needs it, and a full
-# test run on a machine with a well-used disk cache does not finish. The
-# default disk cache has to be a `common` line above the platform-config line,
-# or it is applied after dev-remote and switches the cache back on.
-line_number 'build:dev-remote --disk_cache=' > /dev/null
+# A disk cache of its own in front of the remote cache, not the directory local
+# builds write to: an output that only a disk cache holds is lost to every
+# remote action that needs it, and with the shared directory a full test run on
+# a machine with a well-used disk cache does not finish. The default disk cache
+# has to be a `common` line above the platform-config line, or it is applied
+# after dev-remote and puts the shared directory back.
+line_number 'build:dev-remote --disk_cache=~/.cache/bazelcache-remote' > /dev/null
+[[ "$(count_active '^[a-z]+:dev-remote .*--disk_cache')" == "1" ]] ||
+  fail "dev-remote must name exactly one disk cache"
 disk_cache_line="$(line_number 'common --disk_cache=~/.cache/bazelcache')"
 platform_line="$(line_number 'common --enable_platform_specific_config')"
 ((disk_cache_line < platform_line)) || fail "the default disk cache must come before the platform-config line"
 [[ "$(count_active '^(build|test|run) .*--disk_cache')" == "0" ]] ||
   fail "a plain build/test/run --disk_cache line is applied after dev-remote and overrides it"
+# Nothing else may write to dev-remote's directory: a local build into it puts
+# back the entries it exists to keep out.
+[[ "$(count_active 'bazelcache-remote')" == "1" ]] ||
+  fail "only dev-remote may use the remote-mode disk cache directory"
 line_number 'build:dev-remote --remote_local_fallback' > /dev/null
 # Without this a result a developer's Mac produced after a fallback is uploaded
 # under the key CI's remote steps use, and a CI step can be satisfied by it.

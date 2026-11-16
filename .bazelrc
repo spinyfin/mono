@@ -118,17 +118,22 @@ build:dev-remote-endpoint --remote_cache=
 # Never pass --config=dev-remote by hand, and never select it from a line that
 # is not reached through `build:macos`: see the test strategy below.
 #
-# No disk cache in front of the remote cache. Bazel does not download what a
-# cache hit produced, and it assumes a remote action can be given any such
-# output from the remote cache. An output that came from the disk cache, where
-# this machine's own earlier builds put it, is not there, and the remote action
-# fails with "Lost inputs no longer available remotely". Bazel restarts the
-# build, but the restart goes back to the disk cache and loses a different
-# input: measured on a laptop with a well-used disk cache, `bazel test //...`
-# gave up after its five restarts. With the remote cache alone there is one
-# answer to "is this output available", and it is right. The first remote
-# build in a checkout that has built locally still restarts once.
-build:dev-remote --disk_cache=
+# A disk cache of its own, never the one at the top of this file. Bazel does
+# not download what a cache hit produced, and it assumes a remote action can be
+# given any such output from the remote cache. An output that a local build put
+# in the disk cache is not there, and the remote action fails with "Lost inputs
+# no longer available remotely". Bazel restarts the build, but the restart goes
+# back to the disk cache and loses a different input: with the shared directory
+# in front, `bazel test //...` on a laptop gave up after its five restarts.
+# Local builds keep writing to the shared directory (older checkouts,
+# --config=dev-local, other repositories), so emptying it would not last. This
+# directory only ever holds what a remote-mode build downloaded, which the
+# remote cache has too. It is used for little: Bazel stores only what it
+# downloads, and that is the final outputs. The one way a local-only entry gets
+# in is an action this machine ran itself in remote mode; a build that needs it
+# remotely restarts once and re-runs that action. The first remote build in a
+# checkout that has built locally also restarts once.
+build:dev-remote --disk_cache=~/.cache/bazelcache-remote
 # If the endpoint cannot be reached, build on this machine instead of failing.
 # A laptop is not always on the workers' network.
 build:dev-remote --remote_local_fallback
