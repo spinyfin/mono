@@ -22,6 +22,7 @@ const WORKSPACES_ROOT: &str = "/boss-test-absent/workspaces";
 const DATA_DIR: &str = "/boss-test-absent/Library/Application Support/Boss";
 const HOOKS_DIR: &str = "/boss-test-absent/agy-homes/run-1/process-home/.gemini/config";
 const CLI_SETTINGS: &str = "/boss-test-absent/agy-homes/run-1/process-home/.gemini/antigravity-cli/settings.json";
+const RULES_ROOT: &str = "/boss-test-absent/agy-homes/run-1/rules-root";
 const CONTROL_DIR: &str = "/boss-test-absent/agy-homes/run-1/control";
 
 fn plan(worker_kind: WorkerKind, boss_data_dir: Option<&'static str>) -> SettingsPlan<'static> {
@@ -31,6 +32,7 @@ fn plan(worker_kind: WorkerKind, boss_data_dir: Option<&'static str>) -> Setting
         boss_data_dir: boss_data_dir.map(Path::new),
         hooks_dir: Path::new(HOOKS_DIR),
         control_dir: Path::new(CONTROL_DIR),
+        rules_root: Path::new(RULES_ROOT),
     }
 }
 
@@ -162,7 +164,7 @@ fn boss_state_and_the_runs_own_wiring_are_fenced_for_every_kind() {
             assert!(settings.deny_rules().contains(&rule), "{kind:?} missing {rule}");
         }
         // The run may not rewrite its own hook wiring, settings or launcher...
-        for dir in [HOOKS_DIR, CONTROL_DIR] {
+        for dir in [HOOKS_DIR, CONTROL_DIR, RULES_ROOT] {
             let rule = format!("write_file({dir})");
             assert!(settings.deny_rules().contains(&rule), "{kind:?} missing {rule}");
         }
@@ -194,16 +196,20 @@ fn remote_workers_have_no_boss_data_dir_fence() {
 }
 
 #[test]
-fn only_kinds_that_must_not_write_get_the_workspaces_root_write_fence() {
+fn reviewer_keeps_its_external_artifact_while_other_non_writers_get_a_blanket_fence() {
     let fence = format!("write_file({WORKSPACES_ROOT})");
     for kind in ALL_KINDS {
         let settings = rendered(kind);
         let fenced = settings.deny_rules().contains(&fence);
         assert_eq!(
             fenced,
-            kind != WorkerKind::Standard,
+            kind == WorkerKind::Reviewer,
             "{kind:?}: {:?}",
             settings.deny_rules()
+        );
+        assert_eq!(
+            settings.deny_rules().contains(&"write_file(/)".to_owned()),
+            !matches!(kind, WorkerKind::Standard | WorkerKind::Reviewer)
         );
         // No kind is denied reads of its own workspace.
         for rule in settings.deny_rules() {
@@ -665,12 +671,15 @@ fn log_check_matches_the_study_line_shape_exactly() {
         boss_data_dir: None,
         hooks_dir: Path::new(HOOKS_DIR),
         control_dir: Path::new(CONTROL_DIR),
+        rules_root: Path::new(RULES_ROOT),
     })
     .unwrap();
     let file = settings.to_json().unwrap();
     let line = init_line(
         "",
-        &format!("write_file({HOOKS_DIR}) write_file({CONTROL_DIR}) write_file({CLI_SETTINGS})"),
+        &format!(
+            "write_file({HOOKS_DIR}) write_file({CONTROL_DIR}) write_file({RULES_ROOT}) write_file({CLI_SETTINGS})"
+        ),
         "request-review",
     );
     assert_eq!(
@@ -814,6 +823,7 @@ fn allow_reads_cover_every_spelling_of_a_var_or_tmp_rooted_workspace() {
             boss_data_dir: Some(Path::new(DATA_DIR)),
             hooks_dir: Path::new(HOOKS_DIR),
             control_dir: Path::new(CONTROL_DIR),
+            rules_root: Path::new(RULES_ROOT),
         })
         .unwrap();
         let allow = settings.allow_rules();

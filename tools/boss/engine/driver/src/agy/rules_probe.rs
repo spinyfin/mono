@@ -20,17 +20,6 @@ fn deny_command(attempts: &Path) -> String {
     )
 }
 
-/// Probe-local session settings that pin review mode for the print-mode run.
-fn probe_settings_json(workspace: &Path) -> String {
-    serde_json::to_string_pretty(&json!({
-        "agentMode": "",
-        "toolPermission": "request-review",
-        "trustedWorkspaces": crate::scoped_home::trust_path_variants(workspace),
-    }))
-    .expect("probe session settings are serializable")
-        + "\n"
-}
-
 fn verify_response(stdout: &[u8], canary: &str, attempts: &[u8], started: bool) -> anyhow::Result<()> {
     ensure!(
         started,
@@ -86,7 +75,17 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
     ensure!(version.status.success(), "agy --version failed");
     fs::write(evidence.join("version.txt"), version.stdout)?;
     let settings = evidence.join("session-settings.json");
-    fs::write(&settings, probe_settings_json(&workspace))?;
+    let rules_path = agent_rules_path_for_run("rules-probe")?;
+    let rendered = super::permissions::render_settings(
+        &super::permissions::SettingsPlan::builder()
+            .worker_kind(crate::WorkerKind::Standard)
+            .workspace(&fs::canonicalize(&workspace)?)
+            .hooks_dir(&runtime.process_home.join(".gemini/config"))
+            .control_dir(runtime.session_settings_path.parent().context("control directory")?)
+            .rules_root(rules_path.ancestors().nth(3).context("rules root")?)
+            .build(),
+    )?;
+    fs::write(&settings, rendered.to_json()?)?;
     let mut command = Command::new(&runtime.agy_binary);
     environment.apply_to_command(&mut command);
     command
@@ -103,6 +102,12 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
         run_agy_bounded(&mut command, Duration::from_secs(120)).context("live rules discovery; evidence retained")?;
     fs::write(evidence.join("stdout.txt"), &output.stdout)?;
     fs::write(evidence.join("stderr.txt"), &output.stderr)?;
+    let log_check = super::permissions::verify_settings_log_files(&settings, &runtime.log_file);
+    fs::write(evidence.join("settings-log-check.txt"), format!("{log_check:#?}\n"))?;
+    ensure!(
+        log_check? == super::permissions::SettingsLogCheck::ConsistentSoFar,
+        "settings initialization not observed"
+    );
     ensure!(
         output.status.success(),
         "agy exited {}; see retained stderr.txt",
@@ -123,19 +128,6 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn probe_settings_pin_review_mode() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&probe_settings_json(Path::new("/tmp/rules-probe-ws"))).unwrap();
-        assert_eq!(parsed["agentMode"], "");
-        assert_eq!(parsed["toolPermission"], "request-review");
-        assert!(
-            parsed["trustedWorkspaces"]
-                .as_array()
-                .is_some_and(|paths| !paths.is_empty())
-        );
-    }
 
     #[test]
     fn verdict_rejects_tool_retrieval_and_incidental_canary_text() {

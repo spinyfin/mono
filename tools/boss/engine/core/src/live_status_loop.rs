@@ -88,6 +88,8 @@ pub struct SlotDebugSnapshot {
     /// Outcome tag of the most recent summarizer call (the four
     /// distinguishable cases from [`SummarizerOutcome::tag`]).
     pub last_outcome_tag: Option<String>,
+    /// Completed attempts skipped because the transcript buffer was empty.
+    pub empty_transcript_polls: u64,
     /// Human-readable detail for the most recent summarizer call.
     pub last_outcome_detail: Option<String>,
     pub last_outcome_at_epoch_s: Option<i64>,
@@ -1244,6 +1246,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             transcript_buffer.drain(0..drop_n);
         }
         if transcript_buffer.is_empty() {
+            debug_store.update(slot_id, |snap| snap.empty_transcript_polls += 1);
             tracing::debug!(slot_id, "live_status: skip — transcript buffer empty after poll",);
             continue;
         }
