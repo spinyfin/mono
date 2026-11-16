@@ -1841,8 +1841,8 @@ pub enum SettingsLogCheck {
     NotYetInitialized,
     /// Every initialisation line matches the rendered settings and no rule has
     /// been reported invalid *so far*. The grant store reports malformed
-    /// entries on a separate, later line (about a second after initialisation
-    /// in the study), so this is not final: the caller must check again right
+    /// entries on a separate, later line (observed roughly a second after the
+    /// initialisation line with agy, which is why `SETTINGS_SETTLE` is 2s), so this is not final: the caller must check again right
     /// before it delivers input, and treat a later failure as fatal.
     ConsistentSoFar,
 }

@@ -43,7 +43,15 @@ if mode == 'mismatch':
     line = 'CLI settings initialized: permissions=wrong'
 if mode == 'invalid':
     line += '\nignoring invalid deny rule'
-(root / 'agy.log').write_text(line)
+if mode == 'split-write':
+    # A poll landing mid-line must not judge the incomplete initialization line.
+    half = len(line) // 2
+    (root / 'agy.log').write_text(line[:half])
+    time.sleep(0.7)
+    with (root / 'agy.log').open('a') as log:
+        log.write(line[half:] + '\n')
+else:
+    (root / 'agy.log').write_text(line + '\n')
 if mode == 'late-invalid':
     # Starting UI prevents admission while a later grant-store warning arrives.
     os.write(1, b'\x1b[2JSigning in...')
@@ -55,7 +63,7 @@ if mode == 'grant-store-delay':
     time.sleep(1)
     with (root / 'agy.log').open('a') as log:
         log.write('\nignoring invalid deny rule')
-if mode not in ('valid', 'after-delivery-invalid', 'after-delivery-missing'):
+if mode not in ('valid', 'split-write', 'after-delivery-invalid', 'after-delivery-missing'):
     assert not select.select([0], [], [], 1.5)[0], 'brief despite invalid settings'
     raise SystemExit(7)
 data = b''
@@ -77,6 +85,7 @@ if mode == 'after-delivery-missing':
     fs::write(root.path().join("stub.py"), code).unwrap();
     for mode in [
         "valid",
+        "split-write",
         "mismatch",
         "invalid",
         "late-invalid",
@@ -102,7 +111,7 @@ if mode == 'after-delivery-missing':
             std::time::Duration::from_secs(15),
         )
         .unwrap();
-        if mode == "valid" {
+        if mode == "valid" || mode == "split-write" {
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
             assert!(root.path().join(initial_prompt::DELIVERED_MARKER).exists());
         } else if mode == "after-delivery-invalid" {
@@ -173,7 +182,7 @@ while not response.endswith(b"R"):
 assert response == b"\\x1b[24;10R", response
 os.write(1, b"QUERY_OK")
 assert not select.select([0], [], [], 0.3)[0], "brief before initialization"
-(root / "agy.log").write_text("CLI settings initialized: " + sys.argv[1])
+(root / "agy.log").write_text("CLI settings initialized: " + sys.argv[1] + "\\n")
 os.write(1, b"\\x1b[?2004h? for shortcuts")
 data = b""
 while not data.endswith(b"\\x1b[201~"):

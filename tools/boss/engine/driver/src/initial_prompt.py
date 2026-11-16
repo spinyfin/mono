@@ -374,19 +374,22 @@ class SettingsLogWatcher:
                 break
             line = self.buf[:index].decode("utf-8", "replace")
             self.buf = self.buf[index + 1:]
-            self._consume(line, now)
+            self._consume(line, now, terminated=True)
         if self.buf:
-            self._consume(self.buf.decode("utf-8", "replace"), now)
+            # A read can land mid-write: only the invalid-rule check is safe
+            # on an unterminated tail; the initialization line is judged once
+            # its newline arrives.
+            self._consume(self.buf.decode("utf-8", "replace"), now, terminated=False)
         self.ready = bool(
             self.initialized and self.initialized_at is not None
             and now - self.initialized_at >= SETTINGS_SETTLE
         )
         return self.ready
 
-    def _consume(self, line, now):
+    def _consume(self, line, now, terminated):
         if "ignoring invalid" in line:
             raise RuntimeError(f"agy dropped rendered permission rules: {line}")
-        if "CLI settings initialized" in line:
+        if terminated and "CLI settings initialized" in line:
             if self.expected not in line:
                 raise RuntimeError(
                     f"agy initialized settings that differ from rendered posture: {line}"
