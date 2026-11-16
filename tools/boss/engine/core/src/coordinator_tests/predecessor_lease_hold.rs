@@ -1305,9 +1305,126 @@ async fn remote_retry_rejects_a_provider_that_routes_to_local() {
 }
 
 #[tokio::test]
-async fn externally_released_lease_is_reconciled_without_preserving_the_free_workspace() {
+async fn externally_released_lease_preserves_the_free_workspace() {
+    reconcile_missing_lease(false).await;
+}
+
+#[tokio::test]
+async fn reassigned_lease_preserves_only_the_predecessor_boundary() {
+    reconcile_missing_lease(true).await;
+}
+
+fn legacy_occupancy_evidence(s: &Stalled) {
+    crate::workspace_lease_release::raise_attention(
+        s.db(),
+        &s.stalled(),
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        "Workspace recovery needs process cleanup",
+        "Workspace processes have not exited",
+    );
+}
+
+#[tokio::test]
+async fn legacy_occupancy_keep_dispatches_after_preservation() {
     let s = Stalled::new(true).await;
     s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    legacy_occupancy_evidence(&s);
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    assert!(
+        s.db()
+            .latest_local_shell_pid_for_execution(&s.stalled_id)
+            .unwrap()
+            .is_none()
+    );
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert!(s.stalled().cube_lease_id.is_none());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
+    );
+}
+
+async fn reconcile_missing_lease(reassigned: bool) {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    legacy_occupancy_evidence(&s);
+    s.db()
+        .record_workspace_lease_generation(&s.stalled_id, "lease-old", 1)
+        .unwrap();
+    // Snapshot the predecessor while it still owns the lease.
+    JjRepo::snapshot(&s.repo.worker);
+    let boundary = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    s.db()
+        .confirm_workspace_lease(&s.stalled_id, "lease-old", boundary)
+        .unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    s.cube.active_leases.lock().await.clear();
+    if reassigned {
+        // New edits belong to another holder and must survive reconciliation.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        JjRepo::run(&s.repo.worker, &["new", "main", "-m", "new holder workspace"]);
+        std::fs::write(s.repo.worker.join("fix"), "new holder work").unwrap();
+        JjRepo::snapshot(&s.repo.worker);
+    }
+    s.cube.list_workspaces_response.lock().await.push(
+        CubeWorkspaceStatus::builder()
+            .workspace_id("workspace-old")
+            .workspace_path(s.repo.worker.clone())
+            .state(if reassigned { "leased" } else { "free" })
+            .maybe_lease_id(reassigned.then(|| "lease-new".to_owned()))
+            .lease_generation(if reassigned { 2 } else { 1 })
+            .build(),
+    );
+    age_predecessor(&s);
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert!(s.stalled().cube_lease_id.is_none());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.repo.worker.join("fix")).unwrap(),
+        if reassigned {
+            "new holder work"
+        } else {
+            "unpublished fix"
+        }
+    );
+    assert!(s.cube.force_release_calls.lock().await.is_empty());
+    if reassigned {
+        let rows = s.cube.list_workspaces_response.lock().await;
+        assert_eq!(rows[0].lease_id.as_deref(), Some("lease-new"));
+        assert_eq!(rows[0].state, "leased");
+    }
+}
+
+#[tokio::test]
+async fn absent_lease_preservation_failure_keeps_successor_held() {
+    let s = Stalled::new(false).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    legacy_occupancy_evidence(&s);
+    s.cube.active_leases.lock().await.clear();
     let successor = s
         .db()
         .request_execution(
@@ -1317,35 +1434,47 @@ async fn externally_released_lease_is_reconciled_without_preserving_the_free_wor
         )
         .unwrap();
     s.coordinator.drain_ready_queue_for_test().await;
-    assert_eq!(s.wait_reason(&successor.id).as_deref(), Some(HOLD_REASON));
-    // Cube has already returned the workspace, but the engine still records its lease.
-    s.cube.active_leases.lock().await.clear();
-    s.cube.list_workspaces_response.lock().await.push(
-        CubeWorkspaceStatus::builder()
-            .workspace_id("workspace-old")
-            .workspace_path(s.repo.worker.clone())
-            .state("free")
-            .build(),
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
     );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    let swept =
+        crate::workspace_lease_release::run_one_pass(s.db(), s.cube.as_ref(), &LiveWorkerStateRegistry::new()).await;
+    assert_eq!(swept.kept, 1);
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    let items = s.db().list_attention_items(&s.stalled_id).unwrap();
+    assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"
+        && item.body_markdown.contains(s.repo.worker.to_str().unwrap())));
     age_predecessor(&s);
     s.coordinator.drain_ready_queue_for_test().await;
-    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
-    assert!(s.stalled().cube_lease_id.is_none());
-    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
-    assert!(!s.repo.replacement.join("fix").exists());
-    assert_eq!(
-        std::fs::read_to_string(s.repo.worker.join("fix")).unwrap(),
-        "unpublished fix"
-    );
-    let items = s.db().list_attention_items(&s.stalled_id).unwrap();
-    assert!(items.iter().any(|item| {
-        item.kind == "preserved_work_needs_inspection"
-            && item
-                .body_markdown
-                .contains("No workspace work was preserved during reconciliation")
+    let failed = s.db().get_execution(&successor.id).unwrap();
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert!(s.db().list_runs(&successor.id).unwrap().iter().any(|run| {
+        run.error_text
+            .as_deref()
+            .is_some_and(|error| error.contains(s.repo.worker.to_str().unwrap()))
     }));
-    assert!(!items.iter().any(
-        |item| item.kind == crate::workspace_lease_release::LEASE_RELEASE_FAILED_ATTENTION_KIND
-            && item.status == "open"
-    ));
+}
+
+#[tokio::test]
+async fn absent_lease_does_not_authorize_unconfirmed_worker_death() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    s.cube.active_leases.lock().await.clear();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
 }

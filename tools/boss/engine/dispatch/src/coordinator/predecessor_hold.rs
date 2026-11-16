@@ -121,8 +121,8 @@ impl ExecutionCoordinator {
     /// A waiting successor must not quote a stale occupant list, and a
     /// workspace that has since emptied must be preserved and returned so
     /// the successor can start. An absent lease is reconciled without reading
-    /// the free workspace. Existing leases with cube-release failures are
-    /// retried by the leftover-lease sweep.
+    /// the new holder's workspace. Absent leases are cleared only after
+    /// owning-host preservation succeeds.
     pub(super) async fn refresh_predecessor_lease(&self, execution: &WorkExecution) {
         let Ok(Some(predecessor)) = self.work_db.recovery_predecessor_holding_lease(execution) else {
             return;

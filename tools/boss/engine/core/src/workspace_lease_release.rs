@@ -375,12 +375,32 @@ pub(crate) fn retry_pane_status(db: &WorkDb, is_live: bool, execution: &WorkExec
     }
 }
 
+fn occupancy_keep_evidence(kind: &str, title: &str) -> bool {
+    kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND
+        || (kind == LEASE_UNRELEASED_ATTENTION_KIND
+            && matches!(
+                title,
+                "Workspace recovery needs process cleanup"
+                    | "Workspace recovery could not release its lease"
+                    | "Remote workspace recovery needs process cleanup"
+                    | "Workspace recovery could not preserve unpublished work"
+            ))
+}
+
+pub(crate) fn previous_occupancy_keep(db: &WorkDb, execution_id: &str) -> bool {
+    db.list_attention_items(execution_id).is_ok_and(|items| {
+        items
+            .iter()
+            .any(|item| item.status == "open" && occupancy_keep_evidence(&item.kind, &item.title))
+    })
+}
+
 pub(crate) fn previous_release_passed_pane_gate(db: &WorkDb, execution_id: &str) -> bool {
     db.list_attention_items(execution_id).is_ok_and(|items| {
         items.iter().any(|item| {
             item.status == "open"
                 && (item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND
-                    || item.kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND)
+                    || occupancy_keep_evidence(&item.kind, &item.title))
         })
     })
 }
@@ -486,6 +506,20 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
                 );
             }
             outcome.held += 1;
+            continue;
+        }
+        // An expired or reassigned lease must preserve successfully before
+        // dropping the engine's recovery record. Never release its new holder.
+        if let Ok(rows) = cube_client.list_workspaces().await
+            && !rows
+                .iter()
+                .any(|row| row.lease_id.as_deref() == Some(lease_id.as_str()))
+        {
+            match reconcile_absent_lease(work_db, &execution, &lease_id, None, Some(cube_client)).await {
+                Ok(LeaseReleaseOutcome::Released) => outcome.released += 1,
+                Ok(LeaseReleaseOutcome::NoLease) => {}
+                _ => outcome.kept += 1,
+            }
             continue;
         }
         if occupancy.is_none() {

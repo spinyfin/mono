@@ -124,14 +124,16 @@ impl<'a> DbPreservation<'a> {
 #[async_trait::async_trait]
 impl Preservation for DbPreservation<'_> {
     async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()> {
-        self.preserve_workspace(execution, cause, None).await
+        self.preserve_workspace(execution, cause, None, false).await
     }
 }
 
 #[async_trait::async_trait]
 impl Preservation for CubePreservation<'_> {
     async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()> {
-        self.inner.preserve_workspace(execution, cause, Some(self.cube)).await
+        self.inner
+            .preserve_workspace(execution, cause, Some(self.cube), false)
+            .await
     }
 }
 
@@ -216,6 +218,7 @@ impl DbPreservation<'_> {
         execution: &WorkExecution,
         cause: TerminalCause,
         cube: Option<&dyn CubeClient>,
+        require_complete: bool,
     ) -> Result<()> {
         // Read-only reviews never preserve or inherit implementation work.
         if execution.kind.never_writes_pr_branch() {
@@ -280,7 +283,12 @@ impl DbPreservation<'_> {
             None => self.db.clear_preserved_tip(&execution.id)?,
         }
         if let Some(inspect) = outcome.inspect {
+            let reason = inspect.reason.clone();
             raise_inspect_attention(self.db, execution, inspect);
+            anyhow::ensure!(
+                !require_complete,
+                "workspace preservation requires inspection: {reason}"
+            );
         }
         Ok(())
     }
@@ -390,8 +398,8 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
                     db,
                     execution,
                     LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
-                    "Workspace occupancy kept the lease",
-                    "The pane gate passed; occupancy must be checked again before release.",
+                    "Workspace is waiting for remaining processes to exit",
+                    "The worker has exited. The engine will check the workspace again and return its lease automatically once it is empty.",
                 );
                 let (title, body) = occupancy_keep_attention(lease_id, reason, occupancy_detail.as_deref());
                 if occupancy_detail.is_some() {
@@ -530,25 +538,39 @@ impl Preservation for NoPreservation {
     }
 }
 
-/// Reconcile an authoritative cube registry absence without reading or resetting
-/// the workspace. A positioned run must retain a durable preservation-gap record.
-pub fn reconcile_absent_lease(
+/// Preserve on the owning host before clearing an absent lease record.
+/// The registry-aware preservation source never snapshots a new holder's work.
+/// A failure keeps the recovery record so a successor cannot skip preservation.
+pub async fn reconcile_absent_lease(
     db: &WorkDb,
     execution: &WorkExecution,
     lease_id: &str,
-    record_preservation_gap: bool,
+    adapter: Option<&dyn HostAdapter>,
+    cube: Option<&dyn CubeClient>,
 ) -> Result<LeaseReleaseOutcome> {
     let current = db.get_execution(&execution.id)?;
     if current.cube_lease_id.as_deref() != Some(lease_id) {
         return Ok(LeaseReleaseOutcome::NoLease);
     }
-    if record_preservation_gap {
-        db.refresh_teardown_preservation_attention(
-            &execution.id,
-            Some(&format!("Cube no longer holds lease `{lease_id}`. No workspace work was preserved during reconciliation; the workspace was neither read nor reset. Any previously preserved work remains recorded.")),
-            "cube lease already absent",
-        )?;
+    if let Err(err) = DbPreservation::new(db, adapter)
+        .preserve_workspace(&current, TerminalCause::Inferred, cube, true)
+        .await
+    {
+        let reason = format!(
+            "Could not preserve workspace {} before reconciling absent lease {lease_id}: {err:#}",
+            current.workspace_path.as_deref().unwrap_or("(unknown path)")
+        );
+        db.refresh_teardown_preservation_attention(&current.id, Some(&reason), "recovery held; lease already absent")?;
+        refresh_attention(
+            db,
+            &current,
+            LEASE_UNRELEASED_ATTENTION_KIND,
+            "Workspace recovery could not preserve unpublished work",
+            &reason,
+        );
+        return Ok(LeaseReleaseOutcome::CubeFailed { error: reason });
     }
+    db.refresh_teardown_preservation_attention(&current.id, None, "absent lease preserved")?;
     if !db.claim_execution_workspace_release(&execution.id, lease_id)? {
         return Ok(LeaseReleaseOutcome::NoLease);
     }
@@ -579,11 +601,11 @@ pub async fn release_lease_after_proven_never_started(
     if let Ok(workspaces) = adapter.list_workspaces().await
         && !workspaces.iter().any(|ws| ws.lease_id.as_deref() == Some(lease_id))
     {
-        return reconcile_absent_lease(work_db, execution, lease_id, false).unwrap_or_else(|err| {
-            LeaseReleaseOutcome::CubeFailed {
+        return reconcile_absent_lease(work_db, execution, lease_id, Some(adapter), None)
+            .await
+            .unwrap_or_else(|err| LeaseReleaseOutcome::CubeFailed {
                 error: format!("{err:#}"),
-            }
-        });
+            });
     }
     apply_release(
         work_db,

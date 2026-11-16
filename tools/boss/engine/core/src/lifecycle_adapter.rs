@@ -257,10 +257,31 @@ impl LifecycleServices for CoreLifecycleServices {
         let Some(lease_id) = execution.cube_lease_id.as_deref() else {
             return;
         };
+        if retry_pane_status(&self.work_db, is_live, execution) != PaneStatus::Gone {
+            return;
+        }
+        if adapter.host_id() != "local" {
+            match self.work_db.latest_remote_run_for_execution(&execution.id) {
+                Ok(Some(run)) => {
+                    if let Some(pid) = run.remote_pid
+                        && !matches!(adapter.probe_remote_worker_alive(pid).await, Ok(Some(false)))
+                    {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
         match adapter.list_workspaces().await {
             Ok(rows) if !rows.iter().any(|row| row.lease_id.as_deref() == Some(lease_id)) => {
-                if let Err(err) =
-                    crate::workspace_lease_release::reconcile_absent_lease(&self.work_db, execution, lease_id, true)
+                if let Err(err) = crate::workspace_lease_release::reconcile_absent_lease(
+                    &self.work_db,
+                    execution,
+                    lease_id,
+                    Some(adapter.as_ref()),
+                    None,
+                )
+                .await
                 {
                     refresh_attention(
                         &self.work_db,
@@ -284,29 +305,8 @@ impl LifecycleServices for CoreLifecycleServices {
                 return;
             }
         }
-        let occupancy_kept = self.work_db.list_attention_items(&execution.id).is_ok_and(|items| {
-            items.iter().any(|item| {
-                item.status == "open"
-                    && item.kind == crate::workspace_lease_release::LEASE_OCCUPANCY_KEPT_ATTENTION_KIND
-            })
-        });
-        if !occupancy_kept {
+        if !crate::workspace_lease_release::previous_occupancy_keep(&self.work_db, &execution.id) {
             return;
-        }
-        if retry_pane_status(&self.work_db, is_live, execution) != PaneStatus::Gone {
-            return;
-        }
-        if adapter.host_id() != "local" {
-            match self.work_db.latest_remote_run_for_execution(&execution.id) {
-                Ok(Some(run)) => {
-                    if let Some(pid) = run.remote_pid
-                        && !matches!(adapter.probe_remote_worker_alive(pid).await, Ok(Some(false)))
-                    {
-                        return;
-                    }
-                }
-                _ => return,
-            }
         }
         let db = Arc::clone(&self.work_db);
         let execution = execution.clone();

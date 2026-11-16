@@ -120,6 +120,9 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         dir.path().to_str().unwrap(),
     )
     .unwrap();
+    // This synthetic worker has no leased checkout or unpublished edits.
+    // Model completed workspace teardown before testing guide regeneration.
+    db.clear_execution_workspace(&execution.id).unwrap();
     let response = comment_request(
         &state,
         FrontendRequest::CommentsRecordGuideOutcome {

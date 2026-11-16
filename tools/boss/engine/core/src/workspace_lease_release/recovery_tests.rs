@@ -207,7 +207,7 @@ async fn unresolved_first_teardown_raises_inspection_without_prior_record() {
         }
         assert!(db.preserved_tip(&execution.id).unwrap().is_none());
         DbPreservation::new(&db, None)
-            .with_cube(&OkCube)
+            .with_cube(&HandoffRegistry(vec![]))
             .preserve(&execution, TerminalCause::Inferred)
             .await
             .unwrap();
@@ -309,7 +309,16 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
             EmptyOccupancy
         })
         .await;
-        assert_eq!(outcome.released, 1, "{state}: {outcome:?}");
+        assert_eq!(
+            outcome.released,
+            usize::from(state != "unlisted"),
+            "{state}: {outcome:?}"
+        );
+        assert_eq!(outcome.kept, usize::from(state == "unlisted"), "{state}: {outcome:?}");
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.is_some(),
+            state == "unlisted"
+        );
         assert_eq!(db.preserved_tip(&execution.id).unwrap().unwrap().commit_id, ours);
         // Another holder's stack is reported only when cube shows no evidence
         // of a later holder. A workspace leased under another id, or free
@@ -469,11 +478,16 @@ async fn remote_rows_never_reach_local_release_or_occupancy() {
 async fn sweep_requires_both_durable_pane_death_and_empty_cwds() {
     struct RecordingCube(std::sync::atomic::AtomicUsize);
     crate::stub_cube_client! { RecordingCube {
+
         async fn release_workspace(&self, _: &str) -> Result<()> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn release_workspace_with_reset(&self, _: &str) -> Result<()> { panic!("sweep must never force-reset") }
+        async fn list_workspaces(&self) -> Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+            Ok(vec![boss_execution_contracts::CubeWorkspaceStatus::builder()
+                .workspace_id("workspace").workspace_path(PathBuf::from("/unused")).state("leased").lease_id("lease").build()])
+        }
     } }
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
@@ -553,6 +567,7 @@ async fn sweep_requires_both_durable_pane_death_and_empty_cwds() {
 async fn sweep_retries_a_cancelled_row_after_a_transient_cube_failure() {
     struct FlakyCube(std::sync::atomic::AtomicUsize);
     crate::stub_cube_client! { FlakyCube {
+
         async fn release_workspace(&self, _: &str) -> Result<()> {
             if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 anyhow::bail!("cube temporarily unavailable");
@@ -560,6 +575,10 @@ async fn sweep_retries_a_cancelled_row_after_a_transient_cube_failure() {
             Ok(())
         }
         async fn release_workspace_with_reset(&self, _: &str) -> Result<()> { panic!("sweep must never force-reset") }
+        async fn list_workspaces(&self) -> Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+            Ok(vec![boss_execution_contracts::CubeWorkspaceStatus::builder()
+                .workspace_id("workspace").workspace_path(PathBuf::from("/unused")).state("leased").lease_id("lease").build()])
+        }
     } }
     let (dir, db) = open_db();
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
@@ -611,10 +630,14 @@ async fn sweep_retries_a_cancelled_row_after_a_transient_cube_failure() {
     assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
 }
 
-struct OkCube;
-crate::stub_cube_client! { OkCube {
+struct HeldCube;
+crate::stub_cube_client! { HeldCube {
     async fn release_workspace(&self, _: &str) -> Result<()> { Ok(()) }
     async fn release_workspace_with_reset(&self, _: &str) -> Result<()> { panic!("sweep must never force-reset") }
+    async fn list_workspaces(&self) -> Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+        Ok(vec![boss_execution_contracts::CubeWorkspaceStatus::builder()
+            .workspace_id("workspace").workspace_path(PathBuf::from("/unused")).state("leased").lease_id("lease").build()])
+    }
 } }
 
 fn open_kinds(db: &WorkDb, execution_id: &str) -> Vec<String> {
@@ -635,7 +658,7 @@ async fn sweep_retries_a_pidless_row_only_after_a_gated_cube_failure() {
     let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
     let execution = fixture(&db, &repo.worker).await;
     let live = LiveWorkerStateRegistry::new();
-    let held = run_one_pass_with_occupancy(&db, &OkCube, &live, || forbidden_scan("no proof yet")).await;
+    let held = run_one_pass_with_occupancy(&db, &HeldCube, &live, || forbidden_scan("no proof yet")).await;
     assert_eq!((held.held, held.released), (1, 0));
 
     let outcome = apply_release(
@@ -654,7 +677,7 @@ async fn sweep_retries_a_pidless_row_only_after_a_gated_cube_failure() {
     assert!(matches!(outcome, LeaseReleaseOutcome::CubeFailed { .. }), "{outcome:?}");
     assert!(open_kinds(&db, &execution.id).contains(&LEASE_RELEASE_FAILED_ATTENTION_KIND.to_owned()));
 
-    let swept = run_one_pass_with_occupancy(&db, &OkCube, &live, || async { EmptyOccupancy }).await;
+    let swept = run_one_pass_with_occupancy(&db, &HeldCube, &live, || async { EmptyOccupancy }).await;
     assert_eq!(swept.released, 1);
     assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
     assert!(!open_kinds(&db, &execution.id).contains(&LEASE_RELEASE_FAILED_ATTENTION_KIND.to_owned()));
@@ -693,7 +716,7 @@ async fn sweep_retries_a_never_started_row_without_a_bookmark() {
     )
     .await;
     assert!(matches!(outcome, LeaseReleaseOutcome::CubeFailed { .. }), "{outcome:?}");
-    let swept = run_one_pass_with_occupancy(&db, &OkCube, &LiveWorkerStateRegistry::new(), || async {
+    let swept = run_one_pass_with_occupancy(&db, &HeldCube, &LiveWorkerStateRegistry::new(), || async {
         EmptyOccupancy
     })
     .await;
@@ -942,7 +965,11 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
             EmptyOccupancy
         })
         .await;
-        assert_eq!(outcome.released, 1, "{outcome:?}");
+        assert_eq!((outcome.released, outcome.kept), (0, 1), "{outcome:?}");
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+            Some("lease")
+        );
         let preserved = preserved_files(&repo, &execution);
         assert!(
             !preserved.contains("theirs"),
@@ -1013,7 +1040,11 @@ async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_late
             EmptyOccupancy
         })
         .await;
-        assert_eq!(outcome.released, 1, "{action}: {outcome:?}");
+        assert_eq!((outcome.released, outcome.kept), (0, 1), "{action}: {outcome:?}");
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+            Some("lease")
+        );
         if action == "edit" {
             assert!(db.preserved_tip(&execution.id).unwrap().is_none());
             assert!(preserved_files(&repo, &execution).is_empty());

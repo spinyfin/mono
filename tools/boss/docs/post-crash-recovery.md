@@ -64,13 +64,19 @@ cannot be confirmed, or a cube failure; the leftover sweep keeps retrying —
 including a fresh occupancy scan for a lease that was kept because the
 workspace was occupied, even when the finished run never recorded a worker
 pid — and the successor stays held behind it rather than abandoning the work.
-A successor retry first checks cube's owning-host registry. If the lease is
-already absent, it clears the engine's stale lease record, records that no
-workspace work was preserved during reconciliation, and admits the successor.
-It does not read or reset the free workspace. Cube's lease-not-found release
-result is likewise treated as an already completed release.
-An occupancy hold has distinct durable evidence that the pane gate passed;
-unconfirmed-death items, including legacy items, never supply that evidence.
+A successor retry checks the owning-host registry after confirming worker death.
+If the lease is already absent, it preserves the predecessor's work before
+clearing the stale engine record. An unchanged claim counter on a free workspace
+allows live preservation; an absent or reassigned workspace uses the recorded
+lease boundary. No workspace is reset or released during this reconciliation.
+Preservation failure or unresolved inspection keeps the successor held, with
+the workspace path in the diagnostic, until recovery succeeds or the wait bound
+fails the successor. Cube's lease-not-found release result remains idempotent.
+An occupancy hold has distinct durable evidence that the pane gate passed.
+Open legacy cleanup items titled "Workspace recovery needs process cleanup",
+"Workspace recovery could not release its lease", or "Remote workspace recovery
+needs process cleanup" also supply that evidence. "Terminal worker still holds
+its workspace" never authorizes a no-pid retry.
 The sweep and dispatch both require absence from the live registry and
 confirmed death of any recorded shell PID before retrying. Remote retries
 resolve and validate the owning host adapter and confirm any recorded remote
@@ -80,7 +86,7 @@ most once per minute, with a fresh check at the failure bound. Blocking scans
 run off the async executor. After a scan: an empty workspace (or one that holds only
 unowned occupants past the existing bound) is preserved and released so the
 successor can start, and a still-occupied workspace fails with the occupants
-seen on that scan. A
+seen on that scan. For a lease cube still holds, a
 preservation failure does not hold the lease: the release goes ahead and a
 `preserved_work_needs_inspection` attention item on the predecessor carries the
 error and the lease id, so a successor that then starts without that work does
