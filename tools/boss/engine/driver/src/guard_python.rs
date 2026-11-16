@@ -141,11 +141,29 @@ def strip_prefixes(group):
     while index < len(group):
         token = group[index]
         base = os.path.basename(token)
-        if ASSIGNMENT_RE.match(token) or base in WRAPPERS:
+        if ASSIGNMENT_RE.match(token):
             index += 1
             continue
-        if base == 'timeout' and index + 1 < len(group):
-            index += 2
+        if base in WRAPPERS or base == 'timeout':
+            index += 1
+            value_options = {
+                'env': {'-u', '--unset', '-C', '--chdir'},
+                'sudo': {'-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt'},
+                'nice': {'-n', '--adjustment'},
+                'ionice': {'-c', '--class', '-n', '--classdata', '-p', '--pid'},
+                'stdbuf': {'-i', '-o', '-e', '--input', '--output', '--error'},
+                'timeout': {'-k', '--kill-after', '-s', '--signal'},
+                'xargs': {'-n', '-L', '-P', '-I', '-d', '--max-args', '--max-lines', '--max-procs', '--replace', '--delimiter'},
+            }.get(base, set())
+            while index < len(group) and group[index].startswith('-'):
+                option = group[index]
+                index += 1
+                if option == '--':
+                    break
+                if option in value_options and index < len(group):
+                    index += 1
+            if base == 'timeout' and index < len(group):
+                index += 1
             continue
         break
     return group[index:]

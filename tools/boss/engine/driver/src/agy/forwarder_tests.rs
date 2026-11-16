@@ -218,11 +218,12 @@ fn write_hooks_replaces_the_provisioned_canary_and_leaves_trust_alone() {
 }
 
 fn permission_input(run_id: &str, workspace: &Path) -> PermissionInput {
+    let forwarder = stub_forwarder(workspace.parent().unwrap());
     PermissionInput::builder()
         .worker_kind(WorkerKind::Standard)
         .workspace_path(workspace.to_path_buf())
         .events_socket_path(PathBuf::from("/tmp/boss/events.sock"))
-        .boss_event_path(PathBuf::from("/opt/boss/boss-event"))
+        .boss_event_path(forwarder)
         .run_id(run_id.to_owned())
         .lease_id("lease-9".to_owned())
         .execution_kind("task_implementation".to_owned())
@@ -250,7 +251,8 @@ async fn write_permission_config_installs_the_forwarder_under_the_per_run_home()
         .unwrap();
 
     let expected = hooks_file_path(&runtime.process_home);
-    assert_eq!(artifacts.config_files, vec![expected.clone()]);
+    assert!(artifacts.config_files.contains(&expected));
+    assert!(artifacts.config_files.contains(&adapter_path(&runtime.process_home)));
     assert!(artifacts.extra_args.is_empty());
     assert!(artifacts.env.is_empty());
     let parsed: Value = serde_json::from_str(&fs::read_to_string(&expected).unwrap()).unwrap();
@@ -267,7 +269,7 @@ async fn write_permission_config_installs_the_forwarder_under_the_per_run_home()
         lease_id: "lease-9".into(),
         run_id: "run-wpc".into(),
         workspace_path: workspace.clone(),
-        forwarder_binary: PathBuf::from("/opt/boss/boss-event"),
+        forwarder_binary: tmp.path().join("boss event stub"),
     });
     let crate::ProgressIngress::HookCallback(wiring) = declared else {
         panic!("agy declares HookCallback ingress");

@@ -1517,6 +1517,39 @@ pub struct ToolUseInterceptionConfig {
     /// ignores this.
     pub workspace_path: Option<PathBuf>,
 }
+impl ToolUseInterceptionConfig {
+    pub fn from_permission_input(input: &PermissionInput) -> Self {
+        ToolUseInterceptionConfig {
+            data_dir: if input.is_remote {
+                None
+            } else {
+                input.events_socket_path.parent().map(|p| p.to_path_buf())
+            },
+            path_guard_script: if input.is_remote {
+                None
+            } else {
+                input.path_guard_script.clone()
+            },
+            checkleft_guard_script: if input.is_remote {
+                None
+            } else {
+                input.checkleft_guard_script.clone()
+            },
+            git_store_guard_script: if input.is_remote {
+                None
+            } else {
+                input.git_store_guard_script.clone()
+            },
+            is_revision: input.execution_kind == "revision_implementation"
+                || input.task_kind.as_deref() == Some("revision"),
+            is_standard_worker: input.worker_kind == WorkerKind::Standard,
+            is_reviewer: input.worker_kind == WorkerKind::Reviewer,
+            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
+            run_id: Some(input.run_id.clone()),
+            workspace_path: Some(input.workspace_path.clone()),
+        }
+    }
+}
 
 /// The PreToolUse hook entries the driver wires for [`Capability::ToolUseInterception`].
 ///
@@ -2471,6 +2504,7 @@ const _: () = {
 };
 
 mod guard_python;
+mod hook_guards;
 
 pub mod capability_rules {
     //! Claude-grammar capability rule tables shared by every driver that has to

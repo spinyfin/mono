@@ -48,8 +48,8 @@ use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trac
 pub(crate) use review_guide_guard::codex_review_guide_guard_script;
 #[cfg(test)]
 pub(crate) use review_guide_guard::with_review_guide_command as codex_review_guide_guard_script_for_test;
-use reviewer_publish_guard::codex_reviewer_publish_guard_script;
-use tool_surface_guard::codex_tool_surface_guard_script;
+pub(crate) use reviewer_publish_guard::codex_reviewer_publish_guard_script;
+pub(crate) use tool_surface_guard::codex_tool_surface_guard_script;
 
 use crate::transcript_store::{
     durable_sessions_dir, provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir,
@@ -2084,35 +2084,7 @@ impl AgentDriver for CodexDriver {
             );
         }
 
-        let interception = ToolUseInterceptionConfig {
-            data_dir: if input.is_remote {
-                None
-            } else {
-                input.events_socket_path.parent().map(|p| p.to_path_buf())
-            },
-            path_guard_script: if input.is_remote {
-                None
-            } else {
-                input.path_guard_script.clone()
-            },
-            checkleft_guard_script: if input.is_remote {
-                None
-            } else {
-                input.checkleft_guard_script.clone()
-            },
-            git_store_guard_script: if input.is_remote {
-                None
-            } else {
-                input.git_store_guard_script.clone()
-            },
-            is_revision: input.execution_kind == "revision_implementation"
-                || input.task_kind.as_deref() == Some("revision"),
-            is_standard_worker: input.worker_kind == WorkerKind::Standard,
-            is_reviewer: input.worker_kind == WorkerKind::Reviewer,
-            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
-            run_id: Some(input.run_id.clone()),
-            workspace_path: Some(input.workspace_path.clone()),
-        };
+        let interception = ToolUseInterceptionConfig::from_permission_input(input);
 
         // When path/checkleft scripts are supplied via PermissionInput they
         // win; otherwise leave those guards off (remote / early unit tests).

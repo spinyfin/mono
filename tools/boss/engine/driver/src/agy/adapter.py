@@ -6,25 +6,27 @@ boss-event, run the engine-owned guard chain, then print exactly one
 verdict (auto_approve, deny, or deny_unless_prior_grant). Silent stdout
 is not an authorization. Never emit allow, ask, or force_ask.
 
-`--probe` exercises the same path with harmless sentinels and checks
+The engine probes this installed command with harmless sentinels and checks
 content binding. Native SessionStart is not a pre-prompt readiness signal.
 """
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
-
-POSITIVE_SENTINEL = "echo boss-agy-auth-positive"
-DENIED_SENTINEL = "sudo rm -rf /tmp/boss-agy-auth-denied-sentinel"
 
 TOOL_NAME_MAP = {
     "run_command": "Bash",
     "write_file": "Write",
     "edit_file": "Edit",
     "read_file": "Read",
+    "grep": "Grep",
+    "glob": "Glob",
+    "list_dir": "Glob",
 }
 
 KNOWN_TOOLS = {
@@ -33,16 +35,9 @@ KNOWN_TOOLS = {
     "edit_file",
     "read_file",
     "invoke_subagent",
-    "define_subagent",
-    "send_message",
     "grep",
     "glob",
     "list_dir",
-    "list_directory",
-    "list_files",
-    "search_codebase",
-    "view_file",
-    "read_url",
 }
 
 WRITE_PROGRAMS = {
@@ -101,11 +96,29 @@ def load_policy():
         fail_closed("authorization policy is missing run_id")
     if env_run and env_run != run_id:
         fail_closed("BOSS_RUN_ID %r does not match policy run_id %r" % (env_run, run_id))
-    if not env_run and "--probe" not in sys.argv:
+    if not env_run:
         fail_closed("BOSS_RUN_ID is unset; refusing to authorize without run identity")
     approval = policy.get("approval")
     if approval not in ("auto_approve", "deny_unless_prior_grant"):
         fail_closed("authorization policy has unknown approval %r" % (approval,))
+    kinds = {"standard", "reviewer", "triage", "answer_agent", "review_guide", "progression"}
+    if policy.get("worker_kind") not in kinds:
+        fail_closed("authorization policy has unknown worker kind")
+    for key in ("process_home", "workspace_path", "forwarder", "attestation_path"):
+        if not isinstance(policy.get(key), str) or not os.path.isabs(policy[key]):
+            fail_closed("authorization policy requires an absolute " + key)
+    paths = policy.get("protected_paths")
+    if not isinstance(paths, list) or not paths or any(not isinstance(p, str) or not os.path.isabs(p) for p in paths):
+        fail_closed("authorization policy has malformed protected paths")
+    guards = policy.get("guards")
+    if not isinstance(guards, list) or not guards:
+        fail_closed("authorization policy requires a nonempty guard chain")
+    for guard in guards:
+        if not isinstance(guard, dict) or guard.get("matcher") not in ("*", ".*", "Bash") or not isinstance(guard.get("command"), str) or not guard["command"]:
+            fail_closed("authorization policy has malformed guard configuration")
+        timeout = guard.get("timeout_sec", 30)
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            fail_closed("authorization policy has invalid guard timeout")
     return policy
 
 
@@ -114,9 +127,28 @@ def verify_binding(policy, require_self=True):
     if not isinstance(attestation_path, str) or not attestation_path:
         fail_closed("authorization policy is missing attestation_path")
     attestation = load_json_file(attestation_path, "authorization attestation")
+    required = policy.get("required_artifacts")
+    if not isinstance(required, dict) or not all(key in required for key in ("adapter", "hooks", "policy", "settings", "forwarder")):
+        fail_closed("authorization binding missing required artifact set")
+    config = os.path.dirname(os.path.abspath(__file__))
+    expected = {"adapter": os.path.abspath(__file__), "policy": os.path.join(config, "boss-agy-auth-policy.json"),
+                "hooks": os.path.join(config, "hooks.json"),
+                "settings": os.path.join(policy["process_home"], "../control/session-settings.json"),
+                "forwarder": policy["forwarder"]}
+    for name, path in expected.items():
+        if os.path.abspath(required.get(name, "")) != os.path.abspath(path):
+            fail_closed("authorization binding has unexpected run path for " + name)
     entries = attestation.get("entries")
     if not isinstance(entries, list) or not entries:
         fail_closed("authorization attestation has no entries")
+    if len(entries) != len(required):
+        fail_closed("authorization binding has incomplete artifact set")
+    for name, path in required.items():
+        if sum(entry.get("name") == name and entry.get("path") == path for entry in entries if isinstance(entry, dict)) != 1:
+            fail_closed("authorization binding missing or misplaced " + name)
+    for name in ("adapter", "forwarder"):
+        if not os.access(required[name], os.X_OK):
+            fail_closed("authorization binding: %s is not executable" % name)
     problems = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -160,13 +192,14 @@ def tool_args_of(payload):
     tool_call = payload.get("toolCall")
     if isinstance(tool_call, dict):
         args = tool_call.get("args")
-        if isinstance(args, dict):
-            return args
+        if not isinstance(args, dict):
+            fail_closed("toolCall.args must be an object")
+        return args
     for key in ("tool_input", "toolInput"):
         args = payload.get(key)
         if isinstance(args, dict):
             return args
-    return {}
+    fail_closed("tool arguments are missing or not an object")
 
 
 def first_str(args, keys):
@@ -180,7 +213,28 @@ def first_str(args, keys):
 def canonicalise(payload):
     native_name = tool_name_of(payload)
     args = tool_args_of(payload)
+    aliases = (
+        ("CommandLine", "command", "commandLine"),
+        ("Cwd", "cwd", "workingDirectory"),
+        ("Path", "path", "TargetFile", "targetFile", "target_file", "file_path", "AbsolutePath", "absolutePath"),
+        ("Contents", "contents", "Content", "content"),
+    )
+    for keys in aliases:
+        values = [args[key] for key in keys if key in args]
+        if any(not isinstance(value, str) for value in values):
+            fail_closed("native argument %s must be a string" % keys[0])
+        if len(set(values)) > 1:
+            fail_closed("conflicting native aliases for %s" % keys[0])
+    if native_name == "run_command" and not first_str(args, aliases[0]):
+        fail_closed("run_command requires a nonempty string command")
+    if native_name in ("write_file", "read_file", "edit_file", "grep", "glob", "list_dir"):
+        if not first_str(args, aliases[2]):
+            fail_closed("%s requires a nonempty string path" % native_name)
+    if native_name == "write_file" and not any(key in args for key in aliases[3]):
+        fail_closed("write_file requires string content")
     canonical_name = TOOL_NAME_MAP.get(native_name, native_name)
+    if native_name == "call_mcp_tool" or native_name.startswith("mcp_"):
+        canonical_name = "mcp__agy_" + native_name
     tool_input = dict(args)
     command = first_str(args, ("CommandLine", "command", "commandLine"))
     if command is not None:
@@ -194,6 +248,8 @@ def canonicalise(payload):
     )
     if path is not None:
         tool_input["file_path"] = path
+        if native_name in ("grep", "glob", "list_dir"):
+            tool_input["path"] = path
     content = first_str(args, ("Contents", "contents", "Content", "content"))
     if content is not None:
         tool_input["content"] = content
@@ -210,10 +266,10 @@ def canonicalise(payload):
     if isinstance(tool_call, dict) and isinstance(tool_call.get("id"), str):
         out["tool_use_id"] = tool_call["id"]
     cwd_payload = payload.get("cwd")
-    if isinstance(cwd_payload, str):
-        out["cwd"] = cwd_payload
-    elif cwd is not None:
+    if cwd is not None:
         out["cwd"] = cwd
+    elif isinstance(cwd_payload, str):
+        out["cwd"] = cwd_payload
     return native_name, args, out
 
 
@@ -231,58 +287,15 @@ def authorized(policy, overwrite=None):
     emit(policy["approval"], overwrite=overwrite)
 
 
-def command_groups(command):
-    try:
-        tokens = shlex.split(command, posix=True)
-    except Exception:
-        tokens = command.split()
-    groups = []
-    current = []
-    for token in tokens:
-        if token in ("&&", "||", ";", "|", "&"):
-            if current:
-                groups.append(current)
-                current = []
-        else:
-            current.append(token)
-    if current:
-        groups.append(current)
-    return groups
-
-
-def strip_prefixes(group):
-    launchers = {
-        "env",
-        "nohup",
-        "nice",
-        "ionice",
-        "stdbuf",
-        "timeout",
-        "time",
-        "command",
-        "exec",
-        "busybox",
-    }
-    index = 0
-    while index < len(group):
-        token = group[index]
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
-            index += 1
-            continue
-        base = os.path.basename(token)
-        if base in launchers:
-            index += 1
-            if base == "timeout" and index < len(group):
-                index += 1
-            continue
-        break
-    return group[index:]
+# COMMAND_TOKENIZER_FRAGMENT
 
 
 def nested_shell_bodies(group):
     rest = strip_prefixes(group)
-    if len(rest) >= 3 and os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh") and rest[1] == "-c":
-        return [rest[2]]
+    if rest and os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
+        for index, arg in enumerate(rest[1:], 1):
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
+                return [rest[index + 1]]
     if len(rest) >= 3 and os.path.basename(rest[0]) in ("python", "python3") and rest[1] == "-c":
         return [rest[2]]
     return []
@@ -290,7 +303,9 @@ def nested_shell_bodies(group):
 
 def iter_groups(command, depth=0):
     if depth > 4:
-        return
+        fail_closed("shell nesting exceeds the inspected depth")
+    if any(group.error for group in command_records(command)):
+        fail_closed("incomplete shell syntax cannot be inspected")
     for group in command_groups(command):
         yield group
         for body in nested_shell_bodies(group):
@@ -306,26 +321,74 @@ def basename_of(group):
 
 
 def has_redirect(command):
-    return bool(re.search(r"(^|[^0-9])>|>>", command))
+    lexer = shlex.shlex(command, posix=False, punctuation_chars="><")
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    for index, token in enumerate(tokens):
+        if token in (">", ">>"):
+            target = tokens[index + 1].strip(chr(34) + chr(39)) if index + 1 < len(tokens) else ""
+            if target != "/dev/null":
+                return True
+    return False
 
 
-def path_is_protected(path, protected):
-    if not path:
-        return False
-    expanded = os.path.abspath(os.path.expanduser(path))
-    for root in protected:
-        if not root:
-            continue
-        root_abs = os.path.abspath(root)
+def resolve_path(path, policy, cwd=None):
+    home = policy["process_home"]
+    path = path.replace(chr(36) + "{HOME}", home).replace("$HOME", home)
+    if path == "~" or path.startswith("~/"):
+        path = home + path[1:]
+    if not os.path.isabs(path):
+        path = os.path.join(cwd or policy["workspace_path"], path)
+    return os.path.realpath(path)
+
+
+def path_is_protected(path, policy, cwd=None):
+    expanded = resolve_path(path, policy, cwd)
+    for root in policy.get("protected_paths", []):
+        root_abs = os.path.realpath(root)
         if expanded == root_abs or expanded.startswith(root_abs + os.sep):
             return True
     return False
 
 
-def command_touches_protected(command, protected):
-    for root in protected:
-        if root and root in command:
-            return True
+def command_touches_protected(command, policy, cwd):
+    # Enforcement leaf names also cover commands that change directory first,
+    # and reads: disclosure of policy is as sensitive as modifying the hook.
+    leaves = ("hooks.json", "session-settings.json", "boss-agy-auth-policy.json",
+              "boss-agy-auth-attestation.json", "boss-agy-hook-adapter.py")
+    for group in iter_groups(command):
+        for token in group:
+            if any(leaf in token for leaf in leaves):
+                return True
+            candidate = token.lstrip("<>")
+            if path_is_protected(candidate, policy, cwd):
+                return True
+    return False
+
+
+def vcs_mutation(rest):
+    if not rest:
+        return False
+    program = os.path.basename(rest[0])
+    value_flags = {"-C", "-c", "-R", "--repo", "--repository", "--hostname", "-H", "--git-dir", "--work-tree", "--config", "--config-file", "--at-operation"}
+    index = 1
+    while index < len(rest) and rest[index].startswith("-"):
+        index += 2 if rest[index] in value_flags else 1
+    args = rest[index:]
+    if not args:
+        return False
+    if program == "git":
+        return args[0] in {"reset", "apply", "checkout", "restore", "commit", "stash", "clean", "merge", "rebase", "cherry-pick", "revert", "add", "rm", "mv"}
+    if program == "jj":
+        return args[0] in {"new", "describe", "squash", "restore", "abandon", "edit", "rebase", "commit", "split", "sparse", "undo", "revert", "bookmark"}
+    if program == "gh" and args[0] == "api":
+        for i, arg in enumerate(args[1:], 1):
+            if arg in ("-f", "-F", "--field", "--raw-field", "--input") or arg.startswith(("-f", "-F", "--field=", "--raw-field=", "--input=")):
+                return True
+            if arg in ("-X", "--method") and i + 1 < len(args) and args[i + 1].upper() not in ("GET", "HEAD", "OPTIONS"):
+                return True
+            if arg not in ("-X", "--method") and arg.startswith(("-X", "--method=")) and arg.split("=", 1)[-1].removeprefix("-X").upper() not in ("GET", "HEAD", "OPTIONS"):
+                return True
     return False
 
 
@@ -340,13 +403,29 @@ def is_recursive_rm(rest):
     return False
 
 
-def structural_command_reason(command, policy, worker_kind):
-    protected = policy.get("protected_paths") or []
-    if not isinstance(protected, list):
-        protected = []
-    protected = [p for p in protected if isinstance(p, str)]
+def structural_command_reason(command, policy, worker_kind, cwd):
+    # Substitutions execute before argv exists; fail closed instead of
+    # pretending their contents are ordinary arguments.
+    quote, escaped = None, False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == chr(92) and quote != chr(39):
+            escaped = True
+            continue
+        if char in (chr(34), chr(39)):
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+        if quote != chr(39) and (char == chr(96) or command[index:index + 2] == "$("):
+            return "command substitution is structurally denied"
     for group in iter_groups(command):
         rest = strip_prefixes(group)
+        prefixes = group[:len(group) - len(rest)]
+        if any(os.path.basename(token) == "sudo" for token in prefixes):
+            return "sudo is structurally denied for Antigravity workers"
         if not rest:
             continue
         base = os.path.basename(rest[0])
@@ -356,10 +435,8 @@ def structural_command_reason(command, policy, worker_kind):
             return "bossctl is coordinator-only and is structurally denied for workers"
         if is_recursive_rm(rest):
             return "destructive recursive removal is structurally denied"
-    if command_touches_protected(command, protected) and (
-        has_redirect(command) or any(basename_of(group) in WRITE_PROGRAMS for group in iter_groups(command))
-    ):
-        return "command writes into protected Antigravity or Boss state"
+    if command_touches_protected(command, policy, cwd):
+        return "command accesses protected Antigravity or Boss state"
     if worker_kind in ("reviewer", "triage"):
         if has_redirect(command):
             return "%s workers must not perform shell-mediated writes" % (worker_kind,)
@@ -371,25 +448,10 @@ def structural_command_reason(command, policy, worker_kind):
             if not rest:
                 continue
             prog = os.path.basename(rest[0])
-            if prog == "git" and "push" in rest:
-                return "%s workers must not publish" % (worker_kind,)
-            if prog == "jj" and "push" in rest:
-                return "%s workers must not publish" % (worker_kind,)
-            if prog == "gh" and len(rest) >= 3 and rest[1] in ("pr", "issue"):
-                return "%s workers must not mutate GitHub" % (worker_kind,)
-            if prog == "cube" and len(rest) >= 2 and rest[1] == "pr":
-                return "%s workers must not publish" % (worker_kind,)
-    return None
-
-
-def mcp_reason(native_name, args):
-    if native_name == "call_mcp_tool" or native_name.startswith("mcp_"):
-        server = first_str(args, ("ServerName", "serverName", "server", "Server"))
-        tool = first_str(args, ("ToolName", "toolName", "tool", "Tool"))
-        detail = native_name
-        if server or tool:
-            detail = "%s server=%s tool=%s" % (native_name, server or "?", tool or "?")
-        return "MCP tool calls are denied for Antigravity workers (%s)" % (detail,)
+            if vcs_mutation(rest):
+                return "%s workers must not mutate repository or GitHub state" % worker_kind
+            if prog in ("patch",) or (prog == "sed" and any(t == "--in-place" or t.startswith("-i") or t.startswith("--in-place=") for t in rest[1:])) or (prog in ("awk", "gawk") and any(t == "inplace" or t.startswith("--inplace") for t in rest[1:])):
+                return "%s workers must not edit files in place" % worker_kind
     return None
 
 
@@ -407,15 +469,12 @@ def structural_reason(native_name, args, canonical, policy):
     worker_kind = policy.get("worker_kind")
     if native_name == "browser_subagent":
         return "browser_subagent is structurally disabled until its tool path is qualified"
-    mcp = mcp_reason(native_name, args)
-    if mcp:
-        return mcp
     manage = manage_task_reason(native_name, args)
     if manage:
         return manage
     if args.get("BypassSandbox") is True or canonical["tool_input"].get("BypassSandbox") is True:
         return "BypassSandbox is denied for Antigravity workers"
-    if native_name not in KNOWN_TOOLS and native_name not in TOOL_NAME_MAP:
+    if native_name not in KNOWN_TOOLS and not canonical["tool_name"].startswith("mcp__"):
         if native_name:
             return "unknown Antigravity tool %r is denied" % (native_name,)
         return "tool call is missing a name"
@@ -424,13 +483,13 @@ def structural_reason(native_name, args, canonical, policy):
         protected = []
     protected = [p for p in protected if isinstance(p, str)]
     file_path = canonical["tool_input"].get("file_path")
-    if isinstance(file_path, str) and path_is_protected(file_path, protected):
+    if isinstance(file_path, str) and path_is_protected(file_path, policy, canonical.get("cwd")):
         return "refusing access to protected Antigravity or Boss state: %s" % (file_path,)
     if worker_kind in ("reviewer", "triage") and native_name in ("write_file", "edit_file"):
         return "%s workers must not modify files" % (worker_kind,)
     command = canonical["tool_input"].get("command")
     if isinstance(command, str):
-        reason = structural_command_reason(command, policy, worker_kind)
+        reason = structural_command_reason(command, policy, worker_kind, canonical.get("cwd"))
         if reason:
             return reason
     return None
@@ -444,12 +503,26 @@ def guard_applies(matcher, canonical_name):
     return matcher == canonical_name
 
 
-def run_guards(policy, canonical):
-    guards = policy.get("guards") or []
-    if not isinstance(guards, list):
-        fail_closed("authorization policy guards must be an array")
+def run_bounded(argv, **kwargs):
+    data = kwargs.pop("input")
+    timeout = kwargs.pop("timeout")
+    kwargs.pop("capture_output", None)
+    child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, **kwargs)
+    try:
+        stdout, stderr = child.communicate(data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+
+
+def run_guards(policy, canonical, rewrites=0):
+    guards = policy.get("guards")
+    if not isinstance(guards, list) or not guards:
+        fail_closed("authorization policy guards must be a nonempty array")
     canonical_name = canonical.get("tool_name")
-    stdin = json.dumps(canonical)
     for guard in guards:
         if not isinstance(guard, dict):
             fail_closed("malformed guard entry in authorization policy")
@@ -460,16 +533,19 @@ def run_guards(policy, canonical):
         if not isinstance(command, str) or not command:
             fail_closed("guard entry is missing a command")
         try:
-            result = subprocess.run(
+            result = run_bounded(
                 ["/bin/sh", "-c", command],
-                input=stdin,
+                input=json.dumps(canonical),
                 capture_output=True,
                 text=True,
+                timeout=guard.get("timeout_sec", 30),
             )
         except Exception as exc:
             fail_closed("failed to exec guard command: %r" % (exc,))
         if result.stderr:
             sys.stderr.write(result.stderr)
+        if result.returncode != 0:
+            fail_closed("guard exited nonzero or by signal: %s" % result.returncode)
         raw = result.stdout.strip()
         try:
             decision_obj = json.loads(raw) if raw else None
@@ -477,29 +553,75 @@ def run_guards(policy, canonical):
             fail_closed("guard produced non-JSON stdout (exit=%s): %r" % (result.returncode, raw[:500]))
         if not isinstance(decision_obj, dict):
             fail_closed("guard produced no decision object (exit=%s)" % (result.returncode,))
-        decision = decision_obj.get("decision")
+        hook = decision_obj.get("hookSpecificOutput", {})
+        if not isinstance(hook, dict):
+            fail_closed("guard hookSpecificOutput is not an object")
+        decision = decision_obj.get("decision", hook.get("permissionDecision"))
+        rewrite = hook.get("updatedInput", decision_obj.get("updatedInput", decision_obj.get("overwrite")))
+        if rewrite is not None:
+            if decision in (None, "approve", "allow"):
+                decision = "approve"
+            else:
+                rewrite = None
         reason = decision_obj.get("reason")
         if decision in ("block", "deny"):
             emit("deny", reason=reason or "guard denied the tool call")
         if decision in ("approve", "allow"):
+            if rewrite is not None:
+                before = dict(canonical["_native_args"])
+                apply_rewrite(policy, canonical, rewrite)
+                if before != canonical["_native_args"]:
+                    if rewrites >= 4:
+                        fail_closed("guard rewrite chain did not converge")
+                    # Earlier guards must also approve the changed input.
+                    run_guards(policy, canonical, rewrites + 1)
+                    return
             continue
         fail_closed("guard emitted unrecognised decision %r (exit=%s)" % (decision, result.returncode))
 
 
+
+def apply_rewrite(policy, canonical, rewrite):
+    if not isinstance(rewrite, dict):
+        fail_closed("guard updatedInput must be an object")
+    aliases = {
+        "command": ("CommandLine", "command", "commandLine"),
+        "cwd": ("Cwd", "cwd", "workingDirectory"),
+        "file_path": ("Path", "path", "TargetFile", "targetFile", "target_file", "file_path", "AbsolutePath", "absolutePath"),
+        "content": ("Contents", "contents", "Content", "content"),
+    }
+    args = dict(canonical["_native_args"])
+    args.update({k: v for k, v in rewrite.items() if k not in aliases})
+    for key, names in aliases.items():
+        if key in rewrite:
+            for name in names:
+                if name in args:
+                    args[name] = rewrite[key]
+            if not any(name in args for name in names):
+                args[names[0]] = rewrite[key]
+    native = canonical["agy_tool_name"]
+    _, _, rewritten = canonicalise({"cwd": canonical.get("cwd"), "toolCall": {"name": native, "args": args}})
+    reason = structural_reason(native, args, rewritten, policy)
+    if reason:
+        emit("deny", reason=reason)
+    canonical.update(rewritten)
+    canonical["_native_args"] = args
+
+
+
 def forward_progress(raw_stdin, policy):
-    if os.environ.get("BOSS_AGY_SKIP_FORWARD") == "1" or "--probe" in sys.argv:
-        return
     forwarder = policy.get("forwarder")
     if not isinstance(forwarder, str) or not forwarder:
         fail_closed("authorization policy is missing the progress forwarder")
     if not os.path.isfile(forwarder) or not os.access(forwarder, os.X_OK):
         fail_closed("progress forwarder is missing or not executable: %s" % (forwarder,))
     try:
-        result = subprocess.run(
-            [forwarder],
+        result = run_bounded(
+            [forwarder, "PreToolUse"],
             input=raw_stdin,
             capture_output=True,
             text=True,
+            timeout=15,
         )
     except Exception as exc:
         fail_closed("progress forwarder failed to exec: %r" % (exc,))
@@ -517,89 +639,18 @@ def authorize_payload(payload, policy, raw_stdin):
         fail_closed("stdin payload was not a JSON object")
     verify_binding(policy)
     native_name, args, canonical = canonicalise(payload)
-    forward_progress(raw_stdin, policy)
+    canonical["_native_args"] = dict(args)
     reason = structural_reason(native_name, args, canonical, policy)
     if reason:
         emit("deny", reason=reason)
     run_guards(policy, canonical)
-    authorized(policy)
-
-
-def sentinel_payload(command):
-    return {
-        "hookEventName": "PreToolUse",
-        "conversationId": "probe",
-        "toolCall": {"id": "probe", "name": "run_command", "args": {"CommandLine": command, "Cwd": "/tmp"}},
-    }
-
-
-def capture_authorize(payload, policy):
-    raw = json.dumps(payload)
-    env = os.environ.copy()
-    env["BOSS_AGY_SKIP_FORWARD"] = "1"
-    env["BOSS_RUN_ID"] = policy.get("run_id") or env.get("BOSS_RUN_ID") or "probe"
-    env["BOSS_AGY_POLICY"] = policy_path()
-    result = subprocess.run(
-        [sys.executable, os.path.abspath(__file__)],
-        input=raw,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    stdout = result.stdout.strip()
-    try:
-        body = json.loads(stdout) if stdout else {}
-    except Exception:
-        body = {"decision": "deny", "reason": "probe child produced non-JSON: %r" % (stdout[:500],)}
-    return body, result.stderr
-
-
-def run_probe():
-    os.environ["BOSS_AGY_SKIP_FORWARD"] = "1"
-    policy = load_policy()
-    if not os.environ.get("BOSS_RUN_ID"):
-        os.environ["BOSS_RUN_ID"] = policy["run_id"]
-    attestation = verify_binding(policy)
-    expected = policy["approval"]
-    positive, _ = capture_authorize(sentinel_payload(POSITIVE_SENTINEL), policy)
-    denied, _ = capture_authorize(sentinel_payload(DENIED_SENTINEL), policy)
-    binding_ok = True
-    positive_ok = positive.get("decision") == expected
-    denied_ok = denied.get("decision") == "deny"
-    ok = binding_ok and positive_ok and denied_ok
-    report = {
-        "ok": ok,
-        "binding": {"ok": True, "entries": attestation.get("entries")},
-        "positive": {
-            "decision": positive.get("decision"),
-            "reason": positive.get("reason"),
-            "sentinel": POSITIVE_SENTINEL,
-            "expected": expected,
-        },
-        "denied": {
-            "decision": denied.get("decision"),
-            "reason": denied.get("reason"),
-            "sentinel": DENIED_SENTINEL,
-        },
-    }
-    if not ok:
-        report["reason"] = "pre-prompt authorization probe failed"
-        if not positive_ok:
-            report["reason"] = "positive sentinel did not receive %s (got %r)" % (
-                expected,
-                positive.get("decision"),
-            )
-        elif not denied_ok:
-            report["reason"] = "denied sentinel was not denied (got %r)" % (denied.get("decision"),)
-    sys.stdout.write(json.dumps(report))
-    sys.exit(0 if ok else 1)
+    overwrite = {key: value for key, value in canonical["_native_args"].items() if key not in args or args[key] != value}
+    authorized(policy, overwrite=overwrite)
 
 
 def main():
-    if "--probe" in sys.argv:
-        run_probe()
-        return
     raw_stdin = sys.stdin.read()
+    forward_progress(raw_stdin, {"forwarder": os.environ.get("BOSS_AGY_FORWARDER")})
     try:
         payload = json.loads(raw_stdin) if raw_stdin else None
     except Exception:
@@ -609,4 +660,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        fail_closed("authorization adapter failed: %s" % exc)

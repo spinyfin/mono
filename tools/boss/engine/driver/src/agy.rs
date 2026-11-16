@@ -312,7 +312,7 @@ impl AgentDriver for AgyDriver {
         // renderer. Hash whatever session-settings file is already on disk.
         home::validate_private_layout(&process_home)?;
         let obs = hooks::observation_from_permission(input);
-        let interception = hooks::interception_from_permission(input);
+        let interception = ToolUseInterceptionConfig::from_permission_input(input);
         let config_files = hooks::install_authorization(&process_home, input.worker_kind, &obs, &interception)
             .with_context(|| {
                 format!(
@@ -838,6 +838,7 @@ mod tests {
     }
 
     fn permission_input(tmp: &TempDir, run_id: &str, workspace: PathBuf) -> PermissionInput {
+        crate::hook_guards::write_executable(&tmp.path().join("boss-event"), "#!/bin/sh\ncat >/dev/null\n").unwrap();
         let path_guard = tmp.path().join("boss-path-guard.py");
         fs::write(
             &path_guard,
@@ -908,13 +909,13 @@ mod tests {
             artifacts.config_files
         );
         let hooks_doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
-        let pre = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
+        let pre = hooks_doc["boss"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 1, "{pre:#?}");
         let command = pre[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(command.contains(&adapter.display().to_string()), "{command}");
         assert!(
-            hooks_doc["hooks"].get("SessionStart").is_none(),
-            "provision SessionStart canary must not remain after authorization install: {hooks_doc:#}"
+            hooks_doc["boss"].get("SessionStart").is_some(),
+            "SessionStart must forward progress after authorization install: {hooks_doc:#}"
         );
         assert!(!driver.launch_ready());
     }

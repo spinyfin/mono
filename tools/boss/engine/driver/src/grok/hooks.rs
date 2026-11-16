@@ -49,10 +49,9 @@ use boss_ssh_transport::shell_quote;
 use serde_json::json;
 
 use super::home::hooks_file_path;
-use crate::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
-    pr_redirect_guard_command,
-};
+#[cfg(test)]
+use crate::claude::{BOSS_LAUNCH_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
+use crate::hook_guards::{guard_commands, write_executable};
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig};
 
 /// Filename of the canonicalisation adapter under `$GROK_HOME/hooks/`.
@@ -116,117 +115,6 @@ pub fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_json::Ma
     hooks
 }
 
-/// One unchanged Boss guard command plus the Grok matcher that should fire
-/// it (mirrors the matcher `claude::ClaudeDriver::tool_use_interception_wiring`
-/// uses for the same guard: Grok's matcher engine resolves the `Bash` alias
-/// to `run_terminal_command` — design §Hooks — so reusing `"Bash"` here fires
-/// on Grok shell calls without a Grok-specific matcher spelling).
-struct Guard {
-    command: String,
-    matcher: &'static str,
-    /// Outer Grok hook-runner timeout in seconds. `None` omits the field
-    /// (Grok's default). The checkleft push guard sets this above the sum of its
-    /// own probe and run subprocess timeouts so the inner fail-open wins.
-    timeout_sec: Option<u64>,
-}
-
-/// The five Boss `PreToolUse` guard commands, unchanged from Claude's. Order
-/// matches `claude::ClaudeDriver::tool_use_interception_wiring` exactly.
-/// Guards are omitted per the same rules Claude/Codex use (path guard +
-/// checkleft guard need their materialised script path; PR-redirect +
-/// checkleft are Standard-worker-only; revision guard is revision-only) —
-/// the Boss-launch guard is the only one that is always present, so this
-/// never returns empty as long as `config` reaches this function at all.
-fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
-    let mut out = Vec::new();
-
-    // 1. Path guard (data-dir sandbox). Matcher `*`: it inspects
-    //    file_path/notebook_path/path on every tool, not just Bash.
-    if let (Some(data_dir), Some(guard_script)) = (&config.data_dir, &config.path_guard_script) {
-        out.push(Guard {
-            command: format!(
-                "BOSS_DATA_DIR={dir} python3 {script}",
-                dir = shell_quote(&data_dir.display().to_string()),
-                script = shell_quote(&guard_script.display().to_string()),
-            ),
-            matcher: "*",
-            timeout_sec: None,
-        });
-    }
-
-    // 1b. Shared-source-store write gate (every local worker kind). Same
-    //     script and hook-command shape as Claude; the adapter canonicalises
-    //     Grok's payload into the Claude dialect the script reads.
-    if let Some(guard_script) = &config.git_store_guard_script {
-        out.push(Guard {
-            command: crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref()),
-            matcher: "Bash",
-            timeout_sec: None,
-        });
-    }
-
-    // 2. Boss-launch guard. Always on, all workers.
-    out.push(Guard {
-        command: BOSS_LAUNCH_GUARD_COMMAND.to_owned(),
-        matcher: "Bash",
-        timeout_sec: None,
-    });
-
-    // 3. PR-redirect guard. Standard workers only (local + remote).
-    if config.is_standard_worker {
-        out.push(Guard {
-            command: pr_redirect_guard_command(config.is_revision),
-            matcher: "Bash",
-            timeout_sec: None,
-        });
-    }
-
-    // 4. Checkleft push guard. Local Standard workers only.
-    if config.is_standard_worker
-        && let Some(checkleft_script) = &config.checkleft_guard_script
-    {
-        out.push(Guard {
-            command: format!(
-                "python3 {script}",
-                script = shell_quote(&checkleft_script.display().to_string())
-            ),
-            matcher: "Bash",
-            timeout_sec: Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
-        });
-    }
-
-    // 5. Reviewer static-analysis guard. The shared Claude command is run by
-    // Grok's adapter, so the three drivers enforce the same command policy.
-    if config.is_reviewer {
-        out.push(Guard {
-            command: REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND.to_owned(),
-            matcher: "Bash",
-            timeout_sec: None,
-        });
-    }
-
-    // 6. Revision PR guard.
-    if config.is_revision {
-        out.push(Guard {
-            command: REVISION_PR_GUARD_COMMAND.to_owned(),
-            matcher: "Bash",
-            timeout_sec: None,
-        });
-    }
-
-    if config.is_review_guide {
-        out.push(Guard {
-            command: format!(
-                "python3 -c {}",
-                shell_quote(&crate::codex::codex_review_guide_guard_script())
-            ),
-            matcher: ".*",
-            timeout_sec: None,
-        });
-    }
-    out
-}
-
 /// Write the canonicalisation adapter script and the full hooks wiring
 /// (forwarder on every lifecycle event, adapter-wrapped guards on
 /// `PreToolUse`) into `$GROK_HOME/hooks/`. Overwrites the provisional canary
@@ -284,18 +172,6 @@ pub fn write_hooks(
         .with_context(|| format!("writing {}", hooks_path.display()))?;
 
     Ok(vec![hooks_path, adapter_path])
-}
-
-fn write_executable(path: &Path, body: &str) -> anyhow::Result<()> {
-    fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).with_context(|| format!("chmod +x {}", path.display()))?;
-    }
-    Ok(())
 }
 
 /// The driver-owned canonicalisation adapter (design T-09 / A-2).
@@ -565,8 +441,8 @@ mod tests {
             "checkleft hook must outlive a contended Bazel compile"
         );
         assert!(
-            guards.iter().take(3).all(|g| g.timeout_sec.is_none()),
-            "ordinary guards omit timeout so Grok's default applies"
+            guards.iter().take(3).all(|g| g.timeout_sec == Some(30)),
+            "ordinary shared guards have an explicit bounded timeout"
         );
     }
 

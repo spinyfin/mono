@@ -6,13 +6,14 @@
 //! `deny`, or `deny_unless_prior_grant`. Native `SessionStart` is not a
 //! pre-prompt readiness signal; loaded hook counts are not authorization.
 //!
-//! Session-settings rendering and the non-PreToolUse `boss-event` forwarder
-//! map belong to their own wiring. This module merges the authorization
-//! entry into whatever `hooks.json` is already on disk.
+//! The global-root progress map wires all six measured lifecycle events.
+//! Authorization replaces its single PreToolUse entry before atomic
+//! installation and content binding; the other five remain forwarders.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
@@ -22,10 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::home::{agy_homes_root, process_home_for_run, session_settings_path_for_run};
-use crate::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
-    pr_redirect_guard_command,
-};
+use crate::hook_guards::{Guard, guard_commands, write_executable};
 use crate::hook_settings::forwarder_command;
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig, WorkerKind};
 
@@ -67,17 +65,11 @@ pub(super) const FORWARDER_HOOK_TIMEOUT_SEC: u64 = 15;
 /// The shim's own budget (`SHIM_TOTAL_BUDGET`, 12s) plus teardown headroom.
 const _: () = assert!(FORWARDER_HOOK_TIMEOUT_SEC >= 12 + 3);
 
-
 const ADAPTER_SCRIPT: &str = include_str!("adapter.py");
 
 /// Outer hook timeout when the checkleft push guard is not in the chain.
 /// Covers silent `boss-event` delivery (~10s retry) plus the remaining guards.
 pub const AUTHORIZATION_HOOK_TIMEOUT_SEC: u64 = 60;
-
-struct Guard {
-    command: String,
-    matcher: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttestationEntry {
@@ -139,81 +131,6 @@ pub fn attestation_path(process_home: &Path) -> PathBuf {
     gemini_config_dir(process_home).join(ATTESTATION_FILENAME)
 }
 
-fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
-    let mut out = Vec::new();
-    if let (Some(data_dir), Some(guard_script)) = (&config.data_dir, &config.path_guard_script) {
-        out.push(Guard {
-            command: format!(
-                "BOSS_DATA_DIR={dir} python3 {script}",
-                dir = shell_quote(&data_dir.display().to_string()),
-                script = shell_quote(&guard_script.display().to_string()),
-            ),
-            matcher: "*",
-        });
-    }
-    if let Some(guard_script) = &config.git_store_guard_script {
-        out.push(Guard {
-            command: crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref()),
-            matcher: "Bash",
-        });
-    }
-    out.push(Guard {
-        command: BOSS_LAUNCH_GUARD_COMMAND.to_owned(),
-        matcher: "Bash",
-    });
-    if config.is_standard_worker {
-        out.push(Guard {
-            command: pr_redirect_guard_command(config.is_revision),
-            matcher: "Bash",
-        });
-    }
-    if config.is_standard_worker
-        && let Some(checkleft_script) = &config.checkleft_guard_script
-    {
-        out.push(Guard {
-            command: format!(
-                "python3 {script}",
-                script = shell_quote(&checkleft_script.display().to_string())
-            ),
-            matcher: "Bash",
-        });
-    }
-    if config.is_reviewer {
-        out.push(Guard {
-            command: REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND.to_owned(),
-            matcher: "Bash",
-        });
-    }
-    if config.is_revision {
-        out.push(Guard {
-            command: REVISION_PR_GUARD_COMMAND.to_owned(),
-            matcher: "Bash",
-        });
-    }
-    if config.is_review_guide {
-        out.push(Guard {
-            command: format!(
-                "python3 -c {}",
-                shell_quote(&crate::codex::codex_review_guide_guard_script())
-            ),
-            matcher: ".*",
-        });
-    }
-    out
-}
-
-fn write_executable(path: &Path, body: &str) -> anyhow::Result<()> {
-    fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).with_context(|| format!("chmod +x {}", path.display()))?;
-    }
-    Ok(())
-}
-
 fn hash_file(path: &Path) -> anyhow::Result<String> {
     let bytes = fs::read(path).with_context(|| format!("hashing {}", path.display()))?;
     Ok(sha256_hex_prefixed(&bytes))
@@ -243,14 +160,15 @@ fn protected_paths(process_home: &Path, interception: &ToolUseInterceptionConfig
 }
 
 fn authorization_command(process_home: &Path, config: &ProgressObservationConfig) -> String {
+    let adapter_config = ProgressObservationConfig {
+        forwarder_binary: adapter_path(process_home),
+        ..config.clone()
+    };
     format!(
-        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} BOSS_AGY_POLICY={policy} {adapter}",
-        socket = shell_quote(&config.events_socket_path.display().to_string()),
-        lease = shell_quote(&config.lease_id),
-        run_id = shell_quote(&config.run_id),
-        workspace = shell_quote(&config.workspace_path.display().to_string()),
-        policy = shell_quote(&policy_path(process_home).display().to_string()),
-        adapter = shell_quote(&adapter_path(process_home).display().to_string()),
+        "BOSS_AGY_FORWARDER={} BOSS_AGY_POLICY={} {}",
+        shell_quote(&config.forwarder_binary.display().to_string()),
+        shell_quote(&policy_path(process_home).display().to_string()),
+        forwarder_command(&adapter_config)
     )
 }
 
@@ -301,39 +219,6 @@ pub fn authorization_hooks_map(
     hooks
 }
 
-fn is_provision_canary(entry: &Value) -> bool {
-    entry
-        .pointer("/hooks/0/command")
-        .and_then(Value::as_str)
-        .is_some_and(|command| command == "true")
-}
-
-fn named_hook_group(existing: Option<&Value>) -> (String, serde_json::Map<String, Value>) {
-    let Some(object) = existing.and_then(Value::as_object) else {
-        return ("hooks".to_owned(), serde_json::Map::new());
-    };
-    for name in ["boss", "hooks"] {
-        if let Some(group) = object.get(name).and_then(Value::as_object) {
-            return (name.to_owned(), group.clone());
-        }
-    }
-    (
-        "hooks".to_owned(),
-        object.values().find_map(Value::as_object).cloned().unwrap_or_default(),
-    )
-}
-
-fn merge_authorization_entry(existing: Option<Value>, pre_tool_use: Value) -> Value {
-    let (group_name, mut hooks) = named_hook_group(existing.as_ref());
-    if let Some(session_start) = hooks.get("SessionStart").and_then(Value::as_array)
-        && session_start.iter().all(is_provision_canary)
-    {
-        hooks.remove("SessionStart");
-    }
-    hooks.insert("PreToolUse".to_owned(), json!([pre_tool_use]));
-    json!({ group_name: hooks })
-}
-
 fn collect_guard_artifact_paths(config: &ToolUseInterceptionConfig) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     if let Some(path) = &config.path_guard_script {
@@ -362,7 +247,26 @@ pub fn install_authorization(
             process_home.display()
         );
     }
-    let guards = guard_commands(interception);
+    super::home::validate_private_layout(process_home)?;
+    let mut guards = guard_commands(interception);
+    guards.push(Guard {
+        command: format!(
+            "python3 -c {}",
+            shell_quote(&crate::codex::codex_tool_surface_guard_script())
+        ),
+        matcher: "*",
+        timeout_sec: Some(30),
+    });
+    if matches!(worker_kind, WorkerKind::Reviewer | WorkerKind::Triage) {
+        guards.push(Guard {
+            command: format!(
+                "python3 -c {}",
+                shell_quote(&crate::codex::codex_reviewer_publish_guard_script())
+            ),
+            matcher: "*",
+            timeout_sec: Some(30),
+        });
+    }
     if guards.is_empty() {
         bail!("AgyDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
     }
@@ -371,7 +275,7 @@ pub fn install_authorization(
     fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
 
     let adapter = adapter_path(process_home);
-    write_executable(&adapter, ADAPTER_SCRIPT)?;
+    write_executable(&adapter, &crate::guard_python::with_command_tokenizer(ADAPTER_SCRIPT))?;
 
     let policy_file = policy_path(process_home);
     let attestation_file = attestation_path(process_home);
@@ -383,8 +287,21 @@ pub fn install_authorization(
             .join("control/session-settings.json")
     });
 
+    let mut artifacts = collect_guard_artifact_paths(interception);
+    artifacts.extend([
+        ("adapter".into(), adapter.clone()),
+        ("policy".into(), policy_file.clone()),
+        ("hooks".into(), hooks_path.clone()),
+        ("settings".into(), settings_path),
+        ("forwarder".into(), obs.forwarder_binary.clone()),
+    ]);
+    let required_artifacts: serde_json::Map<String, Value> = artifacts
+        .iter()
+        .map(|(name, path)| (name.clone(), json!(path)))
+        .collect();
     let policy = json!({
         "version": 1,
+        "required_artifacts": required_artifacts,
         "run_id": obs.run_id,
         "worker_kind": worker_kind_name(worker_kind),
         "approval": approval_for(worker_kind),
@@ -396,51 +313,29 @@ pub fn install_authorization(
         "guards": guards.iter().map(|guard| json!({
             "command": guard.command,
             "matcher": guard.matcher,
+            "timeout_sec": guard.timeout_sec.unwrap_or(30),
         })).collect::<Vec<_>>(),
     });
-    fs::write(&policy_file, serde_json::to_string_pretty(&policy)? + "\n")
-        .with_context(|| format!("writing {}", policy_file.display()))?;
+    write_json_atomic(&policy_file, &policy)?;
+    let mut hooks = forwarder_hooks_map(obs);
+    hooks.insert(
+        "PreToolUse".into(),
+        json!([pre_tool_use_entry(process_home, obs, interception)]),
+    );
+    write_hooks_document(process_home, &json!({ HOOK_GROUP: hooks }))?;
 
-    let existing = fs::read_to_string(&hooks_path)
-        .ok()
-        .and_then(|body| serde_json::from_str(&body).ok());
-    let hooks_doc = merge_authorization_entry(existing, pre_tool_use_entry(process_home, obs, interception));
-    fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_doc)? + "\n")
-        .with_context(|| format!("writing {}", hooks_path.display()))?;
-
-    let mut entries = vec![
-        AttestationEntry {
-            name: "adapter".into(),
-            path: adapter.display().to_string(),
-            sha256: hash_file(&adapter)?,
-        },
-        AttestationEntry {
-            name: "hooks".into(),
-            path: hooks_path.display().to_string(),
-            sha256: hash_file(&hooks_path)?,
-        },
-        AttestationEntry {
-            name: "policy".into(),
-            path: policy_file.display().to_string(),
-            sha256: hash_file(&policy_file)?,
-        },
-    ];
-    if settings_path.is_file() {
-        entries.push(AttestationEntry {
-            name: "settings".into(),
-            path: settings_path.display().to_string(),
-            sha256: hash_file(&settings_path)?,
-        });
-    }
-    for (name, path) in collect_guard_artifact_paths(interception) {
-        if path.is_file() {
-            entries.push(AttestationEntry {
+    // Every declared artifact must exist; missing guards/settings never shrink
+    // the binding to a misleadingly healthy subset.
+    let entries = artifacts
+        .into_iter()
+        .map(|(name, path)| {
+            Ok(AttestationEntry {
                 name,
                 path: path.display().to_string(),
                 sha256: hash_file(&path)?,
-            });
-        }
-    }
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let attestation = AuthorizationAttestation {
         generated_at_unix: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -448,8 +343,7 @@ pub fn install_authorization(
             .unwrap_or(0),
         entries,
     };
-    fs::write(&attestation_file, serde_json::to_string_pretty(&attestation)? + "\n")
-        .with_context(|| format!("writing {}", attestation_file.display()))?;
+    write_json_atomic(&attestation_file, &serde_json::to_value(&attestation)?)?;
 
     Ok(vec![hooks_path, adapter, policy_file, attestation_file])
 }
@@ -460,6 +354,53 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
     let body = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let attestation: AuthorizationAttestation =
         serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+    let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
+    let required = policy["required_artifacts"]
+        .as_object()
+        .context("policy missing required artifact set")?;
+    for name in ["adapter", "hooks", "policy", "settings", "forwarder"] {
+        if !required.contains_key(name) {
+            bail!("binding missing required artifact {name}");
+        }
+    }
+    if required["adapter"] != json!(adapter_path(process_home))
+        || required["hooks"] != json!(hooks_file_path(process_home))
+        || required["policy"] != json!(policy_path(process_home))
+        || required["settings"]
+            != json!(
+                process_home
+                    .parent()
+                    .context("run container")?
+                    .join("control/session-settings.json")
+            )
+        || required["forwarder"] != policy["forwarder"]
+    {
+        bail!("authorization binding has unexpected run paths");
+    }
+    if attestation.entries.len() != required.len() {
+        bail!("authorization binding has incomplete artifact set");
+    }
+    for (name, expected) in required {
+        if attestation
+            .entries
+            .iter()
+            .filter(|e| &e.name == name && json!(e.path) == *expected)
+            .count()
+            != 1
+        {
+            bail!("authorization binding missing or misplaced {name}");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["adapter", "forwarder"] {
+            let path = required[name].as_str().context("executable path")?;
+            if fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
+                bail!("authorization binding: {name} is not executable");
+            }
+        }
+    }
     if attestation.entries.is_empty() {
         bail!("authorization attestation at {} has no entries", path.display());
     }
@@ -481,6 +422,7 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
     Ok(attestation)
 }
 
+#[cfg(test)]
 fn python3_available() -> bool {
     Command::new("python3")
         .arg("--version")
@@ -493,96 +435,64 @@ fn python3_available() -> bool {
 /// launch a pane. Native SessionStart cannot establish this; hook counts cannot
 /// either.
 pub fn probe_authorization(process_home: &Path) -> anyhow::Result<AuthorizationProbeReport> {
-    let binding = verify_attestation(process_home);
-    let binding_ok = binding.is_ok();
-    if !python3_available() {
-        bail!("python3 is required to probe Antigravity authorization");
+    verify_attestation(process_home)?;
+    let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
+    let command = hooks
+        .pointer("/boss/PreToolUse/0/hooks/0/command")
+        .and_then(Value::as_str)
+        .context("missing or disabled PreToolUse authorization command")?;
+    if !command.contains(&shell_quote(&adapter_path(process_home).display().to_string())) {
+        bail!("PreToolUse authorization command is disabled or malformed");
     }
-    let policy = policy_path(process_home);
-    if !policy.is_file() {
-        bail!("authorization policy missing at {}", policy.display());
-    }
-    let adapter = adapter_path(process_home);
-    let output = Command::new("python3")
-        .arg(&adapter)
-        .arg("--probe")
-        .env("BOSS_AGY_POLICY", &policy)
-        .env("BOSS_AGY_SKIP_FORWARD", "1")
-        .output()
-        .with_context(|| format!("running {} --probe", adapter.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Value = serde_json::from_str(stdout.trim()).with_context(|| {
-        format!(
-            "authorization probe produced non-JSON stdout (status {:?}): {stdout}",
-            output.status.code()
-        )
-    })?;
-    let report = AuthorizationProbeReport {
-        ok: parsed.get("ok").and_then(Value::as_bool).unwrap_or(false) && binding_ok,
-        positive_decision: parsed
-            .pointer("/positive/decision")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
-        denied_decision: parsed
-            .pointer("/denied/decision")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
-        denied_reason: parsed
-            .pointer("/denied/reason")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        reason: parsed
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| binding.err().map(|error| error.to_string())),
+    let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
+    let run = |payload: Value| -> anyhow::Result<Value> {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .context("probe stdin")?
+            .write_all(payload.to_string().as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "installed authorization command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        serde_json::from_slice(&output.stdout).context("installed authorization command produced malformed output")
     };
-    if !report.ok {
+    let payload = |cmd: &str| {
+        json!({
+            "hookEventName": "PreToolUse",
+            "conversationId": "probe",
+            "toolCall": {"id":"probe", "name":"run_command", "args":{
+                "CommandLine":cmd, "Cwd":policy["workspace_path"]
+            }}
+        })
+    };
+    let positive = run(payload("echo boss-agy-auth-positive"))?;
+    let denied = run(payload("sudo rm -rf /tmp/boss-agy-auth-denied-sentinel"))?;
+    // Only the reused launch guard denies this command; structural policy allows
+    // it. This checks deny liveness in addition to the adapter's own deny.
+    let guard_denied = run(payload("open -a Boss"))?;
+    let expected = policy["approval"].as_str().context("approval")?;
+    if positive["decision"] != expected || denied["decision"] != "deny" || guard_denied["decision"] != "deny" {
         bail!(
-            "pre-prompt authorization probe failed: {}",
-            report
-                .reason
-                .as_deref()
-                .unwrap_or("positive or denied sentinel mismatch")
+            "pre-prompt authorization probe failed: positive={positive}, structural={denied}, reused_guard={guard_denied}"
         );
     }
-    Ok(report)
-}
-
-/// Build [`ToolUseInterceptionConfig`] from permission input the same way
-/// Grok and Codex do, so the reused guards see identical flags.
-pub fn interception_from_permission(input: &crate::PermissionInput) -> ToolUseInterceptionConfig {
-    ToolUseInterceptionConfig {
-        data_dir: if input.is_remote {
-            None
-        } else {
-            input.events_socket_path.parent().map(|p| p.to_path_buf())
-        },
-        path_guard_script: if input.is_remote {
-            None
-        } else {
-            input.path_guard_script.clone()
-        },
-        checkleft_guard_script: if input.is_remote {
-            None
-        } else {
-            input.checkleft_guard_script.clone()
-        },
-        git_store_guard_script: if input.is_remote {
-            None
-        } else {
-            input.git_store_guard_script.clone()
-        },
-        is_revision: input.execution_kind == "revision_implementation"
-            || input.task_kind.as_deref() == Some("revision"),
-        is_standard_worker: input.worker_kind == WorkerKind::Standard,
-        is_reviewer: input.worker_kind == WorkerKind::Reviewer,
-        is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
-        run_id: Some(input.run_id.clone()),
-        workspace_path: Some(input.workspace_path.clone()),
-    }
+    Ok(AuthorizationProbeReport {
+        ok: true,
+        positive_decision: expected.into(),
+        denied_decision: "deny".into(),
+        denied_reason: denied["reason"].as_str().map(str::to_owned),
+        reason: None,
+    })
 }
 
 pub fn observation_from_permission(input: &crate::PermissionInput) -> ProgressObservationConfig {
@@ -623,6 +533,7 @@ pub(super) fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_j
 }
 
 /// Render the whole `hooks.json` body for the forwarder wiring.
+#[cfg(test)]
 pub(super) fn render_hooks_json(config: &ProgressObservationConfig) -> anyhow::Result<String> {
     let body = json!({ HOOK_GROUP: forwarder_hooks_map(config) });
     Ok(serde_json::to_string_pretty(&body)? + "\n")
@@ -630,17 +541,28 @@ pub(super) fn render_hooks_json(config: &ProgressObservationConfig) -> anyhow::R
 
 /// Overwrite the per-run home's `hooks.json` (provisioned as a no-op canary)
 /// with the forwarder wiring. Returns the path written.
+#[cfg(test)]
 pub(super) fn write_hooks(process_home: &Path, config: &ProgressObservationConfig) -> anyhow::Result<PathBuf> {
-    let path = hooks_file_path(process_home);
-    let parent = path.parent().context("hooks.json has a parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    // Write beside the target and rename so a reader never sees a partial file.
-    let staging = path.with_extension("json.tmp");
-    fs::write(&staging, render_hooks_json(config)?).with_context(|| format!("writing {}", staging.display()))?;
-    fs::rename(&staging, &path).with_context(|| format!("installing {}", path.display()))?;
-    Ok(path)
+    write_hooks_document(
+        process_home,
+        &serde_json::from_str::<Value>(&render_hooks_json(config)?)?,
+    )
 }
 
+fn write_json_atomic(path: &Path, body: &Value) -> anyhow::Result<()> {
+    let parent = path.parent().context("JSON has parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = path.with_extension("json.tmp");
+    fs::write(&staging, serde_json::to_string_pretty(body)? + "\n")?;
+    fs::rename(&staging, path).with_context(|| format!("installing {}", path.display()))
+}
+
+fn write_hooks_document(process_home: &Path, body: &Value) -> anyhow::Result<PathBuf> {
+    super::home::validate_private_layout(process_home)?;
+    let path = hooks_file_path(process_home);
+    write_json_atomic(&path, body)?;
+    Ok(path)
+}
 
 #[cfg(test)]
 #[path = "hooks_tests.rs"]

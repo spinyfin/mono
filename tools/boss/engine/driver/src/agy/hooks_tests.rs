@@ -94,15 +94,6 @@ impl Fixture {
     }
 }
 
-fn python3_or_skip() -> bool {
-    if super::python3_available() {
-        true
-    } else {
-        eprintln!("python3 not available; skipping adapter acceptance test");
-        false
-    }
-}
-
 fn run_command_payload(command: &str) -> Value {
     json!({
         "hookEventName": "PreToolUse",
@@ -123,6 +114,7 @@ fn authorize(process_home: &Path, payload: &Value, skip_forward: bool) -> (i32, 
     let mut cmd = Command::new("python3");
     cmd.arg(&adapter)
         .env("BOSS_AGY_POLICY", &policy)
+        .env("BOSS_AGY_FORWARDER", policy_doc["forwarder"].as_str().unwrap())
         .env("BOSS_RUN_ID", run_id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -169,7 +161,7 @@ fn install_writes_adapter_policy_attestation_and_single_pre_tool_use_entry() {
         assert_eq!(mode & 0o111, 0o111, "adapter must be executable");
     }
     let hooks_doc: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
-    let pre = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
+    let pre = hooks_doc["boss"]["PreToolUse"].as_array().unwrap();
     assert_eq!(pre.len(), 1, "{pre:#?}");
     assert_eq!(pre[0]["matcher"], "*");
     let command = pre[0]["hooks"][0]["command"].as_str().unwrap();
@@ -180,8 +172,8 @@ fn install_writes_adapter_policy_attestation_and_single_pre_tool_use_entry() {
         Some(AUTHORIZATION_HOOK_TIMEOUT_SEC)
     );
     assert!(
-        hooks_doc["hooks"].get("SessionStart").is_none(),
-        "provision canary must be dropped: {hooks_doc:#}"
+        hooks_doc["boss"].get("SessionStart").is_some(),
+        "SessionStart must forward progress: {hooks_doc:#}"
     );
     let policy_doc: Value = serde_json::from_str(&fs::read_to_string(&policy).unwrap()).unwrap();
     assert_eq!(policy_doc["approval"], "auto_approve");
@@ -207,14 +199,14 @@ fn install_merges_sibling_lifecycle_hooks_and_drops_only_the_canary() {
     .unwrap();
     fx.install(WorkerKind::Standard);
     let hooks_doc: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
-    assert!(hooks_doc["hooks"].get("SessionStart").is_none());
+    assert!(hooks_doc["boss"].get("SessionStart").is_some());
     assert!(
-        hooks_doc["hooks"]["PostToolUse"]
+        hooks_doc["boss"]["PostToolUse"]
             .as_array()
             .is_some_and(|a| !a.is_empty())
     );
-    assert!(hooks_doc["hooks"]["Stop"].as_array().is_some_and(|a| !a.is_empty()));
-    assert_eq!(hooks_doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert!(hooks_doc["boss"]["Stop"].as_array().is_some_and(|a| !a.is_empty()));
+    assert_eq!(hooks_doc["boss"]["PreToolUse"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -237,6 +229,7 @@ fn install_takes_over_pre_tool_use_inside_an_existing_boss_group() {
     fx.install(WorkerKind::Standard);
     let hooks_doc: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
     assert!(hooks_doc.get("hooks").is_none());
+    assert_eq!(hooks_doc["boss"].as_object().unwrap().len(), 6);
     assert!(
         hooks_doc["boss"]["SessionStart"]
             .as_array()
@@ -266,16 +259,17 @@ fn checkleft_raises_the_outer_hook_timeout() {
     let hooks_doc: Value =
         serde_json::from_str(&fs::read_to_string(hooks_file_path(&fx.process_home)).unwrap()).unwrap();
     assert_eq!(
-        hooks_doc["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"].as_u64(),
+        hooks_doc["boss"]["PreToolUse"][0]["hooks"][0]["timeout"].as_u64(),
         Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS)
     );
 }
 
 #[test]
 fn probe_attests_positive_and_denied_sentinels_and_content_binding() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-probe-1");
     fx.install(WorkerKind::Standard);
     let report = probe_authorization(&fx.process_home).expect("probe");
@@ -299,9 +293,10 @@ fn probe_attests_positive_and_denied_sentinels_and_content_binding() {
 
 #[test]
 fn mutated_attested_artifacts_fail_the_probe() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-probe-mutate");
     fx.install(WorkerKind::Standard);
     probe_authorization(&fx.process_home).unwrap();
@@ -350,9 +345,10 @@ fn mutated_hooks_policy_settings_and_guard_fail_binding() {
 
 #[test]
 fn camelcase_toolcall_payload_translates_to_auto_approve() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-translate-1");
     fx.install(WorkerKind::Standard);
     let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"), true);
@@ -362,9 +358,10 @@ fn camelcase_toolcall_payload_translates_to_auto_approve() {
 
 #[test]
 fn write_file_is_not_fail_closed_by_bash_only_guards() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-write-1");
     fx.install_with(WorkerKind::Standard, |c| {
         c.path_guard_script = None;
@@ -383,9 +380,10 @@ fn write_file_is_not_fail_closed_by_bash_only_guards() {
 
 #[test]
 fn structural_denies_cover_bypass_mcp_stdin_sudo_and_unknown_tools() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-struct-1");
     fx.install(WorkerKind::Standard);
     let cases = [
@@ -438,9 +436,10 @@ fn structural_denies_cover_bypass_mcp_stdin_sudo_and_unknown_tools() {
 
 #[test]
 fn protected_configuration_is_denied() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-protect-1");
     fx.install(WorkerKind::Standard);
     let gemini = fx.process_home.join(".gemini/config/hooks.json");
@@ -461,9 +460,10 @@ fn protected_configuration_is_denied() {
 
 #[test]
 fn reviewer_native_and_shell_writes_are_denied() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-reviewer-1");
     fx.install_with(WorkerKind::Reviewer, |c| {
         c.is_standard_worker = false;
@@ -490,9 +490,10 @@ fn reviewer_native_and_shell_writes_are_denied() {
 
 #[test]
 fn allowlist_kinds_return_deny_unless_prior_grant() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-allowlist-1");
     fx.install_with(WorkerKind::AnswerAgent, |c| {
         c.is_standard_worker = false;
@@ -504,9 +505,10 @@ fn allowlist_kinds_return_deny_unless_prior_grant() {
 
 #[test]
 fn child_calls_share_the_same_authorization_entry() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-child-1");
     fx.install(WorkerKind::Standard);
     let invoke = json!({"toolCall": {"name": "invoke_subagent", "args": {"prompt": "hello"}}});
@@ -524,9 +526,10 @@ fn child_calls_share_the_same_authorization_entry() {
 
 #[test]
 fn silent_forward_discards_forwarder_stdout() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-forward-1");
     write_exec(
         &fx.forwarder(),
@@ -544,9 +547,10 @@ fn silent_forward_discards_forwarder_stdout() {
 
 #[test]
 fn forwarder_failure_denies() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-forward-fail");
     write_exec(&fx.forwarder(), "#!/bin/sh\nexit 1\n");
     fx.install(WorkerKind::Standard);
@@ -561,9 +565,10 @@ fn forwarder_failure_denies() {
 
 #[test]
 fn pr_redirect_guard_denies_gh_pr_create_through_the_adapter() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-pr-1");
     fx.install(WorkerKind::Standard);
     let (code, body, stderr) = authorize(
@@ -582,9 +587,10 @@ fn pr_redirect_guard_denies_gh_pr_create_through_the_adapter() {
 
 #[test]
 fn git_store_guard_refuses_store_writes_via_agy_payload() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let layout = crate::git_store_guard::tests::cube_layout();
     let fx = Fixture::new("run-git-store-1");
     fx.install_with(WorkerKind::Standard, |c| {
@@ -623,9 +629,10 @@ fn guard_commands_always_includes_boss_launch_guard() {
 
 #[test]
 fn never_emits_allow_ask_or_force_ask() {
-    if !python3_or_skip() {
-        return;
-    }
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
     let fx = Fixture::new("run-vocab-1");
     fx.install(WorkerKind::Standard);
     let (code, body, _) = authorize(&fx.process_home, &run_command_payload("echo ok"), true);
@@ -639,3 +646,6 @@ fn never_emits_allow_ask_or_force_ask() {
     assert_ne!(decision, "ask");
     assert_ne!(decision, "force_ask");
 }
+
+#[path = "adapter_failure_tests.rs"]
+mod failure_tests;
