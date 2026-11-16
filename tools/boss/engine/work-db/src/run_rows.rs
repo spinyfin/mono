@@ -221,8 +221,8 @@ impl WorkDb {
     }
 
     /// Best-effort rewrite of `work_runs.transcript_path` values that still
-    /// point into a per-run Grok, Codex, or agy home (`boss-grok-homes` /
-    /// `boss-codex-homes` / `boss-agy-homes`). Those homes are reclaimed; the
+    /// point into a per-run Grok or Codex home (`boss-grok-homes` /
+    /// `boss-codex-homes`). Those homes are reclaimed; the
     /// transcript bytes live under the durable store when one was
     /// provisioned. Returns the number of rows updated.
     ///
@@ -235,13 +235,14 @@ impl WorkDb {
     /// with a dead one that no longer matches this backfill's query, making
     /// the missing transcript permanently invisible.
     pub fn backfill_durable_transcript_paths(&self) -> Result<BackfillDurableTranscriptPathsOutcome> {
+        // Only select layouts that persistable_transcript_path can rewrite.
+        // Agy paths remain ephemeral and are protected by agy retention.
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, transcript_path FROM work_runs
              WHERE transcript_path IS NOT NULL
                AND (instr(transcript_path, '/boss-grok-homes/') > 0
-                 OR instr(transcript_path, '/boss-codex-homes/') > 0
-                 OR instr(transcript_path, '/boss-agy-homes/') > 0)",
+                 OR instr(transcript_path, '/boss-codex-homes/') > 0)",
         )?;
         let rows: Vec<(String, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?

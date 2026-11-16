@@ -85,8 +85,7 @@ pub async fn run_one_pass_with_policy(
     dry_run: bool,
 ) -> GrokHomeRetentionSweepOutcome {
     // Rewrite pointers into per-run homes before those homes are deleted.
-    // Covers Grok and Codex rows: this pass also runs from `bossctl grok-homes`,
-    // which is not the engine-start path.
+    // This also runs from `bossctl grok-homes`, outside engine startup.
     work_db.apply_durable_transcript_path_backfill();
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();

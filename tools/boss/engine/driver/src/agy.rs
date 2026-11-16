@@ -2,8 +2,8 @@
 //!
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
 //! provisioning, and per-kind permission rendering (`--settings`). Interactive
-//! TUI spawn still refuses until guard hooks land and durable transcript
-//! storage exists.
+//! TUI spawn still refuses until guard hooks land. Retention preserves
+//! transcript evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -86,14 +86,13 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning and permission
 /// rendering are live; interactive TUI spawn still refuses until guard hooks
-/// land and durable transcript storage exists.
+/// land. Retention preserves per-run transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
 }
 
-/// Refuse launch while guard hooks or the durable transcript store are
-/// unavailable.
+/// Refuse launch while guard hooks are unavailable.
 pub fn refuse_agy_spawn(reason: &str) -> String {
     format!("printf '%s\\n' {} >&2; exit 1\n", shell_quote(reason))
 }
@@ -258,15 +257,10 @@ impl AgentDriver for AgyDriver {
             );
         }
 
-        // HOME is isolated; spawn stays refused until guard hooks land and a
-        // durable transcript store exists. Teardown keeps `brain/` and
-        // `conversations/` readable, but the retention sweep still deletes
-        // the whole container after the age/byte policy, so enabling spawn
-        // before that store lands would leave dead transcript_path values.
-        refuse_agy_plan(
-            env,
-            "agy driver is not spawnable yet (guard hooks are not wired; durable transcript store is not provisioned)",
-        )
+        // HOME is isolated; spawn stays refused until guard hooks land.
+        // Retention preserves containers holding brain/ or conversations/
+        // evidence while agy lacks durable transcript storage.
+        refuse_agy_plan(env, "agy driver is not spawnable yet (guard hooks are not wired)")
     }
 
     async fn provision_workspace(

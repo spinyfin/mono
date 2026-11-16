@@ -85,8 +85,7 @@ pub async fn run_one_pass_with_policy(
     dry_run: bool,
 ) -> AgyHomeRetentionSweepOutcome {
     // Rewrite pointers into per-run homes before those homes are deleted.
-    // Covers Grok, Codex, and agy rows: this pass also runs from
-    // `bossctl agy-homes`, which is not the engine-start path.
+    // This also runs from `bossctl agy-homes`, outside engine startup.
     work_db.apply_durable_transcript_path_backfill();
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -237,6 +236,45 @@ mod tests {
         )
         .unwrap();
         std::fs::write(container.join("process-home/.gemini/antigravity-cli/marker"), "x").unwrap();
+    }
+
+    #[test]
+    fn retention_preserves_transcripts_under_age_and_byte_pressure() {
+        let tmp = tempfile::tempdir().unwrap();
+        for subtree in ["brain", "conversations"] {
+            for policy in [
+                retention::AgyHomeRetentionPolicy::new(Duration::ZERO, u64::MAX),
+                retention::AgyHomeRetentionPolicy::new(Duration::from_secs(u64::MAX), 0),
+            ] {
+                let container = tmp.path().join(subtree);
+                write_agy_container(&container);
+                let transcript = container
+                    .join("process-home/.gemini/antigravity-cli")
+                    .join(subtree)
+                    .join("conversation.jsonl");
+                std::fs::write(&transcript, "conversation evidence").unwrap();
+                let homes = [retention::OwnedAgyHome {
+                    path: container.clone(),
+                    execution_id: "terminal-run".into(),
+                    is_live: false,
+                    age_anchor_epoch: 0,
+                    size_bytes: retention::directory_size_bytes(&container),
+                }];
+                let plan = retention::plan_reclaim(&homes, now_epoch(), &policy);
+                assert!(plan.to_delete.is_empty(), "{plan:?}");
+                for dry_run in [true, false] {
+                    let report =
+                        retention::execute_reclaim(&homes, now_epoch(), &policy, dry_run, &|_| Ok(())).unwrap();
+                    assert!(report.deleted.is_empty(), "{report:?}");
+                    assert!(report.errors.is_empty(), "{report:?}");
+                    assert_eq!(report.scanned, 1);
+                    assert_eq!(report.kept_in_policy, 1);
+                    assert_eq!(report.deleted_bytes, 0);
+                    assert_eq!(std::fs::read_to_string(&transcript).unwrap(), "conversation evidence");
+                }
+                std::fs::remove_dir_all(&container).unwrap();
+            }
+        }
     }
 
     /// Driven by a test-owned current-thread runtime rather than
