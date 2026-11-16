@@ -421,7 +421,7 @@ impl ExecutionCoordinator {
         self.work_db.get_execution_driver_slug(&execution.id)
     }
 
-    fn check_predecessor_lease_hold(&self, execution: &WorkExecution, worker_id: &str) -> Result<()> {
+    async fn check_predecessor_lease_hold(&self, execution: &WorkExecution, worker_id: &str) -> Result<()> {
         // The run this row recovers from has not released its cube lease, so
         // its unpublished work may not be preserved yet. The drain holds such
         // a row before claiming a slot; this is the chokepoint backstop for
@@ -429,6 +429,7 @@ impl ExecutionCoordinator {
         // and this call. Starting from trunk here would strand the work, so it
         // refuses rather than guess. A pending preservation leaves the row
         // ready; a hold that outlasts its bound terminalizes it with a retry reason.
+        self.refresh_occupancy_kept_predecessor(execution).await;
         let hold = match self.predecessor_lease_hold(execution) {
             None => return Ok(()),
             Some(hold) => hold,
@@ -505,7 +506,7 @@ impl ExecutionCoordinator {
                 execution.id
             ));
         }
-        self.check_predecessor_lease_hold(execution, worker_id)?;
+        self.check_predecessor_lease_hold(execution, worker_id).await?;
         // Global pause gate. `drain_ready_queue` short-circuits before ever
         // claiming a slot, so in the ordinary case this is never reached
         // while paused — but a pause can land in the window between that
@@ -642,7 +643,7 @@ impl ExecutionCoordinator {
                         // Reconciliation can make a previously live run the
                         // recovery predecessor while its release gates keep
                         // the lease. Recheck before leasing a successor.
-                        self.check_predecessor_lease_hold(execution, worker_id)?;
+                        self.check_predecessor_lease_hold(execution, worker_id).await?;
                         // Not redundant after all — fall through to the rest of dispatch.
                     } else {
                         // The blocker survived every death check the reconciler

@@ -60,8 +60,15 @@ hold ends when the predecessor's lease is released (the cleared lease columns
 are what dispatch reads). The leftover sweep also retries leases older than
 cube's TTL. What keeps a
 lease recorded is a pane or process still in the workspace, occupancy that
-cannot be confirmed, or a cube failure; the leftover sweep keeps retrying and
-the successor stays held behind it rather than abandoning the work. A
+cannot be confirmed, or a cube failure; the leftover sweep keeps retrying —
+including a fresh occupancy scan for a lease that was kept because the
+workspace was occupied, even when the finished run never recorded a worker
+pid — and the successor stays held behind it rather than abandoning the work.
+When a successor is waiting on such a lease, dispatch re-scans occupancy
+before holding or failing it: an empty workspace (or one that holds only
+unowned occupants past the existing bound) is preserved and released so the
+successor can start, and a still-occupied workspace fails with the occupants
+seen on that scan. A
 preservation failure does not hold the lease: the release goes ahead and a
 `preserved_work_needs_inspection` attention item on the predecessor carries the
 error and the lease id, so a successor that then starts without that work does

@@ -18,7 +18,8 @@ use crate::transient_recovery::{
     NoopWorkerNudger, RecoveryContext, TransientRecoveryOutcome, TransientRecoveryReaper, run_one_pass_with_occupancy,
 };
 use crate::workspace_lease_release::{
-    DbPreservation, EmptyOccupancy, LeaseReleaseOutcome, PaneStatus, ReleaseEvidence, TerminalCause, apply_release,
+    DbPreservation, EmptyOccupancy, HostOccupancy, KeepReason, LEASE_UNRELEASED_ATTENTION_KIND, LeaseReleaseOutcome,
+    Occupancy, PaneStatus, ReleaseEvidence, TerminalCause, WorkspaceOccupancy, apply_release, run_one_pass,
 };
 use boss_engine_recovery::execution_bookmark::{self as recovery, LocalJj};
 use boss_engine_test_git::jj::JjRepo;
@@ -379,6 +380,201 @@ async fn orphan_cleanup_preserves_work_and_unblocks_the_successor() {
         std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
         "unpublished fix"
     );
+}
+
+fn spawn_workspace_occupant(workspace: &Path, run_id: Option<&str>) -> Occupant {
+    use std::io::BufRead;
+    let mut command = std::process::Command::new("python3");
+    command
+        .args([
+            "-u",
+            "-c",
+            "import os,time; os.setsid(); print('ready'); time.sleep(600)",
+        ])
+        .current_dir(workspace)
+        .env_remove("BOSS_RUN_ID")
+        .env_remove("BOSS_SPAWN_TOKEN")
+        .stdout(std::process::Stdio::piped());
+    if let Some(run_id) = run_id {
+        command.env("BOSS_RUN_ID", run_id);
+    }
+    let mut child = command.spawn().unwrap();
+    let mut ready = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    Occupant(child)
+}
+
+struct Occupant(std::process::Child);
+
+impl Occupant {
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Occupant {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn wait_until_occupied(path: &Path) -> Occupancy {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let seen = HostOccupancy.occupancy(path);
+        if seen == Occupancy::Occupied || std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn wait_until_empty(path: &Path) -> Occupancy {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let seen = HostOccupancy.occupancy(path);
+        if seen == Occupancy::Empty || std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+async fn keep_lease_with_occupants(s: &Stalled) -> LeaseReleaseOutcome {
+    apply_release(
+        s.db(),
+        &s.stalled(),
+        "lease-old",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &HostOccupancy,
+            preservation: &DbPreservation::new(s.db(), None).with_cube(s.cube.as_ref()),
+        },
+        s.cube.force_release_lease("lease-old", Some("occupancy keep")),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn occupancy_kept_lease_releases_on_recheck_and_successor_dispatches() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    let occupant = spawn_workspace_occupant(&s.repo.worker, None);
+    assert_eq!(wait_until_occupied(&s.repo.worker), Occupancy::Occupied);
+    let kept = keep_lease_with_occupants(&s).await;
+    assert!(
+        matches!(
+            kept,
+            LeaseReleaseOutcome::Kept {
+                reason: KeepReason::OccupancyUnconfirmed | KeepReason::ProcessInWorkspace
+            }
+        ),
+        "{kept:?}"
+    );
+    assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    assert_eq!(s.wait_reason(&successor.id).as_deref(), Some(HOLD_REASON));
+
+    drop(occupant);
+    assert_eq!(wait_until_empty(&s.repo.worker), Occupancy::Empty);
+    let swept = run_one_pass(s.db(), s.cube.as_ref(), &LiveWorkerStateRegistry::new()).await;
+    assert_eq!(swept.released, 1, "{swept:?}");
+    assert!(s.db().get_execution(&s.stalled_id).unwrap().cube_lease_id.is_none());
+    assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
+
+    s.coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+    assert_eq!(
+        std::fs::read_to_string(s.repo.replacement.join("fix")).unwrap(),
+        "unpublished fix"
+    );
+}
+
+#[tokio::test]
+async fn successor_failure_quotes_fresh_occupancy_not_the_original_list() {
+    let s = Stalled::new(true).await;
+    s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
+    let successor = s
+        .db()
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(s.stalled().work_item_id)
+                .build(),
+        )
+        .unwrap();
+    let original = spawn_workspace_occupant(&s.repo.worker, None);
+    assert_eq!(wait_until_occupied(&s.repo.worker), Occupancy::Occupied);
+    assert!(matches!(
+        keep_lease_with_occupants(&s).await,
+        LeaseReleaseOutcome::Kept { .. }
+    ));
+    let original_pid = original.pid().to_string();
+    let original_body = s
+        .db()
+        .list_attention_items(&s.stalled_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .unwrap()
+        .body_markdown;
+    assert!(original_body.contains(&original_pid), "{original_body}");
+
+    drop(original);
+    assert_eq!(wait_until_empty(&s.repo.worker), Occupancy::Empty);
+
+    let product = create_test_product(s.db());
+    let chore = create_test_chore(s.db(), product.id, "live-owner");
+    let live = create_ready_chore_execution(s.db(), chore.id);
+    s.db()
+        .start_execution_run(&live.id, "worker", "mono", "lease-live", "ws-live", "/tmp/ws-live")
+        .unwrap();
+    let live_occupant = spawn_workspace_occupant(&s.repo.worker, Some(&live.id));
+    assert_eq!(wait_until_occupied(&s.repo.worker), Occupancy::Occupied);
+    let live_pid = live_occupant.pid().to_string();
+
+    s.coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Ready
+    );
+    age_predecessor(&s);
+    let err = s
+        .coordinator
+        .force_dispatch(&successor.id, DispatchAdmission::OperatorForced)
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("Recovery cannot start"), "{err}");
+    assert!(
+        err.contains(&live_pid),
+        "fresh scan must name the current occupant: {err}"
+    );
+    assert!(
+        !err.contains(&original_pid),
+        "stale occupants must not appear in the successor failure: {err}"
+    );
+    assert_eq!(
+        s.db().get_execution(&successor.id).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    drop(live_occupant);
 }
 
 #[tokio::test]

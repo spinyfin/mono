@@ -361,17 +361,20 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
     } = evidence;
     let local = matches!(db.execution_host_id(&execution.id), Ok(None))
         || matches!(db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
+    let mut occupancy_detail: Option<String> = None;
     let occupancy_status = if pane == PaneStatus::Present || cause == TerminalCause::ProvenNeverStarted {
         Occupancy::Empty // Neither case may start cleanup; decide still gates on the pane.
     } else if !local && !occupancy.probes_owning_host() {
         Occupancy::Unknown
     } else if local && let Some(cleanup) = occupancy.cleanup(db, execution) {
-        cleanup.await.unwrap_or_else(|err| {
-            raise_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND,
-                "Workspace recovery needs process cleanup", &format!("Lease {lease_id}: {err:#}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected."));
-            tracing::error!(execution_id = %execution.id, lease_id, error = %err, "workspace process cleanup failed");
-            Occupancy::Unknown
-        })
+        match cleanup.await {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, lease_id, error = %err, "workspace process cleanup failed");
+                occupancy_detail = Some(format!("{err:#}"));
+                Occupancy::Unknown
+            }
+        }
     } else {
         execution
             .workspace_path
@@ -381,16 +384,12 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
     match decide(cause, pane, occupancy_status) {
         LeaseReleaseDecision::Keep(reason) => {
             if pane == PaneStatus::Gone {
-                raise_attention(
-                    db,
-                    execution,
-                    LEASE_UNRELEASED_ATTENTION_KIND,
-                    "Workspace recovery could not release its lease",
-                    &format!(
-                        "Lease {lease_id} remains held: {}. Inspect the owning host's worker process cleanup log for PIDs and retry recovery after resolving the occupants or host connectivity.",
-                        reason.label()
-                    ),
-                );
+                let (title, body) = occupancy_keep_attention(lease_id, reason, occupancy_detail.as_deref());
+                if occupancy_detail.is_some() {
+                    refresh_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND, title, &body);
+                } else {
+                    raise_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND, title, &body);
+                }
             }
             tracing::info!(
                 execution_id = %execution.id,
@@ -641,6 +640,29 @@ fn report_preservation_failure(
     }
 }
 
+fn occupancy_keep_attention(
+    lease_id: &str,
+    reason: KeepReason,
+    cleanup_detail: Option<&str>,
+) -> (&'static str, String) {
+    match cleanup_detail {
+        Some(detail) => (
+            "Workspace recovery needs process cleanup",
+            format!(
+                "Lease {lease_id} remains held: {}. {detail}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected.",
+                reason.label()
+            ),
+        ),
+        None => (
+            "Workspace recovery could not release its lease",
+            format!(
+                "Lease {lease_id} remains held: {}. Inspect the owning host's worker process cleanup log for PIDs and retry recovery after resolving the occupants or host connectivity.",
+                reason.label()
+            ),
+        ),
+    }
+}
+
 pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
     match db.list_attention_items(&execution.id) {
         Ok(items) if items.iter().any(|item| item.kind == kind && item.status == "open") => {
@@ -669,6 +691,19 @@ pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title
             execution_id = %execution.id,
             error = %format!("{err:#}"),
             "could not file workspace-lease attention",
+        );
+    }
+}
+
+/// Refresh an open occupancy-keep item with the latest scan. `created_at`
+/// stays put so a successor's hold bound is not reset; the body is what
+/// later failure messages quote.
+fn refresh_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
+    if let Err(err) = db.upsert_execution_attention(&execution.id, kind, title, body) {
+        tracing::error!(
+            execution_id = %execution.id,
+            error = %format!("{err:#}"),
+            "could not refresh workspace-lease attention",
         );
     }
 }

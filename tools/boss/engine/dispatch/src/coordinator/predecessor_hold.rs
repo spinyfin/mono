@@ -1,6 +1,10 @@
 //! The bounded wait on a recovery predecessor that still holds its cube
 //! workspace lease. Part of the `coordinator` module split.
 
+use std::sync::Arc;
+
+use boss_execution_contracts::{HostAdapter, PaneStatus};
+
 use super::*;
 
 /// How long a kept-lease problem may persist before a recovery successor is
@@ -41,8 +45,10 @@ impl ExecutionCoordinator {
     /// start and the successor's first hold, so a successor created after the
     /// problem was already old still gets the full bound. A fresh open
     /// `workspace_lease_release_failed` item still blocks the missing-evidence
-    /// fallback so a remote cube retry is not mistaken for silence. The check
-    /// is read-only; callers record the failure with [`Self::fail_predecessor_hold`].
+    /// fallback so a remote cube retry is not mistaken for silence. Occupancy
+    /// is re-scanned first via [`Self::refresh_occupancy_kept_predecessor`];
+    /// this check then reads that result. Callers record a bound failure with
+    /// [`Self::fail_predecessor_hold`].
     pub(super) fn predecessor_lease_hold(&self, execution: &WorkExecution) -> Option<PredecessorHold> {
         match self.work_db.recovery_predecessor_holding_lease(execution) {
             Ok(None) => None,
@@ -118,6 +124,54 @@ impl ExecutionCoordinator {
             Err(err) => Some(PredecessorHold::Waiting(format!(
                 "recovery predecessor could not be resolved: {err:#}"
             ))),
+        }
+    }
+
+    /// Re-run preservation and release for an occupancy-kept predecessor.
+    /// A waiting successor must not quote a stale occupant list, and a
+    /// workspace that has since emptied must be preserved and returned so
+    /// the successor can start. Cube-release failures are retried by the
+    /// leftover-lease sweep; this path is the occupancy gate.
+    pub(super) async fn refresh_occupancy_kept_predecessor(&self, execution: &WorkExecution) {
+        let Ok(Some(predecessor)) = self.work_db.recovery_predecessor_holding_lease(execution) else {
+            return;
+        };
+        let occupancy_kept = self.work_db.list_attention_items(&predecessor.id).is_ok_and(|items| {
+            items.iter().any(|item| {
+                item.status == "open"
+                    && item.kind == boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND
+            })
+        });
+        if !occupancy_kept {
+            return;
+        }
+        let adapter = self.adapter_for_predecessor_host(&predecessor).await;
+        self.lifecycle
+            .release_lease_after_inferred_death(
+                &predecessor,
+                PaneStatus::Gone,
+                adapter.as_ref(),
+                "recovery successor occupancy re-check",
+            )
+            .await;
+    }
+
+    async fn adapter_for_predecessor_host(&self, predecessor: &WorkExecution) -> Arc<dyn HostAdapter> {
+        let host_id = self
+            .work_db
+            .latest_run_host_for_execution(&predecessor.id)
+            .ok()
+            .flatten();
+        match host_id.as_deref() {
+            None | Some("local") => self.host_adapter(),
+            Some(id) => match self.work_db.get_host(id) {
+                Ok(Some(host)) => self
+                    .host_adapter_provider
+                    .adapter_for(&host)
+                    .await
+                    .unwrap_or_else(|_| self.host_adapter()),
+                _ => self.host_adapter(),
+            },
         }
     }
 

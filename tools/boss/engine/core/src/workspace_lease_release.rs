@@ -357,20 +357,22 @@ fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &Wo
             PaneStatus::Gone
         }
         // A row that never recorded a pid (a pre-start failure, or a spawn
-        // that failed before its pane) is retried only after an earlier
-        // release attempt got past every gate and then failed in cube. That
-        // attempt ran after the spawn had settled, so it is the durable proof
-        // that nothing is mid-spawn; the occupancy scan still runs again here.
-        Ok(None) if release_previously_failed_in_cube(db, &execution.id) => PaneStatus::Gone,
+        // that failed before its pane) is retried after an earlier release
+        // attempt passed the pane gate: occupancy kept the lease, or cube
+        // failed after every gate. Either is proof the spawn had settled;
+        // occupancy is scanned again here so a workspace that has since
+        // emptied can be preserved and returned.
+        Ok(None) if previous_release_passed_pane_gate(db, &execution.id) => PaneStatus::Gone,
         _ => PaneStatus::Present,
     }
 }
 
-fn release_previously_failed_in_cube(db: &WorkDb, execution_id: &str) -> bool {
+fn previous_release_passed_pane_gate(db: &WorkDb, execution_id: &str) -> bool {
     db.list_attention_items(execution_id).is_ok_and(|items| {
-        items
-            .iter()
-            .any(|item| item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND && item.status == "open")
+        items.iter().any(|item| {
+            item.status == "open"
+                && (item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND || item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        })
     })
 }
 
@@ -446,21 +448,25 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
             continue;
         };
         // A terminal registry entry may still own a pane; absence from the
-        // registry is not proof after a restart. Require durable pid death.
+        // registry is not proof after a restart. Require durable pid death,
+        // or a prior occupancy-keep / cube-failure that already passed the
+        // pane gate (so occupancy can be scanned again).
         let pane = sweep_pane_status(work_db, live_states, &execution);
         if pane == PaneStatus::Present {
-            if !live_states.snapshot().iter().any(|state| state.run_id == execution.id) {
+            // A recorded PID is what an operator can inspect. A never-started
+            // row has none; occupancy-keep attention (if any) is what lets
+            // the next pass retry the scan rather than this unconfirmed-death
+            // item, which would otherwise pin the pane as present forever.
+            if !live_states.snapshot().iter().any(|state| state.run_id == execution.id)
+                && let Ok(Some(pid)) = work_db.latest_local_shell_pid_for_execution(&execution.id)
+            {
                 raise_attention(
                     work_db,
                     &execution,
                     LEASE_UNRELEASED_ATTENTION_KIND,
                     "Terminal worker still holds its workspace",
                     &format!(
-                        "Lease {lease_id} cannot be preserved safely: recorded shell PID {:?} has no live execution registration and death is unconfirmed. Inspect this PID on the owning host and retry recovery; the workspace has not been reset.",
-                        work_db
-                            .latest_local_shell_pid_for_execution(&execution.id)
-                            .ok()
-                            .flatten()
+                        "Lease {lease_id} cannot be preserved safely: recorded shell PID {pid} has no live execution registration and death is unconfirmed. Inspect this PID on the owning host and retry recovery; the workspace has not been reset.",
                     ),
                 );
             }
