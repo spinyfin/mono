@@ -2,9 +2,7 @@
 //! Reclaims the parent of process-home, including control and rules directories.
 //! Containers holding transcript evidence are retained regardless of age or byte cap.
 //! Interactive ~/.gemini is never scanned.
-pub use boss_engine_driver_home_retention::{
-    OwnedHome as OwnedAgyHome, ReclaimPlan, ReclaimReport, RetentionPolicy, directory_size_bytes,
-};
+pub use boss_engine_driver_home_retention::{OwnedHome as OwnedAgyHome, RetentionPolicy, directory_size_bytes};
 use std::path::Path;
 use std::time::Duration;
 /// Uses the same retention window as Grok.
@@ -48,26 +46,50 @@ impl AgyHomeRetentionPolicy {
     }
 }
 
-pub fn plan_reclaim(homes: &[OwnedAgyHome], now: i64, policy: &AgyHomeRetentionPolicy) -> ReclaimPlan {
-    let (eligible, protected) = partition_transcript_homes(homes);
+/// Shared reclaim accounting and transcript-preservation accounting.
+#[derive(Debug)]
+pub struct TranscriptRetention<T> {
+    inner: T,
+    /// Distinct terminal containers retained outside the reclaimable byte allowance.
+    pub kept_for_transcripts: usize,
+    /// Sum of recorded container sizes, deduplicated by path using the largest size.
+    pub kept_for_transcripts_bytes: u64,
+}
+impl<T> std::ops::Deref for TranscriptRetention<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+pub type ReclaimPlan = TranscriptRetention<boss_engine_driver_home_retention::ReclaimPlan>;
+pub type ReclaimReport = TranscriptRetention<boss_engine_driver_home_retention::ReclaimReport>;
+
+/// Plan retention using the driver-owned transcript protection predicate.
+pub fn plan_reclaim(
+    homes: &[OwnedAgyHome],
+    now: i64,
+    policy: &AgyHomeRetentionPolicy,
+    probe: &dyn Fn(&Path) -> bool,
+) -> ReclaimPlan {
+    let (eligible, protected) = partition_transcript_homes(homes, probe);
     let mut plan = boss_engine_driver_home_retention::plan_reclaim(
         &eligible,
         now,
         &RetentionPolicy::new(policy.max_age, policy.max_total_bytes),
     );
-    plan.scanned += protected.scanned;
-    plan.skipped_live += protected.skipped_live;
-    plan.kept_in_policy += protected.kept_in_policy;
-    plan
+    plan.scanned += homes.len() - eligible.len();
+    wrap(plan, &protected)
 }
+/// Apply retention using the same driver-owned protection predicate as planning.
 pub fn execute_reclaim(
     homes: &[OwnedAgyHome],
     now: i64,
     policy: &AgyHomeRetentionPolicy,
     dry_run: bool,
     safety: &dyn Fn(&Path) -> anyhow::Result<()>,
+    probe: &dyn Fn(&Path) -> bool,
 ) -> anyhow::Result<ReclaimReport> {
-    let (eligible, protected) = partition_transcript_homes(homes);
+    let (eligible, protected) = partition_transcript_homes(homes, probe);
     let mut report = boss_engine_driver_home_retention::execute_reclaim(
         &eligible,
         now,
@@ -75,39 +97,131 @@ pub fn execute_reclaim(
         dry_run,
         safety,
     )?;
-    report.scanned += protected.scanned;
-    report.skipped_live += protected.skipped_live;
-    report.kept_in_policy += protected.kept_in_policy;
-    Ok(report)
+    report.scanned += homes.len() - eligible.len();
+    Ok(wrap(report, &protected))
 }
-
-// Until agy has durable transcript storage, retain containers holding transcript
-// bytes. Empty subtrees contain no evidence and can be reclaimed. Errors are
-// conservative: unreadable evidence must not become deletable.
-fn contains_transcripts(container: &Path) -> bool {
-    // A corrupt runtime record may name a regular file. It cannot contain
-    // transcript subtrees; let reclaim report its normal deletion error.
-    if container.is_file() {
-        return false;
+fn wrap<T>(inner: T, protected: &[OwnedAgyHome]) -> TranscriptRetention<T> {
+    TranscriptRetention {
+        inner,
+        kept_for_transcripts: protected.len(),
+        kept_for_transcripts_bytes: protected
+            .iter()
+            .fold(0u64, |sum, home| sum.saturating_add(home.size_bytes)),
     }
-    let state = container.join("process-home/.gemini/antigravity-cli");
-    ["brain", "conversations"]
-        .iter()
-        .any(|leaf| match std::fs::read_dir(state.join(leaf)) {
-            Ok(mut entries) => entries.next().is_some(),
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        })
+}
+fn partition_transcript_homes(
+    homes: &[OwnedAgyHome],
+    probe: &dyn Fn(&Path) -> bool,
+) -> (Vec<OwnedAgyHome>, Vec<OwnedAgyHome>) {
+    let mut paths = std::collections::BTreeMap::<_, Vec<&OwnedAgyHome>>::new();
+    for home in homes {
+        paths.entry(&home.path).or_default().push(home);
+    }
+    let mut eligible = Vec::new();
+    let mut protected = Vec::new();
+    for (path, owners) in paths {
+        // Keep all owners visible to the shared live guard and probe each
+        // fully-terminal path only once, even during concurrent transcript writes.
+        if owners.iter().any(|home| home.is_live) || !probe(path) {
+            eligible.extend(owners.into_iter().cloned());
+        } else {
+            let mut home = owners[0].clone();
+            home.size_bytes = owners.iter().map(|home| home.size_bytes).max().unwrap_or(0);
+            protected.push(home);
+        }
+    }
+    (eligible, protected)
 }
 
-fn partition_transcript_homes(homes: &[OwnedAgyHome]) -> (Vec<OwnedAgyHome>, ReclaimPlan) {
-    let (protected, eligible): (Vec<_>, Vec<_>) =
-        homes.iter().cloned().partition(|home| contains_transcripts(&home.path));
-    // Reuse path deduplication and live-owner accounting with unlimited bounds.
-    // Protected terminal paths are counted as kept_in_policy.
-    let protected_plan = boss_engine_driver_home_retention::plan_reclaim(
-        &protected,
-        i64::MIN,
-        &RetentionPolicy::new(Duration::from_secs(u64::MAX), u64::MAX),
-    );
-    (eligible, protected_plan)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn changing_transcripts_cannot_split_live_and_terminal_owners() {
+        for live_first in [false, true] {
+            let home = OwnedAgyHome {
+                path: "/unused/live-container".into(),
+                execution_id: "terminal".into(),
+                is_live: false,
+                age_anchor_epoch: 0,
+                size_bytes: 42,
+            };
+            let mut live = home.clone();
+            live.is_live = true;
+            live.execution_id = "live".into();
+            let homes = if live_first { vec![live, home] } else { vec![home, live] };
+            for policy in [
+                AgyHomeRetentionPolicy::new(Duration::ZERO, u64::MAX),
+                AgyHomeRetentionPolicy::new(Duration::MAX, 0),
+            ] {
+                let calls = Cell::new(0);
+                let probe = |_: &Path| {
+                    let previous = calls.replace(calls.get() + 1);
+                    previous > 0
+                };
+                let plan = plan_reclaim(&homes, 100, &policy, &probe);
+                assert!(plan.to_delete.is_empty());
+                assert_eq!(plan.skipped_live, 1);
+                for dry_run in [true, false] {
+                    let report = execute_reclaim(
+                        &homes,
+                        100,
+                        &policy,
+                        dry_run,
+                        &|_| panic!("live path reached deletion"),
+                        &probe,
+                    )
+                    .unwrap();
+                    assert!(report.deleted.is_empty());
+                    assert_eq!(report.skipped_live, 1);
+                }
+                assert_eq!(
+                    calls.get(),
+                    0,
+                    "live paths must never be partitioned by transcript presence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_terminal_paths_are_probed_and_counted_once() {
+        let home = OwnedAgyHome {
+            path: "/unused/terminal-container".into(),
+            execution_id: "terminal".into(),
+            is_live: false,
+            age_anchor_epoch: 0,
+            size_bytes: 42,
+        };
+        let homes = [home.clone(), home];
+        let calls = Cell::new(0);
+        let probe = |_: &Path| {
+            let previous = calls.replace(calls.get() + 1);
+            previous == 0
+        };
+        let policy = AgyHomeRetentionPolicy::new(Duration::ZERO, 0);
+        let plan = plan_reclaim(&homes, 100, &policy, &probe);
+        assert_eq!(calls.get(), 1);
+        assert!(plan.to_delete.is_empty());
+        assert_eq!(plan.scanned, 2);
+        assert_eq!(plan.kept_in_policy, 0);
+        assert_eq!(plan.kept_for_transcripts, 1);
+        assert_eq!(plan.kept_for_transcripts_bytes, 42);
+        calls.set(0);
+        let report = execute_reclaim(
+            &homes,
+            100,
+            &policy,
+            false,
+            &|_| panic!("protected path reached deletion"),
+            &probe,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(report.deleted.is_empty());
+        assert_eq!(report.kept_for_transcripts, 1);
+        assert_eq!(report.kept_for_transcripts_bytes, 42);
+    }
 }

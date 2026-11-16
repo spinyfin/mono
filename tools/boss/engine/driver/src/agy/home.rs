@@ -33,6 +33,24 @@ pub const AGY_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_AGY_SKIP_POSTURE_ASSERT";
 pub(crate) const AGY_HOMES_DIR_NAME: &str = "boss-agy-homes";
 
 const PROCESS_HOME_LEAF: &str = "process-home";
+/// Transcript paths relative to the container, shared by teardown and retention.
+pub const AGY_TRANSCRIPT_PATHS: &[&[&str]] = &[
+    &[PROCESS_HOME_LEAF, ".gemini", "antigravity-cli", "conversations"],
+    &[PROCESS_HOME_LEAF, ".gemini", "antigravity-cli", "brain"],
+];
+/// Fail closed when transcript evidence cannot be read.
+pub fn contains_agy_transcripts(container: &Path) -> bool {
+    if container.is_file() {
+        return false;
+    }
+    AGY_TRANSCRIPT_PATHS.iter().any(|parts| {
+        let path = parts.iter().fold(container.to_path_buf(), |path, part| path.join(part));
+        match fs::read_dir(path) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    })
+}
 /// Global-root hook directory, relative to the per-run `HOME`.
 const HOOKS_DIR_RELATIVE: &str = ".gemini/config";
 const CONTROL_LEAF: &str = "control";
@@ -424,11 +442,7 @@ pub fn reclaim_agy_run(process_home: &Path) -> anyhow::Result<()> {
     let container = process_home.parent().context("agy run container")?;
     assert_agy_home_safe_to_delete(container)?;
     validate_private_layout(process_home)?;
-    let base = ["process-home", ".gemini", "antigravity-cli"];
-    let keep: Vec<Vec<&str>> = ["conversations", "brain"]
-        .iter()
-        .map(|leaf| base.iter().copied().chain([*leaf]).collect())
-        .collect();
+    let keep: Vec<Vec<&str>> = AGY_TRANSCRIPT_PATHS.iter().map(|path| path.to_vec()).collect();
     retain_paths(container, &keep)
 }
 

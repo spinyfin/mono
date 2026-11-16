@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use boss_engine_agy_home_retention as retention;
-use boss_engine_driver::agy::{AgyRuntimeState, assert_agy_home_safe_to_delete};
+use boss_engine_driver::agy::{AgyRuntimeState, assert_agy_home_safe_to_delete, contains_agy_transcripts};
 
 use crate::work::WorkDb;
 
@@ -44,11 +44,15 @@ pub struct AgyHomeRetentionSweepOutcome {
     pub kept_in_policy: u64,
     #[builder(default)]
     pub errors: u64,
+    #[builder(default)]
+    pub kept_for_transcripts: u64,
+    #[builder(default)]
+    pub kept_for_transcripts_bytes: u64,
 }
 
 impl crate::sweep_loop::SweepOutcome for AgyHomeRetentionSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.deleted > 0 || self.errors > 0
+        self.deleted > 0 || self.errors > 0 || self.kept_for_transcripts > 0
     }
 
     fn log(&self) {
@@ -60,6 +64,8 @@ impl crate::sweep_loop::SweepOutcome for AgyHomeRetentionSweepOutcome {
             skipped_live = self.skipped_live,
             kept_in_policy = self.kept_in_policy,
             errors = self.errors,
+            kept_for_transcripts = self.kept_for_transcripts,
+            kept_for_transcripts_bytes = self.kept_for_transcripts_bytes,
             "agy-home retention sweep: reclaimed Boss-owned agy run containers past policy",
         );
     }
@@ -147,7 +153,14 @@ pub async fn run_one_pass_with_policy(
         return AgyHomeRetentionSweepOutcome::default();
     }
 
-    match retention::execute_reclaim(&homes, now_epoch, policy, dry_run, &assert_agy_home_safe_to_delete) {
+    match retention::execute_reclaim(
+        &homes,
+        now_epoch,
+        policy,
+        dry_run,
+        &assert_agy_home_safe_to_delete,
+        &contains_agy_transcripts,
+    ) {
         Ok(report) => {
             for error in &report.errors {
                 tracing::warn!(%error, "agy-home retention sweep: failed to reclaim a recorded root");
@@ -160,6 +173,8 @@ pub async fn run_one_pass_with_policy(
                 skipped_live: report.skipped_live as u64,
                 kept_in_policy: report.kept_in_policy as u64,
                 errors: report.errors.len() as u64,
+                kept_for_transcripts: report.kept_for_transcripts as u64,
+                kept_for_transcripts_bytes: report.kept_for_transcripts_bytes,
             }
         }
         Err(err) => {
@@ -241,16 +256,17 @@ mod tests {
     #[test]
     fn retention_preserves_transcripts_under_age_and_byte_pressure() {
         let tmp = tempfile::tempdir().unwrap();
-        for subtree in ["brain", "conversations"] {
+        for components in boss_engine_driver::agy::AGY_TRANSCRIPT_PATHS {
+            let subtree = components.last().unwrap();
             for policy in [
                 retention::AgyHomeRetentionPolicy::new(Duration::ZERO, u64::MAX),
                 retention::AgyHomeRetentionPolicy::new(Duration::from_secs(u64::MAX), 0),
             ] {
                 let container = tmp.path().join(subtree);
                 write_agy_container(&container);
-                let transcript = container
-                    .join("process-home/.gemini/antigravity-cli")
-                    .join(subtree)
+                let transcript = components
+                    .iter()
+                    .fold(container.clone(), |path, part| path.join(part))
                     .join("conversation.jsonl");
                 std::fs::write(&transcript, "conversation evidence").unwrap();
                 let homes = [retention::OwnedAgyHome {
@@ -260,15 +276,24 @@ mod tests {
                     age_anchor_epoch: 0,
                     size_bytes: retention::directory_size_bytes(&container),
                 }];
-                let plan = retention::plan_reclaim(&homes, now_epoch(), &policy);
+                let plan = retention::plan_reclaim(&homes, now_epoch(), &policy, &contains_agy_transcripts);
                 assert!(plan.to_delete.is_empty(), "{plan:?}");
                 for dry_run in [true, false] {
-                    let report =
-                        retention::execute_reclaim(&homes, now_epoch(), &policy, dry_run, &|_| Ok(())).unwrap();
+                    let report = retention::execute_reclaim(
+                        &homes,
+                        now_epoch(),
+                        &policy,
+                        dry_run,
+                        &|_| Ok(()),
+                        &contains_agy_transcripts,
+                    )
+                    .unwrap();
                     assert!(report.deleted.is_empty(), "{report:?}");
                     assert!(report.errors.is_empty(), "{report:?}");
                     assert_eq!(report.scanned, 1);
-                    assert_eq!(report.kept_in_policy, 1);
+                    assert_eq!(report.kept_in_policy, 0);
+                    assert_eq!(report.kept_for_transcripts, 1);
+                    assert_eq!(report.kept_for_transcripts_bytes, homes[0].size_bytes);
                     assert_eq!(report.deleted_bytes, 0);
                     assert_eq!(std::fs::read_to_string(&transcript).unwrap(), "conversation evidence");
                 }
@@ -314,6 +339,7 @@ mod tests {
         let old_item = chore("agy-retention-old");
         let live_item = chore("agy-retention-live");
         let recent_item = chore("agy-retention-recent");
+        let protected_item = chore("agy-retention-transcripts");
 
         let now = now_epoch();
         let old_container = homes_root.join("old-run");
@@ -345,6 +371,22 @@ mod tests {
             &recent_container.join("process-home"),
         );
 
+        let protected_container = homes_root.join("transcript-run");
+        write_agy_container(&protected_container);
+        let transcript_dir = boss_engine_driver::agy::AGY_TRANSCRIPT_PATHS[0]
+            .iter()
+            .fold(protected_container.clone(), |path, part| path.join(part));
+        let transcript = transcript_dir.join("conversation.jsonl");
+        std::fs::write(&transcript, "conversation evidence").unwrap();
+        let protected_bytes = retention::directory_size_bytes(&protected_container);
+        seed_execution_with_home(
+            &db,
+            &protected_item,
+            "completed",
+            0,
+            &protected_container.join("process-home"),
+        );
+
         // An unrecorded container under the root must never be touched.
         let orphan = homes_root.join("orphan-unrecorded");
         std::fs::create_dir_all(&orphan).unwrap();
@@ -357,8 +399,8 @@ mod tests {
         let listed = db.list_executions_with_driver_runtime_state().unwrap();
         assert_eq!(
             listed.len(),
-            3,
-            "three executions should carry recorded runtime state; got {listed:?}"
+            4,
+            "four executions should carry recorded runtime state; got {listed:?}"
         );
 
         let policy = retention::AgyHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
@@ -369,6 +411,12 @@ mod tests {
             "only the old terminal container is reclaimed: {outcome:?}"
         );
         assert_eq!(outcome.skipped_live, 1, "{outcome:?}");
+        assert_eq!(outcome.kept_for_transcripts, 1);
+        assert_eq!(outcome.kept_for_transcripts_bytes, protected_bytes);
+        assert!(crate::sweep_loop::SweepOutcome::has_activity(
+            &AgyHomeRetentionSweepOutcome::builder().kept_for_transcripts(1).build()
+        ));
+        assert!(transcript.is_file());
         assert!(!old_container.exists(), "old terminal container must be gone");
         assert!(
             live_container
@@ -391,7 +439,10 @@ mod tests {
             outcome2.already_absent, 1,
             "the missing container is reported separately"
         );
-        assert!(!crate::sweep_loop::SweepOutcome::has_activity(&outcome2));
+        assert!(crate::sweep_loop::SweepOutcome::has_activity(&outcome2));
+        assert_eq!(outcome2.kept_for_transcripts, 1);
+        assert_eq!(outcome2.kept_for_transcripts_bytes, protected_bytes);
+        assert_eq!(outcome2.kept_in_policy, 1);
         assert_eq!(
             outcome2.deleted, 0,
             "already-gone paths are not fresh reclaim: {outcome2:?}"

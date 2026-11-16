@@ -38,7 +38,10 @@ pub mod rules_probe;
 
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
 pub(crate) use home::AGY_HOMES_DIR_NAME;
-pub use home::{AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AgyRuntimeState, assert_agy_home_safe_to_delete};
+pub use home::{
+    AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AGY_TRANSCRIPT_PATHS, AgyRuntimeState, assert_agy_home_safe_to_delete,
+    contains_agy_transcripts,
+};
 use home::{
     agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run, process_home_for_run,
     provision_agy_home, read_workspace_path_stamp, session_settings_path_for_run,
