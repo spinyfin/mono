@@ -18,6 +18,15 @@
 # tools/boss/docs/buildkite-shake-secrets-setup.md.
 set -euo pipefail
 
+# This step may execute its bazel actions on the remote macOS workers; ci-env.sh
+# decides whether it does (see remote-execution.sh). For this step, opting in is
+# a decision about the shake credentials, which the build below passes through
+# --define: the compile action that embeds them, with its environment, and
+# every binary built from it are sent to the workers and kept in the remote
+# cache. That is accepted because the same values are compiled into the app
+# this step publishes, so the cache holds nothing the release does not. A step
+# whose secrets must stay on the agent must not copy this line.
+CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -95,11 +104,23 @@ tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 # fail in CI: the credentials were embedded correctly in the opt artifact, but
 # the smoke test extracted the fastbuild one. Keep BUILD_FLAGS the single
 # source of truth shared by both invocations.
+#
+# --remote_local_fallback only matters when the step executes remotely, where
+# it overrides ci-remote's --noremote_local_fallback: if the workers stop
+# answering part-way through, the remaining actions run on this agent instead
+# of failing the step. A verification step would rather fail, but by this point
+# `prepare` has pushed the tag and created the draft, and a scheduled run does
+# not resume a draft, so a failed build here needs a manual run to finish the
+# release. It does not cover an action that runs and fails.
+#
+# This is plain `bazel build`, not bazel_verify_only: the zip is uploaded
+# below, so it has to be downloaded to the agent.
 BUILD_FLAGS=(
   -c opt
   --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID"
   --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID"
   --define=BOSS_SHAKE_PRIVATE_KEY_PEM="$BOSS_SHAKE_PRIVATE_KEY_PEM"
+  --remote_local_fallback
 )
 
 log "[boss-release] building //tools/boss/app-macos:Boss (opt)"

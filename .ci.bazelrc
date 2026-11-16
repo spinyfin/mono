@@ -81,6 +81,8 @@ common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-27.2.0.app/Content
 build:ci-remote --jobs=64
 # A remote failure fails the step. ci-env.sh decides once per step whether to
 # execute remotely, so a step never mixes worker results with agent results.
+# The one exception is the app build in .buildkite/steps/boss-release.sh, which
+# overrides this on its command line; the reason is in that script.
 build:ci-remote --noremote_local_fallback
 # Tests execute on the workers too; see `test:remote-tests` in .bazelrc.
 test:ci-remote --config=remote-tests

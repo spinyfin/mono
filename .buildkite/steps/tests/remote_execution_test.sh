@@ -114,8 +114,8 @@ expect_local() {
 }
 
 # A step that did not opt in stays on the agent even on a Mac with a working
-# endpoint, and the endpoint is not even probed. This is what keeps the release
-# steps, which pass credentials to bazel, off the workers.
+# endpoint, and the endpoint is not even probed. This is what keeps a step that
+# passes credentials to bazel off the workers until its script opts in.
 decide darwin 0 "$endpoint" 0 || fail "not opted in: decide failed"
 expect_local "not opted in" 0
 expect_equal "" "$(cat "$nc_calls")" "not opted in: endpoint probed"
