@@ -672,6 +672,7 @@ struct RepoOverridePicker: View {
 struct WorkDependenciesSection: View {
     @ObservedObject var model: ChatViewModel
     let taskID: String
+    var onNavigate: ((WorkDependencyRow) -> Void)? = nil
 
     var body: some View {
         let prereqs = model.dependencyPrereqsByTaskID[taskID] ?? []
@@ -706,7 +707,11 @@ struct WorkDependenciesSection: View {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(rows) { row in
                     WorkDependencyRowView(row: row) {
-                        model.selectWorkCard(row.id)
+                        if let onNavigate {
+                            onNavigate(row)
+                        } else {
+                            model.selectWorkCard(row.id)
+                        }
                     }
                 }
             }

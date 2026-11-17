@@ -204,6 +204,10 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
     }
 
+    func viewer(forRunId runId: String) -> WorkerSlot? {
+        viewersByRunId[runId]
+    }
+
     /// Card-ready wording for an attach this app refused. Names the
     /// occupying run on `slotBusy` because that is the one fact a reader
     /// needs to recognise a stale pane squatting on the slot.

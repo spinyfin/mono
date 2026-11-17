@@ -120,6 +120,10 @@ extension ChatViewModel {
             navigator.tab = NavigatorDetailSlot(rawValue: detail.defaultDetail) ?? .activity
             navigator.tabs = [.activity, .history, navigator.tab]
             navigator.askID = askID ?? (task.id != root.id ? task.id : detail.revisions.currentTaskId)
+            if navigator.documentByRoot[root.id] == nil {
+                let ask = navigator.askID.flatMap { self.task(withID: $0) }
+                navigator.documentByRoot[root.id] = (ask != nil && ask?.id != root.id) ? .currentAsk : .original
+            }
         } else if let askID {
             navigator.askID = askID
         }
@@ -164,6 +168,11 @@ extension ChatViewModel {
             navigator.retainedTask = selected
             if selected.prURL != nil { navigator.tabs.insert(.review) }
             syncNavigatorAttention(for: selected)
+            if navigator.askID.flatMap({ task(withID: $0) }) == nil,
+               let current = selected.navigator?.root?.revisions.currentTaskId,
+               task(withID: current) != nil {
+                navigator.askID = current
+            }
         } else if navigator.selectedRootID == nil,
                   let id = selectionHistory.root(scope: navigatorScopeKey),
                   let task = task(withID: id), navigatorIncludes(task) {
@@ -285,5 +294,59 @@ extension ChatViewModel {
         selectWorkCard(rows[index].id)
         selectNavigatorRoot(rows[index].id, askID: rows[index].matchingAskID)
         navigator.revealGeneration = UUID()
+    }
+
+    func navigatorDocument(for rootID: String) -> NavigatorBriefDocument {
+        navigator.documentByRoot[rootID] ?? .original
+    }
+
+    func setNavigatorDocument(_ document: NavigatorBriefDocument, rootID: String) {
+        navigator.documentByRoot[rootID] = document
+    }
+
+    func navigatorDocumentTask(for root: WorkTask) -> WorkTask {
+        switch navigatorDocument(for: root.id) {
+        case .original:
+            return root
+        case .currentAsk:
+            return navigator.askID.flatMap { task(withID: $0) } ?? root
+        }
+    }
+
+    func setNavigatorActivity(executionID: String, rootID: String) {
+        navigator.activityByRoot[rootID] = executionID
+    }
+
+    /// The user's chosen execution, even after it has left the live list.
+    func navigatorSelectedActivity(for root: WorkTask) -> NavigatorActivity? {
+        let activities = root.navigator?.root?.activities ?? []
+        if let chosen = navigator.activityByRoot[root.id] {
+            if let match = activities.first(where: { $0.executionId == chosen }) {
+                return match
+            }
+            return NavigatorActivity(executionId: chosen, taskId: navigator.askID ?? root.id, runId: chosen)
+        }
+        return activities.first
+    }
+
+    func navigatorFamily(of root: WorkTask) -> [WorkTask] {
+        navigatorTasks.filter { $0.navigator?.rootTaskId == root.id || $0.id == root.id }
+            .sorted {
+                if $0.id == root.id { return true }
+                if $1.id == root.id { return false }
+                return $0.createdAt < $1.createdAt || ($0.createdAt == $1.createdAt && $0.id < $1.id)
+            }
+    }
+
+    func navigateNavigatorDependency(_ row: WorkDependencyRow) {
+        guard let task = task(withID: row.id) else { return }
+        let targetID = task.navigator?.rootTaskId ?? task.id
+        if let target = self.task(withID: targetID), navigatorIncludes(target),
+           target.navigator?.root?.knownSection != nil {
+            selectWorkCard(target.id)
+            selectNavigatorRoot(target.id, askID: task.id != target.id ? task.id : nil)
+        } else {
+            revealWorkCard(task.id, productID: task.productID)
+        }
     }
 }

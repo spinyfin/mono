@@ -128,6 +128,20 @@ struct NavigatorSectionRows: Identifiable {
     var id: NavigatorSection { section }
 }
 
+/// Original brief vs the current revision ask. Identity is the document's
+/// task id, never the navigator section or a live execution.
+enum NavigatorBriefDocument: String, Hashable {
+    case original
+    case currentAsk
+}
+
+/// Per-document dirty text. Background work-tree updates never overwrite it.
+struct NavigatorBriefDraft: Equatable {
+    var text: String
+    var baseline: String
+    var isEditing: Bool
+}
+
 /// Presentation state is independent of row location and worker execution.
 struct WorkNavigatorState {
     var mode: WorkViewMode = .kanban
@@ -141,4 +155,10 @@ struct WorkNavigatorState {
     var collapsedByScope: [String: Set<NavigatorSection>] = [:]
     var scrollByScope: [String: String] = [:]
     var revealGeneration = UUID()
+    /// Sticky per root: original brief vs current ask.
+    var documentByRoot: [String: NavigatorBriefDocument] = [:]
+    /// Sticky per root, keyed by execution id so a new run cannot steal it.
+    var activityByRoot: [String: String] = [:]
+    /// Dirty markdown keyed by the document's task id.
+    var briefDrafts: [String: NavigatorBriefDraft] = [:]
 }

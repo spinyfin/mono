@@ -21,6 +21,31 @@ struct PaneSubmissionPlan: Equatable {
     let sendReturn: Bool
 }
 
+/// Home container for a Ghostty surface so Navigator can reparent the
+/// host view without SwiftUI dismantling it (and freeing the PTY).
+final class GhosttyTerminalAnchorView: NSView {
+    private(set) var host: GhosttyTerminalHostView?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func install(_ host: GhosttyTerminalHostView) {
+        self.host = host
+        host.autoresizingMask = [.width, .height]
+        host.frame = bounds
+        addSubview(host)
+    }
+
+    func remember(_ host: GhosttyTerminalHostView) {
+        self.host = host
+    }
+}
+
 struct GhosttyTerminalView: NSViewRepresentable {
     let runtime: GhosttyRuntime
     let session: TerminalPaneSession
@@ -35,18 +60,30 @@ struct GhosttyTerminalView: NSViewRepresentable {
     /// (they never display `paneMonitorState`).
     let paneMonitorEnabled: Bool
 
-    func makeNSView(context: Context) -> GhosttyTerminalHostView {
-        GhosttyTerminalHostView(
-            runtime: runtime,
-            session: session,
-            launchSpec: launchSpec,
-            paneMonitorEnabled: paneMonitorEnabled
-        )
+    func makeNSView(context: Context) -> GhosttyTerminalAnchorView {
+        let anchor = GhosttyTerminalAnchorView()
+        session.homeAnchor = anchor
+        if let existing = session.hostView {
+            if existing.superview == nil {
+                anchor.install(existing)
+            } else {
+                anchor.remember(existing)
+            }
+        } else {
+            anchor.install(GhosttyTerminalHostView(
+                runtime: runtime,
+                session: session,
+                launchSpec: launchSpec,
+                paneMonitorEnabled: paneMonitorEnabled
+            ))
+        }
+        return anchor
     }
 
-    func updateNSView(_ view: GhosttyTerminalHostView, context: Context) {
-        view.syncGeometry()
-        view.reconcilePaneMonitor(enabled: paneMonitorEnabled)
+    func updateNSView(_ view: GhosttyTerminalAnchorView, context: Context) {
+        session.homeAnchor = view
+        (view.host ?? session.hostView)?.syncGeometry()
+        (view.host ?? session.hostView)?.reconcilePaneMonitor(enabled: paneMonitorEnabled)
     }
 
     /// SwiftUI removes the representable here — while it still holds a
@@ -56,8 +93,12 @@ struct GhosttyTerminalView: NSViewRepresentable {
     /// callback can't resolve a half-deallocated view. Freeing on the main
     /// thread inside `deinit` is what deadlocked against the full
     /// `App.Message` mailbox in #961 — see `GhosttyTerminalHostView.tearDown`.
-    static func dismantleNSView(_ view: GhosttyTerminalHostView, coordinator: ()) {
-        view.tearDown()
+    static func dismantleNSView(_ view: GhosttyTerminalAnchorView, coordinator: ()) {
+        guard let host = view.host else { return }
+        // Navigator may have claimed the host. Tearing it down here would
+        // kill the live PTY while the Activity slot is still showing it.
+        guard host.superview === view || host.superview == nil else { return }
+        host.tearDown()
     }
 }
 
