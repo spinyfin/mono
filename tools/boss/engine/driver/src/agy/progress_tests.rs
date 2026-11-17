@@ -337,7 +337,7 @@ fn stop_without_a_claim_fails_loudly_instead_of_claiming() {
         .normalize_progress_event(&stop(PARENT, true))
         .expect_err("Stop must not invent a claim");
     assert!(
-        matches!(err, NormalizeError::Malformed(ref message) if message.contains("before a claimed conversation identity")),
+        matches!(err, NormalizeError::IdentityStoreTransient(ref message) if message.contains("before a claimed conversation identity")),
         "got {err:?}"
     );
     assert!(store.claimed_progress_identity(RUN).unwrap().is_none());
@@ -440,8 +440,10 @@ fn resume_state_round_trips_the_claimed_id() {
 #[test]
 fn stateless_driver_requires_session_for_boundaries() {
     for raw in [session_start(PARENT), pre_invocation(PARENT, 0), stop(PARENT, true)] {
-        assert!(matches!(crate::AgyDriver::default().normalize_progress_event(&raw),
+        for raw in [canonicalize(&raw).unwrap(), raw] {
+            assert!(matches!(crate::AgyDriver::default().normalize_progress_event(&raw),
             Err(NormalizeError::Malformed(message)) if message.contains("per-run progress_session")));
+        }
     }
 }
 

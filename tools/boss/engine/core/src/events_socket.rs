@@ -515,6 +515,52 @@ pub async fn handle_connection(
     }
 }
 
+/// Reserve a decode turn synchronously at accept time, before spawning a task.
+/// This orders identity claims even when an earlier peer is slow to finish
+/// writing. Dispatch after decoding remains concurrent. A stalled writer holds
+/// subsequent decodes on this listener until it closes or its task is cancelled.
+#[derive(Default)]
+pub struct HookDecodeQueue {
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl HookDecodeQueue {
+    pub fn reserve(&mut self) -> HookDecodeTurn {
+        let (completed, next) = tokio::sync::oneshot::channel();
+        HookDecodeTurn {
+            previous: self.tail.replace(next),
+            completed: Some(completed),
+        }
+    }
+}
+
+pub struct HookDecodeTurn {
+    previous: Option<tokio::sync::oneshot::Receiver<()>>,
+    completed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl HookDecodeTurn {
+    pub async fn handle(
+        mut self,
+        stream: UnixStream,
+        registry: &DriverRegistry,
+        work_db: &WorkDb,
+    ) -> Result<Option<IncomingHookEvent>, SocketError> {
+        if let Some(previous) = self.previous.take() {
+            let _ = previous.await;
+        }
+        handle_connection(stream, registry, work_db).await
+    }
+}
+
+impl Drop for HookDecodeTurn {
+    fn drop(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(());
+        }
+    }
+}
+
 /// Decode a fully-read hook payload into an [`IncomingHookEvent`],
 /// without touching the socket. Split out from [`handle_connection`] so
 /// decode failures are produced without touching the socket;
@@ -1631,6 +1677,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_parent_decode_keeps_claim_ahead_of_child() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = Arc::new(DriverRegistry::default());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let mut queue = HookDecodeQueue::default();
+
+        let mut parent = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let parent_db = db.clone();
+        let parent_registry = registry.clone();
+        let parent_task = tokio::spawn(async move { turn.handle(stream, &parent_registry, &parent_db).await });
+        // Hold the parent's payload past boss-event's one-second response window.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let mut child = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let child_db = db.clone();
+        let child_registry = registry.clone();
+        let child_task = tokio::spawn(async move { turn.handle(stream, &child_registry, &child_db).await });
+        child
+            .write_all(
+                format!(r#"{{"hookEventName":"SessionStart","conversationId":"CHILD","_boss_run_id":"{run_id}"}}"#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        child.shutdown().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !child_task.is_finished(),
+            "child must wait for the earlier parent decode"
+        );
+        assert!(db.get_run_progress_session_identity(&run_id).unwrap().is_none());
+        parent
+            .write_all(
+                format!(r#"{{"hookEventName":"SessionStart","conversationId":"PARENT","_boss_run_id":"{run_id}"}}"#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        parent.shutdown().await.unwrap();
+        assert!(parent_task.await.unwrap().unwrap().is_some());
+        assert!(child_task.await.unwrap().unwrap().is_none());
+        assert_eq!(
+            db.get_run_progress_session_identity(&run_id).unwrap().as_deref(),
+            Some("PARENT")
+        );
+    }
+
+    #[tokio::test]
     async fn agy_stop_without_a_claim_fails_loudly() {
         let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
         let registry = DriverRegistry::default();
@@ -1639,13 +1738,13 @@ mod tests {
         );
         let result = handle_payload(&db, &registry, &payload).await;
         match result {
-            Err(SocketError::Normalize(NormalizeError::Malformed(message))) => {
+            Err(SocketError::Normalize(NormalizeError::IdentityStoreTransient(message))) => {
                 assert!(
                     message.contains("before a claimed conversation identity"),
                     "got {message}"
                 );
             }
-            other => panic!("expected Malformed Stop-before-claim, got {other:?}"),
+            other => panic!("expected retryable Stop-before-claim, got {other:?}"),
         }
         assert!(
             db.get_run_progress_session_identity(&run_id).unwrap().is_none(),

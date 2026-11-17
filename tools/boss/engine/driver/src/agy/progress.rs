@@ -21,10 +21,11 @@
 //! A `Stop` (or any other boundary) with no claim fails rather than
 //! inventing one.
 //!
-//! Hooks are synchronous per agy process, but the shim waits at most one
-//! second for a response and connections are decoded concurrently. Ingress
-//! sequencing does not serialize claims. The store atomically preserves the
-//! first committed identity; replay/reordering was not characterised.
+//! The socket reserves decode turns in accept order before spawning tasks,
+//! so a parent delayed beyond the shim's one-second response window still
+//! claims before a later child. The shim queues new hooks behind a failed
+//! buffer drain. This assumes the parent's connection reaches the listener
+//! first; events lost before connecting or buffering cannot be ordered.
 //!
 //! `lastUserInput` repeats the whole prompt on every 1.5.5 hook. It is
 //! stripped during canonicalisation and must not be logged.
@@ -260,8 +261,12 @@ impl AgyProgressSession {
         if can_claim {
             return self.persist_claim(session_id);
         }
-        Err(NormalizeError::Malformed(
-            "agy Stop arrived before a claimed conversation identity".into(),
+        tracing::error!(
+            session_id,
+            "agy Stop arrived before a claimed conversation identity; retry required"
+        );
+        Err(NormalizeError::IdentityStoreTransient(
+            "agy Stop arrived before a claimed conversation identity; retry after SessionStart".into(),
         ))
     }
 

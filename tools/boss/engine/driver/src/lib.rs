@@ -1371,12 +1371,14 @@ impl std::fmt::Debug for ProgressSessionConfig {
 /// Engine-owned durable storage for one run's current provider session id.
 ///
 /// The driver must not persist this identity inside an agent-writable home.
-/// Implementations atomically compare and replace the one bounded identity
-/// for `run_id`; `Ok(true)` means the same id was already present (resume).
 pub trait ProgressIdentityStore: Send + Sync {
-    /// Atomically install only if absent, returning the stored id and whether it already existed.
+    /// Atomically install only if absent; never overwrite a different stored id.
+    /// Returns the stored id (which may differ from `session_id`) and `existed`.
+    /// `existed == true` covers both resuming the same id and losing a claim race.
     fn claim_progress_identity_if_absent(&self, run_id: &str, session_id: &str) -> Result<(String, bool), String>;
 
+    /// Atomically compare and replace the bounded identity for `run_id`.
+    /// `Ok(true)` means the same id was already present (resume).
     fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String>;
 
     /// Read the currently claimed provider session id for `run_id`, if any.

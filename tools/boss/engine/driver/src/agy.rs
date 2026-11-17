@@ -401,7 +401,9 @@ impl AgentDriver for AgyDriver {
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
         // Stateless decoding only supports self-describing non-boundary events.
         if matches!(
-            raw.get("hookEventName").and_then(serde_json::Value::as_str),
+            raw.get("hookEventName")
+                .or_else(|| raw.get("hook_event_name"))
+                .and_then(serde_json::Value::as_str),
             Some("SessionStart" | "PreInvocation" | "Stop")
         ) {
             return Err(NormalizeError::Malformed(
