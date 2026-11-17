@@ -286,12 +286,12 @@ final class CommentLayerTests: XCTestCase {
         container.addSubview(scope)
         container.addSubview(field)
         window.contentView = container
-        window.makeKeyAndOrderFront(nil)
         layer.setHostWindow(window)
         layer.setScopeView(scope)
         layer.isShowingPopover = true
         layer.needsCommentTextFocus = true
         layer.pendingTypeahead = "h"
+        field.selectText(nil)
         XCTAssertTrue(window.makeFirstResponder(field))
         let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
         editor.selectAll(nil)
@@ -316,7 +316,6 @@ final class CommentLayerTests: XCTestCase {
         scroll.documentView = text
         scope.addSubview(scroll)
         window.contentView = scope
-        window.makeKeyAndOrderFront(nil)
         layer.setHostWindow(window)
         layer.setScopeView(scope)
         layer.liveSelectionProvider = { "line" }
