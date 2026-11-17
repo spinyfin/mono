@@ -18,11 +18,25 @@ const MAX_FIELD: usize = 8192;
 /// lifecycle fields (`stop_hook_active`, `source`, `model`, `reason`, ...) that
 /// change how the event is interpreted. Tool payloads become markers; other
 /// large strings keep a bounded prefix and large nested values are dropped.
-fn bound_fields(object: &mut serde_json::Map<String, serde_json::Value>) {
+pub(super) fn bound_fields(object: &mut serde_json::Map<String, serde_json::Value>) {
     use serde_json::Value;
     object.retain(|key, value| {
         let size = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
         if size <= MAX_FIELD {
+            return true;
+        }
+        if key == "toolCall" {
+            let mut bounded = serde_json::json!({"_boss_truncated": true});
+            for field in ["name", "id"] {
+                if let Some(text) = value.get(field).and_then(Value::as_str) {
+                    let mut end = MAX_FIELD.min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    bounded[field] = text[..end].into();
+                }
+            }
+            *value = bounded;
             return true;
         }
         match value {
@@ -51,7 +65,7 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
     );
     let mut value: serde_json::Value = serde_json::from_slice(payload)?;
     // Leave room for producer metadata before enforcing the ingress envelope bound.
-    if payload.len() > 255 * 1024 {
+    if payload.len() > MAX_HOOK_BYTES - 1024 {
         let object = value.as_object_mut().ok_or_else(|| anyhow!("hook is not an object"))?;
         bound_fields(object);
         object.insert("_boss_payload_truncated".into(), true.into());
@@ -102,7 +116,7 @@ pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant
             .into(),
     );
     let bytes = serde_json::to_vec(&value)?;
-    anyhow::ensure!(bytes.len() <= 256 * 1024, "hook envelope exceeds 256 KiB");
+    anyhow::ensure!(bytes.len() <= MAX_HOOK_BYTES, "hook envelope exceeds 256 KiB");
     let path = directory.join(format!("{sequence:020}-{id}.json"));
     let temporary = directory.join(format!("{sequence:020}-{id}.tmp"));
     let mut file = OpenOptions::new()
@@ -164,7 +178,7 @@ mod tests {
             .find(|path| path.extension().is_some_and(|extension| extension == "json"))
             .unwrap();
         let bytes = std::fs::read(path).unwrap();
-        assert!(bytes.len() < 256 * 1024);
+        assert!(bytes.len() < MAX_HOOK_BYTES);
         let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         for key in ["hook_event_name", "session_id", "tool_name", "_boss_run_id", "agent_id"] {
             assert_eq!(saved[key], payload[key]);
@@ -191,6 +205,21 @@ mod tests {
             .find(|path| path.extension().is_some_and(|extension| extension == "json"))
             .unwrap();
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn oversized_agy_tools_keep_name_and_id() {
+        for event in ["PreToolUse", "PostToolUse"] {
+            let saved = deliver_oversized(serde_json::json!({
+                "hookEventName": event, "conversationId": "session",
+                "toolCall": {"name": "run_command", "id": "call-123",
+                    "args": {"command": "x".repeat(MAX_HOOK_BYTES + 1)}},
+            }));
+            assert_eq!(saved["toolCall"]["name"], "run_command");
+            assert_eq!(saved["toolCall"]["id"], "call-123");
+            assert_eq!(saved["toolCall"]["_boss_truncated"], true);
+            assert!(saved["toolCall"].get("args").is_none());
+        }
     }
 
     #[test]

@@ -1407,6 +1407,12 @@ pub trait ProgressIdentityStore: Send + Sync {
 /// this trait are not shared. The reader invokes both methods in stream order,
 /// so sticky session identity and transcript discovery cannot cross streams.
 pub trait ProgressSessionNormalizer: Send {
+    /// Whether the last decoded envelope came from a child of the claimed session.
+    /// Applies to the envelope's entire fanout; unknown origins default to main.
+    fn last_event_from_subagent(&self) -> bool {
+        false
+    }
+
     fn normalize_progress_event(&mut self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
     /// Normalize one provider envelope into its ordered worker-event fanout.

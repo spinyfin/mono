@@ -69,6 +69,7 @@ def runtime_libraries():
             ],
         ),
         compile_data = [
+            "//tools/boss/event-shim:src/main.rs",
             "remote/boss-remote-run.sh",
             # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
             # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
@@ -90,6 +91,7 @@ def runtime_libraries():
         edition = "2024",
         proc_macro_deps = all_crate_deps(package_name = "tools/boss/engine/core/runtime", proc_macro = True),
         rustc_env = {
+            "BOSS_EVENT_SHIM_SOURCE": "$(execpath //tools/boss/event-shim:src/main.rs)",
             # Absolute path to the generated build-info constants file.
             # rules_rust prefixes $(execpath) values with ${pwd} and resolves
             # them to absolute filesystem paths before invoking rustc.

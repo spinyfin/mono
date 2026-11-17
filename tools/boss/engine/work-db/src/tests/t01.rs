@@ -2950,3 +2950,10 @@ fn persist_tmux_identity_after_observation_fills_session_name_and_local_host() {
         (Some(4321), Some(4321)),
     );
 }
+
+#[test]
+fn missing_execution_will_never_claim_progress_identity() {
+    use boss_engine_driver::ProgressIdentityStore;
+    let db = WorkDb::open(temp_db_path("missing-progress-execution")).unwrap();
+    assert!(!db.progress_run_is_non_terminal("missing-execution").unwrap());
+}

@@ -589,3 +589,28 @@ fn concurrent_sessions_commit_only_one_identity() {
         assert_eq!(events.len(), usize::from(id == stored));
     }
 }
+
+#[test]
+fn tool_origin_retries_failed_identity_read() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for claimed in [true, false] {
+        let store = MemoryIdentityStore::new();
+        if claimed {
+            store.claim_progress_identity(RUN, PARENT).unwrap();
+        }
+        store.fail_read.store(true, SeqCst);
+        let mut session = AgyProgressSession::new(Some(RUN.into()), Some(store.clone()));
+        for event in [pre_tool_use(CHILD, "printf CHILD"), post_tool_use(CHILD)] {
+            assert!(matches!(
+                session.normalize_progress_events(&event),
+                Err(NormalizeError::IdentityStoreTransient(_))
+            ));
+        }
+        store.fail_read.store(false, SeqCst);
+        for event in [pre_tool_use(CHILD, "printf CHILD"), post_tool_use(CHILD)] {
+            assert_eq!(session.normalize_progress_events(&event).unwrap().len(), 1);
+            assert_eq!(session.last_event_from_subagent(), claimed);
+        }
+        assert_eq!(store.claims.load(SeqCst), 0);
+    }
+}

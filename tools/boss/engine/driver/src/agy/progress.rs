@@ -201,6 +201,7 @@ pub(super) struct AgyProgressSession {
     identity_store: Option<Arc<dyn ProgressIdentityStore>>,
     claimed_id: Option<String>,
     store_unavailable: bool,
+    from_subagent: bool,
 }
 
 impl AgyProgressSession {
@@ -217,6 +218,7 @@ impl AgyProgressSession {
             identity_store,
             claimed_id,
             store_unavailable,
+            from_subagent: false,
         }
     }
 
@@ -237,9 +239,7 @@ impl AgyProgressSession {
         })
     }
 
-    /// `can_claim` is true only for `SessionStart` and the first-`PreInvocation`
-    /// fallback. A later boundary must not invent a claim.
-    fn accept_identity(&mut self, session_id: &str, can_claim: bool) -> Result<IdentityDecision, NormalizeError> {
+    fn refresh_identity(&mut self) -> Result<(), NormalizeError> {
         if self.store_unavailable {
             self.claimed_id = self
                 .identity_store
@@ -249,6 +249,13 @@ impl AgyProgressSession {
                 .map_err(NormalizeError::IdentityStoreTransient)?;
             self.store_unavailable = false;
         }
+        Ok(())
+    }
+
+    /// `can_claim` is true only for `SessionStart` and the first-`PreInvocation`
+    /// fallback. A later boundary must not invent a claim.
+    fn accept_identity(&mut self, session_id: &str, can_claim: bool) -> Result<IdentityDecision, NormalizeError> {
+        self.refresh_identity()?;
         if let Some(claimed) = self.claimed_id.as_deref() {
             if claimed == session_id {
                 return Ok(IdentityDecision::Accept { resume: true });
@@ -288,6 +295,7 @@ impl AgyProgressSession {
     }
 
     fn decode(&mut self, raw: &Value) -> Result<Option<WorkerEvent>, NormalizeError> {
+        self.from_subagent = false;
         let mut canonical = canonicalize(raw)?;
         let name = event_name(&canonical)?.to_owned();
         let session_id = session_id_of(&canonical)?.to_owned();
@@ -330,7 +338,11 @@ impl AgyProgressSession {
                 IdentityDecision::Drop => Ok(None),
                 IdentityDecision::Accept { .. } => normalize_hook_event(&canonical).map(Some),
             },
-            "PreToolUse" | "PostToolUse" => normalize_hook_event(&canonical).map(Some),
+            "PreToolUse" | "PostToolUse" => {
+                self.refresh_identity()?;
+                self.from_subagent = self.claimed_id.as_deref().is_some_and(|id| id != session_id);
+                normalize_hook_event(&canonical).map(Some)
+            }
             other => {
                 tracing::debug!(
                     event = other,
@@ -348,6 +360,10 @@ enum IdentityDecision {
 }
 
 impl ProgressSessionNormalizer for AgyProgressSession {
+    fn last_event_from_subagent(&self) -> bool {
+        self.from_subagent
+    }
+
     fn normalize_progress_event(&mut self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
         self.normalize_progress_events(raw)?
             .into_iter()

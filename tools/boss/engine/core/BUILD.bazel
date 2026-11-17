@@ -129,6 +129,7 @@ rust_test(
     aliases = TEST_ALIASES,
     crate = ":runtime",
     data = [
+        "//tools/boss/event-shim:boss-event",
         # Config loading requires an engine-owned cube, just like the engine.
         "//tools/cube",
         # The checksum-pinned Codex release (codex_test_archives.bzl) that the
@@ -140,6 +141,7 @@ rust_test(
     ],
     edition = "2024",
     env = {
+        "BOSS_TEST_EVENT_SHIM": "$(rootpath //tools/boss/event-shim:boss-event)",
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
         "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
