@@ -239,9 +239,7 @@ impl AgyProgressSession {
         })
     }
 
-    /// `can_claim` is true only for `SessionStart` and the first-`PreInvocation`
-    /// fallback. A later boundary must not invent a claim.
-    fn accept_identity(&mut self, session_id: &str, can_claim: bool) -> Result<IdentityDecision, NormalizeError> {
+    fn refresh_identity(&mut self) -> Result<(), NormalizeError> {
         if self.store_unavailable {
             self.claimed_id = self
                 .identity_store
@@ -251,6 +249,13 @@ impl AgyProgressSession {
                 .map_err(NormalizeError::IdentityStoreTransient)?;
             self.store_unavailable = false;
         }
+        Ok(())
+    }
+
+    /// `can_claim` is true only for `SessionStart` and the first-`PreInvocation`
+    /// fallback. A later boundary must not invent a claim.
+    fn accept_identity(&mut self, session_id: &str, can_claim: bool) -> Result<IdentityDecision, NormalizeError> {
+        self.refresh_identity()?;
         if let Some(claimed) = self.claimed_id.as_deref() {
             if claimed == session_id {
                 return Ok(IdentityDecision::Accept { resume: true });
@@ -334,6 +339,7 @@ impl AgyProgressSession {
                 IdentityDecision::Accept { .. } => normalize_hook_event(&canonical).map(Some),
             },
             "PreToolUse" | "PostToolUse" => {
+                self.refresh_identity()?;
                 self.from_subagent = self.claimed_id.as_deref().is_some_and(|id| id != session_id);
                 normalize_hook_event(&canonical).map(Some)
             }

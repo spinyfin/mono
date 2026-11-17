@@ -25,3 +25,9 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+# The engine contract test checks the independently compiled ingress limits.
+exports_files(
+    ["src/main.rs"],
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)

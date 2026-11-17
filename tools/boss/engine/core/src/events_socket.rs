@@ -2527,3 +2527,19 @@ mod tests {
 #[cfg(test)]
 #[path = "events_socket_regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(test)]
+#[test]
+fn shim_and_engine_ingress_limits_match() {
+    let shim = include_str!(env!("BOSS_EVENT_SHIM_SOURCE"));
+    let declaration = shim
+        .lines()
+        .find(|line| line.starts_with("const MAX_HOOK_BYTES:"))
+        .unwrap();
+    let expression = declaration.split_once('=').unwrap().1.trim().trim_end_matches(';');
+    let shim_limit: usize = expression
+        .split('*')
+        .map(|factor| factor.trim().parse::<usize>().unwrap())
+        .product();
+    assert_eq!(shim_limit, MAX_HOOK_BYTES);
+}
