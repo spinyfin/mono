@@ -90,7 +90,12 @@ impl Fixture {
     }
 
     fn install_with(&self, kind: WorkerKind, overrides: impl FnOnce(&mut ToolUseInterceptionConfig)) -> Vec<PathBuf> {
-        super::super::test_environment::write_final_settings(&self.run_id, &self.workspace(), kind);
+        super::super::test_environment::write_final_settings(
+            &self.run_id,
+            &self.workspace(),
+            kind,
+            &self.obs().events_socket_path,
+        );
         install_authorization(&self.process_home, kind, &self.obs(), &self.interception(overrides)).unwrap()
     }
 }
@@ -108,6 +113,15 @@ fn run_command_payload(command: &str) -> Value {
 }
 
 fn authorize(process_home: &Path, payload: &Value, skip_forward: bool) -> (i32, Value, String) {
+    authorize_with_env(process_home, payload, skip_forward, &[])
+}
+
+fn authorize_with_env(
+    process_home: &Path,
+    payload: &Value,
+    skip_forward: bool,
+    env: &[(&str, &str)],
+) -> (i32, Value, String) {
     let adapter = adapter_path(process_home);
     let policy = policy_path(process_home);
     let policy_doc: Value = serde_json::from_str(&fs::read_to_string(&policy).unwrap()).unwrap();
@@ -117,6 +131,9 @@ fn authorize(process_home: &Path, payload: &Value, skip_forward: bool) -> (i32, 
         .env("BOSS_AGY_POLICY", &policy)
         .env("BOSS_AGY_FORWARDER", policy_doc["forwarder"].as_str().unwrap())
         .env("BOSS_RUN_ID", run_id)
+        .env_remove("BOSS_BIN")
+        .env_remove("CUBE_BIN")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

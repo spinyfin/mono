@@ -377,9 +377,31 @@ def has_redirect(command):
     return False
 
 
+# Executable variables the engine exports into the worker environment. The
+# adapter runs as a hook of the worker process, so it reads the values the
+# engine set at spawn; nothing a command does inside its own shell can change
+# them here. Reassigning one inside a command is denied outright.
+TRUSTED_EXECUTABLE_VARS = ("BOSS_BIN", "CUBE_BIN")
+TRUSTED_VAR_RE = re.compile(r"\$(?:(%s)\b|\{(%s)\})" % ("|".join(TRUSTED_EXECUTABLE_VARS), "|".join(TRUSTED_EXECUTABLE_VARS)))
+TRUSTED_VAR_ASSIGN_RE = re.compile(r"^(?:%s)(?:\+?=.*|\[.*)?$" % "|".join(TRUSTED_EXECUTABLE_VARS))
+
+
+def trusted_executable(name):
+    value = os.environ.get(name)
+    if not value or not os.path.isabs(value) or any(c in value for c in "\n\0"):
+        fail_closed("$%s is not set to an absolute path by the engine" % (name,))
+    return value
+
+
+def reject_trusted_var_reassignment(token):
+    if TRUSTED_VAR_ASSIGN_RE.match(token):
+        fail_closed("reassigning or unsetting an engine-provided executable variable is denied")
+
+
 def resolve_path(path, policy, cwd=None):
     home = policy["process_home"]
     path = re.sub(r"\$(?:HOME\b|\{HOME\})", lambda _: home, path)
+    path = TRUSTED_VAR_RE.sub(lambda m: trusted_executable(m.group(1) or m.group(2)), path)
     if "$" in path or path.startswith(("~-", "~+")):
         fail_closed("unresolved shell path expansion")
     if path == "~" or path.startswith("~/"):
@@ -403,6 +425,7 @@ def command_touches_protected(command, policy, cwd):
     for group in command_groups(command):
         rest = strip_prefixes(group)
         for token in group:
+            reject_trusted_var_reassignment(token)
             candidate = token.split("=", 1)[1] if ASSIGNMENT_RE.match(token) else token
             candidate = re.sub(r"^(?:[0-9]+|&)?[<>]+", "", candidate)
             expanded = resolve_path(candidate, policy, current)
@@ -461,6 +484,20 @@ def is_recursive_rm(rest):
     return False
 
 
+NON_WRITING_KINDS = ("reviewer", "triage", "answer_agent", "review_guide", "progression")
+SED_RANGE_RE = re.compile(r"[0-9$]+(?:,[0-9$]+)?p")
+
+
+def read_only_sed(args, worker_kind):
+    # Reviewer and triage never run sed. The other non-writing kinds may be
+    # granted `sed -n`, which is only a reader for a plain line-range print.
+    if worker_kind in ("reviewer", "triage"):
+        return False
+    if not args or args[0] != "-n":
+        return False
+    return len(args) >= 2 and SED_RANGE_RE.fullmatch(args[1]) is not None
+
+
 def structural_command_reason(command, policy, worker_kind, cwd):
     for group in iter_groups(command):
         rest = strip_prefixes(group)
@@ -479,7 +516,7 @@ def structural_command_reason(command, policy, worker_kind, cwd):
             return "destructive recursive removal is structurally denied"
     if command_touches_protected(command, policy, cwd):
         return "command accesses protected Antigravity or Boss state"
-    if worker_kind in ("reviewer", "triage"):
+    if worker_kind in NON_WRITING_KINDS:
         if any(has_redirect(body) for body in inspected_commands(command)):
             return "%s workers must not perform shell-mediated writes" % (worker_kind,)
         for group in iter_groups(command):
@@ -498,7 +535,9 @@ def structural_command_reason(command, policy, worker_kind, cwd):
                 return "%s workers must not write find results" % worker_kind
             if prog == "sort" and any(t == "--output" or t.startswith(("-o", "--output=")) for t in rest[1:]):
                 return "%s workers must not write sort output" % worker_kind
-            if prog in ("patch", "sed", "awk", "gawk"):
+            if prog in ("patch", "awk", "gawk"):
+                return "%s workers must not execute file-mutating text scripts" % worker_kind
+            if prog == "sed" and not read_only_sed(rest[1:], worker_kind):
                 return "%s workers must not execute file-mutating text scripts" % worker_kind
     return None
 

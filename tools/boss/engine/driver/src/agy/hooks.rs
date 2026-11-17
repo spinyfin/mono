@@ -67,9 +67,12 @@ const _: () = assert!(FORWARDER_HOOK_TIMEOUT_SEC >= 12 + 3);
 
 const ADAPTER_SCRIPT: &str = include_str!("adapter.py");
 
-/// Outer hook timeout when the checkleft push guard is not in the chain.
-/// Covers silent `boss-event` delivery (~10s retry) plus the remaining guards.
-pub const AUTHORIZATION_HOOK_TIMEOUT_SEC: u64 = 60;
+/// Outer hook timeout for the PreToolUse authorization entry. One value for
+/// every worker kind, so the entry the progress wiring declares (which cannot
+/// see whether a checkleft guard is armed) is always the entry installed. It
+/// is sized for the checkleft push guard, the longest guard in the chain; the
+/// other guards enforce their own, much shorter, budgets inside the adapter.
+pub const AUTHORIZATION_HOOK_TIMEOUT_SEC: u64 = crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttestationEntry {
@@ -172,51 +175,29 @@ fn authorization_command(process_home: &Path, config: &ProgressObservationConfig
     )
 }
 
-fn hook_timeout_sec(interception: &ToolUseInterceptionConfig) -> u64 {
-    if interception.is_standard_worker && interception.checkleft_guard_script.is_some() {
-        crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS
-    } else {
-        AUTHORIZATION_HOOK_TIMEOUT_SEC
-    }
-}
-
-fn pre_tool_use_entry(
-    process_home: &Path,
-    obs: &ProgressObservationConfig,
-    interception: &ToolUseInterceptionConfig,
-) -> Value {
+fn pre_tool_use_entry(process_home: &Path, obs: &ProgressObservationConfig) -> Value {
     json!({
         "matcher": "*",
         "hooks": [{
             "type": "command",
             "command": authorization_command(process_home, obs),
-            "timeout": hook_timeout_sec(interception),
+            "timeout": AUTHORIZATION_HOOK_TIMEOUT_SEC,
         }],
     })
 }
 
 /// Declared PreToolUse wiring. Other lifecycle events are installed by the
-/// global-root progress forwarder, not duplicated here.
-pub fn authorization_hooks_map(
-    config: &ProgressObservationConfig,
-    interception: Option<&ToolUseInterceptionConfig>,
-) -> serde_json::Map<String, Value> {
-    let process_home = process_home_for_run(&config.run_id)
-        .unwrap_or_else(|_| agy_homes_root().join("unknown-run").join("process-home"));
-    let timeout = interception
-        .map(hook_timeout_sec)
-        .unwrap_or(AUTHORIZATION_HOOK_TIMEOUT_SEC);
-    let entry = json!([{
-        "matcher": "*",
-        "hooks": [{
-            "type": "command",
-            "command": authorization_command(&process_home, config),
-            "timeout": timeout,
-        }],
-    }]);
+/// global-root progress forwarder, not duplicated here. Fails when the run's
+/// private home cannot be resolved, rather than declaring a path that does
+/// not exist.
+pub fn authorization_hooks_map(config: &ProgressObservationConfig) -> anyhow::Result<serde_json::Map<String, Value>> {
+    let process_home = process_home_for_run(&config.run_id)?;
     let mut hooks = forwarder_hooks_map(config);
-    hooks.insert("PreToolUse".to_owned(), entry);
-    hooks
+    hooks.insert(
+        "PreToolUse".to_owned(),
+        json!([pre_tool_use_entry(&process_home, config)]),
+    );
+    Ok(hooks)
 }
 
 fn collect_guard_artifact_paths(config: &ToolUseInterceptionConfig) -> Vec<(String, PathBuf)> {
@@ -280,12 +261,7 @@ pub fn install_authorization(
     let policy_file = policy_path(process_home);
     let attestation_file = attestation_path(process_home);
     let hooks_path = hooks_file_path(process_home);
-    let settings_path = session_settings_path_for_run(&obs.run_id).unwrap_or_else(|_| {
-        process_home
-            .parent()
-            .unwrap_or(process_home)
-            .join("control/session-settings.json")
-    });
+    let settings_path = session_settings_path_for_run(&obs.run_id)?;
 
     let mut artifacts = collect_guard_artifact_paths(interception);
     artifacts.extend([
@@ -302,7 +278,7 @@ pub fn install_authorization(
     let policy = json!({
         "version": 1,
         "authorization_command": authorization_command(process_home, obs),
-        "hook_timeout_sec": hook_timeout_sec(interception),
+        "hook_timeout_sec": AUTHORIZATION_HOOK_TIMEOUT_SEC,
         "required_artifacts": required_artifacts,
         "run_id": obs.run_id,
         "worker_kind": worker_kind_name(worker_kind),
@@ -320,10 +296,7 @@ pub fn install_authorization(
     });
     write_json_atomic(&policy_file, &policy)?;
     let mut hooks = forwarder_hooks_map(obs);
-    hooks.insert(
-        "PreToolUse".into(),
-        json!([pre_tool_use_entry(process_home, obs, interception)]),
-    );
+    hooks.insert("PreToolUse".into(), json!([pre_tool_use_entry(process_home, obs)]));
     write_hooks_document(process_home, &json!({ HOOK_GROUP: hooks }))?;
     validate_configuration(process_home, &policy)?;
 
@@ -371,12 +344,9 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
         || required["hooks"] != json!(hooks_file_path(process_home))
         || required["policy"] != json!(policy_path(process_home))
         || required["settings"]
-            != json!(
-                process_home
-                    .parent()
-                    .context("run container")?
-                    .join("control/session-settings.json")
-            )
+            != json!(session_settings_path_for_run(
+                policy["run_id"].as_str().context("policy run_id")?
+            )?)
         || required["forwarder"] != policy["forwarder"]
     {
         bail!("authorization binding has unexpected run paths");
@@ -428,11 +398,9 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
 
 fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result<()> {
     let workspace = PathBuf::from(policy["workspace_path"].as_str().context("workspace path")?);
-    let settings_path = process_home
-        .parent()
-        .context("run container")?
-        .join("control/session-settings.json");
-    let settings: Value = serde_json::from_slice(&fs::read(settings_path)?)?;
+    let settings_path = session_settings_path_for_run(policy["run_id"].as_str().context("policy run_id")?)?;
+    let settings =
+        fs::read_to_string(&settings_path).with_context(|| format!("reading {}", settings_path.display()))?;
     validate_session_settings(&settings, &workspace)?;
     let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
     let entry = &hooks["boss"]["PreToolUse"];
@@ -449,76 +417,15 @@ fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result
     Ok(())
 }
 
-/// Validate the final session contract, rather than the provisioning trust seed.
-fn validate_session_settings(settings: &Value, workspace: &Path) -> anyhow::Result<()> {
-    let object = settings.as_object().context("session settings must be an object")?;
-    if object.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "agentMode" | "toolPermission" | "trustedWorkspaces" | "permissions"
-        )
-    }) || settings["agentMode"] != ""
-        || settings["toolPermission"] != "request-review"
-    {
-        bail!("session settings must explicitly select the default agent mode and request-review");
-    }
-    let workspace = fs::canonicalize(workspace)?;
-    if settings["trustedWorkspaces"] != json!([workspace]) {
+/// Validate the final session contract: the renderer's own parse and
+/// validation (the same rule grammar, pins and strictness it applies when it
+/// writes the file), plus the one authorization-specific requirement that the
+/// session trusts exactly the canonical workspace.
+fn validate_session_settings(settings: &str, workspace: &Path) -> anyhow::Result<()> {
+    let settings = super::permissions::parse_rendered(settings)?;
+    let workspace = fs::canonicalize(workspace)?.display().to_string();
+    if settings.trusted_workspaces() != [workspace] {
         bail!("session settings must trust exactly the canonical workspace");
-    }
-    let permissions = settings["permissions"]
-        .as_object()
-        .context("permissions must be an object")?;
-    if permissions
-        .keys()
-        .any(|key| !matches!(key.as_str(), "allow" | "deny" | "ask"))
-        || permissions
-            .get("ask")
-            .is_some_and(|ask| ask.as_array().is_none_or(|rules| !rules.is_empty()))
-    {
-        bail!("session permissions must not contain ask rules or unknown keys");
-    }
-    for key in ["allow", "deny"] {
-        if key == "allow" && !permissions.contains_key(key) {
-            continue;
-        }
-        let rules = permissions
-            .get(key)
-            .and_then(Value::as_array)
-            .context("permission rules must be arrays")?;
-        if key == "deny" && rules.is_empty() {
-            bail!("session settings must fence native file access");
-        }
-        for rule in rules {
-            let rule = rule.as_str().context("permission rules must be strings")?;
-            let (action, target) = rule
-                .split_once('(')
-                .context("permission rule requires action(target)")?;
-            let target = target
-                .strip_suffix(')')
-                .context("permission rule requires closing parenthesis")?;
-            let actions = if key == "deny" {
-                &["read_file", "write_file"][..]
-            } else {
-                &["command", "read_file", "write_file"][..]
-            };
-            if !actions.contains(&action)
-                || target.is_empty()
-                || target.trim() != target
-                || target.chars().any(|c| c.is_control() || matches!(c, '(' | ')'))
-                || (action == "command" && target.starts_with("regex:"))
-            {
-                bail!("invalid session permission rule: {rule}");
-            }
-            if matches!(action, "read_file" | "write_file")
-                && (!Path::new(target).is_absolute()
-                    || Path::new(target)
-                        .components()
-                        .any(|c| c == std::path::Component::ParentDir))
-            {
-                bail!("native file permission paths must be absolute");
-            }
-        }
     }
     Ok(())
 }

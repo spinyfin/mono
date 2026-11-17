@@ -380,8 +380,15 @@ impl AgentDriver for AgyDriver {
         // entry; other lifecycle events are installed by the global-root
         // progress forwarder. Must not return StdoutJsonl — the registry
         // refuses that topology for built-in drivers.
+        let hooks = hooks::authorization_hooks_map(config).unwrap_or_else(|error| {
+            // The trait cannot return an error. Declare the forwarder events
+            // only: `install_authorization` resolves the same paths and
+            // refuses the spawn, so no worker runs without the guard.
+            tracing::error!(run_id = %config.run_id, error = %error, "agy PreToolUse authorization wiring cannot be declared");
+            hooks::forwarder_hooks_map(config)
+        });
         ProgressIngress::HookCallback(ProgressObservationWiring {
-            hooks: hooks::authorization_hooks_map(config, None),
+            hooks,
             destination: HookWiringDestination::DriverOwned,
         })
     }

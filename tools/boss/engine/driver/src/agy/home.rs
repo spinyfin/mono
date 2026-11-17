@@ -318,7 +318,8 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
         .with_context(|| format!("writing session settings {}", session_settings_path.display()))?;
     // SessionStart `true` canary so the global-root file exists before
     // `write_permission_config` installs PreToolUse authorization.
-    // `install_authorization` drops this canary when merging.
+    // `install_authorization` overwrites this file with the Boss hook group;
+    // nothing else written here survives installation.
     fs::write(hooks_dir.join("hooks.json"), render_provision_hooks_json())
         .with_context(|| format!("writing provision hooks under {}", hooks_dir.display()))?;
     // Do not write `.gemini/settings.json` or `trustedFolders.json`: neither

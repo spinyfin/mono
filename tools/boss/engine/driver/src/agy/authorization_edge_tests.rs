@@ -139,21 +139,162 @@ fn rebind(fx: &Fixture) {
 
 #[test]
 fn final_permission_settings_install_verify_and_probe_for_every_kind() {
+    // The fixture installs the real renderer output for each kind.
+    for kind in ALL_KINDS {
+        let fx = Fixture::new("run-final-settings");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+        });
+        verify_attestation(&fx.process_home).unwrap_or_else(|e| panic!("{kind:?}: {e:#}"));
+        probe_authorization(&fx.process_home).unwrap_or_else(|e| panic!("{kind:?}: {e:#}"));
+    }
+}
+
+const ALL_KINDS: [WorkerKind; 6] = [
+    WorkerKind::Standard,
+    WorkerKind::Reviewer,
+    WorkerKind::Triage,
+    WorkerKind::AnswerAgent,
+    WorkerKind::ReviewGuide,
+    WorkerKind::Progression,
+];
+
+const BOSS_BIN: &str = "/opt/boss-tools/boss";
+const CUBE_BIN: &str = "/opt/boss-tools/cube";
+
+fn authorize_tools(fx: &Fixture, command: &str) -> (Value, String) {
+    let (_, body, stderr) = authorize_with_env(
+        &fx.process_home,
+        &run_command_payload(command),
+        false,
+        &[("BOSS_BIN", BOSS_BIN), ("CUBE_BIN", CUBE_BIN)],
+    );
+    (body, stderr)
+}
+
+#[test]
+fn engine_executable_variables_are_resolved_before_the_guards() {
+    // Fixtures hold the process-wide environment lock, so drop one before
+    // creating the next.
+    {
+        let standard = Fixture::new("run-tool-vars-standard");
+        standard.install(WorkerKind::Standard);
+        for command in [
+            "\"$BOSS_BIN\" propose done --outcome delivered --summary ok",
+            "\"${BOSS_BIN}\" propose done --outcome delivered --summary ok",
+            "\"$CUBE_BIN\" pr update --branch my-feature",
+            "\"${CUBE_BIN}\" pr update --branch my-feature",
+            "$BOSS_BIN pr status --json",
+        ] {
+            let (body, stderr) = authorize_tools(&standard, command);
+            assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+        }
+    }
+    let progression = Fixture::new("run-tool-vars-progression");
+    progression.install(WorkerKind::Progression);
+    for command in [
+        "\"$BOSS_BIN\" propose done --outcome delivered --summary ok",
+        "\"${BOSS_BIN}\" propose done --outcome delivered --summary ok",
+    ] {
+        let (body, stderr) = authorize_tools(&progression, command);
+        assert_eq!(decision(&body), "deny_unless_prior_grant", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn engine_executable_variables_cannot_evade_structural_denies() {
+    let fx = Fixture::new("run-tool-vars-negative");
+    fx.install(WorkerKind::Standard);
+    for command in [
+        "BOSS_BIN=/tmp/evil \"$BOSS_BIN\" propose done",
+        "export CUBE_BIN=/tmp/evil; \"$CUBE_BIN\" pr update",
+        "unset BOSS_BIN; \"$BOSS_BIN\" propose done",
+        "env BOSS_BIN=/tmp/evil sh -c '\"$BOSS_BIN\" propose'",
+        "read BOSS_BIN; \"$BOSS_BIN\" propose",
+        "\"${BOSS_BIN:-sudo}\" id",
+        "\"${BOSS_BIN/boss/sudo}\" id",
+        "X=sudo; \"$X\" id",
+        "\"$BOSS_BIN_OTHER\" propose",
+        "\"$BOSS_BIN\" propose; sudo id",
+        "\"$BOSS_BIN\" propose && git push",
+        "\"$CUBE_BIN\" pr update $(sudo id)",
+        "sh -c '\"$BOSS_BIN\" propose; sudo id'",
+    ] {
+        let (body, stderr) = authorize_tools(&fx, command);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+    // Without an engine-provided value the variable stays unresolved.
+    let (_, body, stderr) = authorize(
+        &fx.process_home,
+        &run_command_payload("\"$BOSS_BIN\" propose done"),
+        false,
+    );
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    // A relative value is not an engine-provided executable.
+    let (_, body, stderr) = authorize_with_env(
+        &fx.process_home,
+        &run_command_payload("\"$BOSS_BIN\" propose done"),
+        false,
+        &[("BOSS_BIN", "boss")],
+    );
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+}
+
+#[test]
+fn non_writing_kinds_deny_shell_mediated_writes_on_allowed_prefixes() {
     for kind in [
-        WorkerKind::Standard,
         WorkerKind::Reviewer,
         WorkerKind::Triage,
         WorkerKind::AnswerAgent,
         WorkerKind::ReviewGuide,
         WorkerKind::Progression,
     ] {
-        let fx = Fixture::new("run-final-settings");
+        let fx = Fixture::new("run-nonwriting-redirects");
         fx.install_with(kind, |c| {
-            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_standard_worker = false;
             c.is_reviewer = kind == WorkerKind::Reviewer;
         });
-        verify_attestation(&fx.process_home).unwrap();
-        probe_authorization(&fx.process_home).unwrap();
+        for command in [
+            "gh pr view 1 --repo spinyfin/mono > ./out.txt",
+            "gh pr view 1 --repo spinyfin/mono >> ./out.txt",
+            "gh pr view 1 --repo spinyfin/mono >| ./out.txt",
+            "\"$BOSS_BIN\" pr status > ./out.txt",
+            "gh pr view 1 | tee out.txt",
+            "gh pr view 1; touch out.txt",
+            "sh -c 'gh pr view 1 > out.txt'",
+            "sed -n '1,5p' f > out.txt",
+            "sed -i s/a/b/ f",
+            "sed -n 'w out' f",
+            "find . -fprint out",
+            "sort -o out f",
+        ] {
+            let (body, stderr) = authorize_tools(&fx, command);
+            assert_eq!(decision(&body), "deny", "{kind:?} {command}: {body} {stderr}");
+        }
+    }
+    for kind in [
+        WorkerKind::AnswerAgent,
+        WorkerKind::ReviewGuide,
+        WorkerKind::Progression,
+    ] {
+        let fx = Fixture::new("run-nonwriting-reads");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = false;
+        });
+        for command in [
+            "gh pr view 1 --repo spinyfin/mono 2>&1",
+            "gh pr view 1 > /dev/null",
+            "\"$BOSS_BIN\" pr status",
+            "sed -n '1,5p' f",
+        ] {
+            let (body, stderr) = authorize_tools(&fx, command);
+            assert_eq!(
+                decision(&body),
+                "deny_unless_prior_grant",
+                "{kind:?} {command}: {body} {stderr}"
+            );
+        }
     }
 }
 

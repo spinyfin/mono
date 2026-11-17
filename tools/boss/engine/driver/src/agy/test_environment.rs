@@ -3,27 +3,21 @@ use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK;
 use std::ffi::OsString;
 use std::path::Path;
 
-/// Final permission-renderer output for authorization integration fixtures.
-pub(crate) fn write_final_settings(run_id: &str, workspace: &Path, kind: crate::WorkerKind) {
-    use crate::WorkerKind;
-    let allow = match kind {
-        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => vec![],
-        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => vec!["command(gh pr view)"],
-    };
-    let process_home = home::process_home_for_run(run_id).unwrap();
-    let mut settings = serde_json::json!({
-        "agentMode": "", "toolPermission": "request-review",
-        "trustedWorkspaces": [std::fs::canonicalize(workspace).unwrap()],
-        "permissions": {"allow": allow, "deny": [format!("write_file({})", process_home.display())]}
-    });
-    if allow.is_empty() {
-        settings["permissions"].as_object_mut().unwrap().remove("allow");
-    }
-    std::fs::write(
-        home::session_settings_path_for_run(run_id).unwrap(),
-        settings.to_string(),
-    )
-    .unwrap();
+/// Write the real permission-renderer output for `kind` into the run's
+/// control directory, exactly as `write_permission_config` does before the
+/// authorization adapter is installed.
+pub(crate) fn write_final_settings(run_id: &str, workspace: &Path, kind: crate::WorkerKind, events_socket: &Path) {
+    let input = crate::PermissionInput::builder()
+        .worker_kind(kind)
+        .workspace_path(workspace.to_path_buf())
+        .events_socket_path(events_socket.to_path_buf())
+        .boss_event_path(events_socket.with_file_name("boss-event"))
+        .run_id(run_id)
+        .lease_id("lease-1")
+        .execution_kind("task_implementation")
+        .is_remote(false)
+        .build();
+    super::permissions::write_session_settings(&input).unwrap();
 }
 
 pub(crate) struct EnvGuard {
