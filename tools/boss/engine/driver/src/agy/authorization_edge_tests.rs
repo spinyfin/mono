@@ -139,13 +139,24 @@ fn rebind(fx: &Fixture) {
 
 #[test]
 fn final_permission_settings_install_verify_and_probe_for_every_kind() {
-    // The fixture installs the real renderer output for each kind.
+    // The fixture installs the real renderer output for each kind, with the
+    // kind flags set exactly as `ToolUseInterceptionConfig::from_permission_input`
+    // sets them, so the review-guide guard is part of that kind's chain.
     for kind in ALL_KINDS {
         let fx = Fixture::new("run-final-settings");
         fx.install_with(kind, |c| {
             c.is_standard_worker = kind == WorkerKind::Standard;
             c.is_reviewer = kind == WorkerKind::Reviewer;
+            c.is_review_guide = kind == WorkerKind::ReviewGuide;
         });
+        if kind == WorkerKind::ReviewGuide {
+            let policy: Value = serde_json::from_slice(&fs::read(policy_path(&fx.process_home)).unwrap()).unwrap();
+            let chain = policy["guards"].to_string();
+            assert!(
+                chain.contains("review-guide"),
+                "guide guard missing from chain: {chain}"
+            );
+        }
         verify_attestation(&fx.process_home).unwrap_or_else(|e| panic!("{kind:?}: {e:#}"));
         probe_authorization(&fx.process_home).unwrap_or_else(|e| panic!("{kind:?}: {e:#}"));
     }
@@ -220,6 +231,10 @@ fn engine_executable_variables_cannot_evade_structural_denies() {
         "\"$BOSS_BIN\" propose && git push",
         "\"$CUBE_BIN\" pr update $(sudo id)",
         "sh -c '\"$BOSS_BIN\" propose; sudo id'",
+        "export BOSS_{BIN,X}=/bin/sh; \"$BOSS_BIN\" -c 'sudo id'",
+        "declare -n r=BOSS_BIN; r=/bin/sh; \"$BOSS_BIN\" -c 'sudo id'",
+        "printf -v BOSS_BIN %s /bin/sh; \"$BOSS_BIN\" -c 'sudo id'",
+        "export \"$NAME=/bin/sh\"; \"$BOSS_BIN\" -c 'sudo id'",
     ] {
         let (body, stderr) = authorize_tools(&fx, command);
         assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
@@ -409,4 +424,57 @@ fn probe_kills_a_hung_forwarder_at_its_deadline() {
     let error = probe_authorization_with_timeout(&fx.process_home, std::time::Duration::from_millis(500)).unwrap_err();
     assert!(error.to_string().contains("exceeded 500ms timeout"), "{error:#}");
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn engine_executable_variable_names_are_plain_data_outside_binding_positions() {
+    let fx = Fixture::new("run-tool-var-names");
+    fx.install(WorkerKind::Standard);
+    for command in [
+        "rg BOSS_BIN tools/",
+        "grep -rn CUBE_BIN .",
+        "rg 'BOSS_BIN=' tools/",
+        "printenv BOSS_BIN",
+        "grep -E 'foo$' f",
+        "awk '{print $1}' f",
+        "rg 'bar$' .",
+        "sed -n '10,$p' f",
+    ] {
+        let (body, stderr) = authorize_tools(&fx, command);
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+    // A `$` the shell would expand still fails closed.
+    for command in ["grep \"$X\" f", "grep $X f", "grep \"a$X\" f", "cat \"$HOME_CONFIG\""] {
+        let (body, stderr) = authorize_tools(&fx, command);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn non_writing_kinds_deny_rebinding_and_sed_option_permutation() {
+    for kind in [WorkerKind::Reviewer, WorkerKind::AnswerAgent, WorkerKind::ReviewGuide] {
+        let fx = Fixture::new("run-nonwriting-rebinding");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = false;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+            c.is_review_guide = kind == WorkerKind::ReviewGuide;
+        });
+        for command in [
+            "export BOSS_{BIN,X}=/bin/sh; \"$BOSS_BIN\" -c 'touch x'",
+            "declare -n r=BOSS_BIN; r=/bin/sh; \"$BOSS_BIN\" -c 'touch x'",
+            "sed -n 1p -i f",
+            "sed -n 1p -e 'w out' f",
+        ] {
+            let (body, stderr) = authorize_tools(&fx, command);
+            assert_eq!(decision(&body), "deny", "{kind:?} {command}: {body} {stderr}");
+        }
+    }
+    for kind in [WorkerKind::AnswerAgent, WorkerKind::Progression] {
+        let fx = Fixture::new("run-nonwriting-sed-range");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = false;
+        });
+        let (body, stderr) = authorize_tools(&fx, "sed -n '10,$p' f");
+        assert_ne!(decision(&body), "deny", "{kind:?}: {body} {stderr}");
+    }
 }

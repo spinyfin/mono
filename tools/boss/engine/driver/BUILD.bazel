@@ -68,6 +68,10 @@ rust_test(
     ],
     edition = "2024",
     env = {"BOSS_TEST_CODEX": "$(rootpath :codex_test_binary)"},
+    # The agy adapter tests spawn a python3 hook process per case. Spread the
+    # crate's tests over native shards so each shard stays well inside the small
+    # budget, instead of raising the limit (see the engine core test target).
+    experimental_enable_sharding = True,
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
@@ -79,6 +83,7 @@ rust_test(
         # release the test binaries were fetched from.
         "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
     },
+    shard_count = 3,
     # Thirty real app-server trust observations retain the production 10s
     # deadline. Run after parallel engine shards instead of contending with
     # them; neither the production deadline nor the small test budget changes.

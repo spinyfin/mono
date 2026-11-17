@@ -380,10 +380,17 @@ def has_redirect(command):
 # Executable variables the engine exports into the worker environment. The
 # adapter runs as a hook of the worker process, so it reads the values the
 # engine set at spawn; nothing a command does inside its own shell can change
-# them here. Reassigning one inside a command is denied outright.
+# them here. A command that could rebind one is denied outright, because the
+# shell would then run something other than what the adapter resolved.
 TRUSTED_EXECUTABLE_VARS = ("BOSS_BIN", "CUBE_BIN")
-TRUSTED_VAR_RE = re.compile(r"\$(?:(%s)\b|\{(%s)\})" % ("|".join(TRUSTED_EXECUTABLE_VARS), "|".join(TRUSTED_EXECUTABLE_VARS)))
-TRUSTED_VAR_ASSIGN_RE = re.compile(r"^(?:%s)(?:\+?=.*|\[.*)?$" % "|".join(TRUSTED_EXECUTABLE_VARS))
+TRUSTED_NAMES = "|".join(TRUSTED_EXECUTABLE_VARS)
+TRUSTED_VAR_RE = re.compile(r"\$(?:(%s)\b|\{(%s)\})" % (TRUSTED_NAMES, TRUSTED_NAMES))
+TRUSTED_VAR_ASSIGN_RE = re.compile(r"^(?:%s)(?:\+?=|\[)" % TRUSTED_NAMES)
+KNOWN_VAR_RE = re.compile(r"\$(?:HOME\b|\{HOME\}|(?:%s)\b|\{(?:%s)\})" % (TRUSTED_NAMES, TRUSTED_NAMES))
+# Builtins that bind or unbind variables by name. Their name arguments can be
+# spelled indirectly (brace expansion, namerefs, "$name"), so with a trusted
+# variable in play they are denied whatever their arguments look like.
+BINDING_BUILTINS = {"export", "declare", "typeset", "local", "readonly", "unset", "read", "getopts", "mapfile", "readarray", "let"}
 
 
 def trusted_executable(name):
@@ -393,16 +400,58 @@ def trusted_executable(name):
     return value
 
 
-def reject_trusted_var_reassignment(token):
-    if TRUSTED_VAR_ASSIGN_RE.match(token):
-        fail_closed("reassigning or unsetting an engine-provided executable variable is denied")
+def reject_trusted_rebinding(command, groups):
+    uses_trusted = TRUSTED_VAR_RE.search(command) is not None
+    for group in groups:
+        normalized = without_redirections(group)
+        rest = strip_prefixes(group)
+        # Only assignment-prefix positions bind a variable; the same words as
+        # ordinary arguments (`rg BOSS_BIN`) are plain data.
+        for token in normalized[:len(normalized) - len(rest)]:
+            if TRUSTED_VAR_ASSIGN_RE.match(token):
+                fail_closed("reassigning an engine-provided executable variable is denied")
+        if not rest:
+            continue
+        program = os.path.basename(rest[0])
+        binds = program in BINDING_BUILTINS or (program == "printf" and "-v" in rest[1:])
+        if binds and (uses_trusted or any(re.search(TRUSTED_NAMES, token) for token in rest[1:])):
+            fail_closed("rebinding variables is denied when an engine-provided executable variable is in use")
 
 
-def resolve_path(path, policy, cwd=None):
+def unknown_live_expansion(command):
+    """True when the shell would expand a `$` outside single quotes that is not
+    one of the variables resolve_path substitutes."""
+    quote, escaped, index = None, False, 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+        elif char == chr(92) and quote != chr(39):
+            escaped = True
+        elif quote == chr(39):
+            if char == quote:
+                quote = None
+        elif char in (chr(34), chr(39)) and quote in (None, char):
+            quote = None if quote else char
+        elif char == "$":
+            known = KNOWN_VAR_RE.match(command, index)
+            if known:
+                index = known.end()
+                continue
+            following = command[index + 1:index + 2]
+            if following and (following.isalnum() or following in "_{('\"!?@*#$-"):
+                return True
+        index += 1
+    return False
+
+
+def resolve_path(path, policy, cwd=None, literal_dollar=False):
     home = policy["process_home"]
     path = re.sub(r"\$(?:HOME\b|\{HOME\})", lambda _: home, path)
     path = TRUSTED_VAR_RE.sub(lambda m: trusted_executable(m.group(1) or m.group(2)), path)
-    if "$" in path or path.startswith(("~-", "~+")):
+    # A `$` left in a token is a live expansion unless the caller established
+    # that every remaining `$` of the command sits inside single quotes.
+    if ("$" in path and not literal_dollar) or path.startswith(("~-", "~+")):
         fail_closed("unresolved shell path expansion")
     if path == "~" or path.startswith("~/"):
         path = home + path[1:]
@@ -411,8 +460,8 @@ def resolve_path(path, policy, cwd=None):
     return os.path.realpath(path)
 
 
-def path_is_protected(path, policy, cwd=None):
-    expanded = resolve_path(path, policy, cwd)
+def path_is_protected(path, policy, cwd=None, literal_dollar=False):
+    expanded = resolve_path(path, policy, cwd, literal_dollar)
     for root in policy.get("protected_paths", []):
         root_abs = os.path.realpath(root)
         if expanded == root_abs or expanded.startswith(root_abs + os.sep):
@@ -422,20 +471,22 @@ def path_is_protected(path, policy, cwd=None):
 
 def command_touches_protected(command, policy, cwd):
     current = cwd
-    for group in command_groups(command):
+    groups = command_groups(command)
+    reject_trusted_rebinding(command, groups)
+    literal_dollar = not unknown_live_expansion(command)
+    for group in groups:
         rest = strip_prefixes(group)
         for token in group:
-            reject_trusted_var_reassignment(token)
             candidate = token.split("=", 1)[1] if ASSIGNMENT_RE.match(token) else token
             candidate = re.sub(r"^(?:[0-9]+|&)?[<>]+", "", candidate)
-            expanded = resolve_path(candidate, policy, current)
+            expanded = resolve_path(candidate, policy, current, literal_dollar)
             if any(c in candidate for c in "*?["):
                 static = re.split(r"[\*\?\[]", expanded, 1)[0].rstrip(os.sep)
                 for root in policy["protected_paths"]:
                     root = os.path.realpath(root)
                     if root.startswith(static) or static.startswith(root + os.sep):
                         return True
-            if path_is_protected(candidate, policy, current):
+            if path_is_protected(candidate, policy, current, literal_dollar):
                 return True
         if rest and rest[0] in ("cd", "pushd", "popd"):
             if len(rest) != 2 or rest[1] == "-" or rest[1].startswith(("~-", "~+")) or any(c in rest[1] for c in "$`*?["):
@@ -495,7 +546,9 @@ def read_only_sed(args, worker_kind):
         return False
     if not args or args[0] != "-n":
         return False
-    return len(args) >= 2 and SED_RANGE_RE.fullmatch(args[1]) is not None
+    # GNU sed permutes options, so a trailing `-i` or `-e 'w out'` would still
+    # write; every remaining argument must be a plain file operand.
+    return len(args) >= 2 and SED_RANGE_RE.fullmatch(args[1]) is not None and not any(a.startswith("-") for a in args[2:])
 
 
 def structural_command_reason(command, policy, worker_kind, cwd):

@@ -460,6 +460,11 @@ fn probe_authorization_with_timeout(
         bail!("PreToolUse authorization command is disabled or malformed");
     }
     let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
+    // A review-guide worker's real guard approves only pinned source reads or a
+    // guide submission, so its positive probe is a read inside the guide
+    // workspace, with the same workspace variable the pane exports.
+    let review_guide = policy["worker_kind"].as_str() == Some("review_guide");
+    let guide_workspace = policy["workspace_path"].as_str().unwrap_or_default().to_owned();
     let run = |payload: Value| -> anyhow::Result<Value> {
         // The shared process runner kills the entire probe process group on
         // expiry rather than waiting indefinitely for adapter output.
@@ -471,6 +476,10 @@ fn probe_authorization_with_timeout(
             Command::new("/bin/sh")
                 .args(["-c", command])
                 .env("BOSS_AGY_PROBE", "1")
+                .env(
+                    "BOSS_REVIEW_GUIDE_WORKSPACE",
+                    if review_guide { guide_workspace.as_str() } else { "" },
+                )
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
@@ -494,7 +503,11 @@ fn probe_authorization_with_timeout(
             }}
         })
     };
-    let positive = run(payload("echo boss-agy-auth-positive"))?;
+    let positive = run(payload(if review_guide {
+        "cat boss-agy-auth-positive.txt"
+    } else {
+        "echo boss-agy-auth-positive"
+    }))?;
     let denied = run(payload("sudo rm -rf /tmp/boss-agy-auth-denied-sentinel"))?;
     // Only the reused launch guard denies this command; structural policy allows
     // it. This checks deny liveness in addition to the adapter's own deny.
