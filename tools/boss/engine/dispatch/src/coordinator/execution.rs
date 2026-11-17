@@ -2609,14 +2609,13 @@ impl ExecutionCoordinator {
             self.work_db
                 .fail_conflict_workspace_on_host(&attempt.id, &error_text, host.as_deref())?;
         }
-        // A positioning failure ends the attempt at once; a lease failure
-        // keeps the ordinary pre-start retries. A structured positioning
-        // refusal never retries: its hold has its own recheck sweep.
-        let retry_delays: &[std::time::Duration] = if positioning_refused || (conflict_workspace.is_some() && positioning) {
-            &[]
-        } else {
-            &self.pre_start_retry_delays
-        };
+        // A structured refusal never retries: its hold has its own recheck sweep.
+        let retry_delays: &[std::time::Duration] =
+            if positioning_refused || (conflict_workspace.is_some() && positioning) {
+                &[]
+            } else {
+                &self.pre_start_retry_delays
+            };
         let transition = if positioning_refused {
             self.work_db.record_workspace_positioning_refusal(
                 &execution.id,
@@ -2704,20 +2703,11 @@ impl ExecutionCoordinator {
             }
             PreStartFailureOutcome::PermanentFail => {
                 if let Some(attempt) = conflict_workspace {
-                    self.publisher
-                        .publish_work_item_changed(
-                            &attempt.product_id,
-                            &attempt.work_item_id,
-                            "conflict_workspace_failed",
-                        )
-                        .await;
-                    self.publisher
-                        .publish_work_item_changed(
-                            &attempt.product_id,
-                            &execution.work_item_id,
-                            "conflict_workspace_failed",
-                        )
-                        .await;
+                    for item in [&attempt.work_item_id, &execution.work_item_id] {
+                        self.publisher
+                            .publish_work_item_changed(&attempt.product_id, item, "conflict_workspace_failed")
+                            .await;
+                    }
                     self.publisher
                         .publish(
                             &execution.id,

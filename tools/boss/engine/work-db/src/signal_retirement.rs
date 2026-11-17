@@ -150,14 +150,12 @@ pub(crate) fn clear_resolved_signal_in_tx(
         // separately below.
         crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some()
     };
-    let retire_conflict = conflict
-        .as_ref()
-        .is_some_and(|a| {
-            a.status == "running"
-                || task_transitioned
-                || a.revision_task_id.is_some()
-                || crate::conflict_stop::conflict_workspace_failed(a)
-        });
+    let retire_conflict = conflict.as_ref().is_some_and(|a| {
+        a.status == "running"
+            || task_transitioned
+            || a.revision_task_id.is_some()
+            || crate::conflict_stop::conflict_workspace_failed(a)
+    });
     let retire = if ci { attempt.is_some() } else { retire_conflict };
     if retire {
         if let Some(conflict) = &conflict {
