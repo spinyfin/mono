@@ -2507,6 +2507,9 @@ macro_rules! agent_rules_preamble {
     };
 }
 
+/// Source of the deterministic pre-push checkleft gate (PreToolUse hook).
+pub const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = include_str!("checkleft_push_guard.py");
+
 pub mod agy;
 pub mod claude;
 pub mod codex;

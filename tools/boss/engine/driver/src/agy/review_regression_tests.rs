@@ -23,33 +23,37 @@ fn shared_forwarder_updates_do_not_change_live_hooks() {
 #[test]
 fn redirected_push_runs_checkleft_once_on_the_complete_command() {
     let fx = Fixture::new("checkleft-once");
-    let log = fx.tmp.path().join("checkleft.jsonl");
-    let checkleft = fx.tmp.path().join("checkleft.py");
-    write_exec(
-        &checkleft,
-        &format!(
-            "#!/usr/bin/env python3\nimport json, sys\nwith open({:?}, 'a') as f:\n    f.write(json.dumps(json.load(sys.stdin)) + '\\n')\nprint(json.dumps({{'decision':'approve'}}))\n",
-            log.to_str().unwrap()
-        ),
-    );
-    fx.install_with(WorkerKind::Standard, |c| c.checkleft_guard_script = Some(checkleft));
+    let log = fx.tmp.path().join("checkleft.log");
+    // The real push guard, with a counting stub standing in for checkleft.
+    let guard = fx.tmp.path().join("boss-checkleft-push-guard.py");
+    write_exec(&guard, crate::CHECKLEFT_PUSH_GUARD_SCRIPT);
+    let stub = fx.tmp.path().join("checkleft-stub");
+    write_exec(&stub, &format!("#!/bin/sh\necho run >> '{}'\nexit 0\n", log.display()));
+    fx.install_with(WorkerKind::Standard, |c| c.checkleft_guard_script = Some(guard));
     // Isolate scheduling from the independent guard that forbids bare pushes.
     super::failure_tests::change_policy(&fx, |p| {
         p["guards"].as_array_mut().unwrap().retain(|g| g["run_once"] == true);
     });
+    let runs = |command: &str| -> usize {
+        let _ = fs::remove_file(&log);
+        let (_, body, stderr) = authorize_with_env(
+            &fx.process_home,
+            &run_command_payload(command),
+            &[("BOSS_CHECKLEFT_BIN", stub.to_str().unwrap())],
+        );
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+        fs::read_to_string(&log).map(|l| l.lines().count()).unwrap_or(0)
+    };
     for command in [
         "jj git push 2>&1",
+        "jj git push --bookmark x && echo ok 2>&1",
         "echo ok 2>/dev/null; jj git push 2>&1 | tail",
+        "echo ok 2>/dev/null && sh -c 'git -C /tmp/repo push 2>&1'",
         "sh -c 'jj git push 2>&1'",
     ] {
-        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
-        assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
-        let lines = fs::read_to_string(&log).unwrap();
-        assert_eq!(lines.lines().count(), 1, "{lines}");
-        let input: Value = serde_json::from_str(lines.trim()).unwrap();
-        assert!(input["tool_input"]["command"].as_str().unwrap().contains(command));
-        fs::remove_file(&log).unwrap();
+        assert_eq!(runs(command), 1, "{command}");
     }
+    assert_eq!(runs("echo ok 2>&1"), 0);
 }
 
 #[test]

@@ -700,9 +700,13 @@ def run_guards(policy, canonical, rewrites=0, synthetic=False):
             fail_closed("guard entry is missing a command")
         guard_input = canonical
         if guard.get("run_once") and commands:
+            # Join with a standalone ";" token: the guard splits command groups
+            # only on standalone delimiter tokens and treats newlines as plain
+            # whitespace, so a newline join would glue the forms onto the
+            # first group of the original and hide a push from it.
             guard_input = dict(canonical)
             guard_input["tool_input"] = dict(canonical["tool_input"],
-                command="\n".join(commands + [canonical["tool_input"]["command"]]))
+                command=" ; ".join(commands + [canonical["tool_input"]["command"]]))
         try:
             result = run_bounded(
                 ["/bin/sh", "-c", command],
