@@ -577,6 +577,59 @@ fn typed_question_attentions_reach_the_owning_family_until_actioned_or_dismissed
     assert_eq!(row(&model, &root).section, NavigatorSection::Backlog);
 }
 
+#[test]
+fn typed_followup_attentions_reach_the_owning_family_until_actioned_or_dismissed() {
+    let db = WorkDb::open(temp_db_path("navigator-followups")).unwrap();
+    let product = make_revision_product(&db, "navigator-followups");
+    let root = make_in_review_chore(&db, &product, PR);
+    let revision = insert_revision_row(&db, &product, &root);
+    let mut model = None;
+    step(&db, &product, &mut model);
+    assert!(actions(&model, &root).is_empty());
+
+    let (_attention, group) = db
+        .create_attention(
+            CreateAttentionInput::builder()
+                .kind("followup")
+                .association_task_id(&revision)
+                .group_key("navigator-followup")
+                .source_kind("task_transcript")
+                .source_task_id(&revision)
+                .proposed_name("Add retry")
+                .proposed_description("Retry transient failures.")
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(step(&db, &product, &mut model), Refresh::Snapshot("broad_input"));
+    let asked = row(&model, &root);
+    assert_eq!(asked.section, NavigatorSection::NeedsAttention);
+    assert_eq!(
+        asked.reason,
+        NavigatorReason::Human {
+            action: NavigatorHumanAction::Question
+        }
+    );
+    assert_eq!(asked.default_detail, boss_protocol::NavigatorDetail::Attention);
+    assert_eq!(
+        actions(&model, &root),
+        [(NavigatorHumanAction::Question, revision.clone())]
+    );
+    let attention_ids: Vec<_> = asked
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            NavigatorAction::Attention { attention_id, .. } => Some(attention_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attention_ids, [group.id.as_str()]);
+
+    db.dismiss_attention(&group.id, None).unwrap();
+    assert_eq!(step(&db, &product, &mut model), Refresh::Snapshot("broad_input"));
+    assert!(actions(&model, &root).is_empty(), "a dismissed follow-up is history");
+    assert_eq!(row(&model, &root).section, NavigatorSection::Backlog);
+}
+
 fn in_review_named(db: &WorkDb, product_id: &str, name: &str, pr_url: &str) -> String {
     let id = create_test_chore_manual(db, product_id, name).id;
     db.connect()

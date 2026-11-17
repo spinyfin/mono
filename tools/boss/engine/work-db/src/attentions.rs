@@ -45,6 +45,15 @@ fn group_is_terminal(state: &str) -> bool {
     matches!(state, "actioned" | "dismissed")
 }
 
+/// Distinctive substrings of terminal-group refusal `work_error`s. Coupled
+/// with `ChatViewModel.attentionTerminalRefusalMarkers` in the macOS app:
+/// a replacement group shows friendly copy when the refusal contains one of
+/// these, and keeps unrelated failures (storage, member not found) as the
+/// raw message. Rewording a `bail!` below must keep the matching substring.
+const TERMINAL_GROUP_REFUSAL_MARKER: &str = "(terminal)";
+const ACTIONED_GROUP_IS_TERMINAL: &str = "an actioned group is terminal";
+const DISMISSED_GROUP_CANNOT_BE_ACTIONED: &str = "a dismissed group cannot be actioned";
+
 /// Stable content key used by [`WorkDb::reconcile_attentions`] for
 /// member-level dedup. Two members with the same key are "the same
 /// question / followup re-emitted" and the second is skipped, so a
@@ -400,10 +409,11 @@ pub(crate) fn create_attention_in_tx(
     }
     if group_is_terminal(&group.state) {
         bail!(
-            "attention group {} is {} (terminal); new attentions form a new generation, \
+            "attention group {} is {} {}; new attentions form a new generation, \
              they cannot join a closed group",
             group.id,
-            group.state
+            group.state,
+            TERMINAL_GROUP_REFUSAL_MARKER
         );
     }
     validate_member_input(&input)?;
@@ -664,9 +674,10 @@ impl WorkDb {
             .with_context(|| format!("attention {member_id} references a missing group"))?;
         if group_is_terminal(&group.state) {
             bail!(
-                "attention group {} is {} (terminal); its members can no longer be changed",
+                "attention group {} is {} {}; its members can no longer be changed",
                 group.id,
-                group.state
+                group.state,
+                TERMINAL_GROUP_REFUSAL_MARKER
             );
         }
         if new_state == "answered" && group.kind == "question" && answer.is_none() {
@@ -1308,12 +1319,14 @@ impl WorkDb {
         let group = resolve_group(&tx, id).require("attention group", id)?;
         match group.state.as_str() {
             "actioned" => bail!(
-                "attention group {} is already actioned; an actioned group is terminal",
-                group.id
+                "attention group {} is already actioned; {}",
+                group.id,
+                ACTIONED_GROUP_IS_TERMINAL
             ),
             "dismissed" => bail!(
-                "attention group {} is dismissed; a dismissed group cannot be actioned",
-                group.id
+                "attention group {} is dismissed; {}",
+                group.id,
+                DISMISSED_GROUP_CANNOT_BE_ACTIONED
             ),
             _ => {}
         }

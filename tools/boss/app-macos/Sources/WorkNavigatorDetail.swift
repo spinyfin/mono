@@ -49,7 +49,7 @@ struct WorkNavigatorDetail: View {
                 }
                 // Count what the Attention slot can actually render, not raw engine actions.
                 let actionCount = WorkNavigatorAttention.entries(model: model, root: root).count
-                let visibleTabs = Self.visibleTabs(model: model, root: root, actionCount: actionCount)
+                let visibleTabs = Self.visibleTabs(model: model)
                 if actionCount > 0, model.navigator.tab != .attention {
                     Button("Attention needed (\(actionCount))") {
                         model.navigator.tab = .attention
@@ -81,20 +81,15 @@ struct WorkNavigatorDetail: View {
         }
     }
 
-    /// Attention is present only while resolved entries exist. Other slots
-    /// still follow the registered tab set (activity, history, review).
+    /// Slots follow the registered tab set for the selected root. Attention
+    /// stays listed after its last entry resolves so the empty state remains
+    /// reachable and every registered body stays mounted.
     static func visibleTabs(
-        model: ChatViewModel,
-        root: WorkTask,
-        actionCount: Int? = nil
+        model: ChatViewModel
     ) -> [NavigatorDetailSlot] {
-        let actionCount = actionCount ?? WorkNavigatorAttention.entries(model: model, root: root).count
-        return NavigatorDetailSlot.allCases.filter { slot in
-            switch slot {
-            case .attention: return actionCount > 0
-            default: return model.navigator.tabs.contains(slot)
-            }
-        }
+        // Presence is the registered tab set on the selection, not the
+        // current entry list, so an empty Attention slot stays mounted.
+        NavigatorDetailSlot.allCases.filter { model.navigator.tabs.contains($0) }
     }
 
     @ViewBuilder

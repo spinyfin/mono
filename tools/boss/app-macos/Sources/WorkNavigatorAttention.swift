@@ -48,7 +48,7 @@ struct WorkNavigatorAttention: View {
                 )
                 .disabled(context.isReadOnly)
             case .group(let group):
-                AttentionGroupBody(group: group, expectedGeneration: group.generation)
+                OwnedAttentionGroupBody(group: group)
                     .environmentObject(context.model)
                     .disabled(context.isReadOnly)
             case .openInput(let activity):
@@ -125,11 +125,19 @@ struct WorkNavigatorAttention: View {
         guard parts.count >= 3, parts[0] == "intervention" else {
             return "Intervention"
         }
-        let reason = parts.dropFirst(2).joined(separator: ":")
-        guard !reason.isEmpty else { return "Intervention" }
-        let spaced = reason.replacingOccurrences(of: "_", with: " ")
-        guard let first = spaced.first else { return "Intervention" }
-        return String(first).uppercased() + spaced.dropFirst()
+        let reason = String(parts.dropFirst(2).joined(separator: ":"))
+        switch reason {
+        case "ci_failure_exhausted":
+            return WorkBlockedBadge.label(forReason: reason)
+        case "deliberate_park":
+            return "Waiting on you"
+        case "recovery_attention":
+            return "Recovery"
+        case "workspace_positioning_refused":
+            return "Workspace blocked"
+        default:
+            return "Intervention"
+        }
     }
 
     static func caption(
