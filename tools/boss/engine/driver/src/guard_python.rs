@@ -22,6 +22,57 @@ ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
 SHLEX_WS = ' \t\r\n'
 
+def skip_arithmetic(line, index):
+    # Double-paren and dollar-bracket arithmetic hold shifts, not redirections. Returns the index after the construct, or None if unclosed.
+    if line.startswith(chr(36) + '[', index):
+        depth, end = 1, index + 2
+        opener, closer = '[', ']'
+    else:
+        depth, end = 2, index + 2
+        opener, closer = '(', ')'
+    while end < len(line) and depth:
+        if line[end] == opener:
+            depth += 1
+        elif line[end] == closer:
+            depth -= 1
+        end += 1
+    return None if depth else end
+
+
+def heredoc_word(rest):
+    # Read the whole delimiter word, applying bash quote removal. Any quote or
+    # backslash anywhere in it makes the body non-expanding. False means the
+    # syntax cannot be parsed safely.
+    word, quoted, index = [], False, 0
+    while index < len(rest):
+        char = rest[index]
+        if char in SHLEX_WS or char in ';&|()<>':
+            break
+        if char == chr(92):
+            if index + 1 >= len(rest):
+                return False
+            word.append(rest[index + 1])
+            quoted, index = True, index + 2
+            continue
+        if char == '$' and rest[index + 1:index + 2] in (chr(39), chr(34)):
+            return False
+        if char in (chr(39), chr(34)):
+            quoted = True
+            index += 1
+            while index < len(rest) and rest[index] != char:
+                if char == chr(34) and rest[index] == chr(92) and rest[index + 1:index + 2] in ('$', chr(96), chr(34), chr(92)):
+                    index += 1
+                word.append(rest[index])
+                index += 1
+            if index >= len(rest):
+                return False
+            index += 1
+            continue
+        word.append(char)
+        index += 1
+    return (''.join(word), quoted) if word else False
+
+
 def heredoc_delim(line):
     # Unquoted << only. A quoted substring is an argument, not an operator.
     quote, escaped, index = None, False, 0
@@ -42,6 +93,11 @@ def heredoc_delim(line):
             quote = char
             index += 1
             continue
+        if line.startswith(chr(36) + '[', index) or line.startswith('((', index):
+            index = skip_arithmetic(line, index)
+            if index is None:
+                return False
+            continue
         if char == '<' and index + 1 < len(line) and line[index + 1] == '<':
             rest = line[index + 2:]
             if rest.startswith('<'):
@@ -49,20 +105,7 @@ def heredoc_delim(line):
             if rest.startswith('-'):
                 rest = rest[1:]
             rest = rest.lstrip(SHLEX_WS)
-            if not rest:
-                return False
-            delim_quote = rest[0] if rest[0] in (chr(39), chr(34)) else None
-            if delim_quote:
-                rest = rest[1:]
-            end = 0
-            while end < len(rest) and (rest[end].isalnum() or rest[end] == '_'):
-                end += 1
-            word = rest[:end]
-            if not word:
-                return False
-            if delim_quote and (end == len(rest) or rest[end] != delim_quote):
-                return False
-            return word, bool(delim_quote)
+            return heredoc_word(rest)
         index += 1
     return None
 
@@ -145,25 +188,61 @@ def quote_provenance(text, tokens):
     return masks
 
 
-def strip_line_continuations(text):
-    # Only an unescaped backslash (odd run) consumes the following newline.
-    out, index = [], 0
+def open_quote(text):
+    # The quote left open after lexing text, mirroring shlex posix quoting.
+    quote, index = None, 0
     while index < len(text):
-        if text[index] == chr(92):
-            end = index
-            while end < len(text) and text[end] == chr(92):
-                end += 1
-            count = end - index
-            if end < len(text) and text[end] == chr(10) and count % 2 == 1:
-                out.append(chr(92) * (count - 1))
-                index = end + 1
-                continue
-            out.append(text[index:end])
-            index = end
+        char = text[index]
+        if quote != chr(39) and char == chr(92):
+            index += 2
             continue
-        out.append(text[index])
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in (chr(39), chr(34)):
+            quote = char
         index += 1
-    return ''.join(out)
+    return quote
+
+
+def odd_trailing_backslashes(text):
+    return (len(text) - len(text.rstrip(chr(92)))) % 2 == 1
+
+
+def strip_line_continuations(text):
+    # Remove backslash-newline only where the shell does: not inside comments,
+    # single quotes or non-expanding heredoc bodies.
+    lines = text.split(chr(10))
+    out, current, pending, carry = [], '', '', ''
+    heredoc_end, expanding = None, False
+    for number, line in enumerate(lines):
+        last = number == len(lines) - 1
+        if heredoc_end is not None:
+            joined = carry + line
+            if expanding and not last and odd_trailing_backslashes(joined):
+                carry = joined[:-1]
+                continue
+            carry = ''
+            out.append(joined)
+            if joined.lstrip(chr(9)) == heredoc_end:
+                heredoc_end = None
+            continue
+        shaped = shell_text(pending + line + chr(10))
+        body = shaped[:-1]
+        if not last and odd_trailing_backslashes(body) and open_quote(body[:-1]) != chr(39):
+            pending = body[:-1]
+            current += line[:-1]
+            continue
+        out.append(current + line)
+        current = ''
+        if open_quote(shaped):
+            pending = shaped
+            continue
+        pending = ''
+        delim = heredoc_delim(shaped)
+        if delim:
+            heredoc_end, expanding = delim[0], not delim[1]
+    return chr(10).join(out + ([current] if current else []))
 
 
 def shell_text(text):
@@ -208,12 +287,13 @@ def shell_text(text):
     return ''.join(out)
 
 
-def command_records(command):
+def command_records(command, stripped=False):
     groups = []
     pending = ''
     receiver = None
     heredoc_end = None
-    command = strip_line_continuations(command)
+    if not stripped:
+        command = strip_line_continuations(command)
     offset = 0
     for line in command.split(chr(10)):
         line_start = offset

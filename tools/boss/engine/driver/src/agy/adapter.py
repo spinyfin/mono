@@ -347,7 +347,7 @@ def nested_shell_bodies(group):
 def has_substitution(command):
     command = strip_line_continuations(command)
     masked = list(command)
-    for group in command_records(command):
+    for group in command_records(command, True):
         if group.body_span and not group.expanding_body:
             start, end = group.body_span
             masked[start:end] = ' ' * (end - start)
@@ -527,17 +527,27 @@ STDIN_ARGV_RUNNERS = {'xargs', 'parallel'}
 STDIN_ARGV_SAFE = {'echo', 'printf', 'true', 'false', ':', 'printenv'}
 
 
-def operand_path_text(token, program):
-    if ASSIGNMENT_RE.match(token) or (token.startswith('-') and '=' in token):
-        token = token.split('=', 1)[1]
-    token = re.sub(r'^(?:[0-9]+|&)?[<>]+', '', token)
-    if token.startswith('-') and not token.startswith('--'):
+def operand_path_texts(token, role, program):
+    # Candidate path texts for one classified operand. Positional operands are
+    # kept verbatim (a name such as `-falias` or `name=alias` is the file the
+    # program opens); only syntactic wrappers are removed for other roles.
+    if role == 'literal':
+        return [token]
+    if role == 'operand':
+        candidates = [token]
+        if ASSIGNMENT_RE.match(token):
+            # dd-style `if=path` operands also name a path in their value.
+            candidates.append(token.split('=', 1)[1])
+        return candidates
+    if role == 'assignment' or role == 'option':
+        return [token.split('=', 1)[1] if '=' in token else token]
+    if role == 'redirect_attached':
+        return [re.sub(r'^(?:[0-9]+|&)?[<>|]+', '', token)]
+    if role == 'attached':
         for i, char in enumerate(token[1:], 1):
-            flag = '-' + char
-            if flag in FILE_FLAGS.get(program, ()):
-                attached = token[i + 1:]
-                return attached or token
-    return token
+            if '-' + char in FILE_FLAGS.get(program, ()):
+                return [token[i + 1:] or token]
+    return [token]
 
 
 def stdin_argv_program(group):
@@ -559,33 +569,35 @@ def stdin_argv_program(group):
 
 def path_operand_positions(group):
     # Default operands to paths; exclude known text and script positions.
+    # Returns {token index: syntactic role}.
     rest = strip_prefixes(group)
     program = os.path.basename(rest[0]) if rest else ''
     text_flags = TEXT_FLAGS.get(program, ())
     file_flags = FILE_FLAGS.get(program, ())
     operand, skip_next, skip_as_path, pattern_seen, end_of_options = 0, False, False, False, False
-    positions = set()
+    positions = {}
+    value_flags = GREP_VALUE_FLAGS if program in ('grep', 'rg') else frozenset()
     for index, token in enumerate(group):
         redirect = re.match(r'^(?:[0-9]+|&)?(?:>\||>>?|<>|<<-?|<)(.*)$', token)
         if redirect:
             if token.startswith('<<'):
                 skip_next, skip_as_path = not redirect.group(1), False
             elif redirect.group(1):
-                positions.add(index)
+                positions[index] = 'redirect_attached'
             elif index + 1 < len(group):
-                positions.add(index + 1)
+                positions[index + 1] = 'redirect_target'
             continue
         if skip_next:
             if skip_as_path:
-                positions.add(index)
+                positions[index] = 'operand'
             skip_next, skip_as_path = False, False
             continue
         if token not in rest:
             if not token.startswith('-'):
-                positions.add(index)
+                positions.setdefault(index, 'assignment' if ASSIGNMENT_RE.match(token) else 'operand')
             continue
         if operand == 0:
-            positions.add(index)
+            positions[index] = 'operand'
             operand += 1
             continue
         if not end_of_options and token == '--':
@@ -593,7 +605,7 @@ def path_operand_positions(group):
             operand += 1
             continue
         if end_of_options:
-            positions.add(index)
+            positions[index] = 'literal'
             operand += 1
             continue
         if token.startswith('-'):
@@ -605,12 +617,12 @@ def path_operand_positions(group):
                 elif name in file_flags:
                     pattern_seen = True
                     if eq:
-                        positions.add(index)
+                        positions[index] = 'option'
                     else:
                         skip_next, skip_as_path = True, True
                 elif eq:
-                    positions.add(index)
-                elif name in GREP_VALUE_FLAGS:
+                    positions[index] = 'option'
+                elif name in value_flags:
                     skip_next, skip_as_path = True, False
             else:
                 consumed = False
@@ -621,27 +633,44 @@ def path_operand_positions(group):
                         pattern_seen = True
                         if attached:
                             if flag in file_flags:
-                                positions.add(index)
+                                positions[index] = 'attached'
                         elif flag in file_flags:
                             skip_next, skip_as_path = True, True
                         else:
                             skip_next, skip_as_path = True, False
                         consumed = True
                         break
-                    if flag in GREP_VALUE_FLAGS and i + 1 == len(token):
+                    if flag in value_flags and i + 1 == len(token):
                         skip_next, skip_as_path = True, False
                         consumed = True
                         break
                 if not consumed and '=' in token:
-                    positions.add(index)
+                    positions[index] = 'option'
         elif program in NON_PATH_PROGRAMS:
             pass
         elif program in GREP_FAMILY and not pattern_seen:
             pattern_seen = True
         else:
-            positions.add(index)
+            positions[index] = 'operand'
         operand += 1
     return positions
+
+
+def operand_touches_protected(candidate, policy, current, program, is_redirect):
+    expanded = expand_exported(candidate, policy)
+    if '$' in expanded or re.match(r"^~[^/]", expanded):
+        # echo/printf argv text is data; a redirect target is always opened.
+        if is_redirect or program not in PATH_TEXT_PROGRAMS:
+            fail_closed("unresolved shell path expansion")
+        return False
+    if expanded == '~' or expanded.startswith('~/'):
+        expanded = policy['process_home'] + expanded[1:]
+    expanded = expanded.replace(chr(1), '$').replace(chr(3), '~')
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(current or policy['workspace_path'], expanded)
+    if any(c in expanded for c in '*?[') and glob_touches_protected(expanded, policy):
+        return True
+    return path_is_protected(expanded, policy, current, pre_expanded=True)
 
 
 def command_touches_protected(command, policy, cwd):
@@ -654,29 +683,16 @@ def command_touches_protected(command, policy, cwd):
         if inner is not None and inner not in STDIN_ARGV_SAFE:
             fail_closed("stdin-to-argv runners cannot be inspected for protected paths")
         program = os.path.basename(rest[0]) if rest else ''
-        for index in path_operand_positions(group):
+        for index, role in sorted(path_operand_positions(group).items()):
             token = group[index]
             literal = group.literal_chars[index] if index < len(group.literal_chars) else []
             # Preserve quoted/escaped expansion characters during resolution.
-            candidate = ''.join({'$': chr(1), '~': chr(3)}.get(c, c) if i < len(literal) and literal[i] else c
-                                for i, c in enumerate(token))
-            candidate = operand_path_text(candidate, program)
-            if not candidate or candidate.startswith('&'):
-                continue
-            expanded = expand_exported(candidate, policy)
-            if '$' in expanded or re.match(r"^~[^/]", expanded):
-                if program not in PATH_TEXT_PROGRAMS:
-                    fail_closed("unresolved shell path expansion")
-                continue
-            if expanded == '~' or expanded.startswith('~/'):
-                expanded = policy['process_home'] + expanded[1:]
-            expanded = expanded.replace(chr(1), '$').replace(chr(3), '~')
-            if not os.path.isabs(expanded):
-                expanded = os.path.join(current or policy['workspace_path'], expanded)
-            if any(c in expanded for c in '*?[') and glob_touches_protected(expanded, policy):
-                return True
-            if path_is_protected(expanded, policy, current, pre_expanded=True):
-                return True
+            protected_text = ''.join({'$': chr(1), '~': chr(3)}.get(c, c) if i < len(literal) and literal[i] else c
+                                     for i, c in enumerate(token))
+            is_redirect = role.startswith('redirect')
+            for candidate in operand_path_texts(protected_text, role, program):
+                if candidate and not candidate.startswith('&') and operand_touches_protected(candidate, policy, current, program, is_redirect):
+                    return True
         if rest and rest[0] in ("cd", "pushd", "popd"):
             if len(rest) != 2 or rest[1] == "-" or re.match(r"^~[^/]", rest[1]) or any(c in rest[1] for c in "`*?["):
                 return True

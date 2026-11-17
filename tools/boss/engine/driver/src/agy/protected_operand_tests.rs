@@ -196,3 +196,91 @@ fn guards_receive_the_workers_exact_environment() {
     assert_eq!(decision(&body), "deny", "{body} {stderr}");
     assert!(body["reason"].as_str().unwrap().contains("protected"), "{body}");
 }
+
+#[test]
+fn value_flags_of_other_programs_do_not_hide_protected_operands() {
+    let fx = Fixture::new("run-value-flag-scope");
+    fx.install(WorkerKind::Standard);
+    let config = fx.process_home.join(".gemini/config");
+    let protected = config.join("hooks.json");
+    let (protected, config) = (protected.display(), config.display());
+    for command in [
+        format!("cat -t {protected}"),
+        format!("ls -lt {config}"),
+        format!("ls -g {protected}"),
+        format!("ls -C {protected}"),
+        format!("tar -xf a.tar -C {config}"),
+        format!("git -C {config} status"),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+    for command in ["grep -A 3 pat f", "rg -t rust pat", "grep -m 2 pat f"] {
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), true);
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn heredoc_delimiter_words_and_arithmetic_do_not_hide_live_lines() {
+    let fx = Fixture::new("run-heredoc-words");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let live = format!("echo \"$(cat {})\"", protected.display());
+    for (opener, terminator) in [
+        ("cat <<'true'X", "trueX"),
+        ("cat <<\"E\"OF", "EOF"),
+        ("cat <<E'OF'", "EOF"),
+        ("(( y = 1 << 2 ))", "2"),
+        ("echo $[1<<2]", "2"),
+    ] {
+        let command = format!("{opener}\n{terminator}\n{live}\ntrue");
+        let body = deny_at(&fx, &command, &fx.workspace());
+        assert_eq!(
+            body["reason"], "command substitution is structurally denied",
+            "{command}"
+        );
+    }
+    let (_, body, stderr) = authorize(
+        &fx.process_home,
+        &run_command_payload("cat <<'E'OF\n`cat /protected/x`\nEOF"),
+        true,
+    );
+    assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
+}
+
+#[test]
+fn continuations_do_not_apply_in_comments_or_literal_heredoc_bodies() {
+    let fx = Fixture::new("run-continuation-context");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let protected = protected.display();
+    for command in [
+        format!("true # x \\\ncat {protected}"),
+        format!("cat <<'true'\nbody \\\ntrue\necho \"$(cat {protected})\"\ntrue"),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+}
+
+#[test]
+fn redirect_targets_with_unresolved_expansions_are_denied() {
+    let fx = Fixture::new("run-redirect-expansion");
+    fx.install(WorkerKind::Standard);
+    for command in ["T=/x; echo x > \"${T}y\"", "printf x >> \"$T\"", "echo x > ~root/y"] {
+        deny_at(&fx, command, &fx.workspace());
+    }
+    let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo cost$"), true);
+    assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
+}
+
+#[test]
+fn operands_after_end_of_options_are_checked_verbatim() {
+    let fx = Fixture::new("run-literal-operands");
+    fx.install(WorkerKind::Standard);
+    let target = fx.process_home.join(".gemini/config/hooks.json");
+    for name in ["-falias", "name=alias"] {
+        std::os::unix::fs::symlink(&target, fx.workspace().join(name)).unwrap();
+    }
+    deny_at(&fx, "grep -e . -- -falias", &fx.workspace());
+    deny_at(&fx, "cat -- name=alias", &fx.workspace());
+}
