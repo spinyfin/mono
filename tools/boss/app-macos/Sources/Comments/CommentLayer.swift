@@ -72,6 +72,11 @@ final class CommentLayer: NSObject, ObservableObject {
     var isReadOnly = false {
         didSet { if isReadOnly { resetAuthoringState() } }
     }
+    /// Whether the full comment sidebar is shown. Collapsed by default; the
+    /// rail's expand control and the sidebar's collapse control write this.
+    /// Stays writable while the layer is read-only so resolved comments can
+    /// still be reached via "Show resolved".
+    @Published var sidebarExpanded = false
     /// True when this layer is persisting through the engine.
     var isEngineBacked: Bool { backend != nil && !artifactId.isEmpty }
 
@@ -141,17 +146,25 @@ final class CommentLayer: NSObject, ObservableObject {
     /// because its monitor reacted to an event meant for a different window.
     private weak var hostWindow: NSWindow?
 
-    /// Zero-size view laid under the whole commented viewer (document, sidebar and
+    /// Full-size view laid under the whole commented viewer (document, sidebar and
     /// rail). Its frame is the layer's own screen region: key and right-click
     /// handling only consider selections and clicks that fall inside it, so a viewer
     /// hosted in a window shared with other inputs does not hijack their events.
-    /// `nil` (unbound / unit tests) leaves the region check open.
+    /// The binder must fill the viewer — a zero-size frame would make every region
+    /// check fail closed. `nil` (unbound / unit tests) leaves the region check open.
     private(set) weak var scopeView: NSView?
 
     /// False while the hosting slot is mounted but not shown; events are ignored.
     var isActive = true
 
     func setScopeView(_ view: NSView?) { scopeView = view }
+
+    /// Apply the hosting slot's visibility. Closing the slot also closes the
+    /// composer so keystrokes cannot keep flowing into a hidden Review tab.
+    func applyActiveState(_ active: Bool) {
+        isActive = active
+        if !active { resetAuthoringState() }
+    }
 
     /// Whether a point in window coordinates lies inside this layer's own region.
     func regionContains(windowPoint: NSPoint) -> Bool {
@@ -162,12 +175,28 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     /// Whether the window's first responder sits inside this layer's own region.
+    ///
+    /// Uses the responder's *visible* rect, not the midpoint of its full bounds.
+    /// Textual renders one interaction view per heading section (or one for a
+    /// heading-less document); that view can be taller than the viewer. The
+    /// geometric midpoint then falls outside the scope even though the user's
+    /// selection is on screen, which would silently kill type-to-comment.
     private func firstResponderIsInRegion(_ window: NSWindow?) -> Bool {
         guard isActive else { return false }
-        guard scopeView != nil else { return true }
-        guard let view = window?.firstResponder as? NSView else { return false }
-        let rect = view.convert(view.bounds, to: nil)
-        return regionContains(windowPoint: NSPoint(x: rect.midX, y: rect.midY))
+        guard let scopeView else { return true }
+        guard scopeView.window != nil, !scopeView.isHiddenOrHasHiddenAncestor else { return false }
+        guard let view = window?.firstResponder as? NSView, view.window === scopeView.window else {
+            return false
+        }
+        if let screenPoint = anchorInteractionScreenPoint, let window {
+            let windowPoint = window.convertFromScreen(
+                NSRect(origin: screenPoint, size: CGSize(width: 1, height: 1))
+            ).origin
+            if regionContains(windowPoint: windowPoint) { return true }
+        }
+        let visible = view.convert(view.visibleRect, to: nil)
+        let scope = scopeView.convert(scopeView.bounds, to: nil)
+        return visible.intersects(scope)
     }
 
     /// Binds this layer to the NSWindow hosting its markdown viewer. Called by
@@ -339,7 +368,7 @@ final class CommentLayer: NSObject, ObservableObject {
     private(set) var composerId = UUID()
 
     func requestNewComment(firstChar: Character? = nil) {
-        guard !isReadOnly else { return }
+        guard isActive, !isReadOnly else { return }
         composerId = UUID()
         ownsGuideDraft = true
         // A live selection always starts a new comment, even when a draft
@@ -557,6 +586,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// unless `showResolved`) via `comments_dismiss`; in-memory comments are
     /// removed outright.
     func dismiss(_ comment: Comment) {
+        guard !isReadOnly else { return }
         if let backend, isEngineBacked, !comment.id.hasPrefix("local:") {
             backend.dismissComment(commentId: comment.id)
         } else {
@@ -771,6 +801,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// fallback (no persistence to defer to): simulates the same override +
     /// routing locally so that surface keeps working.
     func setIntent(_ intent: CommentIntent, for comment: Comment) {
+        guard !isReadOnly else { return }
         if let backend, isEngineBacked {
             backend.setIntent(commentId: comment.id, intent: intent.rawValue)
             return
@@ -850,6 +881,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// when it was not (retry queue full).
     @discardableResult
     func postFollowup(body: String, for comment: Comment) -> Bool {
+        guard !isReadOnly else { return false }
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, comment.status == .answered else { return false }
         if let backend, isEngineBacked {
@@ -903,6 +935,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// simulates the same guarded `active` → `in_revision` batch transition
     /// locally, since there's no engine to persist it.
     func reviseDoc() {
+        guard !isReadOnly else { return }
         if let backend, isEngineBacked {
             backend.reviseDoc(artifactKind: artifactKind, artifactId: artifactId)
             return
@@ -1142,6 +1175,7 @@ final class CommentLayer: NSObject, ObservableObject {
         mods: NSEvent.ModifierFlags,
         window: NSWindow?
     ) -> Bool {
+        guard isActive else { return false }
         guard isKeyEventForThisLayer(window) else { return false }
         guard !isReadOnly, !suppressTypeToComment else { return false }
 
@@ -1152,6 +1186,14 @@ final class CommentLayer: NSObject, ObservableObject {
             if isCommentTextViewFirstResponder, commentTextView?.window === window {
                 needsCommentTextFocus = false
                 return false
+            }
+            // Host-window events keep forwarding only while the comment field or
+            // this layer's document still owns focus. A sibling input in the same
+            // window (or a tab that is no longer Review) must type normally.
+            if window === hostWindow {
+                let commentOwnsFocus = isCommentTextViewFirstResponder
+                let documentOwnsFocus = firstResponderIsInRegion(window)
+                guard commentOwnsFocus || documentOwnsFocus else { return false }
             }
             if isCommentTextViewFirstResponder {
                 return forwardKeystrokeToPendingComment(chars: chars, mods: mods)
@@ -1236,6 +1278,16 @@ final class CommentLayer: NSObject, ObservableObject {
         return true
     }
 
+    /// Whether a right-click at `locationInWindow` belongs to this layer's
+    /// document and should open the comment menu. Extracted so tests can assert
+    /// consumption without running `NSMenu.popUp`'s nested tracking loop.
+    func canHandleRightClick(locationInWindow: NSPoint, window: NSWindow?) -> Bool {
+        guard let window, window === hostWindow else { return false }
+        guard !isReadOnly, regionContains(windowPoint: locationInWindow) else { return false }
+        guard !isShowingPopover, hasCurrentSelection() else { return false }
+        return window.contentView != nil
+    }
+
     /// Returns true if the right-click event is consumed (shows our custom context menu).
     ///
     /// `NSMenu.popUp(positioning:at:in:)` interprets `at:` in the *receiving view's*
@@ -1244,10 +1296,8 @@ final class CommentLayer: NSObject, ObservableObject {
     /// space — passing the window point directly inverts Y and pops the menu at
     /// `viewHeight - clickY`. Route through `windowPointToView` to apply the flip.
     func handleRightClick(locationInWindow: NSPoint, window: NSWindow?) -> Bool {
-        guard let window, window === hostWindow else { return false }
-        guard !isReadOnly, regionContains(windowPoint: locationInWindow) else { return false }
-        guard !isShowingPopover, hasCurrentSelection() else { return false }
-        guard let view = window.contentView else { return false }
+        guard canHandleRightClick(locationInWindow: locationInWindow, window: window) else { return false }
+        guard let window, let view = window.contentView else { return false }
 
         let menu = NSMenu()
         let target = CommentMenuTarget(layer: self)
@@ -1350,19 +1400,26 @@ struct CommentArtifactRef: Equatable {
 
 // MARK: - Window binding
 
-/// Zero-size `NSView` that captures its hosting `NSWindow` and forwards it to a
-/// `CommentLayer` so the layer's NSEvent monitors can scope themselves to the
-/// right window (see `CommentLayer.hostWindow`). Mirrors the deferred-capture
-/// pattern used by `WindowMenuRegistrar` in `DesignsView.swift`: the view isn't
-/// attached to a window yet when `makeNSView` runs, so the first capture is
-/// deferred one runloop tick. `updateNSView` re-applies on every SwiftUI layout
-/// pass in case AppKit later reparents the hierarchy into a different window
-/// (e.g. tab detachment).
+/// Full-size `NSView` that captures its hosting `NSWindow` and this viewer's
+/// on-screen region, and forwards both to a `CommentLayer` so the layer's
+/// NSEvent monitors can scope themselves to the right window and ignore
+/// selections and clicks that belong to other inputs in the same window
+/// (see `CommentLayer.hostWindow` and `CommentLayer.scopeView`). Mirrors the
+/// deferred-capture pattern used by `WindowMenuRegistrar` in `DesignsView.swift`:
+/// the view isn't attached to a window yet when `makeNSView` runs, so the first
+/// capture is deferred one runloop tick. `updateNSView` re-applies on every
+/// SwiftUI layout pass in case AppKit later reparents the hierarchy into a
+/// different window (e.g. tab detachment).
+///
+/// The binder must fill the commented viewer. It is a SwiftUI background, so
+/// its size comes from the viewer; a zero frame would make every region check
+/// fail closed. Hits pass through so the binder never intercepts clicks meant
+/// for the document, sidebar, or rail.
 private struct CommentLayerWindowBinder: NSViewRepresentable {
     let layer: CommentLayer
 
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
+    func makeNSView(context: Context) -> CommentLayerScopeView {
+        let view = CommentLayerScopeView()
         DispatchQueue.main.async { [weak layer] in
             layer?.setScopeView(view)
             layer?.setHostWindow(view.window)
@@ -1370,10 +1427,17 @@ private struct CommentLayerWindowBinder: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
+    func updateNSView(_ nsView: CommentLayerScopeView, context: Context) {
         layer.setScopeView(nsView)
         layer.setHostWindow(nsView.window)
     }
+}
+
+/// Transparent region probe. Must not participate in hit testing: it sits
+/// behind the whole viewer as a SwiftUI background and would otherwise steal
+/// clicks in gaps of the markdown, sidebar, or rail.
+private final class CommentLayerScopeView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 // MARK: - View modifier
@@ -1401,11 +1465,13 @@ struct WithCommentsModifier: ViewModifier {
     @Environment(\.commentsActive) private var commentsActive
     @Environment(\.openOriginalGuide) private var openOriginalGuide
     @StateObject private var layer = CommentLayer()
-    /// Whether the full comment sidebar is shown. Collapsed by default: an
-    /// engine-backed doc with no comments no longer opens onto a wide empty
-    /// sidebar. It auto-expands when the doc gains comments (a fresh add, or an
-    /// engine-backed doc whose existing comments load) and can be toggled by hand
-    /// via the collapsed rail's expand button / the sidebar's collapse button.
+    /// The full comment sidebar is collapsed by default: an engine-backed doc
+    /// with no comments no longer opens onto a wide empty sidebar. It
+    /// auto-expands when the doc gains comments (a fresh add, or an
+    /// engine-backed doc whose existing comments load) and can be toggled by
+    /// hand via the collapsed rail's expand button / the sidebar's collapse
+    /// button. Expansion lives on the layer so a read-only viewer can still
+    /// reopen the sidebar to reach "Show resolved".
     ///
     /// Note the trap this avoids: keying visibility off `!layer.comments.isEmpty`
     /// alone would make a doc whose comments are all *resolved* (filtered out of
@@ -1413,7 +1479,6 @@ struct WithCommentsModifier: ViewModifier {
     /// toggle with it, leaving resolved comments unreachable. The rail's expand
     /// button is always present on engine-backed docs, so the full sidebar — and
     /// with it that toggle — is always one click away.
-    @State private var sidebarExpanded = false
 
     func body(content: Content) -> some View {
         let commentedAnchors = layer.currentVersionComments.filter(\.isHighlightable).map(\.displayAnchor)
@@ -1425,14 +1490,14 @@ struct WithCommentsModifier: ViewModifier {
                 .environment(\.commentFlashAnchor, flashingAnchor)
 
             Divider()
-            if sidebarExpanded {
-                CommentSidebar(layer: layer, onCollapse: { sidebarExpanded = false })
+            if layer.sidebarExpanded {
+                CommentSidebar(layer: layer, onCollapse: { layer.sidebarExpanded = false })
                     .frame(width: 280)
             } else {
                 CollapsedCommentRail(
                     commentCount: layer.currentVersionComments.count,
                     isEngineBacked: layer.isEngineBacked,
-                    onExpand: { sidebarExpanded = true },
+                    onExpand: { layer.sidebarExpanded = true },
                     onAddComment: { layer.requestNewComment() }
                 )
             }
@@ -1442,7 +1507,7 @@ struct WithCommentsModifier: ViewModifier {
         // manual collapse afterwards sticks (no empty→non-empty transition to
         // re-trigger it) until comments next go from none to some.
         .onChange(of: layer.comments.isEmpty) { _, isEmpty in
-            if !isEmpty { sidebarExpanded = true }
+            if !isEmpty { layer.sidebarExpanded = true }
         }
         // Hidden button for ⌘⇧K shortcut (⌘⇧M is already the Metrics panel shortcut).
         .background {
@@ -1453,8 +1518,9 @@ struct WithCommentsModifier: ViewModifier {
             .frame(width: 0, height: 0)
             .hidden()
         }
-        // Binds `layer.hostWindow` so its NSEvent monitors can scope themselves to
-        // this viewer's own window instead of reacting to any window in the app.
+        // Binds `layer.hostWindow` and `layer.scopeView`. The binder must fill
+        // the viewer: its frame is the event region for type-to-comment and
+        // right-click.
         .background(CommentLayerWindowBinder(layer: layer))
         .environment(\.suppressTypeToComment, Binding(
             get: { layer.suppressTypeToComment },
@@ -1462,14 +1528,14 @@ struct WithCommentsModifier: ViewModifier {
         ))
         .onAppear {
             layer.isReadOnly = commentsReadOnly
-            layer.isActive = commentsActive
+            layer.applyActiveState(commentsActive)
             layer.openOriginalGuide = openOriginalGuide
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
             if layer.draftStore.hasPendingResume(for: layer.guideVersionId) {
-                sidebarExpanded = true
+                layer.sidebarExpanded = true
                 layer.resumeGuideDraft()
             } else if layer.guideDraft != nil {
-                sidebarExpanded = true
+                layer.sidebarExpanded = true
             }
             layer.installMonitors()
         }
@@ -1477,7 +1543,7 @@ struct WithCommentsModifier: ViewModifier {
             layer.isReadOnly = value
         }
         .onChange(of: commentsActive) { _, value in
-            layer.isActive = value
+            layer.applyActiveState(value)
         }
         .onChange(of: source) { _, newSource in
             layer.updateSource(newSource, baseURL: baseURL)
@@ -1495,6 +1561,7 @@ struct WithCommentsModifier: ViewModifier {
 /// sidebar (and its "Show resolved" toggle) is always reachable — including on a
 /// doc whose comments are all resolved and therefore absent from `commentCount`.
 struct CollapsedCommentRail: View {
+    @Environment(\.commentsReadOnly) private var readOnly
     /// Number of currently-listed (unresolved, unless `showResolved`) comments,
     /// shown as a badge on the expand button when non-zero.
     let commentCount: Int
@@ -1515,6 +1582,10 @@ struct CollapsedCommentRail: View {
         isEngineBacked || commentCount > 0
     }
 
+    /// Add Comment is the only rail control that mutates. Expand stays
+    /// available while read-only so resolved comments remain reachable.
+    static func addCommentDisabled(readOnly: Bool) -> Bool { readOnly }
+
     private var showExpandButton: Bool {
         Self.shouldOfferExpand(commentCount: commentCount, isEngineBacked: isEngineBacked)
     }
@@ -1526,7 +1597,9 @@ struct CollapsedCommentRail: View {
                     .font(.callout)
             }
             .buttonStyle(.plain)
+            .disabled(Self.addCommentDisabled(readOnly: readOnly))
             .help("Select text, then click or press ⌘⇧K to add a comment")
+            .accessibilityLabel("Add Comment")
             .accessibilityIdentifier("comment-rail-add")
 
             if showExpandButton {
@@ -1548,6 +1621,7 @@ struct CollapsedCommentRail: View {
                 }
                 .buttonStyle(.plain)
                 .help("Show comments")
+                .accessibilityLabel("Show comments")
                 .accessibilityIdentifier("comment-rail-expand")
             }
 

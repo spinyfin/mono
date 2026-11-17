@@ -101,6 +101,7 @@ struct CommentSidebar: View {
                     .toggleStyle(.checkbox)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("comment-show-resolved")
             }
         }
         .padding(.horizontal, 12)
@@ -116,6 +117,7 @@ struct CommentSidebar: View {
                     .font(.callout)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .accessibilityIdentifier("comment-sidebar-add")
             if layer.guideDraft != nil {
                 Button("Resume draft") { layer.resumeGuideDraft() }
                     .font(.callout)
@@ -151,6 +153,7 @@ private struct ReviseBanner: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(readOnly)
+                    .accessibilityIdentifier("comment-revise")
                     .help(layer.guideVersionId == nil
                           ? "Address these comments on the document"
                           : "Changes the PR implementation and tests")
@@ -325,6 +328,7 @@ private struct FollowupComposer: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onSubmit(send)
+                .accessibilityIdentifier("comment-reply")
             Button(action: send) {
                 Image(systemName: "arrow.up.circle.fill")
             }
@@ -381,6 +385,7 @@ private struct IntentBadge: View {
         .menuStyle(.borderlessButton)
         .fixedSize()
         .disabled(readOnly)
+        .accessibilityIdentifier("comment-intent")
         .help(comment.intentOverriddenByUser
             ? "Manually classified as \(comment.intent?.displayName ?? "?") — click to reclassify"
             : "Click to classify this comment")
@@ -610,6 +615,7 @@ private struct CommentRow: View {
                 .foregroundStyle(.secondary)
                 .disabled(readOnly)
                 .help("Dismiss comment")
+                .accessibilityIdentifier("comment-dismiss")
             }
             .padding(.top, 8)
             .padding(.trailing, 8)

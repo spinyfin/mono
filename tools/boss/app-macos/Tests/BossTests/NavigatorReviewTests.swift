@@ -13,9 +13,10 @@ final class NavigatorReviewTests: XCTestCase {
         return task
     }
 
-    private func content(_ id: String = "version", comparison: String = "source") -> ReviewGuideVersionContent {
+    private func content(_ id: String = "version", comparison: String = "source",
+                         markdown: String = "## Guide\nReview the change.") -> ReviewGuideVersionContent {
         ReviewGuideVersionContent(id: id, seriesId: "series", comparisonId: comparison,
-                                  attemptId: "attempt", markdown: "## Guide\nReview the change.", contentHash: "hash",
+                                  attemptId: "attempt", markdown: markdown, contentHash: "hash",
                                   promptVersion: "1", generatedAt: "2026-11-17T00:00:00Z")
     }
 
@@ -181,10 +182,12 @@ final class NavigatorReviewTests: XCTestCase {
     }
 
     func testHostedReadOnlyReaderLoadsCommentsButCannotComposeOrSubmit() throws {
-        let task = root()
+        let task = root("root", version: "readonly-compose")
         let model = NavigatorTestFixture.model([task])
+        model.navigator.tab = .review
         model.navigatorReviewGuides.load(root: task) { _ in "load" }
-        model.navigatorReviewGuides.receive(versionID: "version", content: content(), requestID: "load")
+        model.navigatorReviewGuides.receive(
+            versionID: "readonly-compose", content: content("readonly-compose"), requestID: "load")
         let hosting = host(WorkNavigatorReview(context: NavigatorDetailContext(
             model: model, root: task, ask: nil, isReadOnly: false)))
         settle(hosting)
@@ -192,6 +195,7 @@ final class NavigatorReviewTests: XCTestCase {
         XCTAssertTrue(layer.isEngineBacked)
         layer.ownsGuideDraft = true
         layer.saveGuideDraft(body: "Keep my draft")
+        XCTAssertEqual(layer.guideDraft?.body, "Keep my draft")
         layer.isShowingPopover = true
         var archived = task
         archived.status = "archived"
@@ -200,11 +204,89 @@ final class NavigatorReviewTests: XCTestCase {
         settle(hosting)
         XCTAssertTrue(layer.isReadOnly)
         XCTAssertFalse(layer.isShowingPopover)
-        XCTAssertEqual(layer.guideDraft?.body, "Keep my draft")
+        XCTAssertTrue(layer.guideDrafts.contains { $0.body == "Keep my draft" },
+                      "Becoming read-only must keep the parked draft")
         layer.requestNewComment()
         XCTAssertFalse(layer.isShowingPopover)
         layer.addComment(quoted: "Review", body: "Must not submit")
         XCTAssertFalse(model.engine.hasUnsentAction(kind: "comments_create"))
+    }
+
+    func testHostedReadOnlyReaderBrowsesResolvedComments() throws {
+        var task = root("root", version: "readonly-browse")
+        task.status = "archived"
+        let model = NavigatorTestFixture.model([task])
+        model.navigator.tab = .review
+        model.navigatorReviewGuides.load(root: task) { _ in "load" }
+        model.navigatorReviewGuides.receive(
+            versionID: "readonly-browse", content: content("readonly-browse"), requestID: "load")
+        let hosting = host(WorkNavigatorReview(context: NavigatorDetailContext(
+            model: model, root: task, ask: nil, isReadOnly: true)))
+        settle(hosting)
+        let layer = try XCTUnwrap(model.commentBridge.registeredLayersForTesting.first)
+        XCTAssertTrue(layer.isReadOnly)
+        XCTAssertTrue(layer.isActive)
+        layer.sidebarExpanded = false
+        settle(hosting)
+        XCTAssertFalse(layer.sidebarExpanded, "Resolved-only feedback is reachable from the collapsed rail")
+        XCTAssertTrue(CollapsedCommentRail.shouldOfferExpand(commentCount: 0, isEngineBacked: true))
+        XCTAssertTrue(CollapsedCommentRail.addCommentDisabled(readOnly: true))
+        layer.sidebarExpanded = true
+        layer.showResolved = true
+        model.commentBridge.handleCommentsList(
+            artifactKind: WireArtifactKind.reviewGuide, artifactId: "series",
+            comments: [resolvedGuideComment()])
+        settle(hosting)
+        XCTAssertTrue(layer.sidebarExpanded)
+        XCTAssertTrue(layer.showResolved)
+        XCTAssertEqual(layer.comments.first?.body, "Saved feedback")
+        layer.requestNewComment()
+        XCTAssertFalse(layer.isShowingPopover)
+        layer.addComment(quoted: "Review", body: "Must not submit")
+        XCTAssertFalse(model.engine.hasUnsentAction(kind: "comments_create"))
+        if let comment = layer.comments.first {
+            layer.dismiss(comment)
+            layer.setIntent(.revision, for: comment)
+            XCTAssertFalse(layer.postFollowup(body: "reply", for: comment))
+        }
+        layer.reviseDoc()
+        XCTAssertFalse(model.engine.hasUnsentAction(kind: "comments_dismiss"))
+        XCTAssertFalse(model.engine.hasUnsentAction(kind: "comments_set_intent"))
+        XCTAssertFalse(model.engine.hasUnsentAction(kind: "comments_post_followup"))
+        XCTAssertFalse(model.engine.hasUnsentAction(kind: "comments_revise_doc"))
+    }
+
+    func testHostedReadOnlyReaderReopensCollapsedSidebarFromRail() throws {
+        let task = root()
+        let model = NavigatorTestFixture.model([task])
+        model.navigator.tab = .review
+        model.navigatorReviewGuides.load(root: task) { _ in "load" }
+        model.navigatorReviewGuides.receive(versionID: "version", content: content(), requestID: "load")
+        let hosting = host(WorkNavigatorReview(context: NavigatorDetailContext(
+            model: model, root: task, ask: nil, isReadOnly: false)))
+        settle(hosting)
+        let layer = try XCTUnwrap(model.commentBridge.registeredLayersForTesting.first)
+        model.commentBridge.handleCommentsList(
+            artifactKind: WireArtifactKind.reviewGuide, artifactId: "series",
+            comments: [resolvedGuideComment(status: "active")])
+        settle(hosting)
+        XCTAssertTrue(layer.sidebarExpanded, "Arriving comments auto-expand the sidebar")
+        layer.sidebarExpanded = false
+        settle(hosting)
+        XCTAssertFalse(layer.sidebarExpanded)
+        var archived = task
+        archived.status = "archived"
+        hosting.rootView = WorkNavigatorReview(context: NavigatorDetailContext(
+            model: model, root: archived, ask: nil, isReadOnly: true))
+        settle(hosting)
+        XCTAssertTrue(layer.isReadOnly)
+        XCTAssertFalse(layer.sidebarExpanded)
+        layer.sidebarExpanded = true
+        settle(hosting)
+        XCTAssertTrue(layer.sidebarExpanded)
+        XCTAssertTrue(CollapsedCommentRail.addCommentDisabled(readOnly: true))
+        layer.requestNewComment()
+        XCTAssertFalse(layer.isShowingPopover)
     }
 
     func testConnectionBlipKeepsInlineComposerOpen() throws {
@@ -228,13 +310,14 @@ final class NavigatorReviewTests: XCTestCase {
         for active in [true, false] {
             let task = root()
             let model = NavigatorTestFixture.model([task])
+            model.navigator.tab = active ? .review : .activity
             model.navigatorReviewGuides.load(root: task) { _ in "load" }
             model.navigatorReviewGuides.receive(versionID: "version", content: content(), requestID: "load")
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
                                   styleMask: [.titled], backing: .buffered, defer: false)
             let container = NSView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
             let review = NSHostingView(rootView: WorkNavigatorReview(context: NavigatorDetailContext(
-                model: model, root: task, ask: nil, isReadOnly: false)).environment(\.commentsActive, active))
+                model: model, root: task, ask: nil, isReadOnly: false)))
             review.frame = NSRect(x: 0, y: 0, width: 700, height: 700)
             let field = NSTextField(frame: NSRect(x: 750, y: 600, width: 200, height: 24))
             field.stringValue = "selected text"
@@ -244,13 +327,134 @@ final class NavigatorReviewTests: XCTestCase {
             settle(review)
             let layer = try XCTUnwrap(model.commentBridge.registeredLayersForTesting.first)
             layer.setHostWindow(window)
-            window.makeFirstResponder(field)
-            field.currentEditor()?.selectAll(nil)
+            XCTAssertEqual(layer.isActive, active)
+            XCTAssertNotNil(layer.scopeView)
+            field.selectText(nil)
+            XCTAssertTrue(window.makeFirstResponder(field))
+            let editor = try XCTUnwrap(field.currentEditor() as? NSTextView, "field editor must exist")
+            editor.selectAll(nil)
+            XCTAssertGreaterThan(editor.selectedRange().length, 0)
             XCTAssertFalse(layer.shouldConsumeKeyEvent(chars: "a", mods: [], window: window))
             XCTAssertFalse(layer.handleRightClick(
                 locationInWindow: NSPoint(x: 800, y: 612), window: window))
             XCTAssertFalse(layer.isShowingPopover)
+            withExtendedLifetime(window) {}
         }
+    }
+
+    func testCommentEventsConsumeSelectionsInsideTheActiveReader() throws {
+        let task = root()
+        let model = NavigatorTestFixture.model([task])
+        model.navigator.tab = .review
+        model.navigatorReviewGuides.load(root: task) { _ in "load" }
+        model.navigatorReviewGuides.receive(versionID: "version", content: content(), requestID: "load")
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let review = NSHostingView(rootView: WorkNavigatorReview(context: NavigatorDetailContext(
+            model: model, root: task, ask: nil, isReadOnly: false)))
+        review.frame = NSRect(x: 0, y: 0, width: 1000, height: 700)
+        window.contentView = review
+        settle(review)
+        let layer = try XCTUnwrap(model.commentBridge.registeredLayersForTesting.first)
+        XCTAssertTrue(layer.isActive)
+        XCTAssertNotNil(layer.scopeView)
+        let interaction = try XCTUnwrap(
+            textInteractionView(in: review),
+            "Textual interaction view must exist inside the hosted reader")
+        XCTAssertTrue(window.makeFirstResponder(interaction))
+        interaction.perform(#selector(NSText.selectAll(_:)), with: nil)
+        layer.liveSelectionProvider = { "Review" }
+        XCTAssertTrue(layer.hasCurrentSelection())
+        let binder = descendants(review).first {
+            String(describing: type(of: $0)).contains("CommentLayerScopeView")
+        }
+        XCTAssertNil(binder?.hitTest(NSPoint(x: 1, y: 1)))
+        let click = interaction.convert(
+            NSPoint(x: interaction.visibleRect.midX, y: interaction.visibleRect.midY), to: nil)
+        XCTAssertTrue(layer.canHandleRightClick(locationInWindow: click, window: window))
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: "a", mods: [], window: window))
+        XCTAssertTrue(layer.isShowingPopover)
+        withExtendedLifetime(window) {}
+    }
+
+    func testOpenComposerIgnoresKeysAfterLeavingReviewOrFocusingSibling() throws {
+        let task = root()
+        let model = NavigatorTestFixture.model([task])
+        model.navigator.tab = .review
+        model.navigatorReviewGuides.load(root: task) { _ in "load" }
+        model.navigatorReviewGuides.receive(versionID: "version", content: content(), requestID: "load")
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
+        let review = NSHostingView(rootView: WorkNavigatorReview(context: NavigatorDetailContext(
+            model: model, root: task, ask: nil, isReadOnly: false)))
+        review.frame = NSRect(x: 0, y: 0, width: 700, height: 700)
+        let field = NSTextField(frame: NSRect(x: 750, y: 600, width: 200, height: 24))
+        field.stringValue = "unrelated"
+        container.addSubview(review)
+        container.addSubview(field)
+        window.contentView = container
+        settle(review)
+        let layer = try XCTUnwrap(model.commentBridge.registeredLayersForTesting.first)
+        XCTAssertTrue(layer.isActive)
+        layer.isShowingPopover = true
+        layer.needsCommentTextFocus = true
+        layer.pendingTypeahead = "h"
+        field.selectText(nil)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.selectAll(nil)
+        XCTAssertFalse(layer.shouldConsumeKeyEvent(chars: "a", mods: [], window: window),
+                       "A sibling field in the host window must keep its keystrokes")
+        XCTAssertEqual(layer.pendingTypeahead, "h")
+        model.navigator.tab = .activity
+        settle(review)
+        XCTAssertFalse(layer.isActive)
+        XCTAssertFalse(layer.isShowingPopover)
+        XCTAssertFalse(layer.shouldConsumeKeyEvent(chars: "b", mods: [], window: window))
+        withExtendedLifetime(window) {}
+    }
+
+    func testTypeToCommentSurvivesTallSectionWhoseMidpointIsOffscreen() throws {
+        let task = root()
+        let model = NavigatorTestFixture.model([task])
+        model.navigator.tab = .review
+        model.navigatorReviewGuides.load(root: task) { _ in "load" }
+        model.navigatorReviewGuides.receive(versionID: "version", content: content(), requestID: "load")
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let review = NSHostingView(rootView: WorkNavigatorReview(context: NavigatorDetailContext(
+            model: model, root: task, ask: nil, isReadOnly: false)))
+        review.frame = NSRect(x: 0, y: 0, width: 720, height: 240)
+        window.contentView = review
+        settle(review)
+        let layer = try XCTUnwrap(model.commentBridge.registeredLayersForTesting.first)
+        XCTAssertTrue(layer.isActive)
+        let scope = try XCTUnwrap(layer.scopeView)
+        let binder = descendants(review).first {
+            String(describing: type(of: $0)).contains("CommentLayerScopeView")
+        }
+        XCTAssertNotNil(binder)
+        XCTAssertNil(binder?.hitTest(NSPoint(x: 1, y: 1)))
+        // Textual's per-heading interaction view is asserted in the in-region
+        // consume test. This fixture plants a section taller than the hosted
+        // reader so the responder midpoint sits outside the real scope view.
+        let tall = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 2400))
+        tall.minSize = NSSize(width: 0, height: 2400)
+        tall.isVerticallyResizable = true
+        tall.string = String(repeating: "line of review guide text\n", count: 120)
+        tall.setFrameSize(NSSize(width: 400, height: 2400))
+        review.addSubview(tall)
+        XCTAssertTrue(window.makeFirstResponder(tall))
+        let bounds = tall.convert(tall.bounds, to: nil)
+        let mid = NSPoint(x: bounds.midX, y: bounds.midY)
+        XCTAssertGreaterThan(tall.bounds.height, scope.bounds.height)
+        XCTAssertFalse(scope.convert(scope.bounds, to: nil).contains(mid),
+                       "section midpoint must sit off-screen; mid=\(mid) scope=\(scope.convert(scope.bounds, to: nil))")
+        layer.liveSelectionProvider = { "line" }
+        XCTAssertTrue(layer.hasCurrentSelection())
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: "a", mods: [], window: window))
+        withExtendedLifetime(window) {}
     }
 
     func testInactiveReviewDoesNotLoadUntilSelected() {
@@ -360,8 +564,28 @@ final class NavigatorReviewTests: XCTestCase {
 
     private func settle<V: View>(_ host: NSHostingView<V>) {
         host.layoutSubtreeIfNeeded()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         host.layoutSubtreeIfNeeded()
+    }
+
+    private func descendants(_ view: NSView) -> [NSView] {
+        [view] + view.subviews.flatMap(descendants)
+    }
+
+    private func textInteractionView(in root: NSView) -> NSView? {
+        descendants(root).first {
+            String(describing: type(of: $0)).contains("NSTextInteractionView")
+        } ?? descendants(root).first { $0 is NSTextView && $0.bounds.height > 40 }
+    }
+
+    private func resolvedGuideComment(status: String = "resolved") -> CommentWithThread {
+        CommentWithThread(comment: WorkComment(
+            id: "persisted", artifactId: "series", anchor: CommentAnchor(exact: "Review"),
+            artifactKind: WireArtifactKind.reviewGuide, author: "user:test", body: "Saved feedback",
+            createdAt: "2026-11-17T00:00:00Z", status: status,
+            guideContext: GuideCommentContext(versionId: "version", comparisonId: "source",
+                packetHash: "hash", baseSha: "base", mergeBaseSha: "merge", headSha: "head")),
+            threadEntries: [], answerAgentRunning: false, answerAgentFailed: false)
     }
 
 }

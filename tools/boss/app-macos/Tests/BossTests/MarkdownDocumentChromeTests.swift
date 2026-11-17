@@ -248,6 +248,22 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
+    func testCollapsedRailAddDisablesWhenReadOnly() {
+        XCTAssertTrue(CollapsedCommentRail.addCommentDisabled(readOnly: true))
+        XCTAssertFalse(CollapsedCommentRail.addCommentDisabled(readOnly: false))
+        let view = CollapsedCommentRail(
+            commentCount: 0,
+            isEngineBacked: true,
+            onExpand: {},
+            onAddComment: {}
+        )
+        .environment(\.commentsReadOnly, true)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 36, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
     // MARK: - Collapsible sections
 
     /// A revision brief's exact shape: a summary paragraph, the

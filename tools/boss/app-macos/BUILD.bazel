@@ -198,14 +198,24 @@ _RENDER_SHARD_SRCS = [
     "Tests/BossTests/RevisionFooterRenderTests.swift",
 ]
 
+# Shared by the navigator shards. Not a test target of its own.
+_NAVIGATOR_SUPPORT_SRCS = [
+    "Tests/BossTests/NavigatorTestFixture.swift",
+]
+
 _NAVIGATOR_SHARD_SRCS = [
     "Tests/BossTests/NavigatorSelectionTests.swift",
     "Tests/BossTests/NavigatorModeRegressionTests.swift",
     "Tests/BossTests/NavigatorRowTests.swift",
-    "Tests/BossTests/NavigatorAttentionTests.swift",
     "Tests/BossTests/NavigatorActivityTests.swift",
     "Tests/BossTests/NavigatorLifecycleTests.swift",
     "Tests/BossTests/NavigatorReviewTests.swift",
+]
+
+# Attention snapshot captures take ~50s of XCTest wall on their own, which
+# leaves the rest of the navigator suite no room inside the 60s small budget.
+_NAVIGATOR_ATTENTION_SHARD_SRCS = [
+    "Tests/BossTests/NavigatorAttentionTests.swift",
 ]
 
 macos_unit_test(
@@ -221,10 +231,30 @@ macos_unit_test(
 swift_library(
     name = "boss_mac_app_tests_navigator_lib",
     testonly = True,
-    srcs = _NAVIGATOR_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    srcs = _NAVIGATOR_SHARD_SRCS + _NAVIGATOR_SUPPORT_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsNavigator",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsNavigatorAttention",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_navigator_attention_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_navigator_attention_lib",
+    testonly = True,
+    srcs = _NAVIGATOR_ATTENTION_SHARD_SRCS + _NAVIGATOR_SUPPORT_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsNavigatorAttention",
     deps = [":boss_mac_app_lib"],
 )
 
@@ -451,7 +481,7 @@ genrule(
 app_test_shards(
     srcs = glob(
         ["Tests/BossTests/**/*.swift"],
-        exclude = _CHROME_SHARD_SRCS + _RENDER_SHARD_SRCS + _NAVIGATOR_SHARD_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+        exclude = _CHROME_SHARD_SRCS + _RENDER_SHARD_SRCS + _NAVIGATOR_SHARD_SRCS + _NAVIGATOR_ATTENTION_SHARD_SRCS + _NAVIGATOR_SUPPORT_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     ),
     linkopts = _COVERAGE_LINKOPTS,
     principal_srcs = _BOSS_TESTS_PRINCIPAL_SRCS,
