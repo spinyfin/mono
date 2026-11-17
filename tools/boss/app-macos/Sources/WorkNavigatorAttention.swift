@@ -110,7 +110,7 @@ struct WorkNavigatorAttention: View {
         let attentionID = action.attentionId ?? ""
         if action.kind == "intervention" {
             let id = attentionID.isEmpty ? (action.taskId ?? root.id) : attentionID
-            return .intervention(id: id, label: root.navigator?.root?.reasonLabel ?? "Intervention")
+            return .intervention(id: id, label: interventionLabel(attentionID: attentionID))
         }
         if !attentionID.isEmpty, let group = model.attentionGroup(id: attentionID), group.isOpen {
             return .group(group)
@@ -124,6 +124,21 @@ struct WorkNavigatorAttention: View {
             return .question(task, presentation)
         }
         return nil
+    }
+
+    /// Engine attention ids are `intervention:<task>:<reason>`. The family
+    /// `reasonLabel` is the highest-ranked human action (Question before
+    /// Intervention), so this card names the action's own reason.
+    static func interventionLabel(attentionID: String) -> String {
+        let parts = attentionID.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count >= 3, parts[0] == "intervention" else {
+            return "Intervention"
+        }
+        let reason = parts.dropFirst(2).joined(separator: ":")
+        guard !reason.isEmpty else { return "Intervention" }
+        let spaced = reason.replacingOccurrences(of: "_", with: " ")
+        guard let first = spaced.first else { return "Intervention" }
+        return String(first).uppercased() + spaced.dropFirst()
     }
 
     static func caption(

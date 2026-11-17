@@ -266,6 +266,38 @@ final class NavigatorAttentionTests: XCTestCase {
         XCTAssertNil(model.workErrorMessage)
     }
 
+    func testTerminalGroupRaceShowsRefusalOnRenderedBanner() throws {
+        let group = makeGroup(id: "atg_term", taskID: "root", generation: 1)
+        let member = makeMember(id: "atn_term", groupID: group.id, type: "prompt", text: "Which channel?")
+        let model = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
+                          groups: [group], members: [member])
+        model.engine.simulateConnectedForTesting = true
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        model.navigator.tab = .attention
+        XCTAssertTrue(model.answerAttention(member.id, answer: "ops", expectedGeneration: 1))
+        let answerRequest = try XCTUnwrap(model.attentionRequestGroupByRequestID.keys.first)
+        XCTAssertTrue(model.actionAttentionGroup(group.id, expectedGeneration: 1))
+        let actionRequest = try XCTUnwrap(
+            model.attentionRequestGroupByRequestID.keys.first { $0 != answerRequest }
+        )
+        let actioned = makeGroup(id: group.id, taskID: "root", generation: 1, state: "actioned")
+        let answered = makeMember(
+            id: member.id, groupID: group.id, type: "prompt",
+            text: "Which channel?", answer: "ops", state: "answered"
+        )
+        // Another client's terminal snapshot has no matching request id.
+        model.applyEventForTest(.attentionGroupUpdated(group: actioned, members: [answered]))
+        let selected = try XCTUnwrap(model.navigatorSelectedTask)
+        XCTAssertTrue(WorkNavigatorAttention.entries(model: model, root: selected).isEmpty)
+        XCTAssertEqual(model.navigator.tab, .activity)
+        XCTAssertFalse(model.navigator.tabs.contains(.attention))
+        XCTAssertEqual(model.attentionRequestGroupByRequestID[actionRequest], group.id)
+        model.applyEventForTest(.workError(message: "group is already actioned", requestId: actionRequest))
+        XCTAssertEqual(model.workErrorMessage, "group is already actioned")
+        XCTAssertNil(model.attentionAnswerError(forGroup: group.id))
+    }
+
     func testForeignSnapshotDoesNotDropPendingActionCorrelation() throws {
         let group = makeGroup(id: "atg_foreign", taskID: "root", generation: 1)
         let member = makeMember(id: "atn_foreign", groupID: group.id, type: "prompt", text: "Which channel?")
@@ -334,6 +366,34 @@ final class NavigatorAttentionTests: XCTestCase {
         // An attention action whose task has no operator question also renders nothing.
         let unresolved = makeRoot(actions: [attentionAction(id: "oq_none", task: "root")])
         XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: unresolved).count, 0)
+    }
+
+    func testInterventionEntryUsesOwnLabelBesideQuestion() {
+        var root = makeRoot(
+            reasonAction: "question",
+            actions: [
+                attentionAction(id: "oq_ask", task: "root"),
+                [
+                    "type": "attention", "kind": "intervention",
+                    "attention_id": "intervention:root:deliberate_park", "task_id": "root",
+                ],
+            ]
+        )
+        root.operatorQuestion = makeQuestion(id: "oq_ask")
+        let model = model([root])
+        let entries = WorkNavigatorAttention.entries(model: model, root: root)
+        XCTAssertEqual(entries.map(\.id), [
+            "question:oq_ask", "intervention:intervention:root:deliberate_park",
+        ])
+        guard case .intervention(_, let label) = entries[1] else {
+            return XCTFail("expected an intervention entry")
+        }
+        XCTAssertEqual(label, "Deliberate park")
+        XCTAssertEqual(root.navigator?.root?.reasonLabel, "Answer")
+        XCTAssertEqual(
+            WorkNavigatorAttention.caption(entries[1], index: 1, total: 2, rootID: "root"),
+            "Deliberate park · 2 of 2"
+        )
     }
 
     func testInterventionDefaultOpensAttentionWithReadOnlyEntry() throws {
@@ -515,7 +575,8 @@ final class NavigatorAttentionTests: XCTestCase {
         taskID: String?,
         projectID: String? = nil,
         generation: Int = 0,
-        kind: String = "question"
+        kind: String = "question",
+        state: String = "open"
     ) -> AttentionGroup {
         AttentionGroup(
             id: id, productID: NavigatorTestFixture.product.id, shortID: nil, kind: kind,
@@ -523,7 +584,7 @@ final class NavigatorAttentionTests: XCTestCase {
             sourceKind: taskID == nil ? "design_doc" : "task_transcript",
             sourceTaskID: taskID, sourceRunID: nil, sourceDocPath: nil,
             sourceDocRepoRemoteURL: nil, sourceDocBranch: nil,
-            groupingKey: "k_\(id)", generation: generation, state: "open",
+            groupingKey: "k_\(id)", generation: generation, state: state,
             producedArtifactKind: nil, producedArtifactRef: nil,
             createdAt: "2026-06-01T00:00:00Z", actionedAt: nil, dismissedAt: nil
         )

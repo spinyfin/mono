@@ -181,13 +181,19 @@ extension ChatViewModel {
 
     /// An engine refusal (`work_error`) carrying the request id of an
     /// answer/action on a group — for example another client already
-    /// actioned it. Painted inline beside that group; the drafts stay put.
+    /// actioned it. Painted inline beside that group while it is still
+    /// open; otherwise on the work-error banner, because a terminal
+    /// snapshot can drop the group body before this refusal arrives.
     /// Returns whether the error belonged to an attention request.
     func settleAttentionWorkError(message: String, requestId: String?) -> Bool {
         guard let requestId,
               let groupID = attentionRequestGroupByRequestID.removeValue(forKey: requestId)
         else { return false }
-        attentionAnswerErrorByGroupID[groupID] = message
+        if attentionGroup(id: groupID)?.isOpen == true {
+            attentionAnswerErrorByGroupID[groupID] = message
+        } else {
+            workErrorMessage = message
+        }
         return true
     }
 
