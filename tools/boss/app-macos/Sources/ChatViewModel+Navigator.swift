@@ -123,7 +123,7 @@ extension ChatViewModel {
         }
         if let historicalID = askID ?? (task.id != root.id ? task.id : nil) {
             navigator.historicalDocumentByRoot[root.id] = historicalID
-            navigator.documentByRoot[root.id] = historicalID == detail.revisions.currentTaskId ? .currentAsk : .historical
+            setNavigatorDocument(historicalID == detail.revisions.currentTaskId ? .currentAsk : .historical, rootID: root.id)
         }
         navigator.retainedTask = root
         retainNavigatorActivity(for: root)
@@ -150,6 +150,15 @@ extension ChatViewModel {
     }
 
     func reconcileNavigatorSelection() {
+        for (rootID, documentID) in navigator.draftDocumentByRoot {
+            guard navigatorBriefIsEditing(documentID) else {
+                releaseNavigatorDraftPin(documentID)
+                continue
+            }
+            if task(withID: rootID)?.navigator?.root?.revisions.currentTaskId != documentID {
+                keepNavigatorAskDraft(rootID: rootID, previous: documentID)
+            }
+        }
         defer {
             if navigator.mode == .navigator, selectedWorkCardID != navigator.selectedRootID {
                 // Align the shared card id even when the root has left the
@@ -329,6 +338,7 @@ extension ChatViewModel {
               navigatorBriefIsEditing(previous) else { return false }
         navigator.historicalDocumentByRoot[rootID] = previous
         navigator.documentByRoot[rootID] = .historical
+        navigator.automaticDocumentPins.insert(rootID)
         return true
     }
 
@@ -352,7 +362,19 @@ extension ChatViewModel {
         }
     }
 
+    func releaseNavigatorDraftPin(_ documentID: String) {
+        for (rootID, id) in navigator.draftDocumentByRoot where id == documentID {
+            navigator.draftDocumentByRoot[rootID] = nil
+            if navigator.automaticDocumentPins.remove(rootID) != nil {
+                navigator.documentByRoot[rootID] = nil
+                navigator.historicalDocumentByRoot[rootID] = nil
+            }
+        }
+    }
+
     func setNavigatorDocument(_ document: NavigatorBriefDocument, rootID: String) {
+        navigator.automaticDocumentPins.remove(rootID)
+        navigator.draftDocumentByRoot[rootID] = nil
         navigator.documentByRoot[rootID] = document
     }
 

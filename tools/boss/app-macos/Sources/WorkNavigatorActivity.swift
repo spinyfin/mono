@@ -108,28 +108,50 @@ struct WorkNavigatorActivity: View {
         }
     }
 
-    /// The family member whose run failed. The picker's sticky selection is
-    /// deliberately not consulted: the current revision wins when it has a
-    /// failure, then the selected activity's task, then the root.
-    var failingTask: WorkTask {
-        let current = projection?.revisions.currentTaskId.flatMap { model.task(withID: $0) }
-        let candidates = [current, selected.flatMap { model.task(withID: $0.taskId) }, root]
-        return candidates.compactMap { $0 }.first(where: hasFailure) ?? current ?? root
+    struct FailureTarget {
+        let task: WorkTask
+        let executionID: String?
     }
 
-    private func hasFailure(_ task: WorkTask) -> Bool {
-        task.dispatchFailedReason != nil
-            || model.taskRuntimesByID[task.id]?.dispatchFailures.isEmpty == false
+    private func failedStatus(_ status: String?) -> Bool {
+        ["failed", "abandoned", "cancelled", "orphaned"].contains(status ?? "")
+    }
+
+    var failureTarget: FailureTarget {
+        let family = model.navigatorFamily(of: root)
+        let currentID = projection?.revisions.currentTaskId
+        let candidates = family.compactMap { task -> (FailureTarget, Date)? in
+            let runtime = model.taskRuntimesByID[task.id]
+            let last = model.executionsByTaskID[task.id]?.filter { failedStatus($0.status) }
+                .max { ($0.endedDate ?? $0.startedDate ?? .distantPast)
+                    < ($1.endedDate ?? $1.startedDate ?? .distantPast) }
+            let failedRuntime = failedStatus(runtime?.executionStatus)
+            let dispatchFailure = task.dispatchFailedReason != nil || runtime?.dispatchFailures.isEmpty == false
+            guard failedRuntime || dispatchFailure || last != nil else { return nil }
+            let executionID = failedRuntime || dispatchFailure ? runtime?.executionID : last?.id
+            return (FailureTarget(task: task, executionID: executionID),
+                    last?.endedDate ?? last?.startedDate
+                        ?? runtime?.dispatchFailures.last.flatMap { BackgroundWorkElapsed.parse($0.happenedAt) }
+                        ?? BackgroundWorkElapsed.parse(task.updatedAt) ?? .distantPast)
+        }
+        if let current = candidates.first(where: { $0.0.task.id == currentID }) { return current.0 }
+        return candidates.max { $0.1 < $1.1 }?.0
+            ?? FailureTarget(task: root, executionID: nil)
+    }
+
+    var failingTask: WorkTask { failureTarget.task }
+
+    var failureTranscript: TranscriptViewerRef {
+        TranscriptViewerRef(taskId: failureTarget.task.id, preselectExecutionId: failureTarget.executionID)
     }
 
     /// Latest recorded dispatch failure text for the failing member, falling
     /// back to the root's when the member's list is empty.
     var failureText: String? {
         let failing = failingTask
-        for id in [failing.id, root.id] {
-            if let last = model.taskRuntimesByID[id]?.dispatchFailures.last { return last.errorText }
-        }
-        return nil
+        if let last = model.taskRuntimesByID[failing.id]?.dispatchFailures.last { return last.errorText }
+        if let text = failing.dispatchFailedError { return text }
+        return model.taskRuntimesByID[root.id]?.dispatchFailures.last?.errorText ?? root.dispatchFailedError
     }
 
     private var pickerActivities: [NavigatorActivity] {
@@ -208,19 +230,15 @@ struct WorkNavigatorActivity: View {
     @ViewBuilder
     private var failureBody: some View {
         let failing = failingTask
-        let banner = failing.dispatchFailedReason != nil ? failing : root
-        if let reason = banner.dispatchFailedReason {
-            WorkDispatchFailureBanner(reason: reason, errorText: banner.dispatchFailedError)
+        if let reason = failing.dispatchFailedReason {
+            WorkDispatchFailureBanner(reason: reason, errorText: failing.dispatchFailedError)
         }
         if let text = failureText {
             Text(text).font(.caption).foregroundStyle(.secondary)
         }
         HStack {
             Button("Open last transcript") {
-                openWindow(id: "transcript-viewer", value: TranscriptViewerRef(
-                    taskId: failing.id,
-                    preselectExecutionId: selected?.taskId == failing.id ? selected?.executionId : nil
-                ))
+                openWindow(id: "transcript-viewer", value: failureTranscript)
             }
             .buttonStyle(.link)
         }
@@ -271,7 +289,7 @@ struct WorkNavigatorActivity: View {
         if let selected, let host = remoteHost(for: selected) {
             WorkNavigatorRemotePane(
                 model: model.remotePaneViewer,
-                runId: selected.runId ?? selected.executionId,
+                selected: selected,
                 host: host,
                 ended: selectedRunEnded,
                 isActive: isSlotActive
@@ -312,7 +330,7 @@ struct WorkNavigatorTerminalSlot: View {
     let selected: NavigatorActivity
     let ended: Bool
     let isLive: Bool
-    let isActive: Bool
+    var isActive: Bool
     @ObservedObject var workspace: WorkersWorkspaceModel
     @Environment(\.openWindow) private var openWindow
 
@@ -338,15 +356,25 @@ struct WorkNavigatorTerminalSlot: View {
         isActive && isLive && !ended && !hasSession
     }
 
-    private var runId: String { selected.runId ?? selected.executionId }
-    private var session: TerminalPaneSession? { workspace.viewer(forRunId: runId)?.session }
+    @State private var attachOwner = UUID().uuidString
+    var runId: String { selected.runId ?? selected.executionId }
+    var session: TerminalPaneSession? { workspace.viewer(forRunId: runId)?.session }
+
+    var presentation: Presentation {
+        Self.presentation(hasHostedSession: session?.hostView != nil, ended: ended,
+                          failure: workspace.viewerAttachFailuresByRunId[runId])
+    }
+
+    func updateAttachRequest(owner: String) {
+        if Self.shouldRequestAttach(isActive: isActive, isLive: isLive, ended: ended, hasSession: session != nil) {
+            requestAttachIfNeeded(owner: owner)
+        } else {
+            workspace.resetViewerAttachRequests(owner: owner)
+        }
+    }
 
     var body: some View {
-        let presentation = Self.presentation(
-            hasHostedSession: session?.hostView != nil, ended: ended,
-            failure: workspace.viewerAttachFailuresByRunId[runId]
-        )
-        return Group {
+        Group {
             if presentation == .terminal, let session {
                 VStack(alignment: .leading, spacing: 4) {
                     if !isLive {
@@ -378,21 +406,23 @@ struct WorkNavigatorTerminalSlot: View {
                 NavigatorPaneNotice(text: "Agent pane not available yet.", systemImage: "terminal")
             }
         }
-        .onAppear(perform: requestAttachIfNeeded)
-        .onDisappear { workspace.endViewerAttachRequest(forRun: runId) }
-        .onChange(of: isActive) { _, active in
-            if active { requestAttachIfNeeded() } else { workspace.endViewerAttachRequest(forRun: runId) }
+        .onAppear { updateAttachRequest(owner: attachOwner) }
+        .onDisappear { workspace.resetViewerAttachRequests(owner: attachOwner) }
+        .onChange(of: isActive) { _, _ in
+            updateAttachRequest(owner: attachOwner)
         }
+        .onChange(of: isLive) { _, _ in updateAttachRequest(owner: attachOwner) }
+        .onChange(of: ended) { _, _ in updateAttachRequest(owner: attachOwner) }
         .onChange(of: runId) { old, _ in
-            workspace.endViewerAttachRequest(forRun: old)
-            requestAttachIfNeeded()
+            workspace.endViewerAttachRequest(forRun: old, owner: attachOwner)
+            requestAttachIfNeeded(owner: attachOwner)
         }
     }
 
-    private func requestAttachIfNeeded() {
+    func requestAttachIfNeeded(owner: String) {
         guard Self.shouldRequestAttach(isActive: isActive, isLive: isLive, ended: ended, hasSession: session != nil)
         else { return }
-        workspace.requestViewerAttach(forRuns: [runId])
+        workspace.requestViewerAttach(forRuns: [runId], owner: owner)
     }
 }
 
@@ -400,7 +430,10 @@ struct WorkNavigatorTerminalSlot: View {
 /// remote-pane model the Agents view uses. Watching follows visibility.
 struct WorkNavigatorRemotePane: View {
     @ObservedObject var model: RemotePaneViewerModel
-    let runId: String
+    let selected: NavigatorActivity
+    var runId: String { selected.runId ?? selected.executionId }
+    @State private var watchOwner = UUID().uuidString
+    @Environment(\.openWindow) private var openWindow
     let host: String
     let ended: Bool
     let isActive: Bool
@@ -408,17 +441,27 @@ struct WorkNavigatorRemotePane: View {
     var body: some View {
         Group {
             if ended {
-                NavigatorPaneNotice(text: "Remote execution on \(host) ended.", systemImage: "stop.circle")
+                VStack {
+                    NavigatorPaneNotice(text: "Remote execution on \(host) ended.", systemImage: "stop.circle")
+                    Button("Open transcript") { openWindow(id: "transcript-viewer", value: transcript) }
+                        .buttonStyle(.link)
+                }
             } else {
                 RemotePaneViewerView(model: model, runId: runId, hostFallback: host)
                     .accessibilityIdentifier("navigator-remote-pane")
             }
         }
-        .onChange(of: watchTarget, initial: true) { _, run in model.watch(run) }
-        .onDisappear { model.stopWatching() }
+        .onChange(of: watchTarget, initial: true) { _, _ in updateWatch(owner: watchOwner) }
+        .onDisappear { model.stopWatching(owner: watchOwner) }
     }
 
-    private var watchTarget: String? { isActive && !ended ? runId : nil }
+    var transcript: TranscriptViewerRef {
+        TranscriptViewerRef(taskId: selected.taskId, preselectExecutionId: selected.executionId)
+    }
+
+    func updateWatch(owner: String) { model.watch(watchTarget, owner: owner) }
+
+    var watchTarget: String? { isActive && !ended ? runId : nil }
 }
 
 extension NavigatorDetailRegistry {

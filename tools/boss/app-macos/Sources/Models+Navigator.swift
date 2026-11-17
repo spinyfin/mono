@@ -159,6 +159,8 @@ struct WorkNavigatorState {
     var revealGeneration = UUID()
     /// Explicit per-root choice (picker, History, reveal). Absent means the
     /// default derived from the projection; see `navigatorDocument(for:)`.
+    var draftDocumentByRoot: [String: String] = [:]
+    var automaticDocumentPins: Set<String> = []
     var documentByRoot: [String: NavigatorBriefDocument] = [:]
     /// Keyed by root id; holds the selected activity so a new run cannot replace it.
     var activityByRoot: [String: NavigatorActivity] = [:]

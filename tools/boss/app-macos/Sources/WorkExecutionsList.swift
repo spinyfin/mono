@@ -23,6 +23,10 @@ struct WorkExecutionsList: View {
     @State private var showAllAbandonedAttempts = false
     @State private var consumer = WorkExecutionsConsumer()
 
+    func updateConsumer(_ consumer: WorkExecutionsConsumer) {
+        consumer.update(taskIDs: isActive ? Set(taskIDs) : [], model: model)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -79,9 +83,9 @@ struct WorkExecutionsList: View {
                 Text("No executions yet.").font(.caption).foregroundStyle(.tertiary)
             }
         }
-        .onAppear { consumer.update(taskIDs: isActive ? Set(taskIDs) : [], model: model) }
-        .onChange(of: taskIDs) { _, ids in consumer.update(taskIDs: isActive ? Set(ids) : [], model: model) }
-        .onChange(of: isActive) { _, active in consumer.update(taskIDs: active ? Set(taskIDs) : [], model: model) }
+        .onAppear { updateConsumer(consumer) }
+        .onChange(of: taskIDs) { _, _ in updateConsumer(consumer) }
+        .onChange(of: isActive) { _, _ in updateConsumer(consumer) }
         .onDisappear { consumer.update(taskIDs: [], model: model) }
     }
 }

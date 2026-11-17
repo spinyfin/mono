@@ -408,6 +408,10 @@ extension ChatViewModel {
 
     func beginNavigatorBriefEdit(_ task: WorkTask) {
         guard navigatorBriefCanEdit(task) else { return }
+        let rootID = task.navigator?.rootTaskId ?? task.id
+        if navigatorDocumentTask(for: self.task(withID: rootID) ?? task).id == task.id {
+            navigator.draftDocumentByRoot[rootID] = task.id
+        }
         let existing = navigator.briefDrafts[task.id]
         navigator.briefDrafts[task.id] = NavigatorBriefDraft(
             text: existing?.text ?? task.description,
@@ -424,6 +428,7 @@ extension ChatViewModel {
 
     func cancelNavigatorBriefEdit(_ task: WorkTask) {
         navigator.briefDrafts[task.id] = nil
+        releaseNavigatorDraftPin(task.id)
     }
 
     func reloadNavigatorBrief(_ task: WorkTask) {
@@ -450,6 +455,7 @@ extension ChatViewModel {
         let requestID = engine.sendUpdateWorkItem(id: task.id, patch: ["description": text])
         if requestID != nil || engine.hasUnsentAction(kind: "update_work_item") {
             navigator.briefDrafts[task.id] = nil
+            releaseNavigatorDraftPin(task.id)
             return true
         }
         return false

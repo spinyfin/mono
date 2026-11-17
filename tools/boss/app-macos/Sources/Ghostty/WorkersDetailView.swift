@@ -65,6 +65,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         }
         .background(Color(nsColor: .separatorColor))
         .onAppear(perform: bindAndSync)
+        .onDisappear { workspace.resetViewerAttachRequests(owner: "agents") }
         .task(id: isVisible) {
             guard isVisible else { return }
             while !Task.isCancelled {
@@ -74,7 +75,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
             }
         }
         .onChange(of: isVisible) { _, visible in
-            if !visible { workspace.resetViewerAttachRequests() }
+            if !visible { workspace.resetViewerAttachRequests(owner: "agents") }
             syncGrid()
             if visible {
                 workspace.refreshExecutionLabels(forReleasedRuns: releasedRunIds)
@@ -196,7 +197,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
         }
         Self.bindAgentReveal(grid: grid, workspace: workspace, liveStates: liveStates)
         grid.onViewerAttachRequested = { [weak workspace] runs in
-            workspace?.requestViewerAttach(forRuns: runs)
+            workspace?.requestViewerAttach(forRuns: runs, owner: "agents")
         }
         syncGrid()
     }
