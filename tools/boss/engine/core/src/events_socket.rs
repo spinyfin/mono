@@ -523,9 +523,10 @@ pub async fn handle_connection(
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
+    let read_deadline = tokio::time::Instant::now() + HOOK_READ_DEADLINE;
     let read_result = {
         let mut limited = (&mut stream).take(MAX_HOOK_BYTES as u64 + 1);
-        tokio::time::timeout(HOOK_READ_DEADLINE, limited.read_to_end(&mut bytes)).await
+        tokio::time::timeout_at(read_deadline, limited.read_to_end(&mut bytes)).await
     };
     match read_result {
         Ok(Ok(_)) => {}
@@ -545,6 +546,9 @@ pub async fn handle_connection(
         }
     }
     if bytes.len() > MAX_HOOK_BYTES {
+        // Let a finite sender finish write_all and half-close before replying.
+        // Discard without allocating, under the original connection deadline.
+        let _ = tokio::time::timeout_at(read_deadline, tokio::io::copy(&mut stream, &mut tokio::io::sink())).await;
         let err = SocketError::PayloadTooLarge { max: MAX_HOOK_BYTES };
         reject_connection(&mut stream, &err).await;
         return Err(err);
@@ -649,8 +653,10 @@ fn decode_incoming_event(
         identity_store: Some(Arc::new(work_db.clone()) as Arc<dyn ProgressIdentityStore>),
         ..ProgressSessionConfig::default()
     };
+    let mut from_subagent = payload_is_from_subagent(&raw);
     let event = if let Some(mut session) = driver.progress_session(&session_config) {
         let mut events = session.normalize_progress_events(&raw)?;
+        from_subagent |= session.last_event_from_subagent();
         if events.is_empty() {
             return Ok(None);
         }
@@ -672,7 +678,7 @@ fn decode_incoming_event(
     }
     Ok(Some(
         IncomingHookEvent::resolve(driver.as_ref(), event, run_id, transcript_path, peer_pid_value)
-            .with_subagent_origin(payload_is_from_subagent(&raw)),
+            .with_subagent_origin(from_subagent),
     ))
 }
 
@@ -935,7 +941,7 @@ mod tests {
     /// Like [`db_with_ready_execution`], but with a `work_runs` row so
     /// identity claim can persist. Live hook ingress only fires after spawn
     /// has started the run.
-    fn db_with_started_execution(driver_slug: Option<&str>) -> (TempDir, WorkDb, String) {
+    pub(super) fn db_with_started_execution(driver_slug: Option<&str>) -> (TempDir, WorkDb, String) {
         let (dir, db, execution_id) = db_with_ready_execution(driver_slug);
         db.start_execution_run(
             &execution_id,
@@ -949,7 +955,7 @@ mod tests {
         (dir, db, execution_id)
     }
 
-    async fn handle_payload(
+    pub(super) async fn handle_payload(
         db: &WorkDb,
         registry: &DriverRegistry,
         payload: &str,
@@ -2517,3 +2523,7 @@ mod tests {
         assert!(!payload_is_from_subagent(&serde_json::json!({"agent_id": null})));
     }
 }
+
+#[cfg(test)]
+#[path = "events_socket_regression_tests.rs"]
+mod regression_tests;

@@ -1842,8 +1842,13 @@ impl boss_engine_driver::ProgressIdentityStore for WorkDb {
     }
 
     fn progress_run_is_non_terminal(&self, run_id: &str) -> Result<bool, String> {
-        self.get_execution(run_id)
-            .map(|execution| !execution.status.is_terminal())
-            .map_err(|err| format!("{err:#}"))
+        let conn = self.connect().map_err(|err| format!("{err:#}"))?;
+        conn.query_row("SELECT status FROM work_executions WHERE id = ?1", [run_id], |row| {
+            let raw: String = row.get(0)?;
+            parse_text_column::<ExecutionStatus>(0, &raw)
+        })
+        .optional()
+        .map(|status| status.is_some_and(|status| !status.is_terminal()))
+        .map_err(|err| format!("{err:#}"))
     }
 }

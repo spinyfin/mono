@@ -201,6 +201,7 @@ pub(super) struct AgyProgressSession {
     identity_store: Option<Arc<dyn ProgressIdentityStore>>,
     claimed_id: Option<String>,
     store_unavailable: bool,
+    from_subagent: bool,
 }
 
 impl AgyProgressSession {
@@ -217,6 +218,7 @@ impl AgyProgressSession {
             identity_store,
             claimed_id,
             store_unavailable,
+            from_subagent: false,
         }
     }
 
@@ -288,6 +290,7 @@ impl AgyProgressSession {
     }
 
     fn decode(&mut self, raw: &Value) -> Result<Option<WorkerEvent>, NormalizeError> {
+        self.from_subagent = false;
         let mut canonical = canonicalize(raw)?;
         let name = event_name(&canonical)?.to_owned();
         let session_id = session_id_of(&canonical)?.to_owned();
@@ -330,7 +333,10 @@ impl AgyProgressSession {
                 IdentityDecision::Drop => Ok(None),
                 IdentityDecision::Accept { .. } => normalize_hook_event(&canonical).map(Some),
             },
-            "PreToolUse" | "PostToolUse" => normalize_hook_event(&canonical).map(Some),
+            "PreToolUse" | "PostToolUse" => {
+                self.from_subagent = self.claimed_id.as_deref().is_some_and(|id| id != session_id);
+                normalize_hook_event(&canonical).map(Some)
+            }
             other => {
                 tracing::debug!(
                     event = other,
@@ -348,6 +354,10 @@ enum IdentityDecision {
 }
 
 impl ProgressSessionNormalizer for AgyProgressSession {
+    fn last_event_from_subagent(&self) -> bool {
+        self.from_subagent
+    }
+
     fn normalize_progress_event(&mut self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
         self.normalize_progress_events(raw)?
             .into_iter()

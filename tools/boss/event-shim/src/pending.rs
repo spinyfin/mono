@@ -18,7 +18,7 @@ const MAX_FIELD: usize = 8192;
 /// lifecycle fields (`stop_hook_active`, `source`, `model`, `reason`, ...) that
 /// change how the event is interpreted. Tool payloads become markers; other
 /// large strings keep a bounded prefix and large nested values are dropped.
-fn bound_fields(object: &mut serde_json::Map<String, serde_json::Value>) {
+pub(super) fn bound_fields(object: &mut serde_json::Map<String, serde_json::Value>) {
     use serde_json::Value;
     object.retain(|key, value| {
         let size = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());

@@ -191,6 +191,9 @@ const REJECTION_READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// hook timeout covers process teardown and scheduling jitter.
 const SHIM_TOTAL_BUDGET: Duration = Duration::from_secs(12);
 
+// Must match the engine events socket's ingress limit.
+const MAX_HOOK_BYTES: usize = 256 * 1024;
+
 /// Compile-time headroom that the default connect-retry schedule must
 /// leave within [`SHIM_TOTAL_BUDGET`] for a final write attempt. The
 /// actual write timeout remains the time left at runtime because a
@@ -267,6 +270,9 @@ fn deliver_local(
     payload_line: Vec<u8>,
     deadline: Instant,
 ) -> Result<()> {
+    if payload_line.len() > MAX_HOOK_BYTES {
+        return reject_delivery(socket_path, "hook exceeds ingress size limit after truncation");
+    }
     // Drain leftover buffered events FIRST (oldest first). The head
     // record retries connect under `deadline` so an engine restart still
     // rides through when the buffer is non-empty. A concurrent drain
@@ -420,7 +426,14 @@ fn splice_shim_fields(payload: &[u8]) -> Vec<u8> {
             serde_json::Value::String(generate_delivery_id()),
         );
     }
-    serde_json::to_vec(&value).unwrap_or_else(|_| payload.to_vec())
+    let encoded = serde_json::to_vec(&value).unwrap_or_else(|_| payload.to_vec());
+    if encoded.len() <= MAX_HOOK_BYTES {
+        return encoded;
+    }
+    let object = value.as_object_mut().expect("hook object");
+    pending::bound_fields(object);
+    object.insert("_boss_payload_truncated".into(), true.into());
+    serde_json::to_vec(&value).unwrap_or(encoded)
 }
 
 fn generate_delivery_id() -> String {
@@ -628,6 +641,9 @@ enum BufferedSendError {
 /// keeps FIFO order. Fails fast once `deadline` has passed, without
 /// attempting a connect.
 fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> std::result::Result<(), BufferedSendError> {
+    if payload.len() > MAX_HOOK_BYTES {
+        return Err(BufferedSendError::Rejected("hook exceeds ingress size limit".into()));
+    }
     if budget_exhausted(deadline) {
         return Err(BufferedSendError::Transient(anyhow!(
             "shim wall-clock budget exhausted before send"
@@ -936,6 +952,27 @@ mod tests {
             assert!(maybe_splice_run_id(b"not json at all").is_err());
             assert!(maybe_splice_run_id(b"\"a string\"").is_err());
             assert!(maybe_splice_run_id(b"[1,2,3]").is_err());
+        });
+    }
+
+    #[test]
+    fn oversized_hook_retains_lifecycle_and_delivery_fields() {
+        with_env(RUN_ID_ENV, Some("run-large"), || {
+            let payload = serde_json::json!({
+                "hook_event_name": "PostToolUse", "session_id": "parent",
+                "tool_name": "Write", "tool_input": {"content": "x".repeat(300 * 1024)},
+                "stop_hook_active": false, "_boss_delivery_id": "stable-delivery",
+            });
+            let bounded = splice_shim_fields(payload.to_string().as_bytes());
+            assert!(bounded.len() <= MAX_HOOK_BYTES);
+            let parsed: serde_json::Value = serde_json::from_slice(&bounded).unwrap();
+            assert_eq!(parsed["_boss_payload_truncated"], true);
+            assert_eq!(parsed["tool_input"]["_boss_truncated"], true);
+            assert_eq!(parsed["session_id"], "parent");
+            assert_eq!(parsed["hook_event_name"], "PostToolUse");
+            assert_eq!(parsed["stop_hook_active"], false);
+            assert_eq!(parsed["_boss_run_id"], "run-large");
+            assert_eq!(parsed["_boss_delivery_id"], "stable-delivery");
         });
     }
 
