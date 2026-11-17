@@ -1300,11 +1300,20 @@ impl ExecutionRunner for PaneSpawnRunner {
         // needs a pure derived phrase or can use the cached/LLM path; see its
         // doc comment for why some kinds can't share `get_or_generate`.
         let review_stage = review_batch_member_role.map(ReviewBatchMemberRole::stage);
-        let title_summary =
-            match pane_summary::derived_title_summary(&execution.kind, review_stage, work_item_name(work_item)) {
-                Some(summary) => summary,
-                None => pane_summary::get_or_generate(&self.work_db, utility.as_ref(), work_item).await,
-            };
+        // A review-guide run's synthetic row is named after the PR title; the
+        // title should name the task the guide explains instead.
+        let title_subject = if execution.kind == ExecutionKind::PrReviewGuide {
+            self.work_db
+                .get_work_item(&self.work_db.owning_work_item_id(&execution.work_item_id))
+                .map(|owner| work_item_name(&owner).to_owned())
+                .unwrap_or_default()
+        } else {
+            work_item_name(work_item).to_owned()
+        };
+        let title_summary = match pane_summary::derived_title_summary(&execution.kind, review_stage, &title_subject) {
+            Some(summary) => summary,
+            None => pane_summary::get_or_generate(&self.work_db, utility.as_ref(), work_item).await,
+        };
 
         let work_item_binding = Some(WorkItemBinding {
             work_item_id: work_item_id(work_item).to_owned(),

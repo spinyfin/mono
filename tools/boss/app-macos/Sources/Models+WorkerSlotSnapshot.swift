@@ -37,6 +37,8 @@ struct ExecutionWorkLabel: Codable, Hashable {
     var status: ExecutionLabelStatus
     var kind: String?
     var productId: String?
+    var productName: String?
+    var projectName: String?
     var prURL: String?
     var purpose: String?
     var workItemId: String?
@@ -48,6 +50,8 @@ struct ExecutionWorkLabel: Codable, Hashable {
         case status
         case kind
         case productId = "product_id"
+        case productName = "product_name"
+        case projectName = "project_name"
         case prURL = "pr_url"
         case purpose
         case workItemId = "work_item_id"
@@ -79,12 +83,15 @@ extension ExecutionWorkLabel {
     }
 }
 
-/// Compact Agents-header row: the bound work item's short id and, when a
-/// PR exists, `repo#n`. Clicking the id reveals the Work card; clicking
-/// the PR opens it in the browser.
+/// Compact Agents-header row: product → project → short id → PR (`repo#n`),
+/// each omitted when the engine did not supply it. Clicking the id reveals the
+/// Work card; clicking the PR opens it in the browser. The project is the
+/// first part to truncate when the row is too long.
 struct WorkerHeaderWorkLinks: Equatable {
     let workItemId: String
     let productId: String?
+    let productName: String?
+    let projectName: String?
     let shortIdLabel: String
     let title: String
     let prURL: String?
@@ -121,8 +128,11 @@ struct WorkerSlotLiveSlice: Equatable {
     let viewerAttachError: String?
     let workItemId: String?
     let workItemName: String?
+    let owningWorkItemId: String?
+    let owningWorkItemTitle: String?
     let workItemShortId: Int?
     let productId: String?
+    let productName: String?
     let prURL: String?
 
     init(_ live: WorkerLiveState) {
@@ -143,8 +153,11 @@ struct WorkerSlotLiveSlice: Equatable {
         self.viewerAttachError = live.viewerAttachError
         self.workItemId = live.workItemId
         self.workItemName = live.workItemName
+        self.owningWorkItemId = live.owningWorkItemId
+        self.owningWorkItemTitle = live.owningWorkItemTitle
         self.workItemShortId = live.workItemShortId
         self.productId = live.productId
+        self.productName = live.productName
         self.prURL = live.prURL
     }
 
@@ -314,15 +327,17 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
     var headerWorkLinks: WorkerHeaderWorkLinks? {
         if isPlaceholder { return finishedWorkLinks }
         guard let live,
-              let workItemId = live.workItemId, !workItemId.isEmpty,
+              let workItemId = live.owningWorkItemId ?? live.workItemId, !workItemId.isEmpty,
               let shortId = live.workItemShortId
         else { return nil }
         let prURL = live.prURL.flatMap { $0.isEmpty ? nil : $0 }
         return WorkerHeaderWorkLinks(
             workItemId: workItemId,
             productId: live.productId.flatMap { $0.isEmpty ? nil : $0 },
+            productName: Self.nonEmpty(live.productName),
+            projectName: Self.nonEmpty(live.projectName),
             shortIdLabel: Self.shortIdLabel(workItemId: workItemId, shortId: shortId),
-            title: live.workItemName ?? "",
+            title: live.owningWorkItemTitle ?? live.workItemName ?? "",
             prURL: prURL,
             prLabel: prURL.flatMap(Self.pullRequestCompactLabel(from:))
         )
@@ -339,11 +354,18 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
         return WorkerHeaderWorkLinks(
             workItemId: workItemId,
             productId: label.productId.flatMap { $0.isEmpty ? nil : $0 },
+            productName: Self.nonEmpty(label.productName),
+            projectName: Self.nonEmpty(label.projectName),
             shortIdLabel: Self.shortIdLabel(workItemId: workItemId, shortId: shortId),
             title: label.workItemTitle ?? "",
             prURL: prURL,
             prLabel: prURL.flatMap(Self.pullRequestCompactLabel(from:))
         )
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return trimmed
     }
 
     /// `T<n>` for tasks and chores, `P<n>` for projects.

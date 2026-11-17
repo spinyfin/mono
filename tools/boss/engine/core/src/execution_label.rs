@@ -6,12 +6,12 @@
 //! fields while the run was alive is dropped at release, so the label is
 //! rebuilt from the execution → work item → PR binding instead of being
 //! remembered by the frontend. The fields are derived by the same helper the
-//! live state uses ([`work_item_header_fields`]), so a pane reads identically
+//! live state uses ([`work_item_header`]), so a pane reads identically
 //! before and after the run finishes.
 
 use boss_protocol::{ExecutionKind, ExecutionLabelStatus, ExecutionWorkLabel};
 
-use crate::live_worker_metadata::work_item_header_fields;
+use crate::live_worker_metadata::work_item_header;
 use crate::runner::work_item_name;
 use crate::work::{WorkDb, WorkExecution};
 
@@ -47,26 +47,29 @@ pub fn label_for_execution(work_db: &WorkDb, execution: &WorkExecution) -> Execu
     let work_item = match work_db.get_work_item(&owning_id) {
         Ok(item) => item,
         Err(error) => {
-            return unbound_label(execution, purpose, &owning_id, &error);
+            return unbound_label(work_db, execution, purpose, &owning_id, &error);
         }
     };
-    let (product_id, work_item_short_id, pr_url) = work_item_header_fields(Some(&work_item), execution);
+    let header = work_item_header(work_db, execution, Some(&work_item));
     ExecutionWorkLabel::builder()
         .execution_id(execution.id.clone())
         .status(ExecutionLabelStatus::Resolved)
         .kind(execution.kind.as_str())
         .work_item_id(owning_id)
         .work_item_title(work_item_name(&work_item))
-        .maybe_product_id(product_id)
-        .maybe_pr_url(pr_url)
+        .maybe_product_id(header.product_id)
+        .maybe_product_name(header.product_name)
+        .maybe_project_name(header.project_name)
+        .maybe_pr_url(header.pr_url)
         .maybe_purpose(purpose)
-        .maybe_work_item_short_id(work_item_short_id)
+        .maybe_work_item_short_id(header.short_id)
         .build()
 }
 
 /// No work-item row backs the execution. Kinds that are never bound to a work
 /// item are not "deleted"; everything else lost its item.
 fn unbound_label(
+    work_db: &WorkDb,
     execution: &WorkExecution,
     purpose: Option<String>,
     owning_id: &str,
@@ -74,7 +77,7 @@ fn unbound_label(
 ) -> ExecutionWorkLabel {
     let status = if matches!(
         execution.kind,
-        ExecutionKind::AnswerAgent | ExecutionKind::AutomationTriage
+        ExecutionKind::AnswerAgent | ExecutionKind::AutomationTriage | ExecutionKind::PrReviewGuide
     ) {
         ExecutionLabelStatus::NoWorkItem
     } else {
@@ -91,7 +94,7 @@ fn unbound_label(
         .execution_id(execution.id.clone())
         .status(status)
         .kind(execution.kind.as_str())
-        .maybe_pr_url(execution.pr_url.clone().filter(|url| !url.trim().is_empty()))
+        .maybe_pr_url(work_item_header(work_db, execution, None).pr_url)
         .maybe_purpose(purpose)
         .build()
 }

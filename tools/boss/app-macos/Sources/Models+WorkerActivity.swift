@@ -92,9 +92,13 @@ struct WorkerLiveState {
     /// Bound work item for this pane. `nil` for ad-hoc / unbound runs.
     let workItemId: String?
     let workItemName: String?
+    let owningWorkItemId: String?
+    let owningWorkItemTitle: String?
     let workItemShortId: Int?
     /// Product that owns `workItemId`. Needed to reveal the Work card.
     let productId: String?
+    /// Display name of `productId`, as the left nav shows it.
+    let productName: String?
     /// GitHub PR URL bound to the work item; updates when a PR is opened
     /// mid-run.
     let prURL: String?
@@ -147,8 +151,11 @@ struct WorkerLiveState {
         hungSince: String? = nil,
         workItemId: String? = nil,
         workItemName: String? = nil,
+        owningWorkItemId: String? = nil,
+        owningWorkItemTitle: String? = nil,
         workItemShortId: Int? = nil,
         productId: String? = nil,
+        productName: String? = nil,
         prURL: String? = nil
     ) {
         self.hungSince = hungSince
@@ -178,8 +185,11 @@ struct WorkerLiveState {
         self.viewerAttachError = viewerAttachError
         self.workItemId = workItemId
         self.workItemName = workItemName
+        self.owningWorkItemId = owningWorkItemId
+        self.owningWorkItemTitle = owningWorkItemTitle
         self.workItemShortId = workItemShortId
         self.productId = productId
+        self.productName = productName
         self.prURL = prURL
     }
 
@@ -249,8 +259,11 @@ extension WorkerLiveState: Hashable {
             && lhs.viewerAttachError == rhs.viewerAttachError
             && lhs.workItemId == rhs.workItemId
             && lhs.workItemName == rhs.workItemName
+            && lhs.owningWorkItemId == rhs.owningWorkItemId
+            && lhs.owningWorkItemTitle == rhs.owningWorkItemTitle
             && lhs.workItemShortId == rhs.workItemShortId
             && lhs.productId == rhs.productId
+            && lhs.productName == rhs.productName
             && lhs.prURL == rhs.prURL
     }
 
@@ -280,8 +293,11 @@ extension WorkerLiveState: Hashable {
         hasher.combine(viewerAttachError)
         hasher.combine(workItemId)
         hasher.combine(workItemName)
+        hasher.combine(owningWorkItemId)
+        hasher.combine(owningWorkItemTitle)
         hasher.combine(workItemShortId)
         hasher.combine(productId)
+        hasher.combine(productName)
         hasher.combine(prURL)
     }
 }

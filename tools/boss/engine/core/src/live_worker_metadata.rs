@@ -120,9 +120,8 @@ pub fn resolve_with_automation(
     host_id: &str,
     has_source_automation: bool,
 ) -> LiveWorkerMetadata {
-    let work_item = work_db.get_work_item(&execution.work_item_id).ok();
-    let (project_id, project_name) = project_attribution(work_db, work_item.as_ref());
-    let (product_id, work_item_short_id, pr_url) = work_item_header_fields(work_item.as_ref(), execution);
+    let work_item = owning_work_item(work_db, execution);
+    let header = work_item_header(work_db, execution, work_item.as_ref());
     LiveWorkerMetadata {
         review_stage: review_stage(work_db, execution),
         agent_type: Some(
@@ -130,31 +129,60 @@ pub fn resolve_with_automation(
                 .as_str()
                 .to_owned(),
         ),
-        project_id,
-        project_name,
+        project_id: header.project_id,
+        project_name: header.project_name,
         host_id: Some(host_id.to_owned()),
         started_at: execution
             .started_epoch()
             .map(boss_engine_utils::iso8601::format_epoch_iso8601),
-        product_id,
-        work_item_short_id,
-        pr_url,
+        product_id: header.product_id,
+        product_name: header.product_name,
+        work_item_short_id: header.short_id,
+        owning_work_item_id: header.owning_work_item_id,
+        owning_work_item_title: header.owning_work_item_title,
+        pr_url: header.pr_url,
     }
 }
 
-/// Product id, short id, and bound PR URL for the Agents pane header.
-/// `None` triple (aside from a possible execution-level PR URL) when the
-/// execution is not pointed at a work-item row (automation id,
-/// review-guide comparison, missing row).
+/// The work item an execution's pane header describes. A review-guide run
+/// binds `work_item_id` to an immutable comparison, not a `tasks` row; the
+/// item it explains is the comparison series' root task, which is also the
+/// chain root when the PR belongs to a revision chain. `None` when no row
+/// resolves (an automation id, an external-PR guide whose series has no
+/// owning task, a deleted item).
+pub(crate) fn owning_work_item(work_db: &WorkDb, execution: &WorkExecution) -> Option<WorkItem> {
+    let owning_id = work_db.owning_work_item_id(&execution.work_item_id);
+    work_db.get_work_item(&owning_id).ok()
+}
+
+/// Everything the Agents pane header's second line is built from, resolved
+/// once so live panes and finished-pane labels read identically.
+#[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub(crate) struct WorkItemHeader {
+    pub owning_work_item_id: Option<String>,
+    pub owning_work_item_title: Option<String>,
+    pub product_id: Option<String>,
+    pub product_name: Option<String>,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub short_id: Option<i64>,
+    pub pr_url: Option<String>,
+}
+
+/// Product, project, short id and bound PR URL for the pane header, for the
+/// owning `work_item` of `execution` (see [`owning_work_item`]).
 ///
-/// Prefers the work-item row's `pr_url`. Revision tasks are inserted with
-/// that column NULL; their bound PR lives on [`WorkExecution::pr_url`]
-/// (stamped from the chain root at dispatch). Fall back to a non-empty
-/// execution URL so revision workers show the PR they are updating.
-pub(crate) fn work_item_header_fields(
-    work_item: Option<&WorkItem>,
+/// The PR is, in order: for a review-guide run, the comparison's canonical PR
+/// (so a manual guide on an external PR still names its PR); the work-item
+/// row's `pr_url`; the execution's `pr_url`. Revision tasks are inserted with
+/// a NULL `pr_url`; their bound PR lives on [`WorkExecution::pr_url`] (stamped
+/// from the chain root at dispatch).
+pub(crate) fn work_item_header(
+    work_db: &WorkDb,
     execution: &WorkExecution,
-) -> (Option<String>, Option<i64>, Option<String>) {
+    work_item: Option<&WorkItem>,
+) -> WorkItemHeader {
     let (product_id, short_id, task_pr_url) = match work_item {
         Some(WorkItem::Task(task) | WorkItem::Chore(task)) => (
             Some(task.product_id.clone()),
@@ -165,8 +193,36 @@ pub(crate) fn work_item_header_fields(
         Some(WorkItem::Product(product)) => (Some(product.id.clone()), None, None),
         None => (None, None, None),
     };
-    let pr_url = task_pr_url.or_else(|| non_empty_pr_url(execution.pr_url.as_deref()));
-    (product_id, short_id, pr_url)
+    let product_name = product_id.as_deref().and_then(|id| match work_db.get_product(id) {
+        Ok(product) => product.map(|product| product.name),
+        Err(error) => {
+            tracing::warn!(product_id = id, %error, "live worker metadata: could not read product name");
+            None
+        }
+    });
+    let guide_pr_url = (execution.kind == ExecutionKind::PrReviewGuide)
+        .then(|| {
+            work_db
+                .get_pr_review_guide_comparison_by_id(&execution.work_item_id)
+                .ok()
+                .flatten()
+                .and_then(|capture| non_empty_pr_url(Some(&capture.packet.canonical_pr_url)))
+        })
+        .flatten();
+    let pr_url = guide_pr_url
+        .or(task_pr_url)
+        .or_else(|| non_empty_pr_url(execution.pr_url.as_deref()));
+    let (project_id, project_name) = project_attribution(work_db, work_item);
+    WorkItemHeader::builder()
+        .maybe_owning_work_item_id(work_item.map(|_| work_db.owning_work_item_id(&execution.work_item_id)))
+        .maybe_owning_work_item_title(work_item.map(|item| crate::runner::work_item_name(item).to_owned()))
+        .maybe_product_id(product_id)
+        .maybe_product_name(product_name)
+        .maybe_project_id(project_id)
+        .maybe_project_name(project_name)
+        .maybe_short_id(short_id)
+        .maybe_pr_url(pr_url)
+        .build()
 }
 
 fn non_empty_pr_url(url: Option<&str>) -> Option<String> {
