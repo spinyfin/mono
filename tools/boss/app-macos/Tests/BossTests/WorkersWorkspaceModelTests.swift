@@ -294,6 +294,26 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
 
 @MainActor
 final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
+    func testProgressionSlotsAttachAndRejectAnOccupiedSlot() {
+        let model = WorkersWorkspaceModel()
+        // Progression follows the fixed review capacity, even when fewer
+        // reviewers are configured.
+        model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 8)
+        for slot in 41...44 {
+            guard case .success = model.attachWorkerPane(makeAttachRequest(slot: slot, runId: "progression-\(slot)")) else {
+                return XCTFail("progression slot \(slot) must attach")
+            }
+            guard case .failure(.slotBusy(occupyingRunId: "progression-\(slot)")) =
+                    model.attachWorkerPane(makeAttachRequest(slot: slot, runId: "replacement-\(slot)")) else {
+                return XCTFail("a second run cannot displace the progression viewer")
+            }
+        }
+        XCTAssertEqual(Set(model.listHostedPanes().map(\.slotId)), Set(41...44))
+        guard case .failure(.internalFailure) = model.attachWorkerPane(makeAttachRequest(slot: 45)) else {
+            return XCTFail("slots beyond the progression hard cap must be rejected")
+        }
+    }
+
     func testSameRunAttachPreservesSurfaceAndOriginalSlotMetadata() {
         let model = WorkersWorkspaceModel()
         _ = model.attachWorkerPane(makeAttachRequest(slot: 3))

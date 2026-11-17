@@ -305,7 +305,7 @@ impl StaleWorkerReaper for ReleasingReaper {
     async fn reap_worker(&self, execution_id: &str) {
         self.live_states.release_slot(self.slot_id);
         self.coordinator
-            .release_worker_and_kick(&worker_id_for_slot(self.slot_id), None)
+            .release_worker_and_kick(&worker_id_for_slot(self.slot_id), execution_id, None)
             .await;
         self.reaped.lock().unwrap().push(execution_id.to_owned());
     }

@@ -329,7 +329,7 @@ impl ExecutionCoordinator {
             } else if let Err(error) = self.work_db.release_persona(&execution.id) {
                 tracing::error!(execution_id = %execution.id, %error, "could not release persona after progression cleanup");
             }
-            self.release_worker_and_kick(&worker_id, None).await;
+            self.release_worker_and_kick(&worker_id, &execution.id, None).await;
         }
     }
 }

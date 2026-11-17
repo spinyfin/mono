@@ -1005,10 +1005,13 @@ pub(crate) async fn finish_reap(
     ctx.reaper.reap_worker(execution_id).await;
 
     // Release the worker pool slot so the orphan sweep detects the chore and
-    // creates a fresh ready execution for redispatch. Idempotent with the
-    // pool-slot release production's `release_worker_pane` already performs.
+    // creates a fresh ready execution for redispatch. The reaper may already
+    // have released and dispatched a replacement into this slot, so only
+    // release the execution whose reap just completed.
     let worker_id = worker_id_for_slot(slot_id);
-    ctx.coordinator.release_worker_and_kick(&worker_id, None).await;
+    ctx.coordinator
+        .release_worker_and_kick(&worker_id, execution_id, None)
+        .await;
 
     // Release the cube workspace lease. `mark_execution_orphaned`
     // deliberately leaves the lease columns intact (a live workspace may

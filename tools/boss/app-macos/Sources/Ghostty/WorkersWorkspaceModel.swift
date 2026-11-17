@@ -20,6 +20,10 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// when the engine pushes EnginePoolConfig on RegisterAppSession.
     /// The initial value of 16 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs.
     static let reviewSlotBase = automationSlotBase + automationSlotCount   // 25
+    /// Progression follows MAX_REVIEW_POOL_SIZE, independent of the configured
+    /// review count. Mirrors MAX_PROGRESSION_POOL_SIZE in the engine.
+    static let progressionSlotBase = reviewSlotBase + 16   // 41
+    static let progressionSlotRange = progressionSlotBase...(progressionSlotBase + 4 - 1)
 
     /// Engine-pushed pool sizes for the Agents pool strip. Existing
     /// viewers survive capacity changes until detached.
@@ -243,7 +247,8 @@ final class WorkersWorkspaceModel: ObservableObject {
         let slotId = request.slotId
         guard (1...Self.workerSlotCount).contains(slotId)
                 || Self.automationSlotRange.contains(slotId)
-                || reviewSlotRange.contains(slotId) else {
+                || reviewSlotRange.contains(slotId)
+                || Self.progressionSlotRange.contains(slotId) else {
             return .failure(.internalFailure("engine requested unknown slot \(slotId)"))
         }
         if let occupant = viewersByRunId.values.first(where: { $0.slotId == slotId }) {

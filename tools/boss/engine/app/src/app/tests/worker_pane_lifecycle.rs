@@ -342,7 +342,7 @@ async fn release_worker_pane_releases_matching_worker_pool_slot() {
     // the worker_registry so `release_worker_pane` can resolve
     // the run id back to that slot.
     let claimed = pool
-        .claim_worker("exec-1", None)
+        .claim_worker(&run_id, None)
         .await
         .expect("worker pool starts with one free slot");
     assert_eq!(claimed, "worker-1");
@@ -376,7 +376,7 @@ async fn release_worker_pane_pool_release_is_idempotent() {
     let run_id = super::tmux_stub::seed_teardown(&server_state);
     let pool = server_state.execution_coordinator.worker_pool();
 
-    let _claimed = pool.claim_worker("exec-1", None).await.unwrap();
+    let _claimed = pool.claim_worker(&run_id, None).await.unwrap();
     server_state.worker_registry.register_run_slot(&run_id, 1);
 
     server_state.release_worker_pane(&run_id).await;
@@ -589,6 +589,65 @@ async fn tmux_teardown_finishes_before_waiting_for_the_viewer_ack() {
         )
         .await;
     assert_eq!(release.await.unwrap(), PaneReleaseOutcome::Reaped);
+}
+
+#[tokio::test]
+async fn delayed_progression_viewer_detach_preserves_the_replacement_and_its_driver_signal() {
+    let (server, _dir) = test_server_state();
+    let execution_id = super::tmux_stub::seed_teardown(&server);
+    let pool = server.execution_coordinator.progression_worker_pool();
+    let worker = pool.claim_worker(&execution_id, None).await.unwrap();
+    assert_eq!(worker, "progression-1");
+    server.worker_registry.register_run_slot(&execution_id, 41);
+    server
+        .live_worker_states
+        .register_spawn(41, &execution_id, "codex", 0, None);
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let releasing_server = server.clone();
+    let releasing_id = execution_id.clone();
+    let release = tokio::spawn(async move { releasing_server.release_worker_pane(&releasing_id).await });
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let FrontendEvent::EngineRequest { request_id, request } = envelope.payload else {
+        panic!("expected viewer detach");
+    };
+    assert!(matches!(request, EngineToAppRequest::DetachWorkerPane(_)));
+
+    // Another cleanup completes while this detach acknowledgement is in flight.
+    // Its released slot is immediately claimed by the next progression run.
+    assert!(pool.release_worker_if_execution(&worker, &execution_id, None).await);
+    server.live_worker_states.release_slot_for_run(&execution_id);
+    assert_eq!(pool.claim_worker("replacement", None).await, Some(worker.clone()));
+    server.worker_registry.register_run_slot("replacement", 41);
+    server
+        .live_worker_states
+        .register_spawn(41, "replacement", "codex", 0, None);
+    server.live_worker_states.record_driver_signal(
+        "replacement",
+        boss_engine_runtime::live_worker_state::DriverSignalKind::TranscriptPath,
+    );
+
+    server
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(boss_protocol::DetachWorkerPaneResult {}),
+            },
+        )
+        .await;
+    assert_eq!(release.await.unwrap(), PaneReleaseOutcome::Reaped);
+    assert_eq!(
+        server.execution_coordinator.claim_holder(&worker).await.as_deref(),
+        Some("replacement")
+    );
+    assert_eq!(server.worker_registry.slot_for_run("replacement"), Some(41));
+    assert_eq!(server.live_worker_states.get(41).unwrap().run_id, "replacement");
+    assert!(server.live_worker_states.has_driver_signal_for_run("replacement"));
+    assert!(pool.claim_worker("third-run", None).await.is_none());
 }
 
 #[tokio::test(start_paused = true)]

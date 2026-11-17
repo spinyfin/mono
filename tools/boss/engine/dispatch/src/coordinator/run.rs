@@ -1041,7 +1041,7 @@ impl ExecutionCoordinator {
                     self.rescan_active_dispatch_after_release();
                     self.kick();
                 } else {
-                    self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
+                    self.release_worker_and_kick(&worker_id, &execution.id, Some(lease.workspace_id.as_str()))
                         .await;
                 }
             }
@@ -1192,22 +1192,32 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Release `worker_id` back to the pool, then rescan + kick to
+    /// Release `worker_id` only while owned by `execution_id`, then rescan + kick to
     /// pick up newly-eligible work. Used at the tail of non-pane
     /// `run_execution` calls and from [`ServerState::release_worker_pane`]
     /// for the deferred pane-spawn case. The WorkerPool free signal
     /// follows token-verified tmux teardown and viewer detach, keeping
     /// the slot occupied until the worker has been released.
-    pub async fn release_worker_and_kick(self: &Arc<Self>, worker_id: &str, last_workspace_id: Option<&str>) {
-        self.pool_for_worker_id(worker_id)
-            .release_worker(worker_id, last_workspace_id)
-            .await;
-        self.rescan_active_dispatch_after_release();
-        self.kick();
+    /// A pane reaper and its spawn-failure tail can both reach this helper.
+    /// The first release wakes dispatch, so the second must not free a new
+    /// occupant or overwrite its workspace affinity.
+    pub async fn release_worker_and_kick(
+        self: &Arc<Self>,
+        worker_id: &str,
+        execution_id: &str,
+        last_workspace_id: Option<&str>,
+    ) {
+        if self
+            .pool_for_worker_id(worker_id)
+            .release_worker_if_execution(worker_id, execution_id, last_workspace_id)
+            .await
+        {
+            self.rescan_active_dispatch_after_release();
+            self.kick();
+        }
     }
 
-    /// Compare-and-release variant of [`Self::release_worker_and_kick`]
-    /// for the pool-claim reconciler: free `worker_id` only if it is
+    /// Pool-claim reconciler cleanup: free `worker_id` only if it is
     /// still claimed by exactly `execution_id`, then rescan + kick if it
     /// was actually freed. Returns whether the slot was released.
     ///

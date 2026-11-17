@@ -450,7 +450,8 @@ impl ExecutionCoordinator {
             })?;
         let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
         if let Err(err) = self.schedule_execution(&execution, &worker_id, admission).await {
-            pool.release_worker(&worker_id, preferred_workspace_id.as_deref()).await;
+            pool.release_worker_if_execution(&worker_id, &execution.id, preferred_workspace_id.as_deref())
+                .await;
             self.recover_failed_dispatch(&execution, &worker_id, &err).await;
             return Err(err);
         }
@@ -2629,7 +2630,7 @@ impl ExecutionCoordinator {
                     "spawn_attempt status=ready -> skipped reason=claim_lost"
                 );
                 self.pool_for_worker_id(worker_id)
-                    .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
+                    .release_worker_if_execution(worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
                     .await;
                 return;
             }
@@ -2641,7 +2642,7 @@ impl ExecutionCoordinator {
                     "spawn_attempt status=ready -> skipped reason=claim_error"
                 );
                 self.pool_for_worker_id(worker_id)
-                    .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
+                    .release_worker_if_execution(worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
                     .await;
                 return;
             }
@@ -2729,7 +2730,7 @@ impl ExecutionCoordinator {
             );
             // `spawn_claim` is still armed: Drop reverts `claimed → ready`.
             self.pool_for_worker_id(worker_id)
-                .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
+                .release_worker_if_execution(worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
                 .await;
             return;
         };
@@ -2766,7 +2767,11 @@ impl ExecutionCoordinator {
                     );
                     coordinator
                         .pool_for_worker_id(&worker_id)
-                        .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                        .release_worker_if_execution(
+                            &worker_id,
+                            &execution.id,
+                            execution.preferred_workspace_id.as_deref(),
+                        )
                         .await;
                     return;
                 }
@@ -2793,7 +2798,11 @@ impl ExecutionCoordinator {
                     );
                     coordinator
                         .pool_for_worker_id(&worker_id)
-                        .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                        .release_worker_if_execution(
+                            &worker_id,
+                            &execution.id,
+                            execution.preferred_workspace_id.as_deref(),
+                        )
                         .await;
                     coordinator.recover_failed_dispatch(&execution, &worker_id, &err).await;
                 }
