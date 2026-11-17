@@ -1487,6 +1487,143 @@ mod tests {
 
     // ─── tests ───────────────────────────────────────────────────────────────
 
+    /// Mirrors a production pane reaper whose awaited release hands the slot to
+    /// a new run that registers live state before the sweep's tail runs.
+    struct ReplacingReaper {
+        coordinator: Arc<ExecutionCoordinator>,
+        live_states: Arc<LiveWorkerStateRegistry>,
+    }
+
+    #[async_trait]
+    impl SpawnAckReaper for ReplacingReaper {
+        async fn reap_worker(&self, execution_id: &str) {
+            self.live_states.release_slot_for_run(execution_id);
+            self.coordinator
+                .release_worker_and_kick(&worker_id_for_slot(1), execution_id, None)
+                .await;
+            assert!(
+                self.coordinator
+                    .worker_pool()
+                    .claim_worker("replacement", None)
+                    .await
+                    .is_some()
+            );
+            register_slot_zero_pid(&self.live_states, 1, "replacement", "replacement-item");
+        }
+    }
+
+    /// Incident shape for a progression spawn that "never produced a driver
+    /// signal": the failing spawn's teardown frees slot 41, a replacement claims
+    /// and registers it, and only then do the old spawn's error tail and reaper
+    /// run. The replacement must keep its claim and live entry so its real
+    /// driver signal lands on it and the driver-start check passes.
+    #[tokio::test]
+    async fn displaced_progression_spawn_cleanup_does_not_strip_the_replacements_driver_signal() {
+        let (_dir, db) = open_db();
+        let db = Arc::new(db);
+        let mut coordinator = ExecutionCoordinator::new(
+            db.clone(),
+            boss_execution_contracts::WorkerPool::new(1),
+            Arc::new(NoopCube),
+            Arc::new(NoopRunner),
+        );
+        coordinator.set_progression_pool(boss_execution_contracts::WorkerPool::new_progression(1));
+        let coordinator = Arc::new(coordinator);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+
+        let worker = coordinator
+            .progression_worker_pool()
+            .claim_worker("old-run", None)
+            .await
+            .unwrap();
+        let slot = crate::coordinator::slot_id_from_worker_id(&worker).unwrap();
+        assert_eq!(slot, 41);
+        register_slot_with_live_shell(&live_states, slot, "old-run", "item-old", 4242, false);
+        let old_state = live_states.snapshot().pop().unwrap();
+
+        // The failing spawn's pane teardown frees the slot first.
+        live_states.release_slot_for_run("old-run");
+        coordinator.release_worker_and_kick(&worker, "old-run", None).await;
+        // Dispatch hands slot 41 to a replacement, which registers.
+        coordinator
+            .progression_worker_pool()
+            .claim_worker("replacement", None)
+            .await
+            .unwrap();
+        register_slot_with_live_shell(&live_states, slot, "replacement", "item-new", 4343, false);
+
+        // The old spawn's error tail and the reaper run late.
+        coordinator.release_worker_and_kick(&worker, "old-run", None).await;
+        crate::dead_pid_sweep::release_reaped_execution(&live_states, &coordinator, &old_state).await;
+
+        // The replacement's real driver signal now lands and is retained.
+        assert!(
+            live_states
+                .record_driver_signal("replacement", crate::live_worker_state::DriverSignalKind::HookEvent)
+                .is_some(),
+            "the replacement still has a live entry to receive its driver signal",
+        );
+        assert!(live_states.has_driver_signal_for_run("replacement"));
+        assert_eq!(coordinator.claim_holder(&worker).await.as_deref(), Some("replacement"));
+
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            &RecordingDispatchEventSink::new(),
+            &RecordingReaper::new(coordinator.clone()),
+            &SpawnHealthTracker::new(),
+            &NoopCube,
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+        assert_eq!(
+            outcome.driver_start_reaped, 0,
+            "driver-start check passes for the replacement"
+        );
+    }
+
+    /// The reap's guarded release must not free a slot the reaper's own release
+    /// already handed to a replacement run.
+    #[tokio::test]
+    async fn reaped_spawn_tail_leaves_a_replacement_claim_in_place() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &execution_id).await;
+
+        let reaper = ReplacingReaper {
+            coordinator: coordinator.clone(),
+            live_states: live_states.clone(),
+        };
+        let sink = RecordingDispatchEventSink::new();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            &sink,
+            &reaper,
+            &SpawnHealthTracker::new(),
+            &RecordingCube::default(),
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+
+        assert_eq!(outcome.driver_start_reaped, 1);
+        assert_eq!(
+            coordinator.claim_holder(&worker_id_for_slot(1)).await.as_deref(),
+            Some("replacement"),
+            "the replacement keeps its claim",
+        );
+        assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+    }
+
     /// A driver-start timeout must not assert "the binary never started"
     /// when the run's file ingress says otherwise. In the 2026-09-13 breaker
     /// incident five Codex workers were reaped with exactly that text while

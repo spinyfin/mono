@@ -20,10 +20,19 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// when the engine pushes EnginePoolConfig on RegisterAppSession.
     /// The initial value of 16 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs.
     static let reviewSlotBase = automationSlotBase + automationSlotCount   // 25
-    /// Progression follows MAX_REVIEW_POOL_SIZE, independent of the configured
-    /// review count. Mirrors MAX_PROGRESSION_POOL_SIZE in the engine.
-    static let progressionSlotBase = reviewSlotBase + 16   // 41
-    static let progressionSlotRange = progressionSlotBase...(progressionSlotBase + 4 - 1)
+    /// Maximum review pool width. Mirrors `MAX_REVIEW_POOL_SIZE` in
+    /// `engine/storage-values/src/pool_policy.rs`; the engine reserves this
+    /// many slot ids for review even when fewer are configured.
+    static let maxReviewSlotCount = 16
+    /// Progression pool width. Mirrors `MAX_PROGRESSION_POOL_SIZE` in
+    /// `engine/storage-values/src/pool_policy.rs`. If either engine constant
+    /// changes, change these with it, or the engine will request slots the
+    /// viewer rejects as unknown.
+    static let progressionSlotCount = 4
+    /// Progression follows the full review range, independent of the
+    /// configured review count.
+    static let progressionSlotBase = reviewSlotBase + maxReviewSlotCount   // 41
+    static let progressionSlotRange = progressionSlotBase...(progressionSlotBase + progressionSlotCount - 1)  // 41...44
 
     /// Engine-pushed pool sizes for the Agents pool strip. Existing
     /// viewers survive capacity changes until detached.

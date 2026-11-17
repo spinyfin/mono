@@ -311,6 +311,31 @@ impl StaleWorkerReaper for ReleasingReaper {
     }
 }
 
+/// Mirrors a production pane reaper whose awaited release hands slot 1 to a
+/// new run that registers live state before the sweep's own tail runs.
+struct ReplacingReaper {
+    coordinator: Arc<ExecutionCoordinator>,
+    live_states: Arc<LiveWorkerStateRegistry>,
+}
+
+#[async_trait]
+impl StaleWorkerReaper for ReplacingReaper {
+    async fn reap_worker(&self, execution_id: &str) {
+        self.live_states.release_slot_for_run(execution_id);
+        self.coordinator
+            .release_worker_and_kick(&worker_id_for_slot(1), execution_id, None)
+            .await;
+        assert!(
+            self.coordinator
+                .worker_pool()
+                .claim_worker("replacement", None)
+                .await
+                .is_some()
+        );
+        register_slot(&self.live_states, 1, "replacement", "replacement-item");
+    }
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────
 
 fn register_slot(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str, work_item_id: &str) {
@@ -441,6 +466,45 @@ async fn stale_idle_worker_is_reaped() {
         _ => panic!("expected chore"),
     };
     assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
+}
+
+/// The cadence fallback's guarded release must leave a replacement that the
+/// reaper's own release admitted into the same slot untouched.
+#[tokio::test]
+async fn cadence_reap_leaves_a_replacement_claim_and_live_state_in_place() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+    let reaper = ReplacingReaper {
+        coordinator: coordinator.clone(),
+        live_states: live_states.clone(),
+    };
+    let sink = RecordingDispatchEventSink::new();
+    let outcome = run_one_pass(
+        db.as_ref(),
+        &live_states,
+        coordinator.clone(),
+        &sink,
+        &reaper,
+        &HoldRegistry::new(),
+        ALWAYS_STALE,
+    )
+    .await;
+
+    assert_eq!(outcome.reaped, 1);
+    assert_eq!(
+        coordinator.claim_holder(&worker_id_for_slot(1)).await.as_deref(),
+        Some("replacement")
+    );
+    assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
 }
 
 #[tokio::test]
