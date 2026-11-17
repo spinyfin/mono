@@ -102,14 +102,6 @@ build:ci-remote --remote_cache_compression
 # with ci-remote above, the endpoint comes from the agent's environment and
 # the conditions are in .buildkite/steps/remote-execution.sh.
 #
-# Build actions execute on the Linux workers. Tests do not: this config names
-# no test strategy, so `test:linux --strategy=TestRunner=linux-sandbox` in
-# .bazelrc still applies and every test runs on the agent, inside Bazel's
-# linux-sandbox. That sandbox is the isolation boundary for tests on Linux
-# (tools/test-sandbox/README.md) and the workers run an action directly in its
-# work directory, so do not add `--config=remote-tests` or any TestRunner
-# strategy here. Bazel downloads what a test needs from the remote cache.
-#
 # The disk cache from build:ci-linux stays on, for the reason given under
 # ci-remote.
 build:ci-remote-linux --jobs=64
@@ -121,3 +113,12 @@ build:ci-remote-linux --remote_cache_compression
 # a step that executes remotely and one that builds on the agent do not share
 # results, in either the remote cache or the disk cache.
 build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux
+# Tests execute on the workers too; see `test:remote-tests` in .bazelrc. This
+# replaces `test:linux --strategy=TestRunner=linux-sandbox` for the step, so
+# Bazel's linux-sandbox is not around a test any more. The boundary is the
+# sandbox every Linux worker runs each action in,
+# tools/test-sandbox/linux_remote_action_sandbox.sh, and this line is only
+# sound while every worker on the endpoint runs it. Before pointing an agent
+# at an endpoint, or adding a worker to one, run the gate in
+# tools/test-sandbox/README.md, "Remote execution on Linux workers".
+test:ci-remote-linux --config=remote-tests

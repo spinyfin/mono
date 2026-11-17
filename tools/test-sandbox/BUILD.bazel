@@ -121,6 +121,7 @@ sh_test(
     data = [
         ":defs.bzl",
         ":hermetic_test_wrapper.sh",
+        ":linux_remote_action_sandbox.sh",
         "//:.bazelrc",
     ],
 )

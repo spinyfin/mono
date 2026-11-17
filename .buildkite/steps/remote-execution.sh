@@ -42,11 +42,12 @@
 #   macOS  `ci-remote`: every action, tests included. The test wrapper's
 #          Seatbelt profile is the isolation boundary and it is built on the
 #          worker.
-#   Linux  `ci-remote-linux`: build actions only. Tests keep the strategy
-#          .bazelrc gives them, `linux-sandbox` on the agent, because that
-#          sandbox is the Linux isolation boundary and the workers do not
-#          provide one. The config also tags every action OSFamily=linux, the
-#          property the Linux scheduler matches workers on.
+#   Linux  `ci-remote-linux`: every action, tests included. A test leaves
+#          Bazel's linux-sandbox when it leaves the agent, so the isolation
+#          boundary is the sandbox each Linux worker runs every action in
+#          (tools/test-sandbox/linux_remote_action_sandbox.sh). The config
+#          also tags every action OSFamily=linux, the property the Linux
+#          scheduler matches workers on.
 #
 # A malformed endpoint is an error, not a fallback: a typo on an agent would
 # otherwise leave that agent building locally for good with nothing to show it.
@@ -136,7 +137,7 @@ ci_remote_execution_decide() {
       ;;
     linux/x86_64)
       config="ci-remote-linux"
-      scope="build actions execute on the remote Linux workers; tests run on this agent under linux-sandbox"
+      scope="actions execute on the remote Linux workers"
       ;;
     *)
       CI_REMOTE_EXECUTION_REASON="there are no remote workers for ${os_type}/${arch:-unknown}"

@@ -179,12 +179,20 @@ test:linux --strategy=TestRunner=linux-sandbox
 test:linux --sandbox_tmpfs_path=/tmp
 
 # Opt-in: `--config=remote-tests`, together with a --remote_executor, runs test
-# actions on remote macOS workers instead of on this machine. The wrapper's
-# Seatbelt profile is still the whole isolation boundary; it is built on the
-# worker, from the worker's own paths. Use it only with macOS workers that
-# have the audited runtime where this client recorded it (the same system tool
-# paths, and Xcode reachable at the same DEVELOPER_DIR). Where a recorded tool
-# is missing, the wrapper fails the action closed.
+# actions on remote workers instead of on this machine.
+#
+# On macOS the wrapper's Seatbelt profile is still the whole isolation
+# boundary; it is built on the worker, from the worker's own paths. Use it
+# only with macOS workers that have the audited runtime where this client
+# recorded it (the same system tool paths, and Xcode reachable at the same
+# DEVELOPER_DIR). Where a recorded tool is missing, the wrapper fails the
+# action closed.
+#
+# On Linux this takes the test out of Bazel's linux-sandbox, so the boundary
+# has to come from the worker: use it only with workers that run every action
+# inside tools/test-sandbox/linux_remote_action_sandbox.sh. CI selects it from
+# `ci-remote-linux` in .ci.bazelrc. See tools/test-sandbox/README.md, "Remote
+# execution on Linux workers".
 #
 # The strategy is `remote` alone on purpose. With a comma fallback
 # (`remote,local`) a test that cannot run remotely would run under a local
@@ -195,7 +203,7 @@ test:linux --sandbox_tmpfs_path=/tmp
 # Tests that need tmux, claude or the Codex probe's login shell still receive
 # copies of this machine's binaries, and tests that use jj receive the pinned
 # download. See tools/test-sandbox/README.md, "Remote execution on macOS
-# workers".
+# workers" and "Remote execution on Linux workers".
 test:remote-tests --strategy=TestRunner=remote
 
 # Keep remote and local test results apart. Bazel's action key does not record

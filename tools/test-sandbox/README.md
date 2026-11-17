@@ -182,6 +182,8 @@ A loud failure on a misconfigured agent is the desired outcome. A green build th
 - `test --sandbox_default_allow_network=false`
 - `test:remote-tests --strategy=TestRunner=remote`, and that it is the only strategy line on that config
 - `test:remote-tests --test_env=MONO_TEST_REMOTE_EXECUTION=1`
+- in `linux_remote_action_sandbox.sh`: the read-only root, the new namespaces, `--unshare-net` as the default, the `MONO_TEST_ALLOW_NETWORK` opt-in, the tmpfs `/tmp` for a test action, and the empty `/run` and `/home`
+- `network_env["MONO_TEST_ALLOW_NETWORK"] = "1"` in `defs.bzl`
 - `network_tags.append("requires-network")` in `defs.bzl`
 - `mktemp" -d /tmp/mono-test.XXXXXX` in the wrapper
 - the three `BOSS_SHAKE_*` `--test_env` lines, and their presence in the wrapper's `unset` block
@@ -306,7 +308,61 @@ The audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, wh
 
 A test tagged `exclusive` cannot be scheduled remotely at all, because the tag also forces local execution. `exclusive-if-local` keeps the serial run locally and lets the test go to a worker.
 
-Remote execution of tests on Linux is out of scope altogether. The Linux boundary comes from Bazel's local `linux-sandbox`, and a remote executor would have to provide an equivalent. CI's Linux agents do send build actions to remote Linux workers (`ci-remote-linux` in `.ci.bazelrc`, see `.buildkite/README.md`), but that config names no test strategy, so `test:linux --strategy=TestRunner=linux-sandbox` still decides where a test runs: on the agent.
+The list above is about macOS workers. Linux workers are a separate arrangement with its own boundary; see the next section.
+
+## Remote execution on Linux workers
+
+On Linux the boundary around a test is Bazel's local `linux-sandbox`, and a test that executes remotely is not inside it. A remote executor has to provide an equivalent, and CI's Linux workers do: each one runs every action, build or test, through `linux_remote_action_sandbox.sh`, installed as the worker's per-action entrypoint. `ci-remote-linux` in `.ci.bazelrc` selects `remote-tests` on that basis, and it is the only thing that does. A plain `bazel test` on a Linux machine, and a CI step that builds on its agent, still get `test:linux --strategy=TestRunner=linux-sandbox`.
+
+The wrapper is unchanged and does the same three things inside the worker's sandbox that it does inside `linux-sandbox`: the audited `PATH`, the credential `unset`, and the short private temp root under `/tmp`.
+
+### What the worker's sandbox enforces
+
+It is one `bwrap` (bubblewrap) invocation per action, using unprivileged user namespaces, so it needs no root and no setuid helper.
+
+| Property                          | `linux-sandbox` on an agent                                 | The worker's sandbox                                                                                   | Guard                                                 |
+| --------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| Writes outside the action denied  | mount namespace, execroot writable                          | `--ro-bind / /`, then only the action's own directory bound writable                                   | `writes_outside_the_test_sandbox_are_denied`          |
+| Network denied by default         | `--sandbox_default_allow_network=false` → network namespace | `--unshare-net`: a new network namespace with loopback only                                            | `network_is_denied_by_the_test_sandbox`               |
+| Network opt-in works              | `requires-network` tag                                      | the action's environment carries `MONO_TEST_ALLOW_NETWORK=1`, so the script leaves `--unshare-net` out | `network_opt_in_test`                                 |
+| Short, action-private temp root   | `--sandbox_tmpfs_path=/tmp`                                 | `--tmpfs /tmp` for a test action (one whose environment has `TEST_TMPDIR`)                             | `linux_private_temp_root_is_short_and_action_private` |
+| Leftover processes do not survive | PID namespace                                               | `--unshare-pid`: the namespace is torn down when the action's command exits                            | `cleanup_guard_test` covers the wrapper's own part    |
+| The user's home and daemons       | visible, read-only                                          | `/home` and `/run` are empty tmpfs mounts; only the DNS stub configuration is put back                 | none                                                  |
+
+Three things about that table:
+
+- **The opt-in is the environment variable because a worker never sees a tag.** Bazel reads `requires-network` itself, to configure its own sandbox, and does not send tags to a remote executor. `MONO_TEST_ALLOW_NETWORK=1` is in the action's environment, which the worker's entrypoint inherits. It is the same variable the wrapper reads on macOS, and `network_enabled_rust_test` sets it together with the tag, so one macro covers a local Linux run, a remote Linux run and macOS. `linux_policy_source_test.sh` pins that the macro still sets it and that the script still reads it.
+- **`/home` and `/run` go further than `linux-sandbox` does.** A worker runs as a login user, not as a dedicated service account. Read-only is not enough for `/run`: it holds the sockets of that user's D-Bus and systemd instances and of the ssh and gpg agents, and a read-only mount does not stop a `connect()`.
+- **An action that is not a test gets a `/tmp` on disk**, a directory inside the action directory that the worker deletes with it, so that a compiler's temporary files do not count against the host's RAM. It is as private as the tmpfs. The guard only ever runs as a test, so it sees the tmpfs.
+
+The script also sets `umask 022` before it starts the action. A worker runs in its user's systemd session, where the umask is `002` on a distribution with per-user groups, and an action would otherwise create group-writable directories. The `spoke-package` tests found this: the installer refuses a staging directory that others can write, and every one of its tests that creates one failed on a worker until the umask matched an agent's.
+
+The sandbox fails closed. If `bwrap` is missing, or a namespace cannot be created, the action fails; nothing runs unsandboxed.
+
+### The gate
+
+**The sandbox is not part of any action's cache key, and nothing in a build proves a worker has it.** A worker registered without the entrypoint would run every test with no isolation and report the same green result. The guards are the only evidence, and they are evidence about the worker they ran on. So the rule from the macOS section applies per worker: `hermeticity_guard_test` and `network_opt_in_test` passing, uncached, on a given worker is the gate for trusting any test result from that worker.
+
+Each worker declares a `worker-host` platform property with its own name (`.buildkite/linux-agents-runbook.md`, "Remote execution workers"). Adding that property to a remote run pins every action of the run to the one worker:
+
+```console
+$ bazel test //tools/test-sandbox/... <the flags ci-remote-linux expands to, with the endpoint> \
+    --remote_default_exec_properties=worker-host=<name> --nocache_test_results
+INFO: 341 processes: 326 internal, 24 remote.
+//tools/test-sandbox:hermeticity_guard_test                              PASSED in 0.1s
+//tools/test-sandbox:network_opt_in_test                                 PASSED in 0.0s
+```
+
+Check that the summary reports the actions as `remote` and none as `linux-sandbox` or `local`. Run it against every worker after installing or changing the sandbox script, and against a new worker before it joins the endpoint the agents use. The property changes every action's cache key, so the run also rebuilds the tests' dependencies on that worker, inside the sandbox.
+
+`network_opt_in_test` matters as much as the denial: it fails if the opt-in did not reach the sandbox, which is what would happen if the script stopped reading the variable or a worker ran a different script.
+
+### What is different from a test on an agent
+
+- **The test runs as the worker's login user**, in a user namespace that maps that one user. Files owned by anyone else show up as owned by `nobody`.
+- **Runfiles are real files in a real tree**, not symlinks into an execroot.
+- **Timers and CPU are shared with whatever else the worker is running**, which includes other tests and compiles up to its slot count, and the CI agent on the same host.
+- **A copied host tool runs.** `host_tmux`, `host_claude` and `codex_probe_runtime` hand a test a copy of the client's binary. On a Linux worker that is the same distribution's binary and it launches, unlike on a Mac, though it is still the client's build and not the worker's.
 
 ## Remote execution from a developer's Mac
 
@@ -436,6 +492,7 @@ The guard could not have passed on any host, under any configuration. It had sim
 | `host_tool_symlink_guard_test.sh`              | The same assertion for one host tool that `host_tool_symlink` declares; the packages allowed to use `@host_lsof` and `@worker_zsh` run it.                                                         |
 | `hermeticity_guard_test.rs`                    | The guards. Every property in the table above is asserted here. Built twice: `hermeticity_guard_test` and `xcode_capability_guard_test` (the latter with `MONO_TEST_XCODE_TOOLCHAIN=1`).           |
 | `linux_policy_source_test.sh`                  | Pins the exact `.bazelrc` / wrapper / `defs.bzl` strings so the policy cannot be silently relaxed.                                                                                                 |
+| `linux_remote_action_sandbox.sh`               | The per-action sandbox a Linux remote worker runs every action in. The workers install a copy; this file is the one they must match.                                                               |
 | `dev_remote_source_test.sh`                    | Pins the `.bazelrc` lines behind remote execution from a developer's Mac: their configs, their order, and that no endpoint or other selection of `dev-remote` is in the repository.                |
 | `network_opt_in_test.rs`                       | Asserts the opt-in actually reaches the platform sandbox, so `network_enabled_rust_test` is not a no-op.                                                                                           |
 | `defs.bzl`                                     | `network_enabled_rust_test` — the only sanctioned way to opt a target into external network access.                                                                                                |
