@@ -186,10 +186,27 @@ impl WorkerCompletionHandler {
 
         match outcome {
             boss_protocol::RunDoneOutcome::NoChangesNeeded => {
-                // Only the driver's terminal boundary has authoritative command
-                // evidence. Submission (including delayed/replayed finalizers)
-                // cannot authorize a no-op, even if its cached payload says so.
-                StopOutcome::AwaitingInput
+                // Submission alone cannot authorize a no-op. A retry may finish
+                // the exact applied declaration validated at the driver boundary.
+                let declaration_id = match self.work_db.ready_no_op_declaration_id(execution_id) {
+                    Ok(None) => return StopOutcome::AwaitingInput,
+                    Err(err) => {
+                        tracing::error!(execution_id, ?err, "no-op recovery: validation lookup failed");
+                        return StopOutcome::DbError;
+                    }
+                    Ok(Some(id)) => id,
+                };
+                if self.refuse_no_op_declaration(&execution) {
+                    return self.nudge_refused_no_op(&execution).await;
+                }
+                let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
+                self.finalize_no_op_completion_retaining_declaration(
+                    &execution,
+                    &declaration_id,
+                    contribution,
+                    attention,
+                )
+                .await
             }
             boss_protocol::RunDoneOutcome::Delivered => self.finalize_declared_delivery(&execution).await,
             boss_protocol::RunDoneOutcome::Blocked => self.finalize_declared_blocked(&execution).await,

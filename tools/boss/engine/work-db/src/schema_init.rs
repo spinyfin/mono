@@ -907,6 +907,15 @@ mod floor_tests {
                 Box::new(|c| merge_evidence::migrate(c).unwrap()),
             ),
             (
+                "20261117_0212_no_op_completion_ready",
+                Box::new(|c| {
+                    c.execute_batch(
+                        "ALTER TABLE worker_proposals ADD COLUMN no_op_completion_ready INTEGER NOT NULL DEFAULT 0",
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
                 super::super::conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID,
                 Box::new(|c| super::super::conflict_mismatch::migrate_operator_forced_admission(c).unwrap()),
             ),

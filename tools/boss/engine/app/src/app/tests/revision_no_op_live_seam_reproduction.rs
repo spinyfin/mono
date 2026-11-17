@@ -297,3 +297,97 @@ async fn revision_without_declaration_is_never_closed_as_a_no_op_by_inference() 
         "no declined-finding record may be filed for an undeclared run",
     );
 }
+
+/// Codex's actual terminal envelope must complete an applied no-op even when
+/// a description-only revision leaves its parent's CI red.
+#[tokio::test]
+async fn codex_applied_no_op_with_changed_description_releases_the_live_slot() {
+    use boss_engine_completion::tests::{FixedStateProbe, StubBranchVerifier};
+    use boss_engine_driver::{AgentDriver, CodexDriver, ProgressSessionConfig, ProgressStreamSource};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        boss_engine_runtime::config::WorkConfig::builder()
+            .cwd(dir.path().to_path_buf())
+            .db_path(dir.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    verifier.set_head_oid(Ok("before".into())).await;
+    verifier
+        .set_body(Ok("description with verification evidence".into()))
+        .await;
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+            branch_verifier: Some(verifier),
+            merge_probe: Some(Arc::new(FixedStateProbe(
+                boss_observation_contracts::PrLifecycleState::Open(
+                    boss_observation_contracts::OpenPrStatus::ci_failing(vec![]),
+                ),
+            ))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (execution_id, _workspace) = seed_parked_revision(&state, "https://github.com/spinyfin/mono/pull/3639", 2);
+    super::tmux_stub::install_teardown(&state, &execution_id, 4_194_305);
+    state
+        .work_db
+        .set_execution_pr_body_before(&execution_id, "original description")
+        .unwrap();
+    declare_no_changes_needed(&state.work_db, &execution_id);
+    let driver = CodexDriver::default();
+    let mut session = driver
+        .progress_session(&ProgressSessionConfig {
+            source: ProgressStreamSource::AgentJsonlFile,
+            ..Default::default()
+        })
+        .unwrap();
+    session
+        .normalize_progress_events(&serde_json::json!({
+            "type": "session_meta", "payload": {"id": "no-op-revision"}
+        }))
+        .unwrap();
+    let events = session
+        .normalize_progress_events(&serde_json::json!({
+            "type": "event_msg", "payload": {"type": "task_complete"}
+        }))
+        .unwrap();
+    assert!(!events.is_empty());
+    for event in events {
+        let incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+            &driver,
+            event,
+            Some(execution_id.clone()),
+            None,
+            None,
+        );
+        dispatch_worker_event_fanout(&state, &incoming).await;
+    }
+    assert_eq!(
+        state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert!(
+        state.live_worker_states.get(2).is_none(),
+        "the idle worker must release its slot"
+    );
+    let execution = state.work_db.get_execution(&execution_id).unwrap();
+    assert!(execution.cube_lease_id.is_none());
+    assert!(
+        state
+            .work_db
+            .latest_run_turn_boundary_for_execution(&execution_id)
+            .unwrap()
+            .is_some()
+    );
+    let boss_work_db::WorkItem::Task(task) = state.work_db.get_work_item(&execution.work_item_id).unwrap() else {
+        panic!("revision missing");
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Done);
+}

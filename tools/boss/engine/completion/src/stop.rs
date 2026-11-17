@@ -84,7 +84,9 @@ impl WorkerCompletionHandler {
         // lock go away after the last in-flight boundary finishes.
         let lock = self.boundary_lock(execution_id);
         let _boundary = lock.lock().await;
-        let outcome = self.on_stop_inner(execution_id, turn_end, defer_finalization).await;
+        // Keep the completion decision's large future out of each caller's
+        // state machine, including hook fanout paths with many awaits.
+        let outcome = Box::pin(self.on_stop_inner(execution_id, turn_end, defer_finalization)).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
@@ -1112,10 +1114,20 @@ impl WorkerCompletionHandler {
                         .await
                     {
                         Some(refusal) => refusal,
-                        None => (
-                            probe_push_to_existing_pr(&_pr_url_for_nudge),
-                            format!("nocontribution:{_pr_url_for_nudge}"),
-                        ),
+                        None => {
+                            // An absorbed parent head cannot prove this
+                            // revision made no contribution.
+                            if let Some(outcome) = self
+                                .try_revision_no_op(&execution, &_pr_url_for_nudge, ContributionEvidence::Indeterminate)
+                                .await
+                            {
+                                return outcome;
+                            }
+                            (
+                                probe_push_to_existing_pr(&_pr_url_for_nudge),
+                                format!("nocontribution:{_pr_url_for_nudge}"),
+                            )
+                        }
                     };
                     tracing::info!(
                         execution_id,

@@ -2136,6 +2136,8 @@ mod conflict_delivery;
 #[cfg(test)]
 mod local_teardown;
 #[cfg(test)]
+mod no_op_recovery;
+#[cfg(test)]
 mod nudge_delivery;
 #[cfg(test)]
 mod revision_delivery;

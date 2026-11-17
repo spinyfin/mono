@@ -109,6 +109,25 @@ impl WorkerCompletionHandler {
         contribution: Option<ContributionEvidence>,
         attention: Option<CreateAttentionItemInput>,
     ) -> StopOutcome {
+        let declaration_id = match self.work_db.current_no_op_declaration_id(&execution.id) {
+            Ok(Some(id)) => id,
+            Ok(None) => return StopOutcome::AwaitingInput,
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, ?err, "no-op declaration lookup failed");
+                return StopOutcome::DbError;
+            }
+        };
+        self.finalize_no_op_completion_for_declaration(execution, &declaration_id, contribution, attention)
+            .await
+    }
+
+    pub(super) async fn finalize_no_op_completion_for_declaration(
+        &self,
+        execution: &crate::work::WorkExecution,
+        declaration_id: &str,
+        contribution: Option<ContributionEvidence>,
+        attention: Option<CreateAttentionItemInput>,
+    ) -> StopOutcome {
         // Both the proposal seam and the ordinary Stop path must verify a
         // primary workspace before accepting its no-changes-needed declaration.
         if should_enqueue_reviewer_for_primary(&execution.kind) {
@@ -134,14 +153,6 @@ impl WorkerCompletionHandler {
                     .await;
             }
         }
-        let declaration_id = match self.work_db.current_no_op_declaration_id(&execution.id) {
-            Ok(Some(id)) => id,
-            Ok(None) => return StopOutcome::AwaitingInput,
-            Err(err) => {
-                tracing::error!(execution_id = %execution.id, ?err, "no-op declaration lookup failed");
-                return StopOutcome::DbError;
-            }
-        };
         let mut confirmed_merged_pr = None;
         if execution.kind == ExecutionKind::RevisionImplementation {
             let pr_url = self.resolve_bound_pr_url(execution);
@@ -172,13 +183,30 @@ impl WorkerCompletionHandler {
                  head check was inconclusive); closed as a no-op without a PR."
             }
         };
+        // The declaration and the completed driver validation must survive a
+        // failed terminal write or an engine restart. Never infer this from
+        // activity=idle, or let a later declaration reuse this proposal's proof.
+        match self.work_db.mark_no_op_completion_ready(&execution.id, declaration_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return match self.work_db.get_execution(&execution.id) {
+                    Ok(current) if current.status.is_live() => StopOutcome::AwaitingInput,
+                    Ok(_) => StopOutcome::AlreadyTerminal,
+                    Err(_) => StopOutcome::DbError,
+                };
+            }
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, ?err, "no-op completion: failed to persist validation");
+                return StopOutcome::DbError;
+            }
+        }
         // Marked before the terminalizing write so no sweep can observe
         // this execution terminal-with-a-live-pane without also seeing
         // that its own teardown owns the pane — see `super::teardown`.
         let teardown = self.begin_teardown(&execution.id);
         let completion = match self.work_db.record_declared_worker_no_op_completion(
             &execution.id,
-            &declaration_id,
+            declaration_id,
             confirmed_merged_pr.as_deref(),
             detail,
             attention,
@@ -275,6 +303,14 @@ impl WorkerCompletionHandler {
     /// Contribution is always [`ContributionEvidence::Indeterminate`]: this
     /// path is the declaration termination and must not call GitHub, so the
     /// record must not describe a measured empty diff.
+    ///
+    /// Durable sweep recovery intentionally uses the same conservative evidence:
+    /// the ready stamp persists validation of the exact proposal, not the
+    /// transient head measurement. After restart, a previously ProvenAbsent
+    /// result is therefore recorded as Indeterminate. Recovery still rechecks
+    /// local command/contribution evidence; a refusal consumes the declaration
+    /// even without a new driver event, preventing a contradicted claim from
+    /// being retried indefinitely by the sweep.
     pub(super) fn declared_run_done_no_op_inputs(
         &self,
         execution: &crate::work::WorkExecution,
