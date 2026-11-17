@@ -345,7 +345,7 @@ def nested_shell_bodies(group):
 
 
 def has_substitution(command):
-    command = command.replace(chr(92) + chr(10), '')
+    command = strip_line_continuations(command)
     masked = list(command)
     for group in command_records(command):
         if group.body_span and not group.expanding_body:
@@ -455,8 +455,8 @@ def expand_exported(path, policy):
     return re.sub(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})", replacer, path)
 
 
-def resolve_path(path, policy, cwd=None, single_quoted=False):
-    if single_quoted:
+def resolve_path(path, policy, cwd=None, pre_expanded=False):
+    if pre_expanded:
         expanded = path
     else:
         expanded = expand_exported(path, policy)
@@ -480,8 +480,8 @@ def protected_spellings(root):
     return unique
 
 
-def path_is_protected(path, policy, cwd=None, single_quoted=False):
-    expanded = resolve_path(path, policy, cwd, single_quoted=single_quoted)
+def path_is_protected(path, policy, cwd=None, pre_expanded=False):
+    expanded = resolve_path(path, policy, cwd, pre_expanded=pre_expanded)
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
             root_abs = spelling.rstrip(os.sep)
@@ -505,27 +505,80 @@ def glob_touches_protected(expanded, policy):
     return False
 
 
+PATH_TEXT_PROGRAMS = {'echo', 'printf'}
+NON_PATH_PROGRAMS = {'printenv', 'test', '['}
+GREP_FAMILY = {'grep', 'rg', 'sed', 'awk', 'gawk'}
+TEXT_FLAGS = {
+    'grep': ('-e', '--regexp'),
+    'rg': ('-e', '--regexp'),
+    'sed': ('-e', '--expression'),
+    'awk': ('-e', '--source'),
+    'gawk': ('-e', '--source'),
+}
+FILE_FLAGS = {
+    'grep': ('-f', '--file'),
+    'rg': ('-f', '--file'),
+    'sed': ('-f', '--file'),
+    'awk': ('-f', '--file'),
+    'gawk': ('-f', '--file'),
+}
+GREP_VALUE_FLAGS = frozenset({'-g', '--glob', '--iglob', '-t', '--type', '-A', '-B', '-C', '-m', '--max-depth'})
+STDIN_ARGV_RUNNERS = {'xargs', 'parallel'}
+STDIN_ARGV_SAFE = {'echo', 'printf', 'true', 'false', ':', 'printenv'}
+
+
+def operand_path_text(token, program):
+    if ASSIGNMENT_RE.match(token) or (token.startswith('-') and '=' in token):
+        token = token.split('=', 1)[1]
+    token = re.sub(r'^(?:[0-9]+|&)?[<>]+', '', token)
+    if token.startswith('-') and not token.startswith('--'):
+        for i, char in enumerate(token[1:], 1):
+            flag = '-' + char
+            if flag in FILE_FLAGS.get(program, ()):
+                attached = token[i + 1:]
+                return attached or token
+    return token
+
+
+def stdin_argv_program(group):
+    normalized = without_redirections(group)
+    rest = strip_prefixes(group)
+    prefixes = normalized[:len(normalized) - len(rest)] if rest else normalized
+    if any(os.path.basename(token) in STDIN_ARGV_RUNNERS for token in prefixes if not ASSIGNMENT_RE.match(token)):
+        return os.path.basename(rest[0]) if rest else 'echo'
+    if rest and os.path.basename(rest[0]) in STDIN_ARGV_RUNNERS:
+        inner, index = rest[1:], 0
+        while index < len(inner) and inner[index].startswith('-'):
+            option = inner[index]
+            index += 1
+            if option == '--':
+                break
+        return os.path.basename(inner[index]) if index < len(inner) else 'echo'
+    return None
+
+
 def path_operand_positions(group):
     # Default operands to paths; exclude known text and script positions.
     rest = strip_prefixes(group)
     program = os.path.basename(rest[0]) if rest else ''
-    operand, skip_next, pattern_seen = 0, False, False
-    text_flags = {'grep': ('-e', '--regexp'), 'rg': ('-e', '--regexp'),
-                  'sed': ('-e', '--expression'), 'awk': ('-e', '--source'),
-                  'gawk': ('-e', '--source')}.get(program, ())
+    text_flags = TEXT_FLAGS.get(program, ())
+    file_flags = FILE_FLAGS.get(program, ())
+    operand, skip_next, skip_as_path, pattern_seen, end_of_options = 0, False, False, False, False
     positions = set()
     for index, token in enumerate(group):
         redirect = re.match(r'^(?:[0-9]+|&)?(?:>\||>>?|<>|<<-?|<)(.*)$', token)
         if redirect:
             if token.startswith('<<'):
-                skip_next = not redirect.group(1)
+                skip_next, skip_as_path = not redirect.group(1), False
             elif redirect.group(1):
                 positions.add(index)
             elif index + 1 < len(group):
                 positions.add(index + 1)
             continue
         if skip_next:
-            skip_next = False
+            if skip_as_path:
+                positions.add(index)
+            skip_next, skip_as_path = False, False
             continue
         if token not in rest:
             if not token.startswith('-'):
@@ -533,19 +586,57 @@ def path_operand_positions(group):
             continue
         if operand == 0:
             positions.add(index)
-        elif token.startswith('-'):
-            if any(token.startswith(flag + '=') for flag in text_flags):
-                pattern_seen = True
-            elif '=' in token:
-                positions.add(index)
-            if token in text_flags:
-                skip_next = True
-                pattern_seen = True
-            elif program in ('grep', 'rg', 'sed', 'awk', 'gawk') and token in ('-f', '--file'):
-                pattern_seen = True
-        elif program in ('echo', 'printf', 'printenv', 'test', '['):
+            operand += 1
+            continue
+        if not end_of_options and token == '--':
+            end_of_options = True
+            operand += 1
+            continue
+        if end_of_options:
+            positions.add(index)
+            operand += 1
+            continue
+        if token.startswith('-'):
+            if token.startswith('--'):
+                name, eq, _value = token.partition('=')
+                if name in text_flags:
+                    pattern_seen = True
+                    skip_next, skip_as_path = not eq, False
+                elif name in file_flags:
+                    pattern_seen = True
+                    if eq:
+                        positions.add(index)
+                    else:
+                        skip_next, skip_as_path = True, True
+                elif eq:
+                    positions.add(index)
+                elif name in GREP_VALUE_FLAGS:
+                    skip_next, skip_as_path = True, False
+            else:
+                consumed = False
+                for i, char in enumerate(token[1:], 1):
+                    flag = '-' + char
+                    if flag in text_flags or flag in file_flags:
+                        attached = token[i + 1:]
+                        pattern_seen = True
+                        if attached:
+                            if flag in file_flags:
+                                positions.add(index)
+                        elif flag in file_flags:
+                            skip_next, skip_as_path = True, True
+                        else:
+                            skip_next, skip_as_path = True, False
+                        consumed = True
+                        break
+                    if flag in GREP_VALUE_FLAGS and i + 1 == len(token):
+                        skip_next, skip_as_path = True, False
+                        consumed = True
+                        break
+                if not consumed and '=' in token:
+                    positions.add(index)
+        elif program in NON_PATH_PROGRAMS:
             pass
-        elif program in ('grep', 'rg', 'awk', 'gawk', 'sed') and not pattern_seen:
+        elif program in GREP_FAMILY and not pattern_seen:
             pattern_seen = True
         else:
             positions.add(index)
@@ -559,20 +650,24 @@ def command_touches_protected(command, policy, cwd):
     reject_trusted_rebinding(command, groups)
     for group in groups:
         rest = strip_prefixes(group)
+        inner = stdin_argv_program(group)
+        if inner is not None and inner not in STDIN_ARGV_SAFE:
+            fail_closed("stdin-to-argv runners cannot be inspected for protected paths")
+        program = os.path.basename(rest[0]) if rest else ''
         for index in path_operand_positions(group):
             token = group[index]
-            literal = group.literal_chars[index]
+            literal = group.literal_chars[index] if index < len(group.literal_chars) else []
             # Preserve quoted/escaped expansion characters during resolution.
             candidate = ''.join({'$': chr(1), '~': chr(3)}.get(c, c) if i < len(literal) and literal[i] else c
                                 for i, c in enumerate(token))
-            if ASSIGNMENT_RE.match(candidate) or (candidate.startswith('-') and '=' in candidate):
-                candidate = candidate.split("=", 1)[1]
-            candidate = re.sub(r"^(?:[0-9]+|&)?[<>]+", "", candidate)
+            candidate = operand_path_text(candidate, program)
             if not candidate or candidate.startswith('&'):
                 continue
             expanded = expand_exported(candidate, policy)
             if '$' in expanded or re.match(r"^~[^/]", expanded):
-                fail_closed("unresolved shell path expansion")
+                if program not in PATH_TEXT_PROGRAMS:
+                    fail_closed("unresolved shell path expansion")
+                continue
             if expanded == '~' or expanded.startswith('~/'):
                 expanded = policy['process_home'] + expanded[1:]
             expanded = expanded.replace(chr(1), '$').replace(chr(3), '~')
@@ -580,7 +675,7 @@ def command_touches_protected(command, policy, cwd):
                 expanded = os.path.join(current or policy['workspace_path'], expanded)
             if any(c in expanded for c in '*?[') and glob_touches_protected(expanded, policy):
                 return True
-            if path_is_protected(expanded, policy, current, single_quoted=True):
+            if path_is_protected(expanded, policy, current, pre_expanded=True):
                 return True
         if rest and rest[0] in ("cd", "pushd", "popd"):
             if len(rest) != 2 or rest[1] == "-" or re.match(r"^~[^/]", rest[1]) or any(c in rest[1] for c in "`*?["):
@@ -588,7 +683,7 @@ def command_touches_protected(command, policy, cwd):
             if "$" in rest[1] and expand_exported(rest[1], policy) == rest[1]:
                 return True
             current = resolve_path(rest[1], policy, current)
-            if path_is_protected(current, policy, single_quoted=True):
+            if path_is_protected(current, policy, pre_expanded=True):
                 return True
         for body in nested_shell_bodies(group):
             if command_touches_protected(body, policy, current):

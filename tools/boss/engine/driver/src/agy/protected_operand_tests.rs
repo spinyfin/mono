@@ -1,4 +1,6 @@
 use super::*;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 fn deny_at(fx: &Fixture, command: &str, cwd: &Path) -> Value {
     let mut payload = run_command_payload(command);
@@ -62,6 +64,85 @@ fn identical_heredoc_text_does_not_mask_a_live_substitution() {
     assert_eq!(body["reason"], "command substitution is structurally denied");
 }
 
+fn tokenizer_records(command: &str) -> Value {
+    let script = format!(
+        "import re,shlex,os,json,sys\n{}\nprint(json.dumps([list(g) for g in command_records(sys.stdin.read()) if list(g)]))\n",
+        crate::guard_python::CODEX_COMMAND_TOKENIZER_PY
+    );
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("python3 is required for tokenizer tests");
+    child.stdin.take().unwrap().write_all(command.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "tokenizer crashed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn tokenizer_keeps_quoted_punctuation_nbsp_and_escaped_parens() {
+    for command in ["echo '()'", r"echo \(\)", "echo foo\u{00a0}bar"] {
+        let groups = tokenizer_records(command);
+        assert!(
+            groups.as_array().unwrap().iter().any(|g| g[0] == "echo"),
+            "{command}: {groups}"
+        );
+    }
+}
+
+#[test]
+fn attached_grep_options_end_of_options_and_xargs_are_denied() {
+    let fx = Fixture::new("run-operand-classifier");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let protected = protected.display();
+    std::os::unix::fs::symlink(
+        fx.process_home.join(".gemini/config/hooks.json"),
+        fx.workspace().join("-alias"),
+    )
+    .unwrap();
+    for command in [
+        format!("grep -e. {protected}"),
+        format!("rg -e. {protected}"),
+        format!("grep --file={protected} f"),
+        format!("grep -fX {protected}"),
+        "cat -- -alias".into(),
+        format!("echo {protected} | xargs cat"),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+}
+
+#[test]
+fn quoted_text_is_not_a_heredoc_and_continuations_keep_span() {
+    let fx = Fixture::new("run-heredoc-lex");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let attack = format!("echo \"<<'true'\"\necho \"$(cat {})\"\ntrue", protected.display());
+    let body = deny_at(&fx, &attack, &fx.workspace());
+    assert_eq!(body["reason"], "command substitution is structurally denied");
+    let continuation = format!(
+        "echo foo\\\\\n\ncat <<'EOF'\nbody\nEOF\necho `cat {}`",
+        protected.display()
+    );
+    let body = deny_at(&fx, &continuation, &fx.workspace());
+    assert_eq!(body["reason"], "command substitution is structurally denied");
+    let (_, body, stderr) = authorize(
+        &fx.process_home,
+        &run_command_payload("cat <<'EOF'\n`cat /protected/x`\nEOF"),
+        true,
+    );
+    assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
+}
+
 #[test]
 fn quote_segments_preserve_literal_dollars_in_path_operands() {
     let fx = Fixture::new("run-quote-segments");
@@ -74,6 +155,9 @@ fn quote_segments_preserve_literal_dollars_in_path_operands() {
         "grep -n x'$' f",
         "printf '%s' a$",
         "echo cost$",
+        "echo '()'",
+        r"echo \(\)",
+        "echo foo\u{00a0}bar",
     ] {
         let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), true);
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");

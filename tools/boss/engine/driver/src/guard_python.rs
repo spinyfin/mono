@@ -20,31 +20,54 @@ DELIMS = {'&&', '||', ';', '|', '&'}
 WRAPPERS = {'env', 'command', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic'}
 ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
+SHLEX_WS = ' \t\r\n'
+
 def heredoc_delim(line):
-    index = line.find('<<')
-    if index < 0:
-        return None
-    rest = line[index + 2:]
-    if rest.startswith('-'):
-        rest = rest[1:]
-    rest = rest.lstrip()
-    if not rest:
-        return None
-    quote = rest[0] if rest[0] in (chr(39), chr(34)) else None
-    if quote:
-        rest = rest[1:]
-    end = 0
-    while end < len(rest) and (rest[end].isalnum() or rest[end] == '_'):
-        end += 1
-    word = rest[:end]
-    if not word:
-        return None
-    if quote and (end == len(rest) or rest[end] != quote):
-        return None
-    return word, bool(quote)
+    # Unquoted << only. A quoted substring is an argument, not an operator.
+    quote, escaped, index = None, False, 0
+    while index < len(line):
+        char = line[index]
+        if escaped:
+            escaped, index = False, index + 1
+            continue
+        if quote != chr(39) and char == chr(92):
+            escaped, index = True, index + 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in (chr(39), chr(34)):
+            quote = char
+            index += 1
+            continue
+        if char == '<' and index + 1 < len(line) and line[index + 1] == '<':
+            rest = line[index + 2:]
+            if rest.startswith('<'):
+                return None
+            if rest.startswith('-'):
+                rest = rest[1:]
+            rest = rest.lstrip(SHLEX_WS)
+            if not rest:
+                return False
+            delim_quote = rest[0] if rest[0] in (chr(39), chr(34)) else None
+            if delim_quote:
+                rest = rest[1:]
+            end = 0
+            while end < len(rest) and (rest[end].isalnum() or rest[end] == '_'):
+                end += 1
+            word = rest[:end]
+            if not word:
+                return False
+            if delim_quote and (end == len(rest) or rest[end] != delim_quote):
+                return False
+            return word, bool(delim_quote)
+        index += 1
+    return None
 
 class CommandGroup(list):
-    def __init__(self, tokens, body='', boundary=None, error=None, single_quoted=None, literal_chars=None):
+    def __init__(self, tokens, body='', boundary=None, error=None, literal_chars=None):
         super().__init__(tokens)
         self.body = body
         self.body_span = None
@@ -52,7 +75,17 @@ class CommandGroup(list):
         self.expanding_body = False
         self.boundary = boundary
         self.error = error
-        self.single_quoted = list(single_quoted or [False] * len(tokens))
+
+
+def split_punct_word(word, mask):
+    if word and all(c in '();&|' for c in word):
+        parts, masks, offset = [], [], 0
+        for part in re.findall(r'[()]|[;&|]+', word):
+            parts.append(part)
+            masks.append(mask[offset:offset + len(part)])
+            offset += len(part)
+        return parts, masks
+    return [word], [mask]
 
 
 def quote_provenance(text, tokens):
@@ -62,8 +95,9 @@ def quote_provenance(text, tokens):
     def finish():
         nonlocal word, mask, active
         if active:
-            words.append(''.join(word))
-            masks.append(mask)
+            parts, part_masks = split_punct_word(''.join(word), mask)
+            words.extend(parts)
+            masks.extend(part_masks)
         word, mask, active = [], [], False
     while index < len(text):
         char = text[index]
@@ -80,17 +114,18 @@ def quote_provenance(text, tokens):
         elif quote is None and char in (chr(39), chr(34)):
             quote = char
             active = True
-        elif quote is None and (char.isspace() or char in ';&|()'):
+        elif quote is None and char in SHLEX_WS:
             finish()
-            if not char.isspace():
-                end = index + 1
-                while end < len(text) and text[end] in ';&|()':
-                    end += 1
-                for part in re.findall(r'[()]|[;&|]+', text[index:end]):
-                    words.append(part)
-                    masks.append([False] * len(part))
-                index = end
-                continue
+        elif quote is None and char in ';&|()':
+            finish()
+            end = index + 1
+            while end < len(text) and text[end] in ';&|()':
+                end += 1
+            for part in re.findall(r'[()]|[;&|]+', text[index:end]):
+                words.append(part)
+                masks.append([False] * len(part))
+            index = end
+            continue
         else:
             word.append(char)
             mask.append(quote == chr(39) or char == chr(2))
@@ -106,8 +141,29 @@ def quote_provenance(text, tokens):
                 word = word[:start] + value + word[start + len(marker):]
         restored.append(word)
     if restored != tokens:
-        raise ValueError('quote provenance does not match shell tokens')
+        return [[False] * len(token) for token in tokens]
     return masks
+
+
+def strip_line_continuations(text):
+    # Only an unescaped backslash (odd run) consumes the following newline.
+    out, index = [], 0
+    while index < len(text):
+        if text[index] == chr(92):
+            end = index
+            while end < len(text) and text[end] == chr(92):
+                end += 1
+            count = end - index
+            if end < len(text) and text[end] == chr(10) and count % 2 == 1:
+                out.append(chr(92) * (count - 1))
+                index = end + 1
+                continue
+            out.append(text[index:end])
+            index = end
+            continue
+        out.append(text[index])
+        index += 1
+    return ''.join(out)
 
 
 def shell_text(text):
@@ -157,8 +213,7 @@ def command_records(command):
     pending = ''
     receiver = None
     heredoc_end = None
-    # Shell escaped newlines do not delimit commands.
-    command = command.replace(chr(92) + chr(10), '')
+    command = strip_line_continuations(command)
     offset = 0
     for line in command.split(chr(10)):
         line_start = offset
@@ -185,26 +240,29 @@ def command_records(command):
         pending = ''
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
-        literal = quote_provenance(logical_line, tokens)
-        quoted = [bool(m) and all(m) for m in literal]
-        current_quoted = []
+        try:
+            literal = quote_provenance(logical_line, tokens)
+        except Exception:
+            literal = [[False] * len(token) for token in tokens]
+        if len(literal) != len(tokens):
+            literal = [[False] * len(token) for token in tokens]
         current_literal = []
         for index, token in enumerate(tokens):
             if token in DELIMS or (token and all(c in '()' for c in token)):
                 if current:
-                    groups.append(CommandGroup(current, single_quoted=current_quoted, literal_chars=current_literal))
+                    groups.append(CommandGroup(current, literal_chars=current_literal))
                 current = []
-                current_quoted = []
                 current_literal = []
                 groups.append(CommandGroup([], boundary=token))
             else:
                 current.append(token)
-                current_quoted.append(quoted[index])
                 current_literal.append(literal[index])
         if current:
-            groups.append(CommandGroup(current, single_quoted=current_quoted, literal_chars=current_literal))
+            groups.append(CommandGroup(current, literal_chars=current_literal))
         delim = heredoc_delim(logical_line)
-        if delim and groups:
+        if delim is False:
+            groups.append(CommandGroup([], error='incomplete shell syntax'))
+        elif delim and groups:
             heredoc_end, quoted = delim
             receiver = groups[-1]
             receiver.expanding_body = not quoted
