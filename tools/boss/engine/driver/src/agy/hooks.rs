@@ -1,68 +1,38 @@
-//! `agy` hook wiring: the `boss-event` progress forwarder, written to the
-//! per-run home's global-root `hooks.json`.
+//! Antigravity PreToolUse authorization: one adapter entry, reused guards.
 //!
-//! `agy` loads `$HOME/.gemini/config/hooks.json` with no flag, whether or not
-//! any workspace is trusted, and `HOME` is the Boss-owned per-run home, so the
-//! file is Boss-owned and never enters the repo or the agent's workspace
-//! (pane viability study, Q3/Q4; design doc, "Global-root hook wiring"). That
-//! is why this driver declares
-//! [`crate::HookWiringDestination::DriverOwned`]: the engine must not merge
-//! the map into the Claude-shaped worker settings file `agy` never reads.
+//! Progress stays silent on stdout. This module writes the engine-owned
+//! policy, content-binding attestation, and the single `PreToolUse` command
+//! that forwards, runs the existing guard chain, and returns `auto_approve`,
+//! `deny`, or `deny_unless_prior_grant`. Native `SessionStart` is not a
+//! pre-prompt readiness signal; loaded hook counts are not authorization.
 //!
-//! ## What the forwarder is
-//!
-//! Every wired event runs the unchanged `boss-event` shim, which splices
-//! `_boss_run_id` into the payload and forwards the bytes to the engine
-//! events socket, exactly as Claude and Grok do. The `agy` payload is *not*
-//! canonicalised here: decoding the dialect is the engine-side
-//! `normalize_progress_event`'s job, so there is one decoder rather than a
-//! second "canonical" shape here that could drift from it.
-//!
-//! The event name is appended to each command as an argument. The shim does
-//! not read argv, so the argument is not spliced into the payload; the
-//! qualified `agy` (1.5.7 or later) stamps `hookEventName` on every payload.
-//! The argument keeps the event distinguishable in process listings and
-//! diagnostics, and is where a forwarder that does need it (1.1.12 payloads
-//! carry no `hookEventName`) would read it (hook surface study, "Driver
-//! follow-up").
-//!
-//! ## Reply and failure contract
-//!
-//! `agy` hooks run synchronously, so `SessionStart`, `PreInvocation` and
-//! `PreToolUse` add the forwarder's latency to every step.
-//!
-//! * **Silent stdout.** The shim writes nothing to stdout on success, so the
-//!   forwarder never emits a permission verdict of its own. That matters:
-//!   in review mode an `allow` reply raises the approval dialog and `{}`
-//!   denies the tool (permission study, section 7; shared-HOME study,
-//!   section 2). Silence is not approval either: it leaves normal permission
-//!   evaluation in place.
-//! * **Delivery failure is observable and never an approval.** A non-zero
-//!   exit from a hook denies the tool call it reports. The shim exits zero
-//!   only when the event was delivered or queued to its on-disk buffer; it
-//!   exits non-zero when it cannot deliver *or* buffer, or when the engine
-//!   rejects the payload. On `PreToolUse` that denies the call. The
-//!   command string must therefore pass the shim's exit status through
-//!   untouched (no `|| true`), which `forwarder_exit_status_is_not_masked`
-//!   pins.
-//! * **Exactly one `PreToolUse` entry.** How several `PreToolUse` hooks
-//!   combine was not measured, so this file registers one. The hook adapter
-//!   that will answer with the authorization verdict (`auto_approve`,
-//!   `deny` or `deny_unless_prior_grant`) takes over that single entry: it
-//!   runs the same forwarder command as part of its work and emits the
-//!   verdict itself. Until it lands, spawn refuses
-//!   (`AgyDriver::launch_ready` is `false`), so nothing runs against this
-//!   `PreToolUse` entry.
+//! The global-root progress map wires all six measured lifecycle events.
+//! Authorization replaces its single PreToolUse entry before atomic
+//! installation and content binding; the other five remain forwarders.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
+use boss_engine_codex_hook_trust::sha256_hex_prefixed;
 use boss_ssh_transport::shell_quote;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::ProgressObservationConfig;
+use super::home::{agy_homes_root, process_home_for_run, session_settings_path_for_run};
+use crate::hook_guards::{Guard, guard_commands, write_executable};
 use crate::hook_settings::forwarder_command;
+use crate::{ProgressObservationConfig, ToolUseInterceptionConfig, WorkerKind};
+
+/// Filename of the authorization adapter under `$HOME/.gemini/config/`.
+pub const ADAPTER_FILENAME: &str = "boss-agy-hook-adapter.py";
+/// Engine-owned policy the adapter reads at `BOSS_AGY_POLICY`.
+pub const POLICY_FILENAME: &str = "boss-agy-auth-policy.json";
+/// Content binding for settings, hooks, adapter, policy, and guard artifacts.
+pub const ATTESTATION_FILENAME: &str = "boss-agy-auth-attestation.json";
 
 /// Name of the one hook group in `hooks.json` holding the Boss wiring.
 pub(super) const HOOK_GROUP: &str = "boss";
@@ -95,9 +65,556 @@ pub(super) const FORWARDER_HOOK_TIMEOUT_SEC: u64 = 15;
 /// The shim's own budget (`SHIM_TOTAL_BUDGET`, 12s) plus teardown headroom.
 const _: () = assert!(FORWARDER_HOOK_TIMEOUT_SEC >= 12 + 3);
 
-/// Path of the global-root hooks file under a per-run process home.
-pub(super) fn hooks_file_path(process_home: &Path) -> PathBuf {
-    process_home.join(".gemini/config/hooks.json")
+const ADAPTER_SCRIPT: &str = include_str!("adapter.py");
+
+/// Outer hook timeout when the checkleft push guard is not in the chain.
+/// Covers silent `boss-event` delivery (~10s retry) plus the remaining guards.
+pub const AUTHORIZATION_HOOK_TIMEOUT_SEC: u64 = 60;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestationEntry {
+    pub name: String,
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizationAttestation {
+    pub generated_at_unix: u64,
+    pub entries: Vec<AttestationEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationProbeReport {
+    pub ok: bool,
+    pub positive_decision: String,
+    pub denied_decision: String,
+    pub denied_reason: Option<String>,
+    pub reason: Option<String>,
+}
+
+fn worker_kind_name(kind: WorkerKind) -> &'static str {
+    match kind {
+        WorkerKind::Standard => "standard",
+        WorkerKind::Reviewer => "reviewer",
+        WorkerKind::Triage => "triage",
+        WorkerKind::AnswerAgent => "answer_agent",
+        WorkerKind::ReviewGuide => "review_guide",
+        WorkerKind::Progression => "progression",
+    }
+}
+
+fn approval_for(kind: WorkerKind) -> &'static str {
+    match kind {
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => "auto_approve",
+        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => "deny_unless_prior_grant",
+    }
+}
+
+fn gemini_config_dir(process_home: &Path) -> PathBuf {
+    process_home.join(".gemini/config")
+}
+
+pub fn hooks_file_path(process_home: &Path) -> PathBuf {
+    gemini_config_dir(process_home).join("hooks.json")
+}
+
+pub fn adapter_path(process_home: &Path) -> PathBuf {
+    gemini_config_dir(process_home).join(ADAPTER_FILENAME)
+}
+
+pub fn policy_path(process_home: &Path) -> PathBuf {
+    gemini_config_dir(process_home).join(POLICY_FILENAME)
+}
+
+pub fn attestation_path(process_home: &Path) -> PathBuf {
+    gemini_config_dir(process_home).join(ATTESTATION_FILENAME)
+}
+
+fn hash_file(path: &Path) -> anyhow::Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("hashing {}", path.display()))?;
+    Ok(sha256_hex_prefixed(&bytes))
+}
+
+fn protected_paths(process_home: &Path, interception: &ToolUseInterceptionConfig) -> Vec<String> {
+    let mut paths = vec![
+        process_home.join(".gemini").display().to_string(),
+        process_home
+            .parent()
+            .unwrap_or(process_home)
+            .join("control")
+            .display()
+            .to_string(),
+        process_home
+            .parent()
+            .unwrap_or(process_home)
+            .join("rules-root")
+            .display()
+            .to_string(),
+        agy_homes_root().display().to_string(),
+    ];
+    if let Some(data_dir) = &interception.data_dir {
+        paths.push(data_dir.display().to_string());
+    }
+    paths
+}
+
+fn authorization_command(process_home: &Path, config: &ProgressObservationConfig) -> String {
+    let adapter_config = ProgressObservationConfig {
+        forwarder_binary: adapter_path(process_home),
+        ..config.clone()
+    };
+    format!(
+        "BOSS_AGY_FORWARDER={} BOSS_AGY_POLICY={} {}",
+        shell_quote(&config.forwarder_binary.display().to_string()),
+        shell_quote(&policy_path(process_home).display().to_string()),
+        forwarder_command(&adapter_config)
+    )
+}
+
+fn hook_timeout_sec(interception: &ToolUseInterceptionConfig) -> u64 {
+    if interception.is_standard_worker && interception.checkleft_guard_script.is_some() {
+        crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS
+    } else {
+        AUTHORIZATION_HOOK_TIMEOUT_SEC
+    }
+}
+
+fn pre_tool_use_entry(
+    process_home: &Path,
+    obs: &ProgressObservationConfig,
+    interception: &ToolUseInterceptionConfig,
+) -> Value {
+    json!({
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": authorization_command(process_home, obs),
+            "timeout": hook_timeout_sec(interception),
+        }],
+    })
+}
+
+/// Declared PreToolUse wiring. Other lifecycle events are installed by the
+/// global-root progress forwarder, not duplicated here.
+pub fn authorization_hooks_map(
+    config: &ProgressObservationConfig,
+    interception: Option<&ToolUseInterceptionConfig>,
+) -> serde_json::Map<String, Value> {
+    let process_home = process_home_for_run(&config.run_id)
+        .unwrap_or_else(|_| agy_homes_root().join("unknown-run").join("process-home"));
+    let timeout = interception
+        .map(hook_timeout_sec)
+        .unwrap_or(AUTHORIZATION_HOOK_TIMEOUT_SEC);
+    let entry = json!([{
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": authorization_command(&process_home, config),
+            "timeout": timeout,
+        }],
+    }]);
+    let mut hooks = forwarder_hooks_map(config);
+    hooks.insert("PreToolUse".to_owned(), entry);
+    hooks
+}
+
+fn collect_guard_artifact_paths(config: &ToolUseInterceptionConfig) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(path) = &config.path_guard_script {
+        out.push(("guard:path".into(), path.clone()));
+    }
+    if let Some(path) = &config.git_store_guard_script {
+        out.push(("guard:git_store".into(), path.clone()));
+    }
+    if let Some(path) = &config.checkleft_guard_script {
+        out.push(("guard:checkleft".into(), path.clone()));
+    }
+    out
+}
+
+/// Install the adapter, policy, attestation, and PreToolUse authorization
+/// entry under the per-run home. Refuses to arm zero guards.
+pub fn install_authorization(
+    process_home: &Path,
+    worker_kind: WorkerKind,
+    obs: &ProgressObservationConfig,
+    interception: &ToolUseInterceptionConfig,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if !process_home.exists() {
+        bail!(
+            "agy authorization install: process HOME {} does not exist; call provision_workspace first",
+            process_home.display()
+        );
+    }
+    super::home::validate_private_layout(process_home)?;
+    let mut guards = guard_commands(interception);
+    guards.push(Guard {
+        command: format!(
+            "python3 -c {}",
+            shell_quote(&crate::codex::codex_tool_surface_guard_script())
+        ),
+        matcher: "*",
+        timeout_sec: Some(30),
+    });
+    if matches!(worker_kind, WorkerKind::Reviewer | WorkerKind::Triage) {
+        guards.push(Guard {
+            command: format!(
+                "python3 -c {}",
+                shell_quote(&crate::codex::codex_reviewer_publish_guard_script())
+            ),
+            matcher: "*",
+            timeout_sec: Some(30),
+        });
+    }
+    if guards.is_empty() {
+        bail!("AgyDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
+    }
+
+    let config_dir = gemini_config_dir(process_home);
+    fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
+
+    let adapter = adapter_path(process_home);
+    write_executable(&adapter, &crate::guard_python::with_command_tokenizer(ADAPTER_SCRIPT))?;
+
+    let policy_file = policy_path(process_home);
+    let attestation_file = attestation_path(process_home);
+    let hooks_path = hooks_file_path(process_home);
+    let settings_path = session_settings_path_for_run(&obs.run_id).unwrap_or_else(|_| {
+        process_home
+            .parent()
+            .unwrap_or(process_home)
+            .join("control/session-settings.json")
+    });
+
+    let mut artifacts = collect_guard_artifact_paths(interception);
+    artifacts.extend([
+        ("adapter".into(), adapter.clone()),
+        ("policy".into(), policy_file.clone()),
+        ("hooks".into(), hooks_path.clone()),
+        ("settings".into(), settings_path),
+        ("forwarder".into(), obs.forwarder_binary.clone()),
+    ]);
+    let required_artifacts: serde_json::Map<String, Value> = artifacts
+        .iter()
+        .map(|(name, path)| (name.clone(), json!(path)))
+        .collect();
+    let policy = json!({
+        "version": 1,
+        "authorization_command": authorization_command(process_home, obs),
+        "hook_timeout_sec": hook_timeout_sec(interception),
+        "required_artifacts": required_artifacts,
+        "run_id": obs.run_id,
+        "worker_kind": worker_kind_name(worker_kind),
+        "approval": approval_for(worker_kind),
+        "workspace_path": obs.workspace_path.display().to_string(),
+        "process_home": process_home.display().to_string(),
+        "protected_paths": protected_paths(process_home, interception),
+        "forwarder": obs.forwarder_binary.display().to_string(),
+        "attestation_path": attestation_file.display().to_string(),
+        "guards": guards.iter().map(|guard| json!({
+            "command": guard.command,
+            "matcher": guard.matcher,
+            "timeout_sec": guard.timeout_sec.unwrap_or(30),
+        })).collect::<Vec<_>>(),
+    });
+    write_json_atomic(&policy_file, &policy)?;
+    let mut hooks = forwarder_hooks_map(obs);
+    hooks.insert(
+        "PreToolUse".into(),
+        json!([pre_tool_use_entry(process_home, obs, interception)]),
+    );
+    write_hooks_document(process_home, &json!({ HOOK_GROUP: hooks }))?;
+    validate_configuration(process_home, &policy)?;
+
+    // Every declared artifact must exist; missing guards/settings never shrink
+    // the binding to a misleadingly healthy subset.
+    let entries = artifacts
+        .into_iter()
+        .map(|(name, path)| {
+            Ok(AttestationEntry {
+                name,
+                path: path.display().to_string(),
+                sha256: hash_file(&path)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let attestation = AuthorizationAttestation {
+        generated_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        entries,
+    };
+    write_json_atomic(&attestation_file, &serde_json::to_value(&attestation)?)?;
+
+    Ok(vec![hooks_path, adapter, policy_file, attestation_file])
+}
+
+/// Re-check that every attested artifact still has the bytes written at install.
+pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAttestation> {
+    let path = attestation_path(process_home);
+    let body = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let attestation: AuthorizationAttestation =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+    let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
+    validate_configuration(process_home, &policy)?;
+    let required = policy["required_artifacts"]
+        .as_object()
+        .context("policy missing required artifact set")?;
+    for name in ["adapter", "hooks", "policy", "settings", "forwarder"] {
+        if !required.contains_key(name) {
+            bail!("binding missing required artifact {name}");
+        }
+    }
+    if required["adapter"] != json!(adapter_path(process_home))
+        || required["hooks"] != json!(hooks_file_path(process_home))
+        || required["policy"] != json!(policy_path(process_home))
+        || required["settings"]
+            != json!(
+                process_home
+                    .parent()
+                    .context("run container")?
+                    .join("control/session-settings.json")
+            )
+        || required["forwarder"] != policy["forwarder"]
+    {
+        bail!("authorization binding has unexpected run paths");
+    }
+    if attestation.entries.len() != required.len() {
+        bail!("authorization binding has incomplete artifact set");
+    }
+    for (name, expected) in required {
+        if attestation
+            .entries
+            .iter()
+            .filter(|e| &e.name == name && json!(e.path) == *expected)
+            .count()
+            != 1
+        {
+            bail!("authorization binding missing or misplaced {name}");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["adapter", "forwarder"] {
+            let path = required[name].as_str().context("executable path")?;
+            if fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
+                bail!("authorization binding: {name} is not executable");
+            }
+        }
+    }
+    if attestation.entries.is_empty() {
+        bail!("authorization attestation at {} has no entries", path.display());
+    }
+    let mut problems = Vec::new();
+    for entry in &attestation.entries {
+        let artifact = PathBuf::from(&entry.path);
+        if !artifact.is_file() {
+            problems.push(format!("{} missing: {}", entry.name, entry.path));
+            continue;
+        }
+        let actual = hash_file(&artifact)?;
+        if actual != entry.sha256 {
+            problems.push(format!("{} changed: {}", entry.name, entry.path));
+        }
+    }
+    if !problems.is_empty() {
+        bail!("authorization binding failed: {}", problems.join("; "));
+    }
+    Ok(attestation)
+}
+
+fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result<()> {
+    let workspace = PathBuf::from(policy["workspace_path"].as_str().context("workspace path")?);
+    let settings_path = process_home
+        .parent()
+        .context("run container")?
+        .join("control/session-settings.json");
+    let settings: Value = serde_json::from_slice(&fs::read(settings_path)?)?;
+    validate_session_settings(&settings, &workspace)?;
+    let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
+    let entry = &hooks["boss"]["PreToolUse"];
+    let command = policy["authorization_command"]
+        .as_str()
+        .context("expected authorization command")?;
+    let expected_entry = json!([{
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": command, "timeout": policy["hook_timeout_sec"]}]
+    }]);
+    if entry != &expected_entry || hooks.as_object().is_none_or(|groups| groups.len() != 1) {
+        bail!("PreToolUse configuration does not match the wildcard command contract");
+    }
+    Ok(())
+}
+
+/// Validate the final session contract, rather than the provisioning trust seed.
+fn validate_session_settings(settings: &Value, workspace: &Path) -> anyhow::Result<()> {
+    let object = settings.as_object().context("session settings must be an object")?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "agentMode" | "toolPermission" | "trustedWorkspaces" | "permissions"
+        )
+    }) || settings["agentMode"] != ""
+        || settings["toolPermission"] != "request-review"
+    {
+        bail!("session settings must explicitly select the default agent mode and request-review");
+    }
+    let workspace = fs::canonicalize(workspace)?;
+    if settings["trustedWorkspaces"] != json!([workspace]) {
+        bail!("session settings must trust exactly the canonical workspace");
+    }
+    let permissions = settings["permissions"]
+        .as_object()
+        .context("permissions must be an object")?;
+    if permissions
+        .keys()
+        .any(|key| !matches!(key.as_str(), "allow" | "deny" | "ask"))
+        || permissions
+            .get("ask")
+            .is_some_and(|ask| ask.as_array().is_none_or(|rules| !rules.is_empty()))
+    {
+        bail!("session permissions must not contain ask rules or unknown keys");
+    }
+    for key in ["allow", "deny"] {
+        if key == "allow" && !permissions.contains_key(key) {
+            continue;
+        }
+        let rules = permissions
+            .get(key)
+            .and_then(Value::as_array)
+            .context("permission rules must be arrays")?;
+        if key == "deny" && rules.is_empty() {
+            bail!("session settings must fence native file access");
+        }
+        for rule in rules {
+            let rule = rule.as_str().context("permission rules must be strings")?;
+            let (action, target) = rule
+                .split_once('(')
+                .context("permission rule requires action(target)")?;
+            let target = target
+                .strip_suffix(')')
+                .context("permission rule requires closing parenthesis")?;
+            let actions = if key == "deny" {
+                &["read_file", "write_file"][..]
+            } else {
+                &["command", "read_file", "write_file"][..]
+            };
+            if !actions.contains(&action)
+                || target.is_empty()
+                || target.trim() != target
+                || target.chars().any(|c| c.is_control() || matches!(c, '(' | ')'))
+                || (action == "command" && target.starts_with("regex:"))
+            {
+                bail!("invalid session permission rule: {rule}");
+            }
+            if matches!(action, "read_file" | "write_file")
+                && (!Path::new(target).is_absolute()
+                    || Path::new(target)
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir))
+            {
+                bail!("native file permission paths must be absolute");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Harmless pre-prompt probe through the same authorization entry. Does not
+/// launch a pane. Native SessionStart cannot establish this; hook counts cannot
+/// either.
+pub fn probe_authorization(process_home: &Path) -> anyhow::Result<AuthorizationProbeReport> {
+    probe_authorization_with_timeout(process_home, std::time::Duration::from_secs(60))
+}
+
+fn probe_authorization_with_timeout(
+    process_home: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<AuthorizationProbeReport> {
+    verify_attestation(process_home)?;
+    let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
+    let command = hooks
+        .pointer("/boss/PreToolUse/0/hooks/0/command")
+        .and_then(Value::as_str)
+        .context("missing or disabled PreToolUse authorization command")?;
+    if !command.contains(&shell_quote(&adapter_path(process_home).display().to_string())) {
+        bail!("PreToolUse authorization command is disabled or malformed");
+    }
+    let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
+    let run = |payload: Value| -> anyhow::Result<Value> {
+        // The shared process runner kills the entire probe process group on
+        // expiry rather than waiting indefinitely for adapter output.
+        let (input, mut writer) = std::os::unix::net::UnixStream::pair()?;
+        writer.write_all(payload.to_string().as_bytes())?;
+        drop(writer);
+        let input: std::os::fd::OwnedFd = input.into();
+        let output = boss_command_runner::output_blocking_timeout_in_group(
+            Command::new("/bin/sh")
+                .args(["-c", command])
+                .env("BOSS_AGY_PROBE", "1")
+                .stdin(Stdio::from(input))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            timeout,
+            |_| {},
+        )?;
+        if !output.status.success() {
+            bail!(
+                "installed authorization command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        serde_json::from_slice(&output.stdout).context("installed authorization command produced malformed output")
+    };
+    let payload = |cmd: &str| {
+        json!({
+            "hookEventName": "PreToolUse",
+            "conversationId": "probe",
+            "toolCall": {"id":"probe", "name":"run_command", "args":{
+                "CommandLine":cmd, "Cwd":policy["workspace_path"]
+            }}
+        })
+    };
+    let positive = run(payload("echo boss-agy-auth-positive"))?;
+    let denied = run(payload("sudo rm -rf /tmp/boss-agy-auth-denied-sentinel"))?;
+    // Only the reused launch guard denies this command; structural policy allows
+    // it. This checks deny liveness in addition to the adapter's own deny.
+    let guard_denied = run(payload("open -a Boss"))?;
+    let expected = policy["approval"].as_str().context("approval")?;
+    if positive["decision"] != expected || denied["decision"] != "deny" || guard_denied["decision"] != "deny" {
+        bail!(
+            "pre-prompt authorization probe failed: positive={positive}, structural={denied}, reused_guard={guard_denied}"
+        );
+    }
+    Ok(AuthorizationProbeReport {
+        ok: true,
+        positive_decision: expected.into(),
+        denied_decision: "deny".into(),
+        denied_reason: denied["reason"].as_str().map(str::to_owned),
+        reason: None,
+    })
+}
+
+pub fn observation_from_permission(input: &crate::PermissionInput) -> ProgressObservationConfig {
+    ProgressObservationConfig {
+        events_socket_path: input.events_socket_path.clone(),
+        lease_id: input.lease_id.clone(),
+        run_id: input.run_id.clone(),
+        workspace_path: input.workspace_path.clone(),
+        forwarder_binary: input.boss_event_path.clone(),
+    }
 }
 
 /// The shell command one event runs: the shared forwarder command with the
@@ -128,6 +645,7 @@ pub(super) fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_j
 }
 
 /// Render the whole `hooks.json` body for the forwarder wiring.
+#[cfg(test)]
 pub(super) fn render_hooks_json(config: &ProgressObservationConfig) -> anyhow::Result<String> {
     let body = json!({ HOOK_GROUP: forwarder_hooks_map(config) });
     Ok(serde_json::to_string_pretty(&body)? + "\n")
@@ -135,17 +653,33 @@ pub(super) fn render_hooks_json(config: &ProgressObservationConfig) -> anyhow::R
 
 /// Overwrite the per-run home's `hooks.json` (provisioned as a no-op canary)
 /// with the forwarder wiring. Returns the path written.
+#[cfg(test)]
 pub(super) fn write_hooks(process_home: &Path, config: &ProgressObservationConfig) -> anyhow::Result<PathBuf> {
-    let path = hooks_file_path(process_home);
-    let parent = path.parent().context("hooks.json has a parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    // Write beside the target and rename so a reader never sees a partial file.
+    write_hooks_document(
+        process_home,
+        &serde_json::from_str::<Value>(&render_hooks_json(config)?)?,
+    )
+}
+
+fn write_json_atomic(path: &Path, body: &Value) -> anyhow::Result<()> {
+    let parent = path.parent().context("JSON has parent")?;
+    fs::create_dir_all(parent)?;
     let staging = path.with_extension("json.tmp");
-    fs::write(&staging, render_hooks_json(config)?).with_context(|| format!("writing {}", staging.display()))?;
-    fs::rename(&staging, &path).with_context(|| format!("installing {}", path.display()))?;
+    fs::write(&staging, serde_json::to_string_pretty(body)? + "\n")?;
+    fs::rename(&staging, path).with_context(|| format!("installing {}", path.display()))
+}
+
+fn write_hooks_document(process_home: &Path, body: &Value) -> anyhow::Result<PathBuf> {
+    super::home::validate_private_layout(process_home)?;
+    let path = hooks_file_path(process_home);
+    write_json_atomic(&path, body)?;
     Ok(path)
 }
 
 #[cfg(test)]
 #[path = "hooks_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "forwarder_tests.rs"]
+mod forwarder_tests;

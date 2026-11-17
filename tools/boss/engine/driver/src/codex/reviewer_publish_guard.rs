@@ -128,14 +128,15 @@ def matched_publish_command(cmd):
             sub = skip_global_flags(rest[1:], JJ_GLOBAL_VALUE_FLAGS)
             if len(sub) >= 2 and sub[0] == "git" and sub[1] == "push":
                 return "jj git push"
-        if len(rest) >= 3 and prog == "gh" and rest[1] == "pr" and rest[2] in (
+        gh_args = skip_global_flags(rest[1:], {"-R", "--repo", "--hostname"}) if prog == "gh" else []
+        if len(gh_args) >= 2 and gh_args[0] == "pr" and gh_args[1] in (
             "create", "merge", "close", "edit", "comment", "review",
         ):
-            return "gh pr " + rest[2]
-        if len(rest) >= 3 and prog == "gh" and rest[1] == "issue" and rest[2] in (
+            return "gh pr " + gh_args[1]
+        if len(gh_args) >= 2 and gh_args[0] == "issue" and gh_args[1] in (
             "create", "comment", "close", "edit",
         ):
-            return "gh issue " + rest[2]
+            return "gh issue " + gh_args[1]
         if len(rest) >= 2 and is_cube and rest[1] == "pr":
             return "cube pr"
     return None

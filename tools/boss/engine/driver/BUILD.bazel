@@ -12,6 +12,7 @@ rust_library(
         "//tools/boss/tmux:blocking_dialog_cases.json",
         "src/codex-tmux.conf",
         "src/initial_prompt.py",
+        "src/agy/adapter.py",
     ],
     crate_name = "boss_engine_driver",
     crate_root = "src/lib.rs",
@@ -58,6 +59,7 @@ rust_test(
         "//tools/boss/tmux:blocking_dialog_cases.json",
         "src/codex-tmux.conf",
         "src/initial_prompt.py",
+        "src/agy/adapter.py",
     ],
     crate = ":driver",
     data = [

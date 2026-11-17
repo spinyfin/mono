@@ -1,5 +1,13 @@
 //! Shared Python fragments for driver `PreToolUse` guards.
 
+/// Programs that cannot run in static-analysis-only worker sessions.
+#[macro_export]
+macro_rules! render_reviewer_blocked_programs {
+    () => { "REVIEWER_BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin','checkleft'}\n" };
+}
+
+pub const REVIEWER_BLOCKED_PROGRAMS_PY: &str = crate::render_reviewer_blocked_programs!();
+
 /// Shell tokenizer shared by driver guards that inspect `Bash` commands.
 ///
 /// This matches the lexer used by the shared Claude guards, including
@@ -54,6 +62,10 @@ def shell_text(text):
                 continue
             comment = False
         if escaped:
+            # shlex preserves these escapes inside double quotes, while the
+            # shell consumes them before executing an extracted -c body.
+            if quote == chr(34) and char in (chr(36), chr(96)):
+                out.pop()
             out.append(char)
             escaped = False
             continue
@@ -74,6 +86,8 @@ def shell_text(text):
                 char = '__GUARD_FD_AMP__'
             elif before == '|':
                 continue
+        elif char == '|' and text[index - 1:index] == '>':
+            char = '__GUARD_REDIRECT_PIPE__'
         out.append(char)
     return ''.join(out)
 
@@ -97,7 +111,7 @@ def command_records(command):
             lexer = shlex.shlex(pending, posix=True, punctuation_chars=';&|()')
             lexer.whitespace_split = True
             lexer.commenters = ''
-            tokens = [token.replace('__GUARD_FD_AMP__', '&') for token in lexer]
+            tokens = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|') for token in lexer]
         except ValueError:
             # A quote can span physical lines. Never reinterpret failed lexing
             # as whitespace-separated argv.
@@ -136,16 +150,49 @@ def command_groups(command):
                 for part in re.split(r'[;&|()]', line) if part.split()]
     return [group for group in records if group]
 
+def without_redirections(group):
+    result = []
+    index = 0
+    while index < len(group):
+        token = group[index]
+        redirect = re.match(r'^(?:[0-9]+|&)?(?:>\||>>?|<>|<<-?|<)(.*)$', token)
+        if redirect:
+            if redirect.group(1) in ('', '&'):
+                index += 1
+        else:
+            result.append(token)
+        index += 1
+    return result
+
 def strip_prefixes(group):
+    group = without_redirections(group)
     index = 0
     while index < len(group):
         token = group[index]
         base = os.path.basename(token)
-        if ASSIGNMENT_RE.match(token) or base in WRAPPERS:
+        if ASSIGNMENT_RE.match(token):
             index += 1
             continue
-        if base == 'timeout' and index + 1 < len(group):
-            index += 2
+        if base in WRAPPERS or base == 'timeout':
+            index += 1
+            value_options = {
+                'env': {'-u', '--unset', '-C', '--chdir'},
+                'sudo': {'-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt'},
+                'nice': {'-n', '--adjustment'},
+                'ionice': {'-c', '--class', '-n', '--classdata', '-p', '--pid'},
+                'stdbuf': {'-i', '-o', '-e', '--input', '--output', '--error'},
+                'timeout': {'-k', '--kill-after', '-s', '--signal'},
+                'xargs': {'-n', '-L', '-P', '-I', '-d', '--max-args', '--max-lines', '--max-procs', '--replace', '--delimiter'},
+            }.get(base, set())
+            while index < len(group) and group[index].startswith('-'):
+                option = group[index]
+                index += 1
+                if option == '--':
+                    break
+                if option in value_options and index < len(group):
+                    index += 1
+            if base == 'timeout' and index < len(group):
+                index += 1
             continue
         break
     return group[index:]
@@ -155,5 +202,7 @@ pub const CODEX_COMMAND_TOKENIZER_PY: &str = crate::render_command_tokenizer!(""
 
 /// Insert the shared tokenizer into a Python source template.
 pub fn with_command_tokenizer(template: &str) -> String {
-    template.replace("# COMMAND_TOKENIZER_FRAGMENT", CODEX_COMMAND_TOKENIZER_PY)
+    template
+        .replace("# COMMAND_TOKENIZER_FRAGMENT", CODEX_COMMAND_TOKENIZER_PY)
+        .replace("# REVIEWER_BLOCKED_FRAGMENT", REVIEWER_BLOCKED_PROGRAMS_PY)
 }

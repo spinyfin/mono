@@ -1,8 +1,6 @@
-use super::super::AgyDriver;
 use super::super::home::{provision_agy_home, session_settings_path_for_run};
 use super::super::test_environment::env_for_provision;
 use super::*;
-use crate::AgentDriver;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use tempfile::TempDir;
@@ -498,14 +496,11 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
-/// Drive the trait method on a private runtime so the env-var lock the tests
-/// hold is never held across an `.await`.
+/// Exercise the settings renderer on its own. The driver's
+/// `write_permission_config` renders these settings and then installs the
+/// authorization adapter, which is covered by the driver-level tests.
 fn write_config(input: &PermissionInput) -> anyhow::Result<PermissionArtifacts> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(AgyDriver::default().write_permission_config(input, Path::new("/unused-dest-dir")))
+    write_session_settings(input)
 }
 
 #[test]

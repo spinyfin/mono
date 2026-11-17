@@ -2,6 +2,30 @@ use super::{environment, home};
 use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK;
 use std::ffi::OsString;
 use std::path::Path;
+
+/// Final permission-renderer output for authorization integration fixtures.
+pub(crate) fn write_final_settings(run_id: &str, workspace: &Path, kind: crate::WorkerKind) {
+    use crate::WorkerKind;
+    let allow = match kind {
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => vec![],
+        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => vec!["command(gh pr view)"],
+    };
+    let process_home = home::process_home_for_run(run_id).unwrap();
+    let mut settings = serde_json::json!({
+        "agentMode": "", "toolPermission": "request-review",
+        "trustedWorkspaces": [std::fs::canonicalize(workspace).unwrap()],
+        "permissions": {"allow": allow, "deny": [format!("write_file({})", process_home.display())]}
+    });
+    if allow.is_empty() {
+        settings["permissions"].as_object_mut().unwrap().remove("allow");
+    }
+    std::fs::write(
+        home::session_settings_path_for_run(run_id).unwrap(),
+        settings.to_string(),
+    )
+    .unwrap();
+}
+
 pub(crate) struct EnvGuard {
     _lock: Option<std::sync::MutexGuard<'static, ()>>,
     prior: Vec<(&'static str, Option<OsString>)>,
