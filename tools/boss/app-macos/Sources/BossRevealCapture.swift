@@ -90,6 +90,10 @@ enum BossRevealCapture {
             BossOperatorQuestionCapture.start(path: path)
             return
         }
+        if state == "navigator-attention" {
+            BossNavigatorAttentionCapture.start(path: path)
+            return
+        }
         if state == "queued-order" {
             BossQueuedOrderCapture.start(path: path, updateModel: updateModel)
             return

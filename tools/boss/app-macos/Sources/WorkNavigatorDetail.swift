@@ -47,14 +47,16 @@ struct WorkNavigatorDetail: View {
                         }
                     }
                 }
-                if root.navigator?.root?.actions.isEmpty == false {
-                    Button("Attention needed (\(root.navigator?.root?.actions.count ?? 0))") {
+                let actionCount = root.navigator?.root?.actions.count ?? 0
+                if actionCount > 0, model.navigator.tab != .attention {
+                    Button("Attention needed (\(actionCount))") {
                         model.navigator.tab = .attention
                     }
+                    .accessibilityIdentifier("navigator-attention-banner")
                 }
                 Picker("Detail", selection: $model.navigator.tab) {
                     ForEach(NavigatorDetailSlot.allCases.filter { model.navigator.tabs.contains($0) }) { slot in
-                        Text(slot.title).tag(slot)
+                        Text(slot.title(actionCount: actionCount)).tag(slot)
                     }
                 }
                 .pickerStyle(.segmented)

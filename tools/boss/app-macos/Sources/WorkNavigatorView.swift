@@ -2,7 +2,7 @@ import SwiftUI
 
 struct WorkNavigatorView: View {
     @ObservedObject var model: ChatViewModel
-    var registry = NavigatorDetailRegistry()
+    var registry = NavigatorDetailRegistry.withAttention
     @Environment(\.openWindow) private var openWindow
     @FocusState private var focus: Focus?
     private enum Focus: Hashable {
@@ -40,6 +40,7 @@ struct WorkNavigatorView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .environmentObject(model)
     }
 
     private var navigator: some View {

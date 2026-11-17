@@ -33,14 +33,26 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     var onAnswer: ((OperatorAnswer) -> Void)? = nil
     var onDismiss: (() -> Void)? = nil
 
-    @State fileprivate var showingDetail = false
-
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
     }
 
     var body: some View {
-        let question = slice.presentation
+        OperatorQuestionBody(question: slice.presentation, onAnswer: onAnswer, onDismiss: onDismiss)
+    }
+}
+
+/// Shared question controls for the kanban card and Navigator Attention slot.
+/// Closures stay outside any Equatable wrapper so a live-status flip does
+/// not rebuild the buttons.
+struct OperatorQuestionBody: View {
+    let question: OperatorQuestionPresentation
+    var onAnswer: ((OperatorAnswer) -> Void)? = nil
+    var onDismiss: (() -> Void)? = nil
+
+    @State private var showingDetail = false
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let explanation = OperatorQuestionExplanation(question.explanation, optionLabels: question.optionLabels) {
                 OperatorQuestionDecisionContent(question: question.text, explanation: explanation)
@@ -60,46 +72,7 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
                     .accessibilityIdentifier("operator-question-text")
             }
 
-            if question.choices.isEmpty {
-                HStack(spacing: 8) {
-                    whyButton(question)
-                    dismissButton
-                    Spacer(minLength: 0)
-                    // No default action on either button: a stray Return must not
-                    // authorize a bypass. A question whose answers are distinct
-                    // actions shows the engine's names for them; the answer sent
-                    // is still the yes/no the position stands for.
-                    Button(question.optionLabels?.yes ?? "Yes") { onAnswer?(.yesNo(true)) }
-                        .accessibilityIdentifier("operator-question-yes")
-                    Button(question.optionLabels?.no ?? "No") { onAnswer?(.yesNo(false)) }
-                        .accessibilityIdentifier("operator-question-no")
-                }
-                .controlSize(.small)
-                .disabled(question.answerInFlight)
-            } else {
-                // One button per option, in the worker's order. The label is the
-                // string the engine records, so the click is the answer.
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        whyButton(question)
-                        dismissButton
-                    }
-                    ForEach(Array(question.choices.enumerated()), id: \.offset) { index, choice in
-                        Button {
-                            onAnswer?(.multipleChoice(choice))
-                        } label: {
-                            Text(choice)
-                                .lineLimit(2)
-                                .multilineTextAlignment(.leading)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .help(choice)
-                        .accessibilityIdentifier("operator-question-choice-\(index)")
-                    }
-                }
-                .controlSize(.small)
-                .disabled(question.answerInFlight)
-            }
+            answerControls
 
             if let error = question.errorMessage {
                 Text(error)
@@ -110,16 +83,58 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
             }
         }
     }
-}
 
-extension WorkBoardCardOperatorQuestion {
-    fileprivate var dismissButton: some View {
+    @ViewBuilder
+    private var answerControls: some View {
+        if question.choices.isEmpty {
+            HStack(spacing: 8) {
+                whyButton
+                dismissButton
+                Spacer(minLength: 0)
+                // No default action on either button: a stray Return must not
+                // authorize a bypass. A question whose answers are distinct
+                // actions shows the engine's names for them; the answer sent
+                // is still the yes/no the position stands for.
+                Button(question.optionLabels?.yes ?? "Yes") { onAnswer?(.yesNo(true)) }
+                    .accessibilityIdentifier("operator-question-yes")
+                Button(question.optionLabels?.no ?? "No") { onAnswer?(.yesNo(false)) }
+                    .accessibilityIdentifier("operator-question-no")
+            }
+            .controlSize(.small)
+            .disabled(question.answerInFlight)
+        } else {
+            // One button per option, in the worker's order. The label is the
+            // string the engine records, so the click is the answer.
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    whyButton
+                    dismissButton
+                }
+                ForEach(Array(question.choices.enumerated()), id: \.offset) { index, choice in
+                    Button {
+                        onAnswer?(.multipleChoice(choice))
+                    } label: {
+                        Text(choice)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .help(choice)
+                    .accessibilityIdentifier("operator-question-choice-\(index)")
+                }
+            }
+            .controlSize(.small)
+            .disabled(question.answerInFlight)
+        }
+    }
+
+    private var dismissButton: some View {
         Button("Dismiss") { onDismiss?() }
             .help("Close this question without answering. Work stays blocked until explicitly started.")
             .accessibilityIdentifier("operator-question-dismiss")
     }
 
-    fileprivate func whyButton(_ question: OperatorQuestionPresentation) -> some View {
+    private var whyButton: some View {
         Button("Why?") { showingDetail.toggle() }
             .buttonStyle(.link)
             .controlSize(.small)

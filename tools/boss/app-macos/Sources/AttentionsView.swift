@@ -113,13 +113,9 @@ struct AttentionGroupCard: View {
     @EnvironmentObject private var model: ChatViewModel
     let group: AttentionGroup
     @State private var isExpanded = true
-    /// Local drafts for `prompt`-type questions, keyed by attention id. Seeded
-    /// from the persisted answer; flushed to the engine on submit.
-    @State private var promptDrafts: [String: String] = [:]
     @State private var showingAssociationPopover = false
 
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
-    private var answeredCount: Int { members.filter(\.isAnswered).count }
     private var hasExtracted: Bool { members.contains { $0.confidenceSource == "extracted" } }
     /// Provenance badge for a member staged from `boss propose
     /// followup-task` (design: worker-proposal-api §"UI visibility and
@@ -135,16 +131,7 @@ struct AttentionGroupCard: View {
             cardHeader
             if isExpanded {
                 Divider()
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(members) { member in
-                        AttentionMemberRow(
-                            group: group,
-                            member: member,
-                            promptDraft: promptBinding(for: member)
-                        )
-                    }
-                }
-                footer
+                AttentionGroupBody(group: group)
             }
         }
         .padding(14)
@@ -279,6 +266,47 @@ struct AttentionGroupCard: View {
         }
     }
 
+}
+
+/// Member rows, prompt drafts and the group-action footer. Notifications,
+/// the design-doc panel and Navigator Attention all use this so answering
+/// here is the same `AnswerAttention` / `ActionAttentionGroup` path.
+struct AttentionGroupBody: View {
+    @EnvironmentObject private var model: ChatViewModel
+    let group: AttentionGroup
+    /// Generation captured when this body was shown. A later generation of
+    /// the same grouping key must not receive this body's drafts.
+    var expectedGeneration: Int? = nil
+    /// Local drafts for `prompt`-type questions, keyed by attention id. Seeded
+    /// from the persisted answer; flushed to the engine on submit.
+    @State private var promptDrafts: [String: String] = [:]
+
+    private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
+    private var answeredCount: Int { members.filter(\.isAnswered).count }
+    private var boundGeneration: Int { expectedGeneration ?? group.generation }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(members) { member in
+                AttentionMemberRow(
+                    group: group,
+                    member: member,
+                    promptDraft: promptBinding(for: member),
+                    expectedGeneration: boundGeneration
+                )
+            }
+            if let error = model.attentionAnswerError(forGroup: group.id) {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("attention-group-error")
+            }
+            footer
+        }
+        .id("\(group.id)-\(boundGeneration)")
+    }
+
     @ViewBuilder
     private var footer: some View {
         if group.kind != "followup" {
@@ -294,6 +322,7 @@ struct AttentionGroupCard: View {
                 .help(canSubmit
                       ? "Action this group — unanswered items are skipped"
                       : "Answer or accept at least one item first")
+                .accessibilityIdentifier("attention-group-submit")
             }
         }
     }
@@ -325,10 +354,10 @@ struct AttentionGroupCard: View {
         for member in members where member.questionType == "prompt" {
             let draft = (promptDrafts[member.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             if !draft.isEmpty, draft != (member.answer ?? "") {
-                model.answerAttention(member.id, answer: draft)
+                model.answerAttention(member.id, answer: draft, expectedGeneration: boundGeneration)
             }
         }
-        model.actionAttentionGroup(group.id)
+        model.actionAttentionGroup(group.id, expectedGeneration: boundGeneration)
     }
 }
 
@@ -338,6 +367,7 @@ struct AttentionMemberRow: View {
     let group: AttentionGroup
     let member: Attention
     @Binding var promptDraft: String
+    var expectedGeneration: Int? = nil
     @State private var showingMergeProvenance = false
 
     var body: some View {
@@ -446,7 +476,7 @@ struct AttentionMemberRow: View {
             get: { member.answer ?? "" },
             set: { value in
                 guard value == "yes" || value == "no" else { return }
-                model.answerAttention(member.id, answer: value)
+                model.answerAttention(member.id, answer: value, expectedGeneration: expectedGeneration)
             }
         )
     }
@@ -455,7 +485,7 @@ struct AttentionMemberRow: View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(member.choices, id: \.self) { choice in
                 Button {
-                    model.answerAttention(member.id, answer: choice)
+                    model.answerAttention(member.id, answer: choice, expectedGeneration: expectedGeneration)
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: member.answer == choice ? "largecircle.fill.circle" : "circle")
@@ -484,12 +514,12 @@ struct AttentionMemberRow: View {
                 Button("Save") {
                     let trimmed = promptDraft.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { return }
-                    model.answerAttention(member.id, answer: trimmed)
+                    model.answerAttention(member.id, answer: trimmed, expectedGeneration: expectedGeneration)
                 }
                 .controlSize(.small)
                 .disabled(promptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 Button("Skip") {
-                    model.skipAttention(member.id)
+                    model.skipAttention(member.id, expectedGeneration: expectedGeneration)
                 }
                 .controlSize(.small)
                 .buttonStyle(.plain)
@@ -538,9 +568,9 @@ struct AttentionMemberRow: View {
             set: { value in
                 switch value {
                 case "accept":
-                    model.acceptFollowup(member.id)
+                    model.acceptFollowup(member.id, expectedGeneration: expectedGeneration)
                 case "reject":
-                    model.skipAttention(member.id)
+                    model.skipAttention(member.id, expectedGeneration: expectedGeneration)
                 default: break
                 }
             }
@@ -549,7 +579,7 @@ struct AttentionMemberRow: View {
 
     private var skipRow: some View {
         Button("Skip") {
-            model.skipAttention(member.id)
+            model.skipAttention(member.id, expectedGeneration: expectedGeneration)
         }
         .controlSize(.small)
         .buttonStyle(.plain)
