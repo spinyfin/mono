@@ -171,10 +171,11 @@ extension ChatViewModel {
             navigator.retainedTask = selected
             if selected.prURL != nil { navigator.tabs.insert(.review) }
             syncNavigatorAttention(for: selected)
-            if navigator.askID.flatMap({ task(withID: $0) }) == nil,
-               let current = selected.navigator?.root?.revisions.currentTaskId,
+            if let current = selected.navigator?.root?.revisions.currentTaskId,
                task(withID: current) != nil {
                 navigator.askID = current
+            } else if navigator.askID.flatMap({ task(withID: $0) }) == nil {
+                navigator.askID = nil
             }
             retainNavigatorActivity(for: selected)
         } else if navigator.selectedRootID == nil,
