@@ -15,6 +15,7 @@ struct WorkNavigatorHistory: View {
                     LabeledContent("Origin", value: origin)
                 }
                 revisionList
+                NavigatorReviewHistory(model: model, root: root)
                 WorkDependenciesSection(model: model, taskID: root.id) { row in
                     model.navigateNavigatorDependency(row)
                 }

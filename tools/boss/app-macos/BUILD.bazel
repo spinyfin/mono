@@ -205,6 +205,7 @@ _NAVIGATOR_SHARD_SRCS = [
     "Tests/BossTests/NavigatorAttentionTests.swift",
     "Tests/BossTests/NavigatorActivityTests.swift",
     "Tests/BossTests/NavigatorLifecycleTests.swift",
+    "Tests/BossTests/NavigatorReviewTests.swift",
 ]
 
 macos_unit_test(
@@ -302,7 +303,10 @@ macos_unit_test(
 swift_library(
     name = "engine_reconnect_integration_tests_lib",
     testonly = True,
-    srcs = ["Tests/EngineIntegration/EngineReconnectIntegrationTests.swift"],
+    srcs = [
+        "Tests/EngineIntegration/EngineReconnectIntegrationTests.swift",
+        "Tests/EngineIntegration/NavigatorLifecycleIntegrationTests.swift",
+    ],
     module_name = "EngineReconnectIntegrationTests",
     deps = [":boss_mac_app_lib"],
 )

@@ -99,7 +99,7 @@ struct WorkNavigatorDetail: View {
         let ask = model.navigator.askID.flatMap { model.task(withID: $0) }
         let context = NavigatorDetailContext(model: model, root: root, ask: ask, isReadOnly: readOnly)
         if let body = registry.bodies[slot] {
-            body(context).disabled(readOnly)
+            body(context).disabled(readOnly && slot != .review && slot != .history)
         } else {
             NavigatorFallbackDetail(slot: slot, context: context)
         }

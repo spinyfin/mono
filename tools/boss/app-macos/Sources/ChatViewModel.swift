@@ -801,6 +801,7 @@ final class ChatViewModel: ObservableObject {
     /// loaded/failed without needing to pass content through the
     /// `openWindow` value type.
     let asyncMarkdownViewerVM = AsyncMarkdownViewerViewModel()
+    let navigatorReviewGuides = NavigatorReviewGuideStore()
 
     /// In-flight engine fetch for the async markdown viewer (project /
     /// investigation doc icon). `applyProductDesignDocContent` updates

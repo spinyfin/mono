@@ -465,6 +465,7 @@ struct WorkNavigatorRemotePane: View {
 }
 
 extension NavigatorDetailRegistry {
+    @MainActor
     static func navigator(workspace: WorkersWorkspaceModel?) -> NavigatorDetailRegistry {
         var registry = NavigatorDetailRegistry()
         registry.register(.activity) { context in
@@ -474,6 +475,7 @@ extension NavigatorDetailRegistry {
             AnyView(WorkNavigatorHistory(context: context))
         }
         WorkNavigatorAttention.register(in: &registry)
+        WorkNavigatorReview.register(in: &registry)
         return registry
     }
 }
