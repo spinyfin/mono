@@ -13,12 +13,13 @@
 //!   that clears the park. Holds are deliberately left alone, because they
 //!   record a decision a human has not yet made, or evidence a progression
 //!   agent has not yet read: `blocked: awaiting_operator_answer` (a question is
-//!   already in front of the human), `blocked: worker_failed` and a
+//!   already in front of the human), `blocked: question_dismissed` (the owner
+//!   closed the question without answering), `blocked: worker_failed` and a
 //!   `deliberate_park` stamp. A `worker_failed` row the owner refused (ledger
 //!   basis `operator_no`) is a recorded decision, a [`KeptHold::OperatorRefusal`];
 //!   every other producer's `worker_failed` is [`KeptHold::FailureEvidence`],
 //!   retained until progression clears it. Step 5 never redispatches either
-//!   (`task_accepts_execution` refuses both blocked reasons), and step 7 flags
+//!   (`task_accepts_execution` refuses those blocked reasons), and step 7 flags
 //!   them for progression. A stamp written *after* the park (an in-flight run
 //!   that finished failing while the row was parked) is newer evidence and is
 //!   kept too.
@@ -106,8 +107,8 @@ pub struct UnparkedRow {
     /// Set for a revision: the chain root it follows.
     pub parent_task_id: Option<String>,
     pub halt_stamp: HaltStamp,
-    /// The blocked state step 2 preserved (`awaiting_operator_answer` or
-    /// `worker_failed`), if the row has one.
+    /// The blocked state step 2 preserved (`awaiting_operator_answer`,
+    /// `question_dismissed`, or `worker_failed`), if the row has one.
     pub kept_hold: Option<KeptHold>,
 }
 

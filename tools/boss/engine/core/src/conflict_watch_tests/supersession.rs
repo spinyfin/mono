@@ -651,3 +651,113 @@ async fn stale_undispatched_revision_does_not_wedge_pending_attempt() {
     assert_eq!(fresh.status, "pending");
     assert!(fresh.revision_task_id.is_some());
 }
+
+fn mismatch_evidence() -> boss_protocol::ArchitecturalMismatchEvidence {
+    boss_protocol::ArchitecturalMismatchEvidence {
+        basis: boss_protocol::MismatchBasis::SubsystemDeleted,
+        conflicting_commits: "all six commits of the PR".into(),
+        main_changes: "the review-queue subsystem was deleted outright".into(),
+        attempted_port: "mapped every touched symbol onto main and found no queue to extend".into(),
+        contradiction: "Main deleted the review queue entirely, so the PR's new queue priority has nowhere to live."
+            .into(),
+        recommendation: "Rewrite the priority around the dispatcher.".into(),
+    }
+}
+
+/// Raise an architectural-mismatch question on `revision_id` and dismiss it.
+/// Leaves the revision `blocked: question_dismissed` with every execution
+/// terminal, which is the shape that used to look dead to the poller.
+fn raise_and_dismiss_mismatch(db: &WorkDb, attempt_id: &str, revision_id: &str) {
+    let execution_id = db
+        .list_executions(Some(revision_id))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("create_revision mints an execution")
+        .id;
+    db.start_execution_run(&execution_id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    db.record_conflict_architectural_mismatch(attempt_id, Some(&mismatch_evidence()))
+        .unwrap()
+        .expect("live attempt");
+    let payload = serde_json::to_string(&boss_protocol::RunDoneProposalPayload {
+        outcome: boss_protocol::RunDoneOutcome::Blocked,
+        summary: "Architectural mismatch".into(),
+        question: None,
+        queue_ci_evidence: None,
+    })
+    .unwrap();
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: revision_id,
+        kind: boss_protocol::ProposalKind::RunDone,
+        payload_json: &payload,
+        idempotency_key: "declare-blocked",
+    })
+    .unwrap()
+    .unwrap();
+    let question = db
+        .execution_operator_question(&execution_id)
+        .unwrap()
+        .expect("the engine asks on the worker's behalf");
+    db.record_worker_awaiting_operator_answer(&execution_id, "worker declared blocked", &question)
+        .unwrap()
+        .expect("live execution parks the revision");
+    db.dismiss_operator_question_from(revision_id, None, Some("not now"), "human", None)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dismissing_a_mismatch_question_does_not_supersede_the_attempt() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/48";
+    let (product, chore) = make_in_review(&db, "C-dismissed-mismatch", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    assert!(
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            None,
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await
+    );
+    let attempt = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("detection stamps a pending attempt");
+    let original_id = attempt.id.clone();
+    let revision_id = attempt.revision_task_id.clone().expect("detection stamps a revision");
+    raise_and_dismiss_mismatch(&db, &original_id, &revision_id);
+    assert!(
+        db.is_conflict_revision_running_or_queued(&revision_id).unwrap(),
+        "a dismissed mismatch hold keeps the revision as the live fix vehicle"
+    );
+
+    let again = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    assert!(
+        !again,
+        "the poller must leave the dismissed-mismatch attempt in place, not mint a replacement"
+    );
+
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 1, "no replacement attempt: {all:?}");
+    assert_eq!(all[0].id, original_id);
+    assert_eq!(all[0].status, "pending");
+    assert_eq!(all[0].revision_task_id.as_deref(), Some(revision_id.as_str()));
+    let revision = task(&db, &revision_id);
+    assert_eq!(revision.status, TaskStatus::Blocked);
+    assert_eq!(revision.blocked_reason.as_deref(), Some("question_dismissed"));
+}

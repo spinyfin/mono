@@ -273,6 +273,39 @@ fn unpark_keeps_an_open_operator_question() {
     );
 }
 
+#[test]
+fn unpark_keeps_a_dismissed_question_as_a_human_hold() {
+    let db = open();
+    let (_product, chore, execution) = make_waiting_human_chore(&db, "dismissed");
+    let question = OperatorQuestion {
+        text: "Change the timeout?".into(),
+        explanation: "The test needs a longer timeout.".into(),
+        answer_type: boss_protocol::OperatorAnswerType::YesNo,
+    };
+    crate::pr_flow::insert_question(&db.connect().unwrap(), &execution, "proposal", &question).unwrap();
+    db.record_worker_awaiting_operator_answer(&execution, "blocked", &question)
+        .unwrap();
+    db.dismiss_operator_question_from(&chore, None, Some("Neither option fits"), "human", None)
+        .unwrap();
+    assert_eq!(task(&db, &chore).blocked_reason.as_deref(), Some("question_dismissed"));
+    let executions_before = db.list_executions(Some(&chore)).unwrap().len();
+    park(&db, &chore);
+
+    let report = unpark(&db, &chore);
+
+    assert_eq!(report.rows[0].kept_hold, Some(KeptHold::QuestionDismissed));
+    assert!(report.rows[0].kept_hold.as_ref().unwrap().is_human_hold());
+    let row = task(&db, &chore);
+    assert_eq!(row.status, TaskStatus::Blocked);
+    assert_eq!(row.blocked_reason.as_deref(), Some("question_dismissed"));
+    let result = db.reconcile_item_execution(&chore).unwrap();
+    assert!(
+        result.created.is_empty() && result.updated.is_empty(),
+        "un-park must not mint work for a dismissed question: {result:?}"
+    );
+    assert_eq!(db.list_executions(Some(&chore)).unwrap().len(), executions_before);
+}
+
 // ── the report ─────────────────────────────────────────────────────────────
 
 #[test]

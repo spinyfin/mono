@@ -125,7 +125,11 @@ impl WorkDb {
     ///      a human, review or merge) means a worker may be writing to the PR
     ///      branch, so the revision is live whatever the task `status` says
     ///      (a `blocked` task can still own a running execution).
-    ///   3. For a `todo`/`active` task, a still-queued execution (queued,
+    ///   3. A `blocked` revision parked on an architectural-mismatch question
+    ///      — open, or dismissed without an answer — is still the attempt's
+    ///      live fix vehicle. Dismissal applies none of the answer's effects,
+    ///      so the poller must not supersede it or mint a competitor.
+    ///   4. For a `todo`/`active` task, a still-queued execution (queued,
     ///      ready, waiting on a dependency) is live too, as is a task that has
     ///      never been dispatched and was created within a short grace
     ///      window. A queued execution behind a `blocked` task is not: no
@@ -1609,7 +1613,9 @@ fn is_conflict_revision_running_or_queued_on(conn: &Connection, revision_task_id
     }
     // A revision parked on the architectural-mismatch question is waiting
     // for the repo owner, not dead: it stays the attempt's fix vehicle so
-    // the poller neither supersedes it nor mints a competitor.
+    // the poller neither supersedes it nor mints a competitor. Dismissing
+    // that question keeps the same hold — the owner closed it without
+    // answering, and only an explicit start resumes the revision.
     if status == "blocked"
         && super::conflict_mismatch::conflict_revision_awaits_mismatch_answer(conn, revision_task_id)?
     {

@@ -31,6 +31,8 @@ pub(crate) struct TaskDismissQuestionArgs {
     /// Dismiss only this question, which must belong to the item.
     #[arg(long)]
     pub question: Option<String>,
+    /// Optional reason recorded with the dismissal and shown as the item's
+    /// blocked detail and in `boss task show`.
     #[arg(long)]
     pub note: Option<String>,
 }

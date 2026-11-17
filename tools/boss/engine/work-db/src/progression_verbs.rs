@@ -157,6 +157,11 @@ pub enum ProgressionVerbRefusal {
     #[error("{item} is waiting on an open question to the owner; progression never restarts it or asks a second one")]
     AwaitingOperatorAnswer { item: String },
     #[error(
+        "{item}'s question was dismissed; only an explicit start or a status change resumes it, so progression never \
+         restarts it"
+    )]
+    QuestionDismissed { item: String },
+    #[error(
         "the owner refused the last attempt at {item}; a recorded refusal is a human decision, so `{verb}` is refused"
     )]
     OperatorRefusal { verb: String, item: String },
