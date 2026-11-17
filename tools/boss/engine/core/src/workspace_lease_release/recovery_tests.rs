@@ -1144,7 +1144,7 @@ async fn leftover_sweep_lists_cube_workspaces_once_per_pass() {
             Ok(Vec::new())
         }
     } }
-    let (_dir, db) = open_db();
+    let (dir, db) = open_db();
     let product = create_test_product(&db);
     for name in ["first", "second"] {
         let chore = create_test_chore(&db, product.id.clone(), name);
@@ -1168,9 +1168,13 @@ async fn leftover_sweep_lists_cube_workspaces_once_per_pass() {
             "settled",
         );
     }
+    let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
+    let positioned = orphaned_worker(&db, &repo).await;
+    kill_worker(&db, &positioned);
+    assert!(db.preservation_source(&positioned.id).unwrap().is_some());
     let cube = CountingCube(std::sync::atomic::AtomicUsize::new(0));
     let outcome =
         run_one_pass_with_occupancy(&db, &cube, &LiveWorkerStateRegistry::new(), || async { EmptyOccupancy }).await;
-    assert_eq!(outcome.released, 2, "{outcome:?}");
+    assert_eq!(outcome.released, 3, "{outcome:?}");
     assert_eq!(cube.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

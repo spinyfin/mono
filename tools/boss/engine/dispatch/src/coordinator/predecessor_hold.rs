@@ -16,6 +16,11 @@ pub(super) enum PredecessorHold {
     Failed(String),
 }
 
+pub(super) struct Recheck {
+    pub(super) completed: Option<std::time::Instant>,
+    at_bound: bool,
+}
+
 impl ExecutionCoordinator {
     /// Why `execution` must not dispatch yet because the run it recovers from
     /// has not given up its cube workspace lease, or `None` when nothing is
@@ -55,7 +60,11 @@ impl ExecutionCoordinator {
                     predecessor.id,
                     predecessor.cube_lease_id.as_deref().unwrap_or("(unrecorded)")
                 );
-                if !predecessor.status.is_terminal() {
+                if !predecessor.status.is_terminal()
+                    || self
+                        .live_worker_states()
+                        .is_some_and(|live| live.snapshot().iter().any(|state| state.run_id == predecessor.id))
+                {
                     return Some(PredecessorHold::Waiting(detail));
                 }
                 let now = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -87,6 +96,18 @@ impl ExecutionCoordinator {
                         .find(|item| item.status == "open" && item.kind == kind)
                 };
                 let fail = |evidence: String| {
+                    let evidence = match open_of_kind(
+                        boss_engine_storage_values::attention_kinds::LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
+                    ) {
+                        Some(unavailable) => format!(
+                            "Latest re-check could not run: {}. Last observed: {}",
+                            unavailable.body_markdown,
+                            open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND)
+                                .map(|item| item.body_markdown.as_str())
+                                .unwrap_or("no occupancy result recorded"),
+                        ),
+                        None => evidence,
+                    };
                     PredecessorHold::Failed(format!(
                         "Recovery cannot start: {detail} for more than {PREDECESSOR_HOLD_BOUND_SECS} seconds. {evidence}. Resolve the predecessor's workspace cleanup, then resume this execution. No workspace was reset."
                     ))
@@ -136,24 +157,75 @@ impl ExecutionCoordinator {
     /// workspace that has since emptied must be preserved and returned so
     /// the successor can start. An absent lease is reconciled without reading
     /// the new holder's workspace. Absent leases are cleared only after
-    /// owning-host preservation succeeds.
-    pub(super) async fn refresh_predecessor_lease(&self, execution: &WorkExecution) {
+    /// owning-host preservation succeeds. Returns true while a refresh is in flight;
+    /// callers must keep waiting, including at the bound, until it completes.
+    pub(super) fn refresh_predecessor_lease(self: &Arc<Self>, execution: &WorkExecution) -> bool {
         let Ok(Some(predecessor)) = self.work_db.recovery_predecessor_holding_lease(execution) else {
-            return;
+            return false;
         };
         if !predecessor.status.is_terminal() {
-            return;
+            return false;
         }
         let at_bound = matches!(self.predecessor_lease_hold(execution), Some(PredecessorHold::Failed(_)));
-        self.lifecycle
-            .refresh_predecessor_lease(
-                &predecessor,
-                self.live_worker_states(),
-                self.host_adapter_provider.as_ref(),
-                self.host_adapter(),
-                at_bound,
-            )
-            .await;
+        {
+            let mut attempts = self.predecessor_rechecks.lock().expect("predecessor recheck lock");
+            attempts.retain(|_, check| check.completed.is_none_or(|last| last.elapsed().as_secs() < 60));
+            if let Some(check) = attempts.get(&predecessor.id) {
+                if check.completed.is_none() {
+                    return true;
+                }
+                if !at_bound || check.at_bound {
+                    return false;
+                }
+            }
+            attempts.insert(
+                predecessor.id.clone(),
+                Recheck {
+                    completed: None,
+                    at_bound,
+                },
+            );
+        }
+        let coordinator = Arc::clone(self);
+        boss_task_scope::spawn(async move {
+            coordinator
+                .lifecycle
+                .refresh_predecessor_lease(
+                    &predecessor,
+                    coordinator.live_worker_states(),
+                    coordinator.host_adapter_provider.as_ref(),
+                    coordinator.host_adapter(),
+                    at_bound,
+                )
+                .await;
+            coordinator
+                .predecessor_rechecks
+                .lock()
+                .expect("predecessor recheck lock")
+                .insert(
+                    predecessor.id,
+                    Recheck {
+                        completed: Some(std::time::Instant::now()),
+                        at_bound,
+                    },
+                );
+            coordinator.predecessor_recheck_done.notify_waiters();
+            coordinator.kick();
+        });
+        true
+    }
+
+    /// Explicit dispatch can await its own predecessor without holding the drain.
+    pub(super) async fn await_predecessor_recheck(self: &Arc<Self>, execution: &WorkExecution) {
+        loop {
+            let notified = self.predecessor_recheck_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.refresh_predecessor_lease(execution) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Terminalize a row whose predecessor hold outlasted its bound. Never

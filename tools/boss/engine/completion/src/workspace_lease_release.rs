@@ -125,14 +125,16 @@ impl<'a> DbPreservation<'a> {
 #[async_trait::async_trait]
 impl Preservation for DbPreservation<'_> {
     async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()> {
-        self.preserve_workspace(execution, cause, None).await
+        self.preserve_workspace(execution, cause, None, None).await
     }
 }
 
 #[async_trait::async_trait]
 impl Preservation for CubePreservation<'_> {
     async fn preserve(&self, execution: &WorkExecution, cause: TerminalCause) -> Result<()> {
-        self.inner.preserve_workspace(execution, cause, Some(self.cube)).await
+        self.inner
+            .preserve_workspace(execution, cause, Some(self.cube), None)
+            .await
     }
 }
 
@@ -233,6 +235,7 @@ impl DbPreservation<'_> {
         execution: &WorkExecution,
         cause: TerminalCause,
         cube: Option<&dyn CubeClient>,
+        workspaces: Option<&[CubeWorkspaceStatus]>,
     ) -> Result<()> {
         // Read-only reviews never preserve or inherit implementation work.
         if execution.kind.never_writes_pr_branch() {
@@ -255,14 +258,24 @@ impl DbPreservation<'_> {
         let recorded = self.db.preserved_tip(&execution.id)?;
         let since_unix = execution.started_epoch().or_else(|| execution.created_epoch());
         let (tip_source, ownership) = if matches!(cause, TerminalCause::Inferred) {
-            workspace_tip_source(
-                execution,
-                self.db.workspace_lease_boundary(&execution.id)?,
-                self.db.workspace_lease_generation(&execution.id)?,
-                cube,
-                self.adapter,
-            )
-            .await?
+            match workspaces {
+                Some(rows) => workspace_tip_source_from_listing(
+                    execution,
+                    self.db.workspace_lease_boundary(&execution.id)?,
+                    self.db.workspace_lease_generation(&execution.id)?,
+                    rows,
+                ),
+                None => {
+                    workspace_tip_source(
+                        execution,
+                        self.db.workspace_lease_boundary(&execution.id)?,
+                        self.db.workspace_lease_generation(&execution.id)?,
+                        cube,
+                        self.adapter,
+                    )
+                    .await?
+                }
+            }
         } else {
             (WorkspaceTipSource::Live, String::new())
         };
@@ -572,7 +585,7 @@ pub async fn reconcile_absent_lease(
         }
     }
     if let Err(err) = DbPreservation::new(db, adapter)
-        .preserve_workspace(&current, TerminalCause::Inferred, cube)
+        .preserve_workspace(&current, TerminalCause::Inferred, cube, workspaces)
         .await
     {
         let reason = format!(
@@ -584,7 +597,7 @@ pub async fn reconcile_absent_lease(
             db,
             &current,
             LEASE_UNRELEASED_ATTENTION_KIND,
-            "Workspace recovery could not preserve unpublished work",
+            boss_engine_storage_values::attention_kinds::LEASE_PRESERVATION_FAILED_TITLE,
             &reason,
         );
         return Ok(LeaseReleaseOutcome::CubeFailed { error: reason });
@@ -775,14 +788,14 @@ fn occupancy_keep_attention(
 ) -> (&'static str, String) {
     match cleanup_detail {
         Some(detail) => (
-            "Workspace recovery needs process cleanup",
+            boss_engine_storage_values::attention_kinds::LEASE_PROCESS_CLEANUP_TITLE,
             format!(
                 "Lease {lease_id} remains held: {}. {detail}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected.",
                 reason.label()
             ),
         ),
         None => (
-            "Workspace recovery could not release its lease",
+            boss_engine_storage_values::attention_kinds::LEASE_RELEASE_UNCONFIRMED_TITLE,
             format!(
                 "Lease {lease_id} remains held: {}. Inspect the owning host's worker process cleanup log for PIDs and retry recovery after resolving the occupants or host connectivity.",
                 reason.label()
@@ -908,6 +921,35 @@ pub fn bound_unowned_occupants(db: &WorkDb, execution: &WorkExecution, result: R
     Ok(Occupancy::Empty)
 }
 
+/// Stop owned remote processes and report failures consistently across release paths.
+pub async fn remote_cleanup_occupancy(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    host: &dyn HostAdapter,
+) -> Occupancy {
+    match execution.workspace_path.as_deref() {
+        Some(path) => bound_unowned_occupants(
+            work_db,
+            execution,
+            host.cleanup_execution_processes(&execution.id, std::path::Path::new(path))
+                .await,
+        )
+        .unwrap_or_else(|err| {
+                refresh_attention(work_db, execution, LEASE_UNRELEASED_ATTENTION_KIND,
+                    boss_engine_storage_values::attention_kinds::LEASE_REMOTE_PROCESS_CLEANUP_TITLE, &format!("Lease {lease_id} on {}: {err:#}. Inspect the named processes or restore host connectivity, then retry recovery.", host.host_id()));
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    host_id = host.host_id(),
+                    error = %format!("{err:#}"),
+                    "remote lease release: workspace occupancy probe failed; keeping the lease",
+                );
+                Occupancy::Unknown
+            }),
+        _ => Occupancy::Unknown,
+    }
+}
+
 /// Release a remote worker's lease through the claimed release policy, for
 /// every path that releases on the strength of a recorded pid or a finished
 /// turn rather than a confirmed stop. The owning host first stops the
@@ -931,25 +973,10 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
     let Some(lease_id) = execution.cube_lease_id.clone() else {
         return LeaseReleaseOutcome::NoLease;
     };
-    let occupancy = match execution.workspace_path.as_deref() {
-        Some(path) if pane == PaneStatus::Gone => bound_unowned_occupants(
-            work_db,
-            &execution,
-            host.cleanup_execution_processes(execution_id, std::path::Path::new(path))
-                .await,
-        )
-        .unwrap_or_else(|err| {
-                refresh_attention(work_db, &execution, LEASE_UNRELEASED_ATTENTION_KIND,
-                    "Remote workspace recovery needs process cleanup", &format!("Lease {lease_id} on {}: {err:#}. Inspect the named processes or restore host connectivity, then retry recovery.", host.host_id()));
-                tracing::debug!(
-                    execution_id,
-                    host_id = host.host_id(),
-                    error = %format!("{err:#}"),
-                    "remote lease release: workspace occupancy probe failed; keeping the lease",
-                );
-                Occupancy::Unknown
-            }),
-        _ => Occupancy::Unknown,
+    let occupancy = if pane == PaneStatus::Gone {
+        remote_cleanup_occupancy(work_db, &execution, &lease_id, host).await
+    } else {
+        Occupancy::Unknown
     };
     apply_release(
         work_db,

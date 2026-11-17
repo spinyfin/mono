@@ -381,10 +381,10 @@ fn occupancy_keep_evidence(kind: &str, title: &str) -> bool {
         || (kind == LEASE_UNRELEASED_ATTENTION_KIND
             && matches!(
                 title,
-                "Workspace recovery needs process cleanup"
-                    | "Workspace recovery could not release its lease"
-                    | "Remote workspace recovery needs process cleanup"
-                    | "Workspace recovery could not preserve unpublished work"
+                boss_engine_storage_values::attention_kinds::LEASE_PROCESS_CLEANUP_TITLE
+                    | boss_engine_storage_values::attention_kinds::LEASE_RELEASE_UNCONFIRMED_TITLE
+                    | boss_engine_storage_values::attention_kinds::LEASE_REMOTE_PROCESS_CLEANUP_TITLE
+                    | boss_engine_storage_values::attention_kinds::LEASE_PRESERVATION_FAILED_TITLE
             ))
 }
 

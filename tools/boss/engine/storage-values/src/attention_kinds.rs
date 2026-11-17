@@ -300,6 +300,18 @@ pub const WORKER_BLOCKED_ATTENTION_KIND: &str = "worker_blocked";
 /// Attention kind filed when a lease is kept because a gate failed.
 pub const LEASE_UNRELEASED_ATTENTION_KIND: &str = "workspace_lease_unreleased";
 
+/// Legacy kept-lease title used as durable retry evidence.
+pub const LEASE_PROCESS_CLEANUP_TITLE: &str = "Workspace recovery needs process cleanup";
+
+/// Legacy kept-lease title used as durable retry evidence.
+pub const LEASE_RELEASE_UNCONFIRMED_TITLE: &str = "Workspace recovery could not release its lease";
+
+/// Legacy kept-lease title used as durable retry evidence.
+pub const LEASE_REMOTE_PROCESS_CLEANUP_TITLE: &str = "Remote workspace recovery needs process cleanup";
+
+/// Legacy kept-lease title used as durable retry evidence.
+pub const LEASE_PRESERVATION_FAILED_TITLE: &str = "Workspace recovery could not preserve unpublished work";
+
 /// Confirms that a release attempt passed the pane gate and was kept by occupancy.
 pub const LEASE_OCCUPANCY_KEPT_ATTENTION_KIND: &str = "workspace_lease_occupancy_kept";
 

@@ -65,6 +65,8 @@ impl ExecutionCoordinator {
             inflight_dispatches: InflightDispatches::new(),
             dispatch_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)),
             scheduling_active: AtomicBool::new(false),
+            predecessor_rechecks: Default::default(),
+            predecessor_recheck_done: Default::default(),
             scheduling_pending: AtomicBool::new(false),
             event_bus: Arc::new(EventBus::new()),
             enable_dispatch_ready_bus: false,
@@ -166,6 +168,25 @@ impl ExecutionCoordinator {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn drain_ready_queue_for_test(self: &Arc<Self>) -> DrainOutcome {
         self.drain_ready_queue().await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn wait_predecessor_rechecks_for_test(&self) {
+        loop {
+            let notified = self.predecessor_recheck_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .predecessor_rechecks
+                .lock()
+                .unwrap()
+                .values()
+                .all(|check| check.completed.is_some())
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
