@@ -3,9 +3,11 @@
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
 //! provisioning, per-kind permission rendering (`--settings`), PreToolUse
 //! authorization, and hook progress observation (conversation-id
-//! filtering for undisableable subagents). Interactive TUI spawn still
-//! refuses until the startup contract lands. Retention preserves
-//! transcript evidence in the per-run HOME.
+//! filtering for undisableable subagents). Interactive TUI spawn stays
+//! disabled (`launch_ready` false) until pane launch calls
+//! `verify_startup_authorization` and qualifies CLI hook discovery and
+//! review-mode failure behavior. Retention preserves transcript evidence
+//! in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -101,8 +103,10 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning, permission
 /// rendering, PreToolUse authorization, and hook progress observation are
-/// live; interactive TUI spawn still refuses until the startup contract
-/// lands. Retention preserves per-run transcript evidence.
+/// live; interactive TUI spawn stays disabled (`launch_ready` false) until
+/// pane launch calls `verify_startup_authorization` and qualifies CLI hook
+/// discovery and review-mode failure behavior. Retention preserves per-run
+/// transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -144,8 +148,10 @@ impl AgentDriver for AgyDriver {
         // ToolUseInterception is rewrite-or-deny: PreToolUse rewrites
         // arguments through `overwrite` on both measured binaries (hook
         // surface study, "PreToolUse can rewrite arguments"). Authorization
-        // is installed by `write_permission_config`; TUI spawn still refuses
-        // until the startup contract lands.
+        // is installed by `write_permission_config`; TUI spawn stays disabled
+        // (`launch_ready` false) until pane launch calls
+        // `verify_startup_authorization` and qualifies CLI hook discovery
+        // and review-mode failure behavior.
         CapabilitySet::new([
             Capability::Spawn,
             Capability::WorkspaceProvisioning,
@@ -181,7 +187,10 @@ impl AgentDriver for AgyDriver {
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Measured in `docs/investigations/ghostty-agy-pane-viability.md`
         // ("Proposed PaneMonitorSpec"). Needed here so provision can write
-        // the initial-prompt launcher config; TUI spawn still refuses.
+        // the initial-prompt launcher config; TUI spawn stays disabled
+        // (`launch_ready` false) until pane launch calls
+        // `verify_startup_authorization` and qualifies CLI hook discovery
+        // and review-mode failure behavior.
         Some(PaneMonitorSpec {
             agent_markers: vec![
                 "? for shortcuts".into(),

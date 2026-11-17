@@ -226,21 +226,9 @@ fn collect_guard_artifact_paths(config: &ToolUseInterceptionConfig) -> Vec<(Stri
     out
 }
 
-/// Install the adapter, policy, attestation, and PreToolUse authorization
-/// entry under the per-run home. Refuses to arm zero guards.
-pub fn install_authorization(
-    process_home: &Path,
-    worker_kind: WorkerKind,
-    obs: &ProgressObservationConfig,
-    interception: &ToolUseInterceptionConfig,
-) -> anyhow::Result<Vec<PathBuf>> {
-    if !process_home.exists() {
-        bail!(
-            "agy authorization install: process HOME {} does not exist; call provision_workspace first",
-            process_home.display()
-        );
-    }
-    super::home::validate_private_layout(process_home)?;
+/// Guard commands the execution requires: the shared Boss chain plus the
+/// adapter-only tool-surface and Reviewer/Triage publish guards.
+fn authorization_guards(worker_kind: WorkerKind, interception: &ToolUseInterceptionConfig) -> Vec<Guard> {
     let mut guards = guard_commands(interception);
     guards.push(Guard {
         command: format!(
@@ -262,9 +250,93 @@ pub fn install_authorization(
             run_once: false,
         });
     }
+    guards
+}
+
+fn guards_json(guards: &[Guard]) -> Vec<Value> {
+    guards
+        .iter()
+        .map(|guard| {
+            json!({
+                "command": guard.command,
+                "matcher": guard.matcher,
+                "timeout_sec": guard.timeout_sec.unwrap_or(30),
+                "run_once": guard.run_once,
+            })
+        })
+        .collect()
+}
+
+fn required_artifact_paths(
+    process_home: &Path,
+    obs: &ProgressObservationConfig,
+    interception: &ToolUseInterceptionConfig,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let obs = &private_forwarder_config(process_home, obs);
+    let mut artifacts = collect_guard_artifact_paths(interception);
+    artifacts.extend([
+        ("adapter".into(), adapter_path(process_home)),
+        ("policy".into(), policy_path(process_home)),
+        ("hooks".into(), hooks_file_path(process_home)),
+        ("settings".into(), session_settings_path_for_run(&obs.run_id)?),
+        ("forwarder".into(), obs.forwarder_binary.clone()),
+    ]);
+    Ok(artifacts)
+}
+
+/// Pure expected policy for this run: guard commands, matchers, timeouts, and
+/// required artifact paths. Install writes this document; startup verification
+/// compares the installed policy to it before probing.
+pub(super) fn expected_authorization_policy(
+    process_home: &Path,
+    worker_kind: WorkerKind,
+    obs: &ProgressObservationConfig,
+    interception: &ToolUseInterceptionConfig,
+) -> anyhow::Result<Value> {
+    let guards = authorization_guards(worker_kind, interception);
     if guards.is_empty() {
         bail!("AgyDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
     }
+    let obs = &private_forwarder_config(process_home, obs);
+    let artifacts = required_artifact_paths(process_home, obs, interception)?;
+    let required_artifacts: serde_json::Map<String, Value> = artifacts
+        .iter()
+        .map(|(name, path)| (name.clone(), json!(path)))
+        .collect();
+    Ok(json!({
+        "version": 1,
+        "authorization_command": authorization_command(process_home, obs),
+        "hook_timeout_sec": AUTHORIZATION_HOOK_TIMEOUT_SEC,
+        "required_artifacts": required_artifacts,
+        "run_id": obs.run_id,
+        "worker_kind": worker_kind_name(worker_kind),
+        "approval": approval_for(worker_kind),
+        "workspace_path": obs.workspace_path.display().to_string(),
+        "process_home": process_home.display().to_string(),
+        "protected_paths": protected_paths(process_home, interception),
+        "forwarder": obs.forwarder_binary.display().to_string(),
+        "attestation_path": attestation_path(process_home).display().to_string(),
+        "guards": guards_json(&guards),
+    }))
+}
+
+/// Install the adapter, policy, attestation, and PreToolUse authorization
+/// entry under the per-run home. Refuses to arm zero guards.
+pub fn install_authorization(
+    process_home: &Path,
+    worker_kind: WorkerKind,
+    obs: &ProgressObservationConfig,
+    interception: &ToolUseInterceptionConfig,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if !process_home.exists() {
+        bail!(
+            "agy authorization install: process HOME {} does not exist; call provision_workspace first",
+            process_home.display()
+        );
+    }
+    super::home::validate_private_layout(process_home)?;
+    let policy = expected_authorization_policy(process_home, worker_kind, obs, interception)?;
+    let artifacts = required_artifact_paths(process_home, obs, interception)?;
 
     let config_dir = gemini_config_dir(process_home);
     fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
@@ -280,40 +352,6 @@ pub fn install_authorization(
     let policy_file = policy_path(process_home);
     let attestation_file = attestation_path(process_home);
     let hooks_path = hooks_file_path(process_home);
-    let settings_path = session_settings_path_for_run(&obs.run_id)?;
-
-    let mut artifacts = collect_guard_artifact_paths(interception);
-    artifacts.extend([
-        ("adapter".into(), adapter.clone()),
-        ("policy".into(), policy_file.clone()),
-        ("hooks".into(), hooks_path.clone()),
-        ("settings".into(), settings_path),
-        ("forwarder".into(), obs.forwarder_binary.clone()),
-    ]);
-    let required_artifacts: serde_json::Map<String, Value> = artifacts
-        .iter()
-        .map(|(name, path)| (name.clone(), json!(path)))
-        .collect();
-    let policy = json!({
-        "version": 1,
-        "authorization_command": authorization_command(process_home, obs),
-        "hook_timeout_sec": AUTHORIZATION_HOOK_TIMEOUT_SEC,
-        "required_artifacts": required_artifacts,
-        "run_id": obs.run_id,
-        "worker_kind": worker_kind_name(worker_kind),
-        "approval": approval_for(worker_kind),
-        "workspace_path": obs.workspace_path.display().to_string(),
-        "process_home": process_home.display().to_string(),
-        "protected_paths": protected_paths(process_home, interception),
-        "forwarder": obs.forwarder_binary.display().to_string(),
-        "attestation_path": attestation_file.display().to_string(),
-        "guards": guards.iter().map(|guard| json!({
-            "command": guard.command,
-            "matcher": guard.matcher,
-            "timeout_sec": guard.timeout_sec.unwrap_or(30),
-            "run_once": guard.run_once,
-        })).collect::<Vec<_>>(),
-    });
     write_json_atomic(&policy_file, &policy)?;
     let mut hooks = forwarder_hooks_map(obs);
     hooks.insert("PreToolUse".into(), json!([pre_tool_use_entry(process_home, obs)]));
@@ -356,7 +394,9 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
     let body = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let attestation: AuthorizationAttestation =
         serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
-    let policy: Value = serde_json::from_slice(&fs::read(policy_path(process_home))?)?;
+    let policy: Value =
+        serde_json::from_slice(&fs::read(policy_path(process_home)).context("reading authorization policy")?)
+            .context("authorization policy is malformed")?;
     validate_configuration(process_home, &policy)?;
     let required = policy["required_artifacts"]
         .as_object()
@@ -396,7 +436,8 @@ pub fn verify_attestation(process_home: &Path) -> anyhow::Result<AuthorizationAt
         use std::os::unix::fs::PermissionsExt;
         for name in ["adapter", "forwarder"] {
             let path = required[name].as_str().context("executable path")?;
-            if fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
+            let meta = fs::metadata(path).with_context(|| format!("authorization binding: {name} missing: {path}"))?;
+            if meta.permissions().mode() & 0o111 == 0 {
                 bail!("authorization binding: {name} is not executable");
             }
         }
@@ -428,7 +469,9 @@ fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result
     let settings =
         fs::read_to_string(&settings_path).with_context(|| format!("reading {}", settings_path.display()))?;
     validate_session_settings(&settings, &workspace)?;
-    let hooks: Value = serde_json::from_slice(&fs::read(hooks_file_path(process_home))?)?;
+    let hooks: Value =
+        serde_json::from_slice(&fs::read(hooks_file_path(process_home)).context("reading authorization hooks")?)
+            .context("authorization hooks are malformed")?;
     let entry = &hooks["boss"]["PreToolUse"];
     let command = policy["authorization_command"]
         .as_str()

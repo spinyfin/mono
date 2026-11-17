@@ -38,6 +38,8 @@ impl Fixture {
         write_exec(&forwarder, "#!/bin/sh\ncat >/dev/null\n");
         let path_guard = tmp.path().join("boss-path-guard.py");
         write_exec(&path_guard, approve_guard());
+        write_exec(&tmp.path().join("boss-checkleft-push-guard.py"), approve_guard());
+        write_exec(&tmp.path().join("boss-git-store-guard.py"), approve_guard());
         Self {
             tmp,
             _guard: guard,
@@ -56,6 +58,52 @@ impl Fixture {
 
     fn path_guard(&self) -> PathBuf {
         self.tmp.path().join("boss-path-guard.py")
+    }
+
+    fn checkleft_guard(&self) -> PathBuf {
+        self.tmp.path().join("boss-checkleft-push-guard.py")
+    }
+
+    fn git_store_guard(&self) -> PathBuf {
+        self.tmp.path().join("boss-git-store-guard.py")
+    }
+
+    fn input(&self, kind: WorkerKind) -> crate::PermissionInput {
+        self.input_with(kind, |_| {})
+    }
+
+    fn input_with(
+        &self,
+        kind: WorkerKind,
+        overrides: impl FnOnce(&mut crate::PermissionInput),
+    ) -> crate::PermissionInput {
+        let mut input = crate::PermissionInput::builder()
+            .worker_kind(kind)
+            .workspace_path(self.workspace())
+            .events_socket_path(self.obs().events_socket_path)
+            .boss_event_path(self.forwarder())
+            .run_id(self.run_id.clone())
+            .lease_id("lease-1")
+            .execution_kind("task_implementation")
+            .is_remote(false)
+            .path_guard_script(self.path_guard())
+            .build();
+        overrides(&mut input);
+        input
+    }
+
+    fn complete_input(&self, kind: WorkerKind) -> crate::PermissionInput {
+        self.input_with(kind, |input| {
+            input.checkleft_guard_script = Some(self.checkleft_guard());
+            input.git_store_guard_script = Some(self.git_store_guard());
+        })
+    }
+
+    fn complete_install(&self, kind: WorkerKind) -> Vec<PathBuf> {
+        self.install_with(kind, |c| {
+            c.checkleft_guard_script = Some(self.checkleft_guard());
+            c.git_store_guard_script = Some(self.git_store_guard());
+        })
     }
 
     fn obs(&self) -> ProgressObservationConfig {

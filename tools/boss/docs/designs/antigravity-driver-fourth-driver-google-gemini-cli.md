@@ -294,7 +294,7 @@ Omitted, each with its reason:
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 22 entries (20 in-scope, 2 deferred); the pane, hook, credential, and permission studies are complete, with shared-HOME findings also incorporated. The engine submit-key entry was added by the pane study — a new fourth driver reaching across four investigations (pane viability, isolation, hooks, permissions), a breaking protocol+DB+Swift split migration, a new driver module with ten distinct trait seams (skeleton, home provisioning, retention, spawn, hook wiring, guard adapter, progress normaliser, turn boundary, permission rendering, transcript), a soft-deny detector, and a conformance extension; each is its own reviewable PR, and the count sits below the 30 tasks the comparable Grok integration actually shipped.
+Breakdown size: 23 entries (21 in-scope, 2 deferred); the pane, hook, credential, and permission studies are complete, with shared-HOME findings also incorporated. The engine submit-key entry was added by the pane study — a new fourth driver reaching across four investigations (pane viability, isolation, hooks, permissions), a breaking protocol+DB+Swift split migration, a new driver module with ten distinct trait seams (skeleton, home provisioning, retention, spawn, hook wiring, guard adapter, progress normaliser, turn boundary, permission rendering, transcript), a soft-deny detector, and a conformance extension; each is its own reviewable PR, and the count sits below the 30 tasks the comparable Grok integration actually shipped.
 
 Parallelism is noted per entry. The depth-0 pane spike and traffic-split migration may run concurrently.
 
@@ -385,14 +385,18 @@ Reclaim per-run `agy` homes on the same pattern as `grok_home_retention_sweep.rs
 Compose the interactive pane command as the existing initial-brief launcher running `agy` with `--model`, `--effort`, `--settings <file>` and the scoped-`HOME` env directives — **not** `agy -i` and no `--add-dir` (the launcher delivered a 50 KB brief in the study, Q1; `-i` runs behind the trust dialog). Supply the `PaneMonitorSpec` agent / busy / starting / prompt markers from the study's "Proposed `PaneMonitorSpec`" section, so the app's fallback status pill works before the first hook event arrives. Creates the Boss-owned control directory outside the repo for the initial prompt and session settings, and writes agent-rules to whichever outside-the-repo location provisioning settled. Confirm hook liveness and inspect settings logs before delivery; refuse input on blocking dialogs, including the launcher's first brief and spawn-confirmation retries (permission study, §§2, 8).
 
 - **Effort:** medium
-- **Dependencies:** Per-run `HOME` provisioning and credential delegation; Ghostty pane viability spike for `agy`; permission config rendering; global-root hook wiring and guard adapter; verified pre-prompt startup contract. These enforcement prerequisites must land before pane launch.
+- **Dependencies:** Per-run `HOME` provisioning and credential delegation; Ghostty pane viability spike for `agy`; Permission config rendering per worker kind; Global-root hook wiring: `boss-event` progress forwarder; Hook payload adapter and `PreToolUse` guards; Pre-prompt authorization verification. These enforcement prerequisites must land before pane launch.
 - Scope: in-scope
 
 ### Pre-prompt authorization verification
 
-The pane launcher must call `agy::verify_startup_authorization` after permission installation and immediately before launch, supplying the expected observation configuration and worker kind. The check validates private-home posture, content-bound artifacts, expected run/kind identity, and the exact six-event wiring (including lease and socket). It then reuses the installed adapter's harmless positive, structural-deny, and reused-guard-deny probes and rechecks the binding afterward. The forwarder probe uses a private sink rather than publishing synthetic worker activity. No cached result, loaded-hook count, or native `SessionStart` is readiness proof: `SessionStart` only fires when the first prompt begins.
+The pane launcher must call `agy::verify_startup_authorization` after permission installation and immediately before launch, supplying the same `PermissionInput` used to arm the run. The check renders the expected guard commands, matchers, timeouts, required artifact paths, and revision flag through the same pure policy renderer install uses, and refuses a self-consistent install that omitted a required guard or armed the wrong revision flag. It also compares session settings to the per-kind render, then validates private-home posture, content-bound artifacts, expected run/kind identity, and the exact six-event wiring (including lease and socket). It then reuses the installed adapter's harmless positive, structural-deny, and reused-guard-deny probes and rechecks the binding afterward. The forwarder probe uses a private sink rather than publishing synthetic worker activity. No cached result, loaded-hook count, or native `SessionStart` is readiness proof: `SessionStart` only fires when the first prompt begins.
 
 This is the host-side enforcement prerequisite, not proof that the CLI discovered the hooks. `launch_ready` remains false. Pane launch must qualify CLI discovery and review-mode failure behavior and inspect the initialized settings log before delivering any brief; it must not wait for native `SessionStart` to send that first brief.
+
+- **Effort:** medium
+- **Dependencies:** Permission config rendering per worker kind; Global-root hook wiring: `boss-event` progress forwarder; Hook payload adapter and `PreToolUse` guards
+- Scope: in-scope
 
 ### Global-root hook wiring: `boss-event` progress forwarder
 
