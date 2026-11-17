@@ -50,6 +50,7 @@ boss-protocol = { path = "../../protocol" }
 boss-review-guide = { path = "../review-guide" }
 boss-task-scope = { path = "../task-scope" }
 boss-transcript-markdown = { path = "../transcript-markdown" }
+boss-transcript-tail = { path = "../transcript-tail" }
 boss-work-db = { path = "../work-db" }
 chrono = { workspace = true }
 git-utils = { path = "../../../../lib/rust/git_utils" }

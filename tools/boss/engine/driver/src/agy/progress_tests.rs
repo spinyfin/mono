@@ -7,6 +7,9 @@ use serde_json::json;
 
 use crate::AgentDriver;
 
+#[path = "refused_tool_tests.rs"]
+mod refused_tool_tests;
+
 struct MemoryIdentityStore {
     inner: Mutex<HashMap<String, String>>,
     fail_read: std::sync::atomic::AtomicBool,

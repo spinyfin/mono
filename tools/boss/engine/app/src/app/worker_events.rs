@@ -199,6 +199,15 @@ pub(super) async fn dispatch_worker_event_fanout(
     server_state: &Arc<ServerState>,
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
 ) {
+    dispatch_codex_unobserved_command_on_notification(server_state, incoming);
+    dispatch_staged_worker_event_fanout(server_state, incoming).await;
+}
+
+/// Fan out an event whose marker was staged while its hook decode turn was held.
+pub(super) async fn dispatch_staged_worker_event_fanout(
+    server_state: &Arc<ServerState>,
+    incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
+) {
     // Audit *before* the live-state fan-out
     // so an engine-side mismatch in the
     // dispatch path can't drop the audit line
@@ -213,11 +222,6 @@ pub(super) async fn dispatch_worker_event_fanout(
     );
     boss_engine_runtime::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
     dispatch_live_worker_state(server_state, incoming).await;
-    // Codex unobserved-command detection: stage any abandoned-command
-    // Notification the progress session emitted ahead of its Stop, so
-    // `on_stop`'s no-changes-needed gate (dispatched later in this same
-    // fan-out chain, on the following Stop event) sees it.
-    dispatch_codex_unobserved_command_on_notification(server_state, incoming);
     // Codex guard-trace observation: record whether this turn's PreToolUse
     // guards ran and what they decided — and, when tool calls ran with no
     // guard invocation at all, that Boss's command guardrails were not
@@ -417,20 +421,20 @@ pub(super) fn record_turn_boundary_on_stop(
     }
 }
 
-/// Stage a Codex "unobserved command" signal: a `command_execution` whose
-/// start record was observed but never completed before its turn boundary.
-/// The progress session in `boss_engine_driver::codex` detects the gap
-/// structurally (it already correlates start/complete pairs to emit
-/// `PreToolUse`/`PostToolUse`) and surfaces it as a `WorkerEvent::Notification`
-/// carrying [`boss_engine_driver::codex::UNOBSERVED_COMMAND_MARKER`], ordered
-/// ahead of the `Stop` it precedes in the same normalised batch. Staging it
-/// here — mirroring the `boss propose` failure capture in
-/// `proposal_channel_error` — lets `WorkerCompletionHandler::on_stop` see it
-/// by the time that later `Stop` event's own dispatch call reaches
-/// `dispatch_completion_on_stop`.
+/// Stage an unobserved-tool signal: a Codex `command_execution` whose start
+/// record was observed but never completed before its turn boundary, or an
+/// Antigravity parent `PreToolUse` with no matching `PostToolUse` at idle Stop.
+/// Progress sessions detect the gap structurally (they already correlate
+/// start/complete pairs to emit `PreToolUse`/`PostToolUse`) and surface it as
+/// a `WorkerEvent::Notification` carrying
+/// [`boss_engine_driver::codex::UNOBSERVED_COMMAND_MARKER`], ordered ahead of
+/// the `Stop` it precedes in the same normalised batch. Staging it here —
+/// mirroring the `boss propose` failure capture in `proposal_channel_error` —
+/// lets `WorkerCompletionHandler::on_stop` see it by the time that later
+/// `Stop` event's own dispatch call reaches `dispatch_completion_on_stop`.
 ///
 /// A no-op for every event that isn't a matching `Notification` — in
-/// particular, every hook-shaped event Claude and every other driver emits.
+/// particular, native hooks without an internal marker.
 pub(super) fn dispatch_codex_unobserved_command_on_notification(
     server_state: &Arc<ServerState>,
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
@@ -451,8 +455,7 @@ pub(super) fn dispatch_codex_unobserved_command_on_notification(
             tracing::warn!(
                 execution_id = run_id,
                 command = command.trim(),
-                "codex_unobserved_command: staged an abandoned command_execution (item.started with no \
-                 item.completed observed before the turn boundary)",
+                "unobserved_command: staged a tool call without matching completion before the turn boundary",
             );
         }
         RecordOutcome::Duplicate => {}

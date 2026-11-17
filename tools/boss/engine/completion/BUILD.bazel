@@ -29,6 +29,7 @@ COMPLETION_DEPS = [
     "//tools/boss/engine/structured-output",
     "//tools/boss/engine/task-scope",
     "//tools/boss/engine/transcript-markdown:transcript_markdown",
+    "//tools/boss/engine/transcript-tail",
     "//tools/boss/engine/utils",
     "//tools/boss/engine/work-db",
     "//tools/boss/engine/worker-bin",

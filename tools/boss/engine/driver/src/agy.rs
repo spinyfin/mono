@@ -34,8 +34,10 @@ mod environment;
 mod home;
 mod hooks;
 mod model_menu;
+mod pending_tools;
 pub mod permissions;
 mod progress;
+pub use pending_tools::REFUSED_TOOL_PREFIX;
 #[cfg(test)]
 mod test_environment;
 mod transcript;
@@ -432,6 +434,7 @@ impl AgentDriver for AgyDriver {
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
+        // The progress session emits Stop only for the claimed parent's idle boundary.
         turn_boundary::turn_boundary(event)
     }
 
@@ -457,6 +460,10 @@ impl AgentDriver for AgyDriver {
                 .join("unknown-run")
                 .join("rules-root/.agents/rules/boss.md")
         })
+    }
+
+    fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        Ok(Some(process_home_for_run(run_id)?))
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
@@ -570,6 +577,10 @@ mod tests {
         assert_eq!(d.config_dir, ".agy");
         assert_eq!(d.agent_rules_filename, "AGENTS.md");
         assert_eq!(d.initial_prompt_filename, "initial-prompt.txt");
+        assert_eq!(
+            driver.transcript_containment_root("exec_contain").unwrap().as_deref(),
+            Some(process_home_for_run("exec_contain").unwrap().as_path())
+        );
         assert!(driver.settings_log_check().is_some());
         assert_eq!(d.model_menu.engine_default, model_menu::STANDARD_FAMILY);
         assert_eq!(

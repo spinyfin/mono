@@ -58,8 +58,9 @@ impl WorkerCompletionHandler {
     /// Returns `true` when
     /// the declaration is refused.
     ///
-    /// Refuses when (a) a Codex command went unobserved since the gate last
-    /// fired ([`crate::codex_unobserved_command::UnobservedCommandTracker::consume_unresolved`]),
+    /// Refuses when (a) an unobserved tool is staged
+    /// ([`crate::codex_unobserved_command::UnobservedCommandTracker::consume_unresolved`]:
+    /// Codex is read-and-clear; Antigravity latches for the rest of the run),
     /// or (b) for a revision, an observed contribution contradicts the claim
     /// (or the lookup failed, so the claim is unverifiable). Uses local DB
     /// reads and writes plus in-memory state, with no network I/O. This is
@@ -70,7 +71,7 @@ impl WorkerCompletionHandler {
     /// without the worker declaring again.
     pub(super) fn refuse_no_op_declaration(&self, execution: &crate::work::WorkExecution) -> bool {
         let reason = if self.staged_unobserved_commands.consume_unresolved(&execution.id) {
-            "this run left a Codex command unobserved since the gate last checked"
+            "this run has unconfirmed tool execution evidence"
         } else if execution.kind != ExecutionKind::RevisionImplementation {
             return false;
         } else {

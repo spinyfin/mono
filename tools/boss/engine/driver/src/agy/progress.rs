@@ -202,6 +202,7 @@ pub(super) struct AgyProgressSession {
     claimed_id: Option<String>,
     store_unavailable: bool,
     from_subagent: bool,
+    pending_tools: super::pending_tools::PendingTools,
 }
 
 impl AgyProgressSession {
@@ -219,6 +220,7 @@ impl AgyProgressSession {
             claimed_id,
             store_unavailable,
             from_subagent: false,
+            pending_tools: Default::default(),
         }
     }
 
@@ -366,16 +368,23 @@ impl ProgressSessionNormalizer for AgyProgressSession {
 
     fn normalize_progress_event(&mut self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
         self.normalize_progress_events(raw)?
-            .into_iter()
-            .next()
+            .pop()
             .ok_or_else(|| NormalizeError::UnknownEvent("agy_filtered_progress".into()))
     }
 
     fn normalize_progress_events(&mut self, raw: &Value) -> Result<Vec<WorkerEvent>, NormalizeError> {
-        match self.decode(raw)? {
-            Some(event) => Ok(vec![event]),
-            None => Ok(vec![]),
-        }
+        let Some(event) = self.decode(raw)? else {
+            return Ok(vec![]);
+        };
+        self.pending_tools.observe(raw, &event, self.claimed_id.as_deref());
+        let mut events = match &event {
+            WorkerEvent::Stop { session_id, .. } if raw.get("fullyIdle").and_then(Value::as_bool) == Some(true) => {
+                self.pending_tools.drain(session_id)
+            }
+            _ => Vec::new(),
+        };
+        events.push(event);
+        Ok(events)
     }
 
     fn transcript_path_for_session(&mut self, _raw: &Value) -> Option<String> {
@@ -387,10 +396,14 @@ impl ProgressSessionNormalizer for AgyProgressSession {
     fn resume_state(&self) -> Option<Value> {
         self.claimed_id
             .as_ref()
-            .map(|id| json!({ "claimed_conversation_id": id }))
+            .map(|id| json!({ "claimed_conversation_id": id, "pending_tools": self.pending_tools }))
     }
 
     fn restore_resume_state(&mut self, state: &Value) -> Result<(), String> {
+        self.pending_tools = match state.get("pending_tools") {
+            Some(value) => serde_json::from_value(value.clone()).map_err(|err| err.to_string())?,
+            None => Default::default(),
+        };
         match state.get("claimed_conversation_id") {
             Some(Value::String(id)) if !id.is_empty() => {
                 self.claimed_id = Some(id.clone());

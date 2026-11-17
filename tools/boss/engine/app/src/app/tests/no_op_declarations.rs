@@ -1,5 +1,405 @@
 use super::*;
 
+#[tokio::test]
+async fn agy_refused_tools_reject_repeated_no_ops_and_file_bounded_audit_with_overflow() {
+    use boss_engine_completion::codex_unobserved_command::{
+        MAX_COMMANDS_PER_EXECUTION, UNOBSERVED_COMMAND_ATTENTION_KIND, UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND,
+    };
+    use boss_engine_driver::{AgentDriver, ProgressSessionConfig};
+    let (state, _dir, execution_id, _) = live_chore_execution();
+    let driver = boss_engine_driver::agy::AgyDriver::default();
+    let mut session = driver.progress_session(&ProgressSessionConfig::default()).unwrap();
+    session
+        .normalize_progress_events(&json!({"hookEventName": "SessionStart", "conversationId": "parent"}))
+        .unwrap();
+    for id in 0..=MAX_COMMANDS_PER_EXECUTION {
+        session
+            .normalize_progress_events(&json!({
+                "hookEventName": "PreToolUse", "conversationId": "parent",
+                "toolCall": {"id": format!("call-{id}"), "name": "run_command", "args": {}}
+            }))
+            .unwrap();
+    }
+    for turn in 0..2 {
+        submitted(
+            call_with_peer(
+                &state,
+                Some(std::process::id() as libc::pid_t),
+                submit_request(
+                    &execution_id,
+                    ProposalKind::RunDone,
+                    json!({"outcome": "no_changes_needed", "summary": format!("No changes, turn {turn}")}),
+                ),
+            )
+            .await,
+        );
+        let events = session
+            .normalize_progress_events(&json!({
+                "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true, "error": ""
+            }))
+            .unwrap();
+        for event in events {
+            let incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+                &driver,
+                event,
+                Some(execution_id.clone()),
+                None,
+                None,
+            );
+            crate::app::worker_events::dispatch_codex_unobserved_command_on_notification(&state, &incoming);
+            if let Some(boundary) = incoming.turn_boundary() {
+                let expected = if turn == 0 {
+                    boss_engine_completion::StopOutcome::AwaitingInput
+                } else {
+                    boss_engine_completion::StopOutcome::NudgeDebounced
+                };
+                assert_eq!(
+                    state
+                        .completion_handler
+                        .on_stop_with_turn_end(&execution_id, Some(boundary))
+                        .await,
+                    expected
+                );
+            }
+        }
+        assert!(state.work_db.get_execution(&execution_id).unwrap().status.is_live());
+        assert_eq!(state.work_db.execution_run_done_outcome(&execution_id).unwrap(), None);
+        let items = state.work_db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == UNOBSERVED_COMMAND_ATTENTION_KIND)
+                .count(),
+            MAX_COMMANDS_PER_EXECUTION
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND)
+                .count(),
+            1
+        );
+        assert!(
+            items
+                .iter()
+                .filter(|item| item.kind == UNOBSERVED_COMMAND_ATTENTION_KIND)
+                .all(|item| item.body_markdown.contains("rest of this run"))
+        );
+    }
+}
+
+fn stage_agy_events(
+    state: &Arc<ServerState>,
+    execution_id: &str,
+    events: impl IntoIterator<Item = boss_protocol::WorkerEvent>,
+) {
+    let driver = boss_engine_driver::agy::AgyDriver::default();
+    for event in events {
+        let incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+            &driver,
+            event,
+            Some(execution_id.to_owned()),
+            state.work_db.transcript_path_for_execution(execution_id).unwrap(),
+            None,
+        );
+        crate::app::worker_events::dispatch_codex_unobserved_command_on_notification(state, &incoming);
+    }
+}
+
+fn assert_pending_without_latch(
+    state: &Arc<ServerState>,
+    execution_id: &str,
+    session: &dyn boss_engine_driver::ProgressSessionNormalizer,
+) {
+    let snapshot = session.resume_state().unwrap();
+    assert!(snapshot["pending_tools"]["calls"].get("call_1").is_some());
+    assert!(state.staged_unobserved_commands.list(execution_id).is_empty());
+    assert!(!state.staged_unobserved_commands.consume_unresolved(execution_id));
+}
+
+async fn no_stop_fixture(next: Option<serde_json::Value>) {
+    use boss_engine_driver::{AgentDriver, ProgressSessionConfig};
+    let (state, _dir, execution_id, _) = live_chore_execution();
+    let driver = boss_engine_driver::agy::AgyDriver::default();
+    let mut session = driver.progress_session(&ProgressSessionConfig::default()).unwrap();
+    session
+        .normalize_progress_events(&json!({"hookEventName": "SessionStart", "conversationId": "parent"}))
+        .unwrap();
+    let pre = session
+        .normalize_progress_events(&json!({
+            "hookEventName": "PreToolUse", "conversationId": "parent",
+            "toolCall": {"id": "call_1", "name": "run_command", "args": {}}
+        }))
+        .unwrap();
+    assert!(matches!(
+        pre.as_slice(),
+        [boss_protocol::WorkerEvent::PreToolUse { .. }]
+    ));
+    stage_agy_events(&state, &execution_id, pre);
+    assert_pending_without_latch(&state, &execution_id, session.as_ref());
+    if let Some(raw) = next {
+        let events = session.normalize_progress_events(&raw).unwrap();
+        assert!(events.is_empty());
+        stage_agy_events(&state, &execution_id, events);
+        assert_pending_without_latch(&state, &execution_id, session.as_ref());
+    }
+}
+
+#[tokio::test]
+async fn headless_denial_without_stop_stages_nothing() {
+    no_stop_fixture(Some(
+        json!({"hookEventName": "PostInvocation", "conversationId": "parent"}),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn approval_dialog_with_no_further_hook_stages_nothing() {
+    no_stop_fixture(None).await;
+}
+
+#[tokio::test]
+async fn no_stop_boundaries_do_not_stage_or_latch_until_idle_stop() {
+    use boss_engine_driver::{AgentDriver, ProgressSessionConfig};
+    let (state, _dir, execution_id, _) = live_chore_execution();
+    let driver = boss_engine_driver::agy::AgyDriver::default();
+    let mut session = driver.progress_session(&ProgressSessionConfig::default()).unwrap();
+    session
+        .normalize_progress_events(&json!({"hookEventName": "SessionStart", "conversationId": "parent"}))
+        .unwrap();
+    let pre = session
+        .normalize_progress_events(&json!({
+            "hookEventName": "PreToolUse", "conversationId": "parent",
+            "toolCall": {"id": "call_1", "name": "run_command", "args": {}}
+        }))
+        .unwrap();
+    assert!(matches!(
+        pre.as_slice(),
+        [boss_protocol::WorkerEvent::PreToolUse { .. }]
+    ));
+    stage_agy_events(&state, &execution_id, pre);
+    assert_pending_without_latch(&state, &execution_id, session.as_ref());
+    for raw in [
+        json!({"hookEventName": "PostInvocation", "conversationId": "parent"}),
+        json!({"hookEventName": "Stop", "conversationId": "parent", "fullyIdle": false}),
+    ] {
+        let events = session.normalize_progress_events(&raw).unwrap();
+        assert!(events.is_empty());
+        stage_agy_events(&state, &execution_id, events);
+        assert_pending_without_latch(&state, &execution_id, session.as_ref());
+    }
+    let events = session
+        .normalize_progress_events(&json!({
+            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true
+        }))
+        .unwrap();
+    assert!(matches!(
+        events.first(),
+        Some(boss_protocol::WorkerEvent::Notification { .. })
+    ));
+    stage_agy_events(&state, &execution_id, events);
+    assert!(!state.staged_unobserved_commands.list(&execution_id).is_empty());
+    assert!(state.staged_unobserved_commands.consume_unresolved(&execution_id));
+}
+
+#[tokio::test]
+async fn completed_but_failed_empty_error_does_not_latch_or_refuse_no_op() {
+    use boss_engine_driver::{AgentDriver, ProgressSessionConfig};
+    let (state, _dir, execution_id, _) = live_chore_execution();
+    let product_id = match state
+        .work_db
+        .get_work_item(&state.work_db.get_execution(&execution_id).unwrap().work_item_id)
+        .unwrap()
+    {
+        boss_work_db::WorkItem::Task(task) | boss_work_db::WorkItem::Chore(task) => task.product_id,
+        other => panic!("expected chore: {other:?}"),
+    };
+    state
+        .work_db
+        .update_work_item(
+            &product_id,
+            boss_protocol::WorkItemPatch {
+                default_driver: Some("agy".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let driver = boss_engine_driver::agy::AgyDriver::default();
+    let home = driver.transcript_containment_root(&execution_id).unwrap().unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let transcript = home.join("completed-failure.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"status\":\"DONE\",\"content\":\"exit 7\",\"exitCode\":7}\n",
+    )
+    .unwrap();
+    state
+        .work_db
+        .set_run_transcript_path_if_unset(&execution_id, transcript.to_str().unwrap())
+        .unwrap();
+    let mut session = driver.progress_session(&ProgressSessionConfig::default()).unwrap();
+    session
+        .normalize_progress_events(&json!({"hookEventName": "SessionStart", "conversationId": "parent"}))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "hookEventName": "PreToolUse", "conversationId": "parent",
+            "toolCall": {"id": "call_1", "name": "run_command", "args": {}}
+        }))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "hookEventName": "PostToolUse", "conversationId": "parent", "error": "",
+            "toolCall": {"id": "call_1", "name": "run_command", "args": {}}
+        }))
+        .unwrap();
+    let events = session
+        .normalize_progress_events(&json!({
+            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true
+        }))
+        .unwrap();
+    assert!(matches!(events.as_slice(), [boss_protocol::WorkerEvent::Stop { .. }]));
+    stage_agy_events(&state, &execution_id, events);
+    assert!(state.staged_unobserved_commands.list(&execution_id).is_empty());
+    assert!(!state.staged_unobserved_commands.consume_unresolved(&execution_id));
+
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "no_changes_needed", "summary": "Command failed but completed"}),
+            ),
+        )
+        .await,
+    );
+    assert!(matches!(
+        state.completion_handler.on_stop(&execution_id).await,
+        boss_engine_completion::StopOutcome::NoChangesNeeded { .. }
+    ));
+    assert!(state.work_db.list_attention_items(&execution_id).unwrap().is_empty());
+    assert!(state.staged_unobserved_commands.list(&execution_id).is_empty());
+    assert!(!state.staged_unobserved_commands.consume_unresolved(&execution_id));
+}
+
+#[tokio::test]
+async fn following_idle_stop_waits_for_refused_tool_staging_before_no_op() {
+    use boss_engine_runtime::events_socket::{HookDecodeQueue, IncomingHookEvent, bind_events_socket};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    let (state, dir, execution_id, work_item_id) = live_chore_execution();
+    let product_id = match state.work_db.get_work_item(&work_item_id).unwrap() {
+        boss_work_db::WorkItem::Task(task) | boss_work_db::WorkItem::Chore(task) => task.product_id,
+        other => panic!("expected a chore, got {other:?}"),
+    };
+    state
+        .work_db
+        .update_work_item(
+            &product_id,
+            boss_protocol::WorkItemPatch {
+                default_driver: Some("agy".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let registry = std::sync::Arc::new(boss_engine_driver::DriverRegistry::default());
+    let sock = dir.path().join("events.sock");
+    let listener = bind_events_socket(&sock).unwrap();
+    let mut queue = HookDecodeQueue::default();
+    let db = state.work_db.clone();
+
+    async fn send(
+        listener: &tokio::net::UnixListener,
+        path: &std::path::Path,
+        mut payload: serde_json::Value,
+        run_id: &str,
+    ) -> tokio::net::UnixStream {
+        payload["_boss_run_id"] = serde_json::json!(run_id);
+        let mut client = UnixStream::connect(path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        client.write_all(payload.to_string().as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        stream
+    }
+
+    for payload in [
+        json!({"hookEventName": "SessionStart", "conversationId": "parent"}),
+        json!({"hookEventName": "PreToolUse", "conversationId": "parent",
+            "toolCall": {"id": "call", "name": "run_command", "args": {}}}),
+    ] {
+        let stream = send(&listener, &sock, payload, &execution_id).await;
+        queue.reserve().handle(stream, &registry, &db).await.unwrap();
+    }
+
+    let stream = send(
+        &listener,
+        &sock,
+        json!({"hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true}),
+        &execution_id,
+    )
+    .await;
+    let mut first_turn = queue.reserve();
+    let first = first_turn
+        .handle(stream, &registry, &db)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_ordered_events();
+    assert_eq!(first.len(), 2);
+
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "no_changes_needed", "summary": "Nothing to do"}),
+            ),
+        )
+        .await,
+    );
+
+    let stream = send(
+        &listener,
+        &sock,
+        json!({
+            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true,
+            "_boss_delivery_id": "second-idle-stop"
+        }),
+        &execution_id,
+    )
+    .await;
+    let mut second_turn = queue.reserve();
+    let second_db = db.clone();
+    let second_registry = registry.clone();
+    let second_task = tokio::spawn(async move { second_turn.handle(stream, &second_registry, &second_db).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!second_task.is_finished());
+
+    for event in &first {
+        crate::app::worker_events::dispatch_codex_unobserved_command_on_notification(&state, event);
+    }
+    drop(first_turn);
+
+    let second = second_task.await.unwrap().unwrap().unwrap();
+    assert!(matches!(second.event, boss_protocol::WorkerEvent::Stop { .. }));
+    let driver = boss_engine_driver::agy::AgyDriver::default();
+    let boundary = IncomingHookEvent::resolve(&driver, second.event, Some(execution_id.clone()), None, None);
+    assert_eq!(
+        state
+            .completion_handler
+            .on_stop_with_turn_end(&execution_id, boundary.turn_boundary())
+            .await,
+        boss_engine_completion::StopOutcome::AwaitingInput
+    );
+    assert_eq!(state.work_db.execution_run_done_outcome(&execution_id).unwrap(), None);
+}
+
 /// A declaration remains live until the driver makes command evidence authoritative.
 #[tokio::test]
 async fn accepted_run_done_no_changes_needed_waits_for_stop() {
@@ -301,5 +701,44 @@ async fn terminal_write_requires_the_exact_current_no_op_proposal() {
             .record_declared_worker_no_op_completion(&execution_id, &current.id, None, "replayed declaration", None)
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn hook_accept_overflow_is_counted_once_and_does_not_rearm_after_staging() {
+    use boss_engine_completion::codex_unobserved_command::MAX_COMMANDS_PER_EXECUTION;
+    use boss_engine_runtime::events_socket::{HookDecodeQueue, IncomingHookEvent};
+    let (state, _dir, execution_id, _) = live_chore_execution();
+    for id in 0..MAX_COMMANDS_PER_EXECUTION {
+        state
+            .staged_unobserved_commands
+            .record(&execution_id, &format!("command-{id}"));
+    }
+    let incoming = IncomingHookEvent::resolve(
+        &boss_engine_driver::CodexDriver::default(),
+        boss_protocol::WorkerEvent::Notification {
+            session_id: "parent".into(),
+            message: format!(
+                "{}over-cap command",
+                boss_engine_driver::codex::UNOBSERVED_COMMAND_MARKER
+            ),
+        },
+        Some(execution_id.clone()),
+        None,
+        None,
+    );
+    let mut queue = HookDecodeQueue::default();
+    super::super::events_accept::dispatch_hook_events(&state, incoming.clone(), queue.reserve()).await;
+    assert_eq!(
+        state.metrics.counter_value("codex.unobserved_command_overflow"),
+        Some(1)
+    );
+    assert!(state.staged_unobserved_commands.consume_unresolved(&execution_id));
+    // Model a Stop consuming Codex's flag between staging and native fanout.
+    super::super::worker_events::dispatch_staged_worker_event_fanout(&state, &incoming).await;
+    assert!(!state.staged_unobserved_commands.consume_unresolved(&execution_id));
+    assert_eq!(
+        state.metrics.counter_value("codex.unobserved_command_overflow"),
+        Some(1)
     );
 }

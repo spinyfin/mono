@@ -674,18 +674,24 @@ impl WorkerCompletionHandler {
         }
     }
 
-    /// File an attention item for every abandoned Codex command staged for
-    /// `execution` — a `command_execution` whose `item.started` (stdout) /
+    /// File an attention item for every unobserved tool staged for
+    /// `execution` — a Codex `command_execution` whose `item.started` (stdout) /
     /// `function_call` (rollout) was observed with no matching completion
-    /// before a turn boundary. See [`crate::codex_unobserved_command`].
+    /// before a turn boundary, or an Antigravity parent `PreToolUse` with no
+    /// matching `PostToolUse` at the claimed parent's idle Stop. See
+    /// [`crate::codex_unobserved_command`].
     ///
     /// Content-keyed dedup on the command text, mirroring
     /// [`Self::file_worker_signal_attention`]: `staged_unobserved_commands`
     /// never clears, so this runs safely on every terminal Stop of the same
-    /// execution without re-filing a command already surfaced.
+    /// execution without re-filing a command already surfaced. Transcript
+    /// corroboration is read only for the first not-already-seen Antigravity
+    /// tool.
     pub(super) async fn detect_and_file_unobserved_command_signal(&self, execution: &crate::work::WorkExecution) {
         let kind = crate::codex_unobserved_command::UNOBSERVED_COMMAND_ATTENTION_KIND;
-        for command in self.staged_unobserved_commands.list(&execution.id) {
+        let commands = self.staged_unobserved_commands.list(&execution.id);
+        let mut agy_context = None;
+        for command in commands {
             let already_seen = self
                 .work_db
                 .list_attention_items(&execution.id)
@@ -699,23 +705,39 @@ impl WorkerCompletionHandler {
                 continue;
             }
 
-            let body = format!(
-                "Codex started a shell command but Boss never observed its completion before the \
-                 turn boundary (`item.started` with no `item.completed`).\n\n\
-                 - execution: `{execution_id}`\n\
-                 - work item: `{work_item_id}`\n\n\
-                 Command:\n\n```\n{command}\n```\n\n\
-                 Boss cannot confirm this command's outcome (exit code, output). Any claim in this \
-                 run that depends on it — tests passing, a build succeeding, a `no-changes-needed` \
-                 declaration — is treated as unconfirmed: the next no-changes-needed claim after this \
-                 abandonment is refused: the declaration is discarded and the worker is asked to re-verify and declare again.",
-                execution_id = execution.id,
-                work_item_id = execution.work_item_id,
-            );
-            if let Err(err) = self
-                .file_execution_attention(execution, kind, "Codex left a command unobserved", body)
-                .await
-            {
+            let (title, body) = if command.starts_with(boss_engine_driver::agy::REFUSED_TOOL_PREFIX) {
+                if agy_context.is_none() {
+                    let path = self.work_db.transcript_path_for_execution(&execution.id).ok().flatten();
+                    let root = crate::driver_transcript::driver_for_execution(&self.work_db, &execution.id)
+                        .and_then(|driver| driver.transcript_containment_root(&execution.id).ok().flatten());
+                    agy_context = Some(crate::agy_tool_evidence::transcript_context(path, root).await);
+                }
+                (
+                    "Antigravity left a tool unobserved",
+                    format!(
+                        "Antigravity emitted PreToolUse without a matching PostToolUse at the claimed parent's idle Stop. The call may have been refused; a clean Stop does not prove it ran.\n\n{command}\n\nBoss refuses every no-changes-needed declaration for the rest of this run.\n\n{context}",
+                        context = agy_context.as_deref().unwrap_or(""),
+                    ),
+                )
+            } else {
+                (
+                    "Codex left a command unobserved",
+                    format!(
+                        "Codex started a shell command but Boss never observed its completion before the \
+                         turn boundary (`item.started` with no `item.completed`).\n\n\
+                         - execution: `{execution_id}`\n\
+                         - work item: `{work_item_id}`\n\n\
+                         Command:\n\n```\n{command}\n```\n\n\
+                         Boss cannot confirm this command's outcome (exit code, output). Any claim in this \
+                         run that depends on it — tests passing, a build succeeding, a `no-changes-needed` \
+                         declaration — is treated as unconfirmed: the next no-changes-needed claim after this \
+                         abandonment is refused: the declaration is discarded and the worker is asked to re-verify and declare again.",
+                        execution_id = execution.id,
+                        work_item_id = execution.work_item_id,
+                    ),
+                )
+            };
+            if let Err(err) = self.file_execution_attention(execution, kind, title, body).await {
                 tracing::warn!(
                     execution_id = %execution.id,
                     command = %command,
@@ -750,8 +772,8 @@ impl WorkerCompletionHandler {
         }
 
         let body = format!(
-            "Codex abandoned more than \
-             {max} distinct commands (`item.started` with no `item.completed`) in this run — the \
+            "This worker left more than \
+             {max} distinct tool calls without matching completion in this run — the \
              audit trail stopped recording further ones by name.\n\n\
              - execution: `{execution_id}`\n\
              - work item: `{work_item_id}`\n\n\
@@ -764,7 +786,7 @@ impl WorkerCompletionHandler {
             work_item_id = execution.work_item_id,
         );
         if let Err(err) = self
-            .file_execution_attention(execution, kind, "Codex abandoned-command audit trail overflowed", body)
+            .file_execution_attention(execution, kind, "Unobserved-tool audit trail overflowed", body)
             .await
         {
             tracing::warn!(
