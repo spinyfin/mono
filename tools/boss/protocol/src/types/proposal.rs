@@ -1264,7 +1264,16 @@ pub struct OperatorQuestionView {
 pub enum OperatorQuestionStatus {
     Open,
     Answered,
+    Dismissed,
     Withdrawn,
+}
+
+/// Who closed a question without choosing an answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorQuestionDismissal {
+    pub by: String,
+    pub at: String,
+    pub note: Option<String>,
 }
 
 /// Immutable question and durable answer/withdrawal history.
@@ -1279,6 +1288,8 @@ pub struct OperatorQuestionRecord {
     pub answered_by: Option<String>,
     pub answered_at: Option<String>,
     pub withdrawn_reason: Option<String>,
+    #[serde(default)]
+    pub dismissal: Option<OperatorQuestionDismissal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

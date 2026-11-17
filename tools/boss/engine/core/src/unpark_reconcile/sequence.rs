@@ -263,6 +263,9 @@ fn kept_hold_clause(hold: &KeptHold) -> String {
         KeptHold::OperatorQuestion => {
             "; kept `awaiting_operator_answer`, because a question is already in front of the owner".to_owned()
         }
+        KeptHold::QuestionDismissed => {
+            "; kept question_dismissed, because only explicit start or a status change resumes it".to_owned()
+        }
         KeptHold::OperatorRefusal => {
             "; kept `worker_failed`, because the owner refused this work and only the owner reverses that".to_owned()
         }
@@ -763,7 +766,9 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
 /// derive.
 async fn reconcile_execution_step(env: &UnparkEnv, task: &Task) -> StepRecord {
     let step = Step::ReconcileExecution;
-    if let Some(hold @ ("worker_failed" | "awaiting_operator_answer")) = task.blocked_reason.as_deref() {
+    if let Some(hold @ ("worker_failed" | "awaiting_operator_answer" | "question_dismissed")) =
+        task.blocked_reason.as_deref()
+    {
         return StepRecord::skipped(
             step,
             "held",

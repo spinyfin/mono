@@ -2,6 +2,9 @@
 
 use crate::*;
 
+mod question;
+pub(crate) use question::{TaskAnswerArgs, TaskDismissQuestionArgs};
+
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]
 pub(crate) struct Cli {
@@ -467,28 +470,6 @@ pub(crate) enum ProjectCommand {
     },
 }
 
-#[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("answer").required(true).args(["yes", "no", "choice"])))]
-pub(crate) struct TaskAnswerArgs {
-    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
-    pub id: String,
-    /// Answer a genuine yes/no question Yes. On a question whose answers have
-    /// names (for example Split / Bypass limit) this still works and means the
-    /// first option, so existing scripts and older clients keep answering.
-    #[arg(long)]
-    pub yes: bool,
-    /// Answer a genuine yes/no question No. On a question whose answers have
-    /// names this still works and means the second option.
-    #[arg(long)]
-    pub no: bool,
-    /// Answer with a named option, spelled exactly as the question lists it
-    /// (`boss task show` prints the options), for example
-    /// `--choice "Bypass limit"`. Works for multiple-choice questions and for
-    /// questions whose two answers are named actions.
-    #[arg(long, value_name = "OPTION")]
-    pub choice: Option<String>,
-}
-
 /// Subcommands under `boss task ...`.
 ///
 /// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
@@ -514,6 +495,8 @@ pub(crate) enum TaskCommand {
     },
     /// Answer the open question on a task, or a specific question id.
     Answer(TaskAnswerArgs),
+    /// Close a worker question without answering or restarting the item.
+    DismissQuestion(TaskDismissQuestionArgs),
     Create(TaskCreateArgs),
     /// Bulk-create N tasks from a JSON array. Sidesteps the per-call
     /// CLI startup overhead of running `task create` N times — one

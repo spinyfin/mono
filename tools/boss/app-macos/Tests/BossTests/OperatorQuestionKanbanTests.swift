@@ -382,6 +382,39 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
     // MARK: - Wire
 
+    func testDismissQuestionSendsNoAnswerAndSettlesFromEngineUpdate() {
+        let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
+        let task = awaiting(id: "task_q")
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+        XCTAssertTrue(model.dismissOperatorQuestion(for: task))
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent[0]["type"] as? String, "dismiss_operator_question")
+        XCTAssertEqual(sent[0]["id"] as? String, task.operatorQuestion?.id)
+        XCTAssertNil(sent[0]["answer"])
+        XCTAssertFalse(model.answerOperatorQuestion(for: task, answer: .yesNo(true)))
+        XCTAssertFalse(model.dismissOperatorQuestion(for: task))
+
+        var dismissed = task
+        dismissed.blockedReason = "question_dismissed"
+        dismissed.operatorQuestion = nil
+        model.applyEventForTest(.workItemUpdated(item: .chore(dismissed)))
+        XCTAssertNil(model.operatorAnswerInFlightByTaskID[task.id])
+        XCTAssertFalse(dismissed.isAwaitingOperatorAnswer)
+        XCTAssertEqual(WorkBlockedBadge.label(forReason: dismissed.blockedReason!), "Question Dismissed")
+    }
+
+    func testDismissWhileDisconnectedIsSavedForExplicitRetry() {
+        let model = makeModel()
+        let task = awaiting(id: "task_q")
+        model.isConnected = false
+        XCTAssertFalse(model.dismissOperatorQuestion(for: task))
+        XCTAssertTrue(model.engine.hasUnsentAction(kind: "dismiss_operator_question"))
+        XCTAssertEqual(model.operatorAnswerErrorByTaskID[task.id], "Dismissal saved. Use Retry after reconnecting to send it.")
+    }
+
     func testAnswerOperatorQuestionRequestEncoding() throws {
         let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var sent: [[String: Any]] = []

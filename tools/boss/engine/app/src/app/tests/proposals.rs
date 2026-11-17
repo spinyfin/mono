@@ -232,6 +232,7 @@ The repo owner recorded this answer. It is explicit, human-granted approval for 
 }
 
 mod chore_questions;
+mod dismissal;
 mod multiple_choice;
 mod prerequisites;
 
@@ -687,7 +688,9 @@ async fn call_with_peer(
             r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
             r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
             r @ FrontendRequest::GetWorkItem { .. } => super::super::work_items::handle_get_work_item(ctx, r).await,
-            r @ FrontendRequest::AnswerOperatorQuestion { .. } | r @ FrontendRequest::ListOperatorQuestions { .. } => {
+            r @ FrontendRequest::AnswerOperatorQuestion { .. }
+            | r @ FrontendRequest::DismissOperatorQuestion { .. }
+            | r @ FrontendRequest::ListOperatorQuestions { .. } => {
                 super::super::work_items::handle_operator_question(ctx, r).await
             }
             other => panic!("not a supported test verb: {other:?}"),

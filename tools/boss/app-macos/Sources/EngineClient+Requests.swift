@@ -711,6 +711,13 @@ extension EngineClient {
         ])
     }
 
+    /// Dismiss without answering; the engine keeps the work item blocked.
+    @discardableResult
+    func sendDismissOperatorQuestion(id: String) -> String? {
+        sendLine(["type": "dismiss_operator_question", "id": id])
+    }
+
+
     func sendDeleteWorkItem(id: String) {
         sendLine([
             "type": "delete_work_item",

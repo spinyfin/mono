@@ -92,9 +92,15 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         peer_pid,
         ..
     } = ctx;
+    let dismissal = match &req {
+        FrontendRequest::DismissOperatorQuestion { question_id, note, .. } => Some((question_id.clone(), note.clone())),
+        _ => None,
+    };
     let (id, answer) = match req {
         FrontendRequest::AnswerOperatorQuestion { id, answer } => (id, Some(answer)),
-        FrontendRequest::ListOperatorQuestions { id } => (id, None),
+        FrontendRequest::ListOperatorQuestions { id } | FrontendRequest::DismissOperatorQuestion { id, .. } => {
+            (id, None)
+        }
         _ => unreachable!(),
     };
     let resolved = if id.starts_with("oq_") {
@@ -115,7 +121,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             return;
         }
     };
-    let Some(answer) = answer else {
+    if answer.is_none() && dismissal.is_none() {
         match work_db.list_operator_questions(&id) {
             Ok(questions) => send_response(&sink, &request_id, FrontendEvent::OperatorQuestionsList { questions }),
             Err(err) => send_work_error(&sink, &request_id, &err),
@@ -123,14 +129,31 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         return;
     };
     let actor = resolve_status_actor(&server_state, peer_pid);
-    let provenance = resolve_write_basis(&server_state, peer_pid, &session_id, &request_id, "rpc:answer").await;
-    match work_db.answer_operator_question_from(
-        &id,
-        answer,
-        server_state.pr_state_checker.as_ref(),
-        actor,
-        Some(&provenance),
-    ) {
+    let provenance = resolve_write_basis(
+        &server_state,
+        peer_pid,
+        &session_id,
+        &request_id,
+        if dismissal.is_some() {
+            "rpc:dismiss_question"
+        } else {
+            "rpc:answer"
+        },
+    )
+    .await;
+    let is_dismissal = dismissal.is_some();
+    let result = if let Some((question_id, note)) = dismissal {
+        work_db.dismiss_operator_question_from(&id, question_id.as_deref(), note.as_deref(), actor, Some(&provenance))
+    } else {
+        work_db.answer_operator_question_from(
+            &id,
+            answer.expect("answer request"),
+            server_state.pr_state_checker.as_ref(),
+            actor,
+            Some(&provenance),
+        )
+    };
+    match result {
         Ok(outcome) => {
             let mut item = outcome.item;
             // "Archive it", the owner's answer to the engine's question about an
@@ -163,7 +186,11 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 &session_id,
                 &request_id,
                 vec![work_product_topic(&product_id)],
-                "operator_question_answered",
+                if is_dismissal {
+                    "operator_question_dismissed"
+                } else {
+                    "operator_question_answered"
+                },
                 Some(product_id),
                 changed,
             )

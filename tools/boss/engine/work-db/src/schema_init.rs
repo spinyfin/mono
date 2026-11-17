@@ -920,6 +920,10 @@ mod floor_tests {
                 Box::new(|c| super::super::conflict_mismatch::migrate_operator_forced_admission(c).unwrap()),
             ),
             (
+                "20261117_0210_operator_question_dismissal",
+                Box::new(|c| pr_flow::question_dismissal::migrate(c).unwrap()),
+            ),
+            (
                 pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID,
                 Box::new(|c| pr_flow::migrate_operator_question_stuck_classification(c).unwrap()),
             ),

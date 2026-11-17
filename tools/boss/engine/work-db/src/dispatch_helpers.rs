@@ -765,7 +765,7 @@ pub fn reconcile_work_item_execution(
     if query_task(conn, work_item_id)?.is_some_and(|task| {
         matches!(
             task.blocked_reason.as_deref(),
-            Some("worker_failed" | "awaiting_operator_answer")
+            Some("worker_failed" | "awaiting_operator_answer" | "question_dismissed")
         )
     }) || positioning_hold_active(conn, work_item_id)?
     {
@@ -1165,7 +1165,7 @@ pub fn reconcile_revision_execution(
     result: &mut ExecutionReconcileResult,
     task: &Task,
 ) -> Result<()> {
-    if positioning_hold_active(conn, &task.id)? {
+    if task.blocked_reason.as_deref() == Some("question_dismissed") || positioning_hold_active(conn, &task.id)? {
         return Ok(());
     }
     // Walk to the chain root.
@@ -1688,6 +1688,12 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         );
     }
 
+    if !explicit_start
+        && query_task(conn, &work_item_id)?
+            .is_some_and(|task| task.blocked_reason.as_deref() == Some("question_dismissed"))
+    {
+        bail!("question dismissed: only an explicit start or status change can resume this item");
+    }
     if !explicit_start && positioning_hold_active(conn, &work_item_id)? {
         bail!("Workspace blocked: resolve the positioning refusal and launch manually");
     }
@@ -1788,7 +1794,7 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
             actor,
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = ?3, updated_at = ?2
-             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer')",
+             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer', 'question_dismissed')",
             params![work_item_id, now, actor],
         )?;
 
