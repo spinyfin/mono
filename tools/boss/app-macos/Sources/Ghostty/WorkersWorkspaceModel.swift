@@ -166,6 +166,12 @@ final class WorkersWorkspaceModel: ObservableObject {
         requestedViewerRunIds.removeAll()
     }
 
+    /// A single surface stopped showing one run: allow it to be asked for
+    /// again without clearing requests other surfaces still own.
+    func endViewerAttachRequest(forRun runId: String) {
+        requestedViewerRunIds.remove(runId)
+    }
+
     private func recordViewerAttachFailure(runId: String, reason: String) {
         if viewerAttachFailuresByRunId[runId] != reason {
             viewerAttachFailuresByRunId[runId] = reason

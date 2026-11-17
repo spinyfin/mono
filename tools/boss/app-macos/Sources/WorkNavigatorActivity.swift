@@ -108,11 +108,28 @@ struct WorkNavigatorActivity: View {
         }
     }
 
-    /// The family member whose run failed: the selected activity's task,
-    /// else the current revision, else the root.
+    /// The family member whose run failed. The picker's sticky selection is
+    /// deliberately not consulted: the current revision wins when it has a
+    /// failure, then the selected activity's task, then the root.
     var failingTask: WorkTask {
-        let id = selected?.taskId ?? projection?.revisions.currentTaskId
-        return id.flatMap { model.task(withID: $0) } ?? root
+        let current = projection?.revisions.currentTaskId.flatMap { model.task(withID: $0) }
+        let candidates = [current, selected.flatMap { model.task(withID: $0.taskId) }, root]
+        return candidates.compactMap { $0 }.first(where: hasFailure) ?? current ?? root
+    }
+
+    private func hasFailure(_ task: WorkTask) -> Bool {
+        task.dispatchFailedReason != nil
+            || model.taskRuntimesByID[task.id]?.dispatchFailures.isEmpty == false
+    }
+
+    /// Latest recorded dispatch failure text for the failing member, falling
+    /// back to the root's when the member's list is empty.
+    var failureText: String? {
+        let failing = failingTask
+        for id in [failing.id, root.id] {
+            if let last = model.taskRuntimesByID[id]?.dispatchFailures.last { return last.errorText }
+        }
+        return nil
     }
 
     private var pickerActivities: [NavigatorActivity] {
@@ -195,9 +212,8 @@ struct WorkNavigatorActivity: View {
         if let reason = banner.dispatchFailedReason {
             WorkDispatchFailureBanner(reason: reason, errorText: banner.dispatchFailedError)
         }
-        if let runtime = model.taskRuntimesByID[failing.id] ?? model.taskRuntimesByID[root.id],
-           let last = runtime.dispatchFailures.last {
-            Text(last.errorText).font(.caption).foregroundStyle(.secondary)
+        if let text = failureText {
+            Text(text).font(.caption).foregroundStyle(.secondary)
         }
         HStack {
             Button("Open last transcript") {
@@ -236,16 +252,36 @@ struct WorkNavigatorActivity: View {
         }
     }
 
+    var isSlotActive: Bool {
+        model.navigationMode == .work
+            && model.navigator.mode == .navigator
+            && model.navigator.tab == .activity
+    }
+
+    /// Host label when the selected run's worker lives on another machine.
+    /// Remote workers have no local terminal, so no viewer attach applies.
+    func remoteHost(for activity: NavigatorActivity) -> String? {
+        guard let live = model.liveWorkerStates.byRunID[activity.runId ?? activity.executionId],
+              live.isSpokeHosted else { return nil }
+        return live.hostId ?? "remote host"
+    }
+
     @ViewBuilder
     private var terminalRegion: some View {
-        if let selected, let workspace {
+        if let selected, let host = remoteHost(for: selected) {
+            WorkNavigatorRemotePane(
+                model: model.remotePaneViewer,
+                runId: selected.runId ?? selected.executionId,
+                host: host,
+                ended: selectedRunEnded,
+                isActive: isSlotActive
+            )
+        } else if let selected, let workspace {
             WorkNavigatorTerminalSlot(
                 selected: selected,
                 ended: selectedRunEnded,
                 isLive: isLiveSelected,
-                isActive: model.navigationMode == .work
-                    && model.navigator.mode == .navigator
-                    && model.navigator.tab == .activity,
+                isActive: isSlotActive,
                 workspace: workspace
             )
         } else {
@@ -280,12 +316,38 @@ struct WorkNavigatorTerminalSlot: View {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @Environment(\.openWindow) private var openWindow
 
+    enum Presentation: Equatable {
+        case terminal
+        case ended
+        case attachFailure(String)
+        case unavailable
+    }
+
+    /// Which branch the slot renders. A viewer whose session has no host view
+    /// yet (a non-PTY or still-launching attach) is not a terminal.
+    static func presentation(hasHostedSession: Bool, ended: Bool, failure: String?) -> Presentation {
+        if hasHostedSession { return .terminal }
+        if ended { return .ended }
+        if let failure { return .attachFailure(failure) }
+        return .unavailable
+    }
+
+    /// A user-driven attach is only asked for while the slot is in view, the
+    /// run is live, and no viewer exists yet.
+    static func shouldRequestAttach(isActive: Bool, isLive: Bool, ended: Bool, hasSession: Bool) -> Bool {
+        isActive && isLive && !ended && !hasSession
+    }
+
     private var runId: String { selected.runId ?? selected.executionId }
     private var session: TerminalPaneSession? { workspace.viewer(forRunId: runId)?.session }
 
     var body: some View {
-        Group {
-            if let session, session.hostView != nil {
+        let presentation = Self.presentation(
+            hasHostedSession: session?.hostView != nil, ended: ended,
+            failure: workspace.viewerAttachFailuresByRunId[runId]
+        )
+        return Group {
+            if presentation == .terminal, let session {
                 VStack(alignment: .leading, spacing: 4) {
                     if !isLive {
                         Text("Showing the last session. It is not a live agent.")
@@ -296,7 +358,7 @@ struct WorkNavigatorTerminalSlot: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .accessibilityIdentifier("navigator-terminal")
                 }
-            } else if ended {
+            } else if presentation == .ended {
                 VStack(spacing: 8) {
                     Label("Execution ended.", systemImage: "stop.circle")
                         .font(.callout)
@@ -310,21 +372,53 @@ struct WorkNavigatorTerminalSlot: View {
                     .accessibilityIdentifier("navigator-open-transcript")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let reason = workspace.viewerAttachFailuresByRunId[runId] {
+            } else if case .attachFailure(let reason) = presentation {
                 NavigatorPaneNotice(text: "Agent pane could not attach: \(reason)", systemImage: "exclamationmark.triangle")
             } else {
                 NavigatorPaneNotice(text: "Agent pane not available yet.", systemImage: "terminal")
             }
         }
         .onAppear(perform: requestAttachIfNeeded)
-        .onChange(of: isActive) { _, _ in requestAttachIfNeeded() }
-        .onChange(of: runId) { _, _ in requestAttachIfNeeded() }
+        .onDisappear { workspace.endViewerAttachRequest(forRun: runId) }
+        .onChange(of: isActive) { _, active in
+            if active { requestAttachIfNeeded() } else { workspace.endViewerAttachRequest(forRun: runId) }
+        }
+        .onChange(of: runId) { old, _ in
+            workspace.endViewerAttachRequest(forRun: old)
+            requestAttachIfNeeded()
+        }
     }
 
     private func requestAttachIfNeeded() {
-        guard isActive, isLive, !ended, session == nil else { return }
+        guard Self.shouldRequestAttach(isActive: isActive, isLive: isLive, ended: ended, hasSession: session != nil)
+        else { return }
         workspace.requestViewerAttach(forRuns: [runId])
     }
+}
+
+/// Read-only view of a worker hosted on another machine, through the same
+/// remote-pane model the Agents view uses. Watching follows visibility.
+struct WorkNavigatorRemotePane: View {
+    @ObservedObject var model: RemotePaneViewerModel
+    let runId: String
+    let host: String
+    let ended: Bool
+    let isActive: Bool
+
+    var body: some View {
+        Group {
+            if ended {
+                NavigatorPaneNotice(text: "Remote execution on \(host) ended.", systemImage: "stop.circle")
+            } else {
+                RemotePaneViewerView(model: model, runId: runId, hostFallback: host)
+                    .accessibilityIdentifier("navigator-remote-pane")
+            }
+        }
+        .onChange(of: watchTarget, initial: true) { _, run in model.watch(run) }
+        .onDisappear { model.stopWatching() }
+    }
+
+    private var watchTarget: String? { isActive && !ended ? runId : nil }
 }
 
 extension NavigatorDetailRegistry {

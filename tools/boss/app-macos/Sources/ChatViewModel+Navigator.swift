@@ -169,6 +169,9 @@ extension ChatViewModel {
             syncNavigatorAttention(for: selected)
             if let current = selected.navigator?.root?.revisions.currentTaskId {
                 if task(withID: current) != nil {
+                    if let previous = navigator.askID, previous != current {
+                        keepNavigatorAskDraft(rootID: selected.id, previous: previous)
+                    }
                     navigator.askID = current
                 } else if navigator.askID.flatMap({ task(withID: $0) }) == nil {
                     navigator.askID = nil
@@ -304,17 +307,29 @@ extension ChatViewModel {
     }
 
     /// The engine dropped the current ask. A Current ask choice would now
-    /// resolve to the original brief under the wrong title, so move it to the
-    /// retired ask when it holds an open draft, otherwise back to Original.
+    /// resolve to the original brief under the wrong title, so an open draft
+    /// on the retired ask keeps its document; otherwise Current ask falls
+    /// back to Original.
     private func retireNavigatorAsk(rootID: String) {
-        guard navigator.documentByRoot[rootID] == .currentAsk else { return }
-        if let previous = navigator.askID, previous != rootID, task(withID: previous) != nil,
-           navigatorBriefIsEditing(previous) {
-            navigator.historicalDocumentByRoot[rootID] = previous
-            navigator.documentByRoot[rootID] = .historical
-        } else {
+        if let previous = navigator.askID,
+           keepNavigatorAskDraft(rootID: rootID, previous: previous) { return }
+        if navigator.documentByRoot[rootID] == .currentAsk {
             navigator.documentByRoot[rootID] = .original
         }
+    }
+
+    /// Pin the previous ask as the historical document when it holds an open
+    /// draft and Current ask was in view, whether chosen explicitly or shown
+    /// by default. Returns whether the draft was kept reachable.
+    @discardableResult
+    private func keepNavigatorAskDraft(rootID: String, previous: String) -> Bool {
+        let stored = navigator.documentByRoot[rootID]
+        guard stored == nil || stored == .currentAsk,
+              previous != rootID, task(withID: previous) != nil,
+              navigatorBriefIsEditing(previous) else { return false }
+        navigator.historicalDocumentByRoot[rootID] = previous
+        navigator.documentByRoot[rootID] = .historical
+        return true
     }
 
     /// The document the Brief shows. An explicit choice wins while it still

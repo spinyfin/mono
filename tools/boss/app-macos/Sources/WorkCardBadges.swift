@@ -11,12 +11,9 @@ import UpdateCore
 /// logic lives on `RepoChipPresentation` so tests don't need a
 /// SwiftUI host.
 ///
-/// The chip renders in a neutral style matching `WorkStatusBadge`
-/// (used by `Blocked` and the project tag). Earlier the override
-/// variant carried an accent-blue tint, but the color had no stable
-/// meaning to readers — and with per-card chips now only appearing
-/// on rows that carry their own repo, the "this row is special" signal
-/// is already conveyed by the chip's mere presence on the card.
+/// The chip uses a neutral style matching `WorkStatusBadge`. Per-card
+/// chips appear only on rows with their own repo, so their presence
+/// conveys the override without an accent color.
 struct RepoChipView: View {
     let presentation: RepoChipPresentation
     var emphasized: Bool = false
