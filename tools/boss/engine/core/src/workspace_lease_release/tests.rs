@@ -375,9 +375,17 @@ async fn preservation_does_not_run_while_a_gate_keeps_the_lease() {
         }
     );
     let items = db.list_attention_items(&execution.id).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].kind, LEASE_UNRELEASED_ATTENTION_KIND);
-    assert!(!items[0].body_markdown.contains("must not be attempted"));
+    assert_eq!(items.len(), 2);
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND)
+    );
+    let diagnostic = items
+        .iter()
+        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .unwrap();
+    assert!(!diagnostic.body_markdown.contains("must not be attempted"));
 }
 
 #[tokio::test]
@@ -704,7 +712,7 @@ async fn lease_not_found_is_success_without_attention() {
             TerminalCause::ProvenCompleted,
             Occupancy::Empty,
             Ok(()),
-            Err(error.into())
+            Err(anyhow::Error::new(error).context("cube release command failed"))
         )
         .await,
         LeaseReleaseOutcome::Released
@@ -825,4 +833,184 @@ async fn sweep_holds_cancelled_spawn_and_failed_abort() {
             Some("spawn-held")
         );
     }
+}
+
+struct CleanupOccupancy {
+    error: Mutex<Option<String>>,
+}
+
+impl WorkspaceOccupancy for CleanupOccupancy {
+    fn occupancy(&self, _: &Path) -> Occupancy {
+        Occupancy::Unknown
+    }
+
+    fn cleanup<'a>(
+        &'a self,
+        _db: &'a WorkDb,
+        _execution: &'a WorkExecution,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Occupancy>> + Send + 'a>>> {
+        let error = self.error.lock().unwrap().clone();
+        Some(Box::pin(async move {
+            match error {
+                Some(err) => anyhow::bail!("{err}"),
+                None => Ok(Occupancy::Empty),
+            }
+        }))
+    }
+}
+
+#[tokio::test]
+async fn sweep_retries_occupancy_kept_never_started_row_after_occupants_leave() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-occ-retry");
+    assert!(execution.started_at.is_none());
+    let kept = apply_with(
+        &db,
+        &execution,
+        TerminalCause::Inferred,
+        Occupancy::Occupied,
+        Ok(()),
+        Ok(()),
+    )
+    .await;
+    assert_eq!(
+        kept,
+        LeaseReleaseOutcome::Kept {
+            reason: KeepReason::ProcessInWorkspace
+        }
+    );
+    let execution = db.get_execution(&execution.id).unwrap();
+    assert_eq!(
+        sweep_pane_status(&db, &LiveWorkerStateRegistry::new(), &execution),
+        PaneStatus::Gone
+    );
+    let outcome = run_one_pass_with_occupancy(&db, &SweepCube, &LiveWorkerStateRegistry::new(), || async {
+        EmptyOccupancy
+    })
+    .await;
+    assert_eq!(outcome.released, 1, "{outcome:?}");
+    assert!(db.get_execution(&execution.id).unwrap().cube_lease_id.is_none());
+}
+
+#[tokio::test]
+async fn legacy_occupancy_keep_survives_a_transient_registry_fault() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-legacy");
+    raise_attention(
+        &db,
+        &execution,
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        "Workspace recovery needs process cleanup",
+        "Workspace processes have not exited",
+    );
+    assert!(previous_occupancy_keep(&db, &execution));
+    assert!(
+        db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .any(|item| item.status == "open" && item.kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND)
+    );
+    refresh_attention(
+        &db,
+        &execution,
+        LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
+        "Workspace lease registry is unavailable",
+        "Could not confirm cube lease lease-legacy: cube registry unavailable",
+    );
+    assert!(previous_occupancy_keep(&db, &execution));
+    assert_eq!(
+        retry_pane_status(&db, false, &db.get_execution(&execution.id).unwrap()),
+        PaneStatus::Gone
+    );
+}
+
+#[tokio::test]
+async fn occupancy_keep_attention_quotes_the_latest_cleanup() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Failed, "lease-fresh");
+    let occupancy = CleanupOccupancy {
+        error: Mutex::new(Some(
+            "workspace occupants [111] (owners {}); unreadable processes []".to_owned(),
+        )),
+    };
+    let first = apply_release(
+        &db,
+        &execution,
+        "lease-fresh",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &occupancy,
+            preservation: &NoPreservation,
+        },
+        async { Ok(()) },
+    )
+    .await;
+    assert!(matches!(first, LeaseReleaseOutcome::Kept { .. }), "{first:?}");
+    let original = db
+        .list_attention_items(&execution.id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND)
+        .unwrap();
+    assert!(original.body_markdown.contains("[111]"), "{}", original.body_markdown);
+
+    *occupancy.error.lock().unwrap() =
+        Some("workspace occupants [222] (owners {}); unreadable processes []".to_owned());
+    let second = apply_release(
+        &db,
+        &execution,
+        "lease-fresh",
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane: PaneStatus::Gone,
+            occupancy: &occupancy,
+            preservation: &NoPreservation,
+        },
+        async { Ok(()) },
+    )
+    .await;
+    assert!(matches!(second, LeaseReleaseOutcome::Kept { .. }), "{second:?}");
+    let items = db.list_attention_items(&execution.id).unwrap();
+    let open: Vec<_> = items
+        .iter()
+        .filter(|item| item.kind == LEASE_UNRELEASED_ATTENTION_KIND && item.status == "open")
+        .collect();
+    assert_eq!(open.len(), 1);
+    assert!(open[0].body_markdown.contains("[222]"), "{}", open[0].body_markdown);
+    assert!(
+        !open[0].body_markdown.contains("[111]"),
+        "stale occupants must not remain in the item: {}",
+        open[0].body_markdown
+    );
+    assert_eq!(open[0].created_at, original.created_at);
+}
+
+#[tokio::test]
+async fn legacy_unconfirmed_death_does_not_authorize_a_no_pid_release() {
+    let (_dir, db) = open_db();
+    let execution = seed_terminal(&db, ExecutionStatus::Cancelled, "legacy-held");
+    raise_attention(
+        &db,
+        &execution,
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        "Terminal worker still holds its workspace",
+        "Death could not be confirmed",
+    );
+    for _ in 0..2 {
+        let outcome = run_one_pass_with_occupancy(&db, &SweepCube, &LiveWorkerStateRegistry::new(), || {
+            forbidden_occupancy_scan()
+        })
+        .await;
+        assert_eq!(outcome.held, 1);
+        assert_eq!(outcome.released, 0);
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(),
+            Some("legacy-held")
+        );
+    }
+}
+
+async fn forbidden_occupancy_scan() -> EmptyOccupancy {
+    panic!("unconfirmed death must not scan occupancy")
 }

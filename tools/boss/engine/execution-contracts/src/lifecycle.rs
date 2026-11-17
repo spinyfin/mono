@@ -255,6 +255,16 @@ pub trait LifecycleServices: Send + Sync {
         reason: &str,
     ) -> LeaseReleaseOutcome;
 
+    /// Reconcile a predecessor lease using current liveness and validated host routing.
+    async fn refresh_predecessor_lease(
+        &self,
+        execution: &WorkExecution,
+        live: Option<&dyn LiveWorkerLiveness>,
+        provider: &dyn HostAdapterProvider,
+        local: Arc<dyn HostAdapter>,
+        at_bound: bool,
+    );
+
     async fn teardown_driver_workspace(
         &self,
         execution_id: &str,

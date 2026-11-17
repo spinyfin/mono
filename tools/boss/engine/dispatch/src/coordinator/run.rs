@@ -1606,6 +1606,16 @@ mod conflict_diagnosis_for_attempt_tests {
         ) -> LeaseReleaseOutcome {
             unimplemented!()
         }
+        async fn refresh_predecessor_lease(
+            &self,
+            _: &WorkExecution,
+            _: Option<&dyn boss_execution_contracts::LiveWorkerLiveness>,
+            _: &dyn HostAdapterProvider,
+            _: Arc<dyn HostAdapter>,
+            _: bool,
+        ) {
+            unimplemented!()
+        }
         async fn teardown_driver_workspace(&self, _: &str, _: Option<&Path>, _: TeardownReason) {}
         fn report_bookmark_failure(&self, _: &WorkExecution, _: &str) {}
         fn block_unrecoverable_bookmark(&self, _: &WorkExecution, _: &anyhow::Error) -> anyhow::Result<bool> {

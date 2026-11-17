@@ -60,8 +60,38 @@ hold ends when the predecessor's lease is released (the cleared lease columns
 are what dispatch reads). The leftover sweep also retries leases older than
 cube's TTL. What keeps a
 lease recorded is a pane or process still in the workspace, occupancy that
-cannot be confirmed, or a cube failure; the leftover sweep keeps retrying and
-the successor stays held behind it rather than abandoning the work. A
+cannot be confirmed, or a cube failure; the leftover sweep keeps retrying —
+including a fresh occupancy scan for a lease that was kept because the
+workspace was occupied, even when the finished run never recorded a worker
+pid — and the successor stays held behind it rather than abandoning the work.
+A successor retry checks the owning-host registry after confirming worker death.
+If the lease is already absent, it preserves the predecessor's work before
+clearing the stale engine record. An unchanged claim counter on a free workspace
+allows live preservation after occupancy agrees the workspace is empty; an
+absent or reassigned workspace uses the recorded lease boundary. No workspace
+is reset or released during this reconciliation. Failing to run preservation
+(jj, unreachable host, missing recovery record or path) keeps the successor
+held, with the workspace path in the diagnostic, until recovery succeeds or
+the wait bound fails the successor. Completing preservation with an inspection
+still reconciles, matching the held-lease path. Cube's lease-not-found release
+result remains idempotent.
+An occupancy hold has distinct durable evidence that the pane gate passed.
+Open legacy cleanup items titled "Workspace recovery needs process cleanup",
+"Workspace recovery could not release its lease", or "Remote workspace recovery
+needs process cleanup" also supply that evidence; the first match converts them
+into the occupancy-kept marker. Host-resolution and cube-registry faults file a
+separate recovery-unavailable item so they cannot rewrite those titles.
+"Terminal worker still holds its workspace" never authorizes a no-pid retry.
+The sweep and dispatch both require absence from the live registry and
+confirmed death of any recorded shell PID before retrying. Remote retries
+resolve and validate the owning host adapter and confirm any recorded remote
+PID is dead. Routing errors keep the lease and appear in the cleanup evidence.
+When a successor is waiting on such a lease, dispatch re-scans occupancy at
+most once per minute, with a fresh check at the failure bound. Blocking scans
+run off the async executor. After a scan: an empty workspace (or one that holds only
+unowned occupants past the existing bound) is preserved and released so the
+successor can start, and a still-occupied workspace fails with the occupants
+seen on that scan. For a lease cube still holds, a
 preservation failure does not hold the lease: the release goes ahead and a
 `preserved_work_needs_inspection` attention item on the predecessor carries the
 error and the lease id, so a successor that then starts without that work does

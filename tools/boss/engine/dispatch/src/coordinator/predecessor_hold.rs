@@ -33,16 +33,19 @@ impl ExecutionCoordinator {
     ///
     /// The wait is bounded. A cleanup problem is often transient (an
     /// unreachable host, one failed probe) and the sweeps retry it, so a
-    /// fresh attention item never fails the successor. A kept-lease item or a
-    /// `workspace_lease_release_failed` item that has stayed open for
-    /// [`PREDECESSOR_HOLD_BOUND_SECS`] does (the sweeps have then had many
-    /// passes), or, for a remote predecessor that left no item at all, the
-    /// same time since it ended. Either clock runs from the later of that
-    /// start and the successor's first hold, so a successor created after the
-    /// problem was already old still gets the full bound. A fresh open
-    /// `workspace_lease_release_failed` item still blocks the missing-evidence
-    /// fallback so a remote cube retry is not mistaken for silence. The check
-    /// is read-only; callers record the failure with [`Self::fail_predecessor_hold`].
+    /// fresh attention item never fails the successor. A kept-lease item, a
+    /// host-or-registry-unavailable item, or a `workspace_lease_release_failed`
+    /// item that has stayed open for [`PREDECESSOR_HOLD_BOUND_SECS`] does
+    /// (the sweeps have then had many passes), or, for a predecessor that
+    /// left no item at all, the same time since it ended. Either clock runs
+    /// from the later of that start and the successor's first hold, so a
+    /// successor created after the problem was already old still gets the
+    /// full bound. A fresh open `workspace_lease_release_failed` item still
+    /// blocks the missing-evidence fallback so a remote cube retry is not
+    /// mistaken for silence. Occupancy is re-scanned first via
+    /// [`Self::refresh_predecessor_lease`]; this check then reads that
+    /// result. Callers record a bound failure with
+    /// [`Self::fail_predecessor_hold`].
     pub(super) fn predecessor_lease_hold(&self, execution: &WorkExecution) -> Option<PredecessorHold> {
         match self.work_db.recovery_predecessor_holding_lease(execution) {
             Ok(None) => None,
@@ -97,21 +100,28 @@ impl ExecutionCoordinator {
                         PredecessorHold::Waiting(detail)
                     });
                 }
-                let kept = open_of_kind(boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND);
-                // A remote predecessor can leave no item at all (its worker pid
-                // was never recorded, or the host was never probed). Nothing
-                // would ever end that wait, so it is bounded by how long ago
-                // the run ended.
-                let remote = matches!(
-                    self.work_db.latest_run_host_for_execution(&predecessor.id),
-                    Ok(Some(host)) if host != "local"
-                );
-                let evidence = match kept {
-                    Some(item) if older_than_bound(item.created_at.parse::<i64>().ok()) => item.body_markdown.clone(),
-                    None if remote && older_than_bound(predecessor.finished_epoch()) => {
-                        "No cleanup result was recorded for its remote worker".to_owned()
+                let kept_open: Vec<_> = [
+                    boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND,
+                    boss_engine_storage_values::attention_kinds::LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
+                ]
+                .into_iter()
+                .filter_map(open_of_kind)
+                .collect();
+                // A predecessor can leave no cleanup item at all. Bound that
+                // silence too, including a local cancelled spawn with no pid.
+                // Host and registry faults share the bound clock with a kept
+                // lease so a fresh diagnostic still waits, and an aged one
+                // still fails the successor instead of looking like silence.
+                let evidence = match kept_open
+                    .iter()
+                    .find(|item| older_than_bound(item.created_at.parse::<i64>().ok()))
+                {
+                    Some(item) => item.body_markdown.clone(),
+                    None if !kept_open.is_empty() => return Some(PredecessorHold::Waiting(detail)),
+                    None if older_than_bound(predecessor.finished_epoch()) => {
+                        "No cleanup result was recorded for its worker".to_owned()
                     }
-                    _ => return Some(PredecessorHold::Waiting(detail)),
+                    None => return Some(PredecessorHold::Waiting(detail)),
                 };
                 Some(fail(evidence))
             }
@@ -119,6 +129,31 @@ impl ExecutionCoordinator {
                 "recovery predecessor could not be resolved: {err:#}"
             ))),
         }
+    }
+
+    /// Reconcile the owning cube registry, then retry an eligible predecessor.
+    /// A waiting successor must not quote a stale occupant list, and a
+    /// workspace that has since emptied must be preserved and returned so
+    /// the successor can start. An absent lease is reconciled without reading
+    /// the new holder's workspace. Absent leases are cleared only after
+    /// owning-host preservation succeeds.
+    pub(super) async fn refresh_predecessor_lease(&self, execution: &WorkExecution) {
+        let Ok(Some(predecessor)) = self.work_db.recovery_predecessor_holding_lease(execution) else {
+            return;
+        };
+        if !predecessor.status.is_terminal() {
+            return;
+        }
+        let at_bound = matches!(self.predecessor_lease_hold(execution), Some(PredecessorHold::Failed(_)));
+        self.lifecycle
+            .refresh_predecessor_lease(
+                &predecessor,
+                self.live_worker_states(),
+                self.host_adapter_provider.as_ref(),
+                self.host_adapter(),
+                at_bound,
+            )
+            .await;
     }
 
     /// Terminalize a row whose predecessor hold outlasted its bound. Never

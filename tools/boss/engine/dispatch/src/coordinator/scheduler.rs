@@ -1434,6 +1434,7 @@ impl ExecutionCoordinator {
             // this is not a scheduling policy but a guard against silently
             // abandoning work. Checked before any slot, lease or pane is
             // touched; `schedule_execution` repeats it for `force_dispatch`.
+            self.refresh_predecessor_lease(&execution).await;
             match self.predecessor_lease_hold(&execution) {
                 None => {}
                 Some(PredecessorHold::Failed(error)) => {

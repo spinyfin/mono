@@ -169,6 +169,9 @@ pub(super) struct FakeCubeClient {
     /// reporting a workspace still leased to a dead worker so the
     /// stale-lease reclaim path (issue #962) can be exercised.
     pub(super) list_workspaces_response: Mutex<Vec<CubeWorkspaceStatus>>,
+    /// When true, `list_workspaces` fails so a recovery retry can observe a
+    /// transient registry fault without losing occupancy-keep evidence.
+    pub(super) list_workspaces_fail: AtomicBool,
     /// When set, `release_workspace` records its call and then parks on this
     /// gate until the test notifies it. Models the field condition behind the
     /// 2026-07-31 silent-abort incident: a `cube workspace release` that ran
@@ -473,6 +476,9 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+        if self.list_workspaces_fail.load(Ordering::SeqCst) {
+            anyhow::bail!("cube registry unavailable");
+        }
         let mut rows = self.list_workspaces_response.lock().await.clone();
         rows.extend(self.active_leases.lock().await.clone());
         Ok(rows)

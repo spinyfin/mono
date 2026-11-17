@@ -339,9 +339,18 @@ fn proc_uid(proc_dir: &Path) -> Option<u32> {
 }
 
 fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &WorkExecution) -> PaneStatus {
-    if live.snapshot().iter().any(|state| state.run_id == execution.id) {
+    retry_pane_status(
+        db,
+        live.snapshot().iter().any(|state| state.run_id == execution.id),
+        execution,
+    )
+}
+
+pub(crate) fn retry_pane_status(db: &WorkDb, is_live: bool, execution: &WorkExecution) -> PaneStatus {
+    if !execution.status.is_terminal() || is_live {
         return PaneStatus::Present;
     }
+    promote_legacy_occupancy_keep(db, execution);
     // Cancelled and failed rows go through durable death evidence: a recorded
     // worker pid that is dead. A cancelled in-flight spawn (no pid recorded
     // yet) and a failed viewer abort (pid still alive) therefore stay held.
@@ -357,20 +366,64 @@ fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &Wo
             PaneStatus::Gone
         }
         // A row that never recorded a pid (a pre-start failure, or a spawn
-        // that failed before its pane) is retried only after an earlier
-        // release attempt got past every gate and then failed in cube. That
-        // attempt ran after the spawn had settled, so it is the durable proof
-        // that nothing is mid-spawn; the occupancy scan still runs again here.
-        Ok(None) if release_previously_failed_in_cube(db, &execution.id) => PaneStatus::Gone,
+        // that failed before its pane) is retried after an earlier release
+        // attempt passed the pane gate: occupancy kept the lease, or cube
+        // failed after every gate. Either is proof the spawn had settled;
+        // occupancy is scanned again here so a workspace that has since
+        // emptied can be preserved and returned.
+        Ok(None) if previous_release_passed_pane_gate(db, &execution.id) => PaneStatus::Gone,
         _ => PaneStatus::Present,
     }
 }
 
-fn release_previously_failed_in_cube(db: &WorkDb, execution_id: &str) -> bool {
-    db.list_attention_items(execution_id).is_ok_and(|items| {
+fn occupancy_keep_evidence(kind: &str, title: &str) -> bool {
+    kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND
+        || (kind == LEASE_UNRELEASED_ATTENTION_KIND
+            && matches!(
+                title,
+                "Workspace recovery needs process cleanup"
+                    | "Workspace recovery could not release its lease"
+                    | "Remote workspace recovery needs process cleanup"
+                    | "Workspace recovery could not preserve unpublished work"
+            ))
+}
+
+fn promote_legacy_occupancy_keep(db: &WorkDb, execution: &WorkExecution) {
+    let Ok(items) = db.list_attention_items(&execution.id) else {
+        return;
+    };
+    if !items.iter().any(|item| {
+        item.status == "open"
+            && item.kind == LEASE_UNRELEASED_ATTENTION_KIND
+            && occupancy_keep_evidence(&item.kind, &item.title)
+    }) {
+        return;
+    }
+    raise_attention(
+        db,
+        execution,
+        LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+        "Workspace is waiting for remaining processes to exit",
+        "The worker has exited. The engine will check the workspace again and return its lease automatically once it is empty.",
+    );
+}
+
+pub(crate) fn previous_occupancy_keep(db: &WorkDb, execution: &WorkExecution) -> bool {
+    promote_legacy_occupancy_keep(db, execution);
+    db.list_attention_items(&execution.id).is_ok_and(|items| {
         items
             .iter()
-            .any(|item| item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND && item.status == "open")
+            .any(|item| item.status == "open" && occupancy_keep_evidence(&item.kind, &item.title))
+    })
+}
+
+pub(crate) fn previous_release_passed_pane_gate(db: &WorkDb, execution_id: &str) -> bool {
+    db.list_attention_items(execution_id).is_ok_and(|items| {
+        items.iter().any(|item| {
+            item.status == "open"
+                && (item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND
+                    || occupancy_keep_evidence(&item.kind, &item.title))
+        })
     })
 }
 
@@ -441,30 +494,78 @@ async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output =
     };
     let mut occupancy = None;
     let mut capture = Some(capture);
+    let mut listing = None;
     for execution in candidates {
         let Some(lease_id) = execution.cube_lease_id.clone() else {
             continue;
         };
         // A terminal registry entry may still own a pane; absence from the
-        // registry is not proof after a restart. Require durable pid death.
+        // registry is not proof after a restart. Require durable pid death,
+        // or a prior occupancy-keep / cube-failure that already passed the
+        // pane gate (so occupancy can be scanned again).
         let pane = sweep_pane_status(work_db, live_states, &execution);
         if pane == PaneStatus::Present {
+            // Unconfirmed death is diagnostic evidence only. It never
+            // authorizes a later pass to skip the pane gate.
             if !live_states.snapshot().iter().any(|state| state.run_id == execution.id) {
+                let pid = work_db
+                    .latest_local_shell_pid_for_execution(&execution.id)
+                    .ok()
+                    .flatten();
+                let death = match pid {
+                    Some(pid) => {
+                        format!("recorded shell PID {pid} has no live execution registration and death is unconfirmed")
+                    }
+                    None => "no shell PID was recorded and death is unconfirmed".to_owned(),
+                };
                 raise_attention(
                     work_db,
                     &execution,
                     LEASE_UNRELEASED_ATTENTION_KIND,
                     "Terminal worker still holds its workspace",
                     &format!(
-                        "Lease {lease_id} cannot be preserved safely: recorded shell PID {:?} has no live execution registration and death is unconfirmed. Inspect this PID on the owning host and retry recovery; the workspace has not been reset.",
-                        work_db
-                            .latest_local_shell_pid_for_execution(&execution.id)
-                            .ok()
-                            .flatten()
+                        "Lease {lease_id} cannot be preserved safely: {death}. Confirm the worker has stopped on the owning host and retry recovery; the workspace has not been reset.",
                     ),
                 );
             }
             outcome.held += 1;
+            continue;
+        }
+        if listing.is_none() {
+            listing = Some(cube_client.list_workspaces().await);
+        }
+        // An expired or reassigned lease must preserve successfully before
+        // dropping the engine's recovery record. Never release its new holder.
+        // A listing error falls through to apply_release.
+        if let Some(Ok(rows)) = listing.as_ref()
+            && !rows
+                .iter()
+                .any(|row| row.lease_id.as_deref() == Some(lease_id.as_str()))
+        {
+            let (tip_source, _) = workspace_tip_source_from_listing(
+                &execution,
+                work_db.workspace_lease_boundary(&execution.id).ok().flatten(),
+                work_db.workspace_lease_generation(&execution.id).ok().flatten(),
+                rows,
+            );
+            if matches!(tip_source, WorkspaceTipSource::Live) && occupancy.is_none() {
+                occupancy = Some(capture.take().expect("one scan per pass")().await);
+            }
+            match reconcile_absent_lease(
+                work_db,
+                &execution,
+                &lease_id,
+                None,
+                Some(cube_client),
+                occupancy.as_ref().map(|probe| probe as &dyn WorkspaceOccupancy),
+                Some(rows.as_slice()),
+            )
+            .await
+            {
+                Ok(LeaseReleaseOutcome::Released) => outcome.released += 1,
+                Ok(LeaseReleaseOutcome::NoLease) => {}
+                _ => outcome.kept += 1,
+            }
             continue;
         }
         if occupancy.is_none() {

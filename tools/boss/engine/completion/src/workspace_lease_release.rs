@@ -24,12 +24,15 @@ use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 
 use crate::work::WorkDb;
 
-pub use boss_engine_storage_values::attention_kinds::LEASE_UNRELEASED_ATTENTION_KIND;
+pub use boss_engine_storage_values::attention_kinds::{
+    LEASE_OCCUPANCY_KEPT_ATTENTION_KIND, LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND, LEASE_UNRELEASED_ATTENTION_KIND,
+};
 
 pub use boss_engine_storage_values::attention_kinds::LEASE_RELEASE_FAILED_ATTENTION_KIND;
 
-use boss_engine_recovery::execution_bookmark::{BoundaryOwnership, WorkspaceTipSource};
-use boss_execution_contracts::{CubeClient, HostAdapter};
+use boss_engine_recovery::execution_bookmark::BoundaryOwnership;
+pub use boss_engine_recovery::execution_bookmark::WorkspaceTipSource;
+use boss_execution_contracts::{CubeClient, CubeWorkspaceStatus, HostAdapter};
 
 pub use boss_execution_contracts::{
     KeepReason, LeaseReleaseDecision, LeaseReleaseOutcome, Occupancy, PaneStatus, TerminalCause,
@@ -156,6 +159,22 @@ async fn workspace_tip_source(
             None => anyhow::bail!("owning cube unavailable for inferred workspace release"),
         },
     };
+    Ok(workspace_tip_source_from_listing(
+        execution,
+        boundary,
+        lease_generation,
+        &workspaces,
+    ))
+}
+
+/// Registry view of an inferred teardown: live only while this execution still
+/// holds the lease, or the workspace is free with an unchanged claim counter.
+pub fn workspace_tip_source_from_listing(
+    execution: &WorkExecution,
+    boundary: Option<i64>,
+    lease_generation: Option<i64>,
+    workspaces: &[CubeWorkspaceStatus],
+) -> (WorkspaceTipSource, String) {
     let owned = execution
         .cube_workspace_id
         .as_deref()
@@ -164,7 +183,7 @@ async fn workspace_tip_source(
             ws.state == "leased" && execution.cube_lease_id.is_some() && ws.lease_id == execution.cube_lease_id
         });
     if owned {
-        return Ok((WorkspaceTipSource::Live, String::new()));
+        return (WorkspaceTipSource::Live, String::new());
     }
     let registered = execution
         .cube_workspace_id
@@ -179,7 +198,7 @@ async fn workspace_tip_source(
     // the free workspace carries that holder's leftovers, not this execution's.
     let claimed_since = registered_free && matches!(generations, (Some(held), Some(now)) if held != now);
     if sole_holder {
-        return Ok((WorkspaceTipSource::Live, String::new()));
+        return (WorkspaceTipSource::Live, String::new());
     }
     let ownership = format!(
         "workspace {:?}, original lease {:?}, recorded lease generation {:?}, current registry leases: {:?}",
@@ -192,7 +211,7 @@ async fn workspace_tip_source(
             .map(|ws| (&ws.state, &ws.lease_id, ws.lease_generation))
             .collect::<Vec<_>>()
     );
-    Ok((
+    (
         match boundary {
             Some(unix_millis) => WorkspaceTipSource::LeaseBoundary {
                 unix_millis,
@@ -205,7 +224,7 @@ async fn workspace_tip_source(
             None => WorkspaceTipSource::UnknownBoundary,
         },
         ownership,
-    ))
+    )
 }
 
 impl DbPreservation<'_> {
@@ -359,38 +378,11 @@ pub async fn apply_release_choosing<Fut: Future<Output = Result<()>>>(
         occupancy,
         preservation,
     } = evidence;
-    let local = matches!(db.execution_host_id(&execution.id), Ok(None))
-        || matches!(db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
-    let occupancy_status = if pane == PaneStatus::Present || cause == TerminalCause::ProvenNeverStarted {
-        Occupancy::Empty // Neither case may start cleanup; decide still gates on the pane.
-    } else if !local && !occupancy.probes_owning_host() {
-        Occupancy::Unknown
-    } else if local && let Some(cleanup) = occupancy.cleanup(db, execution) {
-        cleanup.await.unwrap_or_else(|err| {
-            raise_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND,
-                "Workspace recovery needs process cleanup", &format!("Lease {lease_id}: {err:#}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected."));
-            tracing::error!(execution_id = %execution.id, lease_id, error = %err, "workspace process cleanup failed");
-            Occupancy::Unknown
-        })
-    } else {
-        execution
-            .workspace_path
-            .as_deref()
-            .map_or(Occupancy::Unknown, |path| occupancy.occupancy(Path::new(path)))
-    };
+    let (occupancy_status, occupancy_detail) = probe_occupancy(db, execution, lease_id, occupancy, pane, cause).await;
     match decide(cause, pane, occupancy_status) {
         LeaseReleaseDecision::Keep(reason) => {
             if pane == PaneStatus::Gone {
-                raise_attention(
-                    db,
-                    execution,
-                    LEASE_UNRELEASED_ATTENTION_KIND,
-                    "Workspace recovery could not release its lease",
-                    &format!(
-                        "Lease {lease_id} remains held: {}. Inspect the owning host's worker process cleanup log for PIDs and retry recovery after resolving the occupants or host connectivity.",
-                        reason.label()
-                    ),
-                );
+                file_occupancy_keep(db, execution, lease_id, reason, occupancy_detail.as_deref());
             }
             tracing::info!(
                 execution_id = %execution.id,
@@ -522,6 +514,90 @@ impl Preservation for NoPreservation {
     }
 }
 
+/// Preserve on the owning host before clearing an absent lease record.
+/// The registry-aware preservation source never snapshots a new holder's work.
+/// A live working copy is snapshotted only after occupancy agrees the
+/// workspace is empty. Failing to run preservation (jj, unreachable host,
+/// missing recovery record or path) keeps the recovery record so a successor
+/// cannot skip it. Completing preservation with an inspection files the item
+/// and still reconciles, matching the held-lease path.
+pub async fn reconcile_absent_lease(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    adapter: Option<&dyn HostAdapter>,
+    cube: Option<&dyn CubeClient>,
+    occupancy: Option<&dyn WorkspaceOccupancy>,
+    workspaces: Option<&[CubeWorkspaceStatus]>,
+) -> Result<LeaseReleaseOutcome> {
+    let current = db.get_execution(&execution.id)?;
+    if current.cube_lease_id.as_deref() != Some(lease_id) {
+        return Ok(LeaseReleaseOutcome::NoLease);
+    }
+    let (tip_source, _) = match workspaces {
+        Some(rows) => workspace_tip_source_from_listing(
+            &current,
+            db.workspace_lease_boundary(&current.id)?,
+            db.workspace_lease_generation(&current.id)?,
+            rows,
+        ),
+        None => {
+            workspace_tip_source(
+                &current,
+                db.workspace_lease_boundary(&current.id)?,
+                db.workspace_lease_generation(&current.id)?,
+                cube,
+                adapter,
+            )
+            .await?
+        }
+    };
+    if matches!(tip_source, WorkspaceTipSource::Live) {
+        let (occupancy_status, occupancy_detail) = match occupancy {
+            Some(probe) => {
+                probe_occupancy(db, &current, lease_id, probe, PaneStatus::Gone, TerminalCause::Inferred).await
+            }
+            None => (Occupancy::Unknown, None),
+        };
+        if let LeaseReleaseDecision::Keep(reason) = decide(TerminalCause::Inferred, PaneStatus::Gone, occupancy_status)
+        {
+            file_occupancy_keep(db, &current, lease_id, reason, occupancy_detail.as_deref());
+            tracing::info!(
+                execution_id = %current.id,
+                lease_id,
+                reason = reason.label(),
+                "workspace lease kept",
+            );
+            return Ok(LeaseReleaseOutcome::Kept { reason });
+        }
+    }
+    if let Err(err) = DbPreservation::new(db, adapter)
+        .preserve_workspace(&current, TerminalCause::Inferred, cube)
+        .await
+    {
+        let reason = format!(
+            "Could not preserve workspace {} before reconciling absent lease {lease_id}: {err:#}",
+            current.workspace_path.as_deref().unwrap_or("(unknown path)")
+        );
+        db.refresh_teardown_preservation_attention(&current.id, Some(&reason), "recovery held; lease already absent")?;
+        refresh_attention(
+            db,
+            &current,
+            LEASE_UNRELEASED_ATTENTION_KIND,
+            "Workspace recovery could not preserve unpublished work",
+            &reason,
+        );
+        return Ok(LeaseReleaseOutcome::CubeFailed { error: reason });
+    }
+    db.refresh_teardown_preservation_attention(&current.id, None, "absent lease preserved")?;
+    if !db.claim_execution_workspace_release(&execution.id, lease_id)? {
+        return Ok(LeaseReleaseOutcome::NoLease);
+    }
+    db.finish_execution_workspace_release(execution)?;
+    resolve_unreleased_attention(db, &execution.id);
+    Ok(LeaseReleaseOutcome::Released)
+}
+
 /// Pre-start helper: the worker never started, so occupancy is not scanned.
 pub async fn release_lease_after_proven_never_started(
     work_db: &WorkDb,
@@ -544,24 +620,19 @@ pub async fn release_lease_after_proven_never_started(
     if let Ok(workspaces) = adapter.list_workspaces().await
         && !workspaces.iter().any(|ws| ws.lease_id.as_deref() == Some(lease_id))
     {
-        return match work_db.claim_execution_workspace_release(&execution.id, lease_id) {
-            Ok(true) => {
-                if let Err(err) = work_db.finish_execution_workspace_release(execution) {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        lease_id,
-                        error = %format!("{err:#}"),
-                        "failed to clear released workspace metadata",
-                    );
-                }
-                resolve_unreleased_attention(work_db, &execution.id);
-                LeaseReleaseOutcome::Released
-            }
-            Ok(false) => LeaseReleaseOutcome::NoLease,
-            Err(err) => LeaseReleaseOutcome::CubeFailed {
-                error: format!("{err:#}"),
-            },
-        };
+        return reconcile_absent_lease(
+            work_db,
+            execution,
+            lease_id,
+            Some(adapter),
+            None,
+            Some(&EmptyOccupancy),
+            Some(&workspaces),
+        )
+        .await
+        .unwrap_or_else(|err| LeaseReleaseOutcome::CubeFailed {
+            error: format!("{err:#}"),
+        });
     }
     apply_release(
         work_db,
@@ -641,6 +712,85 @@ fn report_preservation_failure(
     }
 }
 
+async fn probe_occupancy(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    occupancy: &dyn WorkspaceOccupancy,
+    pane: PaneStatus,
+    cause: TerminalCause,
+) -> (Occupancy, Option<String>) {
+    let local = matches!(db.execution_host_id(&execution.id), Ok(None))
+        || matches!(db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
+    if pane == PaneStatus::Present || cause == TerminalCause::ProvenNeverStarted {
+        return (Occupancy::Empty, None); // Neither case may start cleanup; decide still gates on the pane.
+    }
+    if !local && !occupancy.probes_owning_host() {
+        return (Occupancy::Unknown, None);
+    }
+    if local && let Some(cleanup) = occupancy.cleanup(db, execution) {
+        return match cleanup.await {
+            Ok(status) => (status, None),
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, lease_id, error = %err, "workspace process cleanup failed");
+                (Occupancy::Unknown, Some(format!("{err:#}")))
+            }
+        };
+    }
+    (
+        execution
+            .workspace_path
+            .as_deref()
+            .map_or(Occupancy::Unknown, |path| occupancy.occupancy(Path::new(path))),
+        None,
+    )
+}
+
+fn file_occupancy_keep(
+    db: &WorkDb,
+    execution: &WorkExecution,
+    lease_id: &str,
+    reason: KeepReason,
+    occupancy_detail: Option<&str>,
+) {
+    raise_attention(
+        db,
+        execution,
+        LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+        "Workspace is waiting for remaining processes to exit",
+        "The worker has exited. The engine will check the workspace again and return its lease automatically once it is empty.",
+    );
+    let (title, body) = occupancy_keep_attention(lease_id, reason, occupancy_detail);
+    if occupancy_detail.is_some() {
+        refresh_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND, title, &body);
+    } else {
+        raise_attention(db, execution, LEASE_UNRELEASED_ATTENTION_KIND, title, &body);
+    }
+}
+
+fn occupancy_keep_attention(
+    lease_id: &str,
+    reason: KeepReason,
+    cleanup_detail: Option<&str>,
+) -> (&'static str, String) {
+    match cleanup_detail {
+        Some(detail) => (
+            "Workspace recovery needs process cleanup",
+            format!(
+                "Lease {lease_id} remains held: {}. {detail}. Inspect the named processes on the owning host, then retry recovery. The workspace remains protected.",
+                reason.label()
+            ),
+        ),
+        None => (
+            "Workspace recovery could not release its lease",
+            format!(
+                "Lease {lease_id} remains held: {}. Inspect the owning host's worker process cleanup log for PIDs and retry recovery after resolving the occupants or host connectivity.",
+                reason.label()
+            ),
+        ),
+    }
+}
+
 pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
     match db.list_attention_items(&execution.id) {
         Ok(items) if items.iter().any(|item| item.kind == kind && item.status == "open") => {
@@ -673,9 +823,27 @@ pub fn raise_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title
     }
 }
 
+/// Refresh an open occupancy-keep item with the latest scan. `created_at`
+/// stays put so a successor's hold bound is not reset; the body is what
+/// later failure messages quote.
+pub fn refresh_attention(db: &WorkDb, execution: &WorkExecution, kind: &str, title: &str, body: &str) {
+    if let Err(err) = db.upsert_execution_attention(&execution.id, kind, title, body) {
+        tracing::error!(
+            execution_id = %execution.id,
+            error = %format!("{err:#}"),
+            "could not refresh workspace-lease attention",
+        );
+    }
+}
+
 /// The lease these items describe is gone, so they no longer say anything true.
 pub fn resolve_unreleased_attention(db: &WorkDb, execution_id: &str) {
-    for kind in [LEASE_UNRELEASED_ATTENTION_KIND, LEASE_RELEASE_FAILED_ATTENTION_KIND] {
+    for kind in [
+        LEASE_UNRELEASED_ATTENTION_KIND,
+        LEASE_RELEASE_FAILED_ATTENTION_KIND,
+        LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+        LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND,
+    ] {
         if let Err(err) = db.resolve_attention_kind_for_execution(execution_id, kind) {
             tracing::warn!(
                 execution_id,
@@ -771,7 +939,7 @@ pub async fn release_remote_lease<Fut: std::future::Future<Output = anyhow::Resu
                 .await,
         )
         .unwrap_or_else(|err| {
-                raise_attention(work_db, &execution, LEASE_UNRELEASED_ATTENTION_KIND,
+                refresh_attention(work_db, &execution, LEASE_UNRELEASED_ATTENTION_KIND,
                     "Remote workspace recovery needs process cleanup", &format!("Lease {lease_id} on {}: {err:#}. Inspect the named processes or restore host connectivity, then retry recovery.", host.host_id()));
                 tracing::debug!(
                     execution_id,
