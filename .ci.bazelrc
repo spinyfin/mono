@@ -94,4 +94,30 @@ test:ci-remote --config=remote-tests
 # line is here.
 build:ci-remote --remote_cache_compression
 
-
+# ==========================================
+# REMOTE EXECUTION (Linux)
+# ==========================================
+# Selected by .buildkite/steps/ci-env.sh on a Linux x86-64 agent, after
+# --config=ci-linux, together with --remote_executor and --remote_cache. As
+# with ci-remote above, the endpoint comes from the agent's environment and
+# the conditions are in .buildkite/steps/remote-execution.sh.
+#
+# Build actions execute on the Linux workers. Tests do not: this config names
+# no test strategy, so `test:linux --strategy=TestRunner=linux-sandbox` in
+# .bazelrc still applies and every test runs on the agent, inside Bazel's
+# linux-sandbox. That sandbox is the isolation boundary for tests on Linux
+# (tools/test-sandbox/README.md) and the workers run an action directly in its
+# work directory, so do not add `--config=remote-tests` or any TestRunner
+# strategy here. Bazel downloads what a test needs from the remote cache.
+#
+# The disk cache from build:ci-linux stays on, for the reason given under
+# ci-remote.
+build:ci-remote-linux --jobs=64
+build:ci-remote-linux --noremote_local_fallback
+build:ci-remote-linux --remote_cache_compression
+# The tag that routes the build: every action asks for a worker whose
+# OSFamily is linux, and the Linux scheduler offers an action only to workers
+# that declare that value. The property is part of each action's cache key, so
+# a step that executes remotely and one that builds on the agent do not share
+# results, in either the remote cache or the disk cache.
+build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux

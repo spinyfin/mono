@@ -306,7 +306,7 @@ The audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, wh
 
 A test tagged `exclusive` cannot be scheduled remotely at all, because the tag also forces local execution. `exclusive-if-local` keeps the serial run locally and lets the test go to a worker.
 
-Linux remote execution is out of scope altogether. The Linux boundary comes from Bazel's local `linux-sandbox`, and a remote executor would have to provide an equivalent.
+Remote execution of tests on Linux is out of scope altogether. The Linux boundary comes from Bazel's local `linux-sandbox`, and a remote executor would have to provide an equivalent. CI's Linux agents do send build actions to remote Linux workers (`ci-remote-linux` in `.ci.bazelrc`, see `.buildkite/README.md`), but that config names no test strategy, so `test:linux --strategy=TestRunner=linux-sandbox` still decides where a test runs: on the agent.
 
 ## Remote execution from a developer's Mac
 

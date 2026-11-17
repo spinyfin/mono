@@ -1,15 +1,15 @@
 #!/bin/bash
 # remote-execution.sh -- decide whether a CI step's bazel commands execute on
-# the remote macOS workers or on the agent that runs the step.
+# remote workers or on the agent that runs the step.
 #
 # Sourced by ci-env.sh (and by its test); defines functions only, no side
 # effects. On failure a function prints a `[ci-env] error:` line on stderr and
 # returns non-zero.
 #
-# Why: a macOS CI agent that builds and tests on its own cores competes with
-# everything else on that host, including the remote workers that share the
-# hardware. Sending the actions to the workers leaves the agent as a thin
-# Bazel client and lets the scheduler place the work.
+# Why: a CI agent that builds on its own cores competes with everything else
+# on that host, including the remote workers that share the hardware. Sending
+# the actions to the workers leaves the agent as a thin Bazel client and lets
+# the scheduler place the work.
 #
 # A step executes remotely only when all of these hold. Otherwise it builds on
 # the agent exactly as it did before, with the disk cache from .ci.bazelrc.
@@ -19,7 +19,12 @@
 #      line and action environment are sent to the workers and stored in the
 #      remote cache: a release step that passes credentials through --define
 #      must not start doing that because a new default appeared.
-#   2. The agent is a Mac. The workers are macOS only.
+#   2. There are workers for the agent's platform: macOS, or Linux on x86-64.
+#      The workers run an agent's actions with the agent's own toolchain
+#      paths, so an agent only ever uses workers of its own platform. Which
+#      workers those are is decided by the endpoint (condition 3): each
+#      platform's agents name the endpoint whose scheduler has that
+#      platform's workers.
 #   3. The agent's environment names an endpoint in CI_BAZEL_REMOTE_EXECUTOR.
 #      That is host configuration (the Buildkite agent's environment hook), not
 #      repo configuration: every open branch carries its own copy of the repo's
@@ -28,9 +33,20 @@
 #      the way to take that agent back to local builds without a merge.
 #   4. The endpoint accepts a TCP connection. With the scheduler down the step
 #      builds on the agent rather than failing, and says so. The fallback is
-#      decided once, here, for the whole step: .bazelrc's `remote-tests`
-#      config names the `remote` strategy alone on purpose, so a step never
-#      mixes remote and local results silently.
+#      decided once, here, for the whole step, so a step never mixes worker
+#      results with agent results silently.
+#
+# What "remotely" covers differs by platform, and .ci.bazelrc has the config
+# for each:
+#
+#   macOS  `ci-remote`: every action, tests included. The test wrapper's
+#          Seatbelt profile is the isolation boundary and it is built on the
+#          worker.
+#   Linux  `ci-remote-linux`: build actions only. Tests keep the strategy
+#          .bazelrc gives them, `linux-sandbox` on the agent, because that
+#          sandbox is the Linux isolation boundary and the workers do not
+#          provide one. The config also tags every action OSFamily=linux, the
+#          property the Linux scheduler matches workers on.
 #
 # A malformed endpoint is an error, not a fallback: a typo on an agent would
 # otherwise leave that agent building locally for good with nothing to show it.
@@ -69,20 +85,25 @@ ci_remote_endpoint_host_port() {
   printf '%s %s\n' "$host" "$port"
 }
 
-# ci_remote_endpoint_reachable <host> <port>
+# ci_remote_endpoint_reachable <os_type> <host> <port>
 #
 # Succeeds if a TCP connection to the endpoint is accepted within
-# CI_REMOTE_PROBE_TIMEOUT_SECS. `-G` is the connect timeout of the macOS nc;
-# only Mac agents reach this call.
+# CI_REMOTE_PROBE_TIMEOUT_SECS. The connect timeout is `-G` for the macOS nc
+# and `-w` for the Linux one (netcat-openbsd, where `-G` does not exist).
 ci_remote_endpoint_reachable() {
-  nc -z -G "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$1" "$2" > /dev/null 2>&1
+  local timeout_flag="-G"
+  if [[ "$1" == "linux" ]]; then
+    timeout_flag="-w"
+  fi
+  nc -z "$timeout_flag" "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$2" "$3" > /dev/null 2>&1
 }
 
-# ci_remote_execution_decide <os_type>
+# ci_remote_execution_decide <os_type> <arch>
 #
-# Applies the four conditions above and reports through globals rather than
-# stdout, because there are several results and a command substitution would
-# keep only one:
+# <os_type> is `uname -s` in lower case and <arch> is `uname -m`. Applies the
+# four conditions above and reports through globals rather than stdout,
+# because there are several results and a command substitution would keep only
+# one:
 #
 #   CI_REMOTE_EXECUTION            "on" or "off".
 #   CI_REMOTE_EXECUTION_REASON     One line for the step's log.
@@ -97,7 +118,7 @@ ci_remote_endpoint_reachable() {
 #
 # Returns non-zero only for a malformed endpoint.
 ci_remote_execution_decide() {
-  local os_type="$1" endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port
+  local os_type="$1" arch="${2:-}" endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port config scope
   CI_REMOTE_EXECUTION=off
   CI_REMOTE_EXECUTION_REASON=""
   CI_REMOTE_EXECUTION_FELL_BACK=0
@@ -108,23 +129,33 @@ ci_remote_execution_decide() {
     CI_REMOTE_EXECUTION_REASON="this step has not opted in"
     return 0
   fi
-  if [[ "$os_type" != "darwin" ]]; then
-    CI_REMOTE_EXECUTION_REASON="the remote workers are macOS only"
-    return 0
-  fi
+  case "${os_type}/${arch}" in
+    darwin/*)
+      config="ci-remote"
+      scope="actions execute on the remote macOS workers"
+      ;;
+    linux/x86_64)
+      config="ci-remote-linux"
+      scope="build actions execute on the remote Linux workers; tests run on this agent under linux-sandbox"
+      ;;
+    *)
+      CI_REMOTE_EXECUTION_REASON="there are no remote workers for ${os_type}/${arch:-unknown}"
+      return 0
+      ;;
+  esac
   if [[ -z "$endpoint" ]]; then
     CI_REMOTE_EXECUTION_REASON="this agent does not set CI_BAZEL_REMOTE_EXECUTOR"
     return 0
   fi
   host_port="$(ci_remote_endpoint_host_port "$endpoint")" || return 1
-  if ! ci_remote_endpoint_reachable "${host_port% *}" "${host_port##* }"; then
+  if ! ci_remote_endpoint_reachable "$os_type" "${host_port% *}" "${host_port##* }"; then
     CI_REMOTE_EXECUTION_FELL_BACK=1
     CI_REMOTE_EXECUTION_REASON="the remote executor did not accept a connection within ${CI_REMOTE_PROBE_TIMEOUT_SECS}s, so this step builds on the agent"
     return 0
   fi
 
   CI_REMOTE_EXECUTION=on
-  CI_REMOTE_EXECUTION_REASON="actions execute on the remote macOS workers"
-  CI_REMOTE_BAZEL_FLAGS="--config=ci-remote --remote_executor=${endpoint} --remote_cache=${endpoint}"
+  CI_REMOTE_EXECUTION_REASON="$scope"
+  CI_REMOTE_BAZEL_FLAGS="--config=${config} --remote_executor=${endpoint} --remote_cache=${endpoint}"
   CI_BAZEL_VERIFY_ONLY_FLAGS="--remote_download_minimal"
 }

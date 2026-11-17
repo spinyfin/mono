@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Tests for .buildkite/steps/remote-execution.sh, the library ci-env.sh uses to
-# decide whether a step's bazel actions execute on the remote macOS workers.
+# decide whether a step's bazel actions execute on remote workers.
 #
 # `nc` is stubbed with a shell function: the hermetic test sandbox has no
 # network and its PATH does not carry nc, and a stub is also what lets the test
@@ -88,9 +88,17 @@ nc() {
   return "$nc_status"
 }
 
-# decide <os_type> <allowed> <endpoint> <nc_status>: runs the decision in this
-# shell (it reports through globals) with a clean slate and the given inputs.
+# decide <os_type> <allowed> <endpoint> <nc_status> [<arch>]: runs the decision
+# in this shell (it reports through globals) with a clean slate and the given
+# inputs. <arch> defaults to the architecture of each platform's agents.
 decide() {
+  local arch="${5:-}"
+  if [[ -z "$arch" ]]; then
+    case "$1" in
+      darwin) arch=arm64 ;;
+      *) arch=x86_64 ;;
+    esac
+  fi
   : > "$nc_calls"
   nc_status="$4"
   CI_REMOTE_EXECUTION_ALLOWED="$2"
@@ -99,7 +107,7 @@ decide() {
   CI_REMOTE_BAZEL_FLAGS="stale"
   CI_BAZEL_VERIFY_ONLY_FLAGS="stale"
   CI_REMOTE_EXECUTION_FELL_BACK="stale"
-  ci_remote_execution_decide "$1" 2> /dev/null
+  ci_remote_execution_decide "$1" "$arch" 2> /dev/null
 }
 
 # expect_local <description> <fell_back>: off, no flags of any kind.
@@ -123,25 +131,34 @@ expect_equal "" "$(cat "$nc_calls")" "not opted in: endpoint probed"
 unset CI_REMOTE_EXECUTION_ALLOWED
 : > "$nc_calls"
 CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
-ci_remote_execution_decide darwin || fail "allowed unset: decide failed"
+ci_remote_execution_decide darwin arm64 || fail "allowed unset: decide failed"
 expect_local "allowed unset" 0
 
 # Only the exact value 1 opts in.
 decide darwin true "$endpoint" 0 || fail "allowed=true: decide failed"
 expect_local "allowed=true" 0
 
-# The workers are macOS only: a Linux agent builds locally whatever its
-# environment says.
-decide linux 1 "$endpoint" 0 || fail "linux: decide failed"
-expect_local "linux" 0
-expect_equal "" "$(cat "$nc_calls")" "linux: endpoint probed"
+# A platform with no workers builds on the agent whatever its environment
+# says, and the endpoint is not probed: Linux on anything but x86-64, another
+# OS, and a caller that passes no architecture.
+decide linux 1 "$endpoint" 0 aarch64 || fail "linux/aarch64: decide failed"
+expect_local "linux/aarch64" 0
+expect_equal "" "$(cat "$nc_calls")" "linux/aarch64: endpoint probed"
+decide freebsd 1 "$endpoint" 0 x86_64 || fail "freebsd: decide failed"
+expect_local "freebsd" 0
+: > "$nc_calls"
+CI_REMOTE_EXECUTION_ALLOWED=1
+CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+ci_remote_execution_decide linux || fail "linux, no arch: decide failed"
+expect_local "linux, no arch" 0
+expect_equal "" "$(cat "$nc_calls")" "linux, no arch: endpoint probed"
 
 # A Mac whose environment names no endpoint.
 decide darwin 1 "" 0 || fail "no endpoint: decide failed"
 expect_local "no endpoint" 0
 unset CI_BAZEL_REMOTE_EXECUTOR
 CI_REMOTE_EXECUTION_ALLOWED=1
-ci_remote_execution_decide darwin || fail "endpoint unset: decide failed"
+ci_remote_execution_decide darwin arm64 || fail "endpoint unset: decide failed"
 expect_local "endpoint unset" 0
 
 # All four conditions hold.
@@ -158,6 +175,30 @@ expect_equal "-z -G ${CI_REMOTE_PROBE_TIMEOUT_SECS} executor.test 50051" "$(cat 
 # was meant to execute remotely.
 decide darwin 1 "$endpoint" 1 || fail "unreachable: decide failed"
 expect_local "unreachable" 1
+
+# A Linux x86-64 agent: the Linux config, and the probe uses the connect
+# timeout flag of the Linux nc. Everything else is the same decision.
+decide linux 1 "$endpoint" 0 || fail "linux remote: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "linux remote: CI_REMOTE_EXECUTION"
+expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "linux remote: CI_REMOTE_EXECUTION_FELL_BACK"
+expect_equal \
+  "--config=ci-remote-linux --remote_executor=${endpoint} --remote_cache=${endpoint}" \
+  "$CI_REMOTE_BAZEL_FLAGS" "linux remote: CI_REMOTE_BAZEL_FLAGS"
+expect_equal "--remote_download_minimal" "$CI_BAZEL_VERIFY_ONLY_FLAGS" "linux remote: CI_BAZEL_VERIFY_ONLY_FLAGS"
+expect_equal "-z -w ${CI_REMOTE_PROBE_TIMEOUT_SECS} executor.test 50051" "$(cat "$nc_calls")" "linux remote: probe command"
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"tests run on this agent"* ]]; then
+  fail "linux remote: the reason does not say where tests run: ${CI_REMOTE_EXECUTION_REASON}"
+fi
+
+decide linux 1 "$endpoint" 1 || fail "linux unreachable: decide failed"
+expect_local "linux unreachable" 1
+
+decide linux 1 "" 0 || fail "linux, no endpoint: decide failed"
+expect_local "linux, no endpoint" 0
+
+decide linux 0 "$endpoint" 0 || fail "linux, not opted in: decide failed"
+expect_local "linux, not opted in" 0
+expect_equal "" "$(cat "$nc_calls")" "linux, not opted in: endpoint probed"
 
 # A malformed endpoint is an error, not a quiet local build.
 if decide darwin 1 "executor.test:50051" 0; then
@@ -179,10 +220,24 @@ for line in \
     fail ".ci.bazelrc lacks the line '${line}'"
   fi
 done
-# The remote config must leave the disk cache alone: a remote step has to be
+for line in \
+  "build:ci-remote-linux --noremote_local_fallback" \
+  "build:ci-remote-linux --remote_cache_compression" \
+  "build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux"; do
+  if ! grep -qxF -- "$line" "$real_rc"; then
+    fail ".ci.bazelrc lacks the line '${line}'"
+  fi
+done
+# On Linux, tests stay on the agent under linux-sandbox, which is the isolation
+# boundary there. The Linux remote config must therefore name no test strategy
+# and must not select the config that sends tests to the workers.
+if grep -qE -- "^[a-z]+:ci-remote-linux .*(--config=remote-tests|strategy)" "$real_rc"; then
+  fail ".ci.bazelrc must not send tests to the workers for ci-remote-linux"
+fi
+# Neither remote config may change the disk cache: a remote step has to be
 # able to read what a step that built on the agent left there.
-if grep -qE -- "^[a-z]+:ci-remote .*--disk_cache" "$real_rc"; then
-  fail ".ci.bazelrc must not change --disk_cache for ci-remote"
+if grep -qE -- "^[a-z]+:ci-remote(-linux)? .*--disk_cache" "$real_rc"; then
+  fail ".ci.bazelrc must not change --disk_cache for ci-remote or ci-remote-linux"
 fi
 # The endpoint is host configuration and must not be written into the repo.
 if grep -qE -- "--remote_(executor|cache)=" "$real_rc"; then

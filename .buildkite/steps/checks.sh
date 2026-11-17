@@ -10,7 +10,7 @@
 # execs the binary directly, preserving the caller's cwd.
 set -euo pipefail
 
-# This step may execute its bazel actions on the remote macOS workers; ci-env.sh
+# This step may execute its bazel actions on remote workers; ci-env.sh
 # decides whether it does (see remote-execution.sh). It qualifies because
 # nothing it passes to bazel is a credential. checkleft and
 # repobin build the tools they then run, which downloads those outputs as usual.
