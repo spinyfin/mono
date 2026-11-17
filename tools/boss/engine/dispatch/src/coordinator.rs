@@ -608,6 +608,11 @@ pub struct ExecutionCoordinator {
     /// is responsible for noticing the wakeup via `scheduling_pending`.
     #[builder(default)]
     pub(crate) scheduling_active: AtomicBool,
+    /// Owning-host refresh state, shared by all successors of a predecessor.
+    #[builder(skip = Default::default())]
+    predecessor_rechecks: std::sync::Mutex<std::collections::HashMap<String, predecessor_hold::Recheck>>,
+    #[builder(default)]
+    predecessor_recheck_done: tokio::sync::Notify,
     /// Wakeup flag set by every `kick()` (whether or not it spawned a
     /// fresh scheduler). The running scheduler reads + resets this on
     /// each outer iteration so that a kick which arrived during the

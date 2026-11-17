@@ -421,7 +421,7 @@ impl ExecutionCoordinator {
         self.work_db.get_execution_driver_slug(&execution.id)
     }
 
-    async fn check_predecessor_lease_hold(&self, execution: &WorkExecution, worker_id: &str) -> Result<()> {
+    async fn check_predecessor_lease_hold(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str) -> Result<()> {
         // The run this row recovers from has not released its cube lease, so
         // its unpublished work may not be preserved yet. The drain holds such
         // a row before claiming a slot; this is the chokepoint backstop for
@@ -429,7 +429,7 @@ impl ExecutionCoordinator {
         // and this call. Starting from trunk here would strand the work, so it
         // refuses rather than guess. A pending preservation leaves the row
         // ready; a hold that outlasts its bound terminalizes it with a retry reason.
-        self.refresh_predecessor_lease(execution).await;
+        self.await_predecessor_recheck(execution).await;
         let hold = match self.predecessor_lease_hold(execution) {
             None => return Ok(()),
             Some(hold) => hold,

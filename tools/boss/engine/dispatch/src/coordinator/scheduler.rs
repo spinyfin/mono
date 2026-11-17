@@ -1434,8 +1434,15 @@ impl ExecutionCoordinator {
             // this is not a scheduling policy but a guard against silently
             // abandoning work. Checked before any slot, lease or pane is
             // touched; `schedule_execution` repeats it for `force_dispatch`.
-            self.refresh_predecessor_lease(&execution).await;
-            match self.predecessor_lease_hold(&execution) {
+            let refreshing = self.refresh_predecessor_lease(&execution);
+            let hold = self.predecessor_lease_hold(&execution).map(|hold| {
+                if refreshing {
+                    PredecessorHold::Waiting("recovery predecessor lease re-check is in flight".to_owned())
+                } else {
+                    hold
+                }
+            });
+            match hold {
                 None => {}
                 Some(PredecessorHold::Failed(error)) => {
                     self.fail_predecessor_hold(&execution, &error);

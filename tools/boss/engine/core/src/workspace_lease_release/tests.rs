@@ -900,7 +900,7 @@ async fn legacy_occupancy_keep_survives_a_transient_registry_fault() {
         &db,
         &execution,
         LEASE_UNRELEASED_ATTENTION_KIND,
-        "Workspace recovery needs process cleanup",
+        boss_engine_storage_values::attention_kinds::LEASE_PROCESS_CLEANUP_TITLE,
         "Workspace processes have not exited",
     );
     assert!(previous_occupancy_keep(&db, &execution));
