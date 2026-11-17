@@ -21,7 +21,16 @@ fn matches_only_cancellation_log_for_exact_parent() {
     };
     assert!(driver.is_interrupt_recovery_turn_end(&serde_json::json!(line(PARENT))));
     assert!(driver.is_interrupt_recovery_line(&line(PARENT), &snapshot));
+    for file in ["server.go", "internal/response.go"] {
+        let alternate = line(PARENT).replace("conversation_manager.go", file);
+        assert!(driver.is_interrupt_recovery_line(&alternate, &snapshot));
+    }
     for noise in [
+        line(PARENT).replace(".go:123]", ".rs:123]"),
+        line(PARENT).replace(":123]", ":abc]"),
+        line(PARENT).replace(":123]", ":]"),
+        line(PARENT).replace(":123]", ":123"),
+        line(PARENT).replace("] Cancelling", "] quoted Cancelling"),
         line(CHILD),
         line(&format!("{PARENT}-suffix")),
         format!("server.go:10] Cancelling conversation {PARENT} (killBackgroundTasks=false)"),

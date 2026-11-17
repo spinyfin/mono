@@ -405,6 +405,14 @@ fn malformed_idleness_never_establishes_a_boundary() {
         crate::AgyDriver::default().turn_boundary(&event).unwrap().reason,
         StopReason::Other
     );
+    for reason in [Value::Null, json!(42), json!(true), json!({"reason": "NO_TOOL_CALL"})] {
+        raw["terminationReason"] = reason;
+        let event = session.normalize_progress_event(&raw).unwrap();
+        assert_eq!(
+            crate::AgyDriver::default().turn_boundary(&event).unwrap().reason,
+            StopReason::Other
+        );
+    }
 }
 
 #[test]

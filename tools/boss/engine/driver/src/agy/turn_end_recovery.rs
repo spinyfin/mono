@@ -36,8 +36,15 @@ pub(super) fn prepare_snapshot(run_id: &str, claimed_id: Option<&str>) -> Option
 /// A child cancellation or an id prefix must never confirm the parent.
 pub(super) fn cancelled_conversation(line: &str) -> Option<&str> {
     let (prefix, id) = line.split_once("Cancelling in-progress response for conversation ")?;
-    // Require the originating log location, not an arbitrary quoted message.
-    if !prefix.contains("conversation_manager.go:") {
+    // Require a Go source location immediately before the message, without
+    // depending on the filename used by a particular CLI version.
+    let location = prefix.split_whitespace().last()?.strip_suffix(']')?;
+    let (file, line_number) = location.rsplit_once(':')?;
+    if !file.ends_with(".go")
+        || file.len() <= 3
+        || line_number.is_empty()
+        || !line_number.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     let id = id.trim();

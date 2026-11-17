@@ -505,6 +505,8 @@ impl AgentDriver for AgyDriver {
         turn_end_recovery::prepare_snapshot(run_id, claimed_session_id)
     }
 
+    // This shape check is deliberately identity-free; is_interrupt_recovery_line
+    // is the authoritative matcher against the persisted parent identity.
     fn is_interrupt_recovery_turn_end(&self, raw: &serde_json::Value) -> bool {
         raw.as_str()
             .and_then(turn_end_recovery::cancelled_conversation)

@@ -1,7 +1,7 @@
 //! Parent identity is checked by the progress session before reaching here.
 //! Non-idle Stops are background work, not a re-entrant boundary. If a parent
 //! never emits an idle Stop (observed on 1.1.12; possible on later versions),
-//! it stays active for the existing liveness machinery/operator to handle.
+//! it remains active until existing liveness handling or an explicit interrupt resolves it.
 //! Neither a child's Stop nor PostInvocation can recover that missing boundary.
 
 use boss_protocol::{NormalizeError, StopReason, WorkerEvent};
@@ -14,6 +14,9 @@ pub(super) fn normalize_stop(raw: &Value) -> Result<Option<WorkerEvent>, Normali
         .get("fully_idle")
         .and_then(Value::as_bool)
         .ok_or_else(|| NormalizeError::Malformed("agy Stop requires boolean fullyIdle".into()))?;
+    if !idle {
+        return Ok(None);
+    }
     let reason = raw.get("termination_reason").and_then(Value::as_str);
     let stop_reason = match reason {
         // The only values observed on interactive hooks in the studies.
@@ -32,16 +35,23 @@ pub(super) fn normalize_stop(raw: &Value) -> Result<Option<WorkerEvent>, Normali
             | "HALTED_STEP"
             | "CHAINED",
         ) => StopReason::Other,
-        _ => {
+        Some(reason) => {
             // Retain the exact unknown spelling for diagnostics, never the prompt.
-            tracing::warn!(termination_reason = ?raw.get("termination_reason"),
-                fully_idle = idle, "agy Stop has an unknown termination reason");
+            tracing::warn!(
+                termination_reason = reason,
+                fully_idle = idle,
+                "agy Stop has an unknown termination reason"
+            );
+            StopReason::Other
+        }
+        None => {
+            tracing::warn!(
+                fully_idle = idle,
+                "agy Stop has a missing or non-string termination reason"
+            );
             StopReason::Other
         }
     };
-    if !idle {
-        return Ok(None);
-    }
     let session_id = raw
         .get("session_id")
         .and_then(Value::as_str)
