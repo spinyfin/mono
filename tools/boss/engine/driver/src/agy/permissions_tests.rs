@@ -480,11 +480,14 @@ fn permission_input(
     run_id: &str,
     remote: bool,
 ) -> PermissionInput {
+    fs::create_dir_all(data_dir).unwrap();
+    let forwarder = data_dir.join("boss-event");
+    crate::hook_guards::write_executable(&forwarder, "#!/bin/sh\ncat >/dev/null\n").unwrap();
     PermissionInput::builder()
         .worker_kind(kind)
         .workspace_path(workspace.to_path_buf())
         .events_socket_path(data_dir.join("events.sock"))
-        .boss_event_path(data_dir.join("boss-event"))
+        .boss_event_path(forwarder)
         .run_id(run_id)
         .lease_id("lease")
         .execution_kind("task_implementation")

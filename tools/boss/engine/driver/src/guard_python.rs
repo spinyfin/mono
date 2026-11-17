@@ -44,12 +44,32 @@ def heredoc_delim(line):
     return word, bool(quote)
 
 class CommandGroup(list):
-    def __init__(self, tokens, body='', boundary=None, error=None):
+    def __init__(self, tokens, body='', boundary=None, error=None, single_quoted=None):
         super().__init__(tokens)
         self.body = body
         self.expanding_body = False
         self.boundary = boundary
         self.error = error
+        self.single_quoted = list(single_quoted or [False] * len(tokens))
+
+
+def single_quoted_flags(text, tokens):
+    # posix=False keeps quote characters, so a token that is exactly one
+    # single-quoted word can be aligned with the posix=True token list.
+    lexer = shlex.shlex(text, posix=False, punctuation_chars=';&|()')
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    try:
+        raw = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|') for token in lexer]
+    except ValueError:
+        return [False] * len(tokens)
+    raw = [part for token in raw for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
+    if len(raw) != len(tokens):
+        return [False] * len(tokens)
+    flags = []
+    for source, token in zip(raw, tokens):
+        flags.append(len(source) >= 2 and source[0] == source[-1] == chr(39) and source[1:-1] == token)
+    return flags
 
 
 def shell_text(text):
@@ -120,16 +140,20 @@ def command_records(command):
         pending = ''
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
-        for token in tokens:
+        quoted = single_quoted_flags(logical_line, tokens)
+        current_quoted = []
+        for index, token in enumerate(tokens):
             if token in DELIMS or (token and all(c in '()' for c in token)):
                 if current:
-                    groups.append(CommandGroup(current))
+                    groups.append(CommandGroup(current, single_quoted=current_quoted))
                 current = []
+                current_quoted = []
                 groups.append(CommandGroup([], boundary=token))
             else:
                 current.append(token)
+                current_quoted.append(quoted[index] if index < len(quoted) else False)
         if current:
-            groups.append(CommandGroup(current))
+            groups.append(CommandGroup(current, single_quoted=current_quoted))
         delim = heredoc_delim(logical_line)
         if delim and groups:
             heredoc_end, quoted = delim

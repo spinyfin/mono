@@ -56,6 +56,9 @@ rust_library(
 rust_test(
     name = "driver_test",
     size = "small",
+    # Adapter acceptance tests spawn python3 per case; the 60s default for
+    # size="small" is too tight once those sit next to the rest of the crate.
+    timeout = "moderate",
     compile_data = glob(["src/grok/testdata/**"]) + [
         "//tools/boss/tmux:blocking_dialog_cases.json",
         "src/codex-tmux.conf",
@@ -88,9 +91,9 @@ rust_test(
     shard_count = 3,
     # Thirty real app-server trust observations retain the production 10s
     # deadline. Run after parallel engine shards instead of contending with
-    # them; neither the production deadline nor the small test budget changes.
-    # `exclusive-if-local` and not `exclusive`: the latter also forces local
-    # execution, so the test could not be scheduled on a remote worker at all.
+    # them; the production deadline is unchanged. `exclusive-if-local` and
+    # not `exclusive`: the latter also forces local execution, so the test
+    # could not be scheduled on a remote worker at all.
     tags = ["exclusive-if-local"],
     deps = [
         "//tools/boss/codex_auth",

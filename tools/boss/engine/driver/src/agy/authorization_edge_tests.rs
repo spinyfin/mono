@@ -238,16 +238,18 @@ fn engine_executable_variables_cannot_evade_structural_denies() {
         let (body, stderr) = authorize_tools(&fx, command);
         assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
-    // Without an engine-provided value the variable stays unresolved.
+    // Policy carries the engine-owned path, so the quoted form resolves even
+    // when the adapter process does not inherit BOSS_BIN.
     let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload("\"$BOSS_BIN\" propose done"));
-    assert_eq!(decision(&body), "deny", "{body} {stderr}");
-    // A relative value is not an engine-provided executable.
+    assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
+    // A relative process env value must not override the policy path.
+
     let (_, body, stderr) = authorize_with_env(
         &fx.process_home,
         &run_command_payload("\"$BOSS_BIN\" propose done"),
         &[("BOSS_BIN", "boss")],
     );
-    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
 }
 
 #[test]
@@ -471,4 +473,106 @@ fn non_writing_kinds_deny_rebinding_and_sed_option_permutation() {
         let (body, stderr) = authorize_tools(&fx, "sed -n '10,$p' f");
         assert_ne!(decision(&body), "deny", "{kind:?}: {body} {stderr}");
     }
+}
+
+#[test]
+fn quoted_worker_clis_and_literal_dollar_operands_are_not_fail_closed() {
+    let fx = Fixture::new("run-dollar-ok");
+    fx.install(WorkerKind::Standard);
+    for command in [
+        r#""$BOSS_BIN" propose done --outcome completed --summary x"#,
+        r#"grep -n 'x$' f"#,
+        r#"awk '{print $1}' f"#,
+        "cat <<'EOF'\n`whoami` $(id)\nEOF",
+    ] {
+        let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), true);
+        assert_eq!(code, 0, "{command} stderr={stderr}");
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(r#"cat "$HOME_CONFIG""#), true);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unresolved shell path expansion"),
+        "{body}"
+    );
+}
+
+#[test]
+fn cube_pr_create_reaches_pr_redirect_and_checkleft() {
+    let fx = Fixture::new("run-cube-pr");
+    let marker = fx.tmp.path().join("checkleft-reached");
+    let checkleft = fx.tmp.path().join("boss-checkleft-push-guard.py");
+    write_exec(
+        &checkleft,
+        &format!(
+            "#!/usr/bin/env python3\nimport json,pathlib\npathlib.Path({:?}).write_text('1')\nprint(json.dumps({{'decision':'block','reason':'checkleft-reached'}}))\n",
+            marker
+        ),
+    );
+    fx.install_with(WorkerKind::Standard, |c| {
+        c.checkleft_guard_script = Some(checkleft);
+    });
+    let (code, body, stderr) = authorize(
+        &fx.process_home,
+        &run_command_payload(r#""$CUBE_BIN" pr create --title x --body-file f"#),
+        true,
+    );
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("checkleft-reached"),
+        "must reach checkleft after PR-redirect: {body} {stderr}"
+    );
+    assert!(!reason.contains("unresolved shell path expansion"), "{body}");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "1");
+}
+
+#[test]
+fn protected_tilde_user_and_symlink_glob_are_denied() {
+    let fx = Fixture::new("run-tilde-glob");
+    fx.install(WorkerKind::Standard);
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".into());
+    let tilde = format!("cat ~{user}/.gemini/config/hooks.json");
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&tilde), true);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{tilde}: {body} {stderr}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unresolved shell path expansion"),
+        "{body}"
+    );
+
+    // `/tmp` and `/var` are themselves symlinks (`/private/tmp`, `/private/var`).
+    // Glob the symlink component so the static prefix only matches the
+    // unresolved spelling of the protected homes root.
+    let target = fx.process_home.join(".gemini/config/hooks.json");
+    let raw = target.display().to_string();
+    let globbed = if let Some(rest) = raw.strip_prefix("/tmp/") {
+        format!("/tm?/{rest}")
+    } else if let Some(rest) = raw.strip_prefix("/private/tmp/") {
+        format!("/private/tm?/{rest}")
+    } else if let Some(rest) = raw.strip_prefix("/var/") {
+        format!("/va?/{rest}")
+    } else if let Some(rest) = raw.strip_prefix("/private/var/") {
+        format!("/private/va?/{rest}")
+    } else {
+        panic!("expected test temp under /tmp or /var, got {raw}");
+    };
+    let glob_cmd = format!("cat {globbed}");
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&glob_cmd), true);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{glob_cmd}: {body} {stderr}");
+    assert!(
+        body["reason"].as_str().unwrap_or_default().contains("protected"),
+        "{body}"
+    );
 }

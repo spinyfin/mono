@@ -7,7 +7,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use super::*;
-use crate::agy::home::provision_agy_home;
+use crate::agy::home::{provision_agy_home, session_settings_path_for_run};
 use crate::agy::test_environment::env_for_provision;
 use crate::{AgentDriver, PermissionInput, WorkerKind};
 
@@ -251,9 +251,18 @@ async fn write_permission_config_installs_the_forwarder_under_the_per_run_home()
         .unwrap();
 
     let expected = hooks_file_path(&runtime.process_home);
+    let settings_path = session_settings_path_for_run("run-wpc").unwrap();
     assert!(artifacts.config_files.contains(&expected));
     assert!(artifacts.config_files.contains(&adapter_path(&runtime.process_home)));
-    assert_eq!(artifacts.extra_args[0], "--settings");
+    assert!(
+        artifacts.config_files.contains(&settings_path),
+        "config_files must include session settings: {:?}",
+        artifacts.config_files
+    );
+    assert_eq!(
+        artifacts.extra_args,
+        vec!["--settings".to_owned(), settings_path.display().to_string()]
+    );
     assert!(artifacts.env.is_empty());
     let parsed: Value = serde_json::from_str(&fs::read_to_string(&expected).unwrap()).unwrap();
     let session_start = command_of(&parsed[HOOK_GROUP]["SessionStart"][0]);
