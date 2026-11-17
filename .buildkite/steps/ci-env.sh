@@ -26,15 +26,16 @@ if ! CI_DISK_CACHE_DIR="$(ci_disk_cache_path "$OS_TYPE" "$CI_BAZELRC")" \
 fi
 echo "--- [ci-env] disk cache ${CI_DISK_CACHE_DIR}: filesystem is $((CI_DISK_CACHE_FS_TOTAL_KB / 1048576)) GB, GC cap ${CI_DISK_CACHE_GC_MAX_SIZE} (${CI_DISK_CACHE_GC_PERCENT}%)"
 
-# Decide whether this step's bazel actions execute on the remote macOS workers
-# or on this agent. The conditions (the step opted in with
-# CI_REMOTE_EXECUTION_ALLOWED=1, the agent is a Mac whose environment names an
-# endpoint, and the endpoint answers) and the reasons for them are in
-# remote-execution.sh, tested by //.buildkite/steps/tests. A step that does not
-# qualify runs exactly as before.
+# Decide whether this step's bazel actions execute on remote workers or on
+# this agent. The conditions (the step opted in with
+# CI_REMOTE_EXECUTION_ALLOWED=1, there are workers for this agent's platform,
+# its environment names an endpoint, and the endpoint answers), what executes
+# remotely on each platform, and the reasons are in remote-execution.sh, tested
+# by //.buildkite/steps/tests. A step that does not qualify runs exactly as
+# before.
 # shellcheck source=remote-execution.sh
 source "$(dirname "${BASH_SOURCE[0]}")/remote-execution.sh"
-if ! ci_remote_execution_decide "$OS_TYPE"; then
+if ! ci_remote_execution_decide "$OS_TYPE" "$(uname -m)"; then
   echo "^^^ +++"
   echo "[ci-env] error: could not decide where this step's bazel actions execute (see above). Fix or remove CI_BAZEL_REMOTE_EXECUTOR in this agent's environment hook." >&2
   exit 1

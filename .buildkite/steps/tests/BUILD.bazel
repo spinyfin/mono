@@ -15,10 +15,11 @@ sh_test(
 )
 
 # Script-level test for the decision ci-env.sh makes about where a step's
-# bazel actions execute: a step that has not opted in, a Linux agent, an agent
-# without an endpoint and an endpoint that does not answer all build on the
-# agent; a malformed endpoint fails loudly; and the flags for the remote case
-# select a config that .ci.bazelrc really defines.
+# bazel actions execute: a step that has not opted in, a platform with no
+# workers, an agent without an endpoint and an endpoint that does not answer
+# all build on the agent; a malformed endpoint fails loudly; and the flags for
+# the macOS and Linux remote cases select configs that .ci.bazelrc really
+# defines, the Linux one without sending tests to the workers.
 sh_test(
     name = "remote_execution_test",
     size = "small",

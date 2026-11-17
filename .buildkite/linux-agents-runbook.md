@@ -232,6 +232,28 @@ Per `.buildkite/README.md` ("Pushing from CI"), pushes from Linux Buildkite agen
 - `.ci.darwin.startup.bazelrc` — the macOS equivalent; sets the darwin output root to `/private/var/tmp/bazel_darwin_ci_output_base` (it must stay on the internal case-insensitive volume — see the comment in that file, which documents that pointing it at `/Volumes/ssd` is exactly what broke `mac-app-build` under Xcode 26.5 and was deliberately reverted). The macOS Xcode pin is in `.ci.bazelrc` (`build:ci-darwin`), not here — out of this doc's scope.
 - Both are startup-option `.bazelrc`s specifically because `--output_user_root` (and similar) must be a **startup** flag, not a build flag — see the comment in `.buildkite/steps/ci-env.sh` explaining why `CI_BAZEL_STARTUP_FLAGS` is the single source of truth every CI code path must read from, to avoid two daemons running against the same output base at once.
 
+## Remote execution workers
+
+The three hosts are also the remote workers that the Linux agents send build actions to (what a step sends, and when, is in [`README.md`](README.md), "Remote execution on Linux agents"). This is separate from the Buildkite agent: it runs as the login user, not as `buildkite-agent`, and needs no root.
+
+- **What runs where.** Every host runs a NativeLink worker as a systemd user unit, `nativelink-worker.service`. One host also runs the hub (scheduler, CAS and action cache) as `nativelink-hub.service`; it is the host that has that unit. Lingering is enabled for the user (`loginctl enable-linger`), so the units start at boot without a login.
+- **Files.** Everything is under `~/nativelink/` on each host: the `nativelink` binary, `worker.json5` (and `hub.json5` on the hub host), the worker's store and work directory under `worker/`, and the hub's stores under `hub/`. The units are in `~/.config/systemd/user/`. Stores are on the boot disk, not `/mnt/ssd`, which only `buildkite-agent` can write.
+- **Status and logs.** `systemctl --user status nativelink-worker` and `journalctl --user -u nativelink-worker` (likewise `nativelink-hub`). A worker logs `Worker registered with scheduler` when it has joined. Over ssh, set `XDG_RUNTIME_DIR=/run/user/$(id -u)` first if `systemctl --user` cannot find the bus.
+- **Slots.** `max_inflight_tasks` in `worker.json5`, with `cpu_count` under `platform_properties` kept equal to it. Size it by RAM, not cores, for the reason `/etc/bazel.bazelrc` gives for `--jobs`: a rustc can peak at 2-3 GB, and the host still runs its agent's tests. The worker unit runs at `Nice=5` so the agent's tests win the CPU.
+- **Routing.** The hub's scheduler matches the `OSFamily` property exactly, each worker declares `OSFamily: linux`, and `ci-remote-linux` tags every action with it. Only Linux workers may register with this hub. Do not point a macOS worker at it, and do not point a Linux worker at the macOS hub: the macOS builds do not tag their actions, and an untagged action is offered to every worker its scheduler has.
+- **Restarting.** `systemctl --user restart nativelink-worker` on one host fails the actions that worker was running; Bazel retries them on another worker. Restarting the hub fails every remote step in flight, so pause the Linux agents first (see "Safe maintenance procedure") or wait until none is running a job.
+- **Turning an agent's remote execution on or off.** An agent executes remotely when its `environment` hook exports the endpoint, which needs root because `/etc/buildkite-agent/hooks/` belongs to `buildkite-agent`:
+
+  ```sh
+  # /etc/buildkite-agent/hooks/environment (mode 0755, owner buildkite-agent)
+  export CI_BAZEL_REMOTE_EXECUTOR="grpc://<hub host>:<port>"
+  ```
+
+  It takes effect from the agent's next job. Remove the line to return that agent to local builds, again from its next job and with no merge. With the hub unreachable an agent falls back to building locally by itself and annotates the build.
+
+- **Same toolchain everywhere.** A worker runs an action with the compiler path the agent recorded (`/usr/bin/gcc` and its include directories). Upgrade the compiler, or the distribution, on all three hosts together, with the agents paused. A host that differs produces failures that look like flakiness, as described under "Host inventory".
+- **Trust boundary.** A worker runs an action directly in its work directory, as the login user, with that user's access to the host. Bazel's `linux-sandbox` is not involved for an action that executes remotely. That is the reason tests are not sent to the workers, and it means a build action from a CI job runs with more access than it has on an agent, where it runs sandboxed as `buildkite-agent`.
+
 ## Other configuration observed
 
 - **systemd unit**: `buildkite-agent.service` (plain, not the `buildkite-agent@.service` template) runs as `User=buildkite-agent`, `Environment=HOME=/var/lib/buildkite-agent`, `ExecStart=/usr/bin/buildkite-agent start` on all three hosts. `empiricist`'s second agent registration (`empiricist-2`) is **not** a second systemd unit instance — both `empiricist-1` and `empiricist-2` come from the single running `buildkite-agent start` process (confirmed via `ps aux`: one process, two Bazel server children with distinct `--workspace_directory=.../empiricist-{1,2}/flunge/mono`). The exact mechanism (multiple `spawn`s configured in `buildkite-agent.cfg`) could not be confirmed without root — see "Needs operator input".

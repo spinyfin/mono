@@ -13,7 +13,7 @@
 # and boss-release.sh.
 set -euo pipefail
 
-# This step may execute its bazel actions on the remote macOS workers; ci-env.sh
+# This step may execute its bazel actions on remote workers; ci-env.sh
 # decides whether it does (see remote-execution.sh). It qualifies because
 # nothing it passes to bazel is a credential and its build and
 # test commands are run only for their result.

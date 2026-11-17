@@ -23,7 +23,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     checkleft-release.sh   # checkleft prebuilt-binary release (prepare/linux/musl/darwin phases)
     release-release.sh     # shared release tool prebuilt-binary release
     ci-env.sh              # shared env/toolchain setup sourced by other steps
-    remote-execution.sh    # decides whether a step's bazel actions execute on the remote macOS workers (sourced by ci-env.sh)
+    remote-execution.sh    # decides whether a step's bazel actions execute on remote workers (sourced by ci-env.sh)
     integrity-commit-delta.sh # mono-integrity: commit-delta check
     integrity-bazel.sh        # mono-integrity: full bazel build + test
     integrity-checkleft.sh    # mono-integrity: checkleft check
@@ -50,7 +50,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 
 Sourced by other steps to set up the shared bazel wrapper and CI config rather than run standalone. Sets `CI_BAZEL_STARTUP_FLAGS` (which carries `--max_idle_secs=1800` for every pipeline and OS, CI only, so idle Bazel servers release memory after 30 minutes; local builds get 2 hours from `startup --max_idle_secs=7200` in the root `.bazelrc`, which the command-line flag overrides; the single source of truth for bazel startup options in CI — every code path that shells out to bazel must read from here or the workspace ends up running two daemons at once) and `CI_BAZEL_FLAGS` (the per-command flags: `--config=ci-<os>` plus a `--experimental_disk_cache_gc_max_size` sized to the host — 80% of the filesystem holding the disk cache, computed by `disk-cache-gc-cap.sh` and overriding `.ci.bazelrc`'s fleet-wide `3T`; the step fails if that filesystem cannot be determined), detects and recovers from stale-Xcode-cache failures on macOS, and installs `repobin` tools into `bin/`. `REPOBIN_BAZEL_FLAGS` is set to `CI_BAZEL_FLAGS` so repobin's own bazel calls carry the same config and cap.
 
-It also decides whether the step's bazel actions execute on the remote macOS workers, and appends the remote flags to `CI_BAZEL_FLAGS` when they do; see "Remote execution on macOS agents" below.
+It also decides whether the step's bazel actions execute on remote workers, and appends the remote flags to `CI_BAZEL_FLAGS` when they do; see "Remote execution on macOS agents" and "Remote execution on Linux agents" below.
 
 ### `bazel-build-test.sh`
 
@@ -68,12 +68,12 @@ For the Linux `bazel-any` hosts specifically — host inventory, the unprivilege
 
 ## Remote execution on macOS agents
 
-On a Mac agent the verification steps do not build and test on the agent's own cores. Their bazel actions, tests included, execute on a pool of remote macOS workers, and the agent is a thin Bazel client. The Macs that run agents also serve as workers, and a step that builds locally competes with the worker on the same host: remote builds stall behind it and its own timing-sensitive tests flake. Linux agents are unaffected; there are no Linux workers.
+On a Mac agent the verification steps do not build and test on the agent's own cores. Their bazel actions, tests included, execute on a pool of remote macOS workers, and the agent is a thin Bazel client. The Macs that run agents also serve as workers, and a step that builds locally competes with the worker on the same host: remote builds stall behind it and its own timing-sensitive tests flake. Linux agents have workers of their own and a narrower arrangement; see "Remote execution on Linux agents" below.
 
 `ci-env.sh` makes the decision once per step, using `remote-execution.sh` (tested by `//.buildkite/steps/tests:remote_execution_test`). A step executes remotely only when all of these hold; otherwise it runs exactly as it did before, on the agent, with the disk cache from `.ci.bazelrc`:
 
 1. **The step opted in** by setting `CI_REMOTE_EXECUTION_ALLOWED=1` before sourcing `ci-env.sh`. `bazel-build-test.sh`, `mac-app-build.sh`, `checks.sh`, `integrity-bazel.sh`, `integrity-checkleft.sh` and `boss-release.sh` do. Opting in is explicit because a step's bazel command line and action environment are sent to the workers and stored in the remote cache, so for a step that passes credentials to bazel it is a decision about where those values may be stored, not a performance tweak. `boss-release.sh` passes the shake credentials through `--define` and opts in all the same: those values are compiled into the app it publishes, so the cache holds nothing the release does not. The other release steps (`changelog-release.sh`, `checkleft-release.sh`, `release-release.sh`, `repobin-release.sh`, `spoke-release.sh`) have not been through that review and build on the agent.
-2. **The agent is a Mac.**
+2. **There are workers for the agent's platform**: macOS, or Linux on x86-64. An agent only ever uses workers of its own platform, because the workers run its actions with its own toolchain paths.
 3. **The agent's environment names an endpoint** in `CI_BAZEL_REMOTE_EXECUTOR` (`grpc://<host>:<port>`), exported by the Buildkite agent's `environment` hook on that host. The endpoint is host configuration and is deliberately not in the repo: every open branch carries its own copy of the CI files, so an endpoint written here would have to be rebased into each of them whenever it moved. Removing the variable from a host's hook returns that host to local builds from its next job, with no merge. A malformed value fails the step rather than falling back.
 4. **The endpoint accepts a TCP connection.** If it does not, the step builds on the agent, logs why, and adds a warning annotation to the build.
 
@@ -90,6 +90,17 @@ Things to know when changing a step or a test:
 - **Remote and local test results are cached apart** (`MONO_TEST_REMOTE_EXECUTION` in the `remote-tests` config), so a result produced on an agent never satisfies a remote step or the reverse.
 - **The app release may finish on the agent.** `boss-release.sh` adds `--remote_local_fallback`, overriding `ci-remote`: if the workers stop answering part-way through its build, the remaining actions run on the agent. By then the tag is pushed and the draft exists, and a scheduled run does not resume a draft, so failing would leave the release waiting for a manual run. An action that runs and fails still fails the step.
 - **One output base sees both modes** while old branches and the other release steps still build locally. A remote step can read what a local step left in the disk cache, which is why `ci-remote` keeps the disk cache on. The other direction has no such bridge: when a local build needs an output that a remote build left only on the workers, the log shows `Lost inputs no longer available remotely`, and Bazel starts the build again by itself and rebuilds that output locally.
+
+## Remote execution on Linux agents
+
+A Linux x86-64 agent sends its build actions to a pool of remote Linux workers and keeps its tests. The decision is the same one, made by the same code under the same four conditions as on a Mac: the step opted in, the platform has workers, the agent's `environment` hook exports `CI_BAZEL_REMOTE_EXECUTOR`, and the endpoint accepts a connection. The Linux agents name a different endpoint from the Macs. Each platform has its own scheduler and cache, and that is what keeps a Linux action off a Mac and the reverse: the scheduler offers an action to any worker that satisfies what the action asks for, and the macOS builds ask for nothing.
+
+When a Linux step executes remotely, `CI_BAZEL_FLAGS` gains `--config=ci-remote-linux --remote_executor=<endpoint> --remote_cache=<endpoint>`. `build:ci-remote-linux` in `.ci.bazelrc` differs from `ci-remote` in two ways:
+
+- **Tests run on the agent.** The config names no test strategy, so `test:linux --strategy=TestRunner=linux-sandbox` from `.bazelrc` still applies. On Linux that sandbox is the whole isolation boundary for a test (mount, network and PID namespaces; see `tools/test-sandbox/README.md`), and a worker runs an action directly in its work directory with none of it. Bazel downloads each test's inputs from the remote cache, so a step that executes remotely still spends CPU, memory and download time on its agent for the test phase. None of the "a test must be able to run on a worker" constraints of the macOS arrangement apply.
+- **Every action is tagged `OSFamily=linux`** (`--remote_default_exec_properties`). The Linux scheduler matches that property exactly against what each worker declares. The tag is also part of every action's cache key, so a remote step and a step that built on the agent never share a result, in the remote cache or in the disk cache. The first remote step on a host therefore starts cold even if that host's disk cache is warm.
+
+The workers compile with the same host C toolchain the agents use (the C/C++ toolchain is the one Bazel detects on the agent, recorded by absolute path), so every Linux agent and worker must have the same compiler at the same paths. That is the same "identical host configuration" rule the Linux hosts already follow; see [`linux-agents-runbook.md`](linux-agents-runbook.md), which also covers where the workers run, how to restart one, and how to switch an agent between remote and local builds.
 
 ## Pushing from CI (queue heterogeneity and push identity)
 
