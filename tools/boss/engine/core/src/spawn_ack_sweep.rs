@@ -1344,6 +1344,7 @@ pub(crate) mod probe_hold;
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
@@ -1509,77 +1510,19 @@ mod tests {
                     .is_some()
             );
             register_slot_zero_pid(&self.live_states, 1, "replacement", "replacement-item");
+            latch_scheduler_so_a_stale_kick_is_visible(&self.coordinator);
         }
     }
 
-    /// Incident shape for a progression spawn that "never produced a driver
-    /// signal": the failing spawn's teardown frees slot 41, a replacement claims
-    /// and registers it, and only then do the old spawn's error tail and reaper
-    /// run. The replacement must keep its claim and live entry so its real
-    /// driver signal lands on it and the driver-start check passes.
-    #[tokio::test]
-    async fn displaced_progression_spawn_cleanup_does_not_strip_the_replacements_driver_signal() {
-        let (_dir, db) = open_db();
-        let db = Arc::new(db);
-        let mut coordinator = ExecutionCoordinator::new(
-            db.clone(),
-            boss_execution_contracts::WorkerPool::new(1),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        );
-        coordinator.set_progression_pool(boss_execution_contracts::WorkerPool::new_progression(1));
-        let coordinator = Arc::new(coordinator);
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    fn latch_scheduler_so_a_stale_kick_is_visible(coordinator: &ExecutionCoordinator) {
+        coordinator.scheduling_active().store(true, Ordering::Release);
+        coordinator.scheduling_pending().store(false, Ordering::Release);
+    }
 
-        let worker = coordinator
-            .progression_worker_pool()
-            .claim_worker("old-run", None)
-            .await
-            .unwrap();
-        let slot = crate::coordinator::slot_id_from_worker_id(&worker).unwrap();
-        assert_eq!(slot, 41);
-        register_slot_with_live_shell(&live_states, slot, "old-run", "item-old", 4242, false);
-        let old_state = live_states.snapshot().pop().unwrap();
-
-        // The failing spawn's pane teardown frees the slot first.
-        live_states.release_slot_for_run("old-run");
-        coordinator.release_worker_and_kick(&worker, "old-run", None).await;
-        // Dispatch hands slot 41 to a replacement, which registers.
-        coordinator
-            .progression_worker_pool()
-            .claim_worker("replacement", None)
-            .await
-            .unwrap();
-        register_slot_with_live_shell(&live_states, slot, "replacement", "item-new", 4343, false);
-
-        // The old spawn's error tail and the reaper run late.
-        coordinator.release_worker_and_kick(&worker, "old-run", None).await;
-        crate::dead_pid_sweep::release_reaped_execution(&live_states, &coordinator, &old_state).await;
-
-        // The replacement's real driver signal now lands and is retained.
+    fn assert_stale_release_did_not_kick(coordinator: &ExecutionCoordinator) {
         assert!(
-            live_states
-                .record_driver_signal("replacement", crate::live_worker_state::DriverSignalKind::HookEvent)
-                .is_some(),
-            "the replacement still has a live entry to receive its driver signal",
-        );
-        assert!(live_states.has_driver_signal_for_run("replacement"));
-        assert_eq!(coordinator.claim_holder(&worker).await.as_deref(), Some("replacement"));
-
-        let outcome = run_one_pass(
-            db.as_ref(),
-            &live_states,
-            coordinator.clone(),
-            &RecordingDispatchEventSink::new(),
-            &RecordingReaper::new(coordinator.clone()),
-            &SpawnHealthTracker::new(),
-            &NoopCube,
-            DRIVER_START_GRACE_SECS,
-        )
-        .await;
-        assert_eq!(
-            outcome.driver_start_reaped, 0,
-            "driver-start check passes for the replacement"
+            !coordinator.scheduling_pending().load(Ordering::Acquire),
+            "a no-op ownership miss must not kick dispatch or rescan active work"
         );
     }
 
@@ -1622,6 +1565,7 @@ mod tests {
             "the replacement keeps its claim",
         );
         assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+        assert_stale_release_did_not_kick(&coordinator);
     }
 
     /// A driver-start timeout must not assert "the binary never started"

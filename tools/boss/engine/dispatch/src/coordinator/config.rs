@@ -205,6 +205,19 @@ impl ExecutionCoordinator {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub async fn dispatch_claimed_execution_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        pool_label: &str,
+        spilled: bool,
+        admission: DispatchAdmission,
+    ) {
+        self.dispatch_claimed_execution(execution, worker_id, pool_label, spilled, admission, None)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn recover_failed_dispatch_for_test(
         self: &Arc<Self>,
         execution: &WorkExecution,

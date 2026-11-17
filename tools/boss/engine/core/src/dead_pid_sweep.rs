@@ -806,6 +806,7 @@ pub fn probe_pid(pid: i32) -> PidStatus {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use boss_protocol::{WorkItemBinding, WorkerActivity};
 
@@ -926,10 +927,16 @@ mod tests {
             .unwrap();
         register_slot_with_binding(&live_states, 1, "replacement", 1, "item-new");
 
+        coordinator.scheduling_active().store(true, Ordering::Release);
+        coordinator.scheduling_pending().store(false, Ordering::Release);
         release_reaped_execution(&live_states, &coordinator, &reaped).await;
 
         assert_eq!(coordinator.claim_holder(&worker).await.as_deref(), Some("replacement"));
         assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+        assert!(
+            !coordinator.scheduling_pending().load(Ordering::Acquire),
+            "a no-op ownership miss must not kick dispatch or rescan active work"
+        );
     }
 
     /// A slot backed by the live test process PID is never reaped, even

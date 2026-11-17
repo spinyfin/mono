@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use boss_protocol::{WorkItemBinding, WorkerActivity, WorkerEvent};
@@ -333,6 +334,8 @@ impl StaleWorkerReaper for ReplacingReaper {
                 .is_some()
         );
         register_slot(&self.live_states, 1, "replacement", "replacement-item");
+        self.coordinator.scheduling_active().store(true, Ordering::Release);
+        self.coordinator.scheduling_pending().store(false, Ordering::Release);
     }
 }
 
@@ -505,6 +508,10 @@ async fn cadence_reap_leaves_a_replacement_claim_and_live_state_in_place() {
         Some("replacement")
     );
     assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+    assert!(
+        !coordinator.scheduling_pending().load(Ordering::Acquire),
+        "a no-op ownership miss must not kick dispatch or rescan active work"
+    );
 }
 
 #[tokio::test]

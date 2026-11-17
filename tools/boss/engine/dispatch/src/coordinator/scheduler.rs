@@ -2603,7 +2603,7 @@ impl ExecutionCoordinator {
     /// `worker-N` — indistinguishable by prefix from mainline work — and
     /// per-pool dispatch diagnostics must not silently reattribute
     /// automation load to the main pool.
-    async fn dispatch_claimed_execution(
+    pub(crate) async fn dispatch_claimed_execution(
         self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,
