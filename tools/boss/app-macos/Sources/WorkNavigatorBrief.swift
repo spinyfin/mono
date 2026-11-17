@@ -22,7 +22,7 @@ struct WorkNavigatorBrief: View {
                     if let ask, ask.id != root.id {
                         Text("Current ask").tag(NavigatorBriefDocument.currentAsk)
                     }
-                    if model.navigator.historicalDocumentByRoot[root.id] != nil {
+                    if model.navigatorDocument(for: root.id) == .historical {
                         Text("Historical ask").tag(NavigatorBriefDocument.historical)
                     }
                 }
@@ -30,15 +30,11 @@ struct WorkNavigatorBrief: View {
                 .frame(maxWidth: ask != nil && ask?.id != root.id ? 280 : 160)
                 .accessibilityIdentifier("navigator-brief-document")
                 if document.id != root.id {
-                    Text(askLabel(document))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    askLabel(document)
                 }
             }
             WorkItemBriefEditor(
-                title: model.navigatorDocument(for: root.id) == .original ? "Original brief"
-                    : model.navigatorDocument(for: root.id) == .historical ? "Historical ask" : "Current ask",
+                title: documentTitle,
                 source: document.description,
                 draft: draftBinding,
                 isEditing: model.navigatorBriefIsEditing(document.id),
@@ -66,9 +62,31 @@ struct WorkNavigatorBrief: View {
         )
     }
 
-    func askLabel(_ ask: WorkTask) -> String {
-        let revisions = model.navigatorFamily(of: root).filter { $0.id != root.id }
-        let sequence = revisions.firstIndex(where: { $0.id == ask.id }).map { "Revision \($0 + 1)" } ?? "Revision"
-        return "\(sequence) · \(ask.name)"
+    /// Title of the resolved document, never the stored choice: a choice
+    /// that no longer resolves has already fallen back to the root.
+    var documentTitle: String {
+        switch model.navigatorDocument(for: root.id) {
+        case .original: return "Original brief"
+        case .currentAsk: return "Current ask"
+        case .historical: return "Historical ask"
+        }
+    }
+
+    /// Engine-owned revision number and source, as the Kanban header shows.
+    static func revisionBadgeInputs(_ ask: WorkTask) -> (seq: Int?, origin: EngineRevisionOrigin?) {
+        (ask.revisionSeq, EngineRevisionOrigin(createdVia: ask.createdVia))
+    }
+
+    private func askLabel(_ ask: WorkTask) -> some View {
+        let inputs = Self.revisionBadgeInputs(ask)
+        return HStack(spacing: 6) {
+            if let seq = inputs.seq { RevisionBadge(seq: seq) }
+            if let origin = inputs.origin { EngineRevisionBadge(origin: origin) }
+            Text(ask.name)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .accessibilityIdentifier("navigator-brief-ask-label")
     }
 }

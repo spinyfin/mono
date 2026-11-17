@@ -120,14 +120,10 @@ extension ChatViewModel {
             navigator.selectedAtSection = detail.knownSection
             navigator.tab = NavigatorDetailSlot(rawValue: detail.defaultDetail) ?? .activity
             navigator.tabs = [.activity, .history, navigator.tab]
-            if navigator.documentByRoot[root.id] == nil {
-                let ask = navigator.askID.flatMap { self.task(withID: $0) }
-                navigator.documentByRoot[root.id] = (ask != nil && ask?.id != root.id) ? .currentAsk : .original
-            }
         }
         if let historicalID = askID ?? (task.id != root.id ? task.id : nil) {
             navigator.historicalDocumentByRoot[root.id] = historicalID
-            navigator.documentByRoot[root.id] = historicalID == detail.revisions.currentTaskId ? .currentAsk : .historical
+            setNavigatorDocument(historicalID == detail.revisions.currentTaskId ? .currentAsk : .historical, rootID: root.id)
         }
         navigator.retainedTask = root
         retainNavigatorActivity(for: root)
@@ -154,6 +150,15 @@ extension ChatViewModel {
     }
 
     func reconcileNavigatorSelection() {
+        for (rootID, documentID) in navigator.draftDocumentByRoot {
+            guard navigatorBriefIsEditing(documentID) else {
+                releaseNavigatorDraftPin(documentID)
+                continue
+            }
+            if task(withID: rootID)?.navigator?.root?.revisions.currentTaskId != documentID {
+                keepNavigatorAskDraft(rootID: rootID, previous: documentID)
+            }
+        }
         defer {
             if navigator.mode == .navigator, selectedWorkCardID != navigator.selectedRootID {
                 // Align the shared card id even when the root has left the
@@ -173,6 +178,9 @@ extension ChatViewModel {
             syncNavigatorAttention(for: selected)
             if let current = selected.navigator?.root?.revisions.currentTaskId {
                 if task(withID: current) != nil {
+                    if let previous = navigator.askID, previous != current {
+                        keepNavigatorAskDraft(rootID: selected.id, previous: previous)
+                    }
                     navigator.askID = current
                 } else if navigator.askID.flatMap({ task(withID: $0) }) == nil {
                     navigator.askID = nil
@@ -180,6 +188,7 @@ extension ChatViewModel {
                 // Keep the previous ask while a non-nil current revision
                 // has not loaded into the store yet.
             } else {
+                retireNavigatorAsk(rootID: selected.id)
                 navigator.askID = nil
             }
             retainNavigatorActivity(for: selected)
@@ -306,11 +315,66 @@ extension ChatViewModel {
         navigator.revealGeneration = UUID()
     }
 
+    /// The engine dropped the current ask. A Current ask choice would now
+    /// resolve to the original brief under the wrong title, so an open draft
+    /// on the retired ask keeps its document; otherwise Current ask falls
+    /// back to Original.
+    private func retireNavigatorAsk(rootID: String) {
+        if let previous = navigator.askID,
+           keepNavigatorAskDraft(rootID: rootID, previous: previous) { return }
+        if navigator.documentByRoot[rootID] == .currentAsk {
+            navigator.documentByRoot[rootID] = .original
+        }
+    }
+
+    /// Pin the previous ask as the historical document when it holds an open
+    /// draft and Current ask was in view, whether chosen explicitly or shown
+    /// by default. Returns whether the draft was kept reachable.
+    @discardableResult
+    private func keepNavigatorAskDraft(rootID: String, previous: String) -> Bool {
+        let stored = navigator.documentByRoot[rootID]
+        guard stored == nil || stored == .currentAsk,
+              previous != rootID, task(withID: previous) != nil,
+              navigatorBriefIsEditing(previous) else { return false }
+        navigator.historicalDocumentByRoot[rootID] = previous
+        navigator.documentByRoot[rootID] = .historical
+        navigator.automaticDocumentPins.insert(rootID)
+        return true
+    }
+
+    /// The document the Brief shows. An explicit choice wins while it still
+    /// resolves; otherwise a running revision defaults to its current ask,
+    /// unless the original brief holds an open draft.
     func navigatorDocument(for rootID: String) -> NavigatorBriefDocument {
-        navigator.documentByRoot[rootID] ?? .original
+        let root = task(withID: rootID)
+        let ask = root?.navigator?.root?.revisions.currentTaskId
+            .flatMap { $0 != rootID ? task(withID: $0) : nil }
+        switch navigator.documentByRoot[rootID] {
+        case .original:
+            return .original
+        case .currentAsk:
+            return ask != nil ? .currentAsk : .original
+        case .historical:
+            let found = navigator.historicalDocumentByRoot[rootID].flatMap { task(withID: $0) } != nil
+            return found ? .historical : .original
+        case nil:
+            return ask != nil && !navigatorBriefIsEditing(rootID) ? .currentAsk : .original
+        }
+    }
+
+    func releaseNavigatorDraftPin(_ documentID: String) {
+        for (rootID, id) in navigator.draftDocumentByRoot where id == documentID {
+            navigator.draftDocumentByRoot[rootID] = nil
+            if navigator.automaticDocumentPins.remove(rootID) != nil {
+                navigator.documentByRoot[rootID] = nil
+                navigator.historicalDocumentByRoot[rootID] = nil
+            }
+        }
     }
 
     func setNavigatorDocument(_ document: NavigatorBriefDocument, rootID: String) {
+        navigator.automaticDocumentPins.remove(rootID)
+        navigator.draftDocumentByRoot[rootID] = nil
         navigator.documentByRoot[rootID] = document
     }
 

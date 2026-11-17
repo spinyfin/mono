@@ -204,6 +204,7 @@ _NAVIGATOR_SHARD_SRCS = [
     "Tests/BossTests/NavigatorRowTests.swift",
     "Tests/BossTests/NavigatorAttentionTests.swift",
     "Tests/BossTests/NavigatorActivityTests.swift",
+    "Tests/BossTests/NavigatorLifecycleTests.swift",
 ]
 
 macos_unit_test(

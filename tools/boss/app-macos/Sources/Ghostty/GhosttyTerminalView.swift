@@ -568,10 +568,14 @@ final class GhosttyTerminalHostView: NSView {
 
     /// Free the libghostty surface without blocking the main thread.
     ///
-    /// Called from `GhosttyTerminalView.dismantleNSView` — i.e. while
-    /// SwiftUI is removing the representable but still holds a strong
-    /// reference to this view, so the view is fully alive (refcount ≥ 1),
-    /// unlike inside `deinit`.
+    /// Callers: `GhosttyTerminalView.dismantleNSView` (SwiftUI is removing
+    /// the representable but still holds a strong reference), and
+    /// `TerminalPaneSession.markReleased`, `returnHostHome`,
+    /// `GhosttyTerminalAnchorView.reuseHost` and the test seam. Those last
+    /// paths run `removeFromSuperview()` themselves, so the anchor's strong
+    /// reference is gone and only the caller's transient reference keeps the
+    /// view alive. On every path the view is fully alive (refcount ≥ 1) on
+    /// entry, unlike inside `deinit`.
     ///
     /// Why off the main thread: `ghostty_surface_free` joins the surface's
     /// IO-reader threads, which can be parked inside the bounded

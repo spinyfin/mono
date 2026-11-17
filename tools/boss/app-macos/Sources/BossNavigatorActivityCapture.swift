@@ -124,7 +124,6 @@ enum BossNavigatorActivityCapture {
                 product: product, projects: [project], tasks: tasks, chores: [],
                 taskRuntimes: [], dependencies: [], ideas: []
             ))
-            model.setNavigatorDocument(.currentAsk, rootID: "root")
         }
         if !live.isEmpty {
             model.applyEventForTest(.workerLiveStatesList(states: live, doingSections: ["root": .coding]))

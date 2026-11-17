@@ -16,9 +16,16 @@ struct WorkExecutionsList: View {
     @ObservedObject var model: ChatViewModel
     let taskIDs: [String]
     let transcriptTaskID: String
+    /// False while the list is mounted but hidden; consumers (and their
+    /// refetches) are only registered while it is visible.
+    var isActive = true
     @Environment(\.openWindow) private var openWindow
     @State private var showAllAbandonedAttempts = false
     @State private var consumer = WorkExecutionsConsumer()
+
+    func updateConsumer(_ consumer: WorkExecutionsConsumer) {
+        consumer.update(taskIDs: isActive ? Set(taskIDs) : [], model: model)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -76,8 +83,9 @@ struct WorkExecutionsList: View {
                 Text("No executions yet.").font(.caption).foregroundStyle(.tertiary)
             }
         }
-        .onAppear { consumer.update(taskIDs: Set(taskIDs), model: model) }
-        .onChange(of: taskIDs) { _, ids in consumer.update(taskIDs: Set(ids), model: model) }
+        .onAppear { updateConsumer(consumer) }
+        .onChange(of: taskIDs) { _, _ in updateConsumer(consumer) }
+        .onChange(of: isActive) { _, _ in updateConsumer(consumer) }
         .onDisappear { consumer.update(taskIDs: [], model: model) }
     }
 }

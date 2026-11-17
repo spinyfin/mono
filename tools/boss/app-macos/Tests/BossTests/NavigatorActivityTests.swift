@@ -310,7 +310,8 @@ final class NavigatorActivityTests: XCTestCase {
         ])
         NavigatorTestFixture.snapshot(model, [updated, first, second])
         XCTAssertEqual(model.navigator.askID, second.id)
-        XCTAssertEqual(model.navigatorDocumentTask(for: updated).id, second.id)
+        // The open draft keeps its ask in view when the current ask advances.
+        XCTAssertEqual(model.navigatorDocumentTask(for: updated).id, first.id)
         XCTAssertEqual(model.navigatorBriefText(for: first), "Kept first draft")
         model.navigator.historicalDocumentByRoot[updated.id] = first.id
         model.setNavigatorDocument(.historical, rootID: updated.id)
@@ -334,22 +335,222 @@ final class NavigatorActivityTests: XCTestCase {
         XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.runId, "run-two")
     }
 
-    func testAskLabelUsesFamilyOrdinalAndAskName() {
-        let root = activityTask(section: "working", revisions: [
-            "open": 1, "total": 3, "current_task_id": "third",
+    func testAskLabelUsesEngineRevisionSeqAndOrigin() {
+        var ask = NavigatorTestFixture.task("third", rootID: "root")
+        ask.revisionSeq = 3
+        ask.createdVia = "ci-fix:abc"
+        let inputs = WorkNavigatorBrief.revisionBadgeInputs(ask)
+        XCTAssertEqual(inputs.seq, 3)
+        XCTAssertEqual(inputs.origin, .ciFix)
+        ask.createdVia = "manual"
+        XCTAssertNil(WorkNavigatorBrief.revisionBadgeInputs(ask).origin)
+    }
+
+    func testRunningRevisionDefaultsToCurrentAskWithoutDraft() {
+        let original = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
         ])
-        var first = NavigatorTestFixture.task("first", rootID: "root")
-        first.createdAt = "2026-01-01"
-        var second = NavigatorTestFixture.task("second", rootID: "root")
-        second.createdAt = "2026-01-02"
-        var third = NavigatorTestFixture.task("third", rootID: "root")
-        third.createdAt = "2026-01-03"
-        third.name = "Repair CI"
-        let model = NavigatorTestFixture.model([root, first, second, third])
-        model.selectWorkCard(root.id)
+        let model = NavigatorTestFixture.model([original])
+        model.isConnected = true
+        model.selectWorkCard("root")
         model.setWorkViewMode(.navigator)
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .original)
+        let revised = activityTask(section: "working", activities: [
+            ["execution_id": "execution-2", "task_id": "revision", "run_id": "run-2"],
+        ], revisions: ["open": 1, "total": 1, "current_task_id": "revision"])
+        NavigatorTestFixture.snapshot(model, [revised, NavigatorTestFixture.task("revision", rootID: "root")])
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .currentAsk)
+        XCTAssertEqual(model.navigatorDocumentTask(for: model.navigatorSelectedTask!).id, "revision")
+        // The ask ends: the Brief falls back to the original under its own title.
+        NavigatorTestFixture.snapshot(model, [original, NavigatorTestFixture.task("revision", rootID: "root")])
+        model.setNavigatorDocument(.currentAsk, rootID: "root")
+        model.reconcileNavigatorSelection()
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .original)
+        XCTAssertEqual(model.navigatorDocumentTask(for: model.navigatorSelectedTask!).id, "root")
         let view = WorkNavigatorBrief(context: context(model))
-        XCTAssertEqual(view.askLabel(third), "Revision 3 · Repair CI")
+        XCTAssertEqual(view.documentTitle, "Original brief")
+    }
+
+    func testEndedNoticeOnlyClaimsNewRevisionWhileWorking() {
+        let working = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
+        ])
+        let model = NavigatorTestFixture.model([working])
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        let landed = activityTask(section: "landed", merge: true)
+        NavigatorTestFixture.snapshot(model, [landed])
+        let view = WorkNavigatorActivity(context: context(model), workspace: nil)
+        XCTAssertEqual(view.endedNotice, "Execution ended")
+    }
+
+    func testEndedNoticeWithAnotherLiveActivityAndRetainedRestingStates() {
+        let working = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
+        ])
+        let model = NavigatorTestFixture.model([working])
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        let moved = activityTask(section: "working", activities: [
+            ["execution_id": "execution-2", "task_id": "revision", "run_id": "run-2"],
+        ])
+        NavigatorTestFixture.snapshot(model, [moved])
+        var view = WorkNavigatorActivity(context: context(model), workspace: nil)
+        XCTAssertEqual(view.endedNotice, "Execution ended; new revision available")
+
+        for section in ["backlog", "backlog-failed"] {
+            let resting = section == "backlog"
+                ? activityTask(section: "backlog", waitKind: "waiting_dependency")
+                : activityTask(section: "backlog", waitKind: "failed", failed: true)
+            NavigatorTestFixture.snapshot(model, [resting])
+            view = WorkNavigatorActivity(context: context(model), workspace: nil)
+            XCTAssertEqual(view.endedNotice, "Execution ended", section)
+        }
+    }
+
+    func testStartAndRetryRouteToRequestExecution() {
+        for kind in ["start", "retry"] {
+            let model = NavigatorTestFixture.model([activityTask(section: "backlog", waitKind: "waiting_dependency")])
+            XCTAssertFalse(model.engine.hasUnsentAction(kind: "request_execution"))
+            model.performNavigatorCommand(NavigatorCommand(kind: kind, taskId: "root"))
+            XCTAssertTrue(model.engine.hasUnsentAction(kind: "request_execution"), kind)
+        }
+    }
+
+    func testSlotPresentationRequiresHostedSessionAndFollowsEndedAndFailure() {
+        let workspace = WorkersWorkspaceModel()
+        _ = workspace.attachWorkerPane(EngineAttachRequest(
+            runId: "run", slotId: 1, sessionName: "boss-1-run",
+            tmuxSocketPath: "/state/boss/tmux.sock", summary: nil, taskTitle: nil
+        ))
+        let session = workspace.viewer(forRunId: "run")?.session
+        XCTAssertNotNil(session)
+        XCTAssertNil(session?.hostView, "A non-PTY attach has no host view")
+        typealias Slot = WorkNavigatorTerminalSlot
+        let hosted = session?.hostView != nil
+        XCTAssertEqual(Slot.presentation(hasHostedSession: hosted, ended: false, failure: nil), .unavailable)
+        XCTAssertEqual(Slot.presentation(hasHostedSession: hosted, ended: true, failure: "x"), .ended)
+        XCTAssertEqual(Slot.presentation(hasHostedSession: false, ended: false, failure: "busy"), .attachFailure("busy"))
+        XCTAssertEqual(Slot.presentation(hasHostedSession: true, ended: true, failure: "busy"), .terminal)
+    }
+
+    func testAttachRequestConditions() {
+        typealias Slot = WorkNavigatorTerminalSlot
+        XCTAssertTrue(Slot.shouldRequestAttach(isActive: true, isLive: true, ended: false, hasSession: false))
+        XCTAssertFalse(Slot.shouldRequestAttach(isActive: false, isLive: true, ended: false, hasSession: false))
+        XCTAssertFalse(Slot.shouldRequestAttach(isActive: true, isLive: false, ended: false, hasSession: false))
+        XCTAssertFalse(Slot.shouldRequestAttach(isActive: true, isLive: true, ended: true, hasSession: false))
+        XCTAssertFalse(Slot.shouldRequestAttach(isActive: true, isLive: true, ended: false, hasSession: true))
+    }
+
+    func testEndingAttachRequestAllowsASecondRequestWithoutClearingOthers() {
+        let workspace = WorkersWorkspaceModel()
+        var requested: [String] = []
+        workspace.onViewerAttachRequested = { requested.append($0) }
+        workspace.requestViewerAttach(forRuns: ["run-a", "run-b"])
+        workspace.requestViewerAttach(forRuns: ["run-a"])
+        XCTAssertEqual(requested, ["run-a", "run-b"])
+        workspace.endViewerAttachRequest(forRun: "run-a")
+        workspace.requestViewerAttach(forRuns: ["run-a", "run-b"])
+        XCTAssertEqual(requested, ["run-a", "run-b", "run-a"])
+    }
+
+    func testRemoteRunIsIdentifiedForRemotePane() {
+        let root = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
+        ])
+        let model = NavigatorTestFixture.model([root])
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        let remote = liveState(runId: "run", activity: .working, hostId: "spoke-1")
+        model.applyEventForTest(.workerLiveStatesList(states: [remote]))
+        let view = WorkNavigatorActivity(context: context(model), workspace: nil)
+        let activity = model.navigatorSelectedActivity(for: root)!
+        XCTAssertEqual(view.remoteHost(for: activity), "spoke-1")
+        model.applyEventForTest(.workerLiveStatesList(states: [liveState(runId: "run", activity: .working)]))
+        XCTAssertNil(WorkNavigatorActivity(context: context(model), workspace: nil).remoteHost(for: activity))
+    }
+
+    func testDraftOnDefaultCurrentAskSurvivesClearAndAdvance() {
+        let revised = activityTask(section: "working", activities: [
+            ["execution_id": "e", "task_id": "revision", "run_id": "run"],
+        ], revisions: ["open": 1, "total": 1, "current_task_id": "revision"])
+        let ask = NavigatorTestFixture.task("revision", rootID: "root")
+        let model = NavigatorTestFixture.model([revised, ask])
+        model.isConnected = true
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        XCTAssertNil(model.navigator.documentByRoot["root"])
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .currentAsk)
+        model.beginNavigatorBriefEdit(ask)
+        model.setNavigatorBriefText(ask.id, text: "ask draft")
+
+        NavigatorTestFixture.snapshot(model, [activityTask(section: "working"), ask])
+        model.reconcileNavigatorSelection()
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .historical)
+        XCTAssertEqual(model.navigatorDocumentTask(for: model.navigatorSelectedTask!).id, "revision")
+        XCTAssertEqual(model.navigatorBriefText(for: ask), "ask draft")
+        XCTAssertEqual(WorkNavigatorBrief(context: context(model)).documentTitle, "Historical ask")
+    }
+
+    func testDraftOnDefaultCurrentAskSurvivesAdvanceToAnotherRevision() {
+        let first = activityTask(section: "working", revisions: ["open": 1, "total": 1, "current_task_id": "revision"])
+        let ask = NavigatorTestFixture.task("revision", rootID: "root")
+        let model = NavigatorTestFixture.model([first, ask])
+        model.isConnected = true
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        model.beginNavigatorBriefEdit(ask)
+        model.setNavigatorBriefText(ask.id, text: "first draft")
+        let second = NavigatorTestFixture.task("revision-2", rootID: "root")
+        NavigatorTestFixture.snapshot(model, [
+            activityTask(section: "working", revisions: ["open": 1, "total": 2, "current_task_id": "revision-2"]),
+            ask, second,
+        ])
+        model.reconcileNavigatorSelection()
+        XCTAssertEqual(model.navigator.askID, "revision-2")
+        XCTAssertEqual(model.navigatorDocumentTask(for: model.navigatorSelectedTask!).id, "revision")
+        XCTAssertEqual(model.navigatorBriefText(for: ask), "first draft")
+    }
+
+    func testFailingTaskPrefersFailedRevisionOverStickyRootActivity() {
+        let root = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
+        ])
+        let model = NavigatorTestFixture.model([root])
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        XCTAssertEqual(model.navigatorSelectedActivity(for: root)?.taskId, "root")
+        var failedRoot = activityTask(section: "backlog", waitKind: "failed", failed: true,
+                                      revisions: ["open": 1, "total": 1, "current_task_id": "revision"])
+        failedRoot.dispatchFailedReason = nil
+        var revision = NavigatorTestFixture.task("revision", rootID: "root")
+        revision.dispatchFailedReason = "cube_workspace_lease_failed"
+        NavigatorTestFixture.snapshot(model, [failedRoot, revision])
+        let view = WorkNavigatorActivity(context: context(model), workspace: nil)
+        XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.taskId, "root")
+        XCTAssertEqual(view.failingTask.id, "revision")
+    }
+
+    func testEditBriefRevealsTheDocumentItEdits() {
+        let root = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
+        ], revisions: ["open": 1, "total": 1, "current_task_id": "revision"])
+        let model = NavigatorTestFixture.model([root, NavigatorTestFixture.task("revision", rootID: "root")])
+        model.isConnected = true
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .currentAsk)
+        model.performNavigatorCommand(NavigatorCommand(kind: "edit_brief", taskId: "root"))
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .original)
+        XCTAssertTrue(model.navigatorBriefIsEditing("root"))
+    }
+
+    func testParkCommandRequestsPark() {
+        let root = activityTask(section: "backlog", waitKind: "waiting_dependency")
+        let model = NavigatorTestFixture.model([root])
+        model.performNavigatorCommand(NavigatorCommand(kind: "park", taskId: "root"))
+        XCTAssertEqual(model.pendingParkRequest?.id, "root")
     }
 
     func testLandedBriefCannotEditOrSave() {
@@ -415,11 +616,11 @@ final class NavigatorActivityTests: XCTestCase {
         )
     }
 
-    private func liveState(runId: String, slotId: Int = 3, activity: WorkerActivity) -> WorkerLiveState {
+    private func liveState(runId: String, slotId: Int = 3, activity: WorkerActivity, hostId: String? = nil) -> WorkerLiveState {
         WorkerLiveState(
             name: "Riker", slotId: slotId, runId: runId, model: "claude-opus", shellPid: 0,
             lastEventAt: nil, currentTool: nil, lastToolEndedAt: nil, activity: activity,
-            liveStatus: nil, liveStatusAt: nil, recoveryStatus: nil, tmuxHosted: true
+            liveStatus: nil, liveStatusAt: nil, recoveryStatus: nil, tmuxHosted: true, hostId: hostId
         )
     }
 

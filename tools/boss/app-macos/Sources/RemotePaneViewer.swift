@@ -220,10 +220,12 @@ final class RemotePaneViewerModel: ObservableObject {
 
     static func topic(runId: String) -> String { "pane_capture.\(runId)" }
 
-    /// Start watching `runId` (and stop watching whatever else was being
-    /// watched: the viewer shows one pane at a time).
-    func watch(_ runId: String?) {
-        let wanted: Set<String> = runId.map { [$0] } ?? []
+    private var watchesByOwner: [String: String] = [:]
+
+    /// Replace this surface's watch; other surfaces retain their subscriptions.
+    func watch(_ runId: String?, owner: String = "legacy") {
+        watchesByOwner[owner] = runId
+        let wanted = Set(watchesByOwner.values)
         let leaving = watching.subtracting(wanted)
         let joining = wanted.subtracting(watching)
         watching = wanted
@@ -233,7 +235,7 @@ final class RemotePaneViewerModel: ObservableObject {
         if !joining.isEmpty && isConnected { subscribe(joining.sorted().map(Self.topic)) }
     }
 
-    func stopWatching() { watch(nil) }
+    func stopWatching(owner: String = "legacy") { watch(nil, owner: owner) }
 
     func apply(_ capture: RemotePaneCapture) {
         // A push for a run nobody is watching (an unsubscribe in flight) is
@@ -372,6 +374,7 @@ struct RemoteWorkersPanel: View {
     let isVisible: Bool
 
     @State private var selected: String?
+    @State private var watchOwner = UUID().uuidString
 
     var body: some View {
         VStack(spacing: 0) {
@@ -399,8 +402,8 @@ struct RemoteWorkersPanel: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .onChange(of: effectiveSelection, initial: true) { _, run in model.watch(run) }
-        .onDisappear { model.stopWatching() }
+        .onChange(of: effectiveSelection, initial: true) { _, run in model.watch(run, owner: watchOwner) }
+        .onDisappear { model.stopWatching(owner: watchOwner) }
     }
 
     /// Nothing is watched while the tab is hidden, or once the worker left.

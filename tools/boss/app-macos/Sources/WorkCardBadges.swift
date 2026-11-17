@@ -3,6 +3,17 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+/// Capsule chip surfacing a repo's short name on a kanban card or
+/// product header. Hover tooltip carries the full URL plus the
+/// provenance string ("Inherited from product" vs "Repo set on this
+/// card") so the reader can tell where the URL came from without
+/// digging into the popover. Pure view — all the mode/provenance
+/// logic lives on `RepoChipPresentation` so tests don't need a
+/// SwiftUI host.
+///
+/// The chip uses a neutral style matching `WorkStatusBadge`. Per-card
+/// chips appear only on rows with their own repo, so their presence
+/// conveys the override without an accent color.
 struct RepoChipView: View {
     let presentation: RepoChipPresentation
     var emphasized: Bool = false

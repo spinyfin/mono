@@ -66,6 +66,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// repeat request would add nothing. Cleared when the view is hidden so
     /// bringing it back asks again.
     private var requestedViewerRunIds: Set<String> = []
+    private var viewerRequestsByOwner: [String: Set<String>] = [:]
 
     /// The engine's work-item labels for runs it has released, keyed by run id
     /// (the execution id). A released run has no live state, so its finished
@@ -151,9 +152,10 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// user-driven path for anything that schedule gave up on. Runs that
     /// already have a viewer, or that were asked for in this visibility
     /// episode, are skipped.
-    func requestViewerAttach(forRuns runIds: [String]) {
+    func requestViewerAttach(forRuns runIds: [String], owner: String = "agents") {
         for runId in runIds {
             guard viewersByRunId[runId]?.session == nil else { continue }
+            viewerRequestsByOwner[owner, default: []].insert(runId)
             guard !requestedViewerRunIds.contains(runId) else { continue }
             requestedViewerRunIds.insert(runId)
             onViewerAttachRequested?(runId)
@@ -162,8 +164,20 @@ final class WorkersWorkspaceModel: ObservableObject {
 
     /// The Agents view went out of sight: the next time it shows, every
     /// still-viewerless member may be asked for again.
-    func resetViewerAttachRequests() {
-        requestedViewerRunIds.removeAll()
+    func resetViewerAttachRequests(owner: String = "agents") {
+        let runs = viewerRequestsByOwner.removeValue(forKey: owner) ?? []
+        for run in runs where !viewerRequestsByOwner.values.contains(where: { $0.contains(run) }) {
+            requestedViewerRunIds.remove(run)
+        }
+    }
+
+    /// A single surface stopped showing one run: allow it to be asked for
+    /// again without clearing requests other surfaces still own.
+    func endViewerAttachRequest(forRun runId: String, owner: String = "agents") {
+        viewerRequestsByOwner[owner]?.remove(runId)
+        if !viewerRequestsByOwner.values.contains(where: { $0.contains(runId) }) {
+            requestedViewerRunIds.remove(runId)
+        }
     }
 
     private func recordViewerAttachFailure(runId: String, reason: String) {
