@@ -174,65 +174,6 @@ fn private_forwarder_config(process_home: &Path, config: &ProgressObservationCon
     }
 }
 
-/// Absolute path of an engine-owned worker binary, or a non-protected
-/// placeholder so `"$BOSS_BIN"` / `"$CUBE_BIN"` still expand in tests.
-fn engine_owned_bin(name: &str) -> PathBuf {
-    let engine = std::env::current_exe().unwrap_or_default();
-    let workspace_dir = std::env::var_os(boss_engine_worker_bin::BUILD_WORKSPACE_DIRECTORY_ENV).map(PathBuf::from);
-    let env_override = match name {
-        "boss" => std::env::var_os(boss_engine_worker_bin::BOSS_CLI_BIN_ENV).map(PathBuf::from),
-        "cube" => std::env::var_os(boss_engine_worker_bin::CUBE_CLI_BIN_ENV).map(PathBuf::from),
-        _ => None,
-    };
-    let boss_bin_dir = std::env::var_os(boss_engine_worker_bin::BOSS_BIN_DIR_ENV).map(PathBuf::from);
-    let resolved = match name {
-        "boss" => boss_engine_worker_bin::resolve_boss_cli(
-            &engine,
-            workspace_dir.as_deref(),
-            env_override.as_deref(),
-            boss_bin_dir.as_deref(),
-        ),
-        "cube" => boss_engine_worker_bin::resolve_cube_cli(
-            &engine,
-            workspace_dir.as_deref(),
-            env_override.as_deref(),
-            boss_bin_dir.as_deref(),
-        ),
-        _ => None,
-    };
-    resolved
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| PathBuf::from(format!("/nonexistent/boss-engine-owned/{name}")))
-}
-
-fn designated_structured_output(kind: WorkerKind) -> StructuredOutputKind {
-    match kind {
-        WorkerKind::Reviewer => StructuredOutputKind::ReviewResult,
-        WorkerKind::Triage => StructuredOutputKind::TriageDecision,
-        WorkerKind::Standard | WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => {
-            StructuredOutputKind::Followups
-        }
-    }
-}
-
-fn exported_paths_json(process_home: &Path, worker_kind: WorkerKind, run_id: &str) -> Value {
-    let boss = engine_owned_bin("boss");
-    let cube = engine_owned_bin("cube");
-    let bin_dir = boss
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("/nonexistent/boss-engine-owned"));
-    json!({
-        "BOSS_BIN": boss.display().to_string(),
-        "CUBE_BIN": cube.display().to_string(),
-        "BOSS_BIN_DIR": bin_dir.display().to_string(),
-        "BOSS_STRUCTURED_OUTPUT": boss_engine_structured_output::default_path_string(
-            run_id,
-            designated_structured_output(worker_kind),
-        ),
-        "HOME": process_home.display().to_string(),
-    })
-}
 
 fn artifact_write_paths_json(worker_kind: WorkerKind, run_id: &str) -> Value {
     match worker_kind {
@@ -385,7 +326,6 @@ pub(super) fn expected_authorization_policy(
         "workspace_path": obs.workspace_path.display().to_string(),
         "process_home": process_home.display().to_string(),
         "protected_paths": protected_paths(process_home, interception),
-        "exported_paths": exported_paths_json(process_home, worker_kind, &obs.run_id),
         "artifact_write_paths": artifact_write_paths_json(worker_kind, &obs.run_id),
         "forwarder": obs.forwarder_binary.display().to_string(),
         "attestation_path": attestation_path(process_home).display().to_string(),

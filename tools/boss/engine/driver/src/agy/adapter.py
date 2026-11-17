@@ -344,19 +344,14 @@ def nested_shell_bodies(group):
     return []
 
 
-def quoted_heredoc_bodies(command):
-    bodies = []
-    for group in command_records(command):
-        if getattr(group, "body", "") and not getattr(group, "expanding_body", False):
-            bodies.append(group.body)
-    return bodies
-
-
 def has_substitution(command):
-    masked = command
-    for body in quoted_heredoc_bodies(command):
-        if body:
-            masked = masked.replace(body, " " * len(body), 1)
+    command = command.replace(chr(92) + chr(10), '')
+    masked = list(command)
+    for group in command_records(command):
+        if group.body_span and not group.expanding_body:
+            start, end = group.body_span
+            masked[start:end] = ' ' * (end - start)
+    masked = ''.join(masked)
     quote, escaped = None, False
     for index, char in enumerate(masked):
         if escaped:
@@ -412,11 +407,8 @@ def has_redirect(command):
     return False
 
 
-# Executable variables the engine exports into the worker environment. The
-# adapter runs as a hook of the worker process, so it reads the values the
-# engine set at spawn; nothing a command does inside its own shell can change
-# them here. A command that could rebind one is denied outright, because the
-# shell would then run something other than what the adapter resolved.
+# Resolve the exact environment inherited from the worker at spawn.
+# Commands cannot rebind these variables and use the trusted resolution.
 TRUSTED_EXECUTABLE_VARS = ("BOSS_BIN", "CUBE_BIN")
 TRUSTED_NAMES = "|".join(TRUSTED_EXECUTABLE_VARS)
 TRUSTED_VAR_RE = re.compile(r"\$(?:(%s)\b|\{(%s)\})" % (TRUSTED_NAMES, TRUSTED_NAMES))
@@ -446,19 +438,9 @@ def reject_trusted_rebinding(command, groups):
 
 
 def exported_paths(policy):
-    exported = policy.get("exported_paths") or {}
-    if not isinstance(exported, dict):
-        exported = {}
-    values = {key: value for key, value in exported.items() if key in EXPORTED_PATH_VARS and isinstance(value, str) and os.path.isabs(value)}
-    if "HOME" not in values:
-        values["HOME"] = policy["process_home"]
-    for name in TRUSTED_EXECUTABLE_VARS:
-        if name in values:
-            continue
-        env_value = os.environ.get(name)
-        if env_value and os.path.isabs(env_value) and not any(c in env_value for c in "\n\0"):
-            values[name] = env_value
-    return values
+    return {name: value for name in EXPORTED_PATH_VARS
+            if (value := os.environ.get(name)) and os.path.isabs(value)
+            and not any(c in value for c in "\n\0")}
 
 
 def expand_exported(path, policy):
@@ -471,30 +453,6 @@ def expand_exported(path, policy):
         return match.group(0)
 
     return re.sub(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})", replacer, path)
-
-
-def looks_like_path(token):
-    if not token or token in DELIMS or (token and all(c in "()" for c in token)):
-        return False
-    stripped = re.sub(r"^(?:[0-9]+|&)?[<>]+", "", token)
-    if not stripped or stripped in ("-", "/dev/null"):
-        return False
-    if stripped.startswith("~") or stripped.startswith("$"):
-        return True
-    if any(c in stripped for c in "/*?["):
-        return True
-    if stripped in (".", "..") or stripped.startswith("./") or stripped.startswith("../"):
-        return True
-    return False
-
-
-def is_path_candidate(token, single_quoted=False):
-    if ASSIGNMENT_RE.match(token):
-        return True
-    stripped = re.sub(r"^(?:[0-9]+|&)?[<>]+", "", token)
-    if single_quoted and not looks_like_path(stripped.replace("$", "")):
-        return False
-    return looks_like_path(token)
 
 
 def resolve_path(path, policy, cwd=None, single_quoted=False):
@@ -532,16 +490,67 @@ def path_is_protected(path, policy, cwd=None, single_quoted=False):
     return False
 
 
-def glob_touches_protected(candidate, expanded, policy):
-    static = re.split(r"[\*\?\[]", candidate, 1)[0].rstrip(os.sep)
-    if not static:
-        static = re.split(r"[\*\?\[]", expanded, 1)[0].rstrip(os.sep)
+def glob_touches_protected(expanded, policy):
+    static = re.split(r"[\*\?\[]", os.path.normpath(expanded), 1)[0].rstrip(os.sep) or os.sep
+    prefixes = [static, os.path.realpath(static)]
+    existing = static
+    while not os.path.exists(existing) and os.path.dirname(existing) != existing:
+        existing = os.path.dirname(existing)
+    prefixes.append(os.path.realpath(existing))
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
             root_abs = spelling.rstrip(os.sep)
-            if root_abs.startswith(static) or static.startswith(root_abs + os.sep) or static == root_abs:
+            if any(root_abs.startswith(prefix) or prefix.startswith(root_abs + os.sep) or prefix == root_abs for prefix in prefixes):
                 return True
     return False
+
+
+def path_operand_positions(group):
+    # Default operands to paths; exclude known text and script positions.
+    rest = strip_prefixes(group)
+    program = os.path.basename(rest[0]) if rest else ''
+    operand, skip_next, pattern_seen = 0, False, False
+    text_flags = {'grep': ('-e', '--regexp'), 'rg': ('-e', '--regexp'),
+                  'sed': ('-e', '--expression'), 'awk': ('-e', '--source'),
+                  'gawk': ('-e', '--source')}.get(program, ())
+    positions = set()
+    for index, token in enumerate(group):
+        redirect = re.match(r'^(?:[0-9]+|&)?(?:>\||>>?|<>|<<-?|<)(.*)$', token)
+        if redirect:
+            if token.startswith('<<'):
+                skip_next = not redirect.group(1)
+            elif redirect.group(1):
+                positions.add(index)
+            elif index + 1 < len(group):
+                positions.add(index + 1)
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        if token not in rest:
+            if not token.startswith('-'):
+                positions.add(index)
+            continue
+        if operand == 0:
+            positions.add(index)
+        elif token.startswith('-'):
+            if any(token.startswith(flag + '=') for flag in text_flags):
+                pattern_seen = True
+            elif '=' in token:
+                positions.add(index)
+            if token in text_flags:
+                skip_next = True
+                pattern_seen = True
+            elif program in ('grep', 'rg', 'sed', 'awk', 'gawk') and token in ('-f', '--file'):
+                pattern_seen = True
+        elif program in ('echo', 'printf', 'printenv', 'test', '['):
+            pass
+        elif program in ('grep', 'rg', 'awk', 'gawk', 'sed') and not pattern_seen:
+            pattern_seen = True
+        else:
+            positions.add(index)
+        operand += 1
+    return positions
 
 
 def command_touches_protected(command, policy, cwd):
@@ -550,27 +559,28 @@ def command_touches_protected(command, policy, cwd):
     reject_trusted_rebinding(command, groups)
     for group in groups:
         rest = strip_prefixes(group)
-        quoted = getattr(group, "single_quoted", [False] * len(group))
-        for index, token in enumerate(group):
-            single_quoted = quoted[index] if index < len(quoted) else False
-            candidate = token.split("=", 1)[1] if ASSIGNMENT_RE.match(token) else token
+        for index in path_operand_positions(group):
+            token = group[index]
+            literal = group.literal_chars[index]
+            # Preserve quoted/escaped expansion characters during resolution.
+            candidate = ''.join({'$': chr(1), '~': chr(3)}.get(c, c) if i < len(literal) and literal[i] else c
+                                for i, c in enumerate(token))
+            if ASSIGNMENT_RE.match(candidate) or (candidate.startswith('-') and '=' in candidate):
+                candidate = candidate.split("=", 1)[1]
             candidate = re.sub(r"^(?:[0-9]+|&)?[<>]+", "", candidate)
-            if not candidate:
+            if not candidate or candidate.startswith('&'):
                 continue
-            if not single_quoted:
-                if "$" in expand_exported(candidate, policy):
-                    fail_closed("unresolved shell path expansion")
-                if re.match(r"^~[^/]", candidate):
-                    fail_closed("unresolved shell path expansion")
-            if not is_path_candidate(candidate, single_quoted):
-                continue
-            if any(c in candidate for c in "*?["):
-                expanded = candidate if single_quoted else expand_exported(candidate, policy)
-                if not os.path.isabs(expanded):
-                    expanded = os.path.join(current or cwd or policy["workspace_path"], expanded)
-                if glob_touches_protected(candidate, expanded, policy):
-                    return True
-            if path_is_protected(candidate, policy, current, single_quoted=single_quoted):
+            expanded = expand_exported(candidate, policy)
+            if '$' in expanded or re.match(r"^~[^/]", expanded):
+                fail_closed("unresolved shell path expansion")
+            if expanded == '~' or expanded.startswith('~/'):
+                expanded = policy['process_home'] + expanded[1:]
+            expanded = expanded.replace(chr(1), '$').replace(chr(3), '~')
+            if not os.path.isabs(expanded):
+                expanded = os.path.join(current or policy['workspace_path'], expanded)
+            if any(c in expanded for c in '*?[') and glob_touches_protected(expanded, policy):
+                return True
+            if path_is_protected(expanded, policy, current, single_quoted=True):
                 return True
         if rest and rest[0] in ("cd", "pushd", "popd"):
             if len(rest) != 2 or rest[1] == "-" or re.match(r"^~[^/]", rest[1]) or any(c in rest[1] for c in "`*?["):
@@ -578,6 +588,8 @@ def command_touches_protected(command, policy, cwd):
             if "$" in rest[1] and expand_exported(rest[1], policy) == rest[1]:
                 return True
             current = resolve_path(rest[1], policy, current)
+            if path_is_protected(current, policy, single_quoted=True):
+                return True
         for body in nested_shell_bodies(group):
             if command_touches_protected(body, policy, current):
                 return True
@@ -708,6 +720,9 @@ def structural_reason(native_name, args, canonical, policy):
     if not isinstance(protected, list):
         protected = []
     protected = [p for p in protected if isinstance(p, str)]
+    cwd = canonical.get("cwd")
+    if isinstance(cwd, str) and path_is_protected(cwd, policy):
+        return "working directory accesses protected Antigravity or Boss state"
     file_path = canonical["tool_input"].get("file_path")
     if isinstance(file_path, str) and path_is_protected(file_path, policy, canonical.get("cwd")):
         return "refusing access to protected Antigravity or Boss state: %s" % (file_path,)
@@ -751,11 +766,7 @@ def guard_applies(matcher, canonical_name):
 
 
 def guard_env(policy):
-    env = os.environ.copy()
-    for key, value in exported_paths(policy).items():
-        if isinstance(value, str) and value:
-            env[key] = value
-    return env
+    return os.environ.copy()
 
 
 def run_bounded(argv, **kwargs):

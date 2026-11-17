@@ -238,18 +238,15 @@ fn engine_executable_variables_cannot_evade_structural_denies() {
         let (body, stderr) = authorize_tools(&fx, command);
         assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
-    // Policy carries the engine-owned path, so the quoted form resolves even
-    // when the adapter process does not inherit BOSS_BIN.
-    let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload("\"$BOSS_BIN\" propose done"));
-    assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
-    // A relative process env value must not override the policy path.
+    for value in ["", "boss"] {
+        let (_, body, stderr) = authorize_with_env(
+            &fx.process_home,
+            &run_command_payload("\"$BOSS_BIN\" propose done"),
+            &[("BOSS_BIN", value)],
+        );
+        assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    }
 
-    let (_, body, stderr) = authorize_with_env(
-        &fx.process_home,
-        &run_command_payload("\"$BOSS_BIN\" propose done"),
-        &[("BOSS_BIN", "boss")],
-    );
-    assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
 }
 
 #[test]
@@ -434,16 +431,18 @@ fn engine_executable_variable_names_are_plain_data_outside_binding_positions() {
         "grep -E 'foo$' f",
         "awk '{print $1}' f",
         "rg 'bar$' .",
+        "grep -n x'$' f",
+        "grep -n x\\$ f",
+        "echo cost$",
+        "printf '%s' a$",
+        "grep \"$X\" f",
         "sed -n '10,$p' f",
     ] {
         let (body, stderr) = authorize_tools(&fx, command);
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
-    // A `$` the shell would expand still fails closed.
-    for command in ["grep \"$X\" f", "grep $X f", "grep \"a$X\" f", "cat \"$HOME_CONFIG\""] {
-        let (body, stderr) = authorize_tools(&fx, command);
-        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
-    }
+    let (body, stderr) = authorize_tools(&fx, "cat \"$HOME_CONFIG\"");
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
 }
 
 #[test]
@@ -551,22 +550,18 @@ fn protected_tilde_user_and_symlink_glob_are_denied() {
         "{body}"
     );
 
-    // `/tmp` and `/var` are themselves symlinks (`/private/tmp`, `/private/var`).
-    // Glob the symlink component so the static prefix only matches the
-    // unresolved spelling of the protected homes root.
-    let target = fx.process_home.join(".gemini/config/hooks.json");
-    let raw = target.display().to_string();
-    let globbed = if let Some(rest) = raw.strip_prefix("/tmp/") {
-        format!("/tm?/{rest}")
-    } else if let Some(rest) = raw.strip_prefix("/private/tmp/") {
-        format!("/private/tm?/{rest}")
-    } else if let Some(rest) = raw.strip_prefix("/var/") {
-        format!("/va?/{rest}")
-    } else if let Some(rest) = raw.strip_prefix("/private/var/") {
-        format!("/private/va?/{rest}")
-    } else {
-        panic!("expected test temp under /tmp or /var, got {raw}");
-    };
+    let real = fx.tmp.path().join("real");
+    fs::create_dir_all(real.join("protected")).unwrap();
+    std::os::unix::fs::symlink(&real, fx.tmp.path().join("link")).unwrap();
+    let policy = policy_path(&fx.process_home);
+    let mut doc: Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
+    doc["protected_paths"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(real.join("protected")));
+    write_json_atomic(&policy, &doc).unwrap();
+    rebind(&fx);
+    let globbed = format!("{}/lin?/protected/hooks.json", fx.tmp.path().display());
     let glob_cmd = format!("cat {globbed}");
     let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&glob_cmd), true);
     assert_eq!(code, 0, "stderr={stderr}");

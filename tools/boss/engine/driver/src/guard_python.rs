@@ -44,32 +44,70 @@ def heredoc_delim(line):
     return word, bool(quote)
 
 class CommandGroup(list):
-    def __init__(self, tokens, body='', boundary=None, error=None, single_quoted=None):
+    def __init__(self, tokens, body='', boundary=None, error=None, single_quoted=None, literal_chars=None):
         super().__init__(tokens)
         self.body = body
+        self.body_span = None
+        self.literal_chars = literal_chars or [[] for _ in tokens]
         self.expanding_body = False
         self.boundary = boundary
         self.error = error
         self.single_quoted = list(single_quoted or [False] * len(tokens))
 
 
-def single_quoted_flags(text, tokens):
-    # posix=False keeps quote characters, so a token that is exactly one
-    # single-quoted word can be aligned with the posix=True token list.
-    lexer = shlex.shlex(text, posix=False, punctuation_chars=';&|()')
-    lexer.whitespace_split = True
-    lexer.commenters = ''
-    try:
-        raw = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|') for token in lexer]
-    except ValueError:
-        return [False] * len(tokens)
-    raw = [part for token in raw for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
-    if len(raw) != len(tokens):
-        return [False] * len(tokens)
-    flags = []
-    for source, token in zip(raw, tokens):
-        flags.append(len(source) >= 2 and source[0] == source[-1] == chr(39) and source[1:-1] == token)
-    return flags
+def quote_provenance(text, tokens):
+    # Mirror shlex boundaries while retaining each literal character.
+    words, masks, word, mask = [], [], [], []
+    quote, index, active = None, 0, False
+    def finish():
+        nonlocal word, mask, active
+        if active:
+            words.append(''.join(word))
+            masks.append(mask)
+        word, mask, active = [], [], False
+    while index < len(text):
+        char = text[index]
+        if quote != chr(39) and char == chr(92) and index + 1 < len(text):
+            following = text[index + 1]
+            if quote != chr(34) or following in (chr(34), chr(92)):
+                word.append(following)
+                mask.append(True)
+                active = True
+                index += 2
+                continue
+        if char == quote:
+            quote = None
+        elif quote is None and char in (chr(39), chr(34)):
+            quote = char
+            active = True
+        elif quote is None and (char.isspace() or char in ';&|()'):
+            finish()
+            if not char.isspace():
+                end = index + 1
+                while end < len(text) and text[end] in ';&|()':
+                    end += 1
+                for part in re.findall(r'[()]|[;&|]+', text[index:end]):
+                    words.append(part)
+                    masks.append([False] * len(part))
+                index = end
+                continue
+        else:
+            word.append(char)
+            mask.append(quote == chr(39) or char == chr(2))
+            active = True
+        index += 1
+    finish()
+    restored = []
+    for position, word in enumerate(words):
+        for marker, value in [('__GUARD_FD_AMP__', '&'), ('__GUARD_REDIRECT_PIPE__', '|'), (chr(2), '$')]:
+            while marker in word:
+                start = word.index(marker)
+                masks[position][start:start + len(marker)] = [masks[position][start]]
+                word = word[:start] + value + word[start + len(marker):]
+        restored.append(word)
+    if restored != tokens:
+        raise ValueError('quote provenance does not match shell tokens')
+    return masks
 
 
 def shell_text(text):
@@ -86,6 +124,8 @@ def shell_text(text):
             # shell consumes them before executing an extracted -c body.
             if quote == chr(34) and char in (chr(36), chr(96)):
                 out.pop()
+                if char == chr(36):
+                    char = chr(2)
             out.append(char)
             escaped = False
             continue
@@ -119,19 +159,24 @@ def command_records(command):
     heredoc_end = None
     # Shell escaped newlines do not delimit commands.
     command = command.replace(chr(92) + chr(10), '')
+    offset = 0
     for line in command.split(chr(10)):
+        line_start = offset
+        offset += len(line) + 1
         if heredoc_end is not None:
             if line.lstrip(chr(9)) == heredoc_end:
                 heredoc_end = None
             else:
                 receiver.body += line + chr(10)
+                start = receiver.body_span[0] if receiver.body_span else line_start
+                receiver.body_span = (start, min(offset, len(command)))
             continue
         pending = shell_text(pending + line + chr(10))
         try:
             lexer = shlex.shlex(pending, posix=True, punctuation_chars=';&|()')
             lexer.whitespace_split = True
             lexer.commenters = ''
-            tokens = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|') for token in lexer]
+            tokens = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|').replace(chr(2), '$') for token in lexer]
         except ValueError:
             # A quote can span physical lines. Never reinterpret failed lexing
             # as whitespace-separated argv.
@@ -140,20 +185,24 @@ def command_records(command):
         pending = ''
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
-        quoted = single_quoted_flags(logical_line, tokens)
+        literal = quote_provenance(logical_line, tokens)
+        quoted = [bool(m) and all(m) for m in literal]
         current_quoted = []
+        current_literal = []
         for index, token in enumerate(tokens):
             if token in DELIMS or (token and all(c in '()' for c in token)):
                 if current:
-                    groups.append(CommandGroup(current, single_quoted=current_quoted))
+                    groups.append(CommandGroup(current, single_quoted=current_quoted, literal_chars=current_literal))
                 current = []
                 current_quoted = []
+                current_literal = []
                 groups.append(CommandGroup([], boundary=token))
             else:
                 current.append(token)
-                current_quoted.append(quoted[index] if index < len(quoted) else False)
+                current_quoted.append(quoted[index])
+                current_literal.append(literal[index])
         if current:
-            groups.append(CommandGroup(current, single_quoted=current_quoted))
+            groups.append(CommandGroup(current, single_quoted=current_quoted, literal_chars=current_literal))
         delim = heredoc_delim(logical_line)
         if delim and groups:
             heredoc_end, quoted = delim

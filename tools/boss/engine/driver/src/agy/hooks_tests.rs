@@ -174,9 +174,11 @@ fn authorize_with_env(process_home: &Path, payload: &Value, env: &[(&str, &str)]
         .env("BOSS_AGY_POLICY", &policy)
         .env("BOSS_AGY_FORWARDER", policy_doc["forwarder"].as_str().unwrap())
         .env("BOSS_RUN_ID", run_id)
-        .env_remove("BOSS_BIN")
-        .env_remove("CUBE_BIN")
         .env_remove("BOSS_STRUCTURED_OUTPUT")
+        .env("HOME", process_home)
+        .env("BOSS_BIN", "/opt/boss-tools/boss")
+        .env("CUBE_BIN", "/opt/boss-tools/cube")
+
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -235,10 +237,7 @@ fn install_writes_adapter_policy_attestation_and_single_pre_tool_use_entry() {
     let policy_doc: Value = serde_json::from_str(&fs::read_to_string(&policy).unwrap()).unwrap();
     assert_eq!(policy_doc["approval"], "auto_approve");
     assert_eq!(policy_doc["worker_kind"], "standard");
-    for key in ["BOSS_BIN", "CUBE_BIN", "BOSS_BIN_DIR", "BOSS_STRUCTURED_OUTPUT", "HOME"] {
-        let value = policy_doc["exported_paths"][key].as_str().unwrap_or_default();
-        assert!(Path::new(value).is_absolute(), "{key}={value}");
-    }
+    assert!(policy_doc.get("exported_paths").is_none());
     assert!(policy_doc["artifact_write_paths"].as_array().unwrap().is_empty());
     verify_attestation(&fx.process_home).unwrap();
 }
@@ -799,3 +798,7 @@ mod review_regression_tests;
 
 #[path = "startup_tests.rs"]
 mod startup_tests;
+
+#[path = "protected_operand_tests.rs"]
+mod protected_operand_tests;
+
