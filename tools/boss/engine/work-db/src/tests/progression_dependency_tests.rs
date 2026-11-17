@@ -1,0 +1,459 @@
+//! Dependency health, root targeting, and escalation through the shared candidate views.
+use super::*;
+
+#[test]
+fn a_healthy_chain_waits_indefinitely_with_manual_or_automatic_work() {
+    let f = fixture();
+    let root = f.chore("Backfill");
+    let second = f.dependent_on(&root);
+    let third = f.dependent_on(&second);
+    let fourth = f.dependent_on(&third);
+    for item in [&second, &third, &fourth] {
+        f.age(item, 365 * 24 * HOUR);
+        f.sql(&format!("UPDATE tasks SET kind = 'project_task' WHERE id = '{item}'"));
+    }
+    for autostart in [0, 1] {
+        for status in ["todo", "active", "in_review"] {
+            f.sql(&format!(
+                "UPDATE tasks SET autostart = {autostart};
+                 UPDATE tasks SET status = '{status}' WHERE id = '{root}'"
+            ));
+            for item in [&root, &second, &third, &fourth] {
+                f.assert_candidate(item, false);
+            }
+            assert_eq!(bucket(&f.db, &fourth), Some(StuckBucket::WaitingOnDependency));
+        }
+    }
+    for status in [ExecutionStatus::Ready, ExecutionStatus::Running] {
+        let run = f.execution(&root, ExecutionKind::ChoreImplementation, status);
+        f.assert_candidate(&fourth, false);
+        f.sql(&format!(
+            "UPDATE work_executions SET status = 'completed' WHERE id = '{run}'"
+        ));
+    }
+    assert!(f.db.mint_progression_execution(&fourth).unwrap().is_none());
+    let mint = f.db.mint_progression_executions().unwrap();
+    assert!(mint.minted.is_empty());
+    assert!(mint.asked.is_empty());
+    assert!(mint.failed.is_empty());
+    assert!(mint.ladder_failed.is_empty());
+}
+
+#[test]
+fn broken_or_satisfied_edges_are_repaired_at_the_direct_dependent() {
+    for change in ["status = 'archived'", "deleted_at = '1'", "status = 'done'"] {
+        let f = fixture();
+        let root = f.chore("Prerequisite");
+        let middle = f.dependent_on(&root);
+        let downstream = f.dependent_on(&middle);
+        f.sql(&format!("UPDATE tasks SET {change} WHERE id = '{root}'"));
+        f.assert_candidate(&middle, true);
+        f.assert_candidate(&downstream, false);
+        assert_eq!(f.clauses(&middle).stuck_kind.as_deref(), Some("S4_dependency"));
+        let mint = f.db.mint_progression_executions().unwrap();
+        assert!(mint.failed.is_empty());
+        assert_eq!(mint.minted.len(), 1);
+        assert_eq!(mint.minted[0].0.work_item_id, middle);
+    }
+    let f = fixture();
+    let missing = f.dependent_on("task_missing");
+    f.assert_candidate(&missing, true);
+    f.sql("DELETE FROM work_item_dependencies");
+    f.assert_candidate(&missing, true);
+}
+
+#[test]
+fn completed_edges_do_not_hide_unfinished_work_but_broken_edges_need_repair() {
+    let f = fixture();
+    let finished = f.chore("Finished prerequisite");
+    let unfinished = f.chore("Unfinished prerequisite");
+    let dependent = f.dependent_on(&finished);
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'done' WHERE id = '{finished}';
+         INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES ('{dependent}', '{unfinished}', 'blocks', '1')"
+    ));
+    f.assert_candidate(&dependent, false);
+    f.sql(&format!("UPDATE tasks SET status = 'archived' WHERE id = '{finished}'"));
+    f.assert_candidate(&dependent, true);
+}
+
+#[test]
+fn transitive_cycles_target_cycle_members_even_with_a_healthy_branch() {
+    let f = fixture();
+    let first = f.chore("Cycle start");
+    let second = f.dependent_on(&first);
+    let third = f.dependent_on(&second);
+    let downstream = f.dependent_on(&third);
+    let healthy = f.chore("Healthy branch");
+    // Public dependency writes reject cycles. Plant a corrupt graph to exercise
+    // diagnosis of legacy or externally damaged edges, including a live branch.
+    f.sql(&format!(
+        "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES ('{first}', '{third}', 'blocks', '1'), ('{second}', '{healthy}', 'blocks', '1')"
+    ));
+    f.stick(&first, "status = 'blocked', blocked_reason = 'dependency'", 3);
+    for item in [&first, &second, &third] {
+        f.assert_candidate(item, true);
+    }
+    f.assert_candidate(&downstream, false);
+    // A non-blocking ordering edge must not close the cycle for downstream.
+    f.sql(&format!(
+        "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES ('{first}', '{downstream}', 'merge_order', '1')"
+    ));
+    f.assert_candidate(&downstream, false);
+    // Direct self edges cannot exist: the schema enforces this independently
+    // of the API. Self-dependencies through project membership are tested below.
+    let error =
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES (?1, ?1, 'blocks', '1')",
+                [&first],
+            )
+            .unwrap_err();
+    assert!(error.to_string().contains("dependent_id <> prerequisite_id"));
+}
+
+#[test]
+fn failed_or_orphaned_root_work_is_targeted_through_its_own_stuck_state() {
+    for status in [ExecutionStatus::Failed, ExecutionStatus::Orphaned] {
+        let f = fixture();
+        let root = f.chore("Failed root");
+        f.execution(&root, ExecutionKind::ChoreImplementation, status);
+        f.stick(&root, "status = 'blocked', blocked_reason = 'worker_failed'", 3);
+        let middle = f.dependent_on(&root);
+        let downstream = f.dependent_on(&middle);
+        f.assert_candidate(&root, true);
+        f.assert_candidate(&middle, false);
+        f.assert_candidate(&downstream, false);
+        let mint = f.db.mint_progression_executions().unwrap();
+        assert!(mint.failed.is_empty());
+        assert_eq!(mint.minted.len(), 1);
+        assert_eq!(mint.minted[0].0.work_item_id, root);
+        assert_eq!(mint.minted[0].0.stuck_kind, "S7_worker_failed");
+    }
+}
+
+#[test]
+fn past_progression_failures_do_not_ask_to_park_a_healthy_waiter() {
+    let f = fixture();
+    let root = f.chore("Manual work");
+    let second = f.dependent_on(&root);
+    let third = f.dependent_on(&second);
+    let fourth = f.dependent_on(&third);
+    finished_progression_run(&f, &fourth, ExecutionStatus::Failed, 30 * HOUR);
+    finished_progression_run(&f, &fourth, ExecutionStatus::Orphaned, 20 * HOUR);
+    assert!(f.clauses(&fourth).infrastructure_failing);
+    assert!(!f.clauses(&fourth).dependency_clear);
+    let mint = f.db.mint_progression_executions().unwrap();
+    assert!(mint.minted.is_empty());
+    assert!(mint.asked.is_empty());
+    assert!(mint.failed.is_empty());
+    assert!(mint.ladder_failed.is_empty());
+    let questions: i64 =
+        f.db.connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM operator_questions", [], |row| row.get(0))
+            .unwrap();
+    assert_eq!(questions, 0);
+}
+
+// ── Clause 4: dependency ──────────────────────────────────────────────────
+
+#[test]
+fn clause_4_a_dependent_is_progressed_through_its_prerequisite() {
+    let f = fixture();
+    let dependent = f.chore("Dependent");
+    let prerequisite = f.chore("Prerequisite");
+    f.db.add_dependency(AddDependencyInput {
+        dependent: dependent.clone(),
+        prerequisite: prerequisite.clone(),
+        relation: None,
+    })
+    .unwrap();
+    f.stick(&dependent, "status = 'blocked', blocked_reason = 'dependency'", 3);
+    assert_eq!(f.clauses(&dependent).stuck_kind.as_deref(), Some("S4_dependency"));
+
+    // Idle unfinished work holds its dependent, with or without autostart.
+    f.sql(&format!("UPDATE tasks SET autostart = 1 WHERE id = '{prerequisite}'"));
+    f.assert_candidate(&dependent, false);
+    assert!(!f.clauses(&dependent).dependency_clear);
+
+    // A live one does...
+    let run = f.execution(
+        &prerequisite,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Running,
+    );
+    f.assert_candidate(&dependent, false);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'failed' WHERE id = '{run}'"
+    ));
+
+    // ...a stuck one (the prerequisite is the candidate, not the dependent)...
+    f.stick(
+        &prerequisite,
+        "status = 'blocked', blocked_reason = 'merge_conflict'",
+        3,
+    );
+    f.assert_candidate(&prerequisite, true);
+    f.assert_candidate(&dependent, false);
+
+    // ...and one the owner parked: the owner's decision about the prerequisite
+    // is also the decision about the dependent.
+    f.db.park_work_item_as_actor(&prerequisite, true, None, "human")
+        .unwrap();
+    f.assert_candidate(&dependent, false);
+    f.db.park_work_item_as_actor(&prerequisite, false, None, "human")
+        .unwrap();
+
+    // A prerequisite waiting on a human remains the owner's to unblock.
+    f.sql(&format!(
+        "UPDATE tasks SET human_driven = 1 WHERE id = '{prerequisite}'"
+    ));
+    f.assert_candidate(&dependent, false);
+    f.sql(&format!(
+        "UPDATE tasks SET human_driven = 0 WHERE id = '{prerequisite}'"
+    ));
+    f.assert_candidate(&dependent, false);
+
+    // A dangling edge gates forever; that is exactly what progression repairs.
+    f.sql(&format!(
+        "UPDATE work_item_dependencies SET prerequisite_id = 'task_missing' WHERE dependent_id = '{dependent}'"
+    ));
+    f.assert_candidate(&dependent, true);
+    // And a finished prerequisite no longer carries it.
+    f.sql(&format!(
+        "UPDATE work_item_dependencies SET prerequisite_id = '{prerequisite}' WHERE dependent_id = '{dependent}'"
+    ));
+    f.sql(&format!("UPDATE tasks SET status = 'done' WHERE id = '{prerequisite}'"));
+    f.assert_candidate(&dependent, true);
+}
+
+impl Fixture {
+    /// A dependency-blocked chore gated on `prerequisite`, stuck for three hours.
+    fn dependent_on(&self, prerequisite: &str) -> String {
+        let dependent = self.chore(&format!("Dependent on {prerequisite}"));
+        self.sql(&format!(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{dependent}', '{prerequisite}', 'blocks', '1')"
+        ));
+        self.stick(&dependent, "status = 'blocked', blocked_reason = 'dependency'", 3);
+        dependent
+    }
+}
+
+#[test]
+fn clause_4_an_open_project_with_unfinished_members_holds_its_dependent() {
+    let f = fixture();
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Prerequisite project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let member = f.chore("Idle member");
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}' WHERE id = '{member}'",
+        project.id
+    ));
+    let dependent = f.dependent_on(&project.id);
+
+    // Idle, non-stuck members are unfinished work too.
+    f.assert_candidate(&dependent, false);
+
+    // A running member task makes the project live.
+    let run = f.execution(&member, ExecutionKind::ChoreImplementation, ExecutionStatus::Running);
+    f.assert_candidate(&dependent, false);
+    assert!(!f.clauses(&dependent).dependency_clear);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'failed' WHERE id = '{run}'"
+    ));
+    f.assert_candidate(&dependent, false);
+
+    // A member that is itself a candidate is progressed first.
+    f.stick(&member, "status = 'blocked', blocked_reason = 'merge_conflict'", 3);
+    f.assert_candidate(&member, true);
+    f.assert_candidate(&dependent, false);
+    // A member in cooldown still owns its recovery.
+    finished_progression_run(&f, &member, ExecutionStatus::Completed, 60);
+    f.assert_candidate(&member, false);
+    f.assert_candidate(&dependent, false);
+
+    // A parked project is the owner's decision.
+    f.db.park_work_item_as_actor(&project.id, true, None, "human").unwrap();
+    f.assert_candidate(&dependent, false);
+}
+
+#[test]
+fn clause_4_root_recovery_limits_do_not_redirect_progression_to_dependents() {
+    let f = fixture();
+    let prerequisite = f.stuck_chore("Stuck prerequisite");
+    let dependent = f.dependent_on(&prerequisite);
+    f.assert_candidate(&prerequisite, true);
+    f.assert_candidate(&dependent, false);
+
+    // Inside its cooldown.
+    let run = finished_progression_run(&f, &prerequisite, ExecutionStatus::Completed, 60);
+    f.assert_candidate(&prerequisite, false);
+    f.assert_candidate(&dependent, false);
+    f.sql(&format!(
+        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{run}'"
+    ));
+    f.assert_candidate(&dependent, false);
+
+    // Its create budget exhausted.
+    for i in 0..3 {
+        let child = f.revision_of(&prerequisite, &format!("progression child {i}"));
+        f.sql(&format!(
+            "UPDATE tasks SET created_via = 'progression:exec_{i}', created_at = '{}' WHERE id = '{child}'",
+            now()
+        ));
+    }
+    f.assert_candidate(&prerequisite, false);
+    f.assert_candidate(&dependent, false);
+    f.sql("UPDATE tasks SET created_at = '1' WHERE created_via LIKE 'progression:%'");
+    f.assert_candidate(&prerequisite, true);
+    f.assert_candidate(&dependent, false);
+
+    // At the infrastructure-failure cap.
+    finished_progression_run(&f, &prerequisite, ExecutionStatus::Failed, 30 * HOUR);
+    finished_progression_run(&f, &prerequisite, ExecutionStatus::Orphaned, 20 * HOUR);
+    assert!(f.clauses(&prerequisite).infrastructure_failing);
+    f.assert_candidate(&prerequisite, false);
+    f.assert_candidate(&dependent, false);
+
+    // A fresh failure waits for its own grace; its dependent is still waiting.
+    let fresh = f.chore("Fresh prerequisite");
+    f.stick(&fresh, "status = 'blocked', blocked_reason = 'merge_conflict'", 0);
+    let waiting = f.dependent_on(&fresh);
+    f.assert_candidate(&fresh, false);
+    f.assert_candidate(&waiting, false);
+}
+
+#[test]
+fn the_stuck_report_reads_the_same_dependency_rule_as_the_view() {
+    let f = fixture();
+    // An idle prerequisite keeps the dependent in the waiting bucket.
+    let idle = f.chore("Idle prerequisite");
+    let dependent = f.dependent_on(&idle);
+    f.assert_candidate(&dependent, false);
+    assert_eq!(bucket(&f.db, &dependent), Some(StuckBucket::WaitingOnDependency));
+    f.db.mint_progression_executions().unwrap();
+    assert_eq!(bucket(&f.db, &dependent), Some(StuckBucket::WaitingOnDependency));
+
+    // An empty, unparked project has no unfinished member to progress.
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Idle project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let gated = f.dependent_on(&project.id);
+    f.assert_candidate(&gated, true);
+    f.db.mint_progression_executions().unwrap();
+    assert_eq!(bucket(&f.db, &gated), Some(StuckBucket::ProgressionInFlight));
+
+    // A live prerequisite is still waiting upstream.
+    let busy = f.chore("Busy prerequisite");
+    f.execution(&busy, ExecutionKind::ChoreImplementation, ExecutionStatus::Running);
+    let waiting = f.dependent_on(&busy);
+    f.assert_candidate(&waiting, false);
+    assert_eq!(bucket(&f.db, &waiting), Some(StuckBucket::WaitingOnDependency));
+}
+
+#[test]
+fn clause_4_the_stuck_root_is_picked_and_all_downstream_items_wait() {
+    let f = fixture();
+    let upstream = f.stuck_chore("Upstream");
+    let middle = f.dependent_on(&upstream);
+    let downstream = f.dependent_on(&middle);
+    f.assert_candidate(&upstream, true);
+    f.assert_candidate(&middle, false);
+    // Waiting remains transitive; middle's own candidacy is irrelevant.
+    assert!(f.clauses(&middle).eligible_item);
+    assert!(f.clauses(&middle).stuck_long_enough);
+    assert!(f.clauses(&middle).cooldown_and_budget_clear);
+    f.assert_candidate(&downstream, false);
+    assert!(!f.clauses(&downstream).dependency_clear);
+
+    // The same chain through a project member also keeps waiting.
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Middle's project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}' WHERE id = '{middle}'",
+        project.id
+    ));
+    let gated_on_project = f.dependent_on(&project.id);
+    f.assert_candidate(&middle, false);
+    f.assert_candidate(&gated_on_project, false);
+    let mint = f.db.mint_progression_executions().unwrap();
+    assert!(mint.failed.is_empty());
+    assert_eq!(mint.minted.len(), 1);
+    assert_eq!(mint.minted[0].0.work_item_id, upstream);
+}
+
+#[test]
+fn clause_4_a_task_that_depends_on_its_own_project_is_still_a_candidate() {
+    let f = fixture();
+    let project =
+        f.db.create_project(CreateProjectInput {
+            product_id: f.product.clone(),
+            name: "Self project".into(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let sibling = f.chore("Idle sibling");
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}', autostart = 1 WHERE id = '{sibling}'",
+        project.id
+    ));
+    let member = f.dependent_on(&project.id);
+    f.sql(&format!(
+        "UPDATE tasks SET project_id = '{}' WHERE id = '{member}'",
+        project.id
+    ));
+    f.assert_candidate(&member, true);
+}
+
+#[test]
+fn clause_4_a_same_family_finished_prerequisite_does_not_hide_the_dependent_run() {
+    let f = fixture();
+    let prerequisite = f.chore("Finished same-family prerequisite");
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'done', pr_url = 'https://github.com/o/r/pull/9' WHERE id = '{prerequisite}'"
+    ));
+    let dependent = f.dependent_on(&prerequisite);
+    f.sql(&format!(
+        "UPDATE tasks SET pr_url = 'https://github.com/o/r/pull/9' WHERE id = '{dependent}'"
+    ));
+    f.assert_candidate(&dependent, true);
+    f.db.mint_progression_executions().unwrap();
+    assert_eq!(bucket(&f.db, &dependent), Some(StuckBucket::ProgressionInFlight));
+}
