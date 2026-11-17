@@ -114,6 +114,10 @@ enum BossRevealCapture {
             BossAgentPaneActivityCapture.start(path: path)
             return
         }
+        if state.hasPrefix("navigator-activity-") {
+            BossNavigatorActivityCapture.start(path: path, state: state, updateModel: updateModel)
+            return
+        }
         let model = ChatViewModel(paths: BossEnginePaths.production())
         let now = ISO8601DateFormatter().string(from: Date())
         let product = WorkProduct(

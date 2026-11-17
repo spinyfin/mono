@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import GhosttyKit
 
@@ -195,6 +196,9 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     @Published var paneMonitorState: PaneMonitorState = .unavailable
 
     weak var hostView: GhosttyTerminalHostView?
+    /// Agents-owned container the host view returns to when Navigator
+    /// releases an embedded session. Reparenting never creates a second PTY.
+    weak var homeAnchor: NSView?
     /// Set by `WorkersWorkspaceModel.clearWorkerPane` the instant a slot is
     /// detached, before SwiftUI has necessarily torn down the host view.
     /// `GhosttyTerminalHostView.attemptSurfaceCreation` checks this so a
@@ -207,6 +211,7 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// Mark this session as released. Idempotent.
     func markReleased() {
         isReleased = true
+        hostView?.tearDown()
     }
 
     private var paneMonitorTracker: PaneMonitorTracker
@@ -243,6 +248,36 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     func attach(hostView: GhosttyTerminalHostView) {
         self.hostView = hostView
         terminalReady = true
+    }
+
+    /// Move the existing surface into `container` without creating a PTY or
+    /// taking keyboard focus unless this host already had it.
+    func claimHost(into container: NSView) {
+        guard !isReleased, let host = hostView, !host.isTornDown else { return }
+        reparent(host, into: container)
+    }
+
+    func returnHostHome() {
+        guard let host = hostView else { return }
+        guard !isReleased, let home = homeAnchor else {
+            host.tearDown()
+            return
+        }
+        reparent(host, into: home)
+    }
+
+    /// Reparent `view` without creating a PTY. Restores first responder only
+    /// when this view already had it, so a brief editor keeps typing focus.
+    func reparent(_ view: NSView, into container: NSView) {
+        let wasFirst = view.window?.firstResponder === view
+        guard view.superview !== container else { return }
+        view.removeFromSuperview()
+        view.frame = container.bounds
+        view.autoresizingMask = [.width, .height]
+        container.addSubview(view)
+        if wasFirst {
+            view.window?.makeFirstResponder(view)
+        }
     }
 
     func updatePaneMonitor(snapshot: PaneMonitorSnapshot?) {

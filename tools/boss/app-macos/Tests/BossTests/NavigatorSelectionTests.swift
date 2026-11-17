@@ -216,6 +216,50 @@ final class NavigatorSelectionTests: XCTestCase {
         XCTAssertTrue(model.navigatorSelectionNotice?.contains("removed") == true)
     }
 
+    func testClearingCurrentTaskIdClearsAskID() {
+        let root = NavigatorTestFixture.task()
+        let revision = NavigatorTestFixture.task("revision", rootID: "root")
+        let model = NavigatorTestFixture.model([root, revision])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        XCTAssertEqual(model.navigator.askID, "revision")
+        var cleared = root
+        cleared.navigator = NavigatorProjection.parse([
+            "version": 1, "root_task_id": "root", "root": [
+                "section": "working", "sort_key": "0", "default_detail": "activity",
+                "reason": ["type": "active", "activity": "revising"], "reason_label": "Revising",
+                "revisions": ["open": 0, "total": 3],
+                "activities": [["execution_id": "execution", "task_id": "revision", "run_id": "run"]],
+                "actions": [["type": "attention", "kind": "question", "attention_id": "question", "task_id": "revision"]],
+                "commands": [["kind": "open_pr", "task_id": "root"]],
+            ] as [String: Any],
+        ])
+        NavigatorTestFixture.snapshot(model, [cleared, revision])
+        XCTAssertNil(model.navigator.askID)
+    }
+
+    func testUnloadedCurrentTaskIdKeepsPreviousAsk() {
+        let root = NavigatorTestFixture.task()
+        let revision = NavigatorTestFixture.task("revision", rootID: "root")
+        let model = NavigatorTestFixture.model([root, revision])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        XCTAssertEqual(model.navigator.askID, "revision")
+        var advanced = root
+        advanced.navigator = NavigatorProjection.parse([
+            "version": 1, "root_task_id": "root", "root": [
+                "section": "working", "sort_key": "0", "default_detail": "activity",
+                "reason": ["type": "active", "activity": "revising"], "reason_label": "Revising",
+                "revisions": ["open": 1, "total": 4, "current_task_id": "next"],
+                "activities": [["execution_id": "execution", "task_id": "revision", "run_id": "run"]],
+                "actions": [["type": "attention", "kind": "question", "attention_id": "question", "task_id": "revision"]],
+                "commands": [["kind": "open_pr", "task_id": "root"]],
+            ] as [String: Any],
+        ])
+        NavigatorTestFixture.snapshot(model, [advanced, revision])
+        XCTAssertEqual(model.navigator.askID, "revision")
+    }
+
     func testRevealNonCurrentRevisionSetsAskFromEmptySelection() {
         let root = NavigatorTestFixture.task()
         let current = NavigatorTestFixture.task("revision", rootID: "root")
@@ -225,7 +269,9 @@ final class NavigatorSelectionTests: XCTestCase {
         XCTAssertNil(model.navigator.selectedRootID)
         XCTAssertEqual(model.revealWorkCard("older", productID: "product"), .revealed(cardID: "root"))
         XCTAssertEqual(model.navigator.selectedRootID, "root")
-        XCTAssertEqual(model.navigator.askID, "older")
+        XCTAssertEqual(model.navigator.askID, "revision")
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .historical)
+        XCTAssertEqual(model.navigatorDocumentTask(for: root).id, "older")
     }
 
     func testRevealNonCurrentRevisionSetsAskWhenRootAlreadySelected() {
@@ -238,7 +284,9 @@ final class NavigatorSelectionTests: XCTestCase {
         XCTAssertEqual(model.navigator.askID, "revision")
         XCTAssertEqual(model.revealWorkCard("older", productID: "product"), .revealed(cardID: "root"))
         XCTAssertEqual(model.navigator.selectedRootID, "root")
-        XCTAssertEqual(model.navigator.askID, "older")
+        XCTAssertEqual(model.navigator.askID, "revision")
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .historical)
+        XCTAssertEqual(model.navigatorDocumentTask(for: root).id, "older")
     }
 
     func testAcknowledgementDoesNotSpeculateAboutPlacement() {

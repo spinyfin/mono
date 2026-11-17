@@ -1,14 +1,5 @@
 import SwiftUI
 
-extension NavigatorDetailRegistry {
-    @MainActor
-    static var withAttention: NavigatorDetailRegistry {
-        var registry = NavigatorDetailRegistry()
-        WorkNavigatorAttention.register(in: &registry)
-        return registry
-    }
-}
-
 /// Attention slot: typed operator questions, attention groups and terminal
 /// input waits from the engine projection. Answers reuse the existing
 /// kanban / Notifications handlers.

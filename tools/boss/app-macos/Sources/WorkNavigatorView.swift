@@ -2,7 +2,8 @@ import SwiftUI
 
 struct WorkNavigatorView: View {
     @ObservedObject var model: ChatViewModel
-    var registry = NavigatorDetailRegistry.withAttention
+    var workspace: WorkersWorkspaceModel? = nil
+    var registry: NavigatorDetailRegistry? = nil
     @Environment(\.openWindow) private var openWindow
     @FocusState private var focus: Focus?
     private enum Focus: Hashable {
@@ -24,7 +25,7 @@ struct WorkNavigatorView: View {
             } else {
                 HSplitView {
                     navigator.frame(minWidth: 260, idealWidth: 360, maxWidth: 520)
-                    WorkNavigatorDetail(model: model, registry: registry)
+                    WorkNavigatorDetail(model: model, registry: registry ?? .navigator(workspace: workspace))
                         .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
                         .focusable().focused($focus, equals: .detail)
                         .onKeyPress(.escape) {

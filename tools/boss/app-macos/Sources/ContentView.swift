@@ -962,7 +962,11 @@ struct ContentView: View {
                                 .disabled(model.navigator.mode != .kanban)
                                 .accessibilityHidden(model.navigator.mode != .kanban)
                             if model.navigator.mode == .navigator {
+                                #if canImport(GhosttyKit)
+                                WorkNavigatorView(model: model, workspace: workersWorkspace)
+                                #else
                                 WorkNavigatorView(model: model)
+                                #endif
                             }
                         }
                     case .loading:

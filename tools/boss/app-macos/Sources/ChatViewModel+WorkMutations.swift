@@ -387,4 +387,88 @@ extension ChatViewModel {
         guard task.priority != priority.rawValue else { return }
         engine.sendUpdateWorkItem(id: task.id, patch: ["priority": priority.rawValue])
     }
+
+    func navigatorBriefDraft(for taskID: String) -> NavigatorBriefDraft? {
+        navigator.briefDrafts[taskID]
+    }
+
+    func navigatorBriefText(for task: WorkTask) -> String {
+        navigator.briefDrafts[task.id]?.text ?? task.description
+    }
+
+    func navigatorBriefIsEditing(_ taskID: String) -> Bool {
+        navigator.briefDrafts[taskID]?.isEditing == true
+    }
+
+    /// True when the stored document moved while a dirty draft is open.
+    func navigatorBriefChangedRemotely(_ task: WorkTask) -> Bool {
+        guard let draft = navigator.briefDrafts[task.id], draft.isEditing else { return false }
+        return task.description != draft.baseline && task.description != draft.text
+    }
+
+    func beginNavigatorBriefEdit(_ task: WorkTask) {
+        guard navigatorBriefCanEdit(task) else { return }
+        let existing = navigator.briefDrafts[task.id]
+        navigator.briefDrafts[task.id] = NavigatorBriefDraft(
+            text: existing?.text ?? task.description,
+            baseline: existing?.baseline ?? task.description,
+            isEditing: true
+        )
+    }
+
+    func setNavigatorBriefText(_ taskID: String, text: String) {
+        guard var draft = navigator.briefDrafts[taskID] else { return }
+        draft.text = text
+        navigator.briefDrafts[taskID] = draft
+    }
+
+    func cancelNavigatorBriefEdit(_ task: WorkTask) {
+        navigator.briefDrafts[task.id] = nil
+    }
+
+    func reloadNavigatorBrief(_ task: WorkTask) {
+        navigator.briefDrafts[task.id] = NavigatorBriefDraft(
+            text: task.description,
+            baseline: task.description,
+            isEditing: true
+        )
+    }
+
+    func navigatorBriefCanEdit(_ task: WorkTask) -> Bool {
+        let root = task.navigator.flatMap { self.task(withID: $0.rootTaskId) } ?? task
+        return isConnected && task.deletedAt == nil && root.deletedAt == nil
+            && !["done", "landed", "archived"].contains(task.status)
+            && !["done", "landed", "archived"].contains(root.status)
+            && root.navigator?.root?.knownSection != .landed
+    }
+
+    /// Writes the stored document. It does not send input to a running agent.
+    @discardableResult
+    func saveNavigatorBrief(_ task: WorkTask) -> Bool {
+        guard canSubmitUserActions(), navigatorBriefCanEdit(task) else { return false }
+        let text = navigator.briefDrafts[task.id]?.text ?? task.description
+        let requestID = engine.sendUpdateWorkItem(id: task.id, patch: ["description": text])
+        if requestID != nil || engine.hasUnsentAction(kind: "update_work_item") {
+            navigator.briefDrafts[task.id] = nil
+            return true
+        }
+        return false
+    }
+
+    func performNavigatorCommand(_ command: NavigatorCommand) {
+        switch command.kind {
+        case "start", "retry":
+            guard canSubmitUserActions() else { return }
+            engine.sendRequestExecution(workItemId: command.taskId)
+        case "park":
+            guard let task = task(withID: command.taskId) else { return }
+            requestPark(task: task)
+        case "edit_brief":
+            if let task = task(withID: command.taskId) {
+                beginNavigatorBriefEdit(task)
+            }
+        default:
+            break
+        }
+    }
 }
