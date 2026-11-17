@@ -1,6 +1,27 @@
 //! Replace transport-owned forwarders while retaining independently installed policy hooks.
+use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 use std::path::Path;
+
+use crate::ProgressObservationConfig;
+
+/// The `boss-event` forwarder command line every hook-callback driver wires
+/// to its lifecycle events: the four env vars the shim needs, inline-prefixed
+/// so they reach it regardless of how the agent propagates its environment,
+/// then the shim binary. `BOSS_RUN_ID` is load-bearing: without it the shim
+/// cannot splice `_boss_run_id` and the engine drops the event, pinning the
+/// worker at `Spawning`. `BOSS_WORKSPACE` tells the shim where to buffer
+/// events when the engine is unreachable.
+pub(crate) fn forwarder_command(config: &ProgressObservationConfig) -> String {
+    format!(
+        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
+        socket = shell_quote(&config.events_socket_path.display().to_string()),
+        lease = shell_quote(&config.lease_id),
+        run_id = shell_quote(&config.run_id),
+        workspace = shell_quote(&config.workspace_path.display().to_string()),
+        shim = shell_quote(&config.forwarder_binary.display().to_string()),
+    )
+}
 
 pub fn replace_forwarders(
     settings: &mut Value,

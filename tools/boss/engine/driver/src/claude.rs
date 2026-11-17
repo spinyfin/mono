@@ -670,7 +670,7 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
 /// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
 pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
     shell_command_tokenizer_fragment!(),
-    "BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin','checkleft'}\n",
+    crate::render_reviewer_blocked_programs!(),
     "matched=None\n",
     "for group in command_groups(cmd):\n",
     "    rest=strip_prefixes(group)\n",
@@ -687,7 +687,7 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
     "        matched='cargo execution subcommand'\n",
     "    elif base=='go' and subcommands.intersection({'build','test','run','generate','install'}):\n",
     "        matched='go execution subcommand'\n",
-    "    elif base in BLOCKED:\n",
+    "    elif base in REVIEWER_BLOCKED:\n",
     "        matched=base\n",
     "    elif prog.startswith('./') or prog.startswith('../') or '/bazel-bin/' in prog or '/target/' in prog:\n",
     "        matched=prog\n",
@@ -952,22 +952,10 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
-        // Inline-prefix every env var the `boss-event` shim needs. `BOSS_RUN_ID`
-        // is load-bearing: without it the shim can't splice `_boss_run_id` and
-        // the engine drops the event, pinning the worker at `Spawning`.
-        // `BOSS_WORKSPACE` tells the shim where to buffer events when the
-        // engine is unreachable. Setting them here (rather than relying on env
-        // inheritance from the worker pane through Claude into the hook
-        // subprocess) guarantees the shim sees them regardless of how Claude
-        // propagates env.
-        let command = format!(
-            "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
-            socket = shell_quote(&config.events_socket_path.display().to_string()),
-            lease = shell_quote(&config.lease_id),
-            run_id = shell_quote(&config.run_id),
-            workspace = shell_quote(&config.workspace_path.display().to_string()),
-            shim = shell_quote(&config.forwarder_binary.display().to_string()),
-        );
+        // Inline-prefixed env vars (see `forwarder_command`): setting them here
+        // rather than relying on env inheritance from the worker pane through
+        // Claude into the hook subprocess guarantees the shim sees them.
+        let command = crate::hook_settings::forwarder_command(config);
 
         // Every hook event fires this same forwarder hook (matcher `*`). The
         // caller may extend the `PreToolUse` array with interception guards —

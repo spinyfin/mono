@@ -188,6 +188,11 @@ impl SessionSettings {
         Ok(())
     }
 
+    /// The workspaces the session trusts.
+    pub fn trusted_workspaces(&self) -> &[String] {
+        &self.trusted_workspaces
+    }
+
     /// The rendered `permissions.allow` list (empty for allow-by-default kinds).
     pub fn allow_rules(&self) -> &[String] {
         self.permissions.allow.as_deref().unwrap_or_default()

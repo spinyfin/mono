@@ -75,8 +75,7 @@ use super::{
     PermissionInput, PrUrlCaptureFeed, ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
     ProgressObservationWiring, ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery,
     StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-    TranscriptSessionNormalizer, TurnEnd, TurnEndEvidence, WorkerErrorClass, WorkerKind,
-    default_structured_output_wiring,
+    TranscriptSessionNormalizer, TurnEnd, TurnEndEvidence, WorkerErrorClass, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -496,35 +495,7 @@ impl AgentDriver for GrokDriver {
         // Mirrors CodexDriver::write_permission_config's construction of
         // ToolUseInterceptionConfig from PermissionInput exactly — remote
         // workers get no local sandbox/guard scripts (never shipped there).
-        let interception = ToolUseInterceptionConfig {
-            data_dir: if input.is_remote {
-                None
-            } else {
-                input.events_socket_path.parent().map(|p| p.to_path_buf())
-            },
-            path_guard_script: if input.is_remote {
-                None
-            } else {
-                input.path_guard_script.clone()
-            },
-            checkleft_guard_script: if input.is_remote {
-                None
-            } else {
-                input.checkleft_guard_script.clone()
-            },
-            git_store_guard_script: if input.is_remote {
-                None
-            } else {
-                input.git_store_guard_script.clone()
-            },
-            is_revision: input.execution_kind == "revision_implementation"
-                || input.task_kind.as_deref() == Some("revision"),
-            is_standard_worker: input.worker_kind == WorkerKind::Standard,
-            is_reviewer: input.worker_kind == WorkerKind::Reviewer,
-            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
-            run_id: Some(input.run_id.clone()),
-            workspace_path: Some(input.workspace_path.clone()),
-        };
+        let interception = ToolUseInterceptionConfig::from_permission_input(input);
 
         let mut config_files = hooks::write_hooks(&grok_home, &obs_config, &interception)
             .with_context(|| format!("writing Grok hook wiring under {}", grok_home.display()))?;
