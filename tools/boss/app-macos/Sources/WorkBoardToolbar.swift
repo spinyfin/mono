@@ -3,6 +3,21 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+struct WorkViewModePicker: View {
+    @ObservedObject var model: ChatViewModel
+
+    var body: some View {
+        Picker("Work view", selection: Binding(
+            get: { model.navigator.mode },
+            set: { model.setWorkViewMode($0) }
+        )) {
+            ForEach(WorkViewMode.allCases) { mode in Text(mode.title).tag(mode) }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 180)
+    }
+}
+
 /// Whether a collapsible board section is currently showing its cards.
 ///
 /// The state is one sticky bit per section in `BossDefaults`, written by the

@@ -97,6 +97,7 @@ extension ChatViewModel {
         reconcileOptimisticOverrides(from: tasks + chores)
         reconcileCIFailureBadges(from: tasks + chores)
         reconcileWorkSelection()
+        reconcileNavigatorSelection()
         refreshWorkSubscriptions()
         workErrorMessage = nil
         if let pending = pendingRevealScrollID, revealProductID == product.id {
@@ -254,6 +255,7 @@ extension ChatViewModel {
             let isChore: Bool
             if case .chore = item { isChore = true } else { isChore = false }
             applyIncrementalTaskUpdate(updatedTask, isChore: isChore)
+            reconcileNavigatorSelection()
             // Reconcile optimistic overrides now that the local store reflects
             // the confirmed state — the update above already wrote the new
             // status, so the real column matches the optimistic target.
@@ -277,6 +279,10 @@ extension ChatViewModel {
         // Fan-out regression counter (design entry 2): single-task board update.
         UIUpdateCounters.shared.recordIncrementalTaskUpdate()
         let previous = task(withID: updatedTask.id)
+        var updatedTask = updatedTask
+        // Mutation acknowledgements need not contain family projections. Keep
+        // the last authoritative placement until the coherent tree arrives.
+        if updatedTask.navigator == nil { updatedTask.navigator = previous?.navigator }
         let requiresFullInvalidation = Self.incrementalUpdateRequiresFullInvalidation(
             previous: previous,
             updated: updatedTask,
@@ -441,7 +447,7 @@ extension ChatViewModel {
             persistProjectFilterIDs()
         }
 
-        if let selectedTask, !isTaskVisible(selectedTask) {
+        if navigator.mode == .kanban, let selectedTask, !isTaskVisible(selectedTask) {
             selectedWorkCardID = nil
         }
 

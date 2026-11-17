@@ -58,7 +58,7 @@ struct WorkBoardSectionItemsView: View {
     }
 
     var body: some View {
-        let selectedID = model.selectedTask?.id
+        let selectedID = model.navigator.mode == .kanban ? model.selectedTask?.id : nil
         let highlightID = model.revealHighlightID
         let frontierIDs = model.depFrontierHighlightIDs
         let selectedRevisionParentID = model.selectedRevisionParentID
@@ -335,12 +335,12 @@ struct WorkBoardCardItem: View {
             // isPresented reads live model selection (not a constant true) so
             // dismiss set(false) and subsequent get stay consistent.
             .lazyWorkCardSelectionPopover(
-                isSelected: snapshot.isSelected,
+                isSelected: model.navigator.mode == .kanban && snapshot.isSelected,
                 isPresented: Binding(
-                    get: { model.selectedTask?.id == task.id },
+                    get: { model.isWorkCardPopoverPresented(task.id) },
                     set: { presented in
                         if !presented {
-                            model.selectWorkCard(nil)
+                            model.dismissWorkCardPopover()
                         }
                     }
                 )

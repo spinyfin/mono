@@ -198,6 +198,32 @@ _RENDER_SHARD_SRCS = [
     "Tests/BossTests/RevisionFooterRenderTests.swift",
 ]
 
+_NAVIGATOR_SHARD_SRCS = [
+    "Tests/BossTests/NavigatorSelectionTests.swift",
+    "Tests/BossTests/NavigatorModeRegressionTests.swift",
+    "Tests/BossTests/NavigatorRowTests.swift",
+]
+
+macos_unit_test(
+    name = "BossTestsNavigator",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_navigator_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_navigator_lib",
+    testonly = True,
+    srcs = _NAVIGATOR_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsNavigator",
+    deps = [":boss_mac_app_lib"],
+)
+
 _COMMENTS_TRANSCRIPT_SHARD_SRCS = [
     "Tests/BossTests/CommentsTests.swift",
     "Tests/BossTests/TranscriptViewTests.swift",
@@ -418,7 +444,7 @@ genrule(
 app_test_shards(
     srcs = glob(
         ["Tests/BossTests/**/*.swift"],
-        exclude = _CHROME_SHARD_SRCS + _RENDER_SHARD_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+        exclude = _CHROME_SHARD_SRCS + _RENDER_SHARD_SRCS + _NAVIGATOR_SHARD_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     ),
     linkopts = _COVERAGE_LINKOPTS,
     principal_srcs = _BOSS_TESTS_PRINCIPAL_SRCS,

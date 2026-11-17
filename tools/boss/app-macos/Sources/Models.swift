@@ -331,6 +331,7 @@ struct WorkTask: Identifiable, Hashable {
     /// there is none (never asked, answered, withdrawn, or of an answer type
     /// this build cannot render). Mirrors `Task.operator_question`.
     var operatorQuestion: OperatorQuestion? = nil
+    var navigator: NavigatorProjection? = nil
 
     var isChore: Bool {
         kind == "chore" || (kind == "followup" && projectID == nil)

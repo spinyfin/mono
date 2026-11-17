@@ -44,7 +44,7 @@ extension ChatViewModel {
     /// IDs may still be in the filter set (so toggling Show Archived
     /// back on restores the prior selection), but counts and badges
     /// must only reflect what the user can see.
-    private var visibleSelectedProjectFilterIDs: Set<String> {
+    var visibleSelectedProjectFilterIDs: Set<String> {
         guard !selectedProjectFilterIDs.isEmpty else { return [] }
         let visibleIDs = Set(projectsForSelectedProduct.map(\.id))
         return selectedProjectFilterIDs.intersection(visibleIDs)

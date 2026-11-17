@@ -58,57 +58,65 @@ extension ChatViewModel {
     }
 
     func selectWorkProduct(_ productID: String) {
-        if selectedWorkProductID == productID { selectionHistory.useProduct(productID) }
-        let isAlreadyShowingProductBoard =
-            selectedWorkProductID == productID
-            && selectedProjectFilterIDs.isEmpty
-            && selectedWorkCardID == nil
-        guard !isAlreadyShowingProductBoard else { return }
-        selectedWorkProductID = productID
-        selectedProjectFilterIDs = []
-        selectedWorkCardID = nil
-        workErrorMessage = nil
-        persistSelectedProductID(productID)
-        persistProjectFilterIDs()
-        refreshWorkSubscriptions()
-        if isConnected {
-            engine.sendGetWorkTree(productId: productID, flow: .productSwitch)
-            engine.sendListDeferredScopeAttentions(productId: productID)
+        changeNavigatorScope {
+            if selectedWorkProductID == productID { selectionHistory.useProduct(productID) }
+            let isAlreadyShowingProductBoard =
+                selectedWorkProductID == productID
+                && selectedProjectFilterIDs.isEmpty
+                && selectedWorkCardID == nil
+            guard !isAlreadyShowingProductBoard else { return }
+            selectedWorkProductID = productID
+            selectedProjectFilterIDs = []
+            selectedWorkCardID = nil
+            workErrorMessage = nil
+            persistSelectedProductID(productID)
+            persistProjectFilterIDs()
+            refreshWorkSubscriptions()
+            if isConnected {
+                engine.sendGetWorkTree(productId: productID, flow: .productSwitch)
+                engine.sendListDeferredScopeAttentions(productId: productID)
+            }
         }
     }
 
     func toggleProjectFilter(_ projectID: String) {
-        if filterToChoresOnly {
-            filterToChoresOnly = false
-            defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
+        changeNavigatorScope {
+            if filterToChoresOnly {
+                filterToChoresOnly = false
+                defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
+            }
+            if selectedProjectFilterIDs.contains(projectID) {
+                selectedProjectFilterIDs.remove(projectID)
+            } else {
+                selectedProjectFilterIDs.insert(projectID)
+            }
+            selectedWorkCardID = nil
+            persistProjectFilterIDs()
         }
-        if selectedProjectFilterIDs.contains(projectID) {
-            selectedProjectFilterIDs.remove(projectID)
-        } else {
-            selectedProjectFilterIDs.insert(projectID)
-        }
-        selectedWorkCardID = nil
-        persistProjectFilterIDs()
     }
 
     func clearProjectFilters() {
-        guard !selectedProjectFilterIDs.isEmpty || filterToChoresOnly else { return }
-        selectedProjectFilterIDs = []
-        filterToChoresOnly = false
-        defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
-        selectedWorkCardID = nil
-        persistProjectFilterIDs()
+        changeNavigatorScope {
+            guard !selectedProjectFilterIDs.isEmpty || filterToChoresOnly else { return }
+            selectedProjectFilterIDs = []
+            filterToChoresOnly = false
+            defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
+            selectedWorkCardID = nil
+            persistProjectFilterIDs()
+        }
     }
 
     func setFilterToChoresOnly(_ value: Bool) {
-        guard filterToChoresOnly != value else { return }
-        filterToChoresOnly = value
-        defaults.set(value, forKey: filterToChoresOnlyDefaultsKey)
-        if value {
-            selectedProjectFilterIDs = []
-            persistProjectFilterIDs()
+        changeNavigatorScope {
+            guard filterToChoresOnly != value else { return }
+            filterToChoresOnly = value
+            defaults.set(value, forKey: filterToChoresOnlyDefaultsKey)
+            if value {
+                selectedProjectFilterIDs = []
+                persistProjectFilterIDs()
+            }
+            selectedWorkCardID = nil
         }
-        selectedWorkCardID = nil
     }
 
     /// Navigator right-click → Archive. Sends the status patch and marks
@@ -214,9 +222,13 @@ extension ChatViewModel {
     }
 
     func selectWorkCard(_ taskID: String?) {
+        if taskID == nil {
+            navigator.selectedRootID = nil
+            navigator.retainedTask = nil
+            if navigator.mode == .navigator { selectionHistory.rememberRoot(nil, scope: navigatorScopeKey) }
+        }
+        if let taskID, let task = task(withID: taskID) { selectedWorkProductID = task.productID }
         selectedWorkCardID = taskID
-        guard let taskID, let task = task(withID: taskID) else { return }
-        selectedWorkProductID = task.productID
     }
 
     /// One click on the findings badge does both jobs: open the findings

@@ -6,6 +6,7 @@ struct WorkSelectionHistory {
     private struct Snapshot: Codable {
         var products: [String] = []
         var projects: [String: [String]] = [:]
+        var roots: [String: String]?
     }
     private let defaults: UserDefaults
     private var snapshot: Snapshot
@@ -14,6 +15,25 @@ struct WorkSelectionHistory {
         self.defaults = defaults
         snapshot = defaults.data(forKey: Self.storageKey)
             .flatMap { try? JSONDecoder().decode(Snapshot.self, from: $0) } ?? Snapshot()
+        if snapshot.roots == nil {
+            snapshot.roots = defaults.dictionary(forKey: "boss.work.rootsByScope") as? [String: String] ?? [:]
+            save()
+            defaults.removeObject(forKey: "boss.work.rootsByScope")
+        }
+    }
+
+    func root(scope: String) -> String? {
+        snapshot.roots?[scope]
+    }
+
+    mutating func rememberRoot(_ id: String?, scope: String) {
+        guard snapshot.roots?[scope] != id else { return }
+        snapshot.roots?[scope] = id
+        save()
+    }
+
+    private mutating func pruneRoots(_ keep: ([String]) -> Bool) {
+        snapshot.roots = snapshot.roots?.filter { keep($0.key.components(separatedBy: "|")) }
     }
 
     mutating func useProduct(_ id: String) {
@@ -32,18 +52,21 @@ struct WorkSelectionHistory {
     }
 
     mutating func pruneProducts(validIDs: Set<String>) {
+        pruneRoots { validIDs.contains($0[0]) }
         snapshot.products.removeAll { !validIDs.contains($0) }
         snapshot.projects = snapshot.projects.filter { validIDs.contains($0.key) }
         save()
     }
 
     mutating func forgetProduct(_ id: String) {
+        pruneRoots { $0[0] != id }
         snapshot.products.removeAll { $0 == id }
         snapshot.projects.removeValue(forKey: id)
         save()
     }
 
     mutating func forgetProject(_ id: String, productID: String) {
+        pruneRoots { $0[0] != productID || !$0.dropFirst().contains(id) }
         snapshot.projects[productID]?.removeAll { $0 == id }
         save()
     }
@@ -51,6 +74,9 @@ struct WorkSelectionHistory {
     /// Only prune products with a loaded snapshot: an unvisited product's
     /// missing work tree does not mean that its projects were deleted.
     mutating func pruneProjects(productID: String, validIDs: Set<String>) {
+        pruneRoots { parts in
+            parts[0] != productID || parts.dropFirst().allSatisfy { $0 == "unprojected" || validIDs.contains($0) }
+        }
         snapshot.projects[productID]?.removeAll { !validIDs.contains($0) }
         save()
     }

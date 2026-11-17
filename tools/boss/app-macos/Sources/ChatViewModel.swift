@@ -353,7 +353,17 @@ final class ChatViewModel: ObservableObject {
     }
     /// The park confirmation sheet's target, presented from `ContentView`.
     @Published var pendingParkRequest: ParkRequest?
-    @Published var selectedWorkCardID: String?
+    var navigatorRevealRootID: String?
+    @Published var navigator = WorkNavigatorState()
+    @Published var selectedWorkCardID: String? {
+        didSet {
+            // A retained Navigator root can outlive the task store after a
+            // deletion event. Re-resolving that id would wipe retainedTask
+            // and the removal notice.
+            guard let id = selectedWorkCardID, task(withID: id) != nil else { return }
+            selectNavigatorRoot(id)
+        }
+    }
     /// Task id that the reveal animation is currently highlighting.
     /// Set after viewport confirmation; cleared after 1.5 s. Views observe
     /// this to apply a transient border-glow overlay on the matching
@@ -948,6 +958,7 @@ final class ChatViewModel: ObservableObject {
     private func commonInit() {
         defer { isRestoringWorkSelection = false }
         isWorkSidebarHidden = defaults.bool(forKey: "boss.work.sidebarHidden")
+        navigator.mode = defaults.string(forKey: "boss.work.viewMode").flatMap(WorkViewMode.init(rawValue:)) ?? .kanban
         bindBoardReadObserver()
         bindRemotePaneViewer()
         commentBridge.onSubmissionRejected = { [weak self] action in
@@ -1227,6 +1238,8 @@ final class ChatViewModel: ObservableObject {
     /// `nil` whenever a published input changes (see `invalidateWorkCache`).
     /// Keeps engine pushes that don't touch the work tree (e.g.
     /// `worker.live_states`) from re-walking the projects/tasks/chores trees.
+    var cachedNavigatorSections: [NavigatorSectionRows]?
+    var cachedNavigatorCompatibility: (message: String?, computed: Bool)?
     var cachedVisibleItems: [WorkTask]?
     var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
     var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
@@ -1301,6 +1314,8 @@ final class ChatViewModel: ObservableObject {
     /// the full id index when bucket membership is unchanged.
     func invalidateWorkCache(_ keys: WorkCacheInvalidation) {
         if keys.contains(.boardLayout) {
+            cachedNavigatorSections = nil
+            cachedNavigatorCompatibility = nil
             cachedVisibleItems = nil
             cachedItemsByColumn.removeAll(keepingCapacity: true)
             cachedSectionsByColumn.removeAll(keepingCapacity: true)
