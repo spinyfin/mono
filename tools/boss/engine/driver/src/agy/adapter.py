@@ -626,7 +626,12 @@ def structural_reason(native_name, args, canonical, policy):
     if isinstance(file_path, str) and path_is_protected(file_path, policy, canonical.get("cwd")):
         return "refusing access to protected Antigravity or Boss state: %s" % (file_path,)
     if worker_kind in ("reviewer", "triage") and native_name in ("write_file", "edit_file"):
-        return "%s workers must not modify files" % (worker_kind,)
+        result_path = os.environ.get("BOSS_STRUCTURED_OUTPUT")
+        if not (worker_kind == "reviewer" and native_name == "write_file"
+                and isinstance(file_path, str) and result_path
+                and os.path.isabs(result_path)
+                and resolve_path(file_path, policy, canonical.get("cwd")) == os.path.realpath(result_path)):
+            return "%s workers must not modify files" % (worker_kind,)
     command = canonical["tool_input"].get("command")
     if isinstance(command, str):
         reason = structural_command_reason(command, policy, worker_kind, canonical.get("cwd"))
@@ -662,18 +667,20 @@ def run_bounded(argv, **kwargs):
 
 
 def run_guards(policy, canonical, rewrites=0, synthetic=False):
+    commands = []
     if not synthetic and canonical.get("tool_name") == "Bash":
         original = canonical["tool_input"]["command"]
         for body in inspected_commands(original):
-            commands = [body] if body != original else []
+            if body != original:
+                commands.append(body)
             for group in command_groups(body):
                 normalized = without_redirections(group)
                 if normalized and normalized != list(group):
                     commands.append(shlex.join(normalized))
-            for command in commands:
-                nested = dict(canonical)
-                nested["tool_input"] = dict(canonical["tool_input"], command=command)
-                run_guards(policy, nested, rewrites, synthetic=True)
+        for command in commands:
+            nested = dict(canonical)
+            nested["tool_input"] = dict(canonical["tool_input"], command=command)
+            run_guards(policy, nested, rewrites, synthetic=True)
     guards = policy.get("guards")
     if not isinstance(guards, list) or not guards:
         fail_closed("authorization policy guards must be a nonempty array")
@@ -681,16 +688,25 @@ def run_guards(policy, canonical, rewrites=0, synthetic=False):
     for guard in guards:
         if not isinstance(guard, dict):
             fail_closed("malformed guard entry in authorization policy")
+        # Run the push gate once with all inspected forms. This preserves
+        # nested/redirect-normalized push detection without repeating the gate.
+        if synthetic and guard.get("run_once"):
+            continue
         matcher = guard.get("matcher") or "*"
         if not guard_applies(matcher, canonical_name):
             continue
         command = guard.get("command")
         if not isinstance(command, str) or not command:
             fail_closed("guard entry is missing a command")
+        guard_input = canonical
+        if guard.get("run_once") and commands:
+            guard_input = dict(canonical)
+            guard_input["tool_input"] = dict(canonical["tool_input"],
+                command="\n".join(commands + [canonical["tool_input"]["command"]]))
         try:
             result = run_bounded(
                 ["/bin/sh", "-c", command],
-                input=json.dumps(canonical),
+                input=json.dumps(guard_input),
                 capture_output=True,
                 text=True,
                 timeout=guard.get("timeout_sec", 30),

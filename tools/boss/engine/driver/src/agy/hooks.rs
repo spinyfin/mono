@@ -162,6 +162,13 @@ fn protected_paths(process_home: &Path, interception: &ToolUseInterceptionConfig
     paths
 }
 
+fn private_forwarder_config(process_home: &Path, config: &ProgressObservationConfig) -> ProgressObservationConfig {
+    ProgressObservationConfig {
+        forwarder_binary: gemini_config_dir(process_home).join("boss-event"),
+        ..config.clone()
+    }
+}
+
 fn authorization_command(process_home: &Path, config: &ProgressObservationConfig) -> String {
     let adapter_config = ProgressObservationConfig {
         forwarder_binary: adapter_path(process_home),
@@ -192,10 +199,11 @@ fn pre_tool_use_entry(process_home: &Path, obs: &ProgressObservationConfig) -> V
 /// not exist.
 pub fn authorization_hooks_map(config: &ProgressObservationConfig) -> anyhow::Result<serde_json::Map<String, Value>> {
     let process_home = process_home_for_run(&config.run_id)?;
-    let mut hooks = forwarder_hooks_map(config);
+    let config = private_forwarder_config(&process_home, config);
+    let mut hooks = forwarder_hooks_map(&config);
     hooks.insert(
         "PreToolUse".to_owned(),
-        json!([pre_tool_use_entry(&process_home, config)]),
+        json!([pre_tool_use_entry(&process_home, &config)]),
     );
     Ok(hooks)
 }
@@ -237,6 +245,7 @@ pub fn install_authorization(
         ),
         matcher: "*",
         timeout_sec: Some(30),
+        run_once: false,
     });
     if matches!(worker_kind, WorkerKind::Reviewer | WorkerKind::Triage) {
         guards.push(Guard {
@@ -246,6 +255,7 @@ pub fn install_authorization(
             ),
             matcher: "*",
             timeout_sec: Some(30),
+            run_once: false,
         });
     }
     if guards.is_empty() {
@@ -254,6 +264,11 @@ pub fn install_authorization(
 
     let config_dir = gemini_config_dir(process_home);
     fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
+
+    // App updates replace the shared binary; bind to a run-owned snapshot.
+    let private_obs = private_forwarder_config(process_home, obs);
+    fs::copy(&obs.forwarder_binary, &private_obs.forwarder_binary).context("copying the per-run progress forwarder")?;
+    let obs = &private_obs;
 
     let adapter = adapter_path(process_home);
     write_executable(&adapter, &crate::guard_python::with_command_tokenizer(ADAPTER_SCRIPT))?;
@@ -292,6 +307,7 @@ pub fn install_authorization(
             "command": guard.command,
             "matcher": guard.matcher,
             "timeout_sec": guard.timeout_sec.unwrap_or(30),
+            "run_once": guard.run_once,
         })).collect::<Vec<_>>(),
     });
     write_json_atomic(&policy_file, &policy)?;
@@ -321,7 +337,13 @@ pub fn install_authorization(
     };
     write_json_atomic(&attestation_file, &serde_json::to_value(&attestation)?)?;
 
-    Ok(vec![hooks_path, adapter, policy_file, attestation_file])
+    Ok(vec![
+        hooks_path,
+        adapter,
+        policy_file,
+        attestation_file,
+        obs.forwarder_binary.clone(),
+    ])
 }
 
 /// Re-check that every attested artifact still has the bytes written at install.

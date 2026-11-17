@@ -6,7 +6,10 @@ fn raw_authorize(fx: &Fixture, raw: &str, run_id: Option<&str>) -> Value {
     command
         .arg(adapter_path(&fx.process_home))
         .env("BOSS_AGY_POLICY", policy_path(&fx.process_home))
-        .env("BOSS_AGY_FORWARDER", fx.forwarder())
+        .env(
+            "BOSS_AGY_FORWARDER",
+            gemini_config_dir(&fx.process_home).join("boss-event"),
+        )
         .env_remove("BOSS_RUN_ID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -26,7 +29,7 @@ fn assert_deny(body: &Value) {
     assert!(!body["reason"].as_str().unwrap_or_default().is_empty(), "{body}");
 }
 
-fn change_policy(fx: &Fixture, update: impl FnOnce(&mut Value)) {
+pub(super) fn change_policy(fx: &Fixture, update: impl FnOnce(&mut Value)) {
     let path = policy_path(&fx.process_home);
     let mut policy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     update(&mut policy);
@@ -124,7 +127,7 @@ fn rewrites_emit_native_keys_and_recheck_policy() {
         );
         write_exec(&fx.path_guard(), &body);
         fx.install(WorkerKind::Standard);
-        let (_, result, stderr) = authorize(&fx.process_home, &run_command_payload("echo original"), false);
+        let (_, result, stderr) = authorize(&fx.process_home, &run_command_payload("echo original"));
         assert_eq!(decision(&result), expected, "{result} {stderr}");
         if expected == "auto_approve" {
             assert_eq!(result["overwrite"], json!({"CommandLine":"echo rewritten"}));
@@ -140,7 +143,7 @@ fn rewrites_emit_native_keys_and_recheck_policy() {
     );
     fx.install(WorkerKind::Standard);
     let payload = json!({"toolCall":{"name":"write_file","args":{"Path":"safe.txt","Contents":"hello"}}});
-    assert_deny(&authorize(&fx.process_home, &payload, false).1);
+    assert_deny(&authorize(&fx.process_home, &payload).1);
 }
 
 #[test]
@@ -161,7 +164,7 @@ fn shared_tokenizer_and_reviewer_reads_and_mutations() {
         "timeout --signal TERM 5 sudo id",
         "bash --noprofile -lc 'sudo id'",
     ] {
-        assert_deny(&authorize(&fx.process_home, &run_command_payload(command), false).1);
+        assert_deny(&authorize(&fx.process_home, &run_command_payload(command)).1);
     }
     fx.install_with(WorkerKind::Reviewer, |c| {
         c.is_standard_worker = false;
@@ -181,7 +184,7 @@ fn shared_tokenizer_and_reviewer_reads_and_mutations() {
         "git restore f",
         "gh api -X POST repos/o/r/issues",
     ] {
-        assert_deny(&authorize(&fx.process_home, &run_command_payload(command), false).1);
+        assert_deny(&authorize(&fx.process_home, &run_command_payload(command)).1);
     }
     for command in [
         "gh pr view 1 --repo o/r",
@@ -192,7 +195,7 @@ fn shared_tokenizer_and_reviewer_reads_and_mutations() {
         "grep 'a->b' f",
         "gh api -X GET repos/o/r",
     ] {
-        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), false);
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
 }
@@ -210,7 +213,7 @@ fn protected_state_reads_expansions_and_symlinks_are_denied() {
     ] {
         let mut payload = run_command_payload(command);
         payload["toolCall"]["args"]["Cwd"] = json!(fx.process_home.parent().unwrap().join("control"));
-        assert_deny(&authorize(&fx.process_home, &payload, false).1);
+        assert_deny(&authorize(&fx.process_home, &payload).1);
     }
     std::os::unix::fs::symlink(fx.process_home.join(".gemini"), fx.workspace().join("config-link")).unwrap();
     for (cwd, path) in [
@@ -221,11 +224,11 @@ fn protected_state_reads_expansions_and_symlinks_are_denied() {
         ),
     ] {
         let payload = json!({"cwd":cwd, "toolCall":{"name":"read_file","args":{"Path":path}}});
-        assert_deny(&authorize(&fx.process_home, &payload, false).1);
+        assert_deny(&authorize(&fx.process_home, &payload).1);
     }
     let payload = json!({"cwd":fx.workspace(), "toolCall":{"name":"read_file",
         "args":{"Path":"ordinary-file", "Cwd":fx.process_home.join(".gemini")}}});
-    assert_deny(&authorize(&fx.process_home, &payload, false).1);
+    assert_deny(&authorize(&fx.process_home, &payload).1);
 }
 
 #[test]
@@ -240,7 +243,7 @@ fn native_searches_reach_the_path_guard_as_traversals() {
     fx.install(WorkerKind::Standard);
     for tool in ["grep", "glob", "list_dir"] {
         let payload = json!({"toolCall":{"name":tool,"args":{"Path":"/"}}});
-        let body = authorize(&fx.process_home, &payload, false).1;
+        let body = authorize(&fx.process_home, &payload).1;
         assert_eq!(body["reason"], "broad traversal root", "{body}");
     }
     for tool in [
@@ -252,7 +255,7 @@ fn native_searches_reach_the_path_guard_as_traversals() {
         "define_subagent",
         "send_message",
     ] {
-        assert_deny(&authorize(&fx.process_home, &json!({"toolCall":{"name":tool,"args":{}}}), false).1);
+        assert_deny(&authorize(&fx.process_home, &json!({"toolCall":{"name":tool,"args":{}}})).1);
     }
 }
 
@@ -280,7 +283,7 @@ fn probe_requires_complete_enabled_executable_configuration() {
         let path = if name == "adapter" {
             adapter_path(&fx.process_home)
         } else {
-            fx.forwarder()
+            gemini_config_dir(&fx.process_home).join("boss-event")
         };
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(probe_authorization(&fx.process_home).is_err());
@@ -407,7 +410,7 @@ fn rewrites_revisit_earlier_guards_and_translate_file_keys() {
             "command":format!("python3 -c {}", boss_ssh_transport::shell_quote(&script)), "matcher":"*", "timeout_sec":30
         }))
         });
-        let body = authorize(&fx.process_home, &payload, false).1;
+        let body = authorize(&fx.process_home, &payload).1;
         assert_eq!(decision(&body), expected, "{body}");
         if expected == "auto_approve" {
             assert_eq!(body["overwrite"], json!({"Path":"changed.txt","Contents":"updated"}));
