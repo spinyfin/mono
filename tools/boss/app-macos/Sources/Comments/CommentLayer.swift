@@ -69,6 +69,9 @@ final class CommentLayer: NSObject, ObservableObject {
     private weak var backend: (any CommentBackend)? = nil
     var draftStore = GuideCommentDrafts(directory: nil)
 
+    var isReadOnly = false {
+        didSet { if isReadOnly { resetAuthoringState() } }
+    }
     /// True when this layer is persisting through the engine.
     var isEngineBacked: Bool { backend != nil && !artifactId.isEmpty }
 
@@ -307,6 +310,7 @@ final class CommentLayer: NSObject, ObservableObject {
     private(set) var composerId = UUID()
 
     func requestNewComment(firstChar: Character? = nil) {
+        guard !isReadOnly else { return }
         composerId = UUID()
         ownsGuideDraft = true
         // A live selection always starts a new comment, even when a draft
@@ -331,7 +335,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// is on screen.
     @discardableResult
     func resumeGuideDraft() -> Bool {
-        guard let draft = guideDraft else { return false }
+        guard !isReadOnly, let draft = guideDraft else { return false }
         composerId = draft.composerId
         applyGuideDraft(draft)
         let presented = presentCommentPopover()
@@ -449,6 +453,7 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     func addComment(quoted: String, body: String) {
+        guard !isReadOnly else { return }
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, guideVersionId == nil || !quoted.isEmpty else { return }
         // Leave the composer (and its draft) open when the retry queue is full.
@@ -1109,7 +1114,7 @@ final class CommentLayer: NSObject, ObservableObject {
         window: NSWindow?
     ) -> Bool {
         guard isKeyEventForThisLayer(window) else { return false }
-        guard !suppressTypeToComment else { return false }
+        guard !isReadOnly, !suppressTypeToComment else { return false }
 
         if isShowingPopover {
             // Stop intercepting only when this event will reach the focused text
@@ -1359,6 +1364,7 @@ struct WithCommentsModifier: ViewModifier {
     let baseURL: URL?
 
     @Environment(\.commentBackend) private var commentBackend
+    @Environment(\.commentsReadOnly) private var commentsReadOnly
     @Environment(\.openOriginalGuide) private var openOriginalGuide
     @StateObject private var layer = CommentLayer()
     /// Whether the full comment sidebar is shown. Collapsed by default: an
@@ -1387,6 +1393,7 @@ struct WithCommentsModifier: ViewModifier {
             Divider()
             if sidebarExpanded {
                 CommentSidebar(layer: layer, onCollapse: { sidebarExpanded = false })
+                    .disabled(commentsReadOnly)
                     .frame(width: 280)
             } else {
                 CollapsedCommentRail(
@@ -1395,6 +1402,7 @@ struct WithCommentsModifier: ViewModifier {
                     onExpand: { sidebarExpanded = true },
                     onAddComment: { layer.requestNewComment() }
                 )
+                .disabled(commentsReadOnly)
             }
         }
         // Auto-expand the first time the doc has comments to show — a just-added
@@ -1421,6 +1429,7 @@ struct WithCommentsModifier: ViewModifier {
             set: { layer.suppressTypeToComment = $0 }
         ))
         .onAppear {
+            layer.isReadOnly = commentsReadOnly
             layer.openOriginalGuide = openOriginalGuide
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
             if layer.draftStore.hasPendingResume(for: layer.guideVersionId) {
@@ -1430,6 +1439,9 @@ struct WithCommentsModifier: ViewModifier {
                 sidebarExpanded = true
             }
             layer.installMonitors()
+        }
+        .onChange(of: commentsReadOnly) { _, value in
+            layer.isReadOnly = value
         }
         .onChange(of: source) { _, newSource in
             layer.updateSource(newSource, baseURL: baseURL)
@@ -1552,7 +1564,16 @@ private struct SuppressTypeToCommentKey: EnvironmentKey {
     static var defaultValue: Binding<Bool> { .constant(false) }
 }
 
+private struct CommentsReadOnlyKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
 extension EnvironmentValues {
+    var commentsReadOnly: Bool {
+        get { self[CommentsReadOnlyKey.self] }
+        set { self[CommentsReadOnlyKey.self] = newValue }
+    }
+
     var commentedAnchors: [CommentAnchor] {
         get { self[CommentedAnchorsKey.self] }
         set { self[CommentedAnchorsKey.self] = newValue }

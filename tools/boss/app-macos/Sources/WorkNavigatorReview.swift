@@ -4,10 +4,12 @@ import SwiftUI
 /// Section membership and the status explanation come from the engine.
 struct WorkNavigatorReview: View {
     let context: NavigatorDetailContext
+    @ObservedObject private var model: ChatViewModel
     @ObservedObject private var guides: NavigatorReviewGuideStore
 
     init(context: NavigatorDetailContext) {
         self.context = context
+        model = context.model
         guides = context.model.navigatorReviewGuides
     }
 
@@ -15,7 +17,8 @@ struct WorkNavigatorReview: View {
         registry.register(.review) { AnyView(WorkNavigatorReview(context: $0)) }
     }
 
-    private var model: ChatViewModel { context.model }
+    private var isActive: Bool { model.navigator.tab == .review }
+    var actionsDisabled: Bool { context.isReadOnly || !model.isConnected }
     private var root: WorkTask { context.root }
     private var reader: NavigatorReviewGuideStore.Reader? {
         guides.readers[root.id].flatMap { $0.prURL == root.prURL ? $0 : nil }
@@ -41,13 +44,17 @@ struct WorkNavigatorReview: View {
             }
         }
         .environmentObject(model)
+        .environment(\.commentBackend, model.commentBridge)
+        .environment(\.commentsReadOnly, context.isReadOnly)
         .environment(\.openOriginalGuide, { versionID in
             model.loadNavigatorReviewGuide(for: root, versionID: versionID)
         })
-        .task(id: [root.id, root.prURL ?? "", root.reviewGuideReadableVersionId ?? ""]) {
+        .task(id: [root.id, root.prURL ?? "", root.reviewGuideReadableVersionId ?? "", String(isActive)]) {
+            guard isActive else { return }
             model.loadNavigatorReviewGuide(for: root)
         }
-        .task(id: root.id) {
+        .task(id: "\(root.id)|\(isActive)") {
+            guard isActive else { return }
             if model.attachmentsByTaskID[root.id] == nil { model.loadAttachments(taskId: root.id) }
         }
         .accessibilityIdentifier("navigator-review")
@@ -74,7 +81,7 @@ struct WorkNavigatorReview: View {
         }
         if let title = root.generateReviewGuideMenuTitle {
             Button(title) { model.generateReviewGuide(for: root) }
-                .disabled(context.isReadOnly || model.retryingReviewGuideRootTaskIDs.contains(root.id)
+                .disabled(actionsDisabled || model.retryingReviewGuideRootTaskIDs.contains(root.id)
                     || ["queued", "generating"].contains(root.reviewGuideLifecycle ?? ""))
         }
     }
@@ -92,7 +99,7 @@ struct WorkNavigatorReview: View {
                         artifact: artifact,
                         openVersion: { model.loadNavigatorReviewGuide(for: root, versionID: $0) }
                     ),
-                    isReadOnly: context.isReadOnly
+                    isReadOnly: context.isReadOnly, isActive: isActive
                 )
                 if let reader {
                     HStack {
@@ -127,7 +134,7 @@ struct WorkNavigatorReview: View {
             VStack(spacing: 10) {
                 Text(message).foregroundStyle(.secondary)
                 Button("Retry loading") { model.loadNavigatorReviewGuide(for: root, refresh: true) }
-                    .disabled(!model.isConnected)
+                    .disabled(actionsDisabled)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         case nil:
@@ -197,8 +204,8 @@ struct NavigatorReviewHistory: View {
                 if let version = root.reviewGuideReadableVersionId {
                     Button("Current readable guide") { open(version) }
                 }
-                if let reader = guides.readers[root.id], reader.prURL == root.prURL {
-                    ForEach(reader.versions, id: \.id) { version in
+                if !viewedVersions.isEmpty {
+                    ForEach(viewedVersions, id: \.id) { version in
                         Button("Viewed \(version.generatedAt) · \(version.id)") { open(version.id) }
                     }
                 }
@@ -206,7 +213,12 @@ struct NavigatorReviewHistory: View {
         }
     }
 
-    private func open(_ versionID: String) {
+    var viewedVersions: [ReviewGuideVersionContent] {
+        guard let reader = guides.readers[root.id], reader.prURL == root.prURL else { return [] }
+        return reader.versions
+    }
+
+    func open(_ versionID: String) {
         model.loadNavigatorReviewGuide(for: root, versionID: versionID)
         model.navigator.tab = .review
     }

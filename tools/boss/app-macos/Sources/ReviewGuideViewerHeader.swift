@@ -30,13 +30,15 @@ struct ReviewGuideViewerHeader: View {
         generatedAt: String?,
         findingsInitiallyExpanded: Bool = true,
         inlineGuide: InlineReviewGuideHeader? = nil,
-        isReadOnly: Bool = false
+        isReadOnly: Bool = false,
+        isActive: Bool = true
     ) {
         self.chatModel = chatModel
         self.rootTaskId = rootTaskId
         self.generatedAt = generatedAt
         self.inlineGuide = inlineGuide
         self.isReadOnly = isReadOnly
+        self.isActive = isActive
         self.drafts = chatModel.commentBridge.draftStore
         _findingsExpanded = State(initialValue: findingsInitiallyExpanded)
     }
@@ -46,7 +48,22 @@ struct ReviewGuideViewerHeader: View {
     /// still loading.
     let generatedAt: String?
     let inlineGuide: InlineReviewGuideHeader?
+    let isActive: Bool
     let isReadOnly: Bool
+
+    var actionsDisabled: Bool { isReadOnly || !chatModel.isConnected }
+
+    static func showsMergeControl(_ task: WorkTask) -> Bool {
+        task.isMergeWhenReadyEligible && task.navigator?.root?.mergeEvidence == nil
+    }
+
+    static func sourceLabels(comparisonID: String, selectedID: String?) -> [String] {
+        var labels = ["Source comparison: \(comparisonID)"]
+        if let selectedID, selectedID != comparisonID {
+            labels.append("This guide covers an older source revision.")
+        }
+        return labels
+    }
 
     private var artifact: CommentArtifactRef? {
         if let inlineGuide { return inlineGuide.artifact }
@@ -67,11 +84,11 @@ struct ReviewGuideViewerHeader: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
-                    if task.isMergeWhenReadyEligible, task.navigator?.root?.mergeEvidence == nil {
+                    if Self.showsMergeControl(task) {
                         MergeWhenReadyControl(isRequesting: chatModel.mergingWhenReadyIDs.contains(task.id), onConfirm: {
                             chatModel.mergeWhenReady(for: task, origin: inlineGuide == nil ? .reviewGuideViewer : .board)
                         })
-                        .disabled(isReadOnly || !chatModel.isConnected)
+                        .disabled(actionsDisabled)
                     }
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -143,11 +160,11 @@ struct ReviewGuideViewerHeader: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(Color.secondary.opacity(0.06))
-            .task(id: "\(rootTaskId)|\(displayedSeriesId ?? "")") {
+            .task(id: "\(rootTaskId)|\(displayedSeriesId ?? "")|\(isActive)") {
                 // Skip until the guide on screen has a series id, then
                 // re-poll immediately when that series changes (same root,
                 // replacement PR, or the artifact id arriving after load).
-                guard let seriesId = displayedSeriesId else { return }
+                guard isActive, let seriesId = displayedSeriesId else { return }
                 while !Task.isCancelled {
                     chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId, seriesId: seriesId)
                     do { try await Task.sleep(for: .seconds(5)) }
@@ -217,10 +234,10 @@ struct ReviewGuideViewerHeader: View {
         )
         let comparisonID = inlineGuide != nil ? inlineGuide?.comparisonID : chatModel.asyncMarkdownViewerVM.reviewGuideComparisonId
         if let comparisonID {
-            Text("Source comparison: \(comparisonID)")
+            Text(Self.sourceLabels(comparisonID: comparisonID, selectedID: task.reviewGuideSelectedComparisonId)[0])
                 .font(.caption2.monospaced()).textSelection(.enabled)
-            if let selected = task.reviewGuideSelectedComparisonId, selected != comparisonID {
-                Label("This guide covers an older source revision.", systemImage: "clock")
+            if let stale = Self.sourceLabels(comparisonID: comparisonID, selectedID: task.reviewGuideSelectedComparisonId).dropFirst().first {
+                Label(stale, systemImage: "clock")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -277,7 +294,7 @@ struct ReviewGuideViewerHeader: View {
             }
             Button("Retry") { chatModel.retryReviewGuide(for: task) }
                 .controlSize(.small)
-                .disabled(isReadOnly || !chatModel.isConnected || chatModel.retryingReviewGuideRootTaskIDs.contains(task.id))
+                .disabled(actionsDisabled || chatModel.retryingReviewGuideRootTaskIDs.contains(task.id))
         }
         .help(error ?? headline)
     }
