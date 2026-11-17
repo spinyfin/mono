@@ -534,7 +534,9 @@ async fn a_settled_uncertain_spawn_adopted_alive_is_stopped_then_released() {
 
 #[tokio::test]
 async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_reported_running() {
-    let fx = Fixture::with(short(300)).await;
+    // Only Spawn is intentionally unanswered; Stop must have time to confirm
+    // its reply while the integration tests share a loaded CI worker.
+    let fx = Fixture::with(workspace_slack(300)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
