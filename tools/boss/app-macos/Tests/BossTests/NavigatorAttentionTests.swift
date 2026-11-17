@@ -74,7 +74,10 @@ final class NavigatorAttentionTests: XCTestCase {
         XCTAssertTrue(model.navigator.tabs.contains(.attention))
         XCTAssertEqual(model.navigator.tab, .activity)
         XCTAssertEqual(NavigatorDetailSlot.attention.title(actionCount: 1), "Attention 1")
-        XCTAssertNotNil(NavigatorDetailRegistry.withAttention.bodies[.attention])
+        let registry = NavigatorDetailRegistry.navigator(workspace: nil)
+        XCTAssertNotNil(registry.bodies[.attention])
+        XCTAssertNotNil(registry.bodies[.activity])
+        XCTAssertNotNil(registry.bodies[.history])
         let context = NavigatorDetailContext(model: model, root: model.navigatorSelectedTask!, ask: revision, isReadOnly: false)
         XCTAssertEqual(WorkNavigatorAttention.entries(for: context).map(\.id), ["question:oq_live"])
     }
