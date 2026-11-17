@@ -12,12 +12,13 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
 
-use crate::driver::{AgentDriver, DriverRegistry, TurnEnd};
+use crate::driver::{AgentDriver, DriverRegistry, ProgressIdentityStore, ProgressSessionConfig, TurnEnd};
 use crate::work::WorkDb;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -476,11 +477,17 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// run's actual driver slug, then resolves it through `registry` — the same
 /// `tasks.driver` → `products.default_driver` → engine-default precedence
 /// applied at spawn time.
+/// Decode one shim connection into an [`IncomingHookEvent`].
+///
+/// `Ok(None)` means the run's driver normalised the payload to an empty
+/// fan-out — a filtered event (agy dropping a subagent boundary) that
+/// is still a successful delivery. The shim must not retry or treat it
+/// as a rejection.
 pub async fn handle_connection(
     stream: UnixStream,
     registry: &DriverRegistry,
     work_db: &WorkDb,
-) -> Result<IncomingHookEvent, SocketError> {
+) -> Result<Option<IncomingHookEvent>, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
@@ -517,7 +524,7 @@ fn decode_incoming_event(
     registry: &DriverRegistry,
     work_db: &WorkDb,
     peer_pid_value: Option<libc::pid_t>,
-) -> Result<IncomingHookEvent, SocketError> {
+) -> Result<Option<IncomingHookEvent>, SocketError> {
     let raw: serde_json::Value = serde_json::from_slice(bytes)?;
     let payload_run_id = extract_run_id_from_payload(&raw);
     let run_id = if payload_run_id.is_none() {
@@ -532,12 +539,36 @@ fn decode_incoming_event(
     // machine downstream, unchanged. `resolve` additionally asks the driver's
     // TurnBoundary capability whether this event ends a turn, so the
     // dispatchers never have to re-derive that from the event's shape.
+    //
+    // A driver that returns a progress session (agy conversation-id
+    // filtering) gets one per connection, seeded from the engine-owned
+    // identity store. An empty fan-out is a successful drop, not a
+    // rejection: the shim must not retry a filtered subagent boundary.
     let transcript_path = driver.transcript_path_for_session(&raw);
-    let event = driver.normalize_progress_event(&raw)?;
-    Ok(
+    let session_config = ProgressSessionConfig {
+        run_id: run_id.clone(),
+        identity_store: Some(Arc::new(work_db.clone()) as Arc<dyn ProgressIdentityStore>),
+        ..ProgressSessionConfig::default()
+    };
+    let event = if let Some(mut session) = driver.progress_session(&session_config) {
+        let mut events = session.normalize_progress_events(&raw)?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        if events.len() > 1 {
+            tracing::warn!(
+                n = events.len(),
+                "hook-callback progress session produced more than one worker event; taking the first"
+            );
+        }
+        events.remove(0)
+    } else {
+        driver.normalize_progress_event(&raw)?
+    };
+    Ok(Some(
         IncomingHookEvent::resolve(driver.as_ref(), event, run_id, transcript_path, peer_pid_value)
             .with_subagent_origin(payload_is_from_subagent(&raw)),
-    )
+    ))
 }
 
 /// Whether a hook payload names a subagent as its origin. Claude Code stamps
@@ -736,6 +767,45 @@ mod tests {
         (dir, db, execution.id)
     }
 
+    /// Like [`db_with_ready_execution`], but with a `work_runs` row so
+    /// identity claim can persist. Live hook ingress only fires after spawn
+    /// has started the run.
+    fn db_with_started_execution(driver_slug: Option<&str>) -> (TempDir, WorkDb, String) {
+        let (dir, db, execution_id) = db_with_ready_execution(driver_slug);
+        db.start_execution_run(
+            &execution_id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+        (dir, db, execution_id)
+    }
+
+    async fn handle_payload(
+        db: &WorkDb,
+        registry: &DriverRegistry,
+        payload: &str,
+    ) -> Result<Option<IncomingHookEvent>, SocketError> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let path_owned = path.clone();
+        let payload = payload.to_owned();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, registry, db).await;
+        client.await.unwrap();
+        result
+    }
+
     /// A socket filename that is unique across every test invocation in this
     /// process, not just across the (already-unique) `TempDir` it lives in.
     /// Belt-and-suspenders for the two tests below that rebind at the same
@@ -918,7 +988,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client_task.await.unwrap();
 
         match incoming.event {
@@ -953,7 +1026,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert_eq!(
@@ -985,7 +1061,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -1015,7 +1094,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -1045,7 +1127,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
@@ -1075,7 +1160,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
 
         close_tx.send(()).ok();
@@ -1280,7 +1368,8 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let incoming = handle_connection(stream, &registry, &db)
             .await
-            .expect("camelCase payload must be normalised by the resolved grok driver, not dropped");
+            .expect("camelCase payload must be normalised by the resolved grok driver, not dropped")
+            .expect("decoded hook event");
         client.await.unwrap();
 
         match incoming.event {
@@ -1442,7 +1531,10 @@ mod tests {
         client.await.unwrap();
 
         let incoming = match result {
-            Ok(incoming) => incoming,
+            Ok(Some(incoming)) => incoming,
+            Ok(None) => {
+                panic!("a grok review-batch leaf's Stop must decode via GrokDriver, not be filtered")
+            }
             Err(err) => {
                 panic!("a grok review-batch leaf's Stop must decode via GrokDriver, not be dropped as Claude: {err:?}")
             }
@@ -1463,6 +1555,100 @@ mod tests {
             }
             other => panic!("expected Stop, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn agy_session_start_claims_conversation_identity() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let payload = format!(
+            r#"{{"hookEventName":"SessionStart","conversationId":"parent-cid","modelName":"gemini-4-hydrogen-xhigh","_boss_run_id":"{run_id}"}}"#
+        );
+        let incoming = handle_payload(&db, &registry, &payload)
+            .await
+            .expect("parent SessionStart must decode")
+            .expect("parent SessionStart must not be filtered");
+        match incoming.event {
+            WorkerEvent::SessionStart { session_id, source, .. } => {
+                assert_eq!(session_id, "parent-cid");
+                assert_eq!(source, boss_protocol::SessionStartSource::Startup);
+            }
+            other => panic!("expected SessionStart, got {other:?}"),
+        }
+        assert_eq!(
+            db.get_run_progress_session_identity(&run_id).unwrap().as_deref(),
+            Some("parent-cid"),
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_child_stop_is_dropped_after_parent_claim() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let parent_start =
+            format!(r#"{{"hookEventName":"SessionStart","conversationId":"parent-cid","_boss_run_id":"{run_id}"}}"#);
+        handle_payload(&db, &registry, &parent_start)
+            .await
+            .unwrap()
+            .expect("parent SessionStart");
+        let child_stop = format!(
+            r#"{{"hookEventName":"Stop","conversationId":"child-cid","fullyIdle":true,"_boss_run_id":"{run_id}"}}"#
+        );
+        let dropped = handle_payload(&db, &registry, &child_stop)
+            .await
+            .expect("a filtered child Stop is a successful drop, not a rejection");
+        assert!(dropped.is_none());
+        assert_eq!(
+            db.get_run_progress_session_identity(&run_id).unwrap().as_deref(),
+            Some("parent-cid"),
+            "a child Stop must not replace the parent claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_parent_stop_is_emitted_after_claim() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let parent_start =
+            format!(r#"{{"hookEventName":"SessionStart","conversationId":"parent-cid","_boss_run_id":"{run_id}"}}"#);
+        handle_payload(&db, &registry, &parent_start)
+            .await
+            .unwrap()
+            .expect("parent SessionStart");
+        let parent_stop = format!(
+            r#"{{"hookEventName":"Stop","conversationId":"parent-cid","fullyIdle":true,"_boss_run_id":"{run_id}"}}"#
+        );
+        let incoming = handle_payload(&db, &registry, &parent_stop)
+            .await
+            .expect("parent Stop must decode")
+            .expect("parent Stop must not be filtered");
+        match incoming.event {
+            WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "parent-cid"),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agy_stop_without_a_claim_fails_loudly() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let payload = format!(
+            r#"{{"hookEventName":"Stop","conversationId":"parent-cid","fullyIdle":true,"_boss_run_id":"{run_id}"}}"#
+        );
+        let result = handle_payload(&db, &registry, &payload).await;
+        match result {
+            Err(SocketError::Normalize(NormalizeError::Malformed(message))) => {
+                assert!(
+                    message.contains("before a claimed conversation identity"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected Malformed Stop-before-claim, got {other:?}"),
+        }
+        assert!(
+            db.get_run_progress_session_identity(&run_id).unwrap().is_none(),
+            "a Stop without a prior claim must not invent one"
+        );
     }
 
     /// A connection whose payload carries no `_boss_run_id` at all must fail
@@ -1704,7 +1890,8 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let incoming = handle_connection(stream, &registry, &db)
             .await
-            .expect("an answer-agent Stop must reach the completion handler, not be dropped");
+            .expect("an answer-agent Stop must reach the completion handler, not be dropped")
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));

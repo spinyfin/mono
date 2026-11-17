@@ -71,7 +71,7 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
                 let driver_registry = driver_registry.clone();
                 boss_task_scope::spawn(async move {
                     match handle_connection(stream, &driver_registry, &server_state.work_db).await {
-                        Ok(incoming) => {
+                        Ok(Some(incoming)) => {
                             let incoming = incoming.with_ingress_seq(ingress_seq);
                             tracing::info!(
                                 peer_pid = ?incoming.connection.peer_pid,
@@ -81,6 +81,9 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
                                 "events socket: hook event received",
                             );
                             dispatch_worker_event_fanout(&server_state, &incoming).await;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(ingress_seq, "events socket: dropped a filtered hook event");
                         }
                         Err(err) => {
                             tracing::warn!(?err, "events socket: failed to handle connection");

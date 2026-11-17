@@ -1333,6 +1333,10 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         !db.claim_run_progress_session_identity(&execution.id, "thread-a")
             .unwrap()
     );
+    assert_eq!(
+        db.get_run_progress_session_identity(&execution.id).unwrap().as_deref(),
+        Some("thread-a"),
+    );
     assert!(
         db.claim_run_progress_session_identity(&execution.id, "thread-a")
             .unwrap()
@@ -1341,11 +1345,16 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         !db.claim_run_progress_session_identity(&execution.id, "thread-b")
             .unwrap()
     );
+    assert_eq!(
+        db.get_run_progress_session_identity(&execution.id).unwrap().as_deref(),
+        Some("thread-b"),
+    );
     assert!(
         db.claim_run_progress_session_identity(&execution.id, "thread-b")
             .unwrap()
     );
     assert!(db.clear_run_progress_session_identity(&execution.id).unwrap());
+    assert!(db.get_run_progress_session_identity(&execution.id).unwrap().is_none());
     assert!(
         !db.claim_run_progress_session_identity(&execution.id, "thread-b")
             .unwrap()

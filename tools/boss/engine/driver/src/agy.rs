@@ -1,10 +1,11 @@
 //! `AgyDriver` — Google Antigravity (`agy`) agent driver.
 //!
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
-//! provisioning, per-kind permission rendering (`--settings`), and
-//! PreToolUse authorization. Interactive TUI spawn still refuses until the
-//! startup contract lands. Retention preserves transcript evidence in the
-//! per-run HOME.
+//! provisioning, per-kind permission rendering (`--settings`), PreToolUse
+//! authorization, and hook progress observation (conversation-id
+//! filtering for undisableable subagents). Interactive TUI spawn still
+//! refuses until the startup contract lands. Retention preserves
+//! transcript evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -22,8 +23,9 @@ use boss_ssh_transport::shell_quote;
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
     InterruptDelivery, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput,
-    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, SettingsLogCheckSpec,
-    SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ProgressSessionConfig,
+    ProgressSessionNormalizer, SettingsLogCheckSpec, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 
 mod environment;
@@ -31,9 +33,12 @@ mod home;
 mod hooks;
 mod model_menu;
 pub mod permissions;
+mod progress;
 #[cfg(test)]
 mod test_environment;
 mod transcript;
+
+use progress::AgyProgressSession;
 
 /// Manual authenticated rules-discovery conformance probe.
 pub mod rules_probe;
@@ -95,9 +100,9 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 ///
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning, permission
-/// rendering and PreToolUse authorization are live; interactive TUI spawn
-/// still refuses until the startup contract lands. Retention preserves per-run
-/// transcript evidence.
+/// rendering, PreToolUse authorization, and hook progress observation are
+/// live; interactive TUI spawn still refuses until the startup contract
+/// lands. Retention preserves per-run transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -393,10 +398,19 @@ impl AgentDriver for AgyDriver {
         })
     }
 
-    fn normalize_progress_event(&self, _raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-        Err(NormalizeError::Malformed(
-            "agy progress observation is not wired in this skeleton".into(),
-        ))
+    fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+        // Stateless compatibility path for direct callers. Live hook
+        // ingress owns a per-connection session via `progress_session`
+        // that peeks the engine-owned conversation identity so a child
+        // cannot replace the parent claim.
+        AgyProgressSession::new(None, None).normalize_progress_event(raw)
+    }
+
+    fn progress_session(&self, config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
+        Some(Box::new(AgyProgressSession::new(
+            config.run_id.clone(),
+            config.identity_store.clone(),
+        )))
     }
 
     fn turn_boundary(&self, _event: &WorkerEvent) -> Option<TurnEnd> {

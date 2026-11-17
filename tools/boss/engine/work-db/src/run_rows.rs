@@ -448,6 +448,27 @@ impl WorkDb {
         Ok(resumed)
     }
 
+    /// Read the currently claimed provider session id for an execution.
+    ///
+    /// `Ok(None)` means this run never recorded one — a legitimate answer
+    /// for a run that has not yet emitted a SessionStart, and a distinct
+    /// one from a read failure, which surfaces as `Err`. Targets the same
+    /// agent-session row as [`Self::claim_run_progress_session_identity`].
+    pub fn get_run_progress_session_identity(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT progress_session_id FROM work_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Persist the run's file-progress ingress resume point.
     ///
     /// Targets the same agent-session row as
@@ -1783,6 +1804,11 @@ pub(super) fn latest_local_worker_process_for_work_item(
 impl boss_engine_driver::ProgressIdentityStore for WorkDb {
     fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String> {
         self.claim_run_progress_session_identity(run_id, session_id)
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    fn claimed_progress_identity(&self, run_id: &str) -> Result<Option<String>, String> {
+        self.get_run_progress_session_identity(run_id)
             .map_err(|err| format!("{err:#}"))
     }
 }
