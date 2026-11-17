@@ -158,8 +158,15 @@ struct OperatorQuestionDetailPopover: View {
                             section("Technical details", details)
                         }
                         if let proposed = question.prerequisiteTask {
-                            section("Proposed task", proposed.name)
-                            section("Proposed brief", proposed.brief)
+                            if proposed.existing {
+                                section("Existing task", proposed.name)
+                                if let pullRequest = proposed.pullRequest, !pullRequest.isEmpty {
+                                    section("Pull request", pullRequest)
+                                }
+                            } else {
+                                section("Proposed task", proposed.name)
+                                section("Proposed brief", proposed.brief)
+                            }
                         }
                         section("Run summary", question.runSummary ?? "No run summary recorded.")
                     }

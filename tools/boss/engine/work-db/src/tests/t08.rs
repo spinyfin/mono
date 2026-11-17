@@ -597,6 +597,8 @@ fn named_bypass_answer_reaches_the_file_count_bypass_consumer() {
                 brief: "Land the first capability as its own PR.".to_owned(),
                 file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
                 option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+                existing_id: None,
+                existing_pr: None,
             },
             explanation: "Context:\nToo big.\nSplit:\nLand the first PR.\nBypass limit:\nKeep one PR.\nRecommendation:\nBypass limit".to_owned(),
         };

@@ -700,7 +700,10 @@ impl<'a> PayloadReader<'a> {
             self.error("question", "a question is only meaningful on a blocked declaration");
         }
         if let Some(kind) = value.pointer("/answer_type/kind").and_then(Value::as_str)
-            && !matches!(kind, "yes_no" | "create_prerequisite_task" | "multiple_choice")
+            && !matches!(
+                kind,
+                "yes_no" | "create_prerequisite_task" | "link_prerequisite_task" | "multiple_choice"
+            )
         {
             self.error("question.answer_type.kind", format!("unsupported answer type: {kind}"));
             return None;
@@ -717,6 +720,8 @@ impl<'a> PayloadReader<'a> {
             brief,
             file_count_bypass,
             option_labels: _,
+            existing_id,
+            existing_pr,
         } = question.answer_type
         {
             let name = self.text_from(
@@ -747,11 +752,101 @@ impl<'a> PayloadReader<'a> {
             // The engine also owns the option names: a split-vs-bypass question
             // names its two actions, an ordinary prerequisite stays Yes/No, and
             // whatever labels the worker sent are replaced.
+            let existing_id = existing_id.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_id",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            let existing_pr = existing_pr.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_pr",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            if file_count_bypass.is_some() && (existing_id.is_some() || existing_pr.is_some()) {
+                self.error(
+                    "question.answer_type.existing_pr",
+                    "a split-vs-bypass question cannot also name existing work to wait for",
+                );
+            }
             question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
                 name,
                 brief,
                 file_count_bypass,
                 option_labels: file_count_bypass.map(|_| boss_protocol::AnswerOptionLabels::split_or_bypass()),
+                existing_id,
+                existing_pr,
+            };
+        } else if let boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+            existing_id,
+            existing_pr,
+            work_item_id,
+            name,
+            pr_url,
+        } = question.answer_type
+        {
+            let existing_id = existing_id.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_id",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            let existing_pr = existing_pr.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_pr",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            let work_item_id = if work_item_id.trim().is_empty() {
+                String::new()
+            } else {
+                self.text_from(
+                    "question.answer_type.work_item_id",
+                    &Value::String(work_item_id),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+                .unwrap_or_default()
+            };
+            let name = if name.trim().is_empty() {
+                String::new()
+            } else {
+                self.text_from(
+                    "question.answer_type.name",
+                    &Value::String(name),
+                    MAX_PREREQUISITE_NAME_CHARS,
+                )
+                .unwrap_or_default()
+            };
+            let pr_url = pr_url.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.pr_url",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            if existing_id.is_none() && existing_pr.is_none() && work_item_id.is_empty() {
+                self.error(
+                    "question.answer_type.existing_id",
+                    "a link question must name an existing task id or pull request",
+                );
+            }
+            question.text = if name.is_empty() {
+                boss_protocol::OperatorAnswerType::link_prerequisite_unresolved_question_text()
+            } else {
+                let pr_label = pr_url.as_deref().and_then(boss_protocol::compact_github_pr_label);
+                boss_protocol::OperatorAnswerType::link_prerequisite_question_text(&name, pr_label.as_deref())
+            };
+            question.answer_type = boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+                existing_id,
+                existing_pr,
+                work_item_id,
+                name,
+                pr_url,
             };
         } else {
             if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type
@@ -1070,6 +1165,8 @@ mod operator_question_tests {
                 brief: "A stand-alone brief.".into(),
                 file_count_bypass: None,
                 option_labels: None,
+                existing_id: None,
+                existing_pr: None,
             }
         );
         assert_eq!(
@@ -1138,6 +1235,8 @@ mod operator_question_tests {
                 brief: "Land the first PR.".into(),
                 file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
                 option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+                existing_id: None,
+                existing_pr: None,
             }
         );
         // The engine owns the option names: labels a worker sends are replaced,
@@ -1161,5 +1260,51 @@ mod operator_question_tests {
             invalid["question"]["answer_type"]["file_count_bypass"] = spec.clone();
             assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err(), "{spec}");
         }
+    }
+
+    #[test]
+    fn link_prerequisite_question_requires_an_id_or_pr_and_owns_its_wording() {
+        let payload = json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
+            "text":"Worker wording should be replaced",
+            "answer_type":{"kind":"link_prerequisite_task",
+                "existing_pr":"  https://github.com/acme/widget/pull/9  "},
+            "explanation":"  The other change is already in review.  "
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &payload).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(
+            question.text,
+            "Wait for the existing work this request names? This task will wait for it."
+        );
+        assert_eq!(
+            question.answer_type,
+            boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+                existing_id: None,
+                existing_pr: Some("https://github.com/acme/widget/pull/9".into()),
+                work_item_id: String::new(),
+                name: String::new(),
+                pr_url: None,
+            }
+        );
+        let mut missing = payload.clone();
+        missing["question"]["answer_type"]
+            .as_object_mut()
+            .unwrap()
+            .remove("existing_pr");
+        assert!(validate_payload(ProposalKind::RunDone, &missing).is_err());
+        let resolved = json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
+            "answer_type":{"kind":"link_prerequisite_task",
+                "work_item_id":"task_abc",
+                "name":"Land the wiring",
+                "pr_url":"https://github.com/acme/widget/pull/9"},
+            "explanation":"The other change is already in review."
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &resolved).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        assert_eq!(
+            parsed.question.unwrap().text,
+            "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it."
+        );
     }
 }

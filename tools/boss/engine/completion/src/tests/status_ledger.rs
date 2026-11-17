@@ -1312,6 +1312,8 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
             brief: "Do the other thing first.".into(),
             file_count_bypass: None,
             option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         },
     };
     crate::work::insert_question(&db.connect().unwrap(), &gated_exec.id, "proposal", &prereq_q).unwrap();
@@ -1332,6 +1334,8 @@ fn operator_yes_and_prerequisite_approval_record_exact_bases() {
             brief: "Do the other thing first.".into(),
             file_count_bypass: None,
             option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         },
     };
     crate::work::insert_question(&db.connect().unwrap(), &waiting_exec.id, "proposal", &parked_q).unwrap();

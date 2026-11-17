@@ -21,6 +21,9 @@ struct OperatorQuestion: Hashable {
         /// The worker proposes a task that must land before it can proceed;
         /// the proposal rides on [[OperatorQuestion.prerequisiteTask]].
         case createPrerequisiteTask = "create_prerequisite_task"
+        /// Wait for an existing open task the worker named by id or PR;
+        /// the existing task rides on [[OperatorQuestion.prerequisiteTask]].
+        case linkPrerequisiteTask = "link_prerequisite_task"
     }
 
     let id: String
@@ -32,8 +35,9 @@ struct OperatorQuestion: Hashable {
     /// The run that asked; the answer restarts the task in a new run.
     let executionID: String
     var runSummary: String? = nil
-    /// The proposed task, present exactly when `answerType` is
-    /// `.createPrerequisiteTask`. The card shows it behind "Why?".
+    /// The proposed or existing task, present when `answerType` is
+    /// `.createPrerequisiteTask` or `.linkPrerequisiteTask`. The card
+    /// shows it behind "Why?".
     var prerequisiteTask: PrerequisiteTaskProposal? = nil
     /// The options of a `.multipleChoice` question, in the worker's order;
     /// empty for every other answer type.
@@ -71,6 +75,16 @@ struct OperatorQuestion: Hashable {
                   let brief = answerTypeDict["brief"] as? String
             else { return nil }
             prerequisiteTask = PrerequisiteTaskProposal(name: name, brief: brief)
+        }
+        if answerType == .linkPrerequisiteTask {
+            guard let name = answerTypeDict["name"] as? String, !name.isEmpty
+            else { return nil }
+            prerequisiteTask = PrerequisiteTaskProposal(
+                name: name,
+                brief: "",
+                pullRequest: answerTypeDict["pr_url"] as? String,
+                existing: true
+            )
         }
         var optionLabels: AnswerOptionLabels? = nil
         if answerType == .createPrerequisiteTask {
@@ -122,12 +136,17 @@ struct AnswerOptionLabels: Hashable {
     }
 }
 
-/// The task a blocked worker proposes as its prerequisite
-/// (`OperatorAnswerType::CreatePrerequisiteTask` on the wire).
+/// The task a blocked worker proposes as its prerequisite, or the existing
+/// task a link question waits for (`CreatePrerequisiteTask` /
+/// `LinkPrerequisiteTask` on the wire).
 struct PrerequisiteTaskProposal: Hashable {
     let name: String
-    /// The proposed task's self-contained brief.
+    /// The proposed task's self-contained brief. Empty on a link question.
     let brief: String
+    /// Bound pull request URL when the existing task owns one.
+    var pullRequest: String? = nil
+    /// `true` when this is an existing task to wait for, not a proposal to create.
+    var existing: Bool = false
 }
 
 /// The user's answer, shaped by the question's `AnswerType`. Encodes to

@@ -2684,6 +2684,21 @@ impl WorkDb {
                 )?;
                 prerequisite_work_item_id = Some(linked.id);
             }
+            (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::LinkPrerequisiteTask { work_item_id, .. }) => {
+                let linked = super::prerequisite_question::approve_existing_in_tx(
+                    &mut pending,
+                    &tx,
+                    &task,
+                    super::prerequisite_question::ExistingApproval {
+                        question: &question.question,
+                        existing_id: work_item_id,
+                        answered_at,
+                        now: &now,
+                    },
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
+                prerequisite_work_item_id = Some(linked.id);
+            }
             (OperatorAnswer::YesNo { value: true }, OperatorAnswerType::YesNo) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = authorization_block(&question.question, &timestamp);

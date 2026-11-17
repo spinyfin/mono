@@ -48,6 +48,24 @@ pub fn create_in_tx(
                     .transpose()?,
             )
         }
+        OperatorAnswerType::LinkPrerequisiteTask {
+            name,
+            pr_url,
+            work_item_id,
+            ..
+        } => {
+            let mut existing = format!("\n\nExisting prerequisite: {name}");
+            if let Some(pr_url) = pr_url.as_deref().filter(|url| !url.is_empty()) {
+                existing.push_str(&format!("\n\nPull request: {pr_url}"));
+            }
+            if !work_item_id.is_empty() {
+                existing.push_str(&format!("\n\nTask id: {work_item_id}"));
+            }
+            existing
+                .push_str("\n\nYes links this task as a prerequisite and waits for it. It does not create a new task.");
+            prompt.push_str(&existing);
+            ("yes_no", None)
+        }
     };
     create_attention_in_tx(
         conn,
@@ -168,26 +186,42 @@ pub(super) fn apply_typed_answer_in_tx(
         let Some(record) = stored_question(conn, group)? else {
             return Ok(());
         };
-        let OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } = &record.question.answer_type else {
-            return Ok(());
-        };
         let now = now_string();
         let answered_at = chrono::DateTime::from_timestamp(now.parse::<i64>()?, 0)
             .context("answer timestamp is outside the supported range")?;
         for id in produced_ids {
             let task = query_task(conn, id).require("task", id)?;
-            super::super::prerequisite_question::approve_in_tx(
-                pending,
-                conn,
-                &task,
-                super::super::prerequisite_question::Approval {
-                    question: &record.question,
-                    proposed: (name, brief),
-                    answered_at,
-                    now: &now,
-                },
-                attribution,
-            )?;
+            match &record.question.answer_type {
+                OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } => {
+                    super::super::prerequisite_question::approve_in_tx(
+                        pending,
+                        conn,
+                        &task,
+                        super::super::prerequisite_question::Approval {
+                            question: &record.question,
+                            proposed: (name, brief),
+                            answered_at,
+                            now: &now,
+                        },
+                        attribution,
+                    )?;
+                }
+                OperatorAnswerType::LinkPrerequisiteTask { work_item_id, .. } => {
+                    super::super::prerequisite_question::approve_existing_in_tx(
+                        pending,
+                        conn,
+                        &task,
+                        super::super::prerequisite_question::ExistingApproval {
+                            question: &record.question,
+                            existing_id: work_item_id,
+                            answered_at,
+                            now: &now,
+                        },
+                        attribution,
+                    )?;
+                }
+                _ => return Ok(()),
+            }
             if task.kind == TaskKind::Revision {
                 let task = query_task(conn, id).require("task", id)?;
                 reconcile_revision_execution(pending, conn, &mut ExecutionReconcileResult::default(), &task)?;

@@ -523,8 +523,8 @@ pub(crate) struct RunDoneArgs {
     /// One specific decision in everyday words, without internal symbols,
     /// types, file names, API names, or review jargon. Required with
     /// `--answer-type yes-no` and `multiple-choice`; not accepted with
-    /// `create-prerequisite-task`, whose question the engine words from
-    /// `--prerequisite-name`.
+    /// `create-prerequisite-task` or `link-prerequisite-task`, whose question
+    /// the engine words from the named or resolved task.
     #[arg(
         long,
         requires_all = ["answer_type", "explanation"],
@@ -539,9 +539,13 @@ pub(crate) struct RunDoneArgs {
     /// and explain the dependency and both answers in `--explanation`. For an
     /// over-limit file-count change, also pass `--file-count` and
     /// `--file-count-limit` so No authorizes a file-count exception for this PR.
+    /// `link-prerequisite-task` when that work already belongs to an existing
+    /// open task: pass `--prerequisite-id` and/or `--prerequisite-pr` (a GitHub
+    /// URL, `owner/repo#n`, or PR number). The engine resolves the task from
+    /// that id or PR, never by name.
     #[arg(
         long,
-        value_parser = ["yes-no", "multiple-choice", "create-prerequisite-task"],
+        value_parser = ["yes-no", "multiple-choice", "create-prerequisite-task", "link-prerequisite-task"],
         requires = "explanation"
     )]
     answer_type: Option<String>,
@@ -588,6 +592,17 @@ pub(crate) struct RunDoneArgs {
         required_if_eq("answer_type", "create-prerequisite-task")
     )]
     prerequisite_name: Option<String>,
+
+    /// Canonical or friendly id of an existing task to wait for
+    /// (`link-prerequisite-task`, optional on `create-prerequisite-task`).
+    #[arg(long, requires = "answer_type", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    prerequisite_id: Option<String>,
+
+    /// GitHub pull request that already belongs to the work to wait for:
+    /// a URL, `owner/repo#n`, or a PR number (`link-prerequisite-task`,
+    /// optional on `create-prerequisite-task`).
+    #[arg(long, requires = "answer_type")]
+    prerequisite_pr: Option<String>,
 
     /// Self-contained brief for the proposed prerequisite task: the card
     /// shows it and the task's worker sees nothing else.
@@ -941,22 +956,12 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
         ),
         ProposeCommand::Done(args) => {
             let criterion = args.criterion.clone();
+            let question = operator_question_from_flags(&args)?;
             let mut payload = serde_json::to_value(RunDoneProposalPayload {
                 queue_ci_evidence: read_queue_ci_evidence(args.queue_ci_evidence_file)?,
                 outcome: RunDoneOutcome::from(args.outcome),
                 summary: args.summary,
-                question: operator_question_from_flags(
-                    args.question,
-                    args.answer_type.as_deref(),
-                    args.choices,
-                    args.explanation,
-                    args.prerequisite_name,
-                    args.prerequisite_brief,
-                    match (args.file_count, args.file_count_limit) {
-                        (Some(files), Some(limit)) => Some(boss_protocol::FileCountBypassSpec { files, limit }),
-                        _ => None,
-                    },
-                )?,
+                question,
             })
             .map_err(CliError::internal)?;
             // The criterion rides beside the typed payload; see
@@ -1054,15 +1059,19 @@ pub(crate) fn read_queue_ci_evidence(
 /// Assemble the blocked declaration's question from its flags. clap has
 /// already enforced which flags must travel together; what it cannot express
 /// is that the two question shapes exclude each other's flags.
-fn operator_question_from_flags(
-    question: Option<String>,
-    answer_type: Option<&str>,
-    choices: Vec<String>,
-    explanation: Option<String>,
-    prerequisite_name: Option<String>,
-    prerequisite_brief: Option<String>,
-    file_count_bypass: Option<boss_protocol::FileCountBypassSpec>,
-) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
+fn operator_question_from_flags(args: &RunDoneArgs) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
+    let question = args.question.clone();
+    let answer_type = args.answer_type.as_deref();
+    let choices = args.choices.clone();
+    let explanation = args.explanation.clone();
+    let prerequisite_name = args.prerequisite_name.clone();
+    let prerequisite_brief = args.prerequisite_brief.clone();
+    let prerequisite_id = args.prerequisite_id.clone();
+    let prerequisite_pr = args.prerequisite_pr.clone();
+    let file_count_bypass = match (args.file_count, args.file_count_limit) {
+        (Some(files), Some(limit)) => Some(boss_protocol::FileCountBypassSpec { files, limit }),
+        _ => None,
+    };
     // A split-vs-bypass question names its two actions, so its explanation
     // sections and the card's buttons say Split / Bypass limit, not Yes / No.
     let option_labels = (answer_type == Some("create-prerequisite-task") && file_count_bypass.is_some())
@@ -1088,11 +1097,18 @@ fn operator_question_from_flags(
             "--file-count and --file-count-limit only apply to --answer-type create-prerequisite-task",
         ));
     }
+    let existing_id = nonempty_flag(prerequisite_id);
+    let existing_pr = nonempty_flag(prerequisite_pr);
     match answer_type {
         None => Ok(None),
-        Some("yes-no" | "multiple-choice") if prerequisite_name.is_some() || prerequisite_brief.is_some() => {
+        Some("yes-no" | "multiple-choice")
+            if prerequisite_name.is_some()
+                || prerequisite_brief.is_some()
+                || existing_id.is_some()
+                || existing_pr.is_some() =>
+        {
             Err(CliError::usage(
-                "--prerequisite-name and --prerequisite-brief only apply to --answer-type create-prerequisite-task",
+                "--prerequisite-name, --prerequisite-brief, --prerequisite-id, and --prerequisite-pr only apply to create-prerequisite-task or link-prerequisite-task",
             ))
         }
         Some("multiple-choice") => {
@@ -1132,12 +1148,50 @@ fn operator_question_from_flags(
                     brief: prerequisite_brief.unwrap_or_default(),
                     file_count_bypass,
                     option_labels,
+                    existing_id,
+                    existing_pr,
+                },
+                explanation,
+            }))
+        }
+        Some("link-prerequisite-task") => {
+            if question.is_some() {
+                return Err(CliError::usage(
+                    "--question does not apply to --answer-type link-prerequisite-task; \
+                     the engine words the question from the existing task it resolves",
+                ));
+            }
+            if prerequisite_name.is_some() || prerequisite_brief.is_some() {
+                return Err(CliError::usage(
+                    "--prerequisite-name and --prerequisite-brief only apply to --answer-type create-prerequisite-task",
+                ));
+            }
+            if existing_id.is_none() && existing_pr.is_none() {
+                return Err(CliError::usage(
+                    "--answer-type link-prerequisite-task requires --prerequisite-id and/or --prerequisite-pr",
+                ));
+            }
+            Ok(Some(boss_protocol::OperatorQuestion {
+                text: boss_protocol::OperatorAnswerType::link_prerequisite_unresolved_question_text(),
+                answer_type: boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+                    existing_id,
+                    existing_pr,
+                    work_item_id: String::new(),
+                    name: String::new(),
+                    pr_url: None,
                 },
                 explanation,
             }))
         }
         Some(other) => Err(CliError::usage(format!("unsupported --answer-type `{other}`"))),
     }
+}
+
+fn nonempty_flag(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 /// Parse `--duration` into seconds. Accepts a bare integer or a compact
@@ -1343,6 +1397,10 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::RunDone, "question.answer_type.name") => Some("--prerequisite-name"),
         (ProposalKind::RunDone, "question.answer_type.brief") => Some("--prerequisite-brief"),
         (ProposalKind::RunDone, "question.answer_type.file_count_bypass") => Some("--file-count / --file-count-limit"),
+        (ProposalKind::RunDone, "question.answer_type.existing_id" | "question.answer_type.work_item_id") => {
+            Some("--prerequisite-id")
+        }
+        (ProposalKind::RunDone, "question.answer_type.existing_pr") => Some("--prerequisite-pr"),
         (ProposalKind::Wait, "reason") => Some("--reason"),
         (ProposalKind::Wait, "duration_secs") => Some("--duration"),
         (ProposalKind::Wait, "waiting_on") => Some("--waiting-on"),
@@ -1605,6 +1663,49 @@ mod tests {
             "y",
         ];
         let Commands::Propose(args) = Cli::try_parse_from(yes_no_with_prerequisite).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+    }
+
+    #[test]
+    fn link_prerequisite_flags_require_an_id_or_pr_and_build_the_typed_question() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need the other PR first",
+            "--answer-type",
+            "link-prerequisite-task",
+            "--explanation",
+            explanation::tests::VALID,
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        let Commands::Propose(args) = Cli::try_parse_from(base).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+        let flags = ["--prerequisite-pr", " https://github.com/acme/widget/pull/9 "];
+        let Commands::Propose(args) = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap().command else {
+            panic!("expected propose")
+        };
+        let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        let answer_type = &payload["question"]["answer_type"];
+        assert_eq!(answer_type["kind"], "link_prerequisite_task");
+        assert_eq!(answer_type["existing_pr"], "https://github.com/acme/widget/pull/9");
+        assert_eq!(
+            payload["question"]["text"],
+            "Wait for the existing work this request names? This task will wait for it."
+        );
+        let with_name =
+            base.iter()
+                .copied()
+                .chain(flags)
+                .chain(["--prerequisite-name", "x", "--prerequisite-brief", "y"]);
+        let Commands::Propose(args) = Cli::try_parse_from(with_name).unwrap().command else {
             panic!("expected propose")
         };
         assert!(payload_for(args.command.unwrap()).is_err());
