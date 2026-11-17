@@ -95,7 +95,7 @@ async fn review_prefix_worker_id_releases_to_review_pool() {
     assert_eq!(coordinator.review_worker_pool().idle_count().await, 1);
 
     // Release routes by prefix → the review-pool slot is freed.
-    coordinator.release_worker_and_kick(&wid, None).await;
+    coordinator.release_worker_and_kick(&wid, "exec-r", None).await;
     assert_eq!(
         coordinator.review_worker_pool().idle_count().await,
         2,

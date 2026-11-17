@@ -1310,3 +1310,122 @@ async fn undeterminable_attention_clears_after_terminal_status_and_slot_removal(
 
     assert_eq!(db.list_attention_items(&execution_id).unwrap()[0].status, "resolved");
 }
+
+/// Incident shape: the failing spawn's teardown frees slot 41, a replacement
+/// claims and registers it, and only then do the old spawn's error tail and
+/// reaper run. A correlating rollout on disk must reach the driver-start
+/// guard through the liveness probe — the production path for an armed but
+/// unattached Codex ingress — so injecting `record_driver_signal` by hand
+/// cannot mask a missing execution row. The no-signal control on the same
+/// fixture is reaped, proving the guard was reachable.
+#[tokio::test]
+async fn displaced_progression_spawn_cleanup_does_not_strip_the_replacements_driver_signal() {
+    for with_rollout in [true, false] {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let old_item = create_active_chore(&db, &product_id, "old");
+        let new_item = create_active_chore(&db, &product_id, "new");
+        let db = Arc::new(db);
+        let old_id = create_spawned_execution(&db, &old_item, 4242);
+        let replacement_id = create_spawned_execution(&db, &new_item, 4343);
+        let _old_bm = crate::test_support::seed_empty_execution_bookmark(&db, &old_id).await;
+        let _new_bm = crate::test_support::seed_empty_execution_bookmark(&db, &replacement_id).await;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        if with_rollout {
+            arm_file_ingress(&db, &replacement_id, &root, &workspace, Vec::new());
+            let rollout = root.join("rollout-2026-11-17T10-50-39-sess-1.jsonl");
+            std::fs::write(&rollout, session_meta_line("sess-1", &workspace)).unwrap();
+        } else {
+            let stale = root.join("rollout-old-sess-0.jsonl");
+            std::fs::write(&stale, session_meta_line("sess-0", temp.path())).unwrap();
+            let stale = std::fs::canonicalize(&stale).unwrap();
+            arm_file_ingress(&db, &replacement_id, &root, temp.path(), vec![stale]);
+        }
+
+        let mut coordinator = ExecutionCoordinator::new(
+            db.clone(),
+            boss_execution_contracts::WorkerPool::new(1),
+            Arc::new(NoopCube),
+            Arc::new(NoopRunner),
+        );
+        coordinator.set_progression_pool(boss_execution_contracts::WorkerPool::new_progression(1));
+        let coordinator = Arc::new(coordinator);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+
+        let worker = coordinator
+            .progression_worker_pool()
+            .claim_worker(&old_id, None)
+            .await
+            .unwrap();
+        let slot = crate::coordinator::slot_id_from_worker_id(&worker).unwrap();
+        assert_eq!(slot, 41, "with_rollout={with_rollout}");
+        register_slot_with_live_shell(&live_states, slot, &old_id, &old_item, 4242, false);
+        let old_state = live_states
+            .snapshot()
+            .into_iter()
+            .find(|state| state.run_id == old_id)
+            .expect("old run registered");
+
+        live_states.release_slot_for_run(&old_id);
+        coordinator.release_worker_and_kick(&worker, &old_id, None).await;
+        coordinator
+            .progression_worker_pool()
+            .claim_worker(&replacement_id, None)
+            .await
+            .unwrap();
+        register_slot_with_live_shell(&live_states, slot, &replacement_id, &new_item, 4343, false);
+
+        latch_scheduler_so_a_stale_kick_is_visible(&coordinator);
+        coordinator.release_worker_and_kick(&worker, &old_id, None).await;
+        crate::dead_pid_sweep::release_reaped_execution(&live_states, &coordinator, &old_state).await;
+        assert_stale_release_did_not_kick(&coordinator);
+
+        let cube = RecordingCube::default();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            &RecordingDispatchEventSink::new(),
+            &RecordingReaper::new(coordinator.clone()),
+            &SpawnHealthTracker::new(),
+            &cube,
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+
+        if with_rollout {
+            assert_eq!(
+                outcome.driver_start_reaped, 0,
+                "with_rollout={with_rollout}: a correlating rollout must reach the driver-start guard"
+            );
+            assert_eq!(
+                outcome.vetoed, 1,
+                "with_rollout={with_rollout}: the guard must observe the replacement"
+            );
+            assert!(
+                live_states.driver_signal_at(slot).is_some(),
+                "with_rollout={with_rollout}: the liveness probe must record the rollout"
+            );
+            assert_eq!(
+                coordinator.claim_holder(&worker).await.as_deref(),
+                Some(replacement_id.as_str()),
+            );
+            assert!(
+                live_states
+                    .snapshot()
+                    .iter()
+                    .any(|state| state.run_id == replacement_id)
+            );
+        } else {
+            assert_eq!(
+                outcome.driver_start_reaped, 1,
+                "with_rollout={with_rollout}: without a rollout the same fixture must reap"
+            );
+        }
+    }
+}

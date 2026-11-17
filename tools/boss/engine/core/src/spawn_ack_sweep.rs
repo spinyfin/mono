@@ -1005,10 +1005,13 @@ pub(crate) async fn finish_reap(
     ctx.reaper.reap_worker(execution_id).await;
 
     // Release the worker pool slot so the orphan sweep detects the chore and
-    // creates a fresh ready execution for redispatch. Idempotent with the
-    // pool-slot release production's `release_worker_pane` already performs.
+    // creates a fresh ready execution for redispatch. The reaper may already
+    // have released and dispatched a replacement into this slot, so only
+    // release the execution whose reap just completed.
     let worker_id = worker_id_for_slot(slot_id);
-    ctx.coordinator.release_worker_and_kick(&worker_id, None).await;
+    ctx.coordinator
+        .release_worker_and_kick(&worker_id, execution_id, None)
+        .await;
 
     // Release the cube workspace lease. `mark_execution_orphaned`
     // deliberately leaves the lease columns intact (a live workspace may
@@ -1341,6 +1344,7 @@ pub(crate) mod probe_hold;
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
@@ -1483,6 +1487,86 @@ mod tests {
     }
 
     // ─── tests ───────────────────────────────────────────────────────────────
+
+    /// Mirrors a production pane reaper whose awaited release hands the slot to
+    /// a new run that registers live state before the sweep's tail runs.
+    struct ReplacingReaper {
+        coordinator: Arc<ExecutionCoordinator>,
+        live_states: Arc<LiveWorkerStateRegistry>,
+    }
+
+    #[async_trait]
+    impl SpawnAckReaper for ReplacingReaper {
+        async fn reap_worker(&self, execution_id: &str) {
+            self.live_states.release_slot_for_run(execution_id);
+            self.coordinator
+                .release_worker_and_kick(&worker_id_for_slot(1), execution_id, None)
+                .await;
+            assert!(
+                self.coordinator
+                    .worker_pool()
+                    .claim_worker("replacement", None)
+                    .await
+                    .is_some()
+            );
+            register_slot_zero_pid(&self.live_states, 1, "replacement", "replacement-item");
+            latch_scheduler_so_a_stale_kick_is_visible(&self.coordinator);
+        }
+    }
+
+    fn latch_scheduler_so_a_stale_kick_is_visible(coordinator: &ExecutionCoordinator) {
+        coordinator.scheduling_active().store(true, Ordering::Release);
+        coordinator.scheduling_pending().store(false, Ordering::Release);
+    }
+
+    fn assert_stale_release_did_not_kick(coordinator: &ExecutionCoordinator) {
+        assert!(
+            !coordinator.scheduling_pending().load(Ordering::Acquire),
+            "a no-op ownership miss must not kick dispatch or rescan active work"
+        );
+    }
+
+    /// The reap's guarded release must not free a slot the reaper's own release
+    /// already handed to a replacement run.
+    #[tokio::test]
+    async fn reaped_spawn_tail_leaves_a_replacement_claim_in_place() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &execution_id).await;
+
+        let reaper = ReplacingReaper {
+            coordinator: coordinator.clone(),
+            live_states: live_states.clone(),
+        };
+        let sink = RecordingDispatchEventSink::new();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            &sink,
+            &reaper,
+            &SpawnHealthTracker::new(),
+            &RecordingCube::default(),
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+
+        assert_eq!(outcome.driver_start_reaped, 1);
+        assert_eq!(
+            coordinator.claim_holder(&worker_id_for_slot(1)).await.as_deref(),
+            Some("replacement"),
+            "the replacement keeps its claim",
+        );
+        assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+        assert_stale_release_did_not_kick(&coordinator);
+    }
 
     /// A driver-start timeout must not assert "the binary never started"
     /// when the run's file ingress says otherwise. In the 2026-09-13 breaker

@@ -1288,7 +1288,9 @@ async fn release_worker_and_kick_frees_pool_slot() {
         .expect("pool has free slots");
     assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 
-    coordinator.release_worker_and_kick(&claimed, Some("ws-1")).await;
+    coordinator
+        .release_worker_and_kick(&claimed, "exec-pre", Some("ws-1"))
+        .await;
 
     assert_eq!(
         coordinator.worker_pool().idle_count().await,
@@ -1298,7 +1300,9 @@ async fn release_worker_and_kick_frees_pool_slot() {
     // Idempotent: a second release on the same already-idle slot
     // is a no-op (the pane-spawn lifecycle can racily re-enter
     // this path from completion + chore-done).
-    coordinator.release_worker_and_kick(&claimed, Some("ws-1")).await;
+    coordinator
+        .release_worker_and_kick(&claimed, "exec-pre", Some("ws-1"))
+        .await;
     assert_eq!(coordinator.worker_pool().idle_count().await, 2);
 }
 

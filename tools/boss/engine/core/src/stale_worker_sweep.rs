@@ -1905,12 +1905,14 @@ async fn run_cadence_fallback(
     // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
     // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
     // "auto-worker-N" prefix and release_worker_and_kick routes to the
-    // correct pool via pool_for_worker_id. Idempotent with the
-    // pool-slot release the reaper's `release_worker_pane` already
-    // performed in production (find-or-skip no-op); in tests where the
-    // reaper is a recording stub, this is what frees the slot.
+    // correct pool via pool_for_worker_id. Release only if this execution
+    // still owns the claim, because the reaper's release may already have
+    // given the slot to a new occupant; with a recording-stub reaper this is
+    // what frees the slot.
     let worker_id = worker_id_for_slot(state.slot_id);
-    coordinator.release_worker_and_kick(&worker_id, None).await;
+    coordinator
+        .release_worker_and_kick(&worker_id, execution_id, None)
+        .await;
 
     // Structured event for bossctl dispatch tail.
     dispatch_events

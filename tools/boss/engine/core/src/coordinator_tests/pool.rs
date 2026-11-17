@@ -707,7 +707,9 @@ async fn pool_exhaustion_recovers_automatically_when_slot_frees_without_manual_i
         .find(|claim| claim.execution_id == winner_execution.id)
         .map(|claim| claim.worker_id)
         .expect("winner's execution should hold a claimed worker slot");
-    coordinator.release_worker_and_kick(&claimed_worker_id, None).await;
+    coordinator
+        .release_worker_and_kick(&claimed_worker_id, &winner_execution.id, None)
+        .await;
 
     // No manual intervention: the waiter must pick up the freed slot on
     // its own, driven purely by the release's kick.

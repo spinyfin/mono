@@ -10,6 +10,24 @@ use boss_protocol::{DispatchPool, PauseReason};
 
 const NOTHING_HAPPENS_WINDOW: Duration = Duration::from_millis(150);
 
+#[tokio::test]
+async fn delayed_progression_cleanup_cannot_release_a_replacement_in_slot_41() {
+    let f = fixture();
+    let (coordinator, _, _) = f.coordinator(1, true);
+    let pool = coordinator.progression_worker_pool();
+    let worker = pool.claim_worker("failed-spawn", None).await.unwrap();
+    assert_eq!(slot_id_from_worker_id(&worker), Some(41));
+
+    // Pane teardown frees the first run before the spawn future returns.
+    coordinator.release_worker_and_kick(&worker, "failed-spawn", None).await;
+    assert_eq!(pool.claim_worker("replacement", None).await, Some(worker.clone()));
+
+    // The old spawn's error tail runs after dispatch has reused the slot.
+    coordinator.release_worker_and_kick(&worker, "failed-spawn", None).await;
+    assert_eq!(coordinator.claim_holder(&worker).await.as_deref(), Some("replacement"));
+    assert!(pool.claim_worker("third-run", None).await.is_none());
+}
+
 struct Fixture {
     db: Arc<WorkDb>,
     product: String,

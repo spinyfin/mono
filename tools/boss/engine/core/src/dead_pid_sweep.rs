@@ -757,16 +757,18 @@ async fn reap_dead_execution(
     true
 }
 
-/// Remove a reaped run's live-state entry and release its pool claim only
-/// while that claim still belongs to the reaped execution. Reapers that own
-/// pane teardown may already have done both operations; the execution-id
-/// guard makes the second call harmless if dispatch has re-claimed the slot.
+/// Remove a reaped run's live-state entry and release its pool claim, each
+/// keyed by the reaped run rather than by slot. Reapers that own pane teardown
+/// may already have done both operations, and their awaited release can have
+/// handed the slot to a new run that has since registered live state. Both
+/// halves are therefore no-ops unless the entry or claim still belongs to the
+/// reaped run, so a replacement keeps its live state, driver evidence and claim.
 pub(crate) async fn release_reaped_execution(
     live_states: &LiveWorkerStateRegistry,
     coordinator: &Arc<ExecutionCoordinator>,
     state: &LiveWorkerState,
 ) {
-    live_states.release_slot(state.slot_id);
+    live_states.release_slot_for_run(&state.run_id);
     let worker_id = worker_id_for_slot(state.slot_id);
     coordinator
         .release_pool_claim_if_execution(&worker_id, &state.run_id)
@@ -804,6 +806,7 @@ pub fn probe_pid(pid: i32) -> PidStatus {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use boss_protocol::{WorkItemBinding, WorkerActivity};
 
@@ -896,6 +899,45 @@ mod tests {
     }
 
     // ─── tests ───────────────────────────────────────────────────────────────
+
+    /// A replacement admitted into the slot between the reaper's release and
+    /// the shared cleanup keeps its live-state entry and its pool claim.
+    #[tokio::test]
+    async fn reaped_cleanup_leaves_a_replacement_run_in_the_same_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let coordinator = Arc::new(crate::coordinator::ExecutionCoordinator::new(
+            db,
+            boss_execution_contracts::WorkerPool::new(1),
+            Arc::new(NoopCube),
+            Arc::new(NoopRunner),
+        ));
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot_with_binding(&live_states, 1, "old-run", 1, "item-old");
+        let reaped = live_states.snapshot().pop().unwrap();
+        let worker = coordinator.worker_pool().claim_worker("old-run", None).await.unwrap();
+
+        // The reaper's release already freed the slot and admitted a new run.
+        live_states.release_slot_for_run("old-run");
+        coordinator.release_worker_and_kick(&worker, "old-run", None).await;
+        coordinator
+            .worker_pool()
+            .claim_worker("replacement", None)
+            .await
+            .unwrap();
+        register_slot_with_binding(&live_states, 1, "replacement", 1, "item-new");
+
+        coordinator.scheduling_active().store(true, Ordering::Release);
+        coordinator.scheduling_pending().store(false, Ordering::Release);
+        release_reaped_execution(&live_states, &coordinator, &reaped).await;
+
+        assert_eq!(coordinator.claim_holder(&worker).await.as_deref(), Some("replacement"));
+        assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+        assert!(
+            !coordinator.scheduling_pending().load(Ordering::Acquire),
+            "a no-op ownership miss must not kick dispatch or rescan active work"
+        );
+    }
 
     /// A slot backed by the live test process PID is never reaped, even
     /// when the grace period has passed.

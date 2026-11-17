@@ -2342,17 +2342,16 @@ impl ServerState {
             );
         } else {
             self.execution_coordinator
-                .release_worker_and_kick(&worker_id, None)
+                .release_worker_and_kick(&worker_id, run_id, None)
                 .await;
         }
-        // Always drop the live-state entry — we've already given up
-        // ownership of the slot in the worker registry, so a stale
-        // entry here would lie to the UI about the slot being live.
-        self.live_worker_states.release_slot(slot_id);
+        // Dispatch can reuse the slot during the viewer-detach await or
+        // the pool release above. Only retire this run's live state.
+        self.live_worker_states.release_slot_for_run(run_id);
         // Tear down the per-slot live-status task. The manager
         // doesn't await the task's exit so a wedged Anthropic call
         // can't block the release path.
-        self.live_status_manager.stop_slot(slot_id);
+        self.live_status_manager.stop_slot_for_run(slot_id, run_id);
         // Drop the cached transcript path for this run so the cache
         // doesn't grow without bound across long engine lifetimes.
         // No correctness consequence — the work_runs row is the
