@@ -2618,6 +2618,7 @@ async fn on_stop_staged_url_stamps_contributed_head_before_transient_finalize_fa
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_merge_probe(Arc::new(MergeableInFlightProbe))
     .with_branch_verifier(verifier.clone())
     .with_staged_pr_urls(staged_pr_urls.clone());

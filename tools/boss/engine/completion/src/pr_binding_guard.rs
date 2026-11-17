@@ -29,6 +29,36 @@ pub(super) struct ForeignPrConflict {
 }
 
 impl WorkerCompletionHandler {
+    /// Verify before every binding path, including declarations and late recovery.
+    pub(super) async fn pr_base_allows_binding(&self, work_item_id: &str, pr_url: &str) -> bool {
+        let checker = self.pr_state_checker.clone();
+        let url = pr_url.to_owned();
+        let result = tokio::task::spawn_blocking(move || checker.check(&url)).await;
+        let detail = match result {
+            Ok(Ok(_)) => {
+                if let Err(err) = self
+                    .work_db
+                    .resolve_external_tracker_attention(work_item_id, "pr_base_refused")
+                {
+                    tracing::warn!(?err, "could not clear PR base refusal");
+                }
+                return true;
+            }
+            Ok(Err(err)) => format!("Cannot bind or complete {pr_url}: {err}"),
+            Err(err) => format!("Cannot verify the base of {pr_url}: {err}"),
+        };
+        tracing::warn!(work_item_id, pr_url, %detail, "PR binding refused");
+        if let Err(err) = self.work_db.upsert_work_item_attention(
+            work_item_id,
+            "pr_base_refused",
+            "PR base could not be accepted",
+            &detail,
+        ) {
+            tracing::warn!(?err, "could not surface PR base refusal");
+        }
+        false
+    }
+
     /// Expected branches of every primary implementation execution of
     /// `execution`'s work item, this execution's own first. A PR whose head
     /// identifies any of them ([`head_identifies_any_branch`]) belongs to the

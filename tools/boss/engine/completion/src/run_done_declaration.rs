@@ -428,6 +428,9 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DetectorFailed;
             }
         };
+        if !self.pr_base_allows_binding(&execution.work_item_id, &pr_url).await {
+            return StopOutcome::DetectorFailed;
+        }
         if execution.kind != ExecutionKind::RevisionImplementation
             && let Some(conflict) = self.foreign_pr_binding_conflict(execution, &pr_url)
         {

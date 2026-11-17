@@ -114,6 +114,11 @@ impl WorkerCompletionHandler {
         // teardown still runs per this function's contract, but the failure
         // must be loud rather than silently collapsed into `None`.
         let execution_result = self.work_db.get_execution(execution_id);
+        if let Ok(execution) = execution_result.as_ref()
+            && !self.pr_base_allows_binding(&execution.work_item_id, &pr_url).await
+        {
+            return StopOutcome::DetectorFailed;
+        }
         // Foreign-PR guard: branch verification / the branch-keyed detector
         // established that `pr_url`'s head is this execution's branch; now
         // make sure the engine does not already hold that PR against another

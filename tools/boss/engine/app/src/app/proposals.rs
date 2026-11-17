@@ -591,6 +591,21 @@ pub(super) async fn submit_for_caller(
         }
     }
 
+    if kind == ProposalKind::PrCreated {
+        let payload: boss_protocol::PrCreatedProposalPayload = serde_json::from_str(canonical_json)
+            .map_err(|err| ProposalSubmissionError::new(ProposalErrorCode::Internal, err.to_string()))?;
+        let checker = server_state.pr_state_checker.clone();
+        tokio::task::spawn_blocking(move || checker.check(&payload.pr_url))
+            .await
+            .map_err(|err| ProposalSubmissionError::new(ProposalErrorCode::Internal, err.to_string()))?
+            .map_err(|err| {
+                ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                    "pr_url",
+                    format!("PR binding refused: {err}"),
+                )])
+            })?;
+    }
+
     // Serialise the whole wait submission per execution (replay lookup,
     // budget check, DB acceptance, grant commit) so concurrent declarations
     // cannot both pass the budget check and leave an accepted row with no
