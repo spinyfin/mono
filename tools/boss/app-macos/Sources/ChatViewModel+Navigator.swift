@@ -125,8 +125,25 @@ extension ChatViewModel {
         }
         navigator.retainedTask = root
         if root.prURL != nil { navigator.tabs.insert(.review) }
-        if !detail.actions.isEmpty { navigator.tabs.insert(.attention) }
+        syncNavigatorAttention(for: root)
         if navigator.mode == .navigator { selectionHistory.rememberRoot(root.id, scope: navigatorScopeKey) }
+    }
+
+    /// Attention tab presence and selection follow the resolved entry list,
+    /// never the raw engine actions. An intervention-only or unresolved
+    /// question projection must not leave an empty Attention slot selected.
+    func syncNavigatorAttention(for root: WorkTask? = nil) {
+        let root = root ?? navigatorSelectedTask
+        guard let root else { return }
+        let hasAttention = !WorkNavigatorAttention.entries(model: self, root: root).isEmpty
+        if hasAttention {
+            navigator.tabs.insert(.attention)
+        } else {
+            navigator.tabs.remove(.attention)
+            if navigator.tab == .attention {
+                navigator.tab = .activity
+            }
+        }
     }
 
     func reconcileNavigatorSelection() {
@@ -146,7 +163,7 @@ extension ChatViewModel {
         if let id = navigator.selectedRootID, let selected = task(withID: id) {
             navigator.retainedTask = selected
             if selected.prURL != nil { navigator.tabs.insert(.review) }
-            if selected.navigator?.root?.actions.isEmpty == false { navigator.tabs.insert(.attention) }
+            syncNavigatorAttention(for: selected)
         } else if navigator.selectedRootID == nil,
                   let id = selectionHistory.root(scope: navigatorScopeKey),
                   let task = task(withID: id), navigatorIncludes(task) {

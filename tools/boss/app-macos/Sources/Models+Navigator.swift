@@ -23,6 +23,10 @@ enum NavigatorDetailSlot: String, CaseIterable, Identifiable {
     case activity, review, attention, history
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
+    func title(actionCount: Int) -> String {
+        if self == .attention, actionCount > 0 { return "Attention \(actionCount)" }
+        return title
+    }
 }
 
 /// Unknown enum strings remain decodable. Only section/version compatibility

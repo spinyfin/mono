@@ -48,6 +48,9 @@ extension ChatViewModel {
     func upsertAttentionGroup(_ group: AttentionGroup) {
         var list = attentionGroupsByProductID[group.productID] ?? []
         if let idx = list.firstIndex(where: { $0.id == group.id }) {
+            if list[idx].generation != group.generation {
+                attentionAnswerErrorByGroupID.removeValue(forKey: group.id)
+            }
             list[idx] = group
         } else {
             list.append(group)
@@ -63,6 +66,7 @@ extension ChatViewModel {
             setAttentionMembers(members, forGroup: group.id)
         }
         refreshSelectedProductAttentionCaches()
+        syncNavigatorAttention()
     }
 
     /// Insert or replace one member within its group's row list.
@@ -78,20 +82,127 @@ extension ChatViewModel {
 
     /// Record an answer for a question member (`yes`/`no`, a chosen value, or
     /// free text). The engine replies with `attention_group_updated`.
-    func answerAttention(_ attentionID: String, answer: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: answer, skip: false, dismiss: false)
+    /// `expectedGeneration` binds the click to the group the body was showing;
+    /// a later generation is refused inline instead of resubmitting.
+    @discardableResult
+    func answerAttention(
+        _ attentionID: String,
+        answer: String,
+        expectedGeneration: Int? = nil
+    ) -> Bool {
+        submitAttentionAnswer(
+            attentionID,
+            answer: answer,
+            skip: false,
+            expectedGeneration: expectedGeneration
+        )
     }
 
     /// Accept a followup member (mark it `answered` with no value) so it is
     /// included when the group is actioned.
-    func acceptFollowup(_ attentionID: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: false, dismiss: false)
+    @discardableResult
+    func acceptFollowup(_ attentionID: String, expectedGeneration: Int? = nil) -> Bool {
+        submitAttentionAnswer(
+            attentionID,
+            answer: nil,
+            skip: false,
+            expectedGeneration: expectedGeneration
+        )
     }
 
     /// Mark a member `skipped` — a rejected followup or a question the human
     /// chooses not to answer. Skipped members contribute nothing on action.
-    func skipAttention(_ attentionID: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: true, dismiss: false)
+    @discardableResult
+    func skipAttention(_ attentionID: String, expectedGeneration: Int? = nil) -> Bool {
+        submitAttentionAnswer(
+            attentionID,
+            answer: nil,
+            skip: true,
+            expectedGeneration: expectedGeneration
+        )
+    }
+
+    /// Inline refusal for the group currently shown in Navigator / Notifications.
+    func attentionAnswerError(forGroup groupID: String) -> String? {
+        attentionAnswerErrorByGroupID[groupID]
+    }
+
+    func attentionGroup(id: String) -> AttentionGroup? {
+        attentionGroupsByProductID.values.flatMap { $0 }.first { $0.id == id }
+    }
+
+    func attentionMember(id: String) -> Attention? {
+        attentionMembersByGroupID.values.flatMap { $0 }.first { $0.id == id }
+    }
+
+    /// Operator-question presentation for a family member, independent of
+    /// Kanban column. Navigator Attention uses this so a revision's question
+    /// is answerable on the original row.
+    func navigatorOperatorQuestion(for task: WorkTask) -> OperatorQuestionPresentation? {
+        guard let question = task.operatorQuestion else { return nil }
+        return OperatorQuestionPresentation(
+            questionID: question.id,
+            text: question.text,
+            explanation: question.explanation,
+            askedAt: question.askedAt,
+            answerInFlight: operatorAnswerInFlightByTaskID[task.id] != nil,
+            errorMessage: operatorAnswerError(for: task),
+            runSummary: question.runSummary,
+            prerequisiteTask: question.prerequisiteTask,
+            choices: question.choices,
+            optionLabels: question.optionLabels
+        )
+    }
+
+    private func submitAttentionAnswer(
+        _ attentionID: String,
+        answer: String?,
+        skip: Bool,
+        expectedGeneration: Int?
+    ) -> Bool {
+        guard let member = attentionMember(id: attentionID) else { return false }
+        if let group = attentionGroup(id: member.groupID) {
+            attentionAnswerErrorByGroupID.removeValue(forKey: group.id)
+            if let expectedGeneration, group.generation != expectedGeneration {
+                attentionAnswerErrorByGroupID[group.id] =
+                    "This question was replaced. Review the current question."
+                return false
+            }
+        }
+        if !skip, let answer, member.isAnswered, member.answer == answer {
+            return false
+        }
+        let requestID = engine.sendAnswerAttention(
+            id: attentionID, answer: answer, skip: skip, dismiss: false
+        )
+        if let requestID { attentionRequestGroupByRequestID[requestID] = member.groupID }
+        return true
+    }
+
+    /// An engine refusal (`work_error`) carrying the request id of an
+    /// answer/action on a group — for example another client already
+    /// actioned it. Painted inline beside that group while it is still
+    /// open; otherwise on the work-error banner, because a terminal
+    /// snapshot can drop the group body before this refusal arrives.
+    /// Returns whether the error belonged to an attention request.
+    func settleAttentionWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId,
+              let groupID = attentionRequestGroupByRequestID.removeValue(forKey: requestId)
+        else { return false }
+        if attentionGroup(id: groupID)?.isOpen == true {
+            attentionAnswerErrorByGroupID[groupID] = message
+        } else {
+            workErrorMessage = message
+        }
+        return true
+    }
+
+    /// Drop the mapping for one request when *that* request's reply arrives.
+    /// A snapshot or broadcast for the same group must not clear other
+    /// in-flight request ids (Submit sends an answer then an action).
+    func settleAttentionRequest(_ requestId: String?) {
+        guard let requestId else { return }
+        attentionRequestGroupByRequestID.removeValue(forKey: requestId)
     }
 
     /// Dismiss a single member (`atn_…`) without producing anything.
@@ -122,8 +233,19 @@ extension ChatViewModel {
     /// Action a group — produce its downstream artifact (one revision /
     /// design task, or a batch task-create) and close it. Open members are
     /// skipped first ("skip remaining") so the human needn't touch every row.
-    func actionAttentionGroup(_ groupID: String) {
-        engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true)
+    @discardableResult
+    func actionAttentionGroup(_ groupID: String, expectedGeneration: Int? = nil) -> Bool {
+        guard let group = attentionGroup(id: groupID) else { return false }
+        attentionAnswerErrorByGroupID.removeValue(forKey: groupID)
+        if let expectedGeneration, group.generation != expectedGeneration {
+            attentionAnswerErrorByGroupID[groupID] =
+                "This question was replaced. Review the current question."
+            return false
+        }
+        if let requestID = engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true) {
+            attentionRequestGroupByRequestID[requestID] = groupID
+        }
+        return true
     }
 
     /// Jump a group's association into view: a task association reveals its

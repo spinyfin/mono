@@ -144,7 +144,12 @@ final class NavigatorSelectionTests: XCTestCase {
     }
 
     func testModeSwitchResolvesRevisionAndRetainsDetailAndScopeState() {
-        let model = NavigatorTestFixture.model([NavigatorTestFixture.task(), NavigatorTestFixture.task("revision", rootID: "root")])
+        var revision = NavigatorTestFixture.task("revision", rootID: "root")
+        revision.operatorQuestion = OperatorQuestion(
+            id: "question", text: "Approve the bypass?", answerType: .yesNo,
+            explanation: "Need a decision.", askedAt: "1790000000", executionID: "exec-question"
+        )
+        let model = NavigatorTestFixture.model([NavigatorTestFixture.task(), revision])
         model.selectWorkCard("revision")
         model.setWorkViewMode(.navigator)
         XCTAssertEqual(model.selectedWorkCardID, "root", "Shared toolbar actions must target the selected root")

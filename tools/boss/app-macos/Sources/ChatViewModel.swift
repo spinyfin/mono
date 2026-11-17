@@ -195,6 +195,14 @@ final class ChatViewModel: ObservableObject {
     /// fetched on demand for the merge-provenance affordance (score badge
     /// detail). Absent key means "not yet fetched", not "no merges".
     @Published var attentionMergesByAttentionID: [String: [AttentionMerge]] = [:]
+    /// Inline refusal for a group whose generation no longer matches the
+    /// body that submitted, keyed by group id. Cleared by the next attempt
+    /// or when the group snapshot is replaced.
+    @Published var attentionAnswerErrorByGroupID: [String: String] = [:]
+    /// In-flight `answer_attention` / `action_attention_group` request ids
+    /// mapped to the group they were for, so an engine refusal lands inline
+    /// beside that group instead of the generic work error banner.
+    var attentionRequestGroupByRequestID: [String: String] = [:]
     /// Planner audit rows (`planner_runs`) keyed by project id, newest
     /// first — as returned by `list_planner_runs`. Fetched on demand by the
     /// popover and the inspector only; the kanban affordance itself renders

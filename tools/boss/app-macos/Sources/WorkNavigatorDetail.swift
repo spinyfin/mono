@@ -47,20 +47,24 @@ struct WorkNavigatorDetail: View {
                         }
                     }
                 }
-                if root.navigator?.root?.actions.isEmpty == false {
-                    Button("Attention needed (\(root.navigator?.root?.actions.count ?? 0))") {
+                // Count what the Attention slot can actually render, not raw engine actions.
+                let actionCount = WorkNavigatorAttention.entries(model: model, root: root).count
+                let visibleTabs = Self.visibleTabs(model: model, root: root, actionCount: actionCount)
+                if actionCount > 0, model.navigator.tab != .attention {
+                    Button("Attention needed (\(actionCount))") {
                         model.navigator.tab = .attention
                     }
+                    .accessibilityIdentifier("navigator-attention-banner")
                 }
                 Picker("Detail", selection: $model.navigator.tab) {
-                    ForEach(NavigatorDetailSlot.allCases.filter { model.navigator.tabs.contains($0) }) { slot in
-                        Text(slot.title).tag(slot)
+                    ForEach(visibleTabs) { slot in
+                        Text(slot.title(actionCount: actionCount)).tag(slot)
                     }
                 }
                 .pickerStyle(.segmented)
                 // Keep every registered body mounted while switching tabs.
                 ZStack(alignment: .topLeading) {
-                    ForEach(NavigatorDetailSlot.allCases.filter { model.navigator.tabs.contains($0) }) { slot in
+                    ForEach(visibleTabs) { slot in
                         slotBody(slot, root: root)
                             .opacity(model.navigator.tab == slot ? 1 : 0)
                             .allowsHitTesting(model.navigator.tab == slot)
@@ -74,6 +78,22 @@ struct WorkNavigatorDetail: View {
         } else {
             ContentUnavailableView("Select a task", systemImage: "sidebar.left",
                                    description: Text("See its brief, activity and review here."))
+        }
+    }
+
+    /// Attention is present only while resolved entries exist. Other slots
+    /// still follow the registered tab set (activity, history, review).
+    static func visibleTabs(
+        model: ChatViewModel,
+        root: WorkTask,
+        actionCount: Int? = nil
+    ) -> [NavigatorDetailSlot] {
+        let actionCount = actionCount ?? WorkNavigatorAttention.entries(model: model, root: root).count
+        return NavigatorDetailSlot.allCases.filter { slot in
+            switch slot {
+            case .attention: return actionCount > 0
+            default: return model.navigator.tabs.contains(slot)
+            }
         }
     }
 

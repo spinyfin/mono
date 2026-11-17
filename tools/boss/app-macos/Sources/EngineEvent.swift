@@ -384,10 +384,14 @@ enum EngineEvent {
     /// Pushed (and returned) whenever a group's state or a member's
     /// answer-state changes — e.g. after `answer_attention` /
     /// `dismiss_attention`. Carries the group's refreshed members.
-    case attentionGroupUpdated(group: AttentionGroup, members: [Attention])
+    /// `requestId` is the envelope id of *this* client's matching reply;
+    /// a broadcast from another session leaves it `nil`.
+    case attentionGroupUpdated(group: AttentionGroup, members: [Attention], requestId: String? = nil)
     /// Pushed after `action_attention_group` succeeds: the now-`actioned`
     /// group, its terminal members, and the produced-artifact ref.
-    case attentionGroupActioned(group: AttentionGroup, members: [Attention])
+    /// `requestId` is the envelope id of *this* client's matching reply;
+    /// a broadcast from another session leaves it `nil`.
+    case attentionGroupActioned(group: AttentionGroup, members: [Attention], requestId: String? = nil)
     /// Reply to `list_attention_merges` — the `attention_merges` provenance
     /// rows folded into one canonical `Attention`, chronological.
     case attentionMergesList(attentionID: String, merges: [AttentionMerge])
