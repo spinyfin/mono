@@ -52,7 +52,7 @@ pub(crate) use reviewer_publish_guard::codex_reviewer_publish_guard_script;
 pub(crate) use tool_surface_guard::codex_tool_surface_guard_script;
 
 use crate::transcript_store::{
-    durable_sessions_dir, provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir,
+    durable_sessions_dir, durable_transcript_containment_root, provision_durable_sessions, transcript_store_root,
 };
 use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
@@ -2315,31 +2315,8 @@ impl AgentDriver for CodexDriver {
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let (homes_root, codex_home) = codex_homes_root_and_home_for_run(run_id)?;
         let sessions_path = codex_home.join("sessions");
-        match fs::symlink_metadata(&sessions_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let store_root = transcript_store_root()?;
-                return Ok(Some(verified_durable_sessions_dir(
-                    &codex_home,
-                    &store_root,
-                    "codex",
-                    run_id,
-                )?));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let store_root = transcript_store_root()?;
-                let durable = durable_sessions_dir(&store_root, "codex", run_id)?;
-                if let Ok(canonical) = fs::canonicalize(&durable)
-                    && canonical.is_dir()
-                {
-                    return Ok(Some(canonical));
-                }
-            }
-            Err(err) => tracing::debug!(
-                ?err,
-                path = %sessions_path.display(),
-                "stat of temporary sessions path failed; falling back to legacy containment"
-            ),
-            _ => {}
+        if let Some(root) = durable_transcript_containment_root(&sessions_path, "codex", run_id)? {
+            return Ok(Some(root));
         }
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
             anyhow!(

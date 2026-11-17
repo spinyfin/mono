@@ -16,7 +16,10 @@ use anyhow::{Context, bail};
 // Default leaf names of the per-run homes roots, reused directly so a rename
 // of either original cannot silently desync this rewrite from where the homes
 // actually live.
-use crate::agy::AGY_HOMES_DIR_NAME as AGY_HOMES_DIR_MARKER;
+use crate::agy::{
+    AGY_HOMES_DIR_NAME as AGY_HOMES_DIR_MARKER, GEMINI_DIR as AGY_GEMINI_DIR,
+    PROCESS_HOME_LEAF as AGY_PROCESS_HOME_LEAF, STATE_DIR as AGY_STATE_DIR,
+};
 use crate::codex::CODEX_HOMES_DIR_NAME as CODEX_HOMES_DIR_MARKER;
 use crate::grok::GROK_HOMES_DIR_NAME as GROK_HOMES_DIR_MARKER;
 
@@ -29,9 +32,6 @@ pub const WORKER_TRANSCRIPTS_ROOT_ENV: &str = "BOSS_WORKER_TRANSCRIPTS_ROOT";
 /// lives beneath it, so one link covers conversations whose ids are not known
 /// until the CLI has started.
 pub const AGY_BRAIN_LEAF: &str = "brain";
-const AGY_STATE_DIR: &str = "antigravity-cli";
-const AGY_GEMINI_DIR: &str = ".gemini";
-const AGY_PROCESS_HOME_LEAF: &str = "process-home";
 /// The driver slug `agy` files its transcripts under.
 pub const AGY_TRANSCRIPT_DRIVER: &str = "agy";
 
@@ -122,6 +122,29 @@ pub fn durable_sessions_dir(store_root: &Path, driver: &str, run_id: &str) -> an
         .join("transcripts")
         .join(driver)
         .join("sessions"))
+}
+
+/// Resolve a verified durable link, including after its home is reclaimed.
+/// Legacy directories and stat failures leave containment to the caller.
+pub(crate) fn durable_transcript_containment_root(
+    link: &Path,
+    driver: &str,
+    run_id: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    match fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            verified_durable_link(link, &transcript_store_root()?, driver, run_id).map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let durable = durable_sessions_dir(&transcript_store_root()?, driver, run_id)?;
+            Ok(fs::canonicalize(durable).ok().filter(|canonical| canonical.is_dir()))
+        }
+        Err(error) => {
+            tracing::debug!(?error, path = %link.display(), "stat of transcript link failed; falling back to legacy containment");
+            Ok(None)
+        }
+        Ok(_) => Ok(None),
+    }
 }
 
 /// Rewrite a driver-stamped transcript path onto Boss's durable store.

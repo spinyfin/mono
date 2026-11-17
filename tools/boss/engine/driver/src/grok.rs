@@ -31,9 +31,7 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
-use crate::transcript_store::{
-    durable_sessions_dir, persistable_transcript_path, transcript_store_root, verified_durable_sessions_dir,
-};
+use crate::transcript_store::{durable_transcript_containment_root, persistable_transcript_path};
 
 /// Namespace this driver's durable transcripts are filed under in Boss's
 /// worker transcript store. Every caller that resolves, provisions, or grants
@@ -687,33 +685,7 @@ impl AgentDriver for GrokDriver {
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let grok_home = grok_home_for_run(run_id)?;
         let sessions_path = grok_home.join("sessions");
-        match fs::symlink_metadata(&sessions_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let store_root = transcript_store_root()?;
-                return Ok(Some(verified_durable_sessions_dir(
-                    &grok_home,
-                    &store_root,
-                    TRANSCRIPT_DRIVER_SLUG,
-                    run_id,
-                )?));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let store_root = transcript_store_root()?;
-                let durable = durable_sessions_dir(&store_root, TRANSCRIPT_DRIVER_SLUG, run_id)?;
-                if let Ok(canonical) = fs::canonicalize(&durable)
-                    && canonical.is_dir()
-                {
-                    return Ok(Some(canonical));
-                }
-            }
-            Err(err) => tracing::debug!(
-                ?err,
-                path = %sessions_path.display(),
-                "stat of temporary sessions path failed; falling back to legacy containment"
-            ),
-            _ => {}
-        }
-        Ok(None)
+        durable_transcript_containment_root(&sessions_path, TRANSCRIPT_DRIVER_SLUG, run_id)
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {

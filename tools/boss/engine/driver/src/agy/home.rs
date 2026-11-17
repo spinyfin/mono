@@ -18,8 +18,8 @@ use super::environment::{AgyProcessEnvironment, resolve_agy_binary, skip_binary_
 #[cfg(test)]
 use crate::scoped_home::LOGIN_KEYCHAIN_LEAF;
 use crate::transcript_store::{
-    AGY_BRAIN_LEAF, AGY_TRANSCRIPT_DRIVER, durable_sessions_dir, provision_durable_link_in, transcript_store_root,
-    verified_durable_link,
+    AGY_BRAIN_LEAF, AGY_TRANSCRIPT_DRIVER, durable_transcript_containment_root, provision_durable_link_in,
+    transcript_store_root, verified_durable_link,
 };
 
 /// Process-global lock for tests that mutate [`AGY_HOMES_ROOT_ENV`]. Shared
@@ -36,7 +36,9 @@ pub const AGY_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_AGY_SKIP_POSTURE_ASSERT";
 /// Default leaf under the system temp when [`AGY_HOMES_ROOT_ENV`] is unset.
 pub(crate) const AGY_HOMES_DIR_NAME: &str = "boss-agy-homes";
 
-const PROCESS_HOME_LEAF: &str = "process-home";
+pub(crate) const GEMINI_DIR: &str = ".gemini";
+pub(crate) const STATE_DIR: &str = "antigravity-cli";
+pub(crate) const PROCESS_HOME_LEAF: &str = "process-home";
 /// Transcript paths relative to the container, for homes provisioned **before**
 /// the durable store existed. Their transcripts exist only here, so teardown
 /// and retention keep them. A home whose `brain` is the durable link (every
@@ -73,7 +75,7 @@ pub fn contains_agy_transcripts(container: &Path) -> bool {
 
 /// `<process-home>/.gemini/antigravity-cli`.
 fn agy_state_dir(process_home: &Path) -> PathBuf {
-    process_home.join(".gemini").join("antigravity-cli")
+    process_home.join(GEMINI_DIR).join(STATE_DIR)
 }
 
 /// The path of the durable-transcript link: `<process-home>/.gemini/antigravity-cli/brain`.
@@ -137,24 +139,11 @@ fn verify_durable_brain(process_home: &Path) -> anyhow::Result<PathBuf> {
 /// transcript rather than read through it.
 pub(super) fn transcript_containment_root(run_id: &str) -> anyhow::Result<Option<PathBuf>> {
     let process_home = process_home_for_run(run_id)?;
-    let brain = brain_link(&process_home);
-    match fs::symlink_metadata(&brain) {
-        Ok(meta) if meta.file_type().is_symlink() => verify_durable_brain(&process_home).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let store_root = transcript_store_root()?;
-            let durable = durable_sessions_dir(&store_root, AGY_TRANSCRIPT_DRIVER, &durable_run_id(&process_home)?)?;
-            Ok(fs::canonicalize(durable).ok().filter(|canonical| canonical.is_dir()))
-        }
-        Err(error) => {
-            tracing::debug!(
-                ?error,
-                path = %brain.display(),
-                "stat of the agy brain path failed; falling back to legacy containment"
-            );
-            Ok(None)
-        }
-        Ok(_) => Ok(None),
-    }
+    durable_transcript_containment_root(
+        &brain_link(&process_home),
+        AGY_TRANSCRIPT_DRIVER,
+        &durable_run_id(&process_home)?,
+    )
 }
 /// Global-root hook directory, relative to the per-run `HOME`.
 const HOOKS_DIR_RELATIVE: &str = ".gemini/config";

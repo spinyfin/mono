@@ -197,3 +197,9 @@ rust_binary(
     visibility = ["//visibility:private"],
     deps = [":driver"] + all_crate_deps(normal = True),
 )
+
+filegroup(
+    name = "agy_blocked_marker_capture",
+    srcs = ["src/agy/testdata/blocked_marker_1.5.9.jsonl"],
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)

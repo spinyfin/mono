@@ -286,7 +286,7 @@ fn step_rows_sourced_from_the_user_or_system_never_consume_a_call() {
 #[test]
 fn an_unknown_native_step_type_answering_a_call_is_its_result() {
     // Only `run_command` has been captured; other tools may answer with their
-    // own step type. A model-sourced row right after a call is that call's
+    // own step type. A terminal model-sourced row with content is that call's
     // result either way.
     let mut session = AgyTranscriptSession::default();
     session.normalize(json!({
@@ -342,4 +342,33 @@ fn stateless_normalizer_sees_only_the_call_half_of_a_pair() {
     assert_eq!(call["content"][0]["type"], "tool_use");
     let alone = normalize_transcript_entry(json!({"type": "GENERIC", "status": "DONE", "content": "ok"}));
     assert_eq!(alone["subtype"], "generic_step");
+}
+
+#[test]
+fn unknown_bookkeeping_rows_preserve_pending_calls() {
+    for source in [Some("MODEL"), None] {
+        for extra in [
+            json!({"status": "DONE"}),
+            json!({"status": "RUNNING", "content": "working"}),
+        ] {
+            let mut session = AgyTranscriptSession::default();
+            session.normalize(json!({
+                "type": "PLANNER_RESPONSE", "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": "echo first"}},
+                    {"name": "read_file", "args": {"AbsolutePath": "/ws/a.txt"}},
+                ],
+            }));
+            let mut boundary = extra;
+            boundary["type"] = json!("TASK_BOUNDARY");
+            if let Some(source) = source {
+                boundary["source"] = json!(source);
+            }
+            assert_eq!(session.normalize(boundary.clone()), boundary);
+            let result = session.normalize(json!({"type": "GENERIC", "status": "DONE", "content": "first"}));
+            assert_eq!(result["type"], "tool_result");
+            assert_eq!(result["tool_input"]["command"], "echo first");
+            let next = session.normalize(json!({"type": "GENERIC", "status": "DONE", "content": "second"}));
+            assert_eq!(next["tool_name"], "Read");
+        }
+    }
 }

@@ -54,7 +54,7 @@ use transcript::AgyTranscriptSession;
 pub mod rules_probe;
 
 use environment::{AgyProcessEnvironment, peek_agy_binary, skip_binary_assert, verify_cached_agy_binary};
-pub(crate) use home::AGY_HOMES_DIR_NAME;
+pub(crate) use home::{AGY_HOMES_DIR_NAME, GEMINI_DIR, PROCESS_HOME_LEAF, STATE_DIR};
 pub use home::{
     AGY_HOMES_ENV_TEST_LOCK, AGY_HOMES_ROOT_ENV, AGY_TRANSCRIPT_PATHS, AgyRuntimeState, assert_agy_home_safe_to_delete,
     contains_agy_transcripts,

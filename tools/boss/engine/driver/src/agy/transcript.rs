@@ -113,7 +113,11 @@ impl AgyTranscriptSession {
                 tracing::debug!("agy transcript: GENERIC step with no pending tool call");
                 system(row, "generic_step", text_of(row, "content"))
             }),
-            other if is_native_step_type(other) => match self.tool_step(row) {
+            other if is_native_step_type(other) => match (matches!(status_of(row), "DONE" | "ERROR")
+                && (!text_of(row, "content").trim().is_empty() || !text_of(row, "error").trim().is_empty()))
+            .then(|| self.tool_step(row))
+            .flatten()
+            {
                 Some(entry) => entry,
                 None => {
                     tracing::debug!(step_type = other, "agy transcript: ignoring additive native step type");
