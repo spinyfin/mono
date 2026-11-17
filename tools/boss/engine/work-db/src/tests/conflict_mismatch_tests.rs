@@ -688,3 +688,39 @@ fn an_answer_that_does_not_belong_to_the_question_is_refused() {
     assert!(format!("{err:#}").contains("not one of the offered choices"), "{err:#}");
     assert_eq!(open_questions(&f).len(), 1, "the question stays open");
 }
+
+#[test]
+fn dismissing_a_mismatch_question_leaves_the_revision_as_the_live_fix_vehicle() {
+    let f = fixture();
+    raise_question(&f);
+    f.db.dismiss_operator_question_from(&f.revision_id, None, Some("not now"), "human", None)
+        .unwrap();
+
+    assert_eq!(
+        blocked_fields(&f.db, &f.revision_id).0.as_deref(),
+        Some("question_dismissed")
+    );
+    assert!(
+        open_questions(&f).is_empty(),
+        "dismissal closes the question without answering it"
+    );
+    let executions = executions_for(&f.db, &f.revision_id);
+    assert!(
+        executions.iter().all(|(_, status)| {
+            matches!(
+                status.as_str(),
+                "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
+            )
+        }),
+        "every execution is terminal after the worker parked: {executions:?}"
+    );
+
+    // The dismissed mismatch hold is the same live-vehicle signal the open
+    // question was: the poller must not supersede the attempt.
+    assert!(f.db.is_conflict_revision_running_or_queued(&f.revision_id).unwrap());
+    assert!(f.db.has_live_conflict_revision_for_pr(PR_URL).unwrap());
+    let attempt = f.db.get_conflict_resolution(&f.crz_id).unwrap().unwrap();
+    assert_eq!(attempt.status, "pending");
+    assert_eq!(attempt.failure_reason, None);
+    assert_eq!(attempt.revision_task_id.as_deref(), Some(f.revision_id.as_str()));
+}

@@ -632,6 +632,21 @@ fn redispatch_is_refused_for_live_work_questions_refusals_unknown_provenance_and
 }
 
 #[test]
+fn redispatch_is_refused_when_the_question_was_dismissed() {
+    let fx = fx();
+    let item = fx.chore("Dismissed question");
+    fx.sql(&format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'question_dismissed' WHERE id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+    let message = fx.refused(&run, ProposalKind::Redispatch, json!({}));
+    assert!(
+        message.contains("question was dismissed") && !message.contains("owner refused"),
+        "{message}"
+    );
+}
+
+#[test]
 fn redispatch_is_bounded_across_fingerprints_until_a_work_run_completes() {
     let fx = fx();
     let item = fx.chore("Keeps failing");

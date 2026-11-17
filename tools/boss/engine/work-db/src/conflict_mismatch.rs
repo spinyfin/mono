@@ -216,12 +216,31 @@ impl WorkDb {
     }
 }
 
-/// Whether a conflict revision is parked on an open architectural-mismatch
-/// question. Such a revision is still the live fix vehicle for its attempt.
+/// Whether a conflict revision is still the live fix vehicle because of an
+/// architectural-mismatch question. That is true while the question is open,
+/// and after the owner dismisses it without answering: dismissal applies none
+/// of the answer's effects, so the parked revision stays the attempt's only
+/// fix vehicle until the owner explicitly starts it. A withdrawn mismatch
+/// question without `dismissal_json` (a later blocked-reason change, archive,
+/// or delete) is not this hold.
 pub(super) fn conflict_revision_awaits_mismatch_answer(conn: &Connection, revision_task_id: &str) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM operator_questions
-         WHERE work_item_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL)",
+        "SELECT EXISTS(
+            SELECT 1 FROM operator_questions
+            WHERE work_item_id = ?1 AND status = 'open' AND conflict_resolution_id IS NOT NULL
+         ) OR EXISTS(
+            SELECT 1 FROM tasks
+            WHERE id = ?1
+              AND status = 'blocked'
+              AND blocked_reason = 'question_dismissed'
+              AND (
+                SELECT conflict_resolution_id IS NOT NULL AND dismissal_json IS NOT NULL
+                FROM operator_questions
+                WHERE work_item_id = ?1
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+              )
+         )",
         [revision_task_id],
         |row| row.get(0),
     )?)

@@ -353,18 +353,14 @@ pub(super) fn redispatch(
     ctx.scope(conn, &item.id)?;
     ctx.refuse_live_work(conn, verb)?;
 
-    // Holds that are the owner's: an open question, and a recorded refusal.
+    // Holds that are the owner's: an open question, a dismissed question, and a recorded refusal.
     let question_open: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM operator_questions WHERE work_item_id = ?1 AND status = 'open')",
         [&item.id],
         |row| row.get(0),
     )?;
     if item.blocked_reason.as_deref() == Some("question_dismissed") {
-        return Err(ProgressionVerbRefusal::OperatorRefusal {
-            verb: verb.to_string(),
-            item: item.id.clone(),
-        }
-        .into());
+        return Err(ProgressionVerbRefusal::QuestionDismissed { item: item.id.clone() }.into());
     }
     if question_open || item.blocked_reason.as_deref() == Some("awaiting_operator_answer") {
         return Err(ProgressionVerbRefusal::AwaitingOperatorAnswer { item: item.id.clone() }.into());
