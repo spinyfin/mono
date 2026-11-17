@@ -45,7 +45,8 @@ struct WorkNavigatorReview: View {
         }
         .environmentObject(model)
         .environment(\.commentBackend, model.commentBridge)
-        .environment(\.commentsReadOnly, context.isReadOnly)
+        .environment(\.commentsReadOnly, context.isCommentsReadOnly)
+        .environment(\.commentsActive, isActive)
         .environment(\.openOriginalGuide, { versionID in
             model.loadNavigatorReviewGuide(for: root, versionID: versionID)
         })

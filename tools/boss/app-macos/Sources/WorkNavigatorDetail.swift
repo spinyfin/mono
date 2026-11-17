@@ -7,6 +7,13 @@ struct NavigatorDetailContext {
     let root: WorkTask
     let ask: WorkTask?
     let isReadOnly: Bool
+
+    /// Inline guide comments are read-only only for durable conditions. A
+    /// connection blip must not close an in-progress composer; offline comments
+    /// ride the engine's outbound retry ledger, as in the standalone reader.
+    @MainActor var isCommentsReadOnly: Bool {
+        root.deletedAt != nil || root.status == "archived" || model.task(withID: root.id) == nil
+    }
 }
 
 struct NavigatorDetailRegistry {

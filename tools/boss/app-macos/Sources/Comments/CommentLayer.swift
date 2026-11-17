@@ -141,6 +141,35 @@ final class CommentLayer: NSObject, ObservableObject {
     /// because its monitor reacted to an event meant for a different window.
     private weak var hostWindow: NSWindow?
 
+    /// Zero-size view laid under the whole commented viewer (document, sidebar and
+    /// rail). Its frame is the layer's own screen region: key and right-click
+    /// handling only consider selections and clicks that fall inside it, so a viewer
+    /// hosted in a window shared with other inputs does not hijack their events.
+    /// `nil` (unbound / unit tests) leaves the region check open.
+    private(set) weak var scopeView: NSView?
+
+    /// False while the hosting slot is mounted but not shown; events are ignored.
+    var isActive = true
+
+    func setScopeView(_ view: NSView?) { scopeView = view }
+
+    /// Whether a point in window coordinates lies inside this layer's own region.
+    func regionContains(windowPoint: NSPoint) -> Bool {
+        guard isActive else { return false }
+        guard let scopeView else { return true }
+        guard scopeView.window != nil, !scopeView.isHiddenOrHasHiddenAncestor else { return false }
+        return scopeView.convert(scopeView.bounds, to: nil).contains(windowPoint)
+    }
+
+    /// Whether the window's first responder sits inside this layer's own region.
+    private func firstResponderIsInRegion(_ window: NSWindow?) -> Bool {
+        guard isActive else { return false }
+        guard scopeView != nil else { return true }
+        guard let view = window?.firstResponder as? NSView else { return false }
+        let rect = view.convert(view.bounds, to: nil)
+        return regionContains(windowPoint: NSPoint(x: rect.midX, y: rect.midY))
+    }
+
     /// Binds this layer to the NSWindow hosting its markdown viewer. Called by
     /// `CommentLayerWindowBinder` on mount and on every SwiftUI layout pass.
     /// Until this is set (or if it later becomes nil, e.g. window teardown),
@@ -1141,6 +1170,7 @@ final class CommentLayer: NSObject, ObservableObject {
             let char = str.first,
             Self.isTypeToCommentOpener(char)
         else { return false }
+        guard firstResponderIsInRegion(window) else { return false }
         guard hasCurrentSelection() else { return false }
         requestNewComment(firstChar: char)
         return true
@@ -1213,8 +1243,9 @@ final class CommentLayer: NSObject, ObservableObject {
     /// `isFlipped` is true, while `event.locationInWindow` is in the window's bottom-left
     /// space — passing the window point directly inverts Y and pops the menu at
     /// `viewHeight - clickY`. Route through `windowPointToView` to apply the flip.
-    private func handleRightClick(locationInWindow: NSPoint, window: NSWindow?) -> Bool {
+    func handleRightClick(locationInWindow: NSPoint, window: NSWindow?) -> Bool {
         guard let window, window === hostWindow else { return false }
+        guard !isReadOnly, regionContains(windowPoint: locationInWindow) else { return false }
         guard !isShowingPopover, hasCurrentSelection() else { return false }
         guard let view = window.contentView else { return false }
 
@@ -1333,12 +1364,14 @@ private struct CommentLayerWindowBinder: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async { [weak layer] in
+            layer?.setScopeView(view)
             layer?.setHostWindow(view.window)
         }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        layer.setScopeView(nsView)
         layer.setHostWindow(nsView.window)
     }
 }
@@ -1365,6 +1398,7 @@ struct WithCommentsModifier: ViewModifier {
 
     @Environment(\.commentBackend) private var commentBackend
     @Environment(\.commentsReadOnly) private var commentsReadOnly
+    @Environment(\.commentsActive) private var commentsActive
     @Environment(\.openOriginalGuide) private var openOriginalGuide
     @StateObject private var layer = CommentLayer()
     /// Whether the full comment sidebar is shown. Collapsed by default: an
@@ -1393,7 +1427,6 @@ struct WithCommentsModifier: ViewModifier {
             Divider()
             if sidebarExpanded {
                 CommentSidebar(layer: layer, onCollapse: { sidebarExpanded = false })
-                    .disabled(commentsReadOnly)
                     .frame(width: 280)
             } else {
                 CollapsedCommentRail(
@@ -1402,7 +1435,6 @@ struct WithCommentsModifier: ViewModifier {
                     onExpand: { sidebarExpanded = true },
                     onAddComment: { layer.requestNewComment() }
                 )
-                .disabled(commentsReadOnly)
             }
         }
         // Auto-expand the first time the doc has comments to show — a just-added
@@ -1423,13 +1455,14 @@ struct WithCommentsModifier: ViewModifier {
         }
         // Binds `layer.hostWindow` so its NSEvent monitors can scope themselves to
         // this viewer's own window instead of reacting to any window in the app.
-        .background(CommentLayerWindowBinder(layer: layer).frame(width: 0, height: 0))
+        .background(CommentLayerWindowBinder(layer: layer))
         .environment(\.suppressTypeToComment, Binding(
             get: { layer.suppressTypeToComment },
             set: { layer.suppressTypeToComment = $0 }
         ))
         .onAppear {
             layer.isReadOnly = commentsReadOnly
+            layer.isActive = commentsActive
             layer.openOriginalGuide = openOriginalGuide
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
             if layer.draftStore.hasPendingResume(for: layer.guideVersionId) {
@@ -1442,6 +1475,9 @@ struct WithCommentsModifier: ViewModifier {
         }
         .onChange(of: commentsReadOnly) { _, value in
             layer.isReadOnly = value
+        }
+        .onChange(of: commentsActive) { _, value in
+            layer.isActive = value
         }
         .onChange(of: source) { _, newSource in
             layer.updateSource(newSource, baseURL: baseURL)
@@ -1568,7 +1604,17 @@ private struct CommentsReadOnlyKey: EnvironmentKey {
     static let defaultValue = false
 }
 
+private struct CommentsActiveKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
 extension EnvironmentValues {
+    /// False while a comment-enabled viewer is mounted but not the visible slot.
+    var commentsActive: Bool {
+        get { self[CommentsActiveKey.self] }
+        set { self[CommentsActiveKey.self] = newValue }
+    }
+
     var commentsReadOnly: Bool {
         get { self[CommentsReadOnlyKey.self] }
         set { self[CommentsReadOnlyKey.self] = newValue }
