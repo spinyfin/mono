@@ -120,7 +120,7 @@ fn unique_pr_from_create_text(
         if own.as_ref().is_some_and(|own| same_pr(&url, own)) {
             continue;
         }
-        match lookup_pr_owner(conn, asking, &url)? {
+        match lookup_pr_owner(conn, asking, &url, false)? {
             Ok(Some(owner))
                 if owner.product_id == asking.product_id
                     && !matches!(owner.status, TaskStatus::Done | TaskStatus::Archived) =>
@@ -253,7 +253,7 @@ fn resolve_existing(
         None => None,
     };
     let by_pr = match existing_pr {
-        Some(raw) => match resolve_named_pr(conn, asking, raw)? {
+        Some(raw) => match resolve_named_pr(conn, asking, raw, required)? {
             Ok(Some(task)) => Some(task),
             Ok(None) if required => {
                 return Ok(Err(ExistingError::missing(format!(
@@ -332,18 +332,23 @@ fn resolve_named_task(conn: &Connection, selector: &str) -> Result<Option<Task>>
     Ok(Some(task))
 }
 
-fn resolve_named_pr(conn: &Connection, asking: &Task, raw: &str) -> Result<Result<Option<Task>, ExistingError>> {
+fn resolve_named_pr(
+    conn: &Connection,
+    asking: &Task,
+    raw: &str,
+    required: bool,
+) -> Result<Result<Option<Task>, ExistingError>> {
     let trimmed = raw.trim();
     if let Some(url) = canonical_pr_url(trimmed)
         .or_else(|| parse_slug_pr(trimmed).and_then(|(slug, number)| canonical_slug_pr(&slug, number)))
     {
-        return match lookup_pr_owner(conn, asking, &url)? {
+        return match lookup_pr_owner(conn, asking, &url, required)? {
             Ok(found) => Ok(Ok(found)),
             Err(reason) => Ok(Err(ExistingError::invalid(reason))),
         };
     }
     if let Some(number) = parse_pr_number_only(trimmed) {
-        return match lookup_pr_number(conn, asking, number)? {
+        return match lookup_pr_number(conn, asking, number, required)? {
             Ok(found) => Ok(Ok(found)),
             Err(reason) => Ok(Err(ExistingError::invalid(reason))),
         };
@@ -387,23 +392,31 @@ pub(crate) fn in_askers_revision_chain(conn: &Connection, asking: &Task, existin
     Ok(chain_identity(conn, asking)? == chain_identity(conn, existing)?)
 }
 
-fn prefer_asking_product(asking: &Task, rows: Vec<(String, String, String)>) -> Vec<(String, String)> {
+fn prefer_asking_product(asking: &Task, rows: Vec<(String, String, String)>, required: bool) -> Vec<(String, String)> {
     let in_product: Vec<_> = rows
         .iter()
         .filter(|(_, _, product_id)| product_id == &asking.product_id)
         .map(|(id, url, _)| (id.clone(), url.clone()))
         .collect();
-    if !in_product.is_empty() {
+    // Foreign holders are useful only for explicit-link diagnostics. They cannot
+    // turn a create question into a link or make it ambiguous.
+    if !required || !in_product.is_empty() {
         in_product
     } else {
         rows.into_iter().map(|(id, url, _)| (id, url)).collect()
     }
 }
 
-fn lookup_pr_owner(conn: &Connection, asking: &Task, url: &str) -> Result<Result<Option<Task>, String>> {
+fn lookup_pr_owner(
+    conn: &Connection,
+    asking: &Task,
+    url: &str,
+    required: bool,
+) -> Result<Result<Option<Task>, String>> {
     let matches = prefer_asking_product(
         asking,
         super::pr_binding::query_live_holders_of_pr(conn, url, &asking.id)?,
+        required,
     );
     select_pr_owner(conn, matches, "more than one open task owns that pull request")
 }
@@ -432,7 +445,12 @@ fn select_pr_owner(
     }
 }
 
-fn lookup_pr_number(conn: &Connection, asking: &Task, number: u64) -> Result<Result<Option<Task>, String>> {
+fn lookup_pr_number(
+    conn: &Connection,
+    asking: &Task,
+    number: u64,
+    required: bool,
+) -> Result<Result<Option<Task>, String>> {
     let mut matches = Vec::new();
     for (id, pr_url, product_id) in super::pr_binding::query_live_pr_holders(conn, &asking.id)? {
         if stored_pr_number(&pr_url) == Some(number as i64) {
@@ -455,13 +473,13 @@ fn lookup_pr_number(conn: &Connection, asking: &Task, number: u64) -> Result<Res
         }
         return select_pr_owner(
             conn,
-            prefer_asking_product(asking, matches),
+            prefer_asking_product(asking, matches, required),
             "more than one open task owns that pull request number in this repository",
         );
     }
     select_pr_owner(
         conn,
-        prefer_asking_product(asking, matches),
+        prefer_asking_product(asking, matches, required),
         "more than one open task owns that pull request number; pass the full GitHub URL",
     )
 }

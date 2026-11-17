@@ -242,6 +242,11 @@ fn decorated_stored_pr_url_still_matches_the_qualified_selector() {
     let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
     let owner = crate::test_support::create_test_chore(&db, product.id, "Land the wiring");
     bind_pr(&db, &owner.id, "https://github.com/Acme/Widget/pull/9/files");
+    assert_eq!(
+        db.other_work_item_bound_to_pr("https://github.com/acme/widget/pull/9", &asking.id)
+            .unwrap(),
+        Some(owner.id.clone())
+    );
     let conn = db.connect().unwrap();
     assert_eq!(
         stored_owner_id(ready(&conn, &asking, &link_pr("https://github.com/acme/widget/pull/9"))),
@@ -922,4 +927,32 @@ fn create_brief_with_two_bound_prs_asks_for_an_explicit_prerequisite_pr() {
     );
     assert!(reason.contains("more than one pull request"), "{reason}");
     assert!(reason.contains("--prerequisite-pr"), "{reason}");
+}
+
+#[test]
+fn foreign_only_ambiguous_pr_holders_do_not_reject_create_questions() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product_named(&db, "Asking");
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let url = "https://github.com/acme/widget/pull/9";
+    for name in ["Alpha", "Beta"] {
+        let foreign = crate::test_support::create_test_product_named(&db, name);
+        let owner = crate::test_support::create_test_chore(&db, foreign.id, "Foreign wiring");
+        bind_pr(&db, &owner.id, url);
+    }
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
+        [&product.id],
+    )
+    .unwrap();
+    assert!(resolve_repo_for_work_item(&conn, &asking.id).unwrap().is_none());
+    for q in [
+        create_with_text("Land wiring", &format!("Finish {url}."), "Need it."),
+        create_pr(url),
+        create_pr("acme/widget#9"),
+        create_pr("9"),
+    ] {
+        assert_eq!(ready(&conn, &asking, &q), q);
+    }
 }
