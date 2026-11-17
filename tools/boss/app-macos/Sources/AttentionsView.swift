@@ -114,6 +114,9 @@ struct AttentionGroupCard: View {
     let group: AttentionGroup
     @State private var isExpanded = true
     @State private var showingAssociationPopover = false
+    /// Prompt drafts live on the card so collapsing and expanding keeps
+    /// typed-but-unsent answers. The body is rebuilt; this dictionary is not.
+    @State private var promptDrafts: [String: AttentionPromptDraft] = [:]
 
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
     private var hasExtracted: Bool { members.contains { $0.confidenceSource == "extracted" } }
@@ -131,7 +134,7 @@ struct AttentionGroupCard: View {
             cardHeader
             if isExpanded {
                 Divider()
-                AttentionGroupBody(group: group)
+                AttentionGroupBody(group: group, promptDrafts: $promptDrafts)
             }
         }
         .padding(14)
@@ -268,6 +271,25 @@ struct AttentionGroupCard: View {
 
 }
 
+/// Owns prompt drafts when the parent does not. Navigator and isolated
+/// captures use this so the body is a plain `@Binding` (an optional
+/// Binding stored on the view itself is not Equatable and can loop
+/// layout). `AttentionGroupCard` passes its own store so collapse can
+/// drop the body without losing typed text.
+struct OwnedAttentionGroupBody: View {
+    let group: AttentionGroup
+    var expectedGeneration: Int? = nil
+    @State private var promptDrafts: [String: AttentionPromptDraft] = [:]
+
+    var body: some View {
+        AttentionGroupBody(
+            group: group,
+            expectedGeneration: expectedGeneration,
+            promptDrafts: $promptDrafts
+        )
+    }
+}
+
 /// Member rows, prompt drafts and the group-action footer. Notifications,
 /// the design-doc panel and Navigator Attention all use this so answering
 /// here is the same `AnswerAttention` / `ActionAttentionGroup` path.
@@ -277,9 +299,9 @@ struct AttentionGroupBody: View {
     /// Generation captured when this body was shown. A later generation of
     /// the same grouping key must not receive this body's drafts.
     var expectedGeneration: Int? = nil
-    /// Local drafts for `prompt`-type questions, keyed by attention id. Seeded
-    /// from the persisted answer; flushed to the engine on submit.
-    @State private var promptDrafts: [String: AttentionPromptDraft] = [:]
+    /// Parent-owned drafts, keyed by attention id. Seeded from the
+    /// persisted answer; flushed to the engine on submit.
+    @Binding var promptDrafts: [String: AttentionPromptDraft]
 
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
     private var answeredCount: Int { members.filter(\.isAnswered).count }

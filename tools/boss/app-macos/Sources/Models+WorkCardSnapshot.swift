@@ -316,16 +316,9 @@ struct WorkCardSnapshot: Equatable {
                   let question = task.operatorQuestion
             else { return nil }
             return OperatorQuestionPresentation(
-                questionID: question.id,
-                text: question.text,
-                explanation: question.explanation,
-                askedAt: question.askedAt,
+                question: question,
                 answerInFlight: context.operatorAnswerInFlight,
-                errorMessage: context.operatorAnswerError,
-                runSummary: question.runSummary,
-                prerequisiteTask: question.prerequisiteTask,
-                choices: question.choices,
-                optionLabels: question.optionLabels
+                errorMessage: context.operatorAnswerError
             )
         }()
 

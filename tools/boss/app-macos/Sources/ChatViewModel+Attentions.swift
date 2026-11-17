@@ -36,6 +36,7 @@ extension ChatViewModel {
             attentionGroupsByProductID = groupsByProduct
         }
         refreshSelectedProductAttentionCaches()
+        syncNavigatorAttention()
     }
 
     /// Store group members in their display order so card body evaluation only
@@ -141,17 +142,45 @@ extension ChatViewModel {
     func navigatorOperatorQuestion(for task: WorkTask) -> OperatorQuestionPresentation? {
         guard let question = task.operatorQuestion else { return nil }
         return OperatorQuestionPresentation(
-            questionID: question.id,
-            text: question.text,
-            explanation: question.explanation,
-            askedAt: question.askedAt,
+            question: question,
             answerInFlight: operatorAnswerInFlightByTaskID[task.id] != nil,
-            errorMessage: operatorAnswerError(for: task),
-            runSummary: question.runSummary,
-            prerequisiteTask: question.prerequisiteTask,
-            choices: question.choices,
-            optionLabels: question.optionLabels
+            errorMessage: operatorAnswerError(for: task)
         )
+    }
+
+    /// Friendly copy when a click or refusal targeted a generation that
+    /// the engine has already replaced under a new group id.
+    static let attentionReplacedMessage = "This question was replaced. Review the current question."
+
+    /// The engine mints a new group id for each generation. A later open
+    /// group with the same grouping key is the replacement of `group`.
+    func newerOpenAttentionGroup(replacing group: AttentionGroup) -> AttentionGroup? {
+        attentionGroupsByProductID.values
+            .flatMap { $0 }
+            .filter { candidate in
+                candidate.groupingKey == group.groupingKey
+                    && candidate.isOpen
+                    && candidate.generation > group.generation
+            }
+            .max { $0.generation < $1.generation }
+    }
+
+    /// True when this click should not reach the engine: a newer open group
+    /// already replaced `group`, or the body was bound to a generation this
+    /// id cannot have.
+    private func refuseReplacedAttentionGroup(
+        _ group: AttentionGroup,
+        expectedGeneration: Int?
+    ) -> Bool {
+        if let replacement = newerOpenAttentionGroup(replacing: group) {
+            attentionAnswerErrorByGroupID[replacement.id] = Self.attentionReplacedMessage
+            return true
+        }
+        if let expectedGeneration, group.generation != expectedGeneration {
+            attentionAnswerErrorByGroupID[group.id] = Self.attentionReplacedMessage
+            return true
+        }
+        return false
     }
 
     private func submitAttentionAnswer(
@@ -163,9 +192,7 @@ extension ChatViewModel {
         guard let member = attentionMember(id: attentionID) else { return false }
         if let group = attentionGroup(id: member.groupID) {
             attentionAnswerErrorByGroupID.removeValue(forKey: group.id)
-            if let expectedGeneration, group.generation != expectedGeneration {
-                attentionAnswerErrorByGroupID[group.id] =
-                    "This question was replaced. Review the current question."
+            if refuseReplacedAttentionGroup(group, expectedGeneration: expectedGeneration) {
                 return false
             }
         }
@@ -191,6 +218,9 @@ extension ChatViewModel {
         else { return false }
         if attentionGroup(id: groupID)?.isOpen == true {
             attentionAnswerErrorByGroupID[groupID] = message
+        } else if let group = attentionGroup(id: groupID),
+                  let replacement = newerOpenAttentionGroup(replacing: group) {
+            attentionAnswerErrorByGroupID[replacement.id] = Self.attentionReplacedMessage
         } else {
             workErrorMessage = message
         }
@@ -237,9 +267,7 @@ extension ChatViewModel {
     func actionAttentionGroup(_ groupID: String, expectedGeneration: Int? = nil) -> Bool {
         guard let group = attentionGroup(id: groupID) else { return false }
         attentionAnswerErrorByGroupID.removeValue(forKey: groupID)
-        if let expectedGeneration, group.generation != expectedGeneration {
-            attentionAnswerErrorByGroupID[groupID] =
-                "This question was replaced. Review the current question."
+        if refuseReplacedAttentionGroup(group, expectedGeneration: expectedGeneration) {
             return false
         }
         if let requestID = engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true) {

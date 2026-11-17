@@ -24,8 +24,8 @@
 //! - runtimes, and the live `work_executions` / `work_runs` rows behind them:
 //!   the `board_runtime_epoch` triggers, per owning work item;
 //! - open operator questions: the `operator_questions` journal triggers;
-//! - typed question attentions: `attention_groups` / `attentions`, which are in
-//!   the broad full-snapshot class;
+//! - typed question and follow-up attentions: `attention_groups` / `attentions`,
+//!   which are in the broad full-snapshot class;
 //! - confirmed merge evidence: the `pr_merge_evidence` journal triggers.
 //!
 //! Nothing here reaches GitHub or any other external system.
@@ -219,8 +219,8 @@ struct LiveExecution {
 #[derive(Default)]
 struct Inputs {
     live: HashMap<String, Vec<LiveExecution>>,
-    /// Open typed question groups by the task they are associated with:
-    /// `(group id, state, created_at)`.
+    /// Open typed question and follow-up groups by the task they are
+    /// associated with: `(group id, state, created_at)`.
     questions: HashMap<String, Vec<(String, nav::AttentionState, i64)>>,
     /// Merge evidence rows by root task: `(canonical pr url, observed_at)`.
     evidence: HashMap<String, Vec<(String, String)>>,
@@ -300,7 +300,7 @@ fn read_inputs(conn: &Connection, families: &BTreeMap<&str, FamilyCards<'_>>) ->
 
     let mut stmt = conn.prepare(
         "SELECT COALESCE(association_task_id, source_task_id), id, state, created_at FROM attention_groups
-         WHERE kind = 'question' AND state IN ('open', 'partially_answered')
+         WHERE kind IN ('question', 'followup') AND state IN ('open', 'partially_answered')
            AND (association_task_id IN (SELECT value FROM json_each(?1))
                 OR (source_kind = 'task_transcript' AND source_task_id IN (SELECT value FROM json_each(?1))))
          ORDER BY created_at ASC, id ASC",

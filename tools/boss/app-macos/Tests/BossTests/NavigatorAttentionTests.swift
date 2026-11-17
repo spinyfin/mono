@@ -128,7 +128,7 @@ final class NavigatorAttentionTests: XCTestCase {
     }
 
     func testGenerationMismatchAndDuplicateAnswerDoNotResubmit() {
-        let group = makeGroup(id: "atg_gen", taskID: "root", generation: 2)
+        let group = makeGroup(id: "atg_gen", taskID: "root", generation: 2, groupingKey: "k_shared")
         let member = makeMember(id: "atn_gen", groupID: group.id, type: "yes_no", text: "Ship it?", answer: "yes", state: "answered")
         let open = makeMember(id: "atn_open", groupID: group.id, type: "yes_no", text: "Also this?")
         let root = makeRoot(actions: [attentionAction(id: group.id, task: "root")])
@@ -137,16 +137,35 @@ final class NavigatorAttentionTests: XCTestCase {
         var sent: [[String: Any]] = []
         model.engine.outboundRecorder = { sent.append($0) }
         XCTAssertFalse(model.answerAttention(member.id, answer: "yes", expectedGeneration: 2))
-        XCTAssertFalse(model.answerAttention(open.id, answer: "no", expectedGeneration: 1))
-        XCTAssertEqual(
-            model.attentionAnswerError(forGroup: group.id),
-            "This question was replaced. Review the current question."
-        )
         XCTAssertTrue(model.answerAttention(open.id, answer: "no", expectedGeneration: 2))
-        XCTAssertFalse(model.actionAttentionGroup(group.id, expectedGeneration: 1))
         XCTAssertTrue(model.actionAttentionGroup(group.id, expectedGeneration: 2))
         XCTAssertEqual(sent.map { $0["type"] as? String }, ["answer_attention", "action_attention_group"])
         XCTAssertEqual(sent[0]["id"] as? String, open.id)
+    }
+
+    func testReplacementGroupShowsReplacedMessageOnNewerGroup() {
+        let old = makeGroup(id: "atg_old", taskID: "root", generation: 1, groupingKey: "k_shared")
+        let oldMember = makeMember(id: "atn_old", groupID: old.id, type: "yes_no")
+        let root = makeRoot(actions: [attentionAction(id: old.id, task: "root")])
+        let model = model([root], groups: [old], members: [oldMember])
+        model.engine.simulateConnectedForTesting = true
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+        let newer = makeGroup(id: "atg_new", taskID: "root", generation: 2, groupingKey: "k_shared")
+        let newerMember = makeMember(id: "atn_new", groupID: newer.id, type: "yes_no")
+        model.applyEventForTest(.attentionCreated(attention: newerMember, group: newer))
+        let actioned = makeGroup(
+            id: old.id, taskID: "root", generation: 1, state: "actioned", groupingKey: "k_shared"
+        )
+        model.applyEventForTest(.attentionGroupUpdated(group: actioned, members: [oldMember]))
+        XCTAssertFalse(model.answerAttention(oldMember.id, answer: "yes", expectedGeneration: 1))
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(model.attentionAnswerError(forGroup: newer.id), ChatViewModel.attentionReplacedMessage)
+        XCTAssertNil(model.attentionAnswerError(forGroup: old.id))
+        XCTAssertFalse(model.actionAttentionGroup(old.id, expectedGeneration: 1))
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertTrue(model.answerAttention(newerMember.id, answer: "no", expectedGeneration: 2))
+        XCTAssertEqual(sent.map { $0["type"] as? String }, ["answer_attention"])
     }
 
     func testRevisionOwnedQuestionAnswersTheRevisionTask() {
@@ -194,7 +213,7 @@ final class NavigatorAttentionTests: XCTestCase {
         let groupModel = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
                                groups: [group], members: [member])
         try capture(
-            AttentionGroupBody(group: group, expectedGeneration: 2)
+            OwnedAttentionGroupBody(group: group, expectedGeneration: 2)
                 .environmentObject(groupModel),
             name: "navigator-attention-group"
         )
@@ -293,12 +312,40 @@ final class NavigatorAttentionTests: XCTestCase {
         model.applyEventForTest(.attentionGroupUpdated(group: actioned, members: [answered]))
         let selected = try XCTUnwrap(model.navigatorSelectedTask)
         XCTAssertTrue(WorkNavigatorAttention.entries(model: model, root: selected).isEmpty)
-        XCTAssertEqual(model.navigator.tab, .activity)
-        XCTAssertFalse(model.navigator.tabs.contains(.attention))
+        XCTAssertEqual(model.navigator.tab, .attention)
+        XCTAssertTrue(model.navigator.tabs.contains(.attention))
+        XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
         XCTAssertEqual(model.attentionRequestGroupByRequestID[actionRequest], group.id)
         model.applyEventForTest(.workError(message: "group is already actioned", requestId: actionRequest))
         XCTAssertEqual(model.workErrorMessage, "group is already actioned")
         XCTAssertNil(model.attentionAnswerError(forGroup: group.id))
+    }
+
+    func testTerminalRefusalOfReplacedGroupShowsFriendlyMessageOnNewerGroup() throws {
+        let old = makeGroup(id: "atg_term_old", taskID: "root", generation: 1, groupingKey: "k_race")
+        let oldMember = makeMember(id: "atn_term_old", groupID: old.id, type: "prompt", text: "Which channel?")
+        let model = model(
+            [makeRoot(actions: [attentionAction(id: old.id, task: "root")])],
+            groups: [old], members: [oldMember]
+        )
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertTrue(model.answerAttention(oldMember.id, answer: "ops", expectedGeneration: 1))
+        let requestID = try XCTUnwrap(model.attentionRequestGroupByRequestID.keys.first)
+        let newer = makeGroup(id: "atg_term_new", taskID: "root", generation: 2, groupingKey: "k_race")
+        let newerMember = makeMember(
+            id: "atn_term_new", groupID: newer.id, type: "prompt", text: "Which channel?"
+        )
+        model.applyEventForTest(.attentionCreated(attention: newerMember, group: newer))
+        let actioned = makeGroup(
+            id: old.id, taskID: "root", generation: 1, state: "actioned", groupingKey: "k_race"
+        )
+        model.applyEventForTest(.attentionGroupUpdated(group: actioned, members: [oldMember]))
+        model.applyEventForTest(.workError(
+            message: "attention group atg_term_old is actioned (terminal); its members can no longer be changed",
+            requestId: requestID
+        ))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: newer.id), ChatViewModel.attentionReplacedMessage)
+        XCTAssertNil(model.workErrorMessage)
     }
 
     func testForeignSnapshotDoesNotDropPendingActionCorrelation() throws {
@@ -358,15 +405,33 @@ final class NavigatorAttentionTests: XCTestCase {
     }
 
     func testBannerAndTabCountMatchRenderableEntries() {
-        let review: [String: Any] = ["type": "review", "kind": "review", "task_id": "root"]
-        let root = makeRoot(section: "needs_attention", detail: "activity", actions: [review])
+        var root = makeRoot(
+            section: "needs_attention",
+            detail: "activity",
+            actions: [
+                attentionAction(id: "oq_ask", task: "root"),
+                [
+                    "type": "attention", "kind": "review",
+                    "attention_id": "review:root", "task_id": "root",
+                ],
+                [
+                    "type": "attention", "kind": "merge",
+                    "attention_id": "merge:root", "task_id": "root",
+                ],
+            ]
+        )
+        root.operatorQuestion = makeQuestion(id: "oq_ask")
         let model = model([root])
         model.setWorkViewMode(.navigator)
         model.selectWorkCard("root")
-        XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: root).count, 0)
-        XCTAssertFalse(model.navigator.tabs.contains(.attention))
-        XCTAssertFalse(WorkNavigatorDetail.visibleTabs(model: model, root: root).contains(.attention))
-        // An attention action whose task has no operator question also renders nothing.
+        let selected = model.navigatorSelectedTask ?? root
+        XCTAssertEqual(
+            WorkNavigatorAttention.entries(model: model, root: selected).map(\.id),
+            ["question:oq_ask"]
+        )
+        XCTAssertTrue(model.navigator.tabs.contains(.attention))
+        XCTAssertEqual(NavigatorDetailSlot.attention.title(actionCount: 1), "Attention 1")
+        XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
         let unresolved = makeRoot(actions: [attentionAction(id: "oq_none", task: "root")])
         XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: unresolved).count, 0)
     }
@@ -391,11 +456,27 @@ final class NavigatorAttentionTests: XCTestCase {
         guard case .intervention(_, let label) = entries[1] else {
             return XCTFail("expected an intervention entry")
         }
-        XCTAssertEqual(label, "Deliberate park")
+        XCTAssertEqual(label, "Waiting on you")
         XCTAssertEqual(root.navigator?.root?.reasonLabel, "Answer")
         XCTAssertEqual(
             WorkNavigatorAttention.caption(entries[1], index: 1, total: 2, rootID: "root"),
-            "Deliberate park · 2 of 2"
+            "Waiting on you · 2 of 2"
+        )
+        XCTAssertEqual(
+            WorkNavigatorAttention.interventionLabel(attentionID: "intervention:root:ci_failure_exhausted"),
+            "CI Failed"
+        )
+        XCTAssertEqual(
+            WorkNavigatorAttention.interventionLabel(attentionID: "intervention:root:recovery_attention"),
+            "Recovery"
+        )
+        XCTAssertEqual(
+            WorkNavigatorAttention.interventionLabel(attentionID: "intervention:root:workspace_positioning_refused"),
+            "Workspace blocked"
+        )
+        XCTAssertEqual(
+            WorkNavigatorAttention.interventionLabel(attentionID: "intervention:root:unknown_code"),
+            "Intervention"
         )
     }
 
@@ -478,17 +559,92 @@ final class NavigatorAttentionTests: XCTestCase {
     }
 
     func testNavigatorGroupEntryUsesCurrentGenerationAndShowsStaleError() {
-        let group = makeGroup(id: "atg_cur", taskID: "root", generation: 4)
+        let old = makeGroup(
+            id: "atg_cur_old", taskID: "root", generation: 3, state: "actioned", groupingKey: "k_cur"
+        )
+        let oldMember = makeMember(id: "atn_cur_old", groupID: old.id, type: "yes_no")
+        let group = makeGroup(id: "atg_cur", taskID: "root", generation: 4, groupingKey: "k_cur")
         let member = makeMember(id: "atn_cur", groupID: group.id, type: "yes_no")
         let root = makeRoot(actions: [attentionAction(id: group.id, task: "root")])
-        let model = model([root], groups: [group], members: [member])
+        let model = model([root], groups: [old, group], members: [oldMember, member])
         model.engine.simulateConnectedForTesting = true
         guard case .group(let shown)? = WorkNavigatorAttention.entries(model: model, root: root).first else {
             return XCTFail("expected a group entry")
         }
+        XCTAssertEqual(shown.id, group.id)
         XCTAssertEqual(shown.generation, 4)
-        XCTAssertFalse(model.answerAttention(member.id, answer: "yes", expectedGeneration: 3))
-        XCTAssertNotNil(model.attentionAnswerError(forGroup: group.id))
+        XCTAssertFalse(model.answerAttention(oldMember.id, answer: "yes", expectedGeneration: 3))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: group.id), ChatViewModel.attentionReplacedMessage)
+    }
+
+    func testFollowupProposalIsAnswerableFromAttentionTab() {
+        let group = makeGroup(id: "atg_fu", taskID: "root", kind: "followup")
+        let member = makeMember(
+            id: "atn_fu", groupID: group.id, type: "followup",
+            text: "Add retry", proposedName: "Add retry",
+            proposedDescription: "Retry transient failures."
+        )
+        let root = makeRoot(actions: [attentionAction(id: group.id, task: "root")])
+        let model = model([root], groups: [group], members: [member])
+        model.engine.simulateConnectedForTesting = true
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        model.navigator.tab = .attention
+        XCTAssertEqual(
+            WorkNavigatorAttention.entries(model: model, root: root).map(\.id),
+            ["group:atg_fu:0"]
+        )
+        XCTAssertTrue(model.acceptFollowup(member.id, expectedGeneration: group.generation))
+        XCTAssertEqual(sent.map { $0["type"] as? String }, ["answer_attention"])
+        XCTAssertEqual(sent[0]["id"] as? String, member.id)
+    }
+
+    func testListReplyThatClearsEntriesKeepsAttentionTab() throws {
+        let group = makeGroup(id: "atg_list", taskID: "root", generation: 1)
+        let member = makeMember(id: "atn_list", groupID: group.id, type: "yes_no")
+        let model = model(
+            [makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
+            groups: [group], members: [member]
+        )
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        model.navigator.tab = .attention
+        XCTAssertTrue(model.navigator.tabs.contains(.attention))
+        model.applyAttentionGroupsList(
+            productID: NavigatorTestFixture.product.id, groups: [], members: []
+        )
+        let selected = try XCTUnwrap(model.navigatorSelectedTask)
+        XCTAssertTrue(WorkNavigatorAttention.entries(model: model, root: selected).isEmpty)
+        XCTAssertEqual(model.navigator.tab, .attention)
+        XCTAssertTrue(model.navigator.tabs.contains(.attention))
+        XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
+    }
+
+    func testCollapsingGroupCardKeepsPromptDraft() {
+        let group = makeGroup(id: "atg_draft_keep", taskID: "root")
+        let member = makeMember(
+            id: "atn_draft_keep", groupID: group.id, type: "prompt", text: "Which channel?"
+        )
+        var drafts: [String: AttentionPromptDraft] = [
+            member.id: AttentionPromptDraft(text: "ops", base: member.answer, baseState: member.answerState),
+        ]
+        let binding = Binding(get: { drafts }, set: { drafts = $0 })
+        // AttentionGroupCard owns this dictionary and rebuilds the body
+        // when the user expands the card again.
+        let expanded = AttentionGroupBody(
+            group: group, expectedGeneration: group.generation, promptDrafts: binding
+        )
+        XCTAssertEqual(AttentionPromptDraft.visibleText(drafts[member.id], member: member), "ops")
+        _ = expanded
+        // Collapse drops the body; the card-owned drafts remain.
+        let restored = AttentionGroupBody(
+            group: group, expectedGeneration: group.generation, promptDrafts: binding
+        )
+        XCTAssertEqual(drafts[member.id]?.text, "ops")
+        XCTAssertEqual(AttentionPromptDraft.visibleText(drafts[member.id], member: member), "ops")
+        _ = restored
     }
 
     func testGroupBodyRendersInlineErrorText() throws {
@@ -497,9 +653,9 @@ final class NavigatorAttentionTests: XCTestCase {
         let model = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
                           groups: [group], members: [member])
         let size = CGSize(width: 520, height: 280)
-        let plain = try render(AttentionGroupBody(group: group, expectedGeneration: 2).environmentObject(model), size: size)
+        let plain = try render(OwnedAttentionGroupBody(group: group, expectedGeneration: 2).environmentObject(model), size: size)
         model.attentionAnswerErrorByGroupID[group.id] = "group is already actioned"
-        let failed = try render(AttentionGroupBody(group: group, expectedGeneration: 2).environmentObject(model), size: size)
+        let failed = try render(OwnedAttentionGroupBody(group: group, expectedGeneration: 2).environmentObject(model), size: size)
         XCTAssertEqual(redPixels(plain), 0)
         XCTAssertGreaterThan(redPixels(failed), 20)
     }
@@ -579,7 +735,8 @@ final class NavigatorAttentionTests: XCTestCase {
         projectID: String? = nil,
         generation: Int = 0,
         kind: String = "question",
-        state: String = "open"
+        state: String = "open",
+        groupingKey: String? = nil
     ) -> AttentionGroup {
         AttentionGroup(
             id: id, productID: NavigatorTestFixture.product.id, shortID: nil, kind: kind,
@@ -587,7 +744,7 @@ final class NavigatorAttentionTests: XCTestCase {
             sourceKind: taskID == nil ? "design_doc" : "task_transcript",
             sourceTaskID: taskID, sourceRunID: nil, sourceDocPath: nil,
             sourceDocRepoRemoteURL: nil, sourceDocBranch: nil,
-            groupingKey: "k_\(id)", generation: generation, state: state,
+            groupingKey: groupingKey ?? "k_\(id)", generation: generation, state: state,
             producedArtifactKind: nil, producedArtifactRef: nil,
             createdAt: "2026-06-01T00:00:00Z", actionedAt: nil, dismissedAt: nil
         )
@@ -599,13 +756,15 @@ final class NavigatorAttentionTests: XCTestCase {
         type: String = "yes_no",
         text: String = "Question?",
         answer: String? = nil,
-        state: String = "open"
+        state: String = "open",
+        proposedName: String? = nil,
+        proposedDescription: String? = nil
     ) -> Attention {
         Attention(
             id: id, groupID: groupID, ordinal: 1, sourceAnchor: nil, answerState: state,
             createdAt: "2026-06-01T00:00:00Z", answeredAt: nil, questionType: type,
-            promptText: text, choiceOptions: nil, answer: answer, proposedName: nil,
-            proposedDescription: nil, proposedEffort: nil, proposedWorkKind: nil,
+            promptText: text, choiceOptions: nil, answer: answer, proposedName: proposedName,
+            proposedDescription: proposedDescription, proposedEffort: nil, proposedWorkKind: nil,
             rationale: nil, confidenceSource: "structured", score: 1
         )
     }

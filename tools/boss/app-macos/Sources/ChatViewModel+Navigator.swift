@@ -115,7 +115,8 @@ extension ChatViewModel {
             return
         }
         navigator.askID = detail.revisions.currentTaskId
-        if navigator.selectedRootID != root.id {
+        let isNewRoot = navigator.selectedRootID != root.id
+        if isNewRoot {
             navigator.selectedRootID = root.id
             navigator.selectedAtSection = detail.knownSection
             navigator.tab = NavigatorDetailSlot(rawValue: detail.defaultDetail) ?? .activity
@@ -132,20 +133,23 @@ extension ChatViewModel {
         navigator.retainedTask = root
         retainNavigatorActivity(for: root)
         if root.prURL != nil { navigator.tabs.insert(.review) }
-        syncNavigatorAttention(for: root)
+        // Fall back from an empty Attention tab only when this is a new
+        // selection whose default_detail asked for it. Later updates only
+        // insert the tab; they never remove it or move the user's selection.
+        syncNavigatorAttention(for: root, resetWhenEmpty: isNewRoot)
         if navigator.mode == .navigator { selectionHistory.rememberRoot(root.id, scope: navigatorScopeKey) }
     }
 
-    /// Attention tab presence and selection follow the resolved entry list,
-    /// never the raw engine actions. An intervention-only or unresolved
-    /// question projection must not leave an empty Attention slot selected.
-    func syncNavigatorAttention(for root: WorkTask? = nil) {
+    /// Insert the Attention tab when the selected root has renderable
+    /// entries. `resetWhenEmpty` is only for `selectNavigatorRoot` of a new
+    /// root whose `default_detail` was Attention with nothing to show.
+    func syncNavigatorAttention(for root: WorkTask? = nil, resetWhenEmpty: Bool = false) {
         let root = root ?? navigatorSelectedTask
         guard let root else { return }
         let hasAttention = !WorkNavigatorAttention.entries(model: self, root: root).isEmpty
         if hasAttention {
             navigator.tabs.insert(.attention)
-        } else {
+        } else if resetWhenEmpty {
             navigator.tabs.remove(.attention)
             if navigator.tab == .attention {
                 navigator.tab = .activity

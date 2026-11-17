@@ -196,6 +196,25 @@ struct OperatorQuestionPresentation: Equatable {
     static let inlineLineLimit = 3
 }
 
+extension OperatorQuestionPresentation {
+    /// Shared mapping from the engine's operator-question payload. Callers
+    /// keep their own gating (Kanban column vs Navigator family membership).
+    init(question: OperatorQuestion, answerInFlight: Bool, errorMessage: String?) {
+        self.init(
+            questionID: question.id,
+            text: question.text,
+            explanation: question.explanation,
+            askedAt: question.askedAt,
+            answerInFlight: answerInFlight,
+            errorMessage: errorMessage,
+            runSummary: question.runSummary,
+            prerequisiteTask: question.prerequisiteTask,
+            choices: question.choices,
+            optionLabels: question.optionLabels
+        )
+    }
+}
+
 /// User-readable text for the engine's typed `OperatorQuestionError`
 /// (`{"code": "not_found" | "conflict" | "validation_failed", ...}`).
 enum OperatorQuestionFailure {
