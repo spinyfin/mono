@@ -264,6 +264,54 @@ fn refuses_a_module_import_against_a_grouped_self_in_separate_hunks() {
 }
 
 #[test]
+fn refuses_an_aliased_import_against_an_existing_list_entry() {
+    let content = format!(
+        "use crate::model::{{\n{}    Zone,\n}};\n{}",
+        insertion("    Task as T,\n", "    Project,\n"),
+        insertion("use std::fmt;\n", "use crate::model::Task as T;\n")
+    );
+    assert_eq!(
+        items(&content).unwrap_err(),
+        "both sides added the same import `crate::model::Task as T`"
+    );
+}
+
+#[test]
+fn refuses_an_aliased_module_against_grouped_self_in_the_same_hunk() {
+    let content = insertion("use std::fmt as F;\n", "use std::fmt::{self as F};\n");
+    assert_eq!(
+        items(&content).unwrap_err(),
+        "both sides added the same import `std::fmt as F`"
+    );
+}
+
+#[test]
+fn refuses_an_aliased_module_against_grouped_self_in_separate_hunks() {
+    let content = format!(
+        "{}fn between() {{}}\n{}",
+        insertion("use std::fmt as F;\n", "use std::io;\n"),
+        insertion("use std::env;\n", "use std::fmt::{self as F};\n")
+    );
+    assert_eq!(
+        items(&content).unwrap_err(),
+        "both sides added the same import `std::fmt as F`"
+    );
+}
+
+#[test]
+fn refuses_the_same_import_whose_name_starts_with_selfas() {
+    let content = format!(
+        "use a::{{\n{}    Other,\n}};\n{}",
+        insertion("    selfassessment,\n", "    Different,\n"),
+        insertion("use std::fmt;\n", "use a::selfassessment;\n")
+    );
+    assert_eq!(
+        items(&content).unwrap_err(),
+        "both sides added the same import `a::selfassessment`"
+    );
+}
+
+#[test]
 fn keeps_different_names_added_to_one_use_list_in_two_conflicts() {
     let content = format!(
         "use std::collections::{{\n{}    BTreeSet,\n{}}};\n",

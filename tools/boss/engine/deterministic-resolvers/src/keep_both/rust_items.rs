@@ -151,7 +151,7 @@ impl Header {
             Kind::TypeDef | Kind::TypeAlias | Kind::Mod => name.map(|n| format!("type:{n}")),
             Kind::MacroRules => name.map(|n| format!("macro:{n}")),
             Kind::ExternCrate => name.map(|n| format!("crate:{n}")),
-            Kind::Use => Some(format!("use:{}", squeeze(&code[self.after_name..end], ""))),
+            Kind::Use => Some(format!("use:{}", squeeze(&code[self.after_name..end], " "))),
             Kind::Impl => {
                 let header_end = (self.keyword_at..end).find(|&i| code[i] == '{').unwrap_or(end);
                 Some(squeeze(&code[self.keyword_at..header_end], " "))
@@ -388,7 +388,7 @@ mod tests {
         );
         assert_eq!(items[0].key.as_deref(), Some("use:std::fmt"));
         assert_eq!(items[1].key.as_deref(), Some("type:alpha"));
-        assert_eq!(items[2].key.as_deref(), Some("use:crate::a::{B,C}"));
+        assert_eq!(items[2].key.as_deref(), Some("use:crate::a::{B, C}"));
         assert!(items[0].single_line);
     }
 

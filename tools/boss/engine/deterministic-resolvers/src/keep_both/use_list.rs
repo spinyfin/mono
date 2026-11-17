@@ -95,14 +95,6 @@ fn compact_path(path: &str) -> String {
     path.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn is_ident(text: &str) -> bool {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_alphabetic() => chars.all(|c| c == '_' || c.is_alphanumeric()),
-        _ => false,
-    }
-}
-
 /// `self` under prefix `std::fmt::` is `std::fmt`. `self as fmt` keeps the alias.
 fn canonical_leaf(prefix: &str, entry: &str) -> String {
     let (raw_path, spaced_alias) = match entry.split_once(" as ") {
@@ -115,12 +107,6 @@ fn canonical_leaf(prefix: &str, entry: &str) -> String {
         (enclosing(), spaced_alias)
     } else if let Some(stem) = path.strip_suffix("::self") {
         (format!("{prefix}{stem}"), spaced_alias)
-    } else if spaced_alias.is_none() {
-        match path.strip_prefix("selfas") {
-            // `squeeze` on a `use` key drops spaces, so `self as fmt` arrives as `selfasfmt`.
-            Some(ident) if is_ident(ident) => (enclosing(), Some(ident.to_string())),
-            _ => (format!("{prefix}{path}"), None),
-        }
     } else {
         (format!("{prefix}{path}"), spaced_alias)
     };
@@ -322,7 +308,8 @@ mod tests {
         );
         assert_eq!(imported_paths("", "std::fmt::{self as fmt}"), ["std::fmt as fmt"]);
         assert_eq!(imported_paths("", "std::fmt::self"), ["std::fmt"]);
-        assert_eq!(imported_paths("", "std::fmt::{selfasfmt}"), ["std::fmt as fmt"]);
+        assert_eq!(imported_paths("", "std::fmt::{selfasfmt}"), ["std::fmt::selfasfmt"]);
+        assert_eq!(imported_paths("a::", "selfassessment"), ["a::selfassessment"]);
     }
 
     #[test]
