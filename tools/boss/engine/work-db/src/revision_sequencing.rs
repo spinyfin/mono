@@ -3,19 +3,17 @@ use super::*;
 
 use boss_protocol::CREATED_VIA_CONFLICT_RECOVERY_PREFIX;
 
+/// Shared with dependency health: read-only runs never hold conflict fixes.
+pub(crate) fn has_writer_sql(task_id: &str) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM work_executions
+         WHERE work_item_id = {task_id} AND status IN ('claimed', 'running', 'waiting_human')
+           AND kind NOT IN ('pr_review', 'pr_review_guide', 'progression'))"
+    )
+}
+
 fn has_writer(conn: &Connection, task_id: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT kind FROM work_executions
-         WHERE work_item_id = ?1 AND status IN ('claimed', 'running', 'waiting_human')",
-    )?;
-    let kinds = stmt.query_map([task_id], |row| row.get::<_, String>(0))?;
-    for kind in kinds {
-        let kind: ExecutionKind = kind?.parse().map_err(anyhow::Error::msg)?;
-        if !kind.never_writes_pr_branch() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(conn.query_row(&format!("SELECT {}", has_writer_sql("?1")), [task_id], |row| row.get(0))?)
 }
 
 fn has_execution_in(conn: &Connection, task_id: &str, statuses: &str) -> Result<bool> {
@@ -48,11 +46,17 @@ fn is_conflict_revision(conn: &Connection, task_id: &str) -> Result<bool> {
 /// prerequisites. Judged by task state rather than executions because the fix
 /// has no execution yet when it is minted. A failed or parked fix is not in
 /// flight and must not strand work behind it.
+pub(crate) fn conflict_fix_in_flight_sql(task_id: &str) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM tasks WHERE id = {task_id} AND deleted_at IS NULL
+         AND (status IN ('todo', 'active')
+              OR (status = 'blocked' AND blocked_reason = 'dependency')))"
+    )
+}
+
 fn conflict_fix_in_flight(conn: &Connection, task_id: &str) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL
-         AND (status IN ('todo', 'active')
-              OR (status = 'blocked' AND blocked_reason = 'dependency')))",
+        &format!("SELECT {}", conflict_fix_in_flight_sql("?1")),
         [task_id],
         |row| row.get(0),
     )?)

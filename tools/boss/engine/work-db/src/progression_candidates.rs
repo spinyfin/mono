@@ -366,12 +366,38 @@ fn dependency_held_sql(a: &str) -> String {
 /// Open `blocks` edges expanded to task prerequisites. Include the dependent
 /// among project members: depending on one's own project is a cycle. Parked
 /// projects hold dependents directly, without walking their members.
-fn prereq_task_edges_sql() -> &'static str {
-    "SELECT d.dependent_id AS dependent_id, d.prerequisite_id AS prerequisite_task_id
+fn prereq_task_edges_sql() -> String {
+    let live = crate::live_chain_writer_sql("p");
+    let writer = crate::revision_sequencing::has_writer_sql("p.id");
+    let conflict_in_flight = crate::revision_sequencing::conflict_fix_in_flight_sql("p.id");
+    let conflict_prefix = boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX;
+    let recovery_prefix = boss_protocol::CREATED_VIA_CONFLICT_RECOVERY_PREFIX;
+    let recovery_start = recovery_prefix.len() + 1;
+    format!(
+        "SELECT d.dependent_id AS dependent_id, d.prerequisite_id AS prerequisite_task_id
              FROM work_item_dependencies d
              JOIN tasks p ON p.id = d.prerequisite_id
-             WHERE d.relation = 'blocks'
-               AND p.deleted_at IS NULL AND p.status NOT IN ('done', 'archived')
+             LEFT JOIN tasks t ON t.id = d.dependent_id
+             LEFT JOIN progression_chain_roots tc ON tc.task_id = t.id
+             LEFT JOIN progression_chain_roots pc ON pc.task_id = p.id
+             -- A recovery inherits the conflict revision's ordering identity.
+             LEFT JOIN tasks source ON source.id = CASE
+                 WHEN t.created_via LIKE '{recovery_prefix}%'
+                 THEN substr(t.created_via, {recovery_start}) ELSE t.id END
+             LEFT JOIN progression_chain_roots sc ON sc.task_id = source.id
+             WHERE d.relation = 'blocks' AND p.deleted_at IS NULL
+               AND CASE
+                 -- Conflict writer exclusion precedes status satisfaction,
+                 -- matching gating_prereqs_for.
+                 WHEN t.kind = 'revision' AND source.kind = 'revision'
+                      AND source.created_via LIKE '{conflict_prefix}%'
+                      AND sc.root_id = pc.root_id
+                 THEN CASE WHEN p.id > source.id THEN {conflict_in_flight} ELSE {writer} END
+                 WHEN p.status IN ('done', 'archived') THEN 0
+                 WHEN t.kind = 'revision' AND tc.root_id = pc.root_id
+                 THEN NOT (p.status = 'in_review' OR (p.kind = 'revision' AND NOT {live}))
+                 ELSE 1
+               END
              UNION
              SELECT d.dependent_id, m.id
              FROM work_item_dependencies d
@@ -380,6 +406,7 @@ fn prereq_task_edges_sql() -> &'static str {
              JOIN tasks m ON m.project_id = pj.id AND m.deleted_at IS NULL
                AND m.status NOT IN ('done', 'archived')
              WHERE d.relation = 'blocks'"
+    )
 }
 
 /// Tasks waiting on unfinished work, independent of how that work is dispatched.

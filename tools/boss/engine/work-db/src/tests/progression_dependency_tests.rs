@@ -2,6 +2,123 @@
 use super::*;
 
 #[test]
+fn revisions_repair_stale_blocks_after_same_chain_prerequisites_release_the_branch() {
+    for status in ["in_review", "blocked"] {
+        let f = fixture();
+        let root = f.chore("PR root");
+        let tail = f.revision_of(&root, "Previous revision");
+        // Use a revision parent, rather than siblings, to exercise chain roots.
+        let next = f.revision_of(&tail, "Next revision");
+        f.sql(&format!(
+            "UPDATE tasks SET status = 'in_review' WHERE id = '{root}';
+             UPDATE tasks SET status = '{status}', blocked_reason = 'worker_failed' WHERE id = '{tail}';
+             INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{next}', '{tail}', 'blocks', '1')"
+        ));
+        if status == "blocked" {
+            f.execution(&tail, ExecutionKind::RevisionImplementation, ExecutionStatus::Failed);
+        }
+        f.stick(&next, "status = 'blocked', blocked_reason = 'dependency'", 3);
+        assert!(f.db.gating_prereqs_for(&next).unwrap().is_empty());
+        assert!(f.clauses(&next).dependency_clear);
+        assert_eq!(f.clauses(&next).stuck_kind.as_deref(), Some("S4_dependency"));
+        f.assert_candidate(&next, true);
+        assert_ne!(bucket(&f.db, &next), Some(StuckBucket::WaitingOnDependency));
+
+        // A failed task with a pending retry still owns the branch.
+        if status == "blocked" {
+            f.execution(&tail, ExecutionKind::RevisionImplementation, ExecutionStatus::Ready);
+            assert_eq!(f.db.gating_prereqs_for(&next).unwrap(), vec![tail]);
+            assert!(!f.clauses(&next).dependency_clear);
+        }
+    }
+}
+
+#[test]
+fn unrelated_review_prerequisites_still_hold_revisions() {
+    let f = fixture();
+    let root = f.chore("PR root");
+    let unrelated = f.chore("Unrelated PR");
+    let next = f.dependent_on(&unrelated);
+    f.sql(&format!(
+        "UPDATE tasks SET kind = 'revision', parent_task_id = '{root}' WHERE id = '{next}';
+         UPDATE tasks SET status = 'in_review' WHERE id IN ('{root}', '{unrelated}')"
+    ));
+    assert_eq!(f.db.gating_prereqs_for(&next).unwrap(), vec![unrelated]);
+    assert!(!f.clauses(&next).dependency_clear);
+    f.assert_candidate(&next, false);
+    assert_eq!(bucket(&f.db, &next), Some(StuckBucket::WaitingOnDependency));
+}
+
+#[test]
+fn conflict_dependency_health_matches_writer_exclusion_including_recovery() {
+    for recovery in [false, true] {
+        let f = fixture();
+        let root = f.chore("PR root");
+        let older = f.revision_of(&root, "Older writer");
+        let conflict = f.revision_of(&root, "Conflict fix");
+        assert!(older < conflict, "fixture follows revision ordering");
+        let dependent = if recovery {
+            f.revision_of(&root, "Conflict recovery")
+        } else {
+            conflict.clone()
+        };
+        f.sql(&format!(
+            "UPDATE tasks SET status = 'in_review' WHERE id = '{root}';
+             UPDATE tasks SET created_via = 'merge-conflict:test' WHERE id = '{conflict}';
+             INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{dependent}', '{older}', 'blocks', '1')"
+        ));
+        if recovery {
+            f.sql(&format!(
+                "UPDATE tasks SET created_via = 'attention_conflict_recovery:{conflict}',
+                 status = 'blocked', blocked_reason = 'worker_failed' WHERE id = '{dependent}';
+                 UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed' WHERE id = '{conflict}'"
+            ));
+        }
+        f.stick(&dependent, "status = 'blocked', blocked_reason = 'dependency'", 3);
+        // Even an active task stops holding a conflict fix once no writer is live.
+        f.sql(&format!("UPDATE tasks SET status = 'active' WHERE id = '{older}'"));
+        assert!(f.db.gating_prereqs_for(&dependent).unwrap().is_empty());
+        assert!(f.clauses(&dependent).dependency_clear);
+        f.assert_candidate(&dependent, true);
+
+        let run = f.execution(&older, ExecutionKind::RevisionImplementation, ExecutionStatus::Running);
+        assert_eq!(f.db.gating_prereqs_for(&dependent).unwrap(), vec![older.clone()]);
+        assert!(!f.clauses(&dependent).dependency_clear);
+        f.sql(&format!(
+            "UPDATE work_executions SET status = 'failed' WHERE id = '{run}'"
+        ));
+        f.execution(&older, ExecutionKind::PrReview, ExecutionStatus::Running);
+        assert!(f.db.gating_prereqs_for(&dependent).unwrap().is_empty());
+        assert!(f.clauses(&dependent).dependency_clear);
+    }
+}
+
+#[test]
+fn older_conflict_fixes_wait_only_while_newer_fixes_are_in_flight() {
+    let f = fixture();
+    let root = f.chore("PR root");
+    let older = f.revision_of(&root, "Older conflict fix");
+    let newer = f.revision_of(&root, "Newer conflict fix");
+    assert!(older < newer, "fixture follows revision ordering");
+    f.sql(&format!(
+        "UPDATE tasks SET created_via = 'merge-conflict:test' WHERE id IN ('{older}', '{newer}');
+         INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES ('{older}', '{newer}', 'blocks', '1')"
+    ));
+    f.stick(&older, "status = 'blocked', blocked_reason = 'dependency'", 3);
+    assert_eq!(f.db.gating_prereqs_for(&older).unwrap(), vec![newer.clone()]);
+    assert!(!f.clauses(&older).dependency_clear);
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed' WHERE id = '{newer}'"
+    ));
+    assert!(f.db.gating_prereqs_for(&older).unwrap().is_empty());
+    assert!(f.clauses(&older).dependency_clear);
+    f.assert_candidate(&older, true);
+}
+
+#[test]
 fn a_healthy_chain_waits_indefinitely_with_manual_or_automatic_work() {
     let f = fixture();
     let root = f.chore("Backfill");
