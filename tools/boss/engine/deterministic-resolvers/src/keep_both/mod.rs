@@ -10,6 +10,8 @@
 //!
 //! - the common ancestor had nothing at that spot (both sides inserted),
 //!   or the spot is inside a `use` list where each side only added names;
+//! - the conflict does not start inside a string, raw string or block
+//!   comment in the agreed text before it;
 //! - each side's insertion is self-contained: brackets balanced, not
 //!   ending inside a string or comment;
 //! - under [`KeepBothScope::ItemsAndImports`], each insertion is nothing
@@ -44,7 +46,7 @@ pub enum KeepBothScope {
     ItemsAndImports,
     /// Any self-contained run of whole lines, which adds statements, list
     /// entries, fields, variants and match arms. Their order can matter,
-    /// so this scope is for paths an operator has named.
+    /// so this scope is only for paths a `[[keep_both]]` rule names.
     WholeLines,
 }
 
@@ -115,6 +117,9 @@ pub fn keep_both_insertions(path: &str, content: &str, scope: KeepBothScope) -> 
             Segment::Conflict(hunk) => hunk,
         };
         let at = |reason: String| format!("conflict at line {}: {reason}", hunk.line);
+        if let Some(reason) = lexer::starts_inside_refusal(&out.join("\n"), syntax) {
+            return Err(at(reason));
+        }
         let use_list_path = if syntax == Syntax::Rust {
             use_list::enclosing_use_list(&out)
         } else {
@@ -357,6 +362,9 @@ fn realign(segments: Vec<Segment>) -> Vec<Segment> {
             continue;
         };
         if !hunk.base.is_empty() || whole_items(&hunk.side1, &hunk.side2) {
+            continue;
+        }
+        if lexer::starts_inside_refusal(&before.join("\n"), Syntax::Rust).is_some() {
             continue;
         }
         let limit = MAX_SHIFT.min(hunk.side1.len()).min(hunk.side2.len());

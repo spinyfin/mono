@@ -68,8 +68,8 @@ pub enum RegistryResolution {
 /// Registry of [`DeterministicResolver`]s, dispatched by
 /// [`DeterministicResolver::applies_to`]. This is the extension seam: use
 /// [`ResolverRegistry::with_builtins`] for the shipped resolvers,
-/// [`ResolverRegistry::with_rules_from_base`] to add an operator's
-/// per-path rules, or [`ResolverRegistry::empty`] plus
+/// [`ResolverRegistry::with_rules_from_base`] to add the per-path rules
+/// from `conflict-recipes.toml`, or [`ResolverRegistry::empty`] plus
 /// [`ResolverRegistry::register`] to build a custom set.
 pub struct ResolverRegistry {
     resolvers: Vec<Box<dyn DeterministicResolver>>,
@@ -89,7 +89,7 @@ impl ResolverRegistry {
         Self::assemble(Some(revision), Vec::new())
     }
 
-    /// Built-ins for a rebased PR plus the operator's per-path `rules`.
+    /// Built-ins for a rebased PR plus the per-path `rules`.
     ///
     /// Fails, registering nothing, when a rule does not compile (an
     /// invalid glob or an empty command): a broken rule file must not be

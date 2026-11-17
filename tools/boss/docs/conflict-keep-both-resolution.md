@@ -1,6 +1,6 @@
 # Keep-both conflict resolution and per-path conflict rules
 
-When a PR in review conflicts with its base branch, the engine first rebases the branch itself and then hands every file the rebase left conflicted to a set of deterministic resolvers. If every file resolves, the result is pushed and no agent is started. This page covers two of those resolvers: the built-in keep-both resolver, and the per-path rules an operator can add. Lockfile regeneration is described in the [conflict reduction design](designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md).
+When a PR in review conflicts with its base branch, the engine first rebases the branch itself and then hands every file the rebase left conflicted to a set of deterministic resolvers. If every file resolves, the result is pushed and no agent is started. This page covers two of those resolvers: the built-in keep-both resolver, and the per-path rules in `conflict-recipes.toml`. Lockfile regeneration is described in the [conflict reduction design](designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md).
 
 ## What keep-both resolves
 

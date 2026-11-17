@@ -14,7 +14,9 @@ first two):
               their force-push events.
   clone       Bare clone into the work directory, plus every PR head and
               every force-push "before"/"after" commit, fetched by SHA.
-  replay      `git merge-tree` of each pre-push head against `main`.
+  replay      `git merge-tree` of each pre-push head against `main`,
+              then the first first-parent `main` commit that head
+              conflicts against (the onset).
 
 All state lives under `--work-dir`, which must be outside any checkout.
 Nothing here writes to the repository it is run from.
@@ -233,12 +235,50 @@ def is_content_conflict(entry: dict) -> bool:
     return entry["kinds"] == ["CONFLICT (contents)"] and set(entry["stages"]) == {"1", "2", "3"}
 
 
+def conflict_onset(repo: Path, head: str, merge_base: str, main: str, paths: list[str]) -> str | None:
+    """The first first-parent commit of `main` after `merge_base` that `head` conflicts against.
+
+    Appendix step 6: walk the first-parent commits between the merge base
+    and the selected `main` commit that touch a conflicted file, and take
+    the first one against which the head conflicts. Diagnostic only;
+    resolve rates do not use it.
+    """
+    if not paths:
+        return None
+    log = git(
+        repo,
+        "log",
+        "--first-parent",
+        "--reverse",
+        "--format=%H",
+        f"{merge_base}..{main}",
+        "--",
+        *paths,
+    )
+    for sha in log.stdout.decode().splitlines():
+        if not sha:
+            continue
+        merged = merge_tree(repo, sha, head)
+        if "error" in merged:
+            continue
+        if merged.get("conflict"):
+            return sha
+    return None
+
+
 def cmd_replay(opts) -> None:
     repo = opts.work_dir / "repo.git"
     history = MainHistory(repo)
     since = datetime.fromisoformat(opts.since + "T00:00:00+00:00")
     out_path = opts.work_dir / "states.jsonl"
-    counts = {"pushes": 0, "onto_newer_main": 0, "conflicted": 0, "states": 0, "branch_point_not_on_main": 0}
+    counts = {
+        "pushes": 0,
+        "onto_newer_main": 0,
+        "conflicted": 0,
+        "states": 0,
+        "branch_point_not_on_main": 0,
+        "onset_found": 0,
+    }
     seen: set[tuple[int, str]] = set()
     with out_path.open("w") as out:
         for pr in load_prs(opts.work_dir):
@@ -281,6 +321,10 @@ def cmd_replay(opts) -> None:
                     continue
                 seen.add(key)
                 counts["states"] += 1
+                paths = [entry["path"] for entry in merged["files"]]
+                onset = conflict_onset(repo, event["before"], bases[0], main, paths)
+                if onset is not None:
+                    counts["onset_found"] += 1
                 out.write(
                     json.dumps(
                         {
@@ -291,6 +335,7 @@ def cmd_replay(opts) -> None:
                             "main": main,
                             "landed_on": bases[1],
                             "branch_point": bases[0],
+                            "onset": onset,
                             "tree": merged["tree"],
                             "files": merged["files"],
                         }

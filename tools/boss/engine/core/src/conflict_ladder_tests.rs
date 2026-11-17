@@ -1768,8 +1768,8 @@ async fn rung0_applies_a_per_path_rule_from_the_recipes_file_beside_the_database
 
 #[tokio::test]
 async fn rung0_without_a_rule_leaves_the_same_conflict_to_a_worker() {
-    // No recipes file: the rule mechanism is inert until an operator
-    // writes one, and nothing built in claims this path.
+    // No recipes file: the rule mechanism is inert until a
+    // `conflict-recipes.toml` exists, and nothing built in claims this path.
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);

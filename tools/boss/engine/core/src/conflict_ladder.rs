@@ -7,7 +7,7 @@
 //! baseline maintenance cannot override the published resolution outcome.
 //!
 //! Rung 0 applies deterministic resolvers to residual conflicts: lockfile
-//! regeneration, the operator's per-path rules from the Boss-side
+//! regeneration, the per-path rules in the Boss-side
 //! `conflict-recipes.toml`, and keep-both for same-spot insertions. Every
 //! file must resolve and the result must push before the attempt retires.
 //! Otherwise a bounded residue qualifies for the small rung-2 worker;
@@ -38,7 +38,7 @@ use boss_host_execution::types::CubeWorkspaceLease;
 
 /// Builds the rung-0 resolver registry for a base revision (e.g.
 /// `main@origin`). Production uses [`configured_resolvers`] over the
-/// operator's rules; tests inject a registry whose resolvers do not need a
+/// per-path rules; tests inject a registry whose resolvers do not need a
 /// host toolchain.
 pub(crate) type ResolverFactory<'a> = &'a (dyn Fn(&str) -> ResolverRegistry + Send + Sync);
 
@@ -48,7 +48,7 @@ pub(crate) fn builtin_resolvers(base_revision: &str) -> ResolverRegistry {
     ResolverRegistry::with_builtins_from_base(base_revision)
 }
 
-/// The operator's per-path conflict rules, read from
+/// The per-path conflict rules, read from
 /// `conflict-recipes.toml` beside the work database. The file is Boss-side
 /// configuration, never part of a product repository, so a PR cannot
 /// change what the engine runs on its own conflict.

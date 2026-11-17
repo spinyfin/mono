@@ -54,24 +54,27 @@ fn use_list_path(head: &str) -> Option<String> {
 /// The full paths an import brings into scope: `b::{C, d::E}` under the
 /// prefix `a::` gives `a::b::C` and `a::b::d::E`. `prefix` is the path of
 /// the list the entry sits in, and is empty for a whole declaration.
+///
+/// A grouped `self` is the enclosing module (`use std::fmt::{self}` is
+/// `std::fmt`, the same path as `use std::fmt;`). An `as` alias is kept.
 pub(crate) fn imported_paths(prefix: &str, entry: &str) -> Vec<String> {
-    let entry: String = entry.chars().filter(|c| !c.is_whitespace()).collect();
     let mut paths = Vec::new();
-    expand(prefix, &entry, &mut paths);
+    expand(prefix, entry, &mut paths);
     paths
 }
 
 fn expand(prefix: &str, entry: &str, paths: &mut Vec<String>) {
+    let entry = entry.trim();
     let group = entry
         .split_once('{')
-        .and_then(|(head, rest)| Some((head, rest.strip_suffix('}')?)));
+        .and_then(|(head, rest)| Some((head.trim(), rest.trim().strip_suffix('}')?.trim())));
     let Some((head, inner)) = group else {
         if !entry.is_empty() {
-            paths.push(format!("{prefix}{entry}"));
+            paths.push(canonical_leaf(prefix, entry));
         }
         return;
     };
-    let prefix = format!("{prefix}{head}");
+    let prefix = format!("{prefix}{}", compact_path(head));
     let mut depth = 0usize;
     let mut start = 0;
     for (index, ch) in inner.char_indices() {
@@ -86,6 +89,45 @@ fn expand(prefix: &str, entry: &str, paths: &mut Vec<String>) {
         }
     }
     expand(&prefix, &inner[start..], paths);
+}
+
+fn compact_path(path: &str) -> String {
+    path.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn is_ident(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => chars.all(|c| c == '_' || c.is_alphanumeric()),
+        _ => false,
+    }
+}
+
+/// `self` under prefix `std::fmt::` is `std::fmt`. `self as fmt` keeps the alias.
+fn canonical_leaf(prefix: &str, entry: &str) -> String {
+    let (raw_path, spaced_alias) = match entry.split_once(" as ") {
+        Some((path, alias)) => (path, Some(alias.trim().to_string())),
+        None => (entry, None),
+    };
+    let path = compact_path(raw_path);
+    let enclosing = || prefix.strip_suffix("::").unwrap_or(prefix).to_string();
+    let (module, alias) = if path == "self" {
+        (enclosing(), spaced_alias)
+    } else if let Some(stem) = path.strip_suffix("::self") {
+        (format!("{prefix}{stem}"), spaced_alias)
+    } else if spaced_alias.is_none() {
+        match path.strip_prefix("selfas") {
+            // `squeeze` on a `use` key drops spaces, so `self as fmt` arrives as `selfasfmt`.
+            Some(ident) if is_ident(ident) => (enclosing(), Some(ident.to_string())),
+            _ => (format!("{prefix}{path}"), None),
+        }
+    } else {
+        (format!("{prefix}{path}"), spaced_alias)
+    };
+    match alias {
+        Some(alias) => format!("{module} as {alias}"),
+        None => module,
+    }
 }
 
 /// A region of a `use` list with both sides' additions kept.
@@ -270,10 +312,17 @@ mod tests {
         assert_eq!(imported_paths("crate::a::", "B"), ["crate::a::B"]);
         assert_eq!(
             imported_paths("a::", "b::{C, d::{E, F}, self}"),
-            ["a::b::C", "a::b::d::E", "a::b::d::F", "a::b::self"]
+            ["a::b::C", "a::b::d::E", "a::b::d::F", "a::b"]
         );
         assert_eq!(imported_paths("", "a::{B,C,}"), ["a::B", "a::C"]);
         assert_eq!(imported_paths("a::", "*"), ["a::*"]);
+        assert_eq!(
+            imported_paths("", "std::fmt::{self, Debug}"),
+            ["std::fmt", "std::fmt::Debug"]
+        );
+        assert_eq!(imported_paths("", "std::fmt::{self as fmt}"), ["std::fmt as fmt"]);
+        assert_eq!(imported_paths("", "std::fmt::self"), ["std::fmt"]);
+        assert_eq!(imported_paths("", "std::fmt::{selfasfmt}"), ["std::fmt as fmt"]);
     }
 
     #[test]

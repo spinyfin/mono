@@ -72,6 +72,18 @@ impl Scanned {
     }
 }
 
+/// Why a conflict starting after `text` cannot be classified: `text` left
+/// a string or block comment open. `None` when the next character is
+/// ordinary code.
+pub(crate) fn starts_inside_refusal(text: &str, syntax: Syntax) -> Option<String> {
+    match scan(text, syntax) {
+        Ok(_) => None,
+        Err(reason) => reason
+            .strip_prefix("ends inside ")
+            .map(|rest| format!("starts inside {rest}")),
+    }
+}
+
 /// Classifies every character of `text`. Fails when the fragment ends
 /// inside a string literal or a block comment: such a fragment is a slice
 /// out of the middle of something and cannot be reasoned about alone.
@@ -312,6 +324,19 @@ mod tests {
         assert!(scan("let s = \"unterminated", Syntax::Rust).is_err());
         assert!(scan("/* never closed", Syntax::Rust).is_err());
         assert!(scan("let s = r#\"open", Syntax::Rust).is_err());
+        assert_eq!(
+            starts_inside_refusal("let s = \"unterminated", Syntax::Rust).as_deref(),
+            Some("starts inside a string literal")
+        );
+        assert_eq!(
+            starts_inside_refusal("let s = r#\"open", Syntax::Rust).as_deref(),
+            Some("starts inside a raw string literal")
+        );
+        assert_eq!(
+            starts_inside_refusal("/* never closed", Syntax::Rust).as_deref(),
+            Some("starts inside a block comment")
+        );
+        assert_eq!(starts_inside_refusal("fn a() {}", Syntax::Rust), None);
     }
 
     #[test]

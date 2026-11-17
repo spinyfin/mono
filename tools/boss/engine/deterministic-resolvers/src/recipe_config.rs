@@ -16,7 +16,7 @@
 //! inserted at the same spot is resolved by keeping both insertions. The
 //! built-in keep-both resolver does that for whole Rust items and imports
 //! in any file; a rule extends it to statements and list entries, which
-//! is only right for a list the operator knows is append-only (a
+//! is only right for a list known to be append-only (a
 //! migration list, a registry array).
 //!
 //! ## Registration order
@@ -54,7 +54,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ConflictRecipe {
     /// Stable identifier, used in telemetry summaries and decline
-    /// reasons so operators can tell which recipe fired.
+    /// reasons so a log line names which recipe fired.
     pub name: String,
     /// `globset`-syntax pattern matched against the conflicted file's
     /// path (relative to the workspace root), e.g. `"**/Cargo.lock"`.
@@ -145,7 +145,7 @@ struct FileShape {
 }
 
 /// Boss-side config store for declarative recipes. Read-only by
-/// design: recipes are operator-authored (hand-edited TOML), not
+/// design: recipes are hand-edited TOML, not
 /// mutated through an RPC surface the way feature flags are.
 pub struct ConflictRecipesStore {
     path: PathBuf,

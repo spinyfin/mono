@@ -242,6 +242,28 @@ fn refuses_the_same_import_written_two_ways() {
 }
 
 #[test]
+fn refuses_a_module_import_against_a_grouped_self_in_the_same_hunk() {
+    let content = insertion("use std::fmt;\n", "use std::fmt::{self, Debug};\n");
+    assert_eq!(
+        items(&content).unwrap_err(),
+        "both sides added the same import `std::fmt`"
+    );
+}
+
+#[test]
+fn refuses_a_module_import_against_a_grouped_self_in_separate_hunks() {
+    let content = format!(
+        "{}fn between() {{}}\n{}",
+        insertion("use std::fmt;\n", "use std::io;\n"),
+        insertion("use std::env;\n", "use std::fmt::{self, Display};\n")
+    );
+    assert_eq!(
+        items(&content).unwrap_err(),
+        "both sides added the same import `std::fmt`"
+    );
+}
+
+#[test]
 fn keeps_different_names_added_to_one_use_list_in_two_conflicts() {
     let content = format!(
         "use std::collections::{{\n{}    BTreeSet,\n{}}};\n",
@@ -320,6 +342,37 @@ fn refuses_conflicts_it_cannot_read_as_two_sided() {
     let three_sided = "<<<<<<< Conflict 1 of 1\n%%%%%%% Changes from base to side #1\n+mod a;\n%%%%%%% Changes from base to side #2\n+mod b;\n+++++++ Contents of side #3\nmod c;\n>>>>>>> Conflict 1 of 1 ends\n";
     assert!(items(three_sided).unwrap_err().contains("only two-sided conflicts"));
     assert_eq!(items("mod a;\nmod b;\n").unwrap_err(), "no conflict markers found");
+}
+
+#[test]
+fn refuses_a_conflict_that_starts_inside_a_raw_string() {
+    let content = format!(
+        "const FIXTURE: &str = r#\"\nfn existing() {{}}\n{}\n\"#;\n",
+        insertion("fn from_main() {}\n", "fn from_pr() {}\n")
+    );
+    let err = items(&content).unwrap_err();
+    assert!(err.contains("starts inside a raw string literal"), "{err}");
+}
+
+#[test]
+fn refuses_a_conflict_that_starts_inside_a_block_comment() {
+    let content = format!(
+        "fn keep() {{}}\n/*\n{}\n*/\n",
+        insertion("fn from_main() {}\n", "fn from_pr() {}\n")
+    );
+    let err = items(&content).unwrap_err();
+    assert!(err.contains("starts inside a block comment"), "{err}");
+}
+
+#[test]
+fn refuses_a_fake_use_list_inside_a_string() {
+    let content = format!(
+        "const S: &str = \"\nuse crate::{{\n{}\n}};\";\n",
+        insertion("    Alpha,\n", "    Beta,\n")
+    );
+    let err = items(&content).unwrap_err();
+    assert!(err.contains("starts inside a string literal"), "{err}");
+    assert!(!err.contains("import"), "{err}");
 }
 
 #[test]

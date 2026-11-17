@@ -4,9 +4,10 @@
 //! [`KeepBothUnionResolver`] is the built-in. It applies to every Rust
 //! source file and keeps only whole items and imports, whose order does
 //! not change meaning. [`KeepBothRuleResolver`] is its declarative
-//! counterpart for paths an operator names in the boss-side recipes file
-//! (see [`crate::recipe_config`]); there it keeps any self-contained
-//! lines, which is right for a list the operator knows is append-only.
+//! counterpart for paths a `[[keep_both]]` rule names in the boss-side
+//! recipes file (see [`crate::recipe_config`]); there it keeps any
+//! self-contained lines, which is right only for a list known to be
+//! append-only.
 //!
 //! Both leave the verdict on the merged code to the checks every pushed
 //! resolution already passes: the push gate, the PR's CI and the
@@ -170,8 +171,8 @@ enum Formatter {
     None,
     /// `rustfmt`, invoked as [`rustfmt_command`] describes.
     Rustfmt,
-    /// An operator-supplied program and arguments, run at the workspace
-    /// root. `{file}` in an argument is replaced by the file's path.
+    /// A program and arguments from the rule's `format_command`, run at
+    /// the workspace root. `{file}` in an argument is replaced by the file's path.
     Command(Vec<String>),
 }
 
