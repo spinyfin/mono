@@ -219,8 +219,11 @@ have to come from elsewhere in the `Stop`'s ingress (transcript read, DB
 lock contention). Another unruled-out cause is the shim's resilience path:
 after its roughly ten-second connection retry budget, it appends the hook
 to `.boss/events-pending.jsonl`, exits successfully, and retries delivery
-only when another hook fires. A buffered `PreToolUse` may therefore arrive
-with `PostToolUse` after the entire long command. Check shim stderr for
+on the next hook. A concurrent drain waits for the buffer lock instead of
+stranding the current hook, and a non-empty buffer still uses the same
+connect-retry ride-through so an engine restart does not skip the head
+record. A buffered `PreToolUse` may therefore arrive with `PostToolUse`
+after the entire long command. Check shim stderr for
 `buffering event for later delivery` and the pending file for that payload.
 An engine `hook event received` followed by `dropping hook fan-out`
 distinguishes a slot-less drop from shim buffering; `hook payload arrived

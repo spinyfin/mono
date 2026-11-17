@@ -186,7 +186,8 @@ async fn stop_hook_through_the_events_socket(
         &server_state.work_db,
     )
     .await
-    .expect("a revision Stop must survive per-connection driver resolution");
+    .expect("a revision Stop must survive per-connection driver resolution")
+    .expect("a revision Stop must decode, not be filtered");
     client.await.unwrap();
     incoming
 }

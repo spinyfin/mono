@@ -61,17 +61,22 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
     // connection. The registry is still built once: it is stateless and
     // shared read-only across connections.
     let driver_registry = std::sync::Arc::new(boss_engine_driver::DriverRegistry::default());
+    let mut decode_queue = boss_engine_runtime::events_socket::HookDecodeQueue::default();
     let mut sequencer = IngressSequencer {
         last: server_state.accepted_hook_seq.clone(),
     };
     loop {
         match accept_stamped(&listener, &mut sequencer).await {
             Ok((stream, ingress_seq)) => {
+                let decode_turn = decode_queue.reserve();
                 let server_state = server_state.clone();
                 let driver_registry = driver_registry.clone();
                 boss_task_scope::spawn(async move {
-                    match handle_connection(stream, &driver_registry, &server_state.work_db).await {
-                        Ok(incoming) => {
+                    match decode_turn
+                        .handle(stream, &driver_registry, &server_state.work_db)
+                        .await
+                    {
+                        Ok(Some(incoming)) => {
                             let incoming = incoming.with_ingress_seq(ingress_seq);
                             tracing::info!(
                                 peer_pid = ?incoming.connection.peer_pid,
@@ -81,6 +86,9 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
                                 "events socket: hook event received",
                             );
                             dispatch_worker_event_fanout(&server_state, &incoming).await;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(ingress_seq, "events socket: dropped a filtered hook event");
                         }
                         Err(err) => {
                             tracing::warn!(?err, "events socket: failed to handle connection");

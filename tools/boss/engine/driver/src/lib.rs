@@ -1328,12 +1328,15 @@ pub enum ProgressStreamSource {
     AgentJsonlFile,
 }
 
-/// Run-scoped context supplied when a JSONL progress reader starts.
+/// Run-scoped context supplied when a progress reader or hook-callback
+/// decode session starts.
 ///
 /// Stream protocols commonly omit session identity after their first
 /// envelope. Mutable correlation therefore belongs to the reader session,
 /// not the registry's shared [`AgentDriver`] instance. `run_id` also lets a
 /// driver resolve run-owned artifacts without scanning another run's state.
+/// Hook-callback drivers that correlate identity across connections (agy
+/// conversation-id filtering) receive the same config per connection.
 #[derive(Clone, Default)]
 pub struct ProgressSessionConfig {
     pub run_id: Option<String>,
@@ -1368,10 +1371,34 @@ impl std::fmt::Debug for ProgressSessionConfig {
 /// Engine-owned durable storage for one run's current provider session id.
 ///
 /// The driver must not persist this identity inside an agent-writable home.
-/// Implementations atomically compare and replace the one bounded identity
-/// for `run_id`; `Ok(true)` means the same id was already present (resume).
 pub trait ProgressIdentityStore: Send + Sync {
+    /// Atomically install only if absent; never overwrite a different stored id.
+    /// Returns the stored id (which may differ from `session_id`) and `existed`.
+    /// `existed == true` covers both resuming the same id and losing a claim race.
+    fn claim_progress_identity_if_absent(&self, run_id: &str, session_id: &str) -> Result<(String, bool), String>;
+
+    /// Atomically compare and replace the bounded identity for `run_id`.
+    /// `Ok(true)` means the same id was already present (resume).
     fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String>;
+
+    /// Read the currently claimed provider session id for `run_id`, if any.
+    ///
+    /// Distinct from [`Self::claim_progress_identity`]: this is a non-mutating
+    /// peek so a driver that must never replace a claimed identity (agy
+    /// subagent filtering) can refuse a different id without calling claim.
+    /// `Ok(None)` means this run has never claimed one. There is no default:
+    /// a silent `Ok(None)` would re-claim after a restart and let a child's
+    /// first event replace the parent.
+    fn claimed_progress_identity(&self, run_id: &str) -> Result<Option<String>, String>;
+
+    /// Whether `run_id`'s execution is still non-terminal.
+    ///
+    /// A boundary that arrives before any claim is retried only while this
+    /// is `Ok(true)`. `Ok(false)` means the run will never claim (it is
+    /// already finished, or the row is gone) and the boundary must be
+    /// rejected permanently. A store failure is `Err` so the caller can
+    /// retry the lookup.
+    fn progress_run_is_non_terminal(&self, run_id: &str) -> Result<bool, String>;
 }
 
 /// Mutable normalizer owned by one progress ingress.
@@ -2118,12 +2145,16 @@ pub trait AgentDriver: Send + Sync {
     /// [`boss_protocol::normalize_hook_event`].
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
-    /// Create mutable correlation state for one stdout ingress.
+    /// Create mutable correlation state for one progress ingress.
     ///
-    /// Hook-callback drivers return `None` and keep using the stateless
-    /// methods above. A stdout driver whose wire omits session identity after
-    /// its first record returns a fresh normalizer here; the generic reader
-    /// owns it for exactly one stream.
+    /// A stdout driver whose wire omits session identity after its first
+    /// record returns a fresh normalizer here; the generic reader owns it
+    /// for exactly one stream. A hook-callback driver that needs identity
+    /// correlation across connections (agy conversation-id filtering) also
+    /// returns a session; the events-socket decode constructs one per
+    /// connection with the engine-owned identity store. Drivers whose hook
+    /// payload is fully self-describing per invocation keep returning
+    /// `None` and use the stateless methods above.
     fn progress_session(&self, _config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
         None
     }

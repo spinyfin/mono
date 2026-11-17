@@ -34,7 +34,7 @@ use boss_engine_runtime::audit_effort;
 use boss_engine_runtime::cli::Cli;
 use boss_engine_runtime::config::RuntimeConfig;
 use boss_engine_runtime::cube_client::CommandCubeClient;
-use boss_engine_runtime::events_socket::{bind_events_socket, handle_connection, peer_pid};
+use boss_engine_runtime::events_socket::{bind_events_socket, peer_pid};
 use boss_engine_runtime::external_tracker::WorkDbOrgStateSink;
 use boss_engine_runtime::external_tracker::auth_forwarder::run_auth_forwarder;
 use boss_engine_runtime::external_tracker::github_oauth::{

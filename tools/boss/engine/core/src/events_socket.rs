@@ -8,16 +8,18 @@
 //!
 //! Cross-platform: macOS uses `LOCAL_PEERPID`, Linux uses `SO_PEERCRED`.
 
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
 
-use crate::driver::{AgentDriver, DriverRegistry, TurnEnd};
+use crate::driver::{AgentDriver, DriverRegistry, ProgressIdentityStore, ProgressSessionConfig, TurnEnd};
 use crate::work::WorkDb;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -25,9 +27,9 @@ use tokio::net::{UnixListener, UnixStream};
 /// Marker line the engine writes back to the peer when it rejects a
 /// connection (malformed JSON, unrecognized hook shape, unresolved
 /// driver, ...), so `boss-event` can tell "the engine actively refused
-/// this event" apart from "delivered fine". The shim never reads
-/// anything on a successful connection -- it only looks for this
-/// prefix, best-effort, after it finishes writing and half-closes.
+/// this event" apart from "delivered fine". A successful decode writes
+/// [`RECORDED_NOTICE`] instead. The shim waits briefly after it
+/// finishes writing and half-closes.
 ///
 /// Deliberately duplicated (not shared via a crate dependency) in
 /// `tools/boss/event-shim/src/main.rs`'s `REJECTION_PREFIX`: the shim is
@@ -49,6 +51,28 @@ const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
 /// dependency-free-shim reason as [`REJECTION_PREFIX`]. Keep them
 /// byte-for-byte identical if either changes.
 const RETRY_PREFIX: &str = "BOSS-EVENT-RETRY: ";
+
+/// Marker the engine writes back when it has accepted (or filtered, or
+/// recognised as a duplicate of) a payload. Distinct from silence so a
+/// shim whose response window expires can retry without treating a still-
+/// in-flight decode as success, and so a later drain of the same delivery
+/// id can be dropped instead of dispatched twice.
+///
+/// Deliberately duplicated in `tools/boss/event-shim/src/main.rs`.
+const RECORDED_NOTICE: &str = "BOSS-EVENT-RECORDED\n";
+
+/// Upper bound on how long a peer may take to finish writing a hook
+/// payload. At or below the shim's response window so a stalled
+/// connection (`nc -U`, a paused hook) cannot pin the global decode
+/// queue past the point where every other shim times out and buffers.
+const HOOK_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Cap on a single hook payload. Mirrors spoke `MAX_HOOK`.
+const MAX_HOOK_BYTES: usize = 256 * 1024;
+
+/// Bound on remembered `(run_id, delivery_id)` pairs so a long-lived
+/// engine cannot grow the duplicate ledger without limit.
+const MAX_DELIVERY_LEDGER: usize = 8192;
 
 /// `level` for `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
 #[cfg(target_os = "macos")]
@@ -282,6 +306,10 @@ pub enum SocketError {
     /// permanent verdict on the payload.
     #[error("driver-slug lookup failed for run_id={run_id}: {error}")]
     DriverSlugLookupTransient { run_id: String, error: String },
+    #[error("hook payload read deadline expired")]
+    ReadDeadline,
+    #[error("hook payload exceeds {max} bytes")]
+    PayloadTooLarge { max: usize },
 }
 
 impl SocketError {
@@ -299,7 +327,11 @@ impl SocketError {
         match self {
             SocketError::Io(_) => false,
             SocketError::DriverSlugLookupTransient { .. } => false,
+            SocketError::ReadDeadline => false,
             SocketError::Json(_) => true,
+            SocketError::PayloadTooLarge { .. } => true,
+            SocketError::Normalize(NormalizeError::IdentityStoreTransient(_)) => false,
+            SocketError::Normalize(NormalizeError::BoundaryBeforeClaim(_)) => false,
             SocketError::Normalize(_) => true,
             SocketError::UnresolvedDriver { .. } => true,
         }
@@ -451,7 +483,9 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
     ))
 }
 
-/// Read a connection to EOF and produce a typed IncomingHookEvent.
+/// Decode one shim connection into an [`IncomingHookEvent`].
+///
+/// Read a connection to EOF.
 /// The shim half-closes its write side after writing the full hook
 /// payload, so EOF is the message boundary.
 ///
@@ -476,25 +510,50 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// run's actual driver slug, then resolves it through `registry` — the same
 /// `tasks.driver` → `products.default_driver` → engine-default precedence
 /// applied at spawn time.
+///
+/// `Ok(None)` means the run's driver normalised the payload to an empty
+/// fan-out — a filtered event (agy dropping a subagent boundary) that
+/// is still a successful delivery. The shim must not retry or treat it
+/// as a rejection.
 pub async fn handle_connection(
     stream: UnixStream,
     registry: &DriverRegistry,
     work_db: &WorkDb,
-) -> Result<IncomingHookEvent, SocketError> {
+) -> Result<Option<IncomingHookEvent>, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
-    if let Err(err) = stream.read_to_end(&mut bytes).await {
-        // A read failure is a transient socket-level hiccup, not a verdict
-        // on the payload — report it back as a RETRY_PREFIX notice so the
-        // shim queues the payload for redelivery rather than treating a
-        // silently dropped connection as a successful delivery.
-        let err = SocketError::from(err);
-        retry_connection(&mut stream, &err).await;
+    let read_result = {
+        let mut limited = (&mut stream).take(MAX_HOOK_BYTES as u64 + 1);
+        tokio::time::timeout(HOOK_READ_DEADLINE, limited.read_to_end(&mut bytes)).await
+    };
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            // A read failure is a transient socket-level hiccup, not a verdict
+            // on the payload — report it back as a RETRY_PREFIX notice so the
+            // shim queues the payload for redelivery rather than treating a
+            // silently dropped connection as a successful delivery.
+            let err = SocketError::from(err);
+            retry_connection(&mut stream, &err).await;
+            return Err(err);
+        }
+        Err(_) => {
+            let err = SocketError::ReadDeadline;
+            retry_connection(&mut stream, &err).await;
+            return Err(err);
+        }
+    }
+    if bytes.len() > MAX_HOOK_BYTES {
+        let err = SocketError::PayloadTooLarge { max: MAX_HOOK_BYTES };
+        reject_connection(&mut stream, &err).await;
         return Err(err);
     }
     match decode_incoming_event(&bytes, registry, work_db, peer_pid_value) {
-        Ok(incoming) => Ok(incoming),
+        Ok(incoming) => {
+            acknowledge_connection(&mut stream).await;
+            Ok(incoming)
+        }
         Err(err) => {
             if err.is_permanent() {
                 reject_connection(&mut stream, &err).await;
@@ -502,6 +561,53 @@ pub async fn handle_connection(
                 retry_connection(&mut stream, &err).await;
             }
             Err(err)
+        }
+    }
+}
+
+/// Reserve a decode turn synchronously at accept time, before spawning a task.
+/// This orders identity claims even when an earlier peer is slow to finish
+/// writing, up to [`HOOK_READ_DEADLINE`]. Dispatch after decoding remains
+/// concurrent. A peer that never half-closes is retried when the deadline
+/// expires so it cannot pin every later worker's ingress.
+#[derive(Default)]
+pub struct HookDecodeQueue {
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl HookDecodeQueue {
+    pub fn reserve(&mut self) -> HookDecodeTurn {
+        let (completed, next) = tokio::sync::oneshot::channel();
+        HookDecodeTurn {
+            previous: self.tail.replace(next),
+            completed: Some(completed),
+        }
+    }
+}
+
+pub struct HookDecodeTurn {
+    previous: Option<tokio::sync::oneshot::Receiver<()>>,
+    completed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl HookDecodeTurn {
+    pub async fn handle(
+        mut self,
+        stream: UnixStream,
+        registry: &DriverRegistry,
+        work_db: &WorkDb,
+    ) -> Result<Option<IncomingHookEvent>, SocketError> {
+        if let Some(previous) = self.previous.take() {
+            let _ = previous.await;
+        }
+        handle_connection(stream, registry, work_db).await
+    }
+}
+
+impl Drop for HookDecodeTurn {
+    fn drop(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(());
         }
     }
 }
@@ -517,7 +623,7 @@ fn decode_incoming_event(
     registry: &DriverRegistry,
     work_db: &WorkDb,
     peer_pid_value: Option<libc::pid_t>,
-) -> Result<IncomingHookEvent, SocketError> {
+) -> Result<Option<IncomingHookEvent>, SocketError> {
     let raw: serde_json::Value = serde_json::from_slice(bytes)?;
     let payload_run_id = extract_run_id_from_payload(&raw);
     let run_id = if payload_run_id.is_none() {
@@ -532,12 +638,42 @@ fn decode_incoming_event(
     // machine downstream, unchanged. `resolve` additionally asks the driver's
     // TurnBoundary capability whether this event ends a turn, so the
     // dispatchers never have to re-derive that from the event's shape.
+    //
+    // A driver that returns a progress session (agy conversation-id
+    // filtering) gets one per connection, seeded from the engine-owned
+    // identity store. An empty fan-out is a successful drop, not a
+    // rejection: the shim must not retry a filtered subagent boundary.
     let transcript_path = driver.transcript_path_for_session(&raw);
-    let event = driver.normalize_progress_event(&raw)?;
-    Ok(
+    let session_config = ProgressSessionConfig {
+        run_id: run_id.clone(),
+        identity_store: Some(Arc::new(work_db.clone()) as Arc<dyn ProgressIdentityStore>),
+        ..ProgressSessionConfig::default()
+    };
+    let event = if let Some(mut session) = driver.progress_session(&session_config) {
+        let mut events = session.normalize_progress_events(&raw)?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        if events.len() > 1 {
+            tracing::warn!(
+                n = events.len(),
+                "hook-callback progress session produced more than one worker event; taking the first"
+            );
+        }
+        events.remove(0)
+    } else {
+        driver.normalize_progress_event(&raw)?
+    };
+    if let (Some(run_id), Some(delivery_id)) = (run_id.as_deref(), extract_delivery_id_from_payload(&raw).as_deref())
+        && !claim_hook_delivery(run_id, delivery_id)
+    {
+        tracing::info!(run_id, delivery_id, "events socket: dropping duplicate hook delivery");
+        return Ok(None);
+    }
+    Ok(Some(
         IncomingHookEvent::resolve(driver.as_ref(), event, run_id, transcript_path, peer_pid_value)
             .with_subagent_origin(payload_is_from_subagent(&raw)),
-    )
+    ))
 }
 
 /// Whether a hook payload names a subagent as its origin. Claude Code stamps
@@ -580,6 +716,61 @@ async fn retry_connection(stream: &mut UnixStream, err: &SocketError) {
         return;
     }
     let _ = stream.shutdown().await;
+}
+
+/// Write [`RECORDED_NOTICE`] back to `stream` after a successful decode
+/// (including a filtered event or a recognised duplicate). Best-effort:
+/// a shim past its read window simply retries, and [`claim_hook_delivery`]
+/// drops the replay.
+async fn acknowledge_connection(stream: &mut UnixStream) {
+    if let Err(write_err) = stream.write_all(RECORDED_NOTICE.as_bytes()).await {
+        tracing::debug!(%write_err, "events socket: failed to write recorded notice back to shim");
+        return;
+    }
+    let _ = stream.shutdown().await;
+}
+
+struct DeliveryLedger {
+    order: VecDeque<(String, String)>,
+    seen: HashSet<(String, String)>,
+}
+
+impl DeliveryLedger {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    fn claim(&mut self, run_id: &str, delivery_id: &str) -> bool {
+        let key = (run_id.to_owned(), delivery_id.to_owned());
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > MAX_DELIVERY_LEDGER {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+fn delivery_ledger() -> &'static Mutex<DeliveryLedger> {
+    static LEDGER: OnceLock<Mutex<DeliveryLedger>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(DeliveryLedger::new()))
+}
+
+/// Record `(run_id, delivery_id)` as accepted. Returns `false` when this
+/// pair has already been dispatched (or filtered after a successful
+/// decode) in this process.
+fn claim_hook_delivery(run_id: &str, delivery_id: &str) -> bool {
+    delivery_ledger()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .claim(run_id, delivery_id)
 }
 
 /// Resolve the driver that governs `run_id`'s worker, deterministically.
@@ -702,6 +893,11 @@ fn extract_run_id_from_payload(raw: &serde_json::Value) -> Option<String> {
     if s.is_empty() { None } else { Some(s.to_owned()) }
 }
 
+fn extract_delivery_id_from_payload(raw: &serde_json::Value) -> Option<String> {
+    let s = raw.get("_boss_delivery_id")?.as_str()?;
+    if s.is_empty() { None } else { Some(s.to_owned()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +930,45 @@ mod tests {
         let chore = crate::test_support::create_test_chore(&db, &product.id, "events-socket test chore");
         let execution = crate::test_support::create_ready_chore_execution(&db, &chore.id);
         (dir, db, execution.id)
+    }
+
+    /// Like [`db_with_ready_execution`], but with a `work_runs` row so
+    /// identity claim can persist. Live hook ingress only fires after spawn
+    /// has started the run.
+    fn db_with_started_execution(driver_slug: Option<&str>) -> (TempDir, WorkDb, String) {
+        let (dir, db, execution_id) = db_with_ready_execution(driver_slug);
+        db.start_execution_run(
+            &execution_id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+        (dir, db, execution_id)
+    }
+
+    async fn handle_payload(
+        db: &WorkDb,
+        registry: &DriverRegistry,
+        payload: &str,
+    ) -> Result<Option<IncomingHookEvent>, SocketError> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let path_owned = path.clone();
+        let payload = payload.to_owned();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, registry, db).await;
+        client.await.unwrap();
+        result
     }
 
     /// A socket filename that is unique across every test invocation in this
@@ -918,7 +1153,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client_task.await.unwrap();
 
         match incoming.event {
@@ -953,7 +1191,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert_eq!(
@@ -985,7 +1226,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -1015,7 +1259,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -1045,7 +1292,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
@@ -1075,7 +1325,10 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .unwrap()
+            .expect("decoded hook event");
         assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
 
         close_tx.send(()).ok();
@@ -1280,7 +1533,8 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let incoming = handle_connection(stream, &registry, &db)
             .await
-            .expect("camelCase payload must be normalised by the resolved grok driver, not dropped");
+            .expect("camelCase payload must be normalised by the resolved grok driver, not dropped")
+            .expect("decoded hook event");
         client.await.unwrap();
 
         match incoming.event {
@@ -1442,7 +1696,10 @@ mod tests {
         client.await.unwrap();
 
         let incoming = match result {
-            Ok(incoming) => incoming,
+            Ok(Some(incoming)) => incoming,
+            Ok(None) => {
+                panic!("a grok review-batch leaf's Stop must decode via GrokDriver, not be filtered")
+            }
             Err(err) => {
                 panic!("a grok review-batch leaf's Stop must decode via GrokDriver, not be dropped as Claude: {err:?}")
             }
@@ -1462,6 +1719,316 @@ mod tests {
                 assert!(!stop_hook_active);
             }
             other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agy_session_start_claims_conversation_identity() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let payload = format!(
+            r#"{{"hookEventName":"SessionStart","conversationId":"parent-cid","modelName":"gemini-4-hydrogen-xhigh","_boss_run_id":"{run_id}"}}"#
+        );
+        let incoming = handle_payload(&db, &registry, &payload)
+            .await
+            .expect("parent SessionStart must decode")
+            .expect("parent SessionStart must not be filtered");
+        match incoming.event {
+            WorkerEvent::SessionStart { session_id, source, .. } => {
+                assert_eq!(session_id, "parent-cid");
+                assert_eq!(source, boss_protocol::SessionStartSource::Startup);
+            }
+            other => panic!("expected SessionStart, got {other:?}"),
+        }
+        assert_eq!(
+            db.get_run_progress_session_identity(&run_id).unwrap().as_deref(),
+            Some("parent-cid"),
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_child_stop_is_dropped_after_parent_claim() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let parent_start =
+            format!(r#"{{"hookEventName":"SessionStart","conversationId":"parent-cid","_boss_run_id":"{run_id}"}}"#);
+        handle_payload(&db, &registry, &parent_start)
+            .await
+            .unwrap()
+            .expect("parent SessionStart");
+        let child_stop = format!(
+            r#"{{"hookEventName":"Stop","conversationId":"child-cid","fullyIdle":true,"_boss_run_id":"{run_id}"}}"#
+        );
+        let dropped = handle_payload(&db, &registry, &child_stop)
+            .await
+            .expect("a filtered child Stop is a successful drop, not a rejection");
+        assert!(dropped.is_none());
+        assert_eq!(
+            db.get_run_progress_session_identity(&run_id).unwrap().as_deref(),
+            Some("parent-cid"),
+            "a child Stop must not replace the parent claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_parent_stop_is_emitted_after_claim() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let parent_start =
+            format!(r#"{{"hookEventName":"SessionStart","conversationId":"parent-cid","_boss_run_id":"{run_id}"}}"#);
+        handle_payload(&db, &registry, &parent_start)
+            .await
+            .unwrap()
+            .expect("parent SessionStart");
+        let parent_stop = format!(
+            r#"{{"hookEventName":"Stop","conversationId":"parent-cid","fullyIdle":true,"_boss_run_id":"{run_id}"}}"#
+        );
+        let incoming = handle_payload(&db, &registry, &parent_stop)
+            .await
+            .expect("parent Stop must decode")
+            .expect("parent Stop must not be filtered");
+        match incoming.event {
+            WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "parent-cid"),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_parent_decode_keeps_claim_ahead_of_child() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = Arc::new(DriverRegistry::default());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let mut queue = HookDecodeQueue::default();
+
+        let mut parent = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let parent_db = db.clone();
+        let parent_registry = registry.clone();
+        let parent_task = tokio::spawn(async move { turn.handle(stream, &parent_registry, &parent_db).await });
+        // Hold the parent's payload briefly so the child is accepted first,
+        // still inside the read deadline. A writer that never finishes is
+        // covered by `idle_peer_does_not_block_later_decode`.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let mut child = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let child_db = db.clone();
+        let child_registry = registry.clone();
+        let child_task = tokio::spawn(async move { turn.handle(stream, &child_registry, &child_db).await });
+        child
+            .write_all(
+                format!(r#"{{"hookEventName":"SessionStart","conversationId":"CHILD","_boss_run_id":"{run_id}"}}"#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        child.shutdown().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !child_task.is_finished(),
+            "child must wait for the earlier parent decode"
+        );
+        assert!(db.get_run_progress_session_identity(&run_id).unwrap().is_none());
+        parent
+            .write_all(
+                format!(r#"{{"hookEventName":"SessionStart","conversationId":"PARENT","_boss_run_id":"{run_id}"}}"#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        parent.shutdown().await.unwrap();
+        assert!(parent_task.await.unwrap().unwrap().is_some());
+        assert!(child_task.await.unwrap().unwrap().is_none());
+        assert_eq!(
+            db.get_run_progress_session_identity(&run_id).unwrap().as_deref(),
+            Some("PARENT")
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_stop_without_a_claim_fails_loudly() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let payload = format!(
+            r#"{{"hookEventName":"Stop","conversationId":"parent-cid","fullyIdle":true,"_boss_run_id":"{run_id}"}}"#
+        );
+        let result = handle_payload(&db, &registry, &payload).await;
+        match result {
+            Err(SocketError::Normalize(NormalizeError::BoundaryBeforeClaim(message))) => {
+                assert!(
+                    message.contains("before a claimed conversation identity"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected retryable Stop-before-claim, got {other:?}"),
+        }
+        assert!(
+            db.get_run_progress_session_identity(&run_id).unwrap().is_none(),
+            "a Stop without a prior claim must not invent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_stop_without_a_claim_on_terminal_run_is_rejected_permanently() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        db.mark_execution_orphaned(&run_id, "test terminal run").unwrap();
+        let registry = DriverRegistry::default();
+        let payload = format!(
+            r#"{{"hookEventName":"Stop","conversationId":"parent-cid","fullyIdle":true,"_boss_run_id":"{run_id}"}}"#
+        );
+        let result = handle_payload(&db, &registry, &payload).await;
+        match result {
+            Err(SocketError::Normalize(NormalizeError::Malformed(message))) => {
+                assert!(message.contains("terminal run"), "got {message}");
+            }
+            other => panic!("expected permanent Stop-before-claim rejection, got {other:?}"),
+        }
+        assert!(
+            db.get_run_progress_session_identity(&run_id).unwrap().is_none(),
+            "a Stop without a prior claim must not invent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn redelivered_delivery_id_is_dispatched_once() {
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
+        let delivery_id = format!("delivery-{run_id}");
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}","_boss_delivery_id":"{delivery_id}"}}"#
+        );
+        let first = handle_payload(&db, &registry, &payload)
+            .await
+            .expect("first delivery must decode")
+            .expect("first delivery must dispatch");
+        match first.event {
+            WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "s"),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        let second = handle_payload(&db, &registry, &payload)
+            .await
+            .expect("a duplicate delivery is a successful drop, not a rejection");
+        assert!(
+            second.is_none(),
+            "the engine must not dispatch a replay of an already-accepted delivery id"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_after_shim_window_then_redeliver_dispatches_once() {
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = Arc::new(DriverRegistry::default());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let mut queue = HookDecodeQueue::default();
+        let delivery_id = format!("late-{run_id}");
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}","_boss_delivery_id":"{delivery_id}"}}"#
+        );
+
+        let _idle = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let idle_db = db.clone();
+        let idle_registry = registry.clone();
+        let idle_task = tokio::spawn(async move { turn.handle(stream, &idle_registry, &idle_db).await });
+
+        let mut first = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let first_db = db.clone();
+        let first_registry = registry.clone();
+        let first_task = tokio::spawn(async move { turn.handle(stream, &first_registry, &first_db).await });
+        first.write_all(payload.as_bytes()).await.unwrap();
+        first.shutdown().await.unwrap();
+        // The shim's response window has now expired; it would buffer and
+        // redeliver. Keep the first connection open so the engine can still
+        // finish the decode after the idle peer is cut loose.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let mut replay = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let replay_db = db.clone();
+        let replay_registry = registry.clone();
+        let replay_task = tokio::spawn(async move { turn.handle(stream, &replay_registry, &replay_db).await });
+        replay.write_all(payload.as_bytes()).await.unwrap();
+        replay.shutdown().await.unwrap();
+
+        let first_result = first_task
+            .await
+            .unwrap()
+            .expect("late accept must decode")
+            .expect("first Stop");
+        match first_result.event {
+            WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "s"),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        let replay_result = replay_task.await.unwrap().expect("replay must not be a rejection");
+        assert!(
+            replay_result.is_none(),
+            "replay of the same delivery id must not dispatch"
+        );
+        let idle_result = idle_task.await.unwrap();
+        match idle_result {
+            Err(SocketError::ReadDeadline) => {}
+            other => panic!("expected ReadDeadline for the idle peer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_peer_does_not_block_later_decode() {
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = Arc::new(DriverRegistry::default());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let mut queue = HookDecodeQueue::default();
+
+        let _idle = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let idle_db = db.clone();
+        let idle_registry = registry.clone();
+        let idle_task = tokio::spawn(async move { turn.handle(stream, &idle_registry, &idle_db).await });
+
+        let mut later = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let turn = queue.reserve();
+        let later_db = db.clone();
+        let later_registry = registry.clone();
+        let later_task = tokio::spawn(async move { turn.handle(stream, &later_registry, &later_db).await });
+        later
+            .write_all(
+                format!(
+                    r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        later.shutdown().await.unwrap();
+
+        let later_result = tokio::time::timeout(std::time::Duration::from_secs(2), later_task)
+            .await
+            .expect("an idle peer must not pin a later decode past the read deadline")
+            .expect("later task must not panic")
+            .expect("later decode must succeed")
+            .expect("later Stop must dispatch");
+        match later_result.event {
+            WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "s"),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        let idle_result = tokio::time::timeout(std::time::Duration::from_secs(2), idle_task)
+            .await
+            .expect("idle peer must be cut loose at the read deadline");
+        match idle_result.expect("idle task must not panic") {
+            Err(SocketError::ReadDeadline) => {}
+            other => panic!("expected ReadDeadline for the idle peer, got {other:?}"),
         }
     }
 
@@ -1604,10 +2171,8 @@ mod tests {
         let mut request = Vec::new();
         stream.read_to_end(&mut request).await.unwrap();
         assert_eq!(request, b"anything");
-        let err = SocketError::DriverSlugLookupTransient {
-            run_id: "run-1".to_owned(),
-            error: "database is locked".to_owned(),
-        };
+        let err = SocketError::Normalize(NormalizeError::IdentityStoreTransient("database is locked".into()));
+        assert!(!err.is_permanent());
         retry_connection(&mut stream, &err).await;
         // Production drops the connection after its best-effort notice. Close
         // this fixture's owned socket too before the peer waits for EOF.
@@ -1653,6 +2218,19 @@ mod tests {
             }
             .is_permanent(),
             "a definitively-unknown run_id will fail identically on retry"
+        );
+        assert!(
+            !SocketError::ReadDeadline.is_permanent(),
+            "a stalled peer is asked to retry, not quarantined"
+        );
+        assert!(
+            SocketError::PayloadTooLarge { max: MAX_HOOK_BYTES }.is_permanent(),
+            "an oversized payload will fail identically on retry"
+        );
+        assert!(
+            !SocketError::Normalize(NormalizeError::BoundaryBeforeClaim("retry after SessionStart".into()))
+                .is_permanent(),
+            "a live run's Stop-before-claim is retried"
         );
     }
 
@@ -1704,7 +2282,8 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let incoming = handle_connection(stream, &registry, &db)
             .await
-            .expect("an answer-agent Stop must reach the completion handler, not be dropped");
+            .expect("an answer-agent Stop must reach the completion handler, not be dropped")
+            .expect("decoded hook event");
         client.await.unwrap();
 
         assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
