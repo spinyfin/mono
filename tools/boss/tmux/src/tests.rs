@@ -1019,6 +1019,15 @@ async fn new_session_validation_rejections_do_not_run_tmux() {
             },
             "environment name cannot contain '='",
         ),
+        (
+            NewSession {
+                name: "boss-1".to_owned(),
+                environment: [("BOSS_LEASE_ID".to_owned(), String::new())].into(),
+                working_directory: PathBuf::from("/workspace"),
+                command: "exec codex".to_owned(),
+            },
+            "environment value cannot be empty",
+        ),
     ];
     for (session, expected_error) in cases {
         let (tmux, runner) = tmux([]);
