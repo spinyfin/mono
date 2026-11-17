@@ -36,38 +36,48 @@ private struct BossTerminalSurface: View {
     }
 }
 
+final class GhosttyTerminalClaimView: NSView {}
+
 /// Embeds an already-attached worker session without creating another PTY.
 /// Claims the host while `isActive`; returns it to Agents when not.
 struct EmbeddedWorkerTerminalView: NSViewRepresentable {
     let session: TerminalPaneSession
     let isActive: Bool
 
+    @MainActor
     final class Coordinator {
-        let session: TerminalPaneSession
+        var session: TerminalPaneSession
         init(session: TerminalPaneSession) { self.session = session }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(session: session) }
 
     func makeNSView(context: Context) -> NSView {
-        let container = NSView()
+        let container = GhosttyTerminalClaimView()
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.black.cgColor
         return container
     }
 
     func updateNSView(_ container: NSView, context: Context) {
-        if isActive {
-            session.claimHost(into: container)
-        } else if container.subviews.contains(where: { $0 === session.hostView }) {
-            session.returnHostHome()
-        }
+        context.coordinator.update(session: session, in: container, isActive: isActive)
     }
 
     static func dismantleNSView(_ container: NSView, coordinator: Coordinator) {
         coordinator.session.returnHostHome()
-        for subview in container.subviews {
-            subview.removeFromSuperview()
+    }
+}
+
+extension EmbeddedWorkerTerminalView.Coordinator {
+    func update(session: TerminalPaneSession, in container: NSView, isActive: Bool) {
+        if self.session !== session {
+            self.session.returnHostHome()
+            self.session = session
+        }
+        if isActive {
+            session.claimHost(into: container)
+        } else if container.subviews.contains(where: { $0 === session.hostView }) {
+            session.returnHostHome()
         }
     }
 }

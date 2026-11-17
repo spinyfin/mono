@@ -407,6 +407,7 @@ extension ChatViewModel {
     }
 
     func beginNavigatorBriefEdit(_ task: WorkTask) {
+        guard navigatorBriefCanEdit(task) else { return }
         let existing = navigator.briefDrafts[task.id]
         navigator.briefDrafts[task.id] = NavigatorBriefDraft(
             text: existing?.text ?? task.description,
@@ -433,18 +434,22 @@ extension ChatViewModel {
         )
     }
 
+    func navigatorBriefCanEdit(_ task: WorkTask) -> Bool {
+        let root = task.navigator.flatMap { self.task(withID: $0.rootTaskId) } ?? task
+        return isConnected && task.deletedAt == nil && root.deletedAt == nil
+            && !["done", "landed", "archived"].contains(task.status)
+            && !["done", "landed", "archived"].contains(root.status)
+            && root.navigator?.root?.knownSection != .landed
+    }
+
     /// Writes the stored document. It does not send input to a running agent.
     @discardableResult
     func saveNavigatorBrief(_ task: WorkTask) -> Bool {
-        guard canSubmitUserActions() else { return false }
+        guard canSubmitUserActions(), navigatorBriefCanEdit(task) else { return false }
         let text = navigator.briefDrafts[task.id]?.text ?? task.description
         let requestID = engine.sendUpdateWorkItem(id: task.id, patch: ["description": text])
         if requestID != nil || engine.hasUnsentAction(kind: "update_work_item") {
-            navigator.briefDrafts[task.id] = NavigatorBriefDraft(
-                text: text,
-                baseline: text,
-                isEditing: false
-            )
+            navigator.briefDrafts[task.id] = nil
             return true
         }
         return false

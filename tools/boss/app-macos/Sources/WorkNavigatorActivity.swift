@@ -169,12 +169,6 @@ struct WorkNavigatorActivity: View {
             Text(last.errorText).font(.caption).foregroundStyle(.secondary)
         }
         HStack {
-            if (projection?.commands.contains { $0.kind == "retry" || $0.kind == "start" }) == true {
-                Button("Retry") {
-                    model.engine.sendRequestExecution(workItemId: root.id)
-                }
-                .disabled(context.isReadOnly)
-            }
             Button("Open last transcript") {
                 openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: root.id))
             }
@@ -198,7 +192,7 @@ struct WorkNavigatorActivity: View {
         let commands = (projection?.commands ?? []).filter { ["start", "retry", "park", "edit_brief"].contains($0.kind) }
         if !commands.isEmpty {
             HStack {
-                ForEach(commands, id: \.kind) { command in
+                ForEach(commands, id: \.self) { command in
                     Button(command.kind == "edit_brief" ? "Edit brief" : command.kind.capitalized) {
                         model.performNavigatorCommand(command)
                     }

@@ -41,6 +41,22 @@ final class GhosttyTerminalAnchorView: NSView {
         addSubview(host)
     }
 
+    func reuseHost(of session: TerminalPaneSession) -> Bool {
+        guard let existing = session.hostView, !existing.isTornDown else { return false }
+        if existing.superview == nil || existing.superview is GhosttyTerminalAnchorView {
+            (existing.superview as? GhosttyTerminalAnchorView)?.forget()
+            install(existing)
+        } else if existing.superview is GhosttyTerminalClaimView {
+            remember(existing)
+        } else {
+            existing.tearDown()
+            return false
+        }
+        return true
+    }
+
+    func forget() { host = nil }
+
     func remember(_ host: GhosttyTerminalHostView) {
         self.host = host
     }
@@ -63,13 +79,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
     func makeNSView(context: Context) -> GhosttyTerminalAnchorView {
         let anchor = GhosttyTerminalAnchorView()
         session.homeAnchor = anchor
-        if let existing = session.hostView {
-            if existing.superview == nil {
-                anchor.install(existing)
-            } else {
-                anchor.remember(existing)
-            }
-        } else {
+        if !anchor.reuseHost(of: session) {
             anchor.install(GhosttyTerminalHostView(
                 runtime: runtime,
                 session: session,
@@ -97,15 +107,22 @@ struct GhosttyTerminalView: NSViewRepresentable {
         guard let host = view.host else { return }
         // Navigator may have claimed the host. Tearing it down here would
         // kill the live PTY while the Activity slot is still showing it.
-        guard host.superview === view || host.superview == nil else { return }
-        host.tearDown()
+        if host.superview === view || host.superview == nil || host.session.isReleased {
+            host.tearDown()
+        }
+        if host.session.homeAnchor === view { host.session.homeAnchor = nil }
+        view.forget()
     }
 }
 
 final class GhosttyTerminalHostView: NSView {
-    let runtime: GhosttyRuntime
+    private let runtimeProvider: () -> GhosttyRuntime
+    var runtime: GhosttyRuntime { runtimeProvider() }
+    /// Allows ownership tests to exercise real host views without starting a PTY.
+    private let surfaceCreationEnabled: Bool
     let session: TerminalPaneSession
     let launchSpec: TerminalLaunchSpec
+    private(set) var isTornDown = false
     private(set) var surface: ghostty_surface_t?
 
     private var trackingAreaRef: NSTrackingArea?
@@ -217,12 +234,14 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     init(
-        runtime: GhosttyRuntime,
+        runtime: @autoclosure @escaping () -> GhosttyRuntime,
         session: TerminalPaneSession,
         launchSpec: TerminalLaunchSpec,
-        paneMonitorEnabled: Bool
+        paneMonitorEnabled: Bool,
+        surfaceCreationEnabled: Bool = true
     ) {
-        self.runtime = runtime
+        self.runtimeProvider = runtime
+        self.surfaceCreationEnabled = surfaceCreationEnabled
         self.session = session
         self.launchSpec = launchSpec
         self.paneMonitorEnabled = paneMonitorEnabled
@@ -246,7 +265,7 @@ final class GhosttyTerminalHostView: NSView {
     /// arm a display-change observer so the next display reconfiguration
     /// retries.
     private func attemptSurfaceCreation() {
-        guard surface == nil else { return }
+        guard surfaceCreationEnabled, surface == nil, !isTornDown else { return }
         // The viewer may have been detached while this view's
         // display-change retry was still armed. Creating a surface now
         // would start a tmux client for a released viewer —
@@ -577,6 +596,16 @@ final class GhosttyTerminalHostView: NSView {
     /// `dismantleNSView` or `deinit` is a no-op and the surface is never
     /// double-freed.
     func tearDown() {
+        guard !isTornDown else { return }
+        isTornDown = true
+        if session.hostView === self { session.hostView = nil }
+        if let anchor = session.homeAnchor as? GhosttyTerminalAnchorView, anchor.host === self {
+            anchor.forget()
+        }
+        removeFromSuperview()
+        pendingGeometrySync?.cancel()
+        paneMonitorTimer?.invalidate()
+        removeScreenObserver()
         guard let surface else { return }
         self.surface = nil
 

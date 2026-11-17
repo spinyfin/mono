@@ -225,7 +225,9 @@ final class NavigatorSelectionTests: XCTestCase {
         XCTAssertNil(model.navigator.selectedRootID)
         XCTAssertEqual(model.revealWorkCard("older", productID: "product"), .revealed(cardID: "root"))
         XCTAssertEqual(model.navigator.selectedRootID, "root")
-        XCTAssertEqual(model.navigator.askID, "older")
+        XCTAssertEqual(model.navigator.askID, "revision")
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .historical)
+        XCTAssertEqual(model.navigatorDocumentTask(for: root).id, "older")
     }
 
     func testRevealNonCurrentRevisionSetsAskWhenRootAlreadySelected() {
@@ -238,7 +240,9 @@ final class NavigatorSelectionTests: XCTestCase {
         XCTAssertEqual(model.navigator.askID, "revision")
         XCTAssertEqual(model.revealWorkCard("older", productID: "product"), .revealed(cardID: "root"))
         XCTAssertEqual(model.navigator.selectedRootID, "root")
-        XCTAssertEqual(model.navigator.askID, "older")
+        XCTAssertEqual(model.navigator.askID, "revision")
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .historical)
+        XCTAssertEqual(model.navigatorDocumentTask(for: root).id, "older")
     }
 
     func testAcknowledgementDoesNotSpeculateAboutPlacement() {

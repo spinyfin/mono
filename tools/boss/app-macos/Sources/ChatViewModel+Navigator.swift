@@ -114,20 +114,23 @@ extension ChatViewModel {
             if navigator.mode == .navigator { selectionHistory.rememberRoot(nil, scope: navigatorScopeKey) }
             return
         }
+        navigator.askID = detail.revisions.currentTaskId
         if navigator.selectedRootID != root.id {
             navigator.selectedRootID = root.id
             navigator.selectedAtSection = detail.knownSection
             navigator.tab = NavigatorDetailSlot(rawValue: detail.defaultDetail) ?? .activity
             navigator.tabs = [.activity, .history, navigator.tab]
-            navigator.askID = askID ?? (task.id != root.id ? task.id : detail.revisions.currentTaskId)
             if navigator.documentByRoot[root.id] == nil {
                 let ask = navigator.askID.flatMap { self.task(withID: $0) }
                 navigator.documentByRoot[root.id] = (ask != nil && ask?.id != root.id) ? .currentAsk : .original
             }
-        } else if let askID {
-            navigator.askID = askID
+        }
+        if let historicalID = askID ?? (task.id != root.id ? task.id : nil) {
+            navigator.historicalDocumentByRoot[root.id] = historicalID
+            navigator.documentByRoot[root.id] = historicalID == detail.revisions.currentTaskId ? .currentAsk : .historical
         }
         navigator.retainedTask = root
+        retainNavigatorActivity(for: root)
         if root.prURL != nil { navigator.tabs.insert(.review) }
         syncNavigatorAttention(for: root)
         if navigator.mode == .navigator { selectionHistory.rememberRoot(root.id, scope: navigatorScopeKey) }
@@ -173,6 +176,7 @@ extension ChatViewModel {
                task(withID: current) != nil {
                 navigator.askID = current
             }
+            retainNavigatorActivity(for: selected)
         } else if navigator.selectedRootID == nil,
                   let id = selectionHistory.root(scope: navigatorScopeKey),
                   let task = task(withID: id), navigatorIncludes(task) {
@@ -309,24 +313,28 @@ extension ChatViewModel {
         case .original:
             return root
         case .currentAsk:
-            return navigator.askID.flatMap { task(withID: $0) } ?? root
+            return root.navigator?.root?.revisions.currentTaskId.flatMap { task(withID: $0) } ?? root
+        case .historical:
+            return navigator.historicalDocumentByRoot[root.id].flatMap { task(withID: $0) } ?? root
         }
     }
 
     func setNavigatorActivity(executionID: String, rootID: String) {
-        navigator.activityByRoot[rootID] = executionID
+        guard let activity = task(withID: rootID)?.navigator?.root?.activities.first(where: {
+            $0.executionId == executionID
+        }) else { return }
+        navigator.activityByRoot[rootID] = activity
     }
 
-    /// The user's chosen execution, even after it has left the live list.
-    func navigatorSelectedActivity(for root: WorkTask) -> NavigatorActivity? {
-        let activities = root.navigator?.root?.activities ?? []
-        if let chosen = navigator.activityByRoot[root.id] {
-            if let match = activities.first(where: { $0.executionId == chosen }) {
-                return match
-            }
-            return NavigatorActivity(executionId: chosen, taskId: navigator.askID ?? root.id, runId: chosen)
+    private func retainNavigatorActivity(for root: WorkTask) {
+        if navigator.activityByRoot[root.id] == nil, let first = root.navigator?.root?.activities.first {
+            navigator.activityByRoot[root.id] = first
         }
-        return activities.first
+    }
+
+    /// The displayed execution retains its full reference after it ends.
+    func navigatorSelectedActivity(for root: WorkTask) -> NavigatorActivity? {
+        navigator.activityByRoot[root.id] ?? root.navigator?.root?.activities.first
     }
 
     func navigatorFamily(of root: WorkTask) -> [WorkTask] {

@@ -133,6 +133,7 @@ struct NavigatorSectionRows: Identifiable {
 enum NavigatorBriefDocument: String, Hashable {
     case original
     case currentAsk
+    case historical
 }
 
 /// Per-document dirty text. Background work-tree updates never overwrite it.
@@ -152,13 +153,14 @@ struct WorkNavigatorState {
     var tab: NavigatorDetailSlot = .activity
     var tabs: Set<NavigatorDetailSlot> = [.activity, .history]
     var askID: String?
+    var historicalDocumentByRoot: [String: String] = [:]
     var collapsedByScope: [String: Set<NavigatorSection>] = [:]
     var scrollByScope: [String: String] = [:]
     var revealGeneration = UUID()
     /// Sticky per root: original brief vs current ask.
     var documentByRoot: [String: NavigatorBriefDocument] = [:]
     /// Sticky per root, keyed by execution id so a new run cannot steal it.
-    var activityByRoot: [String: String] = [:]
+    var activityByRoot: [String: NavigatorActivity] = [:]
     /// Dirty markdown keyed by the document's task id.
     var briefDrafts: [String: NavigatorBriefDraft] = [:]
 }

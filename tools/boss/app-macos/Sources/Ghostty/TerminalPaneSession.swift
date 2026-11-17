@@ -211,6 +211,7 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// Mark this session as released. Idempotent.
     func markReleased() {
         isReleased = true
+        hostView?.tearDown()
     }
 
     private var paneMonitorTracker: PaneMonitorTracker
@@ -252,12 +253,16 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// Move the existing surface into `container` without creating a PTY or
     /// taking keyboard focus unless this host already had it.
     func claimHost(into container: NSView) {
-        guard let host = hostView else { return }
+        guard !isReleased, let host = hostView, !host.isTornDown else { return }
         reparent(host, into: container)
     }
 
     func returnHostHome() {
-        guard let host = hostView, let home = homeAnchor else { return }
+        guard let host = hostView else { return }
+        guard !isReleased, let home = homeAnchor else {
+            host.tearDown()
+            return
+        }
         reparent(host, into: home)
     }
 

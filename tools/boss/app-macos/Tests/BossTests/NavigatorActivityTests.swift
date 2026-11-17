@@ -54,7 +54,8 @@ final class NavigatorActivityTests: XCTestCase {
         root.description = "Later remote brief"
         NavigatorTestFixture.snapshot(model, [root])
         XCTAssertFalse(model.navigatorBriefChangedRemotely(root), "Saved drafts must not raise remote-change until editing again")
-        model.reloadNavigatorBrief(root)
+        XCTAssertEqual(model.navigatorBriefText(for: root), "Later remote brief")
+        model.beginNavigatorBriefEdit(root)
         XCTAssertEqual(model.navigatorBriefText(for: root), "Later remote brief")
         model.cancelNavigatorBriefEdit(root)
         XCTAssertEqual(model.navigatorBriefText(for: root), "Later remote brief")
@@ -80,7 +81,7 @@ final class NavigatorActivityTests: XCTestCase {
         let model = NavigatorTestFixture.model([root])
         model.selectWorkCard("root")
         model.setWorkViewMode(.navigator)
-        model.setNavigatorActivity(executionID: "execution", rootID: "root")
+        XCTAssertEqual(model.navigatorSelectedActivity(for: root)?.runId, "run")
         model.applyEventForTest(.workerLiveStatesList(states: [liveState(runId: "run", activity: .working)]))
         var view = WorkNavigatorActivity(context: context(model), workspace: nil)
         XCTAssertEqual(view.variant, .working)
@@ -95,6 +96,8 @@ final class NavigatorActivityTests: XCTestCase {
         model.applyEventForTest(.workerLiveStatesList(states: [liveState(runId: "run-2", slotId: 4, activity: .working)]))
         view = WorkNavigatorActivity(context: context(model), workspace: nil)
         XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.executionId, "execution")
+        XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.runId, "run")
+        XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.taskId, "revision")
         XCTAssertTrue(view.selectedExecutionEnded)
         XCTAssertFalse(view.isLiveSelected)
     }
@@ -240,6 +243,137 @@ final class NavigatorActivityTests: XCTestCase {
             host.frame = NSRect(x: 0, y: 0, width: 1100, height: 700)
             try capture(host, name: "navigator-activity-\(name)")
         }
+    }
+
+    func testClaimedSessionReleaseAndSwitchUnmount() {
+        func session(_ id: String) -> TerminalPaneSession {
+            TerminalPaneSession(id: id, role: .worker(slot: 1), launchSpec: TerminalLaunchSpec(
+                fontSize: 12, workingDirectory: NSTemporaryDirectory(), initialInput: ""
+            ))
+        }
+        func host(_ session: TerminalPaneSession, home: GhosttyTerminalAnchorView) -> GhosttyTerminalHostView {
+            let host = GhosttyTerminalHostView(
+                runtime: GhosttyRuntime.shared, session: session, launchSpec: session.launchSpec,
+                paneMonitorEnabled: false, surfaceCreationEnabled: false
+            )
+            session.hostView = host
+            session.homeAnchor = home
+            home.install(host)
+            return host
+        }
+        let first = session("first"), second = session("second")
+        let firstHome = GhosttyTerminalAnchorView(), secondHome = GhosttyTerminalAnchorView()
+        let firstHost = host(first, home: firstHome), secondHost = host(second, home: secondHome)
+        let container = NSView()
+        let coordinator = EmbeddedWorkerTerminalView.Coordinator(session: first)
+        coordinator.update(session: first, in: container, isActive: true)
+        XCTAssertTrue(firstHost.superview === container)
+        coordinator.update(session: second, in: container, isActive: true)
+        XCTAssertTrue(firstHost.superview === firstHome)
+        XCTAssertTrue(secondHost.superview === container)
+        EmbeddedWorkerTerminalView.dismantleNSView(container, coordinator: coordinator)
+        XCTAssertTrue(secondHost.superview === secondHome)
+        XCTAssertTrue(container.subviews.isEmpty)
+
+        coordinator.update(session: second, in: container, isActive: true)
+        second.markReleased()
+        XCTAssertTrue(secondHost.isTornDown)
+        XCTAssertNil(second.hostView)
+        XCTAssertNil(secondHome.host)
+        XCTAssertNil(secondHost.superview)
+        let remountedHome = GhosttyTerminalAnchorView()
+        XCTAssertTrue(remountedHome.reuseHost(of: first))
+        first.homeAnchor = remountedHome
+        XCTAssertTrue(firstHost.superview === remountedHome)
+        XCTAssertNil(firstHome.host)
+        GhosttyTerminalView.dismantleNSView(firstHome, coordinator: ())
+        XCTAssertFalse(firstHost.isTornDown)
+        firstHost.tearDown()
+        XCTAssertNil(remountedHome.host)
+        XCTAssertFalse(firstHome.reuseHost(of: first))
+    }
+
+    func testCurrentAskAdvancesWhileOldRevisionAndDraftRemain() {
+        let first = NavigatorTestFixture.task("first", rootID: "root")
+        let second = NavigatorTestFixture.task("second", rootID: "root")
+        let root = activityTask(section: "working", revisions: [
+            "open": 1, "total": 1, "current_task_id": "first",
+        ])
+        let model = NavigatorTestFixture.model([root, first])
+        model.isConnected = true
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        model.beginNavigatorBriefEdit(first)
+        model.setNavigatorBriefText(first.id, text: "Kept first draft")
+        let updated = activityTask(section: "working", revisions: [
+            "open": 1, "total": 2, "current_task_id": "second",
+        ])
+        NavigatorTestFixture.snapshot(model, [updated, first, second])
+        XCTAssertEqual(model.navigator.askID, second.id)
+        XCTAssertEqual(model.navigatorDocumentTask(for: updated).id, second.id)
+        XCTAssertEqual(model.navigatorBriefText(for: first), "Kept first draft")
+        model.navigator.historicalDocumentByRoot[updated.id] = first.id
+        model.setNavigatorDocument(.historical, rootID: updated.id)
+        XCTAssertEqual(model.navigatorDocumentTask(for: updated).id, first.id)
+        model.setNavigatorDocument(.currentAsk, rootID: updated.id)
+        XCTAssertEqual(model.navigatorDocumentTask(for: updated).id, second.id)
+    }
+
+    func testActivityReorderRetainsDefaultAndPickerChangesItExplicitly() {
+        let activities = [
+            ["execution_id": "one", "task_id": "root", "run_id": "run-one"],
+            ["execution_id": "two", "task_id": "revision", "run_id": "run-two"],
+        ]
+        let root = activityTask(section: "working", activities: activities)
+        let model = NavigatorTestFixture.model([root])
+        model.selectWorkCard(root.id)
+        model.setWorkViewMode(.navigator)
+        NavigatorTestFixture.snapshot(model, [activityTask(section: "working", activities: activities.reversed())])
+        XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.runId, "run-one")
+        model.setNavigatorActivity(executionID: "two", rootID: root.id)
+        XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.runId, "run-two")
+    }
+
+    func testAskLabelUsesFamilyOrdinalAndAskName() {
+        let root = activityTask(section: "working", revisions: [
+            "open": 1, "total": 3, "current_task_id": "third",
+        ])
+        var first = NavigatorTestFixture.task("first", rootID: "root")
+        first.createdAt = "2026-01-01"
+        var second = NavigatorTestFixture.task("second", rootID: "root")
+        second.createdAt = "2026-01-02"
+        var third = NavigatorTestFixture.task("third", rootID: "root")
+        third.createdAt = "2026-01-03"
+        third.name = "Repair CI"
+        let model = NavigatorTestFixture.model([root, first, second, third])
+        model.selectWorkCard(root.id)
+        model.setWorkViewMode(.navigator)
+        let view = WorkNavigatorBrief(context: context(model))
+        XCTAssertEqual(view.askLabel(third), "Revision 3 · Repair CI")
+    }
+
+    func testLandedBriefCannotEditOrSave() {
+        let root = activityTask(section: "landed", merge: true)
+        let model = NavigatorTestFixture.model([root])
+        model.isConnected = true
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertFalse(model.navigatorBriefCanEdit(root))
+        model.beginNavigatorBriefEdit(root)
+        XCTAssertFalse(model.navigatorBriefIsEditing(root.id))
+        XCTAssertFalse(model.saveNavigatorBrief(root))
+    }
+
+    func testHistoryConsumerTracksFamilyChangesAndUnmount() {
+        let model = NavigatorTestFixture.model([NavigatorTestFixture.task()])
+        let consumer = WorkExecutionsConsumer()
+        consumer.update(taskIDs: ["root"], model: model)
+        consumer.update(taskIDs: ["root", "revision"], model: model)
+        XCTAssertEqual(consumer.registered, ["root", "revision"])
+        XCTAssertNotNil(model.executionsConsumerTokensByTaskID["revision"])
+        consumer.update(taskIDs: ["revision"], model: model)
+        XCTAssertNil(model.executionsConsumerTokensByTaskID["root"])
+        consumer.update(taskIDs: [], model: model)
+        XCTAssertTrue(model.executionsConsumerTokensByTaskID.isEmpty)
     }
 
     private func activityTask(

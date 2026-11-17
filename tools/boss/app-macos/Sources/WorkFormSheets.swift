@@ -891,9 +891,6 @@ struct GitHubAccountSection: View {
     }
 }
 
-// Repo chip lives with the board badges. The comment above used to
-// introduce that view here.
-
 /// Inline markdown preview/edit for a work-item description. Save is
 /// explicit; the caller owns dirty text so a remote update cannot wipe it.
 struct WorkItemBriefEditor: View {

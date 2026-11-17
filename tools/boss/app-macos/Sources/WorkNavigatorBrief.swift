@@ -8,7 +8,7 @@ struct WorkNavigatorBrief: View {
     private var root: WorkTask { context.root }
     private var document: WorkTask { model.navigatorDocumentTask(for: root) }
     private var ask: WorkTask? {
-        model.navigator.askID.flatMap { model.task(withID: $0) }
+        root.navigator?.root?.revisions.currentTaskId.flatMap { model.task(withID: $0) }
     }
 
     var body: some View {
@@ -22,24 +22,28 @@ struct WorkNavigatorBrief: View {
                     if let ask, ask.id != root.id {
                         Text("Current ask").tag(NavigatorBriefDocument.currentAsk)
                     }
+                    if model.navigator.historicalDocumentByRoot[root.id] != nil {
+                        Text("Historical ask").tag(NavigatorBriefDocument.historical)
+                    }
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: ask != nil && ask?.id != root.id ? 280 : 160)
                 .accessibilityIdentifier("navigator-brief-document")
-                if let ask, ask.id != root.id, model.navigatorDocument(for: root.id) == .currentAsk {
-                    Text(askLabel(ask))
+                if document.id != root.id {
+                    Text(askLabel(document))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
             }
             WorkItemBriefEditor(
-                title: model.navigatorDocument(for: root.id) == .currentAsk ? "Current ask" : "Original brief",
+                title: model.navigatorDocument(for: root.id) == .original ? "Original brief"
+                    : model.navigatorDocument(for: root.id) == .historical ? "Historical ask" : "Current ask",
                 source: document.description,
                 draft: draftBinding,
                 isEditing: model.navigatorBriefIsEditing(document.id),
                 remoteChanged: model.navigatorBriefChangedRemotely(document),
-                readOnly: context.isReadOnly,
+                readOnly: context.isReadOnly || !model.navigatorBriefCanEdit(document),
                 showsAgentNotice: root.navigator?.root?.knownSection == .working,
                 onEdit: { model.beginNavigatorBriefEdit(document) },
                 onCancel: { model.cancelNavigatorBriefEdit(document) },
@@ -62,10 +66,9 @@ struct WorkNavigatorBrief: View {
         )
     }
 
-    private func askLabel(_ ask: WorkTask) -> String {
-        let revisions = root.navigator?.root?.revisions
-        let sequence = revisions.map { "Revision \($0.open)" } ?? "Revision"
-        let reason = root.navigator?.root?.reasonLabel ?? ask.name
-        return "\(sequence) · \(reason)"
+    func askLabel(_ ask: WorkTask) -> String {
+        let revisions = model.navigatorFamily(of: root).filter { $0.id != root.id }
+        let sequence = revisions.firstIndex(where: { $0.id == ask.id }).map { "Revision \($0 + 1)" } ?? "Revision"
+        return "\(sequence) · \(ask.name)"
     }
 }
