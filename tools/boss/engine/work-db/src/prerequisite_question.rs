@@ -125,14 +125,112 @@ pub(super) fn approve_in_tx(
             (prerequisite, true)
         }
     };
+    park_behind(
+        pending,
+        conn,
+        task,
+        ParkBehind {
+            question,
+            prerequisite: &prerequisite,
+            created,
+            answered_at,
+            now,
+        },
+        false,
+        attribution,
+    )
+}
 
-    order_project_prerequisites(conn, task, &prerequisite, now)?;
+/// The Yes path of a `link_prerequisite_task` operator question: add a
+/// `blocks` edge to the already-resolved task and park. Never creates a task.
+pub(super) struct ExistingApproval<'a> {
+    pub question: &'a OperatorQuestionView,
+    pub existing_id: &'a str,
+    pub answered_at: DateTime<Utc>,
+    pub now: &'a str,
+}
+
+pub(super) fn approve_existing_in_tx(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    task: &Task,
+    approval: ExistingApproval<'_>,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
+) -> Result<LinkedPrerequisite> {
+    let ExistingApproval {
+        question,
+        existing_id,
+        answered_at,
+        now,
+    } = approval;
+    let Some(prerequisite) = query_task(conn, existing_id)? else {
+        bail!("the named task no longer exists");
+    };
+    if prerequisite.deleted_at.is_some() {
+        bail!("the named task no longer exists");
+    }
+    if matches!(prerequisite.status, TaskStatus::Done | TaskStatus::Archived) {
+        bail!("the named task is already finished");
+    }
+    if prerequisite.id == task.id {
+        bail!("a task cannot wait on itself");
+    }
+    if prerequisite_link::in_askers_revision_chain(conn, task, &prerequisite)? {
+        bail!(prerequisite_link::SAME_CHAIN_REJECTION);
+    }
+    if deps::would_create_cycle(conn, &task.id, &prerequisite.id)? {
+        bail!("linking that task would create a cycle of waiting tasks");
+    }
+    park_behind(
+        pending,
+        conn,
+        task,
+        ParkBehind {
+            question,
+            prerequisite: &prerequisite,
+            created: false,
+            answered_at,
+            now,
+        },
+        true,
+        attribution,
+    )
+}
+
+struct ParkBehind<'a> {
+    question: &'a OperatorQuestionView,
+    prerequisite: &'a Task,
+    created: bool,
+    answered_at: DateTime<Utc>,
+    now: &'a str,
+}
+
+fn park_behind(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    task: &Task,
+    park: ParkBehind<'_>,
+    from_link: bool,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
+) -> Result<LinkedPrerequisite> {
+    let ParkBehind {
+        question,
+        prerequisite,
+        created,
+        answered_at,
+        now,
+    } = park;
+    order_project_prerequisites(conn, task, prerequisite, now)?;
 
     // A same-name task parked in the backlog (autostart off) would never be
-    // dispatched, leaving the dependent waiting with no signal.
+    // dispatched, leaving the dependent waiting with no signal. A task that
+    // already owns a PR must not get a new primary execution — that path
+    // refuses with "use a revision to change it" and would roll the Yes back.
     let schedulable = matches!(prerequisite.status, TaskStatus::Todo | TaskStatus::Blocked);
     let eligible = parking::upkeep_eligible(conn, &prerequisite.id)?;
-    let enabled_dispatch = eligible && !created && schedulable && !prerequisite.autostart;
+    let owns_pr = prerequisite.pr_url.as_deref().is_some_and(|url| !url.is_empty());
+    let needs_fresh_run = eligible && !created && schedulable && !owns_pr;
+    let enabled_dispatch = needs_fresh_run && !prerequisite.autostart;
     let actor = attribution.actor;
     let basis = attribution.basis("approve_in_tx");
     if enabled_dispatch {
@@ -147,8 +245,12 @@ pub(super) fn approve_in_tx(
 
     // Approval is an explicit restart, including after a terminal prior run.
     // Queue it here: the periodic reconciler intentionally cannot restart one.
-    if eligible && !created && schedulable && query_live_execution_for_work_item(conn, &prerequisite.id)?.is_none() {
-        if deps::gating_prereqs_for(conn, &prerequisite.id)?.is_empty() {
+    // A missing repo is a sticky attention on the prerequisite, the same as
+    // [`queue_gated_execution`]: it must not refuse the Yes that linked it.
+    if needs_fresh_run && query_live_execution_for_work_item(conn, &prerequisite.id)?.is_none() {
+        if !deps::gating_prereqs_for(conn, &prerequisite.id)?.is_empty() {
+            queue_gated_execution(conn, prerequisite, question)?;
+        } else if resolve_repo_for_work_item(conn, &prerequisite.id)?.is_some() {
             request_execution_in_tx_with_live_check(
                 pending,
                 conn,
@@ -159,8 +261,6 @@ pub(super) fn approve_in_tx(
                     .build(),
                 |_| false,
             )?;
-        } else {
-            queue_gated_execution(conn, &prerequisite, question)?;
         }
     }
 
@@ -168,7 +268,7 @@ pub(super) fn approve_in_tx(
     let description = format!(
         "{}{}",
         task.description,
-        prerequisite_note(question, &prerequisite, created, enabled_dispatch, &timestamp)
+        prerequisite_note(question, prerequisite, created, enabled_dispatch, from_link, &timestamp,)
     );
     super::description_guard::validate_description_update(&task.description, &description, false)?;
     // `todo` + autostart first, so the edge below parks the task through the
@@ -191,7 +291,7 @@ pub(super) fn approve_in_tx(
         "operator approved a prerequisite task; dependent parked behind it",
     );
     Ok(LinkedPrerequisite {
-        id: prerequisite.id,
+        id: prerequisite.id.clone(),
         created,
     })
 }
@@ -323,6 +423,7 @@ fn prerequisite_note(
     prerequisite: &Task,
     created: bool,
     enabled_dispatch: bool,
+    from_link: bool,
     timestamp: &str,
 ) -> String {
     // The canonical id, never the friendly short id: a worker that quotes the
@@ -330,6 +431,10 @@ fn prerequisite_note(
     let label = format!("{} (`{}`)", prerequisite.name, prerequisite.id);
     let outcome = if created {
         "The prerequisite task was created and scheduled for dispatch."
+    } else if from_link && enabled_dispatch {
+        "This task now waits for the named existing task, and that task has been scheduled for dispatch once its dependencies are satisfied."
+    } else if from_link {
+        "This task now waits for the named existing task."
     } else if enabled_dispatch {
         "An equivalent task already existed in the backlog with autostart off, so this task now links to it, and it has been scheduled for dispatch once its dependencies are satisfied."
     } else {
@@ -362,22 +467,35 @@ mod tests {
                 brief: "Fix the shared fixture on main.".to_owned(),
                 file_count_bypass: None,
                 option_labels: None,
+                existing_id: None,
+                existing_pr: None,
             })
             .explanation("CI cannot go green until the fixture is fixed on main.")
             .asked_at("2026-10-23")
             .execution_id("exec_example")
             .build();
-        // created; linked with dispatch enabled; already linked.
-        for (created, enabled_dispatch) in [(true, false), (false, true), (false, false)] {
+        // created; linked with dispatch enabled; already linked; named-existing link.
+        for (created, enabled_dispatch, from_link) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (false, false, true),
+            (false, true, true),
+        ] {
             let note = prerequisite_note(
                 &question,
                 &prerequisite,
                 created,
                 enabled_dispatch,
+                from_link,
                 "2026-10-23 00:00 UTC",
             );
             crate::prose_vocabulary::assert_no_forbidden_prose("prerequisite approval note", &note);
             assert!(note.contains("## Prerequisite approved by the repo owner (2026-10-23 00:00 UTC)"));
+            if from_link {
+                assert!(note.contains("This task now waits for the named existing task"));
+                assert!(!note.contains("instead of creating a duplicate"));
+            }
         }
     }
 }

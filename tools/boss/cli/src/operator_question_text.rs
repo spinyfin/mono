@@ -16,6 +16,7 @@ pub(crate) fn operator_question_lines(record: &OperatorQuestionRecord) -> Vec<St
     let answer_type = match &q.answer_type {
         OperatorAnswerType::YesNo => "yes_no",
         OperatorAnswerType::CreatePrerequisiteTask { .. } => "create_prerequisite_task",
+        OperatorAnswerType::LinkPrerequisiteTask { .. } => "link_prerequisite_task",
         OperatorAnswerType::MultipleChoice { .. } => "multiple_choice",
     };
     lines.push(format!(
@@ -33,6 +34,23 @@ pub(crate) fn operator_question_lines(record: &OperatorQuestionRecord) -> Vec<St
                 "  File-count split: {} files, limit {}. {declining} authorizes a file-count exception for this PR only.",
                 spec.files, spec.limit
             ));
+        }
+    }
+    if let OperatorAnswerType::LinkPrerequisiteTask {
+        name,
+        pr_url,
+        work_item_id,
+        ..
+    } = &q.answer_type
+    {
+        if !name.is_empty() {
+            lines.push(format!("  Existing prerequisite task: {name}"));
+        }
+        if let Some(pr_url) = pr_url.as_deref().filter(|url| !url.is_empty()) {
+            lines.push(format!("  Existing pull request: {pr_url}"));
+        }
+        if !work_item_id.is_empty() {
+            lines.push(format!("  Existing task id: {work_item_id}"));
         }
     }
     if let Some(labels) = q.answer_type.option_labels() {
@@ -101,6 +119,8 @@ mod tests {
             brief: "Land the first capability.".into(),
             file_count_bypass: Some(FileCountBypassSpec { files: 48, limit: 30 }),
             option_labels: labels,
+            existing_id: None,
+            existing_pr: None,
         }
     }
 
@@ -139,5 +159,30 @@ mod tests {
         .join("\n");
         assert!(choice.contains("Options:\n    a\n    b"), "{choice}");
         assert!(choice.contains("Answer: b;"), "{choice}");
+    }
+
+    #[test]
+    fn a_link_question_lists_the_existing_task_and_pull_request() {
+        let listed = operator_question_lines(&record(
+            OperatorAnswerType::LinkPrerequisiteTask {
+                existing_id: None,
+                existing_pr: Some("https://github.com/acme/widget/pull/9".into()),
+                work_item_id: "task_abc".into(),
+                name: "Land the wiring".into(),
+                pr_url: Some("https://github.com/acme/widget/pull/9".into()),
+            },
+            None,
+        ))
+        .join("\n");
+        assert!(listed.contains("Answer type: link_prerequisite_task"), "{listed}");
+        assert!(
+            listed.contains("Existing prerequisite task: Land the wiring"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("Existing pull request: https://github.com/acme/widget/pull/9"),
+            "{listed}"
+        );
+        assert!(listed.contains("Existing task id: task_abc"), "{listed}");
     }
 }

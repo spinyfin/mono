@@ -1104,6 +1104,11 @@ pub enum OperatorAnswerType {
     ///
     /// When `file_count_bypass` is set, No authorizes a file-count exception
     /// for this PR instead of taking the ordinary declined path.
+    ///
+    /// `existing_id` / `existing_pr` are optional hints. When the engine
+    /// resolves either to an open task that already owns the work, it
+    /// rewrites the stored question to [`Self::LinkPrerequisiteTask`]
+    /// instead of offering to create a duplicate.
     CreatePrerequisiteTask {
         name: String,
         brief: String,
@@ -1116,6 +1121,36 @@ pub enum OperatorAnswerType {
         /// keep Yes / No.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         option_labels: Option<AnswerOptionLabels>,
+        /// Worker-supplied task id (canonical or friendly). The engine
+        /// resolves it; it is never matched by name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_id: Option<String>,
+        /// Worker-supplied GitHub PR URL, `owner/repo#n`, or PR number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_pr: Option<String>,
+    },
+    /// Gate this task behind an existing open task the worker named by id
+    /// or PR. Yes adds a `blocks` edge to that task and parks the asker;
+    /// it never creates a new task. `existing_id` / `existing_pr` are what
+    /// the worker sent; `work_item_id` / `name` / `pr_url` are filled by
+    /// the engine before the question is stored.
+    LinkPrerequisiteTask {
+        /// Worker-supplied task id (canonical or friendly).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_id: Option<String>,
+        /// Worker-supplied GitHub PR URL, `owner/repo#n`, or PR number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_pr: Option<String>,
+        /// Canonical id the engine resolved. Empty on the worker payload;
+        /// required on a stored question.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        work_item_id: String,
+        /// Display name of the resolved task. Empty on the worker payload.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        /// Bound PR URL when the resolved task owns one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr_url: Option<String>,
     },
     /// One of `choices` is selected; the answer is
     /// [`OperatorAnswer::MultipleChoice`] carrying the chosen string verbatim.
@@ -1179,7 +1214,10 @@ impl OperatorAnswerType {
     /// other types are answered with Yes/No.
     pub fn check_answer(&self, answer: &OperatorAnswer) -> Result<(), String> {
         match (self, answer) {
-            (Self::YesNo | Self::CreatePrerequisiteTask { .. }, OperatorAnswer::YesNo { .. }) => Ok(()),
+            (
+                Self::YesNo | Self::CreatePrerequisiteTask { .. } | Self::LinkPrerequisiteTask { .. },
+                OperatorAnswer::YesNo { .. },
+            ) => Ok(()),
             (Self::MultipleChoice { choices }, OperatorAnswer::MultipleChoice { value }) => {
                 if choices.contains(value) {
                     Ok(())
@@ -1199,9 +1237,10 @@ impl OperatorAnswerType {
                     labels.yes, labels.no
                 ))
             }
-            (Self::YesNo | Self::CreatePrerequisiteTask { .. }, OperatorAnswer::MultipleChoice { .. }) => {
-                Err("this question is answered Yes or No, not by choosing an option".into())
-            }
+            (
+                Self::YesNo | Self::CreatePrerequisiteTask { .. } | Self::LinkPrerequisiteTask { .. },
+                OperatorAnswer::MultipleChoice { .. },
+            ) => Err("this question is answered Yes or No, not by choosing an option".into()),
         }
     }
 
@@ -1209,6 +1248,38 @@ impl OperatorAnswerType {
     /// engine owns the phrasing so every producer (CLI, validation) agrees.
     pub fn prerequisite_question_text(name: &str) -> String {
         format!("Create prerequisite task '{name}'? This task will wait for it.")
+    }
+
+    /// Placeholder wording for a link request before the engine resolves the
+    /// named task. Apply overwrites this with [`Self::link_prerequisite_question_text`].
+    pub fn link_prerequisite_unresolved_question_text() -> String {
+        "Wait for the existing work this request names? This task will wait for it.".into()
+    }
+
+    /// Wording for a stored link question. `pr_label` is a compact public
+    /// citation such as `acme/widget#9` when the task owns a PR.
+    pub fn link_prerequisite_question_text(name: &str, pr_label: Option<&str>) -> String {
+        match pr_label.filter(|label| !label.is_empty()) {
+            Some(label) => format!("Wait for '{name}' ({label})? This task will wait for it."),
+            None => format!("Wait for '{name}'? This task will wait for it."),
+        }
+    }
+
+    /// Worker-supplied id and PR hints, when this question names existing work.
+    pub fn existing_prerequisite_refs(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::CreatePrerequisiteTask {
+                existing_id,
+                existing_pr,
+                ..
+            }
+            | Self::LinkPrerequisiteTask {
+                existing_id,
+                existing_pr,
+                ..
+            } => (existing_id.as_deref(), existing_pr.as_deref()),
+            _ => (None, None),
+        }
     }
 
     /// The question wording for a split-vs-file-count-bypass proposal. States
@@ -1225,7 +1296,7 @@ impl OperatorAnswerType {
     pub fn file_count_bypass(&self) -> Option<FileCountBypassSpec> {
         match self {
             Self::CreatePrerequisiteTask { file_count_bypass, .. } => *file_count_bypass,
-            _ => None,
+            Self::YesNo | Self::LinkPrerequisiteTask { .. } | Self::MultipleChoice { .. } => None,
         }
     }
 }
@@ -1367,6 +1438,8 @@ mod tests {
             brief: "Stand-alone brief".into(),
             file_count_bypass: None,
             option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         };
         let json = serde_json::to_value(&prerequisite).unwrap();
         assert_eq!(
@@ -1382,6 +1455,8 @@ mod tests {
             brief: "Stand-alone brief".into(),
             file_count_bypass: Some(super::FileCountBypassSpec { files: 48, limit: 30 }),
             option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         };
         let json = serde_json::to_value(&split).unwrap();
         assert_eq!(
@@ -1405,6 +1480,38 @@ mod tests {
             )
             .is_err(),
             "a prerequisite proposal without a brief is not decodable"
+        );
+        let link = OperatorAnswerType::LinkPrerequisiteTask {
+            existing_id: Some("task_abc".into()),
+            existing_pr: Some("https://github.com/acme/widget/pull/9".into()),
+            work_item_id: String::new(),
+            name: String::new(),
+            pr_url: None,
+        };
+        let json = serde_json::to_value(&link).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "link_prerequisite_task",
+                "existing_id": "task_abc",
+                "existing_pr": "https://github.com/acme/widget/pull/9"
+            })
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), link);
+        let resolved = OperatorAnswerType::LinkPrerequisiteTask {
+            existing_id: None,
+            existing_pr: None,
+            work_item_id: "task_abc".into(),
+            name: "Land the wiring".into(),
+            pr_url: Some("https://github.com/acme/widget/pull/9".into()),
+        };
+        assert_eq!(
+            OperatorAnswerType::link_prerequisite_question_text("Land the wiring", Some("acme/widget#9")),
+            "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it."
+        );
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap()["kind"],
+            "link_prerequisite_task"
         );
         assert_eq!(
             OperatorAnswerType::prerequisite_question_text("Fix fixture race"),
@@ -1491,6 +1598,8 @@ mod tests {
             brief: "b".into(),
             file_count_bypass: None,
             option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         };
         assert!(prerequisite.check_answer(&yes).is_ok());
         assert!(prerequisite.check_answer(&choose("n")).is_err());

@@ -134,6 +134,8 @@ async fn prerequisite_question_reads_like_the_yes_no_question_and_carries_the_pr
             brief: "The shared fixture races retention cleanup. Fix it on main.".into(),
             file_count_bypass: None,
             option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         }
     );
 }
@@ -696,6 +698,8 @@ async fn file_count_split_question_states_count_limit_and_first_pr() {
             file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
             // The engine, not the worker, names the two actions the card offers.
             option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+            existing_id: None,
+            existing_pr: None,
         }
     );
 }
@@ -885,4 +889,176 @@ async fn a_question_stored_without_labels_still_answers_yes_no_only() {
         task.description
             .contains("BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered No by the repo owner on ")
     );
+}
+
+const LINK_PR_URL: &str = "https://github.com/acme/widget/pull/9";
+const LINK_OWNER_NAME: &str = "Land the wiring";
+
+fn bind_pr(state: &ServerState, task_id: &str, url: &str) {
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, url],
+        )
+        .unwrap();
+}
+
+fn link_question_payload(existing_pr: &str) -> Value {
+    json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
+        "answer_type":{"kind":"link_prerequisite_task", "existing_pr": existing_pr},
+        "explanation":"The other change is already in review."
+    }})
+}
+
+async fn parked_asking_task_with_pr_owner() -> (Arc<ServerState>, tempfile::TempDir, String, String, String) {
+    let (state, dir, execution, task_id) = live_chore_execution();
+    prepare_workspace_teardown(&state, &execution);
+    {
+        let conn = state.work_db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET kind = 'project_task', description = 'Original brief' WHERE id = ?1",
+            rusqlite::params![task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET kind = 'task_implementation' WHERE id = ?1",
+            rusqlite::params![execution],
+        )
+        .unwrap();
+    }
+    let product_id = question_task(&state, &task_id).product_id;
+    let owner =
+        boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product_id, LINK_OWNER_NAME);
+    bind_pr(&state, &owner.id, LINK_PR_URL);
+    (state, dir, execution, task_id, owner.id)
+}
+
+#[tokio::test]
+async fn create_question_that_names_a_bound_pr_is_stored_as_a_link() {
+    let (state, _dir, execution, task_id, owner_id) = parked_asking_task_with_pr_owner().await;
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution,
+                ProposalKind::RunDone,
+                json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
+                    "answer_type":{"kind":"create_prerequisite_task",
+                        "name":"Land hook wiring",
+                        "brief": format!("Finish {LINK_PR_URL} on main.")},
+                    "explanation":"The other change is already in review."
+                }}),
+            ),
+        )
+        .await,
+    );
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    assert_eq!(
+        question.text,
+        "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it."
+    );
+    match question.answer_type {
+        boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+            work_item_id,
+            name,
+            pr_url,
+            ..
+        } => {
+            assert_eq!(work_item_id, owner_id);
+            assert_eq!(name, LINK_OWNER_NAME);
+            assert_eq!(pr_url.as_deref(), Some(LINK_PR_URL));
+        }
+        other => panic!("expected a stored link question, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn link_yes_parks_behind_the_named_owner_without_creating() {
+    let (state, _dir, execution, task_id, owner_id) = parked_asking_task_with_pr_owner().await;
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution, ProposalKind::RunDone, link_question_payload(LINK_PR_URL)),
+        )
+        .await,
+    );
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    assert_eq!(
+        question.text,
+        "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it."
+    );
+    let task = match answer_question(&state, &task_id, true).await {
+        FrontendEvent::WorkItemUpdated {
+            item: boss_work_db::WorkItem::Task(task),
+        } => task,
+        other => panic!("expected updated task, got {other:?}"),
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
+    assert_eq!(prerequisites_of(&state, &task_id), vec![owner_id.clone()]);
+    assert_eq!(chore_named(&state, &task.product_id, LINK_OWNER_NAME).len(), 1);
+    assert!(
+        task.description
+            .contains("This task now waits for the named existing task.")
+    );
+    assert!(!task.description.contains("instead of creating a duplicate"));
+}
+
+#[tokio::test]
+async fn link_no_leaves_the_named_owner_untouched() {
+    let (state, _dir, execution, task_id, owner_id) = parked_asking_task_with_pr_owner().await;
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution, ProposalKind::RunDone, link_question_payload(LINK_PR_URL)),
+        )
+        .await,
+    );
+    let task = match answer_question(&state, &task_id, false).await {
+        FrontendEvent::WorkItemUpdated {
+            item: boss_work_db::WorkItem::Task(task),
+        } => task,
+        other => panic!("expected updated task, got {other:?}"),
+    };
+    assert!(prerequisites_of(&state, &task_id).is_empty());
+    assert_eq!(chore_named(&state, &task.product_id, LINK_OWNER_NAME).len(), 1);
+    assert_eq!(owner_id, chore_named(&state, &task.product_id, LINK_OWNER_NAME)[0].id);
+    assert!(task.description.contains("The repo owner recorded this decline"));
+}
+
+#[tokio::test]
+async fn link_question_for_an_unbound_pr_is_rejected() {
+    let (state, _dir, execution, task_id) = live_chore_execution();
+    prepare_workspace_teardown(&state, &execution);
+    {
+        let conn = state.work_db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET kind = 'project_task', description = 'Original brief' WHERE id = ?1",
+            rusqlite::params![task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET kind = 'task_implementation' WHERE id = ?1",
+            rusqlite::params![execution],
+        )
+        .unwrap();
+    }
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution, ProposalKind::RunDone, link_question_payload(LINK_PR_URL)),
+        )
+        .await,
+    );
+    assert_eq!(proposal.state, boss_protocol::ProposalState::Rejected);
+    let reason = proposal.decision_reason.expect("rejected link must name why");
+    assert!(reason.contains("no open task owns the pull request"), "{reason}");
+    assert!(question_task(&state, &task_id).operator_question.is_none());
 }

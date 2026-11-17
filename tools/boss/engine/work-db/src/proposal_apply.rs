@@ -1026,6 +1026,18 @@ fn apply_run_done(
         return Ok(ApplyDecision::Rejected(reason));
     }
 
+    let stored_question = if let Some(question) = &payload.question {
+        let asking = query_task(tx, &execution.work_item_id)?;
+        match super::prerequisite_link::resolve_stored_question(tx, asking.as_ref(), question)? {
+            super::prerequisite_link::ResolvedQuestion::Ready(question) => Some(question),
+            super::prerequisite_link::ResolvedQuestion::Rejected(reason) => {
+                return Ok(ApplyDecision::Rejected(reason));
+            }
+        }
+    } else {
+        None
+    };
+
     let affected = tx.execute(
         "UPDATE work_executions SET run_done_declared_at = ?2, run_done_outcome = ?3 WHERE id = ?1",
         params![execution_id, now_string(), payload.outcome.as_str()],
@@ -1052,7 +1064,7 @@ fn apply_run_done(
     }
     supersede_prior_run_done_declarations(tx, execution_id, proposal_id)?;
     super::queue_ci_evidence::record_delivery(tx, execution_id, &payload)?;
-    if let Some(question) = &payload.question {
+    if let Some(question) = &stored_question {
         super::pr_flow::insert_question_with_liveness(tx, execution_id, proposal_id, question, question_worker)?;
     } else if payload.outcome == boss_protocol::RunDoneOutcome::Blocked
         && !preserve_mismatch_question

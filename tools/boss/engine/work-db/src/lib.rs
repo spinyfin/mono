@@ -936,6 +936,7 @@ mod pr_binding;
 pub use merge_evidence::{MergeEvidence, MergeObservation};
 mod pr_flow;
 mod pr_state;
+mod prerequisite_link;
 mod prerequisite_question;
 mod products_design;
 mod proposal_apply;

@@ -27,6 +27,8 @@ fn file_count_bypass_approval_text_is_scoped_and_avoids_internal_vocabulary() {
             brief: "Land the first capability as its own PR.".into(),
             file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
             option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+            existing_id: None,
+            existing_pr: None,
         })
         .explanation("The change is 48 files against a limit of 30.")
         .asked_at("2026-10-23")
@@ -57,6 +59,8 @@ fn declined_answer_names_the_option_that_was_chosen() {
             brief: "Land the first capability.".into(),
             file_count_bypass: None,
             option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+            existing_id: None,
+            existing_pr: None,
         })
         .explanation("Context:\nToo big.\nSplit:\nLand the first PR.\nBypass limit:\nKeep one PR.\nRecommendation:\nBypass limit")
         .asked_at("2026-10-23")

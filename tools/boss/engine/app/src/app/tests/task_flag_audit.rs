@@ -490,6 +490,8 @@ fn prerequisite_create_question(name: &str) -> OperatorQuestion {
             brief: "Fix the shared fixture first.".into(),
             file_count_bypass: None,
             option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         },
     }
 }

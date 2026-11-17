@@ -158,6 +158,40 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(OperatorAnswer.yesNo(true).wirePayload["kind"] as? String, "yes_no")
     }
 
+    func testParseTaskDecodesLinkPrerequisiteQuestionWithTheExistingTask() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload = basePayload()
+        payload["status"] = "blocked"
+        payload["blocked_reason"] = "awaiting_operator_answer"
+        payload["operator_question"] = [
+            "id": "oq_link",
+            "text": "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it.",
+            "answer_type": [
+                "kind": "link_prerequisite_task",
+                "existing_pr": "https://github.com/acme/widget/pull/9",
+                "work_item_id": "task_abc",
+                "name": "Land the wiring",
+                "pr_url": "https://github.com/acme/widget/pull/9",
+            ] as [String: Any],
+            "explanation": "The other change is already in review.",
+            "asked_at": "1790000000",
+            "execution_id": "exec_1",
+        ] as [String: Any]
+
+        let task = try XCTUnwrap(client.parseTask(payload))
+        let question = try XCTUnwrap(task.operatorQuestion)
+        XCTAssertEqual(question.answerType, .linkPrerequisiteTask)
+        XCTAssertEqual(question.prerequisiteTask?.name, "Land the wiring")
+        XCTAssertEqual(question.prerequisiteTask?.brief, "")
+        XCTAssertEqual(question.prerequisiteTask?.pullRequest, "https://github.com/acme/widget/pull/9")
+        XCTAssertEqual(question.prerequisiteTask?.existing, true)
+        XCTAssertTrue(task.isAwaitingOperatorAnswer)
+        XCTAssertEqual(task.boardColumn, .doing)
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing))
+        XCTAssertEqual(snapshot.operatorQuestion?.prerequisiteTask, question.prerequisiteTask)
+        XCTAssertEqual(OperatorAnswer.yesNo(true).wirePayload["kind"] as? String, "yes_no")
+    }
+
     /// The engine names the two answers of a split-vs-bypass question; the app
     /// carries those names to the card verbatim and attaches no meaning to them.
     func testParseTaskCarriesTheEnginesOptionNamesToTheCard() throws {

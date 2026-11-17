@@ -2231,6 +2231,11 @@ fn revision_directive_routes_blocking_pr_work_to_prerequisite_and_later_work_to_
         "revision prompt must route a PR that must land first to create-prerequisite-task:\n{prompt}",
     );
     assert!(
+        prompt.contains("--answer-type link-prerequisite-task --prerequisite-pr \"<github-pr>\"")
+            && prompt.contains("--prerequisite-id"),
+        "revision prompt must offer linking an existing owner instead of creating a duplicate:\n{prompt}",
+    );
+    assert!(
         prompt.contains("\"$BOSS_BIN\" propose followup-task --name \"<short title>\"")
             && prompt.contains("only for non-blocking work that can happen later"),
         "revision prompt must keep followup-task as the non-blocking path:\n{prompt}",

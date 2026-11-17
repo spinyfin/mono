@@ -53,7 +53,7 @@ impl OperatorAnswerType {
     pub fn option_labels(&self) -> Option<&AnswerOptionLabels> {
         match self {
             Self::CreatePrerequisiteTask { option_labels, .. } => option_labels.as_ref(),
-            Self::YesNo | Self::MultipleChoice { .. } => None,
+            Self::YesNo | Self::LinkPrerequisiteTask { .. } | Self::MultipleChoice { .. } => None,
         }
     }
 
@@ -99,6 +99,8 @@ mod tests {
             brief: "Land the first capability.".into(),
             file_count_bypass: Some(FileCountBypassSpec { files: 48, limit: 30 }),
             option_labels: Some(AnswerOptionLabels::split_or_bypass()),
+            existing_id: None,
+            existing_pr: None,
         }
     }
 
