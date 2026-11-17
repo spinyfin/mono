@@ -1,6 +1,43 @@
 use super::*;
+use boss_observation_contracts::OpenPrMergeability;
 
 const PR: &str = "https://github.com/spinyfin/mono/pull/3639";
+
+#[tokio::test]
+async fn conflicting_parent_refuses_applied_no_op_with_body_edit_even_after_parent_push() {
+    for moved in [false, true] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, _, revision_id, execution_id, _) =
+            conflict_revision_fixture(workspace.path(), PR, "unchanged");
+        db.set_execution_pr_body_before(&execution_id, "original description")
+            .unwrap();
+        db.set_execution_stop_seen(&execution_id).unwrap();
+        let verifier = StubBranchVerifier::ok("boss/parent");
+        verifier
+            .set_head_oid(Ok(if moved { "parent-pushed" } else { "unchanged" }.into()))
+            .await;
+        verifier
+            .set_body(Ok("description with revision verification".into()))
+            .await;
+        let harness = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        let probes = harness.probes.clone();
+        let handler = harness
+            .handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+                mergeability: OpenPrMergeability::Conflict,
+            }));
+        declare_no_changes_needed(&db, &execution_id);
+        assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput);
+        assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+        assert_eq!(task(&db, &revision_id).status, TaskStatus::Active);
+        assert!(db.ready_no_op_declaration_id(&execution_id).unwrap().is_none());
+        assert_eq!(db.execution_pr_head_baseline_absorbed(&execution_id).unwrap(), moved);
+        let nudges = probes.snapshot();
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].1.contains("CONFLICTING"), "{nudges:?}");
+    }
+}
 
 fn task(db: &WorkDb, id: &str) -> boss_protocol::Task {
     match db.get_work_item(id).unwrap() {
@@ -13,7 +50,10 @@ fn task(db: &WorkDb, id: &str) -> boss_protocol::Task {
 /// The next revision needs both the dependency and the PR writer slot freed.
 #[tokio::test]
 async fn applied_revision_no_op_with_body_edit_finishes_before_ci_and_releases_next_writer() {
-    for slug in ["claude", "codex", "grok"] {
+    for (slug, absorbed) in ["claude", "codex", "grok"]
+        .into_iter()
+        .flat_map(|slug| [false, true].map(|absorbed| (slug, absorbed)))
+    {
         let workspace = tempdir().unwrap();
         let (_dir, db, product_id, revision_id, execution_id) = revision_fixture(workspace.path(), PR, "unchanged");
         set_work_item_driver(&db, &revision_id, slug);
@@ -31,7 +71,11 @@ async fn applied_revision_no_op_with_body_edit_finishes_before_ci_and_releases_n
         db.set_execution_pr_body_before(&execution_id, "original description")
             .unwrap();
         let verifier = StubBranchVerifier::ok("boss/parent");
-        verifier.set_head_oid(Ok("unchanged".into())).await;
+        let head = if absorbed { "parent-pushed" } else { "unchanged" };
+        verifier.set_head_oid(Ok(head.into())).await;
+        if absorbed {
+            db.set_execution_stop_seen(&execution_id).unwrap();
+        }
         verifier
             .set_body(Ok("description with revision verification".into()))
             .await;
@@ -54,6 +98,7 @@ async fn applied_revision_no_op_with_body_edit_finishes_before_ci_and_releases_n
         );
         let outcome = handler.on_stop(&execution_id).await;
         assert!(matches!(outcome, StopOutcome::NoChangesNeeded { .. }), "{outcome:?}");
+        assert_eq!(db.execution_pr_head_baseline_absorbed(&execution_id).unwrap(), absorbed);
         assert_eq!(task(&db, &revision_id).status, TaskStatus::Done);
         assert_eq!(task(&db, &parent_id).status, TaskStatus::InReview);
         assert_eq!(

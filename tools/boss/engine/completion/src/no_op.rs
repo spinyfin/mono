@@ -303,6 +303,14 @@ impl WorkerCompletionHandler {
     /// Contribution is always [`ContributionEvidence::Indeterminate`]: this
     /// path is the declaration termination and must not call GitHub, so the
     /// record must not describe a measured empty diff.
+    ///
+    /// Durable sweep recovery intentionally uses the same conservative evidence:
+    /// the ready stamp persists validation of the exact proposal, not the
+    /// transient head measurement. After restart, a previously ProvenAbsent
+    /// result is therefore recorded as Indeterminate. Recovery still rechecks
+    /// local command/contribution evidence; a refusal consumes the declaration
+    /// even without a new driver event, preventing a contradicted claim from
+    /// being retried indefinitely by the sweep.
     pub(super) fn declared_run_done_no_op_inputs(
         &self,
         execution: &crate::work::WorkExecution,
