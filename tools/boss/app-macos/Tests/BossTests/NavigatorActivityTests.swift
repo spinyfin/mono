@@ -334,22 +334,74 @@ final class NavigatorActivityTests: XCTestCase {
         XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.runId, "run-two")
     }
 
-    func testAskLabelUsesFamilyOrdinalAndAskName() {
-        let root = activityTask(section: "working", revisions: [
-            "open": 1, "total": 3, "current_task_id": "third",
+    func testAskLabelUsesEngineRevisionSeqAndOrigin() {
+        var ask = NavigatorTestFixture.task("third", rootID: "root")
+        ask.revisionSeq = 3
+        ask.createdVia = "ci-fix:abc"
+        let inputs = WorkNavigatorBrief.revisionBadgeInputs(ask)
+        XCTAssertEqual(inputs.seq, 3)
+        XCTAssertEqual(inputs.origin, .ciFix)
+        ask.createdVia = "manual"
+        XCTAssertNil(WorkNavigatorBrief.revisionBadgeInputs(ask).origin)
+    }
+
+    func testRunningRevisionDefaultsToCurrentAskWithoutDraft() {
+        let original = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
         ])
-        var first = NavigatorTestFixture.task("first", rootID: "root")
-        first.createdAt = "2026-01-01"
-        var second = NavigatorTestFixture.task("second", rootID: "root")
-        second.createdAt = "2026-01-02"
-        var third = NavigatorTestFixture.task("third", rootID: "root")
-        third.createdAt = "2026-01-03"
-        third.name = "Repair CI"
-        let model = NavigatorTestFixture.model([root, first, second, third])
-        model.selectWorkCard(root.id)
+        let model = NavigatorTestFixture.model([original])
+        model.isConnected = true
+        model.selectWorkCard("root")
         model.setWorkViewMode(.navigator)
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .original)
+        let revised = activityTask(section: "working", activities: [
+            ["execution_id": "execution-2", "task_id": "revision", "run_id": "run-2"],
+        ], revisions: ["open": 1, "total": 1, "current_task_id": "revision"])
+        NavigatorTestFixture.snapshot(model, [revised, NavigatorTestFixture.task("revision", rootID: "root")])
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .currentAsk)
+        XCTAssertEqual(model.navigatorDocumentTask(for: model.navigatorSelectedTask!).id, "revision")
+        // The ask ends: the Brief falls back to the original under its own title.
+        NavigatorTestFixture.snapshot(model, [original, NavigatorTestFixture.task("revision", rootID: "root")])
+        model.setNavigatorDocument(.currentAsk, rootID: "root")
+        model.reconcileNavigatorSelection()
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .original)
+        XCTAssertEqual(model.navigatorDocumentTask(for: model.navigatorSelectedTask!).id, "root")
         let view = WorkNavigatorBrief(context: context(model))
-        XCTAssertEqual(view.askLabel(third), "Revision 3 · Repair CI")
+        XCTAssertEqual(view.documentTitle, "Original brief")
+    }
+
+    func testEndedNoticeOnlyClaimsNewRevisionWhileWorking() {
+        let working = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
+        ])
+        let model = NavigatorTestFixture.model([working])
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        let landed = activityTask(section: "landed", merge: true)
+        NavigatorTestFixture.snapshot(model, [landed])
+        let view = WorkNavigatorActivity(context: context(model), workspace: nil)
+        XCTAssertEqual(view.endedNotice, "Execution ended")
+    }
+
+    func testEditBriefRevealsTheDocumentItEdits() {
+        let root = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "root", "run_id": "run"],
+        ], revisions: ["open": 1, "total": 1, "current_task_id": "revision"])
+        let model = NavigatorTestFixture.model([root, NavigatorTestFixture.task("revision", rootID: "root")])
+        model.isConnected = true
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .currentAsk)
+        model.performNavigatorCommand(NavigatorCommand(kind: "edit_brief", taskId: "root"))
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .original)
+        XCTAssertTrue(model.navigatorBriefIsEditing("root"))
+    }
+
+    func testParkCommandRequestsPark() {
+        let root = activityTask(section: "backlog", waitKind: "waiting_dependency")
+        let model = NavigatorTestFixture.model([root])
+        model.performNavigatorCommand(NavigatorCommand(kind: "park", taskId: "root"))
+        XCTAssertEqual(model.pendingParkRequest?.id, "root")
     }
 
     func testLandedBriefCannotEditOrSave() {

@@ -465,10 +465,25 @@ extension ChatViewModel {
             requestPark(task: task)
         case "edit_brief":
             if let task = task(withID: command.taskId) {
+                revealNavigatorDocument(for: task)
                 beginNavigatorBriefEdit(task)
             }
         default:
             break
+        }
+    }
+
+    /// Show the document an edit targets so its draft is never hidden.
+    private func revealNavigatorDocument(for task: WorkTask) {
+        guard let rootID = navigator.selectedRootID ?? task.navigator?.rootTaskId,
+              let root = self.task(withID: rootID) else { return }
+        if task.id == root.id {
+            setNavigatorDocument(.original, rootID: rootID)
+        } else if task.id == root.navigator?.root?.revisions.currentTaskId {
+            setNavigatorDocument(.currentAsk, rootID: rootID)
+        } else {
+            navigator.historicalDocumentByRoot[rootID] = task.id
+            setNavigatorDocument(.historical, rootID: rootID)
         }
     }
 }

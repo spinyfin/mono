@@ -157,9 +157,10 @@ struct WorkNavigatorState {
     var collapsedByScope: [String: Set<NavigatorSection>] = [:]
     var scrollByScope: [String: String] = [:]
     var revealGeneration = UUID()
-    /// Sticky per root: original brief vs current ask.
+    /// Explicit per-root choice (picker, History, reveal). Absent means the
+    /// default derived from the projection; see `navigatorDocument(for:)`.
     var documentByRoot: [String: NavigatorBriefDocument] = [:]
-    /// Sticky per root, keyed by execution id so a new run cannot steal it.
+    /// Keyed by root id; holds the selected activity so a new run cannot replace it.
     var activityByRoot: [String: NavigatorActivity] = [:]
     /// Dirty markdown keyed by the document's task id.
     var briefDrafts: [String: NavigatorBriefDraft] = [:]

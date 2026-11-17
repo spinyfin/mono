@@ -120,10 +120,6 @@ extension ChatViewModel {
             navigator.selectedAtSection = detail.knownSection
             navigator.tab = NavigatorDetailSlot(rawValue: detail.defaultDetail) ?? .activity
             navigator.tabs = [.activity, .history, navigator.tab]
-            if navigator.documentByRoot[root.id] == nil {
-                let ask = navigator.askID.flatMap { self.task(withID: $0) }
-                navigator.documentByRoot[root.id] = (ask != nil && ask?.id != root.id) ? .currentAsk : .original
-            }
         }
         if let historicalID = askID ?? (task.id != root.id ? task.id : nil) {
             navigator.historicalDocumentByRoot[root.id] = historicalID
@@ -180,6 +176,7 @@ extension ChatViewModel {
                 // Keep the previous ask while a non-nil current revision
                 // has not loaded into the store yet.
             } else {
+                retireNavigatorAsk(rootID: selected.id)
                 navigator.askID = nil
             }
             retainNavigatorActivity(for: selected)
@@ -306,8 +303,38 @@ extension ChatViewModel {
         navigator.revealGeneration = UUID()
     }
 
+    /// The engine dropped the current ask. A Current ask choice would now
+    /// resolve to the original brief under the wrong title, so move it to the
+    /// retired ask when it holds an open draft, otherwise back to Original.
+    private func retireNavigatorAsk(rootID: String) {
+        guard navigator.documentByRoot[rootID] == .currentAsk else { return }
+        if let previous = navigator.askID, previous != rootID, task(withID: previous) != nil,
+           navigatorBriefIsEditing(previous) {
+            navigator.historicalDocumentByRoot[rootID] = previous
+            navigator.documentByRoot[rootID] = .historical
+        } else {
+            navigator.documentByRoot[rootID] = .original
+        }
+    }
+
+    /// The document the Brief shows. An explicit choice wins while it still
+    /// resolves; otherwise a running revision defaults to its current ask,
+    /// unless the original brief holds an open draft.
     func navigatorDocument(for rootID: String) -> NavigatorBriefDocument {
-        navigator.documentByRoot[rootID] ?? .original
+        let root = task(withID: rootID)
+        let ask = root?.navigator?.root?.revisions.currentTaskId
+            .flatMap { $0 != rootID ? task(withID: $0) : nil }
+        switch navigator.documentByRoot[rootID] {
+        case .original:
+            return .original
+        case .currentAsk:
+            return ask != nil ? .currentAsk : .original
+        case .historical:
+            let found = navigator.historicalDocumentByRoot[rootID].flatMap { task(withID: $0) } != nil
+            return found ? .historical : .original
+        case nil:
+            return ask != nil && !navigatorBriefIsEditing(rootID) ? .currentAsk : .original
+        }
     }
 
     func setNavigatorDocument(_ document: NavigatorBriefDocument, rootID: String) {

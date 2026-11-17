@@ -77,13 +77,42 @@ struct WorkNavigatorActivity: View {
             .labelsHidden()
             .frame(maxWidth: 360)
             .accessibilityIdentifier("navigator-activity-picker")
-            if selectedExecutionEnded {
-                Text("Execution ended; new revision available")
+            if let notice = endedNotice {
+                Text(notice)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("navigator-execution-ended")
             }
         }
+    }
+
+    /// "New revision available" only when a different live activity has
+    /// replaced the one in view; resting states just report that it ended.
+    var endedNotice: String? {
+        guard selectedExecutionEnded, let selected else { return nil }
+        let replaced = variant == .working
+            && liveActivities.contains(where: { $0.executionId != selected.executionId })
+        return replaced ? "Execution ended; new revision available" : "Execution ended"
+    }
+
+    /// The selected run is over, either gone from the live list or reported
+    /// terminated/errored by the live worker state.
+    var selectedRunEnded: Bool {
+        if selectedExecutionEnded { return true }
+        guard let selected, let live = model.liveWorkerStates.byRunID[selected.runId ?? selected.executionId] else {
+            return false
+        }
+        switch live.activity {
+        case .errored, .terminated: return true
+        case .spawning, .working, .waitingForInput, .idle: return false
+        }
+    }
+
+    /// The family member whose run failed: the selected activity's task,
+    /// else the current revision, else the root.
+    var failingTask: WorkTask {
+        let id = selected?.taskId ?? projection?.revisions.currentTaskId
+        return id.flatMap { model.task(withID: $0) } ?? root
     }
 
     private var pickerActivities: [NavigatorActivity] {
@@ -161,16 +190,21 @@ struct WorkNavigatorActivity: View {
 
     @ViewBuilder
     private var failureBody: some View {
-        if let reason = root.dispatchFailedReason {
-            WorkDispatchFailureBanner(reason: reason, errorText: root.dispatchFailedError)
+        let failing = failingTask
+        let banner = failing.dispatchFailedReason != nil ? failing : root
+        if let reason = banner.dispatchFailedReason {
+            WorkDispatchFailureBanner(reason: reason, errorText: banner.dispatchFailedError)
         }
-        if let runtime = model.taskRuntimesByID[root.id], !runtime.dispatchFailures.isEmpty,
+        if let runtime = model.taskRuntimesByID[failing.id] ?? model.taskRuntimesByID[root.id],
            let last = runtime.dispatchFailures.last {
             Text(last.errorText).font(.caption).foregroundStyle(.secondary)
         }
         HStack {
             Button("Open last transcript") {
-                openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: root.id))
+                openWindow(id: "transcript-viewer", value: TranscriptViewerRef(
+                    taskId: failing.id,
+                    preselectExecutionId: selected?.taskId == failing.id ? selected?.executionId : nil
+                ))
             }
             .buttonStyle(.link)
         }
@@ -204,44 +238,92 @@ struct WorkNavigatorActivity: View {
 
     @ViewBuilder
     private var terminalRegion: some View {
-        if variant == .landed || variant == .failed || variant == .backlog {
-            EmptyView()
-        } else if variant == .starting, session == nil {
-            startingPlaceholder
-        } else if let session, session.hostView != nil {
-            VStack(alignment: .leading, spacing: 4) {
-                if !isLiveSelected {
-                    Text("Showing the last session. It is not a live agent.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                EmbeddedWorkerTerminalView(
-                    session: session,
-                    isActive: model.navigationMode == .work
-                        && model.navigator.mode == .navigator
-                        && model.navigator.tab == .activity
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityIdentifier("navigator-terminal")
-            }
+        if let selected, let workspace {
+            WorkNavigatorTerminalSlot(
+                selected: selected,
+                ended: selectedRunEnded,
+                isLive: isLiveSelected,
+                isActive: model.navigationMode == .work
+                    && model.navigator.mode == .navigator
+                    && model.navigator.tab == .activity,
+                workspace: workspace
+            )
         } else {
-            startingPlaceholder
+            NavigatorPaneNotice(text: "Agent pane not available yet.", systemImage: "terminal")
         }
     }
+}
 
-    private var startingPlaceholder: some View {
-        Label("Agent pane not available yet.", systemImage: "terminal")
+struct NavigatorPaneNotice: View {
+    let text: String
+    let systemImage: String
+
+    var body: some View {
+        Label(text, systemImage: systemImage)
             .font(.callout)
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .background(Color(nsColor: .black).opacity(0.85))
             .accessibilityIdentifier("navigator-terminal-unavailable")
     }
+}
 
-    private var session: TerminalPaneSession? {
-        guard let selected else { return nil }
-        let runId = selected.runId ?? selected.executionId
-        return workspace?.viewer(forRunId: runId)?.session
+/// The embedded agent pane. Observes the workspace so a late attach
+/// re-renders it, and applies the Agents view's availability rules: the
+/// refusal reason, a user-driven re-attach request, and an ended run that
+/// keeps its transcript reachable.
+struct WorkNavigatorTerminalSlot: View {
+    let selected: NavigatorActivity
+    let ended: Bool
+    let isLive: Bool
+    let isActive: Bool
+    @ObservedObject var workspace: WorkersWorkspaceModel
+    @Environment(\.openWindow) private var openWindow
+
+    private var runId: String { selected.runId ?? selected.executionId }
+    private var session: TerminalPaneSession? { workspace.viewer(forRunId: runId)?.session }
+
+    var body: some View {
+        Group {
+            if let session, session.hostView != nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    if !isLive {
+                        Text("Showing the last session. It is not a live agent.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    EmbeddedWorkerTerminalView(session: session, isActive: isActive)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("navigator-terminal")
+                }
+            } else if ended {
+                VStack(spacing: 8) {
+                    Label("Execution ended.", systemImage: "stop.circle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Button("Open transcript") {
+                        openWindow(id: "transcript-viewer", value: TranscriptViewerRef(
+                            taskId: selected.taskId, preselectExecutionId: selected.executionId
+                        ))
+                    }
+                    .buttonStyle(.link)
+                    .accessibilityIdentifier("navigator-open-transcript")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let reason = workspace.viewerAttachFailuresByRunId[runId] {
+                NavigatorPaneNotice(text: "Agent pane could not attach: \(reason)", systemImage: "exclamationmark.triangle")
+            } else {
+                NavigatorPaneNotice(text: "Agent pane not available yet.", systemImage: "terminal")
+            }
+        }
+        .onAppear(perform: requestAttachIfNeeded)
+        .onChange(of: isActive) { _, _ in requestAttachIfNeeded() }
+        .onChange(of: runId) { _, _ in requestAttachIfNeeded() }
+    }
+
+    private func requestAttachIfNeeded() {
+        guard isActive, isLive, !ended, session == nil else { return }
+        workspace.requestViewerAttach(forRuns: [runId])
     }
 }
 

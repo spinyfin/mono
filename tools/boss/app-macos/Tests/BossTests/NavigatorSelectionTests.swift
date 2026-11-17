@@ -234,8 +234,11 @@ final class NavigatorSelectionTests: XCTestCase {
                 "commands": [["kind": "open_pr", "task_id": "root"]],
             ] as [String: Any],
         ])
+        model.setNavigatorDocument(.currentAsk, rootID: "root")
         NavigatorTestFixture.snapshot(model, [cleared, revision])
         XCTAssertNil(model.navigator.askID)
+        XCTAssertEqual(model.navigatorDocument(for: "root"), .original)
+        XCTAssertEqual(model.navigatorDocumentTask(for: model.navigatorSelectedTask!).id, "root")
     }
 
     func testUnloadedCurrentTaskIdKeepsPreviousAsk() {

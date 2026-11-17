@@ -18,7 +18,12 @@ struct WorkNavigatorHistory: View {
                 WorkDependenciesSection(model: model, taskID: root.id) { row in
                     model.navigateNavigatorDependency(row)
                 }
-                WorkExecutionsList(model: model, taskIDs: family.map(\.id), transcriptTaskID: root.id)
+                WorkExecutionsList(
+                    model: model,
+                    taskIDs: family.map(\.id),
+                    transcriptTaskID: root.id,
+                    isActive: model.navigator.tab == .history
+                )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 4)
@@ -32,10 +37,7 @@ struct WorkNavigatorHistory: View {
             ForEach(family, id: \.id) { member in
                 Button {
                     model.selectNavigatorRoot(root.id, askID: member.id != root.id ? member.id : nil)
-                    if member.id != root.id {
-                        model.setNavigatorDocument(.historical, rootID: root.id)
-                        model.navigator.historicalDocumentByRoot[root.id] = member.id
-                    } else {
+                    if member.id == root.id {
                         model.setNavigatorDocument(.original, rootID: root.id)
                     }
                     model.navigator.tab = .activity
