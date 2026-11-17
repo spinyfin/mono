@@ -308,7 +308,12 @@ fn child_idle_stop_is_dropped_including_the_older_missing_parent_boundary() {
     // not become the parent's.
     let (mut session, store) = stored_session();
     session.normalize_progress_event(&session_start(PARENT)).unwrap();
-    session.normalize_progress_event(&stop(PARENT, false)).unwrap();
+    assert!(
+        session
+            .normalize_progress_events(&stop(PARENT, false))
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         session
             .normalize_progress_events(&session_start(CHILD))
@@ -334,6 +339,93 @@ fn parent_idle_stop_is_kept() {
         panic!("expected Stop");
     };
     assert_eq!(session_id, PARENT);
+}
+
+#[test]
+fn all_termination_reasons_require_parent_idleness_and_never_claude_continuation() {
+    let driver = crate::AgyDriver::default();
+    for (reason, expected) in [
+        ("NO_TOOL_CALL", StopReason::Completed),
+        ("TERMINAL_CUSTOM_HOOK", StopReason::Completed),
+        ("USER_CANCELED", StopReason::Interrupted),
+        ("UNSPECIFIED", StopReason::Other),
+        ("ERROR", StopReason::Other),
+        ("MAX_INVOCATIONS", StopReason::Other),
+        ("MAX_FORCED_INVOCATIONS", StopReason::Other),
+        ("EARLY_CONTINUE", StopReason::Other),
+        ("TERMINAL_STEP_TYPE", StopReason::Other),
+        ("INJECTED_RESPONSE", StopReason::Other),
+        ("MAX_TOKEN_BUDGET_EXCEEDED", StopReason::Other),
+        ("HALTED_STEP", StopReason::Other),
+        ("CHAINED", StopReason::Other),
+        ("FUTURE_REASON", StopReason::Other),
+        ("model_stop", StopReason::Other),
+    ] {
+        for idle in [false, true] {
+            let mut session = stateless();
+            session.normalize_progress_event(&session_start(PARENT)).unwrap();
+            for cid in [CHILD, PARENT] {
+                let mut raw = stop(cid, idle);
+                raw["terminationReason"] = json!(reason);
+                raw["stop_hook_active"] = json!(true);
+                let events = session.normalize_progress_events(&raw).unwrap();
+                if !idle || cid == CHILD {
+                    assert!(events.is_empty(), "{raw}");
+                } else {
+                    assert_eq!(events.len(), 1);
+                    let boundary = driver.turn_boundary(&events[0]).unwrap();
+                    assert_eq!(boundary.reason, expected, "{reason}");
+                    assert_eq!(boundary.session_id, PARENT);
+                    assert!(!boundary.continuation);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_idleness_never_establishes_a_boundary() {
+    let mut session = stateless();
+    session.normalize_progress_event(&session_start(PARENT)).unwrap();
+    for idle in [Value::Null, json!("true"), json!(1)] {
+        let mut raw = stop(PARENT, true);
+        raw["fullyIdle"] = idle;
+        assert!(matches!(
+            session.normalize_progress_events(&raw),
+            Err(NormalizeError::Malformed(_))
+        ));
+    }
+    let mut raw = stop(PARENT, true);
+    raw.as_object_mut().unwrap().remove("fullyIdle");
+    assert!(session.normalize_progress_events(&raw).is_err());
+    raw["fullyIdle"] = json!(true);
+    raw.as_object_mut().unwrap().remove("terminationReason");
+    let event = session.normalize_progress_event(&raw).unwrap();
+    assert_eq!(
+        crate::AgyDriver::default().turn_boundary(&event).unwrap().reason,
+        StopReason::Other
+    );
+}
+
+#[test]
+fn background_tool_reinvocation_only_ends_at_parent_idle_stop() {
+    // Measured 1.5.5 order: non-idle Stop, delayed PostToolUse, automatic
+    // invocationNum=0, idle Stop. PostInvocation can precede PostToolUse.
+    let mut session = stateless();
+    let driver = crate::AgyDriver::default();
+    session.normalize_progress_event(&session_start(PARENT)).unwrap();
+    for raw in [
+        post_invocation(PARENT),
+        stop(PARENT, false),
+        post_tool_use(PARENT),
+        pre_invocation(PARENT, 0),
+    ] {
+        for event in session.normalize_progress_events(&raw).unwrap() {
+            assert!(driver.turn_boundary(&event).is_none());
+        }
+    }
+    let event = session.normalize_progress_event(&stop(PARENT, true)).unwrap();
+    assert!(driver.turn_boundary(&event).is_some());
 }
 
 #[test]

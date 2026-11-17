@@ -869,6 +869,9 @@ fn a_recovery_observer_plan_comes_with_a_recovery_implementation() {
         let cancellation_records = [
             serde_json::json!({"type": "turn_ended", "outcome": "cancelled"}),
             serde_json::json!({"type": "turn.aborted", "reason": "interrupted"}),
+            serde_json::json!(
+                "I1111 04:17:39.400 conversation_manager.go:123] Cancelling in-progress response for conversation 9476903e-615e-4a03-b5b5-ea82733cc97b"
+            ),
         ];
         assert!(
             cancellation_records

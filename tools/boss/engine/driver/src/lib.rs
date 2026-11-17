@@ -2435,7 +2435,13 @@ pub trait AgentDriver: Send + Sync {
     /// driver that needs recovery resolves its own per-run state (Grok:
     /// `GROK_HOME`, session id, workspace) without the engine knowing
     /// anything about that shape.
-    fn prepare_interrupt_recovery(&self, _run_id: &str) -> Option<InterruptRecoverySnapshot> {
+    /// `claimed_session_id` is the persisted progress identity, read before
+    /// interrupt delivery. Drivers with child conversations must use it.
+    fn prepare_interrupt_recovery(
+        &self,
+        _run_id: &str,
+        _claimed_session_id: Option<&str>,
+    ) -> Option<InterruptRecoverySnapshot> {
         None
     }
 
@@ -2452,6 +2458,13 @@ pub trait AgentDriver: Send + Sync {
     /// never consulted for a driver that returns `None` there.
     fn is_interrupt_recovery_turn_end(&self, _raw: &serde_json::Value) -> bool {
         false
+    }
+
+    /// Match a complete evidence line against the pre-interrupt snapshot.
+    /// JSONL drivers retain their existing matcher; text-log drivers can
+    /// decode their own format and enforce snapshot identity here.
+    fn is_interrupt_recovery_line(&self, line: &str, _snapshot: &InterruptRecoverySnapshot) -> bool {
+        serde_json::from_str(line).is_ok_and(|raw| self.is_interrupt_recovery_turn_end(&raw))
     }
 
     /// How long this driver's foreground worker process lives relative to the

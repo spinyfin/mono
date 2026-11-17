@@ -526,8 +526,15 @@ impl ServerState {
         let press_interval = plan.map(|p| p.gesture.press_interval).unwrap_or(Duration::ZERO);
         let recovery_prep = boss_engine_completion::driver_transcript::driver_for_execution(&self.work_db, run_id)
             .and_then(|driver| {
+                let claimed_id = self
+                    .work_db
+                    .get_run_progress_session_identity(run_id)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(run_id, %error, "interrupt recovery: cannot read claimed identity");
+                        None
+                    });
                 driver
-                    .prepare_interrupt_recovery(run_id)
+                    .prepare_interrupt_recovery(run_id, claimed_id.as_deref())
                     .map(|snapshot| (driver, snapshot))
             });
         let mut result = Ok(slot_id);

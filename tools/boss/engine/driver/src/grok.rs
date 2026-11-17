@@ -815,7 +815,11 @@ impl AgentDriver for GrokDriver {
     /// `None` when this run has no resolvable per-run state (never
     /// provisioned, or already torn down) — interrupt delivery itself is
     /// unaffected either way.
-    fn prepare_interrupt_recovery(&self, run_id: &str) -> Option<InterruptRecoverySnapshot> {
+    fn prepare_interrupt_recovery(
+        &self,
+        run_id: &str,
+        _claimed_session_id: Option<&str>,
+    ) -> Option<InterruptRecoverySnapshot> {
         prepare_snapshot(run_id)
     }
 
@@ -2803,7 +2807,7 @@ mod tests {
         driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
 
         let snapshot = driver
-            .prepare_interrupt_recovery(run_id)
+            .prepare_interrupt_recovery(run_id, None)
             .expect("a provisioned run must yield a recovery snapshot");
 
         assert_eq!(snapshot.offset, 0, "events.jsonl does not exist yet; offset must be 0");
@@ -2846,7 +2850,7 @@ mod tests {
         let existing = b"{\"type\":\"turn_started\"}\n";
         fs::write(&events_path, existing).unwrap();
 
-        let snapshot = driver.prepare_interrupt_recovery(run_id).unwrap();
+        let snapshot = driver.prepare_interrupt_recovery(run_id, None).unwrap();
         assert_eq!(snapshot.offset, existing.len() as u64);
         assert_eq!(snapshot.events_path, events_path);
     }
@@ -2856,6 +2860,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _guard = env_for_provision(tmp.path(), &tmp.path().join("auth.json"), true);
         let driver = GrokDriver::default();
-        assert!(driver.prepare_interrupt_recovery("never-provisioned-run").is_none());
+        assert!(
+            driver
+                .prepare_interrupt_recovery("never-provisioned-run", None)
+                .is_none()
+        );
     }
 }
