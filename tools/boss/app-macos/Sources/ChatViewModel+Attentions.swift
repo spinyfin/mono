@@ -65,6 +65,7 @@ extension ChatViewModel {
             upsertAttentionGroup(group)
             setAttentionMembers(members, forGroup: group.id)
         }
+        settleAttentionRequests(forGroup: group.id)
         refreshSelectedProductAttentionCaches()
     }
 
@@ -171,8 +172,28 @@ extension ChatViewModel {
         if !skip, let answer, member.isAnswered, member.answer == answer {
             return false
         }
-        engine.sendAnswerAttention(id: attentionID, answer: answer, skip: skip, dismiss: false)
+        let requestID = engine.sendAnswerAttention(
+            id: attentionID, answer: answer, skip: skip, dismiss: false
+        )
+        if let requestID { attentionRequestGroupByRequestID[requestID] = member.groupID }
         return true
+    }
+
+    /// An engine refusal (`work_error`) carrying the request id of an
+    /// answer/action on a group — for example another client already
+    /// actioned it. Painted inline beside that group; the drafts stay put.
+    /// Returns whether the error belonged to an attention request.
+    func settleAttentionWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId,
+              let groupID = attentionRequestGroupByRequestID.removeValue(forKey: requestId)
+        else { return false }
+        attentionAnswerErrorByGroupID[groupID] = message
+        return true
+    }
+
+    /// A snapshot for the group arrived, so its earlier requests are settled.
+    func settleAttentionRequests(forGroup groupID: String) {
+        attentionRequestGroupByRequestID = attentionRequestGroupByRequestID.filter { $0.value != groupID }
     }
 
     /// Dismiss a single member (`atn_…`) without producing anything.
@@ -212,7 +233,9 @@ extension ChatViewModel {
                 "This question was replaced. Review the current question."
             return false
         }
-        engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true)
+        if let requestID = engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true) {
+            attentionRequestGroupByRequestID[requestID] = groupID
+        }
         return true
     }
 

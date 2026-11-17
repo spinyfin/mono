@@ -125,7 +125,7 @@ extension ChatViewModel {
         }
         navigator.retainedTask = root
         if root.prURL != nil { navigator.tabs.insert(.review) }
-        if !detail.actions.isEmpty { navigator.tabs.insert(.attention) }
+        if WorkNavigatorAttention.entries(model: self, root: root).count > 0 { navigator.tabs.insert(.attention) }
         if navigator.mode == .navigator { selectionHistory.rememberRoot(root.id, scope: navigatorScopeKey) }
     }
 

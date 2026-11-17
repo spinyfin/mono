@@ -78,28 +78,45 @@ struct WorkNavigatorAttention: View {
     }
 
     static func entries(for context: NavigatorDetailContext) -> [NavigatorAttentionEntry] {
-        let actions = context.root.navigator?.root?.actions ?? []
-        return actions.compactMap { action in
+        entries(model: context.model, root: context.root)
+    }
+
+    /// Entries the slot can render for `root`, in action order, one per id.
+    /// The banner, tab title and slot all derive from this one list.
+    static func entries(model: ChatViewModel, root: WorkTask) -> [NavigatorAttentionEntry] {
+        let actions = root.navigator?.root?.actions ?? []
+        var seen = Set<String>()
+        return actions.compactMap { action -> NavigatorAttentionEntry? in
+            let entry: NavigatorAttentionEntry?
             if action.type == "open_input" {
-                guard let activity = action.activity else { return nil }
-                return .openInput(activity)
+                entry = action.activity.map { .openInput($0) }
+            } else if action.type == "attention" {
+                entry = attentionEntry(for: action, model: model)
+            } else {
+                entry = nil
             }
-            guard action.type == "attention", let attentionID = action.attentionId else { return nil }
-            if let group = context.model.attentionGroup(id: attentionID), group.isOpen {
-                return .group(group)
-            }
-            if let taskID = action.taskId, let task = context.model.task(withID: taskID),
-               let presentation = context.model.navigatorOperatorQuestion(for: task),
-               presentation.questionID == attentionID || task.operatorQuestion?.id == attentionID {
-                return .question(task, presentation)
-            }
-            if let taskID = action.taskId, let task = context.model.task(withID: taskID),
-               let presentation = context.model.navigatorOperatorQuestion(for: task),
-               action.kind == "question" {
-                return .question(task, presentation)
-            }
-            return nil
+            guard let entry, seen.insert(entry.id).inserted else { return nil }
+            return entry
         }
+    }
+
+    private static func attentionEntry(
+        for action: NavigatorAction,
+        model: ChatViewModel
+    ) -> NavigatorAttentionEntry? {
+        let attentionID = action.attentionId ?? ""
+        if !attentionID.isEmpty, let group = model.attentionGroup(id: attentionID), group.isOpen {
+            return .group(group)
+        }
+        guard let taskID = action.taskId, let task = model.task(withID: taskID),
+              let presentation = model.navigatorOperatorQuestion(for: task)
+        else { return nil }
+        // An explicit id must match this task's question; only an action with
+        // no id falls back to "the task's question".
+        if attentionID.isEmpty ? action.kind == "question" : presentation.questionID == attentionID {
+            return .question(task, presentation)
+        }
+        return nil
     }
 
     static func caption(

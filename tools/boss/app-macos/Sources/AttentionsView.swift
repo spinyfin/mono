@@ -279,7 +279,7 @@ struct AttentionGroupBody: View {
     var expectedGeneration: Int? = nil
     /// Local drafts for `prompt`-type questions, keyed by attention id. Seeded
     /// from the persisted answer; flushed to the engine on submit.
-    @State private var promptDrafts: [String: String] = [:]
+    @State private var promptDrafts: [String: AttentionPromptDraft] = [:]
 
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
     private var answeredCount: Int { members.filter(\.isAnswered).count }
@@ -336,28 +336,61 @@ struct AttentionGroupBody: View {
     private var hasPendingPromptDraft: Bool {
         members.contains { member in
             member.questionType == "prompt"
-                && !(promptDrafts[member.id] ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && AttentionPromptDraft.flushable(promptDrafts[member.id], member: member) != nil
         }
     }
 
     private func promptBinding(for member: Attention) -> Binding<String> {
         Binding(
-            get: { promptDrafts[member.id] ?? member.answer ?? "" },
-            set: { promptDrafts[member.id] = $0 }
+            get: { AttentionPromptDraft.visibleText(promptDrafts[member.id], member: member) },
+            set: { promptDrafts[member.id] = AttentionPromptDraft(text: $0, base: member.answer) }
         )
     }
 
     /// Flush any edited prompt drafts, then action the group. Sends share one
     /// ordered socket, so the answers are processed before the action.
     private func submit() {
+        Self.submit(model: model, group: group, members: members,
+                    drafts: promptDrafts, generation: boundGeneration)
+    }
+
+    /// A draft is only sent while the recorded answer is still the one the
+    /// user started editing from; one recorded elsewhere meanwhile is kept,
+    /// not resubmitted over it.
+    static func submit(
+        model: ChatViewModel,
+        group: AttentionGroup,
+        members: [Attention],
+        drafts: [String: AttentionPromptDraft],
+        generation: Int
+    ) {
         for member in members where member.questionType == "prompt" {
-            let draft = (promptDrafts[member.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !draft.isEmpty, draft != (member.answer ?? "") {
-                model.answerAttention(member.id, answer: draft, expectedGeneration: boundGeneration)
+            if let draft = AttentionPromptDraft.flushable(drafts[member.id], member: member) {
+                model.answerAttention(member.id, answer: draft, expectedGeneration: generation)
             }
         }
-        model.actionAttentionGroup(group.id, expectedGeneration: boundGeneration)
+        model.actionAttentionGroup(group.id, expectedGeneration: generation)
+    }
+}
+
+/// A locally edited `prompt` answer plus the recorded answer it was edited
+/// from. If the engine's recorded answer changes (another client answered),
+/// the draft is stale: the field shows the recorded answer and Submit does
+/// not send the draft; typing again starts a fresh draft.
+struct AttentionPromptDraft: Equatable {
+    var text: String
+    var base: String?
+
+    static func visibleText(_ draft: AttentionPromptDraft?, member: Attention) -> String {
+        guard let draft, draft.base == member.answer else { return member.answer ?? "" }
+        return draft.text
+    }
+
+    /// The trimmed text to send, or `nil` when empty, unchanged or stale.
+    static func flushable(_ draft: AttentionPromptDraft?, member: Attention) -> String? {
+        guard let draft, draft.base == member.answer else { return nil }
+        let trimmed = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == (member.answer ?? "") ? nil : trimmed
     }
 }
 

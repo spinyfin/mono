@@ -399,7 +399,9 @@ extension EngineClient {
     /// Record the human's resolution of one member (`atn_…`): an `answer`
     /// (value for questions, omitted to "accept" a followup), `skip`, or
     /// `dismiss`. Replies with `attention_group_updated`.
-    func sendAnswerAttention(id: String, answer: String?, skip: Bool, dismiss: Bool) {
+    /// Returns the envelope id so a refusal can be matched to its group.
+    @discardableResult
+    func sendAnswerAttention(id: String, answer: String?, skip: Bool, dismiss: Bool) -> String? {
         var payload: [String: Any] = [
             "type": "answer_attention",
             "id": id,
@@ -407,14 +409,16 @@ extension EngineClient {
             "dismiss": dismiss,
         ]
         if let answer { payload["answer"] = answer }
-        sendLine(payload)
+        return sendLine(payload)
     }
 
     /// Action a group (`atg_…` or `A<n>`) — produce the downstream artifact
     /// and transition it to `actioned`. `skipUnanswered` marks every open
     /// member skipped first so the human needn't touch every row. Replies
     /// with `attention_group_actioned`.
-    func sendActionAttentionGroup(id: String, skipUnanswered: Bool) {
+    /// Returns the envelope id so a refusal can be matched to its group.
+    @discardableResult
+    func sendActionAttentionGroup(id: String, skipUnanswered: Bool) -> String? {
         sendLine([
             "type": "action_attention_group",
             "id": id,

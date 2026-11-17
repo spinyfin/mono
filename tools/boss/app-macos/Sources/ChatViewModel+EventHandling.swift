@@ -223,6 +223,7 @@ extension ChatViewModel {
             // An error carrying the answer's own request id is not ambiguous:
             // settle it onto that card without blaming any other request.
             if settleOperatorAnswerWorkError(message: message, requestId: requestId) { return }
+            if settleAttentionWorkError(message: message, requestId: requestId) { return }
             // Likewise a refused project archive: the row drops its pending
             // mark and the message surfaces, with no other state touched.
             if settleArchiveWorkError(message: message, requestId: requestId) { return }

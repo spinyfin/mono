@@ -47,7 +47,12 @@ struct WorkNavigatorDetail: View {
                         }
                     }
                 }
-                let actionCount = root.navigator?.root?.actions.count ?? 0
+                // Count what the Attention slot can actually render, not raw engine actions.
+                let actionCount = WorkNavigatorAttention.entries(model: model, root: root).count
+                let visibleTabs = NavigatorDetailSlot.allCases.filter {
+                    model.navigator.tabs.contains($0)
+                        && ($0 != .attention || actionCount > 0 || model.navigator.tab == .attention)
+                }
                 if actionCount > 0, model.navigator.tab != .attention {
                     Button("Attention needed (\(actionCount))") {
                         model.navigator.tab = .attention
@@ -55,14 +60,14 @@ struct WorkNavigatorDetail: View {
                     .accessibilityIdentifier("navigator-attention-banner")
                 }
                 Picker("Detail", selection: $model.navigator.tab) {
-                    ForEach(NavigatorDetailSlot.allCases.filter { model.navigator.tabs.contains($0) }) { slot in
+                    ForEach(visibleTabs) { slot in
                         Text(slot.title(actionCount: actionCount)).tag(slot)
                     }
                 }
                 .pickerStyle(.segmented)
                 // Keep every registered body mounted while switching tabs.
                 ZStack(alignment: .topLeading) {
-                    ForEach(NavigatorDetailSlot.allCases.filter { model.navigator.tabs.contains($0) }) { slot in
+                    ForEach(visibleTabs) { slot in
                         slotBody(slot, root: root)
                             .opacity(model.navigator.tab == slot ? 1 : 0)
                             .allowsHitTesting(model.navigator.tab == slot)

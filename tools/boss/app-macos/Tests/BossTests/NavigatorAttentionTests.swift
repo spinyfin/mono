@@ -214,6 +214,110 @@ final class NavigatorAttentionTests: XCTestCase {
         )
     }
 
+    func testEngineRefusalOfGroupActionShowsInlineAndKeepsDraft() {
+        let group = makeGroup(id: "atg_race", taskID: "root", generation: 1)
+        let member = makeMember(id: "atn_race", groupID: group.id, type: "prompt", text: "Which channel?")
+        let model = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
+                          groups: [group], members: [member])
+        model.engine.simulateConnectedForTesting = true
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+        XCTAssertTrue(model.answerAttention(member.id, answer: "ops", expectedGeneration: 1))
+        XCTAssertEqual(model.attentionRequestGroupByRequestID.count, 1)
+        let requestID = model.attentionRequestGroupByRequestID.keys.first
+        // Another client actioned the group first: the engine refuses the answer.
+        model.applyEventForTest(.workError(message: "group is already actioned", requestId: requestID))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: group.id), "group is already actioned")
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.attentionRequestGroupByRequestID.isEmpty)
+        XCTAssertTrue(model.actionAttentionGroup(group.id, expectedGeneration: 1))
+        let actionRequest = model.attentionRequestGroupByRequestID.keys.first
+        model.applyEventForTest(.workError(message: "group is terminal", requestId: actionRequest))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: group.id), "group is terminal")
+        XCTAssertNil(model.workErrorMessage)
+        // An uncorrelated error is not claimed by the group.
+        XCTAssertFalse(model.settleAttentionWorkError(message: "other", requestId: "unknown"))
+        XCTAssertEqual(sent.count, 2)
+    }
+
+    func testStaleDraftDoesNotOverwriteAnswerRecordedElsewhere() {
+        let group = makeGroup(id: "atg_draft", taskID: "root", generation: 2)
+        let open = makeMember(id: "atn_draft", groupID: group.id, type: "prompt", text: "Which channel?")
+        let model = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
+                          groups: [group], members: [open])
+        model.engine.simulateConnectedForTesting = true
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+        // The user types draft A while the member is still open.
+        let draft = AttentionPromptDraft(text: "A", base: open.answer)
+        XCTAssertEqual(AttentionPromptDraft.visibleText(draft, member: open), "A")
+        // Another client records answer B for the same member and generation.
+        let answered = makeMember(id: "atn_draft", groupID: group.id, type: "prompt",
+                                  text: "Which channel?", answer: "B", state: "answered")
+        model.applyEventForTest(.attentionGroupUpdated(group: group, members: [answered]))
+        XCTAssertEqual(AttentionPromptDraft.visibleText(draft, member: answered), "B")
+        XCTAssertNil(AttentionPromptDraft.flushable(draft, member: answered))
+        AttentionGroupBody.submit(model: model, group: group, members: [answered],
+                                  drafts: ["atn_draft": draft], generation: 2)
+        XCTAssertEqual(sent.map { $0["type"] as? String }, ["action_attention_group"])
+        // An explicit edit after the update is a fresh draft and is sent.
+        let edit = AttentionPromptDraft(text: "C", base: answered.answer)
+        XCTAssertEqual(AttentionPromptDraft.flushable(edit, member: answered), "C")
+    }
+
+    func testBannerAndTabCountMatchRenderableEntries() {
+        let review: [String: Any] = ["type": "review", "kind": "review", "task_id": "root"]
+        let root = makeRoot(section: "needs_attention", detail: "activity", actions: [review])
+        let model = model([root])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: root).count, 0)
+        XCTAssertFalse(model.navigator.tabs.contains(.attention))
+        // An attention action whose task has no operator question also renders nothing.
+        let unresolved = makeRoot(actions: [attentionAction(id: "oq_none", task: "root")])
+        XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: unresolved).count, 0)
+    }
+
+    func testQuestionFallbackDoesNotMismatchOrDuplicate() {
+        var root = makeRoot(actions: [
+            attentionAction(id: "oq_task", task: "root"),
+            attentionAction(id: "oq_task", task: "root"),
+            attentionAction(id: "atg_missing", task: "root"),
+            ["type": "attention", "kind": "question", "task_id": "root"],
+        ])
+        root.operatorQuestion = makeQuestion(id: "oq_task")
+        let model = model([root])
+        let entries = WorkNavigatorAttention.entries(model: model, root: root)
+        XCTAssertEqual(entries.map(\.id), ["question:oq_task"])
+    }
+
+    func testNavigatorGroupEntryUsesCurrentGenerationAndShowsStaleError() {
+        let group = makeGroup(id: "atg_cur", taskID: "root", generation: 4)
+        let member = makeMember(id: "atn_cur", groupID: group.id, type: "yes_no")
+        let root = makeRoot(actions: [attentionAction(id: group.id, task: "root")])
+        let model = model([root], groups: [group], members: [member])
+        model.engine.simulateConnectedForTesting = true
+        guard case .group(let shown)? = WorkNavigatorAttention.entries(model: model, root: root).first else {
+            return XCTFail("expected a group entry")
+        }
+        XCTAssertEqual(shown.generation, 4)
+        XCTAssertFalse(model.answerAttention(member.id, answer: "yes", expectedGeneration: 3))
+        XCTAssertNotNil(model.attentionAnswerError(forGroup: group.id))
+    }
+
+    func testGroupBodyRendersInlineErrorText() throws {
+        let group = makeGroup(id: "atg_err", taskID: "root", generation: 2)
+        let member = makeMember(id: "atn_err", groupID: group.id, type: "yes_no", text: "Ship it?")
+        let model = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
+                          groups: [group], members: [member])
+        let size = CGSize(width: 520, height: 280)
+        let plain = try render(AttentionGroupBody(group: group, expectedGeneration: 2).environmentObject(model), size: size)
+        model.attentionAnswerErrorByGroupID[group.id] = "group is already actioned"
+        let failed = try render(AttentionGroupBody(group: group, expectedGeneration: 2).environmentObject(model), size: size)
+        XCTAssertEqual(redPixels(plain), 0)
+        XCTAssertGreaterThan(redPixels(failed), 20)
+    }
+
     private func model(
         _ tasks: [WorkTask],
         groups: [AttentionGroup] = [],
@@ -314,22 +418,51 @@ final class NavigatorAttentionTests: XCTestCase {
         )
     }
 
-    private func capture<V: View>(_ view: V, size: CGSize? = nil, name: String) throws {
+    private func render<V: View>(_ view: V, size: CGSize) throws -> NSBitmapImageRep {
         let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
         host.appearance = NSAppearance(named: .aqua)
-        if let size {
-            host.frame = NSRect(origin: .zero, size: size)
-        } else {
-            host.frame = NSRect(x: 0, y: 0, width: 520, height: 280)
-        }
+        host.frame = NSRect(origin: .zero, size: size)
         for _ in 0..<3 {
             host.layoutSubtreeIfNeeded()
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         }
         let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
         host.cacheDisplay(in: host.bounds, to: rep)
+        return rep
+    }
+
+    /// Pixels clearly red (the inline error colour).
+    private func redPixels(_ rep: NSBitmapImageRep) -> Int {
+        var count = 0
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide {
+                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                if c.redComponent > 0.6, c.greenComponent < 0.4, c.blueComponent < 0.4 { count += 1 }
+            }
+        }
+        return count
+    }
+
+    /// Pixels that differ from the window background: a blank or clipped
+    /// render has almost none.
+    private func inkedPixels(_ rep: NSBitmapImageRep) -> Int {
+        guard let bg = rep.colorAt(x: 0, y: 0)?.usingColorSpace(.sRGB) else { return 0 }
+        var count = 0
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide {
+                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                if abs(c.redComponent - bg.redComponent) + abs(c.greenComponent - bg.greenComponent)
+                    + abs(c.blueComponent - bg.blueComponent) > 0.15 { count += 1 }
+            }
+        }
+        return count
+    }
+
+    private func capture<V: View>(_ view: V, size: CGSize? = nil, name: String) throws {
+        let rep = try render(view, size: size ?? CGSize(width: 520, height: 280))
         let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
         XCTAssertGreaterThan(data.count, 100)
+        XCTAssertGreaterThan(inkedPixels(rep), 400, "\(name) rendered blank or clipped")
         if let output = ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"] {
             try data.write(to: URL(fileURLWithPath: output).appendingPathComponent(name + ".png"))
         }
