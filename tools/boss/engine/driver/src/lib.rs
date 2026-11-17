@@ -1390,6 +1390,15 @@ pub trait ProgressIdentityStore: Send + Sync {
     /// a silent `Ok(None)` would re-claim after a restart and let a child's
     /// first event replace the parent.
     fn claimed_progress_identity(&self, run_id: &str) -> Result<Option<String>, String>;
+
+    /// Whether `run_id`'s execution is still non-terminal.
+    ///
+    /// A boundary that arrives before any claim is retried only while this
+    /// is `Ok(true)`. `Ok(false)` means the run will never claim (it is
+    /// already finished, or the row is gone) and the boundary must be
+    /// rejected permanently. A store failure is `Err` so the caller can
+    /// retry the lookup.
+    fn progress_run_is_non_terminal(&self, run_id: &str) -> Result<bool, String>;
 }
 
 /// Mutable normalizer owned by one progress ingress.

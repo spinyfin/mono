@@ -12,6 +12,7 @@ struct MemoryIdentityStore {
     fail_read: std::sync::atomic::AtomicBool,
     fail_write: std::sync::atomic::AtomicBool,
     claims: std::sync::atomic::AtomicUsize,
+    non_terminal: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryIdentityStore {
@@ -21,6 +22,7 @@ impl MemoryIdentityStore {
             fail_read: false.into(),
             fail_write: false.into(),
             claims: 0.into(),
+            non_terminal: true.into(),
         })
     }
 }
@@ -60,6 +62,10 @@ impl ProgressIdentityStore for MemoryIdentityStore {
             return Err("database is locked".into());
         }
         Ok(self.inner.lock().expect("identity store lock").get(run_id).cloned())
+    }
+
+    fn progress_run_is_non_terminal(&self, _run_id: &str) -> Result<bool, String> {
+        Ok(self.non_terminal.load(std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -337,7 +343,21 @@ fn stop_without_a_claim_fails_loudly_instead_of_claiming() {
         .normalize_progress_event(&stop(PARENT, true))
         .expect_err("Stop must not invent a claim");
     assert!(
-        matches!(err, NormalizeError::IdentityStoreTransient(ref message) if message.contains("before a claimed conversation identity")),
+        matches!(err, NormalizeError::BoundaryBeforeClaim(ref message) if message.contains("before a claimed conversation identity")),
+        "got {err:?}"
+    );
+    assert!(store.claimed_progress_identity(RUN).unwrap().is_none());
+}
+
+#[test]
+fn stop_for_terminal_run_without_a_claim_is_rejected_permanently() {
+    let (mut session, store) = stored_session();
+    store.non_terminal.store(false, std::sync::atomic::Ordering::SeqCst);
+    let err = session
+        .normalize_progress_event(&stop(PARENT, true))
+        .expect_err("Stop for a terminal run must not retry forever");
+    assert!(
+        matches!(err, NormalizeError::Malformed(ref message) if message.contains("terminal run")),
         "got {err:?}"
     );
     assert!(store.claimed_progress_identity(RUN).unwrap().is_none());

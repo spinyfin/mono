@@ -22,20 +22,26 @@
 //! engine without dropping events:
 //!
 //! 1. **Bounded retry on connect.** Up to a handful of attempts with
-//!    exponential backoff, totaling ~10s of wall clock. After
-//!    exhaustion, the event is appended to an on-disk buffer in the
-//!    worker's workspace (`.boss/events-pending.jsonl`) and the shim
-//!    exits zero — the worker keeps moving, and the engine sees the
-//!    event next time it's reachable.
+//!    exponential backoff, totaling ~10s of wall clock. The same
+//!    schedule applies to the current event and to the head of a
+//!    non-empty buffer drain, so an engine restart still gets the
+//!    ride-through when older events are queued. After exhaustion, the
+//!    event is appended to an on-disk buffer in the worker's workspace
+//!    (`.boss/events-pending.jsonl`) and the shim exits zero — the
+//!    worker keeps moving, and the engine sees the event next time
+//!    it's reachable.
 //! 2. **Reconnect on mid-send failure.** If a previously-good
 //!    connection dies between connect and EOF (broken pipe), the shim
 //!    reopens once and resends.
 //! 3. **Drain on success.** Before sending the current event the shim
 //!    opportunistically drains any buffered events from previous
-//!    engine-down windows, oldest first. A permanently rejected event
-//!    is reported and discarded so it cannot block later events; a
-//!    transient failure stops the drain and leaves its unsent suffix
-//!    queued.
+//!    engine-down windows, oldest first. A concurrent drain holds the
+//!    buffer lock; this invocation waits for that lock up to the
+//!    remaining budget, then drains and sends, so a turn-ending Stop
+//!    is not stranded until some later hook fires. A permanently
+//!    rejected event is reported and discarded so it cannot block
+//!    later events; a transient failure stops the drain and leaves its
+//!    unsent suffix queued.
 //! 4. **Bounded buffer.** The buffer is capped at the most recent
 //!    [`MAX_BUFFERED_EVENTS`] events. A persistently-down engine can't
 //!    cause the buffer to grow unbounded.
@@ -84,8 +90,9 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use fs4::fs_std::FileExt;
@@ -134,11 +141,10 @@ const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Marker line the engine writes back on the socket when it rejects a
 /// connection (malformed JSON, unrecognized hook shape, unresolved
-/// driver, ...) rather than accepting it. A successful delivery never
-/// gets a response at all -- the engine just processes the event and
-/// drops the connection -- so any bytes at all arriving with this
-/// prefix mean the write succeeded but the event was never actually
-/// accepted.
+/// driver, ...) rather than accepting it. A successful delivery writes
+/// `BOSS-EVENT-RECORDED`; older engines still close with no bytes. Bytes
+/// arriving with this prefix mean the write succeeded but the event was
+/// never actually accepted.
 ///
 /// Deliberately duplicated (not shared via a crate dependency) from
 /// `tools/boss/engine/core/src/events_socket.rs`'s `REJECTION_PREFIX`:
@@ -162,12 +168,9 @@ const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
 const RETRY_PREFIX: &str = "BOSS-EVENT-RETRY: ";
 
 /// Upper bound on how long the shim waits, after finishing its write and
-/// half-closing, for the engine to write back a [`REJECTION_PREFIX`]
-/// notice. A successful connection is silent, so this only delays the
-/// happy path by however long it actually takes the kernel to notice the
-/// peer closed with nothing sent -- normally sub-millisecond. Bounded by
-/// whatever remains of [`SHIM_TOTAL_BUDGET`] the same way every other
-/// socket stage is.
+/// half-closing, for the engine to write back a [`REJECTION_PREFIX`],
+/// [`RETRY_PREFIX`], or recorded notice. Bounded by whatever remains of
+/// [`SHIM_TOTAL_BUDGET`] the same way every other socket stage is.
 const REJECTION_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Total wall-clock budget for one shim invocation, covering the
@@ -240,14 +243,13 @@ fn run() -> Result<()> {
 
     // If `BOSS_RUN_ID` is set in the worker's env, splice it into the
     // hook JSON object so the engine can correlate this event to the
-    // run without needing a working shell-pid lookup. On any failure
-    // (env not set, payload not a JSON object) we forward the original
+    // run without needing a working shell-pid lookup. Always splice a
+    // stable `_boss_delivery_id` so a timed-out acknowledgement can be
+    // retried without the engine dispatching the same payload twice.
+    // On any failure (payload not a JSON object) we forward the original
     // bytes unchanged so the shim stays best-effort and never blocks
     // the worker.
-    let payload_line = match maybe_splice_run_id(&payload) {
-        Ok(bytes) => bytes,
-        Err(_) => payload,
-    };
+    let payload_line = splice_shim_fields(&payload);
 
     if let Some(directory) = env::var_os(EVENT_SPOOL_ENV) {
         return pending::deliver(Path::new(&directory), &socket_path, &payload_line, deadline);
@@ -265,13 +267,13 @@ fn deliver_local(
     payload_line: Vec<u8>,
     deadline: Instant,
 ) -> Result<()> {
-    // Drain leftover buffered events FIRST (oldest first). Each drain
-    // attempt uses a fresh single-shot connection with no retry: if
-    // the engine is down, the very first drain connect fast-fails and
-    // the rest stay queued for next time. Draining before the current
-    // event preserves FIFO ordering on the engine's accept queue —
-    // the current event's connect would otherwise sit in the backlog
-    // ahead of the drained connections.
+    // Drain leftover buffered events FIRST (oldest first). The head
+    // record retries connect under `deadline` so an engine restart still
+    // rides through when the buffer is non-empty. A concurrent drain
+    // holds the exclusive lock; we wait for it rather than treating
+    // contention as a failure that would strand this hook. Draining
+    // before the current event preserves FIFO ordering on the engine's
+    // accept queue.
     if let Some(buf) = buffer_path.as_deref()
         && let Err(err) = drain_buffer(socket_path, buf, quarantine_path.as_deref(), deadline)
     {
@@ -388,6 +390,47 @@ fn buffer_or_lose(buffer_path: Option<&Path>, payload: &[u8]) -> Result<()> {
         ));
     };
     append_to_buffer(buffer_path, payload).with_context(|| format!("buffering event to {}", buffer_path.display()))
+}
+
+/// Inject `_boss_run_id` and a stable `_boss_delivery_id` into a hook
+/// JSON object payload. Missing env or a non-object payload leaves the
+/// original bytes unchanged. An already-present delivery id (a buffered
+/// retry of this same payload) is kept so the engine can drop duplicates.
+fn splice_shim_fields(payload: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value = match maybe_splice_run_id(payload) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return bytes,
+        },
+        Err(_) => match serde_json::from_slice(payload) {
+            Ok(value) => value,
+            Err(_) => return payload.to_vec(),
+        },
+    };
+    let Some(object) = value.as_object_mut() else {
+        return payload.to_vec();
+    };
+    let has_delivery_id = object
+        .get("_boss_delivery_id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|id| !id.is_empty());
+    if !has_delivery_id {
+        object.insert(
+            "_boss_delivery_id".to_owned(),
+            serde_json::Value::String(generate_delivery_id()),
+        );
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| payload.to_vec())
+}
+
+fn generate_delivery_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}-{n}", std::process::id())
 }
 
 /// Inject `_boss_run_id` into a hook JSON object payload when the env
@@ -530,12 +573,12 @@ enum EngineResponse {
 }
 
 /// Wait, bounded by [`REJECTION_READ_TIMEOUT`] and whatever remains of
-/// `deadline`, for the engine to write a [`REJECTION_PREFIX`] or
-/// [`RETRY_PREFIX`] notice back on `stream` before it closes. Returns
-/// [`EngineResponse::None`] on a clean EOF. A timed-out read or exhausted
-/// budget requests retry; the engine may still be decoding and its eventual
-/// retry notice must not be mistaken for successful delivery. This can
-/// redeliver an already accepted event, just like a mid-send reconnect.
+/// `deadline`, for the engine to write a [`REJECTION_PREFIX`],
+/// [`RETRY_PREFIX`], or recorded notice back on `stream` before it closes.
+/// Returns [`EngineResponse::None`] on a clean EOF. A timed-out read or
+/// exhausted budget requests retry; the engine may still be decoding.
+/// Redelivery is idempotent because [`splice_shim_fields`] stamps a stable
+/// `_boss_delivery_id` that the engine drops on a later drain.
 fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<EngineResponse> {
     let timeout = remaining(deadline).min(REJECTION_READ_TIMEOUT);
     if timeout.is_zero() {
@@ -578,17 +621,19 @@ enum BufferedSendError {
     Transient(anyhow::Error),
 }
 
-/// Send one buffered event in its own connection. Used by drain. No
-/// retry: a failure here means the engine just went down again and the
-/// remaining buffered events should stay on disk for next time. Also
-/// fails fast once `deadline` has passed, without attempting a connect.
+/// Send one buffered event in its own connection. Used by drain. The
+/// head record retries connect under `deadline` so an engine restart
+/// still rides through when the buffer is non-empty. A later record
+/// that cannot connect before the budget runs out stops the drain and
+/// keeps FIFO order. Fails fast once `deadline` has passed, without
+/// attempting a connect.
 fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> std::result::Result<(), BufferedSendError> {
     if budget_exhausted(deadline) {
         return Err(BufferedSendError::Transient(anyhow!(
             "shim wall-clock budget exhausted before send"
         )));
     }
-    let stream = connect_once(socket_path, write_timeout_for(deadline)).map_err(BufferedSendError::Transient)?;
+    let stream = connect_with_retry(socket_path, deadline).map_err(BufferedSendError::Transient)?;
     match send_to_stream(stream, payload, deadline).map_err(BufferedSendError::Transient)? {
         EngineResponse::None | EngineResponse::Recorded => Ok(()),
         EngineResponse::Rejected(reason) => Err(BufferedSendError::Rejected(reason)),
@@ -645,7 +690,8 @@ fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
 /// record hit a transient failure), so a kill between truncate and
 /// rewrite can never lose more than what this drain actually consumed.
 /// No-op when the buffer is absent. If another shim is already draining,
-/// returns a transient error so the caller queues behind that drain.
+/// waits for the exclusive lock up to `deadline` so the current hook is
+/// drained or sent by this invocation instead of stranded until later.
 fn drain_buffer(
     socket_path: &str,
     buffer_path: &Path,
@@ -660,11 +706,7 @@ fn drain_buffer(
         .write(true)
         .open(buffer_path)
         .with_context(|| format!("opening {} for drain", buffer_path.display()))?;
-    match FileExt::try_lock_exclusive(&file) {
-        Ok(true) => {}
-        Ok(false) => return Err(anyhow!("another shim is draining the event buffer")),
-        Err(err) => return Err(err).context("locking event buffer for drain"),
-    }
+    lock_exclusive_until(&file, deadline).context("locking event buffer for drain")?;
     let _guard = LockGuard(&file);
 
     let lines = read_lines(&file)?;
@@ -710,6 +752,25 @@ fn drain_buffer(
         return Err(err);
     }
     Ok(())
+}
+
+/// Wait for an exclusive advisory lock on `file` until `deadline`.
+/// Contention is a wait, not a failure: the lock holder is the in-flight
+/// drain that must finish before this invocation can send in FIFO order.
+fn lock_exclusive_until(file: &File, deadline: Instant) -> Result<()> {
+    loop {
+        match FileExt::try_lock_exclusive(file) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                let time_left = remaining(deadline);
+                if time_left.is_zero() {
+                    return Err(anyhow!("timed out waiting for event buffer drain lock"));
+                }
+                thread::sleep(Duration::from_millis(10).min(time_left));
+            }
+            Err(err) => return Err(err).context("locking event buffer for drain"),
+        }
+    }
 }
 
 /// Append a rejected buffered event, plus the engine's rejection reason,
@@ -875,6 +936,20 @@ mod tests {
             assert!(maybe_splice_run_id(b"not json at all").is_err());
             assert!(maybe_splice_run_id(b"\"a string\"").is_err());
             assert!(maybe_splice_run_id(b"[1,2,3]").is_err());
+        });
+    }
+
+    #[test]
+    fn splice_shim_fields_stamps_a_delivery_id_and_keeps_an_existing_one() {
+        with_env(RUN_ID_ENV, Some("run-xyz"), || {
+            let first = splice_shim_fields(br#"{"hook_event_name":"Stop"}"#);
+            let parsed: serde_json::Value = serde_json::from_slice(&first).unwrap();
+            assert_eq!(parsed["_boss_run_id"], "run-xyz");
+            let delivery_id = parsed["_boss_delivery_id"].as_str().expect("delivery id");
+            assert!(!delivery_id.is_empty());
+            let again = splice_shim_fields(&first);
+            let parsed_again: serde_json::Value = serde_json::from_slice(&again).unwrap();
+            assert_eq!(parsed_again["_boss_delivery_id"], delivery_id);
         });
     }
 
@@ -1073,6 +1148,96 @@ mod tests {
             b"transient-event\nlater-event\ncurrent-event\n",
             "the current event must queue behind the retried record and its FIFO suffix"
         );
+    }
+
+    /// Shim A holds the drain lock while shim B arrives with a Stop. B
+    /// waits for the lock, then drains and sends; Stop reaches the
+    /// socket without a third invocation.
+    #[test]
+    fn concurrent_stop_is_delivered_without_a_third_invocation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let buf = dir.path().join(".boss/events-pending.jsonl");
+        std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
+        std::fs::write(&buf, b"earlier-event\n").unwrap();
+        let socket = dir.path().join("events.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut payload = Vec::new();
+                conn.read_to_end(&mut payload).unwrap();
+                tx.send(payload).unwrap();
+            }
+        });
+
+        let file = OpenOptions::new().read(true).write(true).open(&buf).unwrap();
+        FileExt::lock_exclusive(&file).unwrap();
+        let socket_owned = socket.to_str().unwrap().to_owned();
+        let buf_for_b = buf.clone();
+        let b = std::thread::spawn(move || {
+            deliver_local(
+                &socket_owned,
+                Some(buf_for_b),
+                None,
+                b"stop-event".to_vec(),
+                Instant::now() + Duration::from_secs(2),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        FileExt::unlock(&file).unwrap();
+        drop(file);
+        b.join().unwrap().unwrap();
+        let first = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("earlier event must be drained");
+        let second = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Stop must be sent by the waiting shim");
+        server.join().unwrap();
+        assert_eq!(first, b"earlier-event");
+        assert_eq!(second, b"stop-event");
+        assert!(std::fs::read(&buf).unwrap().is_empty());
+    }
+
+    /// A non-empty buffer must still ride through an engine restart: the
+    /// drain retries connect, then the buffered and current events are
+    /// delivered in order once the socket appears.
+    #[test]
+    fn drain_retries_connect_when_engine_returns_and_keeps_fifo() {
+        with_env(RETRY_DELAYS_ENV, Some("30,50,80"), || {
+            let dir = tempfile::TempDir::new().unwrap();
+            let buf = dir.path().join(".boss/events-pending.jsonl");
+            std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
+            std::fs::write(&buf, b"buffered-event\n").unwrap();
+            let socket = dir.path().join("events.sock");
+            let socket_for_server = socket.clone();
+            let server = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                let listener = std::os::unix::net::UnixListener::bind(&socket_for_server).unwrap();
+                let mut received = Vec::new();
+                for _ in 0..2 {
+                    let (mut conn, _) = listener.accept().unwrap();
+                    let mut payload = Vec::new();
+                    conn.read_to_end(&mut payload).unwrap();
+                    received.push(payload);
+                }
+                received
+            });
+            deliver_local(
+                socket.to_str().unwrap(),
+                Some(buf.clone()),
+                None,
+                b"current-event".to_vec(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(
+                server.join().unwrap(),
+                vec![b"buffered-event".to_vec(), b"current-event".to_vec()]
+            );
+            assert!(std::fs::read(&buf).unwrap().is_empty());
+        });
     }
 
     #[test]

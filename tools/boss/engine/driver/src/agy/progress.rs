@@ -22,10 +22,12 @@
 //! inventing one.
 //!
 //! The socket reserves decode turns in accept order before spawning tasks,
-//! so a parent delayed beyond the shim's one-second response window still
-//! claims before a later child. The shim queues new hooks behind a failed
-//! buffer drain. This assumes the parent's connection reaches the listener
-//! first; events lost before connecting or buffering cannot be ordered.
+//! so a parent that finishes writing before the read deadline still claims
+//! before a later child. A stalled writer is retried rather than pinning
+//! ingress. The shim waits for a concurrent drain lock instead of
+//! stranding the current hook. This assumes the parent's connection
+//! reaches the listener first; events lost before connecting or buffering
+//! cannot be ordered.
 //!
 //! `lastUserInput` repeats the whole prompt on every 1.5.5 hook. It is
 //! stripped during canonicalisation and must not be logged.
@@ -261,12 +263,27 @@ impl AgyProgressSession {
         if can_claim {
             return self.persist_claim(session_id);
         }
+        let live = match (self.run_id.as_deref(), self.identity_store.as_deref()) {
+            (Some(run_id), Some(store)) => store
+                .progress_run_is_non_terminal(run_id)
+                .map_err(NormalizeError::IdentityStoreTransient)?,
+            _ => false,
+        };
+        if live {
+            tracing::error!(
+                session_id,
+                "agy Stop arrived before a claimed conversation identity; retry required"
+            );
+            return Err(NormalizeError::BoundaryBeforeClaim(
+                "agy Stop arrived before a claimed conversation identity; retry after SessionStart".into(),
+            ));
+        }
         tracing::error!(
             session_id,
-            "agy Stop arrived before a claimed conversation identity; retry required"
+            "agy Stop arrived before a claimed conversation identity on a terminal run; rejecting permanently"
         );
-        Err(NormalizeError::IdentityStoreTransient(
-            "agy Stop arrived before a claimed conversation identity; retry after SessionStart".into(),
+        Err(NormalizeError::Malformed(
+            "agy Stop arrived before a claimed conversation identity on a terminal run".into(),
         ))
     }
 

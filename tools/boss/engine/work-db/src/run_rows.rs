@@ -1840,4 +1840,10 @@ impl boss_engine_driver::ProgressIdentityStore for WorkDb {
         self.get_run_progress_session_identity(run_id)
             .map_err(|err| format!("{err:#}"))
     }
+
+    fn progress_run_is_non_terminal(&self, run_id: &str) -> Result<bool, String> {
+        self.get_execution(run_id)
+            .map(|execution| !execution.status.is_terminal())
+            .map_err(|err| format!("{err:#}"))
+    }
 }
