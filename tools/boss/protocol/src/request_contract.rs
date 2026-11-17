@@ -567,6 +567,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         // Other comment actions and planner/merge controls drive the operator's
         // workflow; the worker may reply, but cannot resolve or rewrite it.
         R::AnswerOperatorQuestion { .. }
+        | R::DismissOperatorQuestion { .. }
         | R::CommentsCreate { .. }
         | R::CommentsDismiss { .. }
         | R::CommentsPostFollowup { .. }

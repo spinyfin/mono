@@ -10,6 +10,70 @@ use serde_json::Value;
 use common::{run_boss, run_boss_human};
 use harness::{TestEngine, create_chore, create_product};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dismiss_question_cli_records_history_and_rejects_late_answers() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Question history").await?;
+    let chore = create_chore(&mut client, &product.id, "Choose an approach").await?;
+    let db = engine.db()?;
+    let execution = db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(&chore.id)
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )?;
+    let question_payload = serde_json::json!({"outcome": "blocked", "summary": "Needs a decision",
+        "question": {"text": "Continue?", "answer_type": {"kind": "yes_no"}, "explanation": "Both choices need a decision."}});
+    db.submit_worker_proposal_with_liveness(
+        boss_engine::work::SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &chore.id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: &question_payload.to_string(),
+            idempotency_key: "question-history",
+        },
+        &|_| false,
+    )?
+    .map_err(|err| anyhow!("{err:?}"))?;
+    db.record_worker_awaiting_operator_answer(
+        &execution.id,
+        "Needs a decision",
+        &boss_protocol::OperatorQuestion {
+            text: "Continue?".into(),
+            answer_type: boss_protocol::OperatorAnswerType::YesNo,
+            explanation: "Both choices need a decision.".into(),
+        },
+    )?;
+    let question = db.list_operator_questions(&chore.id)?[0].question.id.clone();
+    let dismissed = run_boss(
+        engine.socket_str(),
+        &[
+            "task",
+            "dismiss-question",
+            &chore.id,
+            "--question",
+            &question,
+            "--note",
+            "Neither choice fits",
+        ],
+    )?;
+    assert_eq!(dismissed["blocked_reason"], "question_dismissed", "{dismissed}");
+    let shown = run_boss(engine.socket_str(), &["task", "show", &chore.id])?;
+    let history = &shown["operator_questions"][0];
+    assert_eq!(history["status"], "dismissed");
+    assert_eq!(history["dismissal"]["note"], "Neither choice fits");
+    assert!(history["answer"].is_null());
+    let human = run_boss_human(engine.socket_str(), &["task", "show", &chore.id])?;
+    assert!(human.contains("Dismissed by:"));
+    assert!(human.contains("Neither choice fits"));
+    let error = common::run_boss_expect_failure(engine.socket_str(), &["task", "answer", &question, "--yes"])?;
+    assert!(error.contains("dismissed"), "{error}");
+    assert_eq!(db.list_executions(Some(&chore.id))?.len(), 1);
+    Ok(())
+}
+
 fn execution_json<'a>(value: &'a Value, id: &str) -> Result<&'a Value> {
     value["executions"]
         .as_array()

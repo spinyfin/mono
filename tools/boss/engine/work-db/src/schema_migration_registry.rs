@@ -344,6 +344,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: conflict_mismatch::migrate_operator_forced_admission,
         },
         Migration {
+            id: "20261117_0210_operator_question_dismissal".into(),
+            legacy_version: None,
+            apply: pr_flow::question_dismissal::migrate,
+        },
+        Migration {
             id: pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID.into(),
             legacy_version: None,
             apply: pr_flow::migrate_operator_question_stuck_classification,

@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "question_dismissal.rs"]
+pub(super) mod question_dismissal;
 use boss_protocol::{
     DispatchAdmissionEntryPoint, OperatorAnswer, OperatorAnswerType, OperatorQuestion, OperatorQuestionError,
     OperatorQuestionRecord, OperatorQuestionStatus, OperatorQuestionView,
@@ -2436,6 +2439,11 @@ pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRe
         .transpose()
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err)))?;
     let status: String = row.get("status")?;
+    let dismissal = row
+        .get::<_, Option<String>>("dismissal_json")?
+        .map(|json| serde_json::from_str::<boss_protocol::OperatorQuestionDismissal>(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err)))?;
     Ok(OperatorQuestionRecord::builder()
         .question(
             OperatorQuestionView::builder()
@@ -2450,6 +2458,7 @@ pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRe
         )
         .work_item_id(row.get::<_, String>("work_item_id")?)
         .status(match status.as_str() {
+            _ if dismissal.is_some() => OperatorQuestionStatus::Dismissed,
             "open" => OperatorQuestionStatus::Open,
             "answered" => OperatorQuestionStatus::Answered,
             _ => OperatorQuestionStatus::Withdrawn,
@@ -2457,7 +2466,12 @@ pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRe
         .maybe_answer(answer)
         .maybe_answered_by(row.get::<_, Option<String>>("answered_by")?)
         .maybe_answered_at(row.get::<_, Option<String>>("answered_at")?)
-        .maybe_withdrawn_reason(row.get::<_, Option<String>>("withdrawn_reason")?)
+        .maybe_withdrawn_reason(if dismissal.is_some() {
+            None
+        } else {
+            row.get::<_, Option<String>>("withdrawn_reason")?
+        })
+        .maybe_dismissal(dismissal)
         .build())
 }
 
@@ -2582,6 +2596,7 @@ impl WorkDb {
             return Err(OperatorQuestionError::Conflict {
                 state: match question.status {
                     OperatorQuestionStatus::Answered => "answered",
+                    OperatorQuestionStatus::Dismissed => "dismissed",
                     _ => "withdrawn",
                 }
                 .into(),

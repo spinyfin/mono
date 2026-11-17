@@ -14,15 +14,32 @@ extension ChatViewModel {
     /// nothing. Returns whether a request was sent.
     @discardableResult
     func answerOperatorQuestion(for task: WorkTask, answer: OperatorAnswer) -> Bool {
+        submitOperatorQuestion(for: task, answer: answer)
+    }
+
+    @discardableResult
+    func dismissOperatorQuestion(for task: WorkTask) -> Bool {
+        submitOperatorQuestion(for: task, answer: nil)
+    }
+
+    private func submitOperatorQuestion(for task: WorkTask, answer: OperatorAnswer?) -> Bool {
         guard let question = task.operatorQuestion else { return false }
         guard operatorAnswerInFlightByTaskID[task.id] == nil else { return false }
         operatorAnswerErrorByTaskID.removeValue(forKey: task.id)
         operatorAnswerErrorQuestionIDByTaskID.removeValue(forKey: task.id)
         guard canSubmitUserActions() else { return false }
-        guard let requestID = engine.sendAnswerOperatorQuestion(id: question.id, answer: answer) else {
+        let requestID = if let answer {
+            engine.sendAnswerOperatorQuestion(id: question.id, answer: answer)
+        } else {
+            engine.sendDismissOperatorQuestion(id: question.id)
+        }
+        guard let requestID else {
             refreshUnsentActions()
             showDisconnectedActionNotice()
-            setOperatorAnswerError("Answer saved. Use Retry after reconnecting to send it.", taskID: task.id, questionID: question.id)
+            let message = answer == nil
+                ? "Dismissal saved. Use Retry after reconnecting to send it."
+                : "Answer saved. Use Retry after reconnecting to send it."
+            setOperatorAnswerError(message, taskID: task.id, questionID: question.id)
             return false
         }
         operatorAnswerInFlightByTaskID[task.id] = requestID

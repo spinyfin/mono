@@ -613,6 +613,15 @@ pub enum FrontendRequest {
         reason: Option<String>,
     },
 
+    /// Close an open question without applying any answer effects.
+    DismissOperatorQuestion {
+        id: String,
+        #[serde(default)]
+        question_id: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+
     /// Set `enabled = true` on an automation. Idempotent.
     /// Replies with [`FrontendEvent::AutomationUpdated`].
     EnableAutomation {

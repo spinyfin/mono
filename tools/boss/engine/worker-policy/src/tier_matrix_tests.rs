@@ -148,6 +148,7 @@ fn denied_for_both_fixtures() -> Vec<FrontendRequest> {
             id: "oq".into(),
             answer: boss_protocol::OperatorAnswer::YesNo { value: true },
         },
+        req(json!({"type": "dismiss_operator_question", "id": "oq"})),
         req(json!({"type": "shutdown", "token": "t"})),
         req(json!({"type": "list_hosts"})),
         req(json!({"type": "list_ideas", "product_id": "p"})),

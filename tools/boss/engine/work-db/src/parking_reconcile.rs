@@ -71,6 +71,8 @@ pub enum KeptHold {
     /// `blocked: awaiting_operator_answer`: a question is already in front of
     /// the human, so nothing about the un-park answers it.
     OperatorQuestion,
+    /// The owner dismissed the question; only explicit start or status editing resumes it.
+    QuestionDismissed,
     /// `blocked: worker_failed` whose ledger basis is `operator_no`: the owner
     /// refused the work, a recorded decision that stays a human hold.
     OperatorRefusal,
@@ -85,6 +87,7 @@ impl KeptHold {
     pub fn blocked_reason(&self) -> &'static str {
         match self {
             KeptHold::OperatorQuestion => "awaiting_operator_answer",
+            KeptHold::QuestionDismissed => "question_dismissed",
             KeptHold::OperatorRefusal | KeptHold::FailureEvidence { .. } => "worker_failed",
         }
     }
@@ -162,6 +165,7 @@ pub(crate) fn release_row(tx: &Connection, task: &Task, actor: &str) -> Result<U
     };
     let kept_hold = match task.blocked_reason.as_deref() {
         Some("awaiting_operator_answer") => Some(KeptHold::OperatorQuestion),
+        Some("question_dismissed") => Some(KeptHold::QuestionDismissed),
         Some("worker_failed") => Some(
             match crate::stuck_report::latest_basis(tx, &task.id, "blocked_reason")? {
                 Some(basis) if basis == WorkerFailureBasis::OperatorNo.as_str() => KeptHold::OperatorRefusal,

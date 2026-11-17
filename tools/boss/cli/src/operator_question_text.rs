@@ -52,6 +52,12 @@ pub(crate) fn operator_question_lines(record: &OperatorQuestionRecord) -> Vec<St
             record.answered_at.as_deref().unwrap_or("")
         ));
     }
+    if let Some(dismissal) = &record.dismissal {
+        lines.push(format!("  Dismissed by: {}; at: {}", dismissal.by, dismissal.at));
+        if let Some(note) = &dismissal.note {
+            lines.push(format!("  Note: {note}"));
+        }
+    }
     if let Some(reason) = &record.withdrawn_reason {
         lines.push(format!("  Withdrawn: {reason}"));
     }

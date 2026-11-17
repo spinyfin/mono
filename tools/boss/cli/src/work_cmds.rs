@@ -883,6 +883,24 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::ByPr(args) => run_by_pr(&mut client, ctx, args).await,
         TaskCommand::ByExec(args) => run_by_exec(&mut client, ctx, args).await,
         TaskCommand::Executions(args) => run_task_executions(&mut client, ctx, args).await,
+        TaskCommand::DismissQuestion(TaskDismissQuestionArgs { id, question, note }) => {
+            let response = client
+                .send_request(&FrontendRequest::DismissOperatorQuestion {
+                    id,
+                    question_id: question,
+                    note,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::WorkItemUpdated { item } => print_entity(ctx, &item, || println!("Question dismissed.")),
+                FrontendEvent::OperatorQuestionError { error } => Err(CliError::application(error.to_string())),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("task dismiss-question", &other)),
+            }
+        }
         TaskCommand::Answer(args) => {
             let response = client
                 .send_request(&FrontendRequest::AnswerOperatorQuestion {

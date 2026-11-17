@@ -208,7 +208,7 @@ fn human_held_sql(a: &str) -> String {
     // todo/active row.
     format!(
         "COALESCE({a}.deferred = 1 OR {a}.human_driven = 1
-          OR {a}.blocked_reason IN ('awaiting_operator_answer', 'deletion_signoff')
+          OR {a}.blocked_reason IN ('awaiting_operator_answer', 'question_dismissed', 'deletion_signoff')
           OR NOT {not_positioning_held}
           OR EXISTS (SELECT 1 FROM operator_questions oq WHERE oq.work_item_id = {a}.id AND oq.status = 'open')
           OR EXISTS (SELECT 1 FROM work_executions hx WHERE hx.work_item_id = {a}.id AND hx.status = 'waiting_human')

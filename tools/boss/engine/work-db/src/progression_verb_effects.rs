@@ -359,6 +359,13 @@ pub(super) fn redispatch(
         [&item.id],
         |row| row.get(0),
     )?;
+    if item.blocked_reason.as_deref() == Some("question_dismissed") {
+        return Err(ProgressionVerbRefusal::OperatorRefusal {
+            verb: verb.to_string(),
+            item: item.id.clone(),
+        }
+        .into());
+    }
     if question_open || item.blocked_reason.as_deref() == Some("awaiting_operator_answer") {
         return Err(ProgressionVerbRefusal::AwaitingOperatorAnswer { item: item.id.clone() }.into());
     }
@@ -666,7 +673,7 @@ pub(super) fn unblock(conn: &Connection, pending: &mut PendingEvents, ctx: &Verb
                 item.blocked_reason.as_deref().unwrap_or_default()
             )));
         }
-        Some("awaiting_operator_answer" | "deletion_signoff") => {
+        Some("awaiting_operator_answer" | "question_dismissed" | "deletion_signoff") => {
             return Err(precondition(format!("{} is waiting on the owner", item.id)));
         }
         Some(other) => {

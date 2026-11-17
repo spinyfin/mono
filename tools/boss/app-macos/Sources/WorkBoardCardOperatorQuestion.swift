@@ -31,6 +31,7 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     /// Invoked with the user's answer. The card never applies it
     /// locally: the engine's `work_item_updated` reply moves the card.
     var onAnswer: ((OperatorAnswer) -> Void)? = nil
+    var onDismiss: (() -> Void)? = nil
 
     @State fileprivate var showingDetail = false
 
@@ -62,6 +63,7 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
             if question.choices.isEmpty {
                 HStack(spacing: 8) {
                     whyButton(question)
+                    dismissButton
                     Spacer(minLength: 0)
                     // No default action on either button: a stray Return must not
                     // authorize a bypass. A question whose answers are distinct
@@ -78,7 +80,10 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
                 // One button per option, in the worker's order. The label is the
                 // string the engine records, so the click is the answer.
                 VStack(alignment: .leading, spacing: 6) {
-                    whyButton(question)
+                    HStack(spacing: 8) {
+                        whyButton(question)
+                        dismissButton
+                    }
                     ForEach(Array(question.choices.enumerated()), id: \.offset) { index, choice in
                         Button {
                             onAnswer?(.multipleChoice(choice))
@@ -108,6 +113,12 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
 }
 
 extension WorkBoardCardOperatorQuestion {
+    fileprivate var dismissButton: some View {
+        Button("Dismiss") { onDismiss?() }
+            .help("Close this question without answering. Work stays blocked until explicitly started.")
+            .accessibilityIdentifier("operator-question-dismiss")
+    }
+
     fileprivate func whyButton(_ question: OperatorQuestionPresentation) -> some View {
         Button("Why?") { showingDetail.toggle() }
             .buttonStyle(.link)
