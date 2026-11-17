@@ -2,9 +2,12 @@
 //!
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
 //! provisioning, per-kind permission rendering (`--settings`), PreToolUse
-//! authorization, and hook progress observation (conversation-id
-//! filtering for undisableable subagents). Interactive TUI spawn stays
-//! disabled (`launch_ready` false) until pane launch calls
+//! authorization, hook progress observation (conversation-id filtering for
+//! undisableable subagents), and transcript access: the per-run `brain/` tree
+//! is linked into Boss's durable per-execution transcript store, the
+//! `transcriptPath` the claimed parent stamps is resolved onto it, and the
+//! native `transcript_full.jsonl` dialect is normalised. Interactive TUI spawn
+//! stays disabled (`launch_ready` false) until pane launch calls
 //! `verify_startup_authorization` and qualifies CLI hook discovery and
 //! review-mode failure behavior. Retention preserves transcript evidence
 //! in the per-run HOME.
@@ -27,7 +30,7 @@ use super::{
     InterruptDelivery, InterruptPlan, InterruptRecoverySnapshot, MidTurnPaneInput, ModelMenu, PermissionArtifacts,
     PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
     ProgressSessionConfig, ProgressSessionNormalizer, SettingsLogCheckSpec, SpawnPlan, SpawnRequest,
-    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass,
 };
 
 mod environment;
@@ -45,6 +48,7 @@ mod turn_boundary;
 mod turn_end_recovery;
 
 use progress::AgyProgressSession;
+use transcript::AgyTranscriptSession;
 
 /// Manual authenticated rules-discovery conformance probe.
 pub mod rules_probe;
@@ -106,10 +110,11 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 ///
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning, permission
-/// rendering, PreToolUse authorization, and hook progress observation are
-/// live; interactive TUI spawn stays disabled (`launch_ready` false) until
-/// pane launch calls `verify_startup_authorization` and qualifies CLI hook
-/// discovery and review-mode failure behavior. Retention preserves per-run
+/// rendering, PreToolUse authorization, hook progress observation, and
+/// transcript access are live; interactive TUI spawn stays disabled
+/// (`launch_ready` false) until pane launch calls
+/// `verify_startup_authorization` and qualifies CLI hook discovery and
+/// review-mode failure behavior. Retention preserves per-run
 /// transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
@@ -294,8 +299,9 @@ impl AgentDriver for AgyDriver {
         }
 
         // HOME is isolated; spawn stays refused until guard hooks land.
-        // Retention preserves containers holding brain/ or conversations/
-        // evidence while agy lacks durable transcript storage.
+        // A home whose `brain/` is the durable-store link is freely
+        // reclaimable; only a legacy home holding a real `brain/` or
+        // `conversations/` is retained as the sole copy of its transcript.
         refuse_agy_plan(env, "agy driver is not spawnable yet (guard hooks are not wired)")
     }
 
@@ -462,16 +468,37 @@ impl AgentDriver for AgyDriver {
         })
     }
 
-    fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
-        Ok(Some(process_home_for_run(run_id)?))
-    }
-
+    /// The transcript of the **claimed parent** conversation, from the payload
+    /// that names it.
+    ///
+    /// Every `agy` hook payload carries `transcriptPath`, and every subagent
+    /// has a transcript of its own (hook study, "Subagent identity"), so the
+    /// field alone does not say whose transcript it is. The driver cannot
+    /// consult the claimed identity here — this method is stateless — but the
+    /// progress session already gates exactly three event kinds on it:
+    /// `SessionStart`, `PreInvocation` and `Stop` are dropped before they reach
+    /// the engine unless they carry the parent's `conversationId`. Tool hooks
+    /// are not gated (a child's progress stays visible), so they never
+    /// contribute a path: a child's `PostToolUse` must not become the run's
+    /// transcript just because it arrived first. The engine keeps the first
+    /// path it is given, and the parent's `SessionStart` always comes first.
+    ///
+    /// The path is the one the CLI stamped, never one constructed from a
+    /// documentation example (the reference describes `transcript.jsonl`; the
+    /// binary writes `transcript_full.jsonl`). Empty strings are treated as
+    /// missing, matching Claude/Grok. [`persistable_transcript_path`]
+    /// rewrites a path through the per-run `brain` link onto the durable store,
+    /// so the recorded location survives the home's reclaim.
+    ///
+    /// [`persistable_transcript_path`]: crate::transcript_store::persistable_transcript_path
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
-        // `agy` stamps `transcriptPath` on the Stop payload (pane study).
-        // Empty strings are treated as missing, matching Claude/Grok.
-        // `persistable_transcript_path` rewrites onto the durable store
-        // when one exists, and warns when the stamp is still under a
-        // per-run home that reclaim will delete.
+        let event = raw
+            .get("hookEventName")
+            .or_else(|| raw.get("hook_event_name"))
+            .and_then(serde_json::Value::as_str)?;
+        if !matches!(event, "SessionStart" | "PreInvocation" | "Stop") {
+            return None;
+        }
         let s = raw
             .get("transcriptPath")
             .or_else(|| raw.get("transcript_path"))
@@ -487,12 +514,30 @@ impl AgentDriver for AgyDriver {
         }
     }
 
+    fn transcript_session(&self) -> Option<Box<dyn TranscriptSessionNormalizer>> {
+        // A tool call and its result are separate rows joined only by
+        // position — `AgyTranscriptSession` owns that per-tail correlation.
+        Some(Box::new(AgyTranscriptSession::default()))
+    }
+
+    fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        home::transcript_containment_root(run_id)
+    }
+
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+        // Isolated single-row reshape for callers that hold no
+        // `transcript_session()` tail; each call starts with no pending tool
+        // call, so a result row is never paired here.
         transcript::normalize_transcript_entry(raw)
     }
 
-    fn extract_error_from_transcript(&self, _lines: &[serde_json::Value]) -> Option<String> {
-        None
+    fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String> {
+        // The dialect work is in the normaliser, which flags a halting
+        // `ERROR_MESSAGE` step the way the shared "last meaningful entry"
+        // extractor reads it. A refused or failed *tool* step is a
+        // `tool_result` there, so a worker that was denied a command and then
+        // stopped is not mistaken for one wedged on an API error.
+        boss_engine_transient_error::extract_worker_error(lines)
     }
 
     fn classify_error(&self, _raw_output: &str) -> WorkerErrorClass {
@@ -539,8 +584,21 @@ impl AgentDriver for AgyDriver {
         MidTurnPaneInput::Buffers
     }
 
-    fn structured_output_fallback(&self, _kind: StructuredOutputKind, _text: &str) -> Vec<FallbackCandidate> {
-        Vec::new()
+    /// Prose fallback for the structured-output file contract.
+    ///
+    /// The conventions the engine teaches a worker for its final message —
+    /// the PR URL on its own line, the `FOLLOWUPS:` block, the triage marker,
+    /// the reviewer's fenced JSON — live in the driver-neutral worker brief,
+    /// which an `agy` worker receives unchanged, and `agy`'s final message is
+    /// the same plain prose (its last `PLANNER_RESPONSE`, normalised to an
+    /// assistant text block). They are therefore declared for this driver
+    /// explicitly rather than inherited by accident, and ride the one shared
+    /// implementation. Every candidate is still validated against its kind's
+    /// parser by the caller, so a worker that ignored the convention yields
+    /// nothing, exactly as an empty list would. This is the fallback only: the
+    /// env-file contract is primary and applies to every driver.
+    fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate> {
+        crate::claude::structured_output::fallback_candidates(kind, text)
     }
 }
 
@@ -793,7 +851,22 @@ mod tests {
             .unwrap();
         assert!(!fallback.exists());
         assert!(!runtime.control_dir.exists());
-        assert_eq!(fs::read_to_string(&transcript).unwrap(), "conversation");
+        assert!(
+            !runtime.process_home.exists(),
+            "a home with durable transcript storage keeps nothing of its own"
+        );
+        // The transcript was written through `brain/`; it now lives only in the
+        // durable per-execution store, which outlives the reclaimed home.
+        let durable = crate::transcript_store::durable_sessions_dir(
+            &test_environment::transcript_store_for(&homes),
+            "agy",
+            "run-prov-agy",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(durable.join("cid/.system_generated/logs/transcript_full.jsonl")).unwrap(),
+            "conversation"
+        );
         assert_eq!(
             fs::read(keychain_dir.join("login.keychain-db")).unwrap(),
             b"dummy-keychain"
@@ -1041,5 +1114,266 @@ mod tests {
             "SessionStart must forward progress after authorization install: {hooks_doc:#}"
         );
         assert!(!driver.launch_ready());
+    }
+    // ── TranscriptAccess ────────────────────────────────────────────────────
+
+    const TOOL_CALLS_CAPTURE: &str = include_str!("agy/testdata/tool_calls_1.5.9.jsonl");
+    const DENIED_STEPS_CAPTURE: &str = include_str!("agy/testdata/denied_steps_1.5.9.jsonl");
+
+    fn stamped_path(cid: &str) -> String {
+        format!("/tmp/agy-test/brain/{cid}/.system_generated/logs/transcript_full.jsonl")
+    }
+
+    fn lifecycle_payload(event: &str, cid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hookEventName": event,
+            "conversationId": cid,
+            "modelName": "gemini-3.8-flash-low",
+            "transcriptPath": stamped_path(cid),
+            "executionNum": 0,
+            "terminationReason": "NO_TOOL_CALL",
+            "fullyIdle": true,
+            "error": "",
+        })
+    }
+
+    fn tool_payload(event: &str, cid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hookEventName": event,
+            "conversationId": cid,
+            "modelName": "gemini-3.8-flash-low",
+            "transcriptPath": stamped_path(cid),
+            "error": "",
+            "toolCall": {"id": "call_1", "name": "run_command", "args": {"CommandLine": "true"}},
+        })
+    }
+
+    #[test]
+    fn transcript_path_comes_only_from_events_the_identity_filter_gates() {
+        let driver = AgyDriver::default();
+        for event in ["SessionStart", "PreInvocation", "Stop"] {
+            assert_eq!(
+                driver.transcript_path_for_session(&lifecycle_payload(event, "cid-1")),
+                Some(stamped_path("cid-1")),
+                "{event}"
+            );
+        }
+        // Tool hooks are not identity-gated, so a child's would otherwise be
+        // able to name its own transcript as the run's.
+        for event in ["PreToolUse", "PostToolUse", "PostInvocation"] {
+            assert_eq!(
+                driver.transcript_path_for_session(&tool_payload(event, "cid-1")),
+                None,
+                "{event}"
+            );
+        }
+        let mut no_event = lifecycle_payload("Stop", "cid-1");
+        no_event.as_object_mut().unwrap().remove("hookEventName");
+        assert_eq!(driver.transcript_path_for_session(&no_event), None);
+        let mut empty = lifecycle_payload("Stop", "cid-1");
+        empty["transcriptPath"] = serde_json::json!("");
+        assert_eq!(driver.transcript_path_for_session(&empty), None);
+        let mut snake = lifecycle_payload("Stop", "cid-1");
+        let path = snake.as_object_mut().unwrap().remove("transcriptPath").unwrap();
+        snake["transcript_path"] = path;
+        assert_eq!(driver.transcript_path_for_session(&snake), Some(stamped_path("cid-1")));
+    }
+
+    #[test]
+    fn a_subagent_never_supplies_the_runs_transcript() {
+        // What the engine does with each payload, in order: ask the driver for a
+        // path, run the payload through the per-connection progress session, and
+        // use the path only if the session lets the event through.
+        let driver = AgyDriver::default();
+        let mut session = AgyProgressSession::new(None, None);
+        let mut contributed = Vec::new();
+        for payload in [
+            lifecycle_payload("SessionStart", "parent"),
+            tool_payload("PreToolUse", "parent"),
+            // The child starts, works and stops. Its tool hooks pass the
+            // session (so its progress stays visible); its boundaries do not.
+            lifecycle_payload("SessionStart", "child"),
+            lifecycle_payload("PreInvocation", "child"),
+            tool_payload("PreToolUse", "child"),
+            tool_payload("PostToolUse", "child"),
+            lifecycle_payload("Stop", "child"),
+            lifecycle_payload("Stop", "parent"),
+        ] {
+            let path = driver.transcript_path_for_session(&payload);
+            let accepted = !session.normalize_progress_events(&payload).unwrap().is_empty();
+            contributed.push(accepted.then_some(path).flatten());
+        }
+        assert_eq!(
+            contributed.iter().flatten().collect::<Vec<_>>(),
+            [&stamped_path("parent"), &stamped_path("parent")],
+            "only the claimed parent's SessionStart and Stop name a transcript: {contributed:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_session_pairs_a_call_with_its_result_across_rows() {
+        let mut session = AgyDriver::default()
+            .transcript_session()
+            .expect("agy correlates tool calls across rows");
+        let entries: Vec<serde_json::Value> = TOOL_CALLS_CAPTURE
+            .lines()
+            .map(|line| session.normalize_transcript_entry(serde_json::from_str(line).unwrap()))
+            .collect();
+        assert_eq!(entries[2]["type"], "tool_result");
+        assert_eq!(entries[2]["tool_name"], "Bash");
+        assert_eq!(entries[5]["content"][0]["text"], "CAPTURE_DONE");
+
+        // The stateless entry point cannot pair rows, by design.
+        let lone: serde_json::Value = serde_json::from_str(TOOL_CALLS_CAPTURE.lines().nth(2).unwrap()).unwrap();
+        assert_eq!(
+            AgyDriver::default().normalize_transcript_entry(lone)["subtype"],
+            "generic_step"
+        );
+    }
+
+    fn normalized_lines(driver: &AgyDriver, jsonl: &str) -> Vec<serde_json::Value> {
+        let mut session = driver.transcript_session().unwrap();
+        jsonl
+            .lines()
+            .map(|line| session.normalize_transcript_entry(serde_json::from_str(line).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn a_trailing_halting_error_is_extracted_only_when_the_worker_did_not_recover() {
+        let driver = AgyDriver::default();
+        // Synthetic ERROR_MESSAGE row: the type is named by the CLI's step enum
+        // but no halting error has been captured (see testdata/README.md).
+        let error_row = r#"{"step_index":9,"source":"MODEL","type":"ERROR_MESSAGE","status":"ERROR","error":"model returned an error (code 429)"}"#;
+        let recovered_row =
+            r#"{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"retrying"}"#;
+
+        let halted = normalized_lines(&driver, &format!("{TOOL_CALLS_CAPTURE}{error_row}\n"));
+        assert_eq!(
+            driver.extract_error_from_transcript(&halted).as_deref(),
+            Some("model returned an error (code 429)")
+        );
+        let recovered = normalized_lines(&driver, &format!("{TOOL_CALLS_CAPTURE}{error_row}\n{recovered_row}\n"));
+        assert_eq!(driver.extract_error_from_transcript(&recovered), None);
+    }
+
+    #[test]
+    fn a_refused_tool_step_is_not_a_halting_api_error() {
+        // The real capture ends with two refused steps followed by the worker's
+        // own reply, but even a transcript that ENDS on a refused step must not
+        // read as a worker wedged on an API error: that would auto-resume a
+        // worker a guard deliberately stopped.
+        let driver = AgyDriver::default();
+        let all = normalized_lines(&driver, DENIED_STEPS_CAPTURE);
+        assert_eq!(driver.extract_error_from_transcript(&all), None);
+        let ends_on_refusal = &all[..3];
+        assert_eq!(ends_on_refusal.last().unwrap()["is_error"], true);
+        assert_eq!(driver.extract_error_from_transcript(ends_on_refusal), None);
+        assert_eq!(
+            driver.extract_error_from_transcript(&normalized_lines(&driver, TOOL_CALLS_CAPTURE)),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_output_fallback_declares_the_shared_final_message_conventions() {
+        use boss_engine_structured_output::StructuredOutputKind as Kind;
+        let driver = AgyDriver::default();
+        let pr = "Opened it.\nhttps://github.com/spinyfin/mono/pull/123\n";
+        let followups =
+            "Summary.\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\":\"n\",\"proposed_description\":\"d\"}]\n```\n";
+        let review = "Review.\n```json\n{\"verdict\":\"approve\"}\n```\n";
+        for (kind, text) in [
+            (Kind::PrUrl, pr),
+            (Kind::Followups, followups),
+            (Kind::ReviewResult, review),
+        ] {
+            let candidates = driver.structured_output_fallback(kind, text);
+            assert!(!candidates.is_empty(), "{kind:?} has a declared convention");
+            assert_eq!(
+                candidates,
+                crate::claude::structured_output::fallback_candidates(kind, text),
+                "{kind:?}: one shared implementation, not a divergent copy"
+            );
+        }
+        assert!(
+            driver
+                .structured_output_fallback(Kind::PrUrl, "no url in this message")
+                .is_empty()
+        );
+        // The postmortem manifest has never had a prose sentinel.
+        assert!(
+            driver
+                .structured_output_fallback(Kind::PostmortemFollowups, followups)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_transcript_path_survives_home_reclaim() {
+        // The lifecycle event that matters: the per-run home is reclaimed at
+        // teardown, and the path recorded from the Stop payload must still
+        // resolve — and still be inside the containment root — afterwards.
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let _guard = env_for_provision(&homes);
+        let driver = AgyDriver::default();
+        let run_id = "run-transcript-lifecycle";
+        let state = driver
+            .provision_workspace(&workspace, "prompt", run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime = AgyRuntimeState::from_driver_runtime_state(&state).unwrap();
+
+        let stamped = runtime
+            .process_home
+            .join(".gemini/antigravity-cli/brain/cid-1/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(stamped.parent().unwrap()).unwrap();
+        fs::write(&stamped, "{\"step_index\":0}\n").unwrap();
+
+        let recorded = driver
+            .transcript_path_for_session(&serde_json::json!({
+                "hookEventName": "Stop",
+                "conversationId": "cid-1",
+                "transcriptPath": stamped.to_string_lossy(),
+            }))
+            .expect("Stop stamps transcriptPath");
+        assert_ne!(
+            Path::new(&recorded),
+            stamped.as_path(),
+            "the recorded path must not run through the per-run home"
+        );
+        let root = driver
+            .transcript_containment_root(run_id)
+            .unwrap()
+            .expect("a provisioned home is contained to its durable store");
+        assert!(Path::new(&recorded).starts_with(&root), "{recorded} outside {root:?}");
+
+        driver
+            .teardown_workspace(Some(&workspace), run_id, Some(&state))
+            .await
+            .unwrap();
+        assert!(!stamped.exists(), "precondition: reclaim deleted the per-run home");
+        assert_eq!(fs::read_to_string(&recorded).unwrap(), "{\"step_index\":0}\n");
+        assert_eq!(
+            driver.transcript_containment_root(run_id).unwrap(),
+            Some(root),
+            "containment still resolves once the home is gone"
+        );
+    }
+
+    #[test]
+    fn a_run_that_never_provisioned_a_home_has_no_containment_root() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = env_for_provision(&tmp.path().join("homes"));
+        assert_eq!(
+            AgyDriver::default()
+                .transcript_containment_root("run-never-provisioned")
+                .unwrap(),
+            None
+        );
     }
 }

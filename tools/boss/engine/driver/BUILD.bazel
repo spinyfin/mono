@@ -8,7 +8,10 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "driver",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = glob(["src/grok/testdata/**"]) + [
+    compile_data = glob([
+        "src/agy/testdata/**",
+        "src/grok/testdata/**",
+    ]) + [
         "//tools/boss/tmux:blocking_dialog_cases.json",
         "src/codex-tmux.conf",
         "src/initial_prompt.py",
@@ -59,7 +62,10 @@ rust_test(
     # Adapter acceptance tests spawn python3 per case; the 60s default for
     # size="small" is too tight once those sit next to the rest of the crate.
     timeout = "moderate",
-    compile_data = glob(["src/grok/testdata/**"]) + [
+    compile_data = glob([
+        "src/agy/testdata/**",
+        "src/grok/testdata/**",
+    ]) + [
         "//tools/boss/tmux:blocking_dialog_cases.json",
         "src/codex-tmux.conf",
         "src/initial_prompt.py",

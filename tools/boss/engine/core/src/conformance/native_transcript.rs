@@ -21,6 +21,15 @@ use crate::transcript_markdown::{TranscriptEvent, TranscriptEventKind};
 
 const BLOCKED_MARKER: &str = "[blocked] reason=\"native-dialect fixture needs a coordinator decision\"";
 
+/// Real `agy` 1.5.9 transcript for a prompt asking it to reply with exactly
+/// [`BLOCKED_MARKER`]. Byte-for-byte what the CLI wrote.
+const AGY_BLOCKED_MARKER_CAPTURE: &str = concat!(
+    r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-17T16:08:59Z","content":"<USER_REQUEST>\nUse no tools. Reply with exactly this text and nothing else: [blocked] reason=\"native-dialect fixture needs a coordinator decision\"\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-17T10:08:59-06:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"}"#,
+    "\n",
+    r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-17T16:08:59Z","model":"gemini-3.8-flash-low","input_tokens":10159,"cache_read_tokens":0,"output_tokens":14,"content":"[blocked] reason=\"native-dialect fixture needs a coordinator decision\""}"#,
+    "\n",
+);
+
 /// Native-dialect JSONL for `slug` carrying [`BLOCKED_MARKER`] as the worker's
 /// final answer, in the shape that driver's on-disk transcript actually uses.
 ///
@@ -63,19 +72,13 @@ fn native_blocked_marker_jsonl(slug: &str) -> Option<String> {
             ),
             marker = serde_json::to_string(BLOCKED_MARKER).unwrap(),
         )),
-        // agy writes PLANNER_RESPONSE rows to transcript_full.jsonl (the path
-        // stamped on Stop as transcriptPath). Shape matches the pane-viability
-        // study summaries under
-        // tools/boss/docs/investigations/ghostty-agy-pane-viability-artifacts/.
-        "agy" => Some(format!(
-            concat!(
-                r#"{{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"do the work"}}"#,
-                "\n",
-                r#"{{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":{marker}}}"#,
-                "\n",
-            ),
-            marker = serde_json::to_string(BLOCKED_MARKER).unwrap(),
-        )),
+        // A verbatim `transcript_full.jsonl` from a real `agy` 1.5.9 session
+        // (the path every hook payload stamps as `transcriptPath`), captured by
+        // asking the CLI to reply with exactly this marker. The prompt row
+        // carries the marker text too, so the assertion below proves it is the
+        // *model's* row that surfaces as assistant text. The driver's own
+        // `agy/testdata/` captures hold the other row shapes.
+        "agy" => Some(AGY_BLOCKED_MARKER_CAPTURE.to_owned()),
         _ => None,
     }
 }

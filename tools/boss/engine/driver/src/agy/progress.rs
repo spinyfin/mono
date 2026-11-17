@@ -73,11 +73,16 @@ fn mapped<'a>(table: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
     table.iter().find(|(from, _)| *from == key).map(|(_, to)| *to)
 }
 
-fn tool_name_mapped(raw: &str) -> String {
+/// Claude-canonical name for an `agy` tool. Shared with the transcript
+/// dialect (`transcript.rs`): a transcript's `tool_calls[].name` is the same
+/// vocabulary as a hook's `toolCall.name`.
+pub(super) fn tool_name_mapped(raw: &str) -> String {
     mapped(TOOL_NAME_MAP, raw).unwrap_or(raw).to_owned()
 }
 
-fn canonical_tool_input(args: &Value) -> Value {
+/// Canonical tool input for an `agy` tool's `args` (hook `toolCall.args` and
+/// transcript `tool_calls[].args` share one shape).
+pub(super) fn canonical_tool_input(args: &Value) -> Value {
     let Some(obj) = args.as_object() else {
         return args.clone();
     };

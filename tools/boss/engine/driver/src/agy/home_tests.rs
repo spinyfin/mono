@@ -47,7 +47,7 @@ fn spawn_posture_rejects_intermediate_alias_after_provision() {
     assert!(assert_agy_posture(&runtime.process_home, tmp.path()).is_err());
 }
 
-use super::super::test_environment::{env_for_provision, env_for_provision_with_home_override};
+use super::super::test_environment::{env_for_provision, env_for_provision_with_home_override, transcript_store_for};
 
 #[test]
 fn process_home_for_run_is_under_homes_root() {
@@ -270,4 +270,197 @@ printf '%s\n' 'CLI settings initialized: permissions=&{Allow:[] Deny:[] Ask:[]},
         verify_settings_log_files(&settings_path, &log).unwrap(),
         SettingsLogCheck::ConsistentSoFar
     );
+}
+
+// ── Durable transcript store ────────────────────────────────────────────────
+
+const TRANSCRIPT_LEAF: &str = ".system_generated/logs/transcript_full.jsonl";
+
+fn write_conversation(process_home: &Path, cid: &str, body: &str) -> PathBuf {
+    let transcript = process_home
+        .join(".gemini/antigravity-cli/brain")
+        .join(cid)
+        .join(TRANSCRIPT_LEAF);
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(&transcript, body).unwrap();
+    transcript
+}
+
+fn durable_dir(homes: &Path, run_id: &str) -> PathBuf {
+    crate::transcript_store::durable_sessions_dir(&transcript_store_for(homes), "agy", run_id).unwrap()
+}
+
+#[test]
+fn provisioning_links_brain_into_the_durable_transcript_store() {
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let _guard = env_for_provision(&homes);
+    let runtime = provision_agy_home(tmp.path(), "prompt", "run-durable").unwrap();
+
+    let brain = runtime.process_home.join(".gemini/antigravity-cli/brain");
+    assert!(fs::symlink_metadata(&brain).unwrap().file_type().is_symlink());
+    assert_eq!(
+        fs::canonicalize(&brain).unwrap(),
+        fs::canonicalize(durable_dir(&homes, "run-durable")).unwrap()
+    );
+    // The CLI creates `brain/<cid>/…` itself; it lands in the store.
+    write_conversation(&runtime.process_home, "cid-1", "row\n");
+    assert_eq!(
+        fs::read_to_string(durable_dir(&homes, "run-durable").join("cid-1").join(TRANSCRIPT_LEAF)).unwrap(),
+        "row\n"
+    );
+    // The private tree is still private: the link is the only symlink in it.
+    assert_agy_posture(&runtime.process_home, tmp.path()).unwrap();
+}
+
+#[test]
+fn reprovisioning_a_durable_home_keeps_the_verified_link() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = env_for_provision(&tmp.path().join("homes"));
+    let first = provision_agy_home(tmp.path(), "prompt", "run-again").unwrap();
+    let transcript = write_conversation(&first.process_home, "cid-1", "kept\n");
+    let second = provision_agy_home(tmp.path(), "prompt", "run-again").unwrap();
+    assert_eq!(second.process_home, first.process_home);
+    assert_eq!(fs::read_to_string(transcript).unwrap(), "kept\n");
+}
+
+#[test]
+fn provisioning_refuses_to_hide_a_legacy_transcript_behind_the_link() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = env_for_provision(&tmp.path().join("homes"));
+    let process_home = process_home_for_run("run-legacy-brain").unwrap();
+    write_conversation(&process_home, "cid-1", "the only copy\n");
+
+    let error = provision_agy_home(tmp.path(), "prompt", "run-legacy-brain").unwrap_err();
+    assert!(format!("{error:#}").contains("non-empty"), "{error:#}");
+}
+
+#[test]
+fn a_retargeted_brain_link_is_refused_everywhere_it_is_read() {
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let _guard = env_for_provision(&homes);
+    let runtime = provision_agy_home(tmp.path(), "prompt", "run-retarget").unwrap();
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let brain = runtime.process_home.join(".gemini/antigravity-cli/brain");
+    fs::remove_file(&brain).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &brain).unwrap();
+
+    for error in [
+        assert_agy_posture(&runtime.process_home, tmp.path()).unwrap_err(),
+        reclaim_agy_run(&runtime.process_home).unwrap_err(),
+        transcript_containment_root("run-retarget").unwrap_err(),
+    ] {
+        assert!(format!("{error:#}").contains("targets"), "{error:#}");
+    }
+    assert!(elsewhere.exists(), "refusal must not touch the link's target");
+}
+
+#[test]
+fn only_the_brain_link_is_exempt_from_the_private_tree_symlink_ban() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = env_for_provision(&tmp.path().join("homes"));
+    let runtime = provision_agy_home(tmp.path(), "prompt", "run-ban").unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    for planted in [
+        ".gemini/antigravity-cli/conversations",
+        ".gemini/antigravity-cli/knowledge",
+        ".gemini/planted",
+    ] {
+        let link = runtime.process_home.join(planted);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let error = assert_agy_posture(&runtime.process_home, tmp.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"), "{planted}: {error:#}");
+        fs::remove_file(&link).unwrap();
+    }
+    assert_agy_posture(&runtime.process_home, tmp.path()).unwrap();
+}
+
+#[test]
+fn a_durable_home_is_unprotected_and_reclaimed_whole_while_its_transcript_remains() {
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let _guard = env_for_provision(&homes);
+    let runtime = provision_agy_home(tmp.path(), "prompt", "run-reclaim").unwrap();
+    let container = runtime.process_home.parent().unwrap().to_path_buf();
+    write_conversation(&runtime.process_home, "cid-1", "durable\n");
+    let conversations = runtime
+        .process_home
+        .join(".gemini/antigravity-cli/conversations/cid-1.db");
+    fs::create_dir_all(conversations.parent().unwrap()).unwrap();
+    fs::write(&conversations, b"cli state, not Boss evidence").unwrap();
+
+    assert!(
+        !contains_agy_transcripts(&container),
+        "retention must not hold a container whose transcript is already durable"
+    );
+    reclaim_agy_run(&runtime.process_home).unwrap();
+
+    assert_eq!(
+        fs::read_dir(&container).unwrap().count(),
+        0,
+        "nothing is retained in the home"
+    );
+    assert_eq!(
+        fs::read_to_string(durable_dir(&homes, "run-reclaim").join("cid-1").join(TRANSCRIPT_LEAF)).unwrap(),
+        "durable\n"
+    );
+}
+
+#[test]
+fn a_legacy_home_is_still_protected_until_its_only_copy_is_gone() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = env_for_provision(&tmp.path().join("homes"));
+    let process_home = process_home_for_run("run-legacy-protect").unwrap();
+    let container = process_home.parent().unwrap().to_path_buf();
+    assert!(
+        !contains_agy_transcripts(&container),
+        "an empty container holds nothing"
+    );
+    write_conversation(&process_home, "cid-1", "only copy\n");
+    assert!(contains_agy_transcripts(&container));
+}
+
+#[test]
+fn containment_root_follows_the_durable_store_for_live_reclaimed_and_legacy_homes() {
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let _guard = env_for_provision(&homes);
+
+    let runtime = provision_agy_home(tmp.path(), "prompt", "run-contain").unwrap();
+    let expected = fs::canonicalize(durable_dir(&homes, "run-contain")).unwrap();
+    assert_eq!(
+        transcript_containment_root("run-contain").unwrap(),
+        Some(expected.clone())
+    );
+    reclaim_agy_run(&runtime.process_home).unwrap();
+    assert_eq!(
+        transcript_containment_root("run-contain").unwrap(),
+        Some(expected),
+        "the durable directory is the root after the home is gone"
+    );
+
+    let legacy = process_home_for_run("run-contain-legacy").unwrap();
+    write_conversation(&legacy, "cid-1", "x\n");
+    assert_eq!(transcript_containment_root("run-contain-legacy").unwrap(), None);
+    assert_eq!(transcript_containment_root("run-never-provisioned").unwrap(), None);
+}
+
+#[test]
+fn the_durable_directory_is_filed_under_the_sanitized_run_id() {
+    // The container is named after the sanitized id; the store, the layout
+    // check and the stamped-path rewrite all derive the same name from it.
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let _guard = env_for_provision(&homes);
+    let runtime = provision_agy_home(tmp.path(), "prompt", "run/odd id").unwrap();
+    assert!(runtime.process_home.ends_with("run_odd_id/process-home"));
+    assert_eq!(
+        fs::canonicalize(runtime.process_home.join(".gemini/antigravity-cli/brain")).unwrap(),
+        fs::canonicalize(durable_dir(&homes, "run_odd_id")).unwrap()
+    );
+    assert_agy_posture(&runtime.process_home, tmp.path()).unwrap();
+    assert!(transcript_containment_root("run/odd id").unwrap().is_some());
 }

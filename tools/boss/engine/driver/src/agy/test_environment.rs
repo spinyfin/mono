@@ -21,6 +21,9 @@ pub(crate) fn write_final_settings(run_id: &str, workspace: &Path, kind: crate::
 }
 
 pub(crate) struct EnvGuard {
+    // Declared first so it is released first: the transcript-store lock is the
+    // innermost of the test environment locks (see `transcript_store_override`).
+    _store: Option<crate::test_support::TranscriptStoreOverride>,
     _lock: Option<std::sync::MutexGuard<'static, ()>>,
     prior: Vec<(&'static str, Option<OsString>)>,
 }
@@ -41,7 +44,19 @@ impl EnvGuard {
             // SAFETY: serialised by SCOPED_HOME_ENV_TEST_LOCK.
             unsafe { std::env::set_var(key, value) };
         }
-        Self { _lock: lock, prior }
+        Self {
+            _store: None,
+            _lock: lock,
+            prior,
+        }
+    }
+
+    /// Also point the durable worker transcript store at `root`, for as long as
+    /// this guard lives. Provisioning an `agy` home links its `brain/` into
+    /// that store, so any test that provisions must not reach the real one.
+    pub(crate) fn with_transcript_store(mut self, root: &Path) -> Self {
+        self._store = Some(crate::test_support::transcript_store_override(root));
+        self
     }
 }
 
@@ -65,6 +80,13 @@ pub(crate) fn env_for_provision_with_home_override(homes: &Path) -> EnvGuard {
     env_for_provision_with_lock(homes, None)
 }
 
+/// Where [`env_for_provision`] puts the durable transcript store: inside the
+/// test's own homes directory, so it is cleaned up with it, but outside every
+/// per-run container.
+pub(crate) fn transcript_store_for(homes: &Path) -> std::path::PathBuf {
+    homes.join(".transcript-store")
+}
+
 fn env_for_provision_with_lock(homes: &Path, lock: Option<std::sync::MutexGuard<'static, ()>>) -> EnvGuard {
     EnvGuard::set_with_lock(
         &[
@@ -74,4 +96,5 @@ fn env_for_provision_with_lock(homes: &Path, lock: Option<std::sync::MutexGuard<
         ],
         lock,
     )
+    .with_transcript_store(&transcript_store_for(homes))
 }

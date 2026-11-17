@@ -235,8 +235,11 @@ impl WorkDb {
     /// with a dead one that no longer matches this backfill's query, making
     /// the missing transcript permanently invisible.
     pub fn backfill_durable_transcript_paths(&self) -> Result<BackfillDurableTranscriptPathsOutcome> {
-        // Only select layouts that persistable_transcript_path can rewrite.
-        // Agy paths remain ephemeral and are protected by agy retention.
+        // Only select layouts that were once recorded un-rewritten. Agy paths
+        // are rewritten onto the durable store when first recorded, so a row
+        // that still points into an agy home belongs to a legacy home (a real
+        // `brain/`), which agy retention protects; rewriting it would only
+        // produce a path that does not exist.
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, transcript_path FROM work_runs
