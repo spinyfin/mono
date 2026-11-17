@@ -155,11 +155,24 @@ extension ChatViewModel {
         )
     }
 
-    /// Marker used by the engine for refusals to mutate a terminal group.
-    static let attentionTerminalRefusalMarker = "(terminal)"
+    /// Distinctive substrings of engine terminal-group refusals. Coupled with
+    /// the constants next to the `bail!` strings in
+    /// `tools/boss/engine/work-db/src/attentions.rs`: answer/member refusals
+    /// embed `(terminal)`; `action_attention_group` refusals use the actioned
+    /// and dismissed phrases. Unrelated failures (storage, member not found)
+    /// match none of these.
+    static let attentionTerminalRefusalMarkers = [
+        "(terminal)",
+        "an actioned group is terminal",
+        "a dismissed group cannot be actioned",
+    ]
 
     /// Friendly copy when a click or refusal targets a replaced group.
     static let attentionReplacedMessage = "This question was replaced. Review the current question."
+
+    static func isAttentionTerminalRefusal(_ message: String) -> Bool {
+        attentionTerminalRefusalMarkers.contains { message.contains($0) }
+    }
 
     /// The engine mints a new group id for each generation. A later open
     /// group with the same grouping key is the replacement of `group`.
@@ -223,7 +236,7 @@ extension ChatViewModel {
         else { return false }
         if let replacement = newerOpenAttentionGroup(replacing: origin) {
             attentionAnswerErrorByGroupID[replacement.id] =
-                message.contains(Self.attentionTerminalRefusalMarker) ? Self.attentionReplacedMessage : message
+                Self.isAttentionTerminalRefusal(message) ? Self.attentionReplacedMessage : message
         } else if attentionGroup(id: origin.id)?.isOpen == true {
             attentionAnswerErrorByGroupID[origin.id] = message
         } else {

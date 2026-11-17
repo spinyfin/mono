@@ -345,6 +345,66 @@ final class NavigatorAttentionTests: XCTestCase {
         XCTAssertNil(model.workErrorMessage)
     }
 
+    func testActionedGroupActionRefusalAfterRefreshShowsFriendlyMessage() throws {
+        try assertActionRefusalAfterRefreshShowsFriendlyMessage(
+            engineMessage: "attention group atg_action_old is already actioned; an actioned group is terminal"
+        )
+    }
+
+    func testDismissedGroupActionRefusalAfterRefreshShowsFriendlyMessage() throws {
+        try assertActionRefusalAfterRefreshShowsFriendlyMessage(
+            engineMessage: "attention group atg_action_old is dismissed; a dismissed group cannot be actioned"
+        )
+    }
+
+    func testAnswerThenActionTerminalRefusalsKeepFriendlyMessageOnReplacement() throws {
+        let old = makeGroup(id: "atg_both_old", taskID: "root", generation: 1, groupingKey: "k_both")
+        let oldMember = makeMember(id: "atn_both_old", groupID: old.id, type: "prompt", text: "Which channel?")
+        let model = model(
+            [makeRoot(actions: [attentionAction(id: old.id, task: "root")])],
+            groups: [old], members: [oldMember]
+        )
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertTrue(model.answerAttention(oldMember.id, answer: "ops"))
+        let answerRequest = try XCTUnwrap(model.attentionRequestGroupByRequestID.keys.first)
+        XCTAssertTrue(model.actionAttentionGroup(old.id))
+        let actionRequest = try XCTUnwrap(
+            model.attentionRequestGroupByRequestID.keys.first { $0 != answerRequest }
+        )
+        let newer = makeGroup(id: "atg_both_new", taskID: "root", generation: 2, groupingKey: "k_both")
+        let newerMember = makeMember(
+            id: "atn_both_new", groupID: newer.id, type: "prompt", text: "Which channel?"
+        )
+        model.applyAttentionGroupsList(productID: old.productID, groups: [newer], members: [newerMember])
+        XCTAssertNil(model.attentionGroup(id: old.id))
+        model.applyEventForTest(.workError(
+            message: "attention group atg_both_old is actioned (terminal); its members can no longer be changed",
+            requestId: answerRequest
+        ))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: newer.id), ChatViewModel.attentionReplacedMessage)
+        model.applyEventForTest(.workError(
+            message: "attention group atg_both_old is already actioned; an actioned group is terminal",
+            requestId: actionRequest
+        ))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: newer.id), ChatViewModel.attentionReplacedMessage)
+        XCTAssertNil(model.workErrorMessage)
+    }
+
+    func testTerminalRefusalMatcherRecognizesEngineFormsAndIgnoresUnrelated() {
+        XCTAssertTrue(ChatViewModel.isAttentionTerminalRefusal(
+            "attention group atg_x is actioned (terminal); its members can no longer be changed"
+        ))
+        XCTAssertTrue(ChatViewModel.isAttentionTerminalRefusal(
+            "attention group atg_x is already actioned; an actioned group is terminal"
+        ))
+        XCTAssertTrue(ChatViewModel.isAttentionTerminalRefusal(
+            "attention group atg_x is dismissed; a dismissed group cannot be actioned"
+        ))
+        XCTAssertFalse(ChatViewModel.isAttentionTerminalRefusal("storage unavailable"))
+        XCTAssertFalse(ChatViewModel.isAttentionTerminalRefusal("attention atn_x not found"))
+        XCTAssertFalse(ChatViewModel.isAttentionTerminalRefusal("group is already actioned"))
+    }
+
     func testForeignSnapshotDoesNotDropPendingActionCorrelation() throws {
         let group = makeGroup(id: "atg_foreign", taskID: "root", generation: 1)
         let member = makeMember(id: "atn_foreign", groupID: group.id, type: "prompt", text: "Which channel?")
@@ -682,6 +742,22 @@ final class NavigatorAttentionTests: XCTestCase {
         let failed = try render(OwnedAttentionGroupBody(group: group).environmentObject(model), size: size)
         XCTAssertEqual(redPixels(plain), 0)
         XCTAssertGreaterThan(redPixels(failed), 20)
+    }
+
+    private func assertActionRefusalAfterRefreshShowsFriendlyMessage(
+        engineMessage: String
+    ) throws {
+        let old = makeGroup(id: "atg_action_old", taskID: "root", generation: 1, groupingKey: "k_action")
+        let model = model([makeRoot(actions: [])], groups: [old])
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertTrue(model.actionAttentionGroup(old.id))
+        let requestID = try XCTUnwrap(model.attentionRequestGroupByRequestID.keys.first)
+        let newer = makeGroup(id: "atg_action_new", taskID: "root", generation: 2, groupingKey: "k_action")
+        model.applyAttentionGroupsList(productID: old.productID, groups: [newer], members: [])
+        XCTAssertNil(model.attentionGroup(id: old.id))
+        model.applyEventForTest(.workError(message: engineMessage, requestId: requestID))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: newer.id), ChatViewModel.attentionReplacedMessage)
+        XCTAssertNil(model.workErrorMessage)
     }
 
     private func model(
