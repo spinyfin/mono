@@ -193,6 +193,13 @@ fn list_open_pr(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, branch
         )));
     }
 
+    if let Some(pr) = prs.first() {
+        git_utils::gh_cli::require_default_branch(
+            pr["base"]["ref"].as_str(),
+            pr["base"]["repo"]["default_branch"].as_str(),
+        )
+        .map_err(CubeError::InvalidArgument)?;
+    }
     Ok(prs
         .first()
         .and_then(|pr| pr.get("html_url"))
@@ -260,6 +267,16 @@ fn gh_create_pr(
     runner: &dyn CommandRunner,
     body: &ResolvedPrBody,
 ) -> Result<String> {
+    let default_branch = runner
+        .run(&RealCommandRunner::invocation(
+            &ctx.cwd,
+            "gh",
+            &["api", &format!("repos/{}", ctx.owner_repo), "--jq", ".default_branch"],
+        ))
+        .map_err(|e| CubeError::InvalidArgument(format!("cannot resolve repository default branch: {e}")))?;
+    let default_branch = default_branch.trim();
+    git_utils::gh_cli::require_default_branch(Some(default_branch), Some(default_branch))
+        .map_err(CubeError::InvalidArgument)?;
     let mut create_args: Vec<&str> = vec![
         "pr",
         "create",
@@ -268,7 +285,7 @@ fn gh_create_pr(
         "--head",
         &ctx.branch,
         "--base",
-        "main",
+        default_branch,
     ];
     let title_ref;
     if let Some(ref t) = args.title {

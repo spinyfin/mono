@@ -154,6 +154,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Conflict remediation clears the signal after workspace preparation succeeds, a retry resumes, or the PR becomes clean.",
     ),
     entry(
+        "pr_base_refused",
+        ClearedBy::ProducerReconciles,
+        "Completion and merge polling clear the refusal only after a fresh GitHub observation verifies the repository default branch; unrelated worker progress cannot clear it.",
+    ),
+    entry(
         WORKSPACE_POSITIONING_REFUSED,
         ClearedBy::ProducerReconciles,
         "The positioning-refusal recheck sweep probes the live PR state each pass and clears the hold with its attention once cube would accept it; an explicit launch also clears both.",

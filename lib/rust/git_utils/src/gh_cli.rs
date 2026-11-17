@@ -337,6 +337,24 @@ pub(crate) fn parse_head_sha_output(sha: String, pr_number: u64, repo_slug: &str
     Ok(sha)
 }
 
+/// Missing metadata fails closed; branch names cannot be inferred from conventions.
+pub fn require_default_branch(base: Option<&str>, default: Option<&str>) -> Result<(), String> {
+    let base = base
+        .filter(|s| !s.is_empty())
+        .ok_or("Cannot verify PR base: GitHub omitted the base branch")?;
+    let default = default
+        .filter(|s| !s.is_empty())
+        .ok_or("Cannot verify PR base: GitHub omitted the repository default branch")?;
+    if base != default {
+        return Err(format!(
+            "PR targets `{base}`, but managed work must land in the repository default branch `{default}`. \
+             Stacked changes are not supported. If this work needs another open PR, use the \
+             prerequisite proposal to link its owning work item and wait until it lands in `{default}`."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +494,24 @@ mod tests {
         assert_eq!(parse_http_status("gh: Not Found (HTTP 404)"), Some(404));
         assert_eq!(parse_http_status("gh: API rate limit exceeded (HTTP 429)"), Some(429));
         assert_eq!(parse_http_status("no status here"), None);
+    }
+}
+
+#[cfg(test)]
+mod pr_base_tests {
+    use super::*;
+
+    #[test]
+    fn uses_actual_default_and_refuses_missing_metadata() {
+        for default in ["main", "master", "trunk"] {
+            assert!(require_default_branch(Some(default), Some(default)).is_ok());
+            let error = require_default_branch(Some("feature/parent"), Some(default)).unwrap_err();
+            assert!(error.contains("feature/parent"));
+            assert!(error.contains(default));
+            assert!(error.contains("prerequisite"));
+        }
+        for (base, default) in [(None, Some("main")), (Some("main"), None), (Some(""), Some("main"))] {
+            assert!(require_default_branch(base, default).is_err());
+        }
     }
 }
