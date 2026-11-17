@@ -1292,11 +1292,6 @@ impl OperatorAnswerType {
         )
     }
 
-    /// `owner/repo#n` from a github.com pull-request URL, for question text.
-    pub fn compact_github_pr_label(pr_url: &str) -> Option<String> {
-        compact_github_pr_label(pr_url)
-    }
-
     /// The recorded file-count approval spec on a split-vs-bypass prerequisite question.
     pub fn file_count_bypass(&self) -> Option<FileCountBypassSpec> {
         match self {
@@ -1304,19 +1299,6 @@ impl OperatorAnswerType {
             Self::YesNo | Self::LinkPrerequisiteTask { .. } | Self::MultipleChoice { .. } => None,
         }
     }
-}
-
-/// `owner/repo#n` from a canonical or decorated github.com PR URL.
-pub fn compact_github_pr_label(pr_url: &str) -> Option<String> {
-    let path = pr_url.strip_prefix("https://github.com/")?;
-    let mut parts = path.split('/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let repo = parts.next().filter(|s| !s.is_empty())?;
-    if parts.next()? != "pull" {
-        return None;
-    }
-    let number = parts.next()?.split(['/', '?', '#']).next()?.parse::<u64>().ok()?;
-    Some(format!("{owner}/{repo}#{number}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1524,10 +1506,7 @@ mod tests {
             pr_url: Some("https://github.com/acme/widget/pull/9".into()),
         };
         assert_eq!(
-            OperatorAnswerType::link_prerequisite_question_text(
-                "Land the wiring",
-                compact_github_pr_label("https://github.com/acme/widget/pull/9").as_deref()
-            ),
+            OperatorAnswerType::link_prerequisite_question_text("Land the wiring", Some("acme/widget#9")),
             "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it."
         );
         assert_eq!(

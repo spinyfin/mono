@@ -1002,7 +1002,34 @@ async fn link_yes_parks_behind_the_named_owner_without_creating() {
     assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
     assert_eq!(prerequisites_of(&state, &task_id), vec![owner_id.clone()]);
     assert_eq!(chore_named(&state, &task.product_id, LINK_OWNER_NAME).len(), 1);
-    assert!(task.description.contains("An equivalent open task already existed"));
+    assert!(
+        task.description
+            .contains("This task now waits for the named existing task.")
+    );
+    assert!(!task.description.contains("instead of creating a duplicate"));
+}
+
+#[tokio::test]
+async fn link_no_leaves_the_named_owner_untouched() {
+    let (state, _dir, execution, task_id, owner_id) = parked_asking_task_with_pr_owner().await;
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&execution, ProposalKind::RunDone, link_question_payload(LINK_PR_URL)),
+        )
+        .await,
+    );
+    let task = match answer_question(&state, &task_id, false).await {
+        FrontendEvent::WorkItemUpdated {
+            item: boss_work_db::WorkItem::Task(task),
+        } => task,
+        other => panic!("expected updated task, got {other:?}"),
+    };
+    assert!(prerequisites_of(&state, &task_id).is_empty());
+    assert_eq!(chore_named(&state, &task.product_id, LINK_OWNER_NAME).len(), 1);
+    assert_eq!(owner_id, chore_named(&state, &task.product_id, LINK_OWNER_NAME)[0].id);
+    assert!(task.description.contains("The repo owner recorded this decline"));
 }
 
 #[tokio::test]

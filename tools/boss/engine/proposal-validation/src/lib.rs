@@ -838,7 +838,7 @@ impl<'a> PayloadReader<'a> {
             question.text = if name.is_empty() {
                 boss_protocol::OperatorAnswerType::link_prerequisite_unresolved_question_text()
             } else {
-                let pr_label = pr_url.as_deref().and_then(boss_protocol::compact_github_pr_label);
+                let pr_label = pr_url.as_deref().and_then(boss_github::pr_url::compact_pr_label);
                 boss_protocol::OperatorAnswerType::link_prerequisite_question_text(&name, pr_label.as_deref())
             };
             question.answer_type = boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {

@@ -88,6 +88,17 @@ pub fn pr_number_from_url(pr_url: &str) -> Option<u64> {
     tail.split(['/', '?', '#']).next()?.parse().ok()
 }
 
+/// `owner/repo#n` from a canonical or decorated github.com pull-request URL.
+///
+/// Uses the same host/owner/repo/`pull` validation as [`repo_from_pr_url_lenient`]
+/// and [`pr_number_from_url`], so a trailing `/files`, query, or fragment is
+/// ignored. `None` when the URL is not a github.com pull request.
+pub fn compact_pr_label(pr_url: &str) -> Option<String> {
+    let repo = repo_from_pr_url_lenient(pr_url)?;
+    let number = pr_number_from_url(pr_url)?;
+    Some(format!("{repo}#{number}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +230,24 @@ mod tests {
         assert_eq!(pr_number_from_url("https://github.com/owner/my-repo/pull/1"), Some(1),);
         assert_eq!(pr_number_from_url("https://example.com/owner/repo/pull/1"), None);
         assert_eq!(pr_number_from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn compact_pr_label_formats_owner_repo_number() {
+        assert_eq!(
+            compact_pr_label("https://github.com/acme/widget/pull/9").as_deref(),
+            Some("acme/widget#9"),
+        );
+        assert_eq!(
+            compact_pr_label("https://github.com/acme/widget/pull/9/files").as_deref(),
+            Some("acme/widget#9"),
+        );
+        assert_eq!(
+            compact_pr_label("https://github.com/acme/widget/pull/9?tab=files").as_deref(),
+            Some("acme/widget#9"),
+        );
+        assert_eq!(compact_pr_label("https://example.com/acme/widget/pull/9"), None);
+        assert_eq!(compact_pr_label("not-a-url"), None);
     }
 }
 

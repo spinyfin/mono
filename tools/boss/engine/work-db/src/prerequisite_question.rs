@@ -136,6 +136,7 @@ pub(super) fn approve_in_tx(
             answered_at,
             now,
         },
+        false,
         attribution,
     )
 }
@@ -174,6 +175,18 @@ pub(super) fn approve_existing_in_tx(
     if prerequisite.id == task.id {
         bail!("a task cannot wait on itself");
     }
+    let same_chain = match (
+        get_chain_root_task(conn, &task.id)?,
+        get_chain_root_task(conn, &prerequisite.id)?,
+    ) {
+        (Some(asking_root), Some(existing_root)) => asking_root.id == existing_root.id,
+        (Some(asking_root), None) => asking_root.id == prerequisite.id,
+        (None, Some(existing_root)) => task.id == existing_root.id,
+        (None, None) => false,
+    };
+    if same_chain {
+        bail!("this change cannot wait on the pull request it is already revising");
+    }
     if deps::would_create_cycle(conn, &task.id, &prerequisite.id)? {
         bail!("linking that task would create a cycle of waiting tasks");
     }
@@ -188,6 +201,7 @@ pub(super) fn approve_existing_in_tx(
             answered_at,
             now,
         },
+        true,
         attribution,
     )
 }
@@ -205,6 +219,7 @@ fn park_behind(
     conn: &Connection,
     task: &Task,
     park: ParkBehind<'_>,
+    from_link: bool,
     attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<LinkedPrerequisite> {
     let ParkBehind {
@@ -262,7 +277,7 @@ fn park_behind(
     let description = format!(
         "{}{}",
         task.description,
-        prerequisite_note(question, prerequisite, created, enabled_dispatch, &timestamp)
+        prerequisite_note(question, prerequisite, created, enabled_dispatch, from_link, &timestamp,)
     );
     super::description_guard::validate_description_update(&task.description, &description, false)?;
     // `todo` + autostart first, so the edge below parks the task through the
@@ -417,6 +432,7 @@ fn prerequisite_note(
     prerequisite: &Task,
     created: bool,
     enabled_dispatch: bool,
+    from_link: bool,
     timestamp: &str,
 ) -> String {
     // The canonical id, never the friendly short id: a worker that quotes the
@@ -424,6 +440,10 @@ fn prerequisite_note(
     let label = format!("{} (`{}`)", prerequisite.name, prerequisite.id);
     let outcome = if created {
         "The prerequisite task was created and scheduled for dispatch."
+    } else if from_link && enabled_dispatch {
+        "This task now waits for the named existing task, and that task has been scheduled for dispatch once its dependencies are satisfied."
+    } else if from_link {
+        "This task now waits for the named existing task."
     } else if enabled_dispatch {
         "An equivalent task already existed in the backlog with autostart off, so this task now links to it, and it has been scheduled for dispatch once its dependencies are satisfied."
     } else {
@@ -463,17 +483,28 @@ mod tests {
             .asked_at("2026-10-23")
             .execution_id("exec_example")
             .build();
-        // created; linked with dispatch enabled; already linked.
-        for (created, enabled_dispatch) in [(true, false), (false, true), (false, false)] {
+        // created; linked with dispatch enabled; already linked; named-existing link.
+        for (created, enabled_dispatch, from_link) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (false, false, true),
+            (false, true, true),
+        ] {
             let note = prerequisite_note(
                 &question,
                 &prerequisite,
                 created,
                 enabled_dispatch,
+                from_link,
                 "2026-10-23 00:00 UTC",
             );
             crate::prose_vocabulary::assert_no_forbidden_prose("prerequisite approval note", &note);
             assert!(note.contains("## Prerequisite approved by the repo owner (2026-10-23 00:00 UTC)"));
+            if from_link {
+                assert!(note.contains("This task now waits for the named existing task"));
+                assert!(!note.contains("instead of creating a duplicate"));
+            }
         }
     }
 }

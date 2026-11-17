@@ -651,6 +651,92 @@ fn named_bypass_answer_reaches_the_file_count_bypass_consumer() {
 }
 
 #[test]
+fn link_yes_through_the_attention_path_adds_a_blocks_edge_without_creating() {
+    let (db, product_id, project_id, _task_id) = fixture();
+    let task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.clone())
+                .project_id(project_id.clone())
+                .name("Asking parent")
+                .build(),
+        )
+        .unwrap();
+    let task_id = task.id.clone();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/acme/widget/pull/1' WHERE id = ?1",
+            [&task_id],
+        )
+        .unwrap();
+    let owner = create_test_chore_manual(&db, product_id.clone(), "Land the wiring");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/acme/widget/pull/9' WHERE id = ?1",
+            [&owner.id],
+        )
+        .unwrap();
+    let task = read_task(&db, &task_id);
+    let execution = create_ready_chore_execution(&db, task_id.clone());
+    let question = boss_protocol::OperatorQuestion {
+        text: "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it.".to_owned(),
+        answer_type: boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+            existing_id: None,
+            existing_pr: Some("https://github.com/acme/widget/pull/9".to_owned()),
+            work_item_id: owner.id.clone(),
+            name: "Land the wiring".to_owned(),
+            pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
+        },
+        explanation: "The other change is already in review.".to_owned(),
+    };
+    let conn = db.connect().unwrap();
+    let (attention, _group) =
+        crate::attentions::worker_questions::create_in_tx(&conn, &task, &execution.id, &question).unwrap();
+    conn.execute(
+        "INSERT INTO operator_questions
+         (id, work_item_id, execution_id, proposal_id, question_json, status, withdrawn_reason, created_at)
+         VALUES (?1, ?2, ?3, 'prop_example', ?4, 'withdrawn', 'task_not_parkable', '1')",
+        rusqlite::params![
+            format!("oq_{}", execution.id),
+            task_id,
+            execution.id,
+            serde_json::to_string(&question).unwrap()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    let group = db
+        .answer_attention(&attention.id, Some("yes".to_owned()), false, false)
+        .unwrap();
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db
+        .action_attention_group(&group.id, false, &Default::default(), &checker)
+        .unwrap();
+    assert_eq!(actioned.produced_work_item_ids.len(), 1);
+    let produced = &actioned.produced_work_item_ids[0];
+    assert_ne!(produced, &owner.id);
+    let prereqs = db
+        .list_dependencies(boss_protocol::ListDependenciesInput {
+            work_item: produced.clone(),
+            direction: Some(boss_protocol::DependencyDirection::Prereqs),
+        })
+        .unwrap()
+        .prerequisites;
+    assert_eq!(prereqs.len(), 1);
+    assert_eq!(prereqs[0].prerequisite_id, owner.id);
+    assert_eq!(prereqs[0].relation, "blocks");
+    let named = db
+        .list_tasks(&product_id, None, None, false)
+        .unwrap()
+        .into_iter()
+        .filter(|task| task.name == "Land the wiring")
+        .count();
+    assert_eq!(named, 1);
+}
+
+#[test]
 fn action_followup_group_creates_tasks() {
     let (db, _product, project_id, task_id) = fixture();
     let (a1, _g) = db.create_attention(followup(&task_id, "extract helper")).unwrap();
