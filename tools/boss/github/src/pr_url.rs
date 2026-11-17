@@ -99,9 +99,36 @@ pub fn compact_pr_label(pr_url: &str) -> Option<String> {
     Some(format!("{repo}#{number}"))
 }
 
+/// Normalize a decorated GitHub PR URL to a case-folded identity.
+pub fn canonical_pr_url(pr_url: &str) -> Option<String> {
+    let slug = repo_from_pr_url_lenient(pr_url)?;
+    let number = pr_number_from_url(pr_url)?;
+    Some(format!("https://github.com/{}/pull/{number}", slug.to_lowercase()))
+}
+
+/// Compare PR identities, ignoring repository case and URL decorations.
+pub fn same_pr(left: &str, right: &str) -> bool {
+    left == right || canonical_pr_url(left).is_some_and(|url| Some(url) == canonical_pr_url(right))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_identity_ignores_case_and_decoration() {
+        let canonical = "https://github.com/acme/widget/pull/9";
+        for url in [
+            canonical,
+            "https://github.com/Acme/Widget/pull/09/files?tab=diff#comment",
+        ] {
+            assert_eq!(canonical_pr_url(url).as_deref(), Some(canonical));
+            assert!(same_pr(url, canonical));
+        }
+        assert!(!same_pr(canonical, "https://github.com/other/repo/pull/9"));
+        assert!(!same_pr(canonical, "https://github.com/acme/widget/pull/10"));
+        assert_eq!(canonical_pr_url("https://example.com/acme/widget/pull/9"), None);
+    }
 
     #[test]
     fn parse_pr_url_parts_extracts_all_fields() {

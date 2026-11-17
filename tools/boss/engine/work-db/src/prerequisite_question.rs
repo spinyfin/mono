@@ -175,17 +175,8 @@ pub(super) fn approve_existing_in_tx(
     if prerequisite.id == task.id {
         bail!("a task cannot wait on itself");
     }
-    let same_chain = match (
-        get_chain_root_task(conn, &task.id)?,
-        get_chain_root_task(conn, &prerequisite.id)?,
-    ) {
-        (Some(asking_root), Some(existing_root)) => asking_root.id == existing_root.id,
-        (Some(asking_root), None) => asking_root.id == prerequisite.id,
-        (None, Some(existing_root)) => task.id == existing_root.id,
-        (None, None) => false,
-    };
-    if same_chain {
-        bail!("this change cannot wait on the pull request it is already revising");
+    if prerequisite_link::in_askers_revision_chain(conn, task, &prerequisite)? {
+        bail!(prerequisite_link::SAME_CHAIN_REJECTION);
     }
     if deps::would_create_cycle(conn, &task.id, &prerequisite.id)? {
         bail!("linking that task would create a cycle of waiting tasks");

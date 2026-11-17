@@ -1,5 +1,7 @@
 //! Confirmed merge observations, independent of task completion.
 use super::*;
+use boss_github::pr_url::canonical_pr_url;
+pub(crate) use boss_github::pr_url::same_pr as same_binding;
 
 pub(crate) const MIGRATION_ID: &str = "20261115_0110_merge_evidence";
 
@@ -55,16 +57,6 @@ pub struct MergeObservation {
     /// Prior `merge_queue_state` when this observation actually cleared the
     /// Merging-lane columns. `None` when those columns were already empty.
     pub cleared_queue_state: Option<String>,
-}
-
-fn canonical_pr_url(pr_url: &str) -> Option<String> {
-    let slug = boss_github::pr_url::repo_from_pr_url_lenient(pr_url)?;
-    let number = boss_github::pr_url::pr_number_from_url(pr_url)?;
-    Some(format!("https://github.com/{}/pull/{number}", slug.to_lowercase()))
-}
-
-pub(crate) fn same_binding(left: &str, right: &str) -> bool {
-    left == right || canonical_pr_url(left).is_some_and(|url| Some(url) == canonical_pr_url(right))
 }
 
 fn current_binding(conn: &Connection, work_item_id: &str) -> Result<Option<(String, String)>> {
