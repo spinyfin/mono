@@ -803,21 +803,24 @@ impl WorkDb {
         }
     }
 
-    /// Live executions carrying a stamped `delivered` / `blocked` `run_done`
+    /// Live executions carrying a stamped `run_done`
     /// declaration made at or before `declared_at_or_before` (epoch seconds).
     /// The stamp is the durable pending-finalize record: a live execution
     /// that still has one has not yet reached its terminal write.
-    /// `no_changes_needed` is excluded — only the driver's terminal boundary
-    /// may accept it.
+    /// A no-op is eligible only after its exact applied proposal passed the
+    /// driver's terminal-boundary validation. Idle activity is not authority.
     pub fn live_executions_with_pending_run_done(
         &self,
         declared_at_or_before: i64,
     ) -> Result<Vec<(String, boss_protocol::RunDoneOutcome)>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, run_done_outcome FROM work_executions
-             WHERE status IN ('running', 'waiting_human')
-               AND run_done_outcome IN ('delivered', 'blocked')
+            "SELECT e.id, e.run_done_outcome FROM work_executions e
+             WHERE e.status IN ('running', 'waiting_human')
+               AND (e.run_done_outcome IN ('delivered', 'blocked')
+                    OR (e.run_done_outcome = 'no_changes_needed' AND EXISTS (
+                        SELECT 1 FROM worker_proposals p WHERE p.execution_id = e.id
+                        AND p.kind = 'run_done' AND p.state = 'applied' AND p.no_op_completion_ready = 1)))
                AND run_done_declared_at IS NOT NULL
                AND CAST(run_done_declared_at AS INTEGER) <= ?1
              ORDER BY id",
@@ -833,6 +836,36 @@ impl WorkDb {
             }
         }
         Ok(pending)
+    }
+
+    /// Persist terminal validation before attempting the no-op completion
+    /// transaction. Scoping this to the applied proposal prevents a replacement
+    /// declaration from inheriting an earlier turn's validation.
+    pub fn mark_no_op_completion_ready(&self, execution_id: &str, proposal_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(conn.execute(
+            "UPDATE worker_proposals SET no_op_completion_ready = 1
+             WHERE id = ?2 AND execution_id = ?1 AND kind = 'run_done' AND state = 'applied'
+               AND EXISTS (SELECT 1 FROM work_executions WHERE id = ?1
+                   AND status IN ('running', 'waiting_human') AND run_done_outcome = 'no_changes_needed')",
+            params![execution_id, proposal_id],
+        )? > 0)
+    }
+
+    /// The exact current no-op that passed terminal-boundary validation.
+    /// Recovery must carry this identity through every asynchronous check.
+    pub fn ready_no_op_declaration_id(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT p.id FROM worker_proposals p JOIN work_executions e ON e.id = p.execution_id
+             WHERE e.id = ?1 AND e.run_done_outcome = 'no_changes_needed'
+               AND p.kind = 'run_done' AND p.state = 'applied' AND p.no_op_completion_ready = 1
+             ORDER BY p.rowid DESC LIMIT 1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// Identify the applied declaration that currently authorizes a no-op.
@@ -932,6 +965,41 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use boss_protocol::{PROPOSAL_CAP_PER_KIND_PER_EXECUTION, PROPOSAL_CAP_TOTAL_PER_EXECUTION, ProposalErrorCode};
+
+    #[test]
+    fn no_op_validation_upgrade_preserves_applied_proposals_without_authorizing_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.db");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (execution_id, work_item_id) = execution_for_new_chore(&db, "No-op upgrade");
+        let proposal = submit(
+            &db,
+            &execution_id,
+            &work_item_id,
+            ProposalKind::RunDone,
+            r#"{"outcome":"no_changes_needed","summary":"Already fixed"}"#,
+            "no-op-upgrade",
+        )
+        .unwrap()
+        .proposal;
+        db.connect()
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE worker_proposals DROP COLUMN no_op_completion_ready;
+             DELETE FROM schema_migrations WHERE id = '20261117_0212_no_op_completion_ready';",
+            )
+            .unwrap();
+        drop(db);
+        let upgraded = WorkDb::open(path).unwrap();
+        assert_eq!(upgraded.get_worker_proposal(&proposal.id).unwrap(), proposal);
+        assert!(upgraded.ready_no_op_declaration_id(&execution_id).unwrap().is_none());
+        assert!(
+            upgraded
+                .live_executions_with_pending_run_done(i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// A product, chore, and `ready` execution — the minimum context a
     /// proposal needs, since `execution_id` is a hard FK.

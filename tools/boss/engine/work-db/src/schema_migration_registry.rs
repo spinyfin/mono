@@ -339,6 +339,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: merge_evidence::migrate,
         },
         Migration {
+            id: "20261117_0212_no_op_completion_ready".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "worker_proposals", "no_op_completion_ready")? {
+                    conn.execute_batch("ALTER TABLE worker_proposals ADD COLUMN no_op_completion_ready INTEGER NOT NULL DEFAULT 0")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: conflict_mismatch::OPERATOR_FORCED_ADMISSION_MIGRATION_ID.into(),
             legacy_version: None,
             apply: conflict_mismatch::migrate_operator_forced_admission,

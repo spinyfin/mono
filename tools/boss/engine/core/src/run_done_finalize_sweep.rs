@@ -7,7 +7,8 @@
 //! no-PR delivery has no poller to pick it up. The declaration stamp on the
 //! execution row is the durable pending-finalize record; this sweep finds
 //! live executions still carrying one and re-runs the finalize, and also
-//! retries retained `no-changes-needed` completion writes. See
+//! retries `no-changes-needed` completion writes whose exact applied proposal
+//! passed terminal-boundary validation, including after a restart. See
 //! [`crate::completion::WorkerCompletionHandler::sweep_pending_finalizes`].
 
 use std::sync::Arc;

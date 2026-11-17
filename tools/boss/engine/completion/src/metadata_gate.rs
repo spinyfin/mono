@@ -36,6 +36,12 @@ impl WorkerCompletionHandler {
         if execution.kind != ExecutionKind::RevisionImplementation {
             return None;
         }
+        // An explicit no-op is resolved by the declaration gate below, with
+        // command/contribution/conflict validation. A description edit must
+        // not divert it into waiting for unrelated parent-PR CI indefinitely.
+        if self.worker_signalled_no_op(execution_id) {
+            return None;
+        }
         // Baseline body snapshot from run start. `None` means no baseline
         // (new-PR flow, or the start-of-run fetch failed) — we cannot prove
         // a delta, so fall through to the normal nudge.

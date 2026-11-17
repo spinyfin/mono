@@ -24,6 +24,8 @@
 //!    that outcome is accepted only at the driver's terminal boundary, so a
 //!    failed write there is retained (already-validated inputs, declaration
 //!    identity re-checked by the write itself) and retried by the same sweep.
+//!    Validation is also persisted on that proposal, so a restart can recover
+//!    the write without the in-memory inputs or another driver event.
 //!
 //! There is deliberately no attempt cap — none has been measured. A stuck
 //! finalize stays visible through [`RUN_DONE_FINALIZE_RETRY`] and an
@@ -48,7 +50,7 @@ pub const RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND: &str = "run_done_finalize_stuc
 /// Result of one [`WorkerCompletionHandler::sweep_pending_finalizes`] pass.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PendingFinalizeSweepOutcome {
-    /// Stamped delivered/blocked declarations that reached a terminal state.
+    /// Stamped declarations that reached a terminal state through durable recovery.
     pub finalized: usize,
     /// Stamped declarations still live after this pass's attempt.
     pub still_pending: usize,
@@ -140,7 +142,7 @@ impl WorkerCompletionHandler {
     }
 
     /// One durable recovery pass: re-run the finalize for every live
-    /// execution whose `delivered` / `blocked` declaration was stamped at or
+    /// execution whose delivered/blocked or validated no-op declaration was stamped at or
     /// before `declared_at_or_before` (epoch seconds; the grace keeps the pass
     /// off the submission path's own in-flight finalize and ack delivery), and
     /// retry every retained `no-changes-needed` write. Each attempt takes the
@@ -155,6 +157,16 @@ impl WorkerCompletionHandler {
             {
                 Ok(pending) => {
                     for (execution_id, declared) in pending {
+                        // The retained-input path below owns this attempt in
+                        // this process. Durable recovery covers lost handlers.
+                        if self
+                            .pending_no_op_completions
+                            .lock()
+                            .expect("pending no-op poisoned")
+                            .contains_key(&execution_id)
+                        {
+                            continue;
+                        }
                         let result = self.finalize_declared_run_done(&execution_id, declared).await;
                         if finalize_resolved(&result) {
                             outcome.finalized += 1;
@@ -185,8 +197,27 @@ impl WorkerCompletionHandler {
         contribution: Option<ContributionEvidence>,
         attention: Option<CreateAttentionItemInput>,
     ) -> StopOutcome {
+        let declaration_id = match self.work_db.current_no_op_declaration_id(&execution.id) {
+            Ok(Some(id)) => id,
+            Ok(None) => return StopOutcome::AwaitingInput,
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, ?err, "no-op retention: declaration lookup failed");
+                return StopOutcome::DbError;
+            }
+        };
+        self.finalize_no_op_completion_retaining_declaration(execution, &declaration_id, contribution, attention)
+            .await
+    }
+
+    pub(super) async fn finalize_no_op_completion_retaining_declaration(
+        &self,
+        execution: &crate::work::WorkExecution,
+        declaration_id: &str,
+        contribution: Option<ContributionEvidence>,
+        attention: Option<CreateAttentionItemInput>,
+    ) -> StopOutcome {
         let outcome = self
-            .finalize_no_op_completion(execution, contribution, attention.clone())
+            .finalize_no_op_completion_for_declaration(execution, declaration_id, contribution, attention.clone())
             .await;
         let mut pending = self.pending_no_op_completions.lock().expect("pending no-op poisoned");
         if outcome == StopOutcome::DbError {
@@ -198,6 +229,7 @@ impl WorkerCompletionHandler {
             pending.insert(
                 execution.id.clone(),
                 PendingNoOpCompletion {
+                    declaration_id: declaration_id.to_owned(),
                     contribution,
                     attention,
                 },
@@ -233,6 +265,21 @@ impl WorkerCompletionHandler {
             let Some(pending) = pending else {
                 continue;
             };
+            match self.work_db.current_no_op_declaration_id(&execution_id) {
+                Ok(Some(current)) if current == pending.declaration_id => {}
+                Ok(_) => {
+                    self.pending_no_op_completions
+                        .lock()
+                        .expect("pending no-op poisoned")
+                        .remove(&execution_id);
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(%execution_id, ?err, "no-op retry: declaration lookup failed");
+                    still_pending += 1;
+                    continue;
+                }
+            }
             let execution = match self.work_db.get_execution(&execution_id) {
                 Ok(execution) if execution.status.is_live() => execution,
                 Ok(_) => {
@@ -249,7 +296,12 @@ impl WorkerCompletionHandler {
                 }
             };
             let result = self
-                .finalize_no_op_completion_retaining(&execution, pending.contribution, pending.attention)
+                .finalize_no_op_completion_retaining_declaration(
+                    &execution,
+                    &pending.declaration_id,
+                    pending.contribution,
+                    pending.attention,
+                )
                 .await;
             if result == StopOutcome::DbError {
                 still_pending += 1;

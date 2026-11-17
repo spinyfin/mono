@@ -2461,6 +2461,7 @@ pub fn worker_owns_turn_loop(execution: &crate::work::WorkExecution) -> bool {
 /// that failed, retained so it can be retried without another worker event.
 #[derive(Debug, Clone)]
 struct PendingNoOpCompletion {
+    declaration_id: String,
     contribution: Option<ContributionEvidence>,
     attention: Option<CreateAttentionItemInput>,
 }
