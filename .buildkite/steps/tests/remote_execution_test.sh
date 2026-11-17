@@ -186,8 +186,8 @@ expect_equal \
   "$CI_REMOTE_BAZEL_FLAGS" "linux remote: CI_REMOTE_BAZEL_FLAGS"
 expect_equal "--remote_download_minimal" "$CI_BAZEL_VERIFY_ONLY_FLAGS" "linux remote: CI_BAZEL_VERIFY_ONLY_FLAGS"
 expect_equal "-z -w ${CI_REMOTE_PROBE_TIMEOUT_SECS} executor.test 50051" "$(cat "$nc_calls")" "linux remote: probe command"
-if [[ "$CI_REMOTE_EXECUTION_REASON" != *"tests run on this agent"* ]]; then
-  fail "linux remote: the reason does not say where tests run: ${CI_REMOTE_EXECUTION_REASON}"
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"Linux workers"* ]]; then
+  fail "linux remote: the reason does not name the Linux workers: ${CI_REMOTE_EXECUTION_REASON}"
 fi
 
 decide linux 1 "$endpoint" 1 || fail "linux unreachable: decide failed"
@@ -223,16 +223,18 @@ done
 for line in \
   "build:ci-remote-linux --noremote_local_fallback" \
   "build:ci-remote-linux --remote_cache_compression" \
-  "build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux"; do
+  "build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux" \
+  "test:ci-remote-linux --config=remote-tests"; do
   if ! grep -qxF -- "$line" "$real_rc"; then
     fail ".ci.bazelrc lacks the line '${line}'"
   fi
 done
-# On Linux, tests stay on the agent under linux-sandbox, which is the isolation
-# boundary there. The Linux remote config must therefore name no test strategy
-# and must not select the config that sends tests to the workers.
-if grep -qE -- "^[a-z]+:ci-remote-linux .*(--config=remote-tests|strategy)" "$real_rc"; then
-  fail ".ci.bazelrc must not send tests to the workers for ci-remote-linux"
+# Neither remote config names a test strategy of its own. Each selects
+# `remote-tests`, whose single `remote` strategy linux_policy_source_test pins:
+# a strategy line here could add a local fallback, and on Linux a test that
+# fell back would run with no sandbox around it at all.
+if grep -qE -- "^[a-z]+:ci-remote(-linux)? .*strategy" "$real_rc"; then
+  fail ".ci.bazelrc must not name a strategy for ci-remote or ci-remote-linux"
 fi
 # Neither remote config may change the disk cache: a remote step has to be
 # able to read what a step that built on the agent left there.

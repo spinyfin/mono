@@ -19,7 +19,7 @@ sh_test(
 # workers, an agent without an endpoint and an endpoint that does not answer
 # all build on the agent; a malformed endpoint fails loudly; and the flags for
 # the macOS and Linux remote cases select configs that .ci.bazelrc really
-# defines, the Linux one without sending tests to the workers.
+# defines, neither with a test strategy of its own.
 sh_test(
     name = "remote_execution_test",
     size = "small",
