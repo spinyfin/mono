@@ -37,9 +37,7 @@ use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, 
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar};
 use crate::worker_registry::WorkerRegistry;
-#[cfg(test)]
-use crate::worker_setup::WorkerKind;
-use crate::worker_setup::{WorkerSetupInput, write_workspace_files};
+use crate::worker_setup::{WorkerKind, WorkerSetupInput, write_workspace_files};
 
 /// Sanitized PATH for worker panes. Excludes `~/bin` (where the
 /// `bossctl` symlink lives in this user's setup) and any other
@@ -700,7 +698,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     //    CLI verbs survive a driver that scopes `$HOME`),
     //    `BOSS_ENGINE_CONTROL_TOKEN_PATH` (the bound token, so
     //    `boss engine stop` does not derive a sibling of the socket),
-    //    `BOSS_LEASE_ID`, and any caller-provided `extra_env` keys
+    //    `BOSS_LEASE_ID` for leased workers, and caller-provided `extra_env` keys
     //    that survive the allowlist filter. Anything else is dropped.
     //
     //    Editor env vars are forced to `false` so a worker that runs
@@ -754,11 +752,16 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
              worker `boss` verbs will fall back to HOME-relative discovery",
         );
     }
-    env.extend([
-        EnvVar {
+    // Progression runs use a scratch directory without a cube lease. Omit
+    // only their lease export; an empty value for a leased worker must still
+    // reach tmux validation and fail as an invalid spawn context.
+    if input.worker_kind != WorkerKind::Progression {
+        env.push(EnvVar {
             key: "BOSS_LEASE_ID".into(),
             value: input.lease_id.clone(),
-        },
+        });
+    }
+    env.extend([
         EnvVar {
             // Read by `boss-event` and embedded in every hook payload
             // as `_boss_run_id`. The engine uses this to correlate
@@ -2680,8 +2683,7 @@ mod tests {
     /// A freshly spawned progression pane is registered at the confined tier and
     /// its neighbourhood is captured before the registration; an ordinary worker
     /// is not.
-    #[tokio::test]
-    async fn a_fresh_progression_spawn_registers_the_pane_at_the_confined_tier() {
+    async fn assert_progression_spawn(driver_name: &str) {
         use crate::test_support::{create_test_chore_manual, create_test_product_named, open_db_arc};
         let (_dir, db) = open_db_arc();
         let product = create_test_product_named(&db, "p");
@@ -2702,13 +2704,82 @@ mod tests {
                 db: db.clone(),
             };
             let mut input = sample_input(&workspace, spawner.inner.tmux_runner.clone());
+            if driver_name == "codex" {
+                input = codex_input(&workspace, &execution.id, 3, spawner.inner.tmux_runner.clone());
+            }
+            input.driver = crate::driver::DriverRegistry::default().require(driver_name).unwrap();
             input.run_id = execution.id.clone();
+            if kind == WorkerKind::Progression {
+                assert!(execution.cube_lease_id.is_none());
+                input.execution_kind = execution.kind.as_str().to_owned();
+                input.lease_id.clear();
+            }
             input.worker_kind = kind;
             start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
             assert_eq!(spawner.inner.registry.registered_tier(4242), Some(expected_tier));
+            let env = spawner.inner.last_spawn_env();
+            assert!(env.iter().all(|(_, value)| !value.is_empty()), "{driver_name}: {env:?}");
+            assert_eq!(
+                env.iter()
+                    .find(|(key, _)| key == "BOSS_LEASE_ID")
+                    .map(|(_, v)| v.as_str()),
+                if expected_tier { None } else { Some("lease-test") },
+            );
+            assert!(
+                env.iter()
+                    .any(|(key, value)| key == "BOSS_RUN_ID" && value == &execution.id)
+            );
+            let calls = spawner.inner.tmux_runner.calls();
+            let create = calls
+                .iter()
+                .find(|args| args.get(2).map(String::as_str) == Some("new-session"))
+                .unwrap();
+            assert!(
+                create
+                    .windows(2)
+                    .any(|pair| pair[0] == "-c" && Path::new(&pair[1]) == workspace.path())
+            );
         }
         db.check_progression_scope(&execution.id, &chore.id)
             .expect("the progression spawn captured its neighbourhood");
+    }
+
+    #[tokio::test]
+    async fn claude_progression_spawn_without_a_cube_lease() {
+        assert_progression_spawn("claude").await;
+    }
+
+    #[test]
+    fn codex_progression_spawn_without_a_cube_lease() {
+        let homes = TempDir::new().unwrap();
+        let _homes_env = codex_homes_override(homes.path());
+        let transcripts = TempDir::new().unwrap();
+        let _transcripts_env = transcript_store_override(transcripts.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_progression_spawn("codex"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_lease_on_a_standard_worker_still_fails_spawn() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
+        input.lease_id.clear();
+        let error = start_worker(&spawner, input, StdDuration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("tmux environment value cannot be empty"));
+        assert!(
+            !spawner
+                .tmux_runner
+                .calls()
+                .iter()
+                .any(|args| args.get(2).map(String::as_str) == Some("new-session"))
+        );
+        assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

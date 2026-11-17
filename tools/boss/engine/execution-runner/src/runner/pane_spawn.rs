@@ -881,9 +881,9 @@ impl ExecutionRunner for PaneSpawnRunner {
         };
 
         // A kind that holds no cube lease (`progression`) runs in an
-        // engine-owned scratch directory and spawns with an empty
-        // `BOSS_LEASE_ID`; every other kind must have been leased by the
-        // coordinator before the spawn.
+        // engine-owned scratch directory. Its empty internal lease id is
+        // not exported as `BOSS_LEASE_ID` by the spawn flow; every other kind
+        // must have been leased by the coordinator before the spawn.
         let lease_id = if execution.kind.holds_cube_lease() {
             execution
                 .cube_lease_id
