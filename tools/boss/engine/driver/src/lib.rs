@@ -1374,6 +1374,9 @@ impl std::fmt::Debug for ProgressSessionConfig {
 /// Implementations atomically compare and replace the one bounded identity
 /// for `run_id`; `Ok(true)` means the same id was already present (resume).
 pub trait ProgressIdentityStore: Send + Sync {
+    /// Atomically install only if absent, returning the stored id and whether it already existed.
+    fn claim_progress_identity_if_absent(&self, run_id: &str, session_id: &str) -> Result<(String, bool), String>;
+
     fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String>;
 
     /// Read the currently claimed provider session id for `run_id`, if any.

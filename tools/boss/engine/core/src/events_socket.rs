@@ -301,6 +301,7 @@ impl SocketError {
             SocketError::Io(_) => false,
             SocketError::DriverSlugLookupTransient { .. } => false,
             SocketError::Json(_) => true,
+            SocketError::Normalize(NormalizeError::IdentityStoreTransient(_)) => false,
             SocketError::Normalize(_) => true,
             SocketError::UnresolvedDriver { .. } => true,
         }
@@ -452,7 +453,9 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
     ))
 }
 
-/// Read a connection to EOF and produce a typed IncomingHookEvent.
+/// Decode one shim connection into an [`IncomingHookEvent`].
+///
+/// Read a connection to EOF.
 /// The shim half-closes its write side after writing the full hook
 /// payload, so EOF is the message boundary.
 ///
@@ -477,7 +480,6 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// run's actual driver slug, then resolves it through `registry` — the same
 /// `tasks.driver` → `products.default_driver` → engine-default precedence
 /// applied at spawn time.
-/// Decode one shim connection into an [`IncomingHookEvent`].
 ///
 /// `Ok(None)` means the run's driver normalised the payload to an empty
 /// fan-out — a filtered event (agy dropping a subagent boundary) that
@@ -1790,10 +1792,8 @@ mod tests {
         let mut request = Vec::new();
         stream.read_to_end(&mut request).await.unwrap();
         assert_eq!(request, b"anything");
-        let err = SocketError::DriverSlugLookupTransient {
-            run_id: "run-1".to_owned(),
-            error: "database is locked".to_owned(),
-        };
+        let err = SocketError::Normalize(NormalizeError::IdentityStoreTransient("database is locked".into()));
+        assert!(!err.is_permanent());
         retry_connection(&mut stream, &err).await;
         // Production drops the connection after its best-effort notice. Close
         // this fixture's owned socket too before the peer waits for EOF.

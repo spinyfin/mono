@@ -399,10 +399,15 @@ impl AgentDriver for AgyDriver {
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-        // Stateless compatibility path for direct callers. Live hook
-        // ingress owns a per-connection session via `progress_session`
-        // that peeks the engine-owned conversation identity so a child
-        // cannot replace the parent claim.
+        // Stateless decoding only supports self-describing non-boundary events.
+        if matches!(
+            raw.get("hookEventName").and_then(serde_json::Value::as_str),
+            Some("SessionStart" | "PreInvocation" | "Stop")
+        ) {
+            return Err(NormalizeError::Malformed(
+                "agy boundary events require a per-run progress_session".into(),
+            ));
+        }
         AgyProgressSession::new(None, None).normalize_progress_event(raw)
     }
 

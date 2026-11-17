@@ -105,6 +105,8 @@ pub enum StopReason {
 
 #[derive(Debug, Error)]
 pub enum NormalizeError {
+    #[error("progress identity store temporarily unavailable: {0}")]
+    IdentityStoreTransient(String),
     #[error("missing or non-string field: {0}")]
     MissingField(&'static str),
     #[error("unknown hook_event_name: {0}")]

@@ -1326,6 +1326,42 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         "passing a work_runs.id where an execution_id is expected must surface as RowMissing — not be silently absorbed as an AlreadySet no-op",
     );
 
+    assert_eq!(
+        db.claim_run_progress_session_identity_if_absent(&execution.id, "parent")
+            .unwrap(),
+        ("parent".into(), false)
+    );
+    assert_eq!(
+        db.claim_run_progress_session_identity_if_absent(&execution.id, "child")
+            .unwrap(),
+        ("parent".into(), true)
+    );
+    assert_eq!(
+        db.claim_run_progress_session_identity_if_absent(&execution.id, "parent")
+            .unwrap(),
+        ("parent".into(), true)
+    );
+    assert!(db.clear_run_progress_session_identity(&execution.id).unwrap());
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let contenders: Vec<_> = ["parent", "child"]
+        .into_iter()
+        .map(|id| {
+            let db = db.clone();
+            let execution_id = execution.id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.claim_run_progress_session_identity_if_absent(&execution_id, id)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let claims: Vec<_> = contenders.into_iter().map(|thread| thread.join().unwrap()).collect();
+    assert_eq!(claims[0].0, claims[1].0);
+    assert_eq!(claims.iter().filter(|(_, existed)| !existed).count(), 1);
+    assert!(db.clear_run_progress_session_identity(&execution.id).unwrap());
+
     // Provider-session identity is one engine-owned value on the latest run:
     // first claim starts, the same id resumes across process restart, and a
     // changed id replaces it without accumulating history.

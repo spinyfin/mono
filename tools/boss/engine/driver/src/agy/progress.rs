@@ -21,10 +21,10 @@
 //! A `Stop` (or any other boundary) with no claim fails rather than
 //! inventing one.
 //!
-//! Live hooks are synchronous: `agy` waits for the shim to exit before
-//! emitting the next event, so the parent's `SessionStart` is decoded
-//! before a child can start. The engine's accept loop then preserves
-//! that order as `ingress_seq`. Replay/reordering was not characterised.
+//! Hooks are synchronous per agy process, but the shim waits at most one
+//! second for a response and connections are decoded concurrently. Ingress
+//! sequencing does not serialize claims. The store atomically preserves the
+//! first committed identity; replay/reordering was not characterised.
 //!
 //! `lastUserInput` repeats the whole prompt on every 1.5.5 hook. It is
 //! stripped during canonicalisation and must not be logged.
@@ -191,58 +191,61 @@ fn session_id_of(canonical: &Value) -> Result<&str, NormalizeError> {
 ///
 /// Identity is seeded from the engine-owned store when present so a new
 /// session object (one hook connection) still knows the parent
-/// `conversationId` claimed by an earlier connection. Live hooks are
-/// synchronous, so the first `SessionStart` is claimed before a child
-/// exists; the store is what keeps that claim across automatic
-/// continuations and engine restarts.
+/// `conversationId` claimed by an earlier connection. The store preserves
+/// that claim across automatic continuations and engine restarts.
 pub(super) struct AgyProgressSession {
     run_id: Option<String>,
     identity_store: Option<Arc<dyn ProgressIdentityStore>>,
     claimed_id: Option<String>,
+    store_unavailable: bool,
 }
 
 impl AgyProgressSession {
     pub(super) fn new(run_id: Option<String>, identity_store: Option<Arc<dyn ProgressIdentityStore>>) -> Self {
-        let claimed_id = match (run_id.as_deref(), identity_store.as_deref()) {
+        let (claimed_id, store_unavailable) = match (run_id.as_deref(), identity_store.as_deref()) {
             (Some(run_id), Some(store)) => match store.claimed_progress_identity(run_id) {
-                Ok(id) => id,
-                Err(err) => {
-                    tracing::warn!(
-                        run_id,
-                        %err,
-                        "agy: could not read claimed conversation identity"
-                    );
-                    None
-                }
+                Ok(id) => (id, false),
+                Err(_) => (None, true),
             },
-            _ => None,
+            _ => (None, false),
         };
         Self {
             run_id,
             identity_store,
             claimed_id,
+            store_unavailable,
         }
     }
 
-    fn persist_claim(&mut self, session_id: &str) -> Result<bool, NormalizeError> {
+    fn persist_claim(&mut self, session_id: &str) -> Result<IdentityDecision, NormalizeError> {
         let (Some(run_id), Some(store)) = (self.run_id.as_deref(), self.identity_store.as_deref()) else {
             self.claimed_id = Some(session_id.to_owned());
-            return Ok(false);
+            return Ok(IdentityDecision::Accept { resume: false });
         };
-        match store.claim_progress_identity(run_id, session_id) {
-            Ok(resumed) => {
-                self.claimed_id = Some(session_id.to_owned());
-                Ok(resumed)
-            }
-            Err(err) => Err(NormalizeError::Malformed(format!(
-                "agy: could not persist conversation identity: {err}"
-            ))),
-        }
+        let (stored, resume) = store
+            .claim_progress_identity_if_absent(run_id, session_id)
+            .map_err(NormalizeError::IdentityStoreTransient)?;
+        let accepted = stored == session_id;
+        self.claimed_id = Some(stored);
+        Ok(if accepted {
+            IdentityDecision::Accept { resume }
+        } else {
+            IdentityDecision::Drop
+        })
     }
 
     /// `can_claim` is true only for `SessionStart` and the first-`PreInvocation`
     /// fallback. A later boundary must not invent a claim.
     fn accept_identity(&mut self, session_id: &str, can_claim: bool) -> Result<IdentityDecision, NormalizeError> {
+        if self.store_unavailable {
+            self.claimed_id = self
+                .identity_store
+                .as_deref()
+                .expect("failed read has a store")
+                .claimed_progress_identity(self.run_id.as_deref().expect("failed read has a run"))
+                .map_err(NormalizeError::IdentityStoreTransient)?;
+            self.store_unavailable = false;
+        }
         if let Some(claimed) = self.claimed_id.as_deref() {
             if claimed == session_id {
                 return Ok(IdentityDecision::Accept { resume: true });
@@ -255,8 +258,7 @@ impl AgyProgressSession {
             return Ok(IdentityDecision::Drop);
         }
         if can_claim {
-            let resume = self.persist_claim(session_id)?;
-            return Ok(IdentityDecision::Accept { resume });
+            return self.persist_claim(session_id);
         }
         Err(NormalizeError::Malformed(
             "agy Stop arrived before a claimed conversation identity".into(),
@@ -366,439 +368,5 @@ impl ProgressSessionNormalizer for AgyProgressSession {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    use boss_protocol::{SessionStartSource, StopReason};
-    use serde_json::json;
-
-    use crate::AgentDriver;
-
-    struct MemoryIdentityStore {
-        inner: Mutex<HashMap<String, String>>,
-    }
-
-    impl MemoryIdentityStore {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                inner: Mutex::new(HashMap::new()),
-            })
-        }
-    }
-
-    impl ProgressIdentityStore for MemoryIdentityStore {
-        fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String> {
-            let mut map = self.inner.lock().expect("identity store lock");
-            match map.get(run_id) {
-                Some(existing) if existing == session_id => Ok(true),
-                Some(_) => {
-                    map.insert(run_id.to_owned(), session_id.to_owned());
-                    Ok(false)
-                }
-                None => {
-                    map.insert(run_id.to_owned(), session_id.to_owned());
-                    Ok(false)
-                }
-            }
-        }
-
-        fn claimed_progress_identity(&self, run_id: &str) -> Result<Option<String>, String> {
-            Ok(self.inner.lock().expect("identity store lock").get(run_id).cloned())
-        }
-    }
-
-    const PARENT: &str = "42227c9d-cdd1-4aa2-b4cf-2233178cd0d1";
-    const CHILD: &str = "74b3e2a3-2e36-4cfd-982a-bc499d905419";
-    const RUN: &str = "run-agy-progress";
-
-    fn stored_session() -> (AgyProgressSession, Arc<MemoryIdentityStore>) {
-        let store = MemoryIdentityStore::new();
-        (
-            AgyProgressSession::new(Some(RUN.to_owned()), Some(store.clone())),
-            store,
-        )
-    }
-
-    fn stateless() -> AgyProgressSession {
-        AgyProgressSession::new(None, None)
-    }
-
-    fn session_start(cid: &str) -> Value {
-        json!({
-            "hookEventName": "SessionStart",
-            "conversationId": cid,
-            "modelName": "gemini-4-hydrogen-xhigh",
-            "transcriptPath": format!("/tmp/brain/{cid}/transcript_full.jsonl"),
-            "artifactDirectoryPath": format!("/tmp/brain/{cid}"),
-            "workspacePaths": ["/tmp/ws"],
-            "cwd": "/tmp/ws",
-            "lastUserInput": "the whole 50KB brief must not be logged",
-        })
-    }
-
-    fn pre_invocation(cid: &str, invocation_num: u64) -> Value {
-        json!({
-            "hookEventName": "PreInvocation",
-            "conversationId": cid,
-            "modelName": "gemini-4-hydrogen-xhigh",
-            "invocationNum": invocation_num,
-            "initialNumSteps": 1,
-            "lastUserInput": "the whole 50KB brief must not be logged",
-        })
-    }
-
-    fn post_invocation(cid: &str) -> Value {
-        json!({
-            "hookEventName": "PostInvocation",
-            "conversationId": cid,
-            "invocationNum": 0,
-            "lastUserInput": "the whole 50KB brief must not be logged",
-        })
-    }
-
-    fn pre_tool_use(cid: &str, command: &str) -> Value {
-        json!({
-            "hookEventName": "PreToolUse",
-            "conversationId": cid,
-            "modelName": "gemini-4-hydrogen-xhigh",
-            "lastUserInput": "the whole 50KB brief must not be logged",
-            "toolCall": {
-                "id": "call_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": command,
-                    "Cwd": "/tmp/ws",
-                    "WaitMsBeforeAsync": 5000,
-                }
-            }
-        })
-    }
-
-    fn post_tool_use(cid: &str) -> Value {
-        json!({
-            "hookEventName": "PostToolUse",
-            "conversationId": cid,
-            "error": "",
-            "lastUserInput": "the whole 50KB brief must not be logged",
-            "toolCall": {
-                "id": "call_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "printf PARENT",
-                    "Cwd": "/tmp/ws",
-                }
-            }
-        })
-    }
-
-    fn stop(cid: &str, fully_idle: bool) -> Value {
-        json!({
-            "hookEventName": "Stop",
-            "conversationId": cid,
-            "executionNum": 0,
-            "terminationReason": "NO_TOOL_CALL",
-            "fullyIdle": fully_idle,
-            "error": "",
-            "lastUserInput": "the whole 50KB brief must not be logged",
-            "transcriptPath": format!("/tmp/brain/{cid}/transcript_full.jsonl"),
-        })
-    }
-
-    #[test]
-    fn session_start_maps_conversation_id_and_model() {
-        let event = stateless().normalize_progress_event(&session_start(PARENT)).unwrap();
-        assert_eq!(
-            event,
-            WorkerEvent::SessionStart {
-                session_id: PARENT.into(),
-                source: SessionStartSource::Startup,
-                model: Some("gemini-4-hydrogen-xhigh".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn last_user_input_is_stripped_from_the_canonical_payload() {
-        let canonical = canonicalize(&session_start(PARENT)).unwrap();
-        assert!(canonical.get("lastUserInput").is_none());
-        assert!(canonical.get("last_user_input").is_none());
-        assert!(canonical.get("prompt").is_none());
-    }
-
-    #[test]
-    fn pre_tool_use_maps_run_command_to_bash() {
-        let WorkerEvent::PreToolUse {
-            session_id,
-            tool_name,
-            tool_input,
-        } = stateless()
-            .normalize_progress_event(&pre_tool_use(PARENT, "printf PARENT"))
-            .unwrap()
-        else {
-            panic!("expected PreToolUse");
-        };
-        assert_eq!(session_id, PARENT);
-        assert_eq!(tool_name, "Bash");
-        assert_eq!(tool_input["command"], "printf PARENT");
-        assert_eq!(tool_input["cwd"], "/tmp/ws");
-    }
-
-    #[test]
-    fn post_tool_use_maps_empty_error_to_empty_response() {
-        let WorkerEvent::PostToolUse {
-            tool_name,
-            tool_response,
-            ..
-        } = stateless().normalize_progress_event(&post_tool_use(PARENT)).unwrap()
-        else {
-            panic!("expected PostToolUse");
-        };
-        assert_eq!(tool_name, "Bash");
-        assert_eq!(tool_response, json!({}));
-    }
-
-    #[test]
-    fn stop_maps_to_worker_event_stop_after_a_claim() {
-        let mut session = stateless();
-        session.normalize_progress_event(&session_start(PARENT)).unwrap();
-        let WorkerEvent::Stop {
-            session_id,
-            stop_hook_active,
-            stop_reason,
-        } = session.normalize_progress_event(&stop(PARENT, true)).unwrap()
-        else {
-            panic!("expected Stop");
-        };
-        assert_eq!(session_id, PARENT);
-        assert!(!stop_hook_active);
-        assert_eq!(stop_reason, StopReason::Completed);
-    }
-
-    #[test]
-    fn first_pre_invocation_is_session_start_fallback_when_nothing_is_claimed() {
-        let (mut session, store) = stored_session();
-        assert_eq!(
-            session.normalize_progress_event(&pre_invocation(PARENT, 0)).unwrap(),
-            WorkerEvent::SessionStart {
-                session_id: PARENT.into(),
-                source: SessionStartSource::Startup,
-                model: Some("gemini-4-hydrogen-xhigh".into()),
-            }
-        );
-        assert_eq!(store.claimed_progress_identity(RUN).unwrap().as_deref(), Some(PARENT));
-    }
-
-    #[test]
-    fn later_pre_invocation_zero_is_not_another_session_start() {
-        let (mut session, _) = stored_session();
-        session.normalize_progress_event(&session_start(PARENT)).unwrap();
-        assert!(
-            session
-                .normalize_progress_events(&pre_invocation(PARENT, 0))
-                .unwrap()
-                .is_empty(),
-            "invocationNum==0 recurs on every later execution and must not re-claim"
-        );
-        assert!(
-            session
-                .normalize_progress_events(&pre_invocation(PARENT, 1))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            session
-                .normalize_progress_events(&post_invocation(PARENT))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn child_session_start_does_not_replace_the_parent_claim() {
-        let (mut session, store) = stored_session();
-        session.normalize_progress_event(&session_start(PARENT)).unwrap();
-        assert!(
-            session
-                .normalize_progress_events(&session_start(CHILD))
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            store.claimed_progress_identity(RUN).unwrap().as_deref(),
-            Some(PARENT),
-            "a child SessionStart must not replace the parent claim"
-        );
-        // A fresh session object (the next hook connection) still sees the parent.
-        let mut next = AgyProgressSession::new(Some(RUN.to_owned()), Some(store.clone()));
-        assert!(
-            next.normalize_progress_events(&session_start(CHILD))
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(store.claimed_progress_identity(RUN).unwrap().as_deref(), Some(PARENT));
-    }
-
-    #[test]
-    fn child_idle_stop_is_dropped_including_the_older_missing_parent_boundary() {
-        // Hook surface study, "Ordering caveat": on 1.1.12 the parent can
-        // stop with fullyIdle=false and emit no later parent idle Stop while
-        // a child finishes with fullyIdle=true. The child's boundary must
-        // not become the parent's.
-        let (mut session, store) = stored_session();
-        session.normalize_progress_event(&session_start(PARENT)).unwrap();
-        session.normalize_progress_event(&stop(PARENT, false)).unwrap();
-        assert!(
-            session
-                .normalize_progress_events(&session_start(CHILD))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            session
-                .normalize_progress_events(&stop(CHILD, true))
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(store.claimed_progress_identity(RUN).unwrap().as_deref(), Some(PARENT));
-        let mut later = AgyProgressSession::new(Some(RUN.to_owned()), Some(store));
-        assert!(later.normalize_progress_events(&stop(CHILD, true)).unwrap().is_empty());
-    }
-
-    #[test]
-    fn parent_idle_stop_is_kept() {
-        let (mut session, _) = stored_session();
-        session.normalize_progress_event(&session_start(PARENT)).unwrap();
-        let WorkerEvent::Stop { session_id, .. } = session.normalize_progress_event(&stop(PARENT, true)).unwrap()
-        else {
-            panic!("expected Stop");
-        };
-        assert_eq!(session_id, PARENT);
-    }
-
-    #[test]
-    fn stop_without_a_claim_fails_loudly_instead_of_claiming() {
-        let (mut session, store) = stored_session();
-        let err = session
-            .normalize_progress_event(&stop(PARENT, true))
-            .expect_err("Stop must not invent a claim");
-        assert!(
-            matches!(err, NormalizeError::Malformed(ref message) if message.contains("before a claimed conversation identity")),
-            "got {err:?}"
-        );
-        assert!(store.claimed_progress_identity(RUN).unwrap().is_none());
-    }
-
-    #[test]
-    fn child_tool_events_are_kept() {
-        let (mut session, _) = stored_session();
-        session.normalize_progress_event(&session_start(PARENT)).unwrap();
-        let WorkerEvent::PreToolUse {
-            session_id, tool_name, ..
-        } = session
-            .normalize_progress_event(&pre_tool_use(CHILD, "printf CHILD"))
-            .unwrap()
-        else {
-            panic!("expected PreToolUse");
-        };
-        assert_eq!(session_id, CHILD);
-        assert_eq!(tool_name, "Bash");
-    }
-
-    #[test]
-    fn claimed_identity_survives_a_new_session_object() {
-        let store = MemoryIdentityStore::new();
-        let mut first = AgyProgressSession::new(Some(RUN.to_owned()), Some(store.clone()));
-        first.normalize_progress_event(&session_start(PARENT)).unwrap();
-        let mut continued = AgyProgressSession::new(Some(RUN.to_owned()), Some(store.clone()));
-        let WorkerEvent::SessionStart { source, .. } =
-            continued.normalize_progress_event(&session_start(PARENT)).unwrap()
-        else {
-            panic!("expected SessionStart");
-        };
-        assert_eq!(source, SessionStartSource::Resume);
-        let WorkerEvent::Stop { session_id, .. } = continued.normalize_progress_event(&stop(PARENT, true)).unwrap()
-        else {
-            panic!("expected Stop");
-        };
-        assert_eq!(session_id, PARENT);
-        assert_eq!(store.claimed_progress_identity(RUN).unwrap().as_deref(), Some(PARENT));
-    }
-
-    #[test]
-    fn missing_hook_event_name_is_a_real_error() {
-        // 1.1.12 payloads omit hookEventName. The conformance pin is 1.5.7+,
-        // which stamps it; guessing the event from adjacent fields is not
-        // this normaliser's job.
-        let raw = json!({ "conversationId": PARENT });
-        assert!(matches!(
-            stateless().normalize_progress_event(&raw),
-            Err(NormalizeError::MissingField("hook_event_name"))
-        ));
-    }
-
-    #[test]
-    fn missing_conversation_id_is_a_real_error() {
-        let raw = json!({ "hookEventName": "Stop", "fullyIdle": true });
-        assert!(matches!(
-            stateless().normalize_progress_event(&raw),
-            Err(NormalizeError::MissingField("session_id"))
-        ));
-    }
-
-    #[test]
-    fn unknown_event_is_ignored_with_logging_not_a_silent_ok() {
-        let raw = json!({
-            "hookEventName": "Notification",
-            "conversationId": PARENT,
-        });
-        assert!(matches!(
-            stateless().normalize_progress_event(&raw),
-            Err(NormalizeError::UnknownEvent(name)) if name == "Notification"
-        ));
-    }
-
-    #[test]
-    fn non_object_payload_is_malformed() {
-        assert!(matches!(
-            stateless().normalize_progress_event(&json!("not an object")),
-            Err(NormalizeError::Malformed(_))
-        ));
-    }
-
-    #[test]
-    fn resume_state_round_trips_the_claimed_id() {
-        let (mut session, _) = stored_session();
-        session.normalize_progress_event(&session_start(PARENT)).unwrap();
-        let state = session.resume_state().expect("claimed id is resumable");
-        let mut restored = AgyProgressSession::new(None, None);
-        restored.restore_resume_state(&state).unwrap();
-        assert!(
-            restored
-                .normalize_progress_events(&session_start(CHILD))
-                .unwrap()
-                .is_empty()
-        );
-        let WorkerEvent::Stop { session_id, .. } = restored.normalize_progress_event(&stop(PARENT, true)).unwrap()
-        else {
-            panic!("expected Stop");
-        };
-        assert_eq!(session_id, PARENT);
-    }
-
-    #[test]
-    fn driver_stateless_path_maps_a_self_describing_session_start() {
-        let event = crate::AgyDriver::default()
-            .normalize_progress_event(&session_start(PARENT))
-            .unwrap();
-        assert_eq!(
-            event,
-            WorkerEvent::SessionStart {
-                session_id: PARENT.into(),
-                source: SessionStartSource::Startup,
-                model: Some("gemini-4-hydrogen-xhigh".into()),
-            }
-        );
-    }
-}
+#[path = "progress_tests.rs"]
+mod tests;

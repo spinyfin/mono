@@ -448,6 +448,30 @@ impl WorkDb {
         Ok(resumed)
     }
 
+    /// Install the first provider identity without replacing a concurrent claim.
+    pub fn claim_run_progress_session_identity_if_absent(
+        &self,
+        execution_id: &str,
+        session_id: &str,
+    ) -> Result<(String, bool)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&tx, execution_id)? else {
+            bail!("no work_runs row for execution {execution_id}");
+        };
+        let installed = tx.execute(
+            "UPDATE work_runs SET progress_session_id = ?2 WHERE id = ?1 AND progress_session_id IS NULL",
+            params![run_id, session_id],
+        )?;
+        let stored: String = tx.query_row(
+            "SELECT progress_session_id FROM work_runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok((stored, installed == 0))
+    }
+
     /// Read the currently claimed provider session id for an execution.
     ///
     /// `Ok(None)` means this run never recorded one — a legitimate answer
@@ -1802,6 +1826,11 @@ pub(super) fn latest_local_worker_process_for_work_item(
 }
 
 impl boss_engine_driver::ProgressIdentityStore for WorkDb {
+    fn claim_progress_identity_if_absent(&self, run_id: &str, session_id: &str) -> Result<(String, bool), String> {
+        self.claim_run_progress_session_identity_if_absent(run_id, session_id)
+            .map_err(|err| format!("{err:#}"))
+    }
+
     fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String> {
         self.claim_run_progress_session_identity(run_id, session_id)
             .map_err(|err| format!("{err:#}"))
