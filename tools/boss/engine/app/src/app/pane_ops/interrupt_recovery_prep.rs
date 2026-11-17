@@ -16,28 +16,13 @@ pub(super) fn prepare(db: &WorkDb, driver: &dyn AgentDriver, run_id: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_engine_driver::{AgyDriver, agy::AGY_HOMES_ROOT_ENV};
+    use boss_engine_driver::AgyDriver;
     use boss_engine_runtime::test_support::{create_ready_chore_execution, create_test_chore, create_test_product};
-
-    struct RestoreRoot(Option<std::ffi::OsString>);
-
-    impl Drop for RestoreRoot {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(value) => std::env::set_var(AGY_HOMES_ROOT_ENV, value),
-                    None => std::env::remove_var(AGY_HOMES_ROOT_ENV),
-                }
-            }
-        }
-    }
 
     #[test]
     fn persisted_identity_reaches_driver_and_missing_or_unreadable_claim_arms_nothing() {
-        let _lock = boss_engine_driver::agy::AGY_HOMES_ENV_TEST_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let _restore = RestoreRoot(std::env::var_os(AGY_HOMES_ROOT_ENV));
-        unsafe { std::env::set_var(AGY_HOMES_ROOT_ENV, root.path()) };
+        let _homes = boss_engine_driver::test_support::agy_homes_override(root.path());
         let db = WorkDb::open_in_memory().unwrap();
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, product.id, "Interrupt recovery");
