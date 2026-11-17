@@ -36,11 +36,25 @@ The settings are read before each off-machine copy, so changes need no engine re
 
 Copies land in `<destination>/<hostname>/state.db.bak-YYYYMMDD-HHMMSS`, so several machines can share one destination. The destination directory itself must already exist (Boss only creates the per-host subfolder); a missing destination usually means the sync folder is not mounted.
 
-Retention is the union of both windows, measured over the copies that exist (not wall-clock), so an engine that was off for a week does not prune its only copies. Retention also removes recognized crash staging files older than 24 hours: atomic-publisher `state.db.bak-YYYYMMDD-HHMMSS.<pid>.<sequence>.tmp` files. Recent staging files and unrelated files are left alone.
+Retention is the union of both windows, measured over the copies that exist (not wall-clock), so an engine that was off for a week does not prune its only copies. Retention also removes recognized crash staging files older than 24 hours from the host folder: atomic-publisher `state.db.bak-YYYYMMDD-HHMMSS.<pid>.<sequence>.tmp` files. Recent staging files and unrelated files are left alone. The local staging folder (below) is cleared of day-old `state.db.bak-*` leftovers before each copy.
 
 ### How a copy is made
 
-Only the already-consistent local snapshot is copied, never the live `state.db`/`-wal`/`-shm`. The shared atomic publisher streams the copy into an exclusively created `state.db.bak-….<pid>.<sequence>.tmp` sibling in the host folder, fsyncs it, and renames it into place, so the sync agent only ever sees a complete file under the final name. The staging file is briefly visible to the agent.
+Only the already-consistent local snapshot is copied, never the live `state.db`/`-wal`/`-shm`.
+
+Each backup reaches the sync agent as exactly one complete new file, which Boss never modifies afterwards:
+
+1. The copy is written and fsynced in `<state_root>/offsite-staging/`, outside the synced folder. This needs free local space for one backup while the copy runs.
+2. A single rename moves the finished file into `<destination>/<hostname>/` under its final name. On the same volume this is atomic.
+3. The file's size at the destination is checked against the bytes copied before the copy counts as succeeded.
+
+A failed copy removes its staging file. A crash can leave one behind in `<state_root>/offsite-staging/`; anything there older than 24 hours is removed before the next copy.
+
+**Why not stage inside the synced folder.** A sync agent uploads whatever it finds, including a file that is still being written. Traced against Google Drive for desktop (macOS File Provider): when a copy staged in the synced folder paused mid-write, the agent was handed the half-written staging file as a new item under its `.tmp` name and uploaded it, then received the remaining bytes and the rename as a content update to that same item, so one backup became two uploads. When the second upload failed or was cancelled on a slow connection, Drive tried to cancel an upload that had already finished and showed "Unable to cancel upload of 'state.db.bak-…' — The upload completed before it could be canceled." Staging outside the folder leaves the agent one create per backup and nothing to update.
+
+**Destination on another volume** (a NAS mount, a sync folder on an external disk): a rename cannot cross volumes, so the copy is staged as an exclusively created `state.db.bak-….<pid>.<sequence>.tmp` sibling inside the host folder, fsynced, and renamed into place there. The final name still only ever appears complete, and the size check still applies, but the sync agent can see the staging file. Google Drive, Dropbox and iCloud Drive folders under `~/Library/CloudStorage` or your home directory are on the same volume as the Boss state root and are not affected.
+
+Before each copy Boss also checks that the host folder is writable by creating and deleting a tiny hidden `.write-probe.partial` there. In the same trace the sync agent only registered the folder's changed modification time; the probe was never created at the provider.
 
 ### Failures are loud, never fatal
 
@@ -68,7 +82,7 @@ Destination validation, copying, and pruning run on a separate single-flight wor
 
 - **Streaming vs mirroring:** in _stream_ mode files are fetched on demand and the folder lives under `~/Library/CloudStorage/`; uploads still happen but local disk is only a cache. In _mirror_ mode a full local copy also exists. Either works; verify in the Drive menu that uploads complete.
 - **Online-only files:** copies Boss wrote can be evicted locally after upload. That is fine for backups, but restoring requires the file to be downloaded first (open it in Finder or `cp` it, which triggers a download).
-- **Partial uploads:** the agent may upload a staging name or a half-synced file during a sync; only trust files that the agent shows as fully synced.
+- **Partial uploads:** a backup that is still uploading can look present in the folder; only trust files that the agent shows as fully synced. Boss never exposes a half-written backup to the agent on a same-volume destination (see "How a copy is made").
 - **macOS privacy:** the engine process needs permission to write under `~/Library/CloudStorage` (Files and Folders / Full Disk Access). A denial surfaces as `copies_failed` plus an ERROR log with `Operation not permitted`.
 - **Account state:** signing out of the sync agent leaves the folder present but stale. `last_success_age_secs` only proves the copy into the folder, not the upload; check the agent's status occasionally.
 - **Sensitive data:** `state.db` contains your work metadata. Point the destination at an account/folder you are comfortable storing it in.

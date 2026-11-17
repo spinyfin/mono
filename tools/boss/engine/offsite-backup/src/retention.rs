@@ -34,9 +34,7 @@ pub fn prune(host_dir: &Path, keep_hourly: usize, keep_daily: usize) -> Result<P
             copies.push((stamp.to_owned(), entry.path()));
         } else if is_staging_name(name) {
             match entry.metadata().and_then(|m| m.modified()) {
-                Ok(modified) if modified.elapsed().unwrap_or_default().as_secs() >= 86400 => {
-                    remove(&entry.path(), &mut outcome);
-                }
+                Ok(modified) if is_abandoned(modified) => remove(&entry.path(), &mut outcome),
                 Ok(_) => {}
                 Err(error) => outcome.failures.push((entry.path(), error)),
             }
@@ -66,6 +64,45 @@ pub fn prune(host_dir: &Path, keep_hourly: usize, keep_daily: usize) -> Result<P
         remove(path, &mut outcome);
     }
     Ok(outcome)
+}
+
+/// Remove crash-orphaned copies from the local staging directory: backup and
+/// staging files there that are older than 24 hours. A live copy is written
+/// in seconds, so anything that old was abandoned. A missing directory is not
+/// an error: it is created by the first copy.
+pub fn prune_staging(staging_dir: &Path) -> Result<PruneOutcome> {
+    let mut outcome = PruneOutcome::default();
+    let read_dir = match std::fs::read_dir(staging_dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(outcome),
+        Err(error) => return Err(error).with_context(|| format!("read {}", staging_dir.display())),
+    };
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                outcome.failures.push((staging_dir.to_owned(), error));
+                continue;
+            }
+        };
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(BACKUP_FILE_PREFIX))
+        {
+            continue;
+        }
+        match entry.metadata().and_then(|m| m.modified()) {
+            Ok(modified) if is_abandoned(modified) => remove(&entry.path(), &mut outcome),
+            Ok(_) => {}
+            Err(error) => outcome.failures.push((entry.path(), error)),
+        }
+    }
+    Ok(outcome)
+}
+
+fn is_abandoned(modified: std::time::SystemTime) -> bool {
+    modified.elapsed().unwrap_or_default().as_secs() >= 86400
 }
 
 fn remove(path: &Path, outcome: &mut PruneOutcome) {
@@ -201,6 +238,39 @@ mod tests {
         assert_eq!(result.removed.len(), 2);
         assert!(tmp.path().join("unrelated.tmp").exists());
         assert!(tmp.path().join("state.db.bak-20260102-000000.2.2.tmp").exists());
+    }
+
+    #[test]
+    fn staging_prune_removes_only_old_backup_files() {
+        let tmp = TempDir::new().unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86401);
+        for name in [
+            "state.db.bak-20260101-000000",
+            "state.db.bak-20260101-000000.123.4.tmp",
+            "unrelated",
+        ] {
+            let file = std::fs::File::create(tmp.path().join(name)).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+        }
+        std::fs::write(tmp.path().join("state.db.bak-20260102-000000.2.2.tmp"), b"active").unwrap();
+        let result = prune_staging(tmp.path()).unwrap();
+        assert!(result.failures.is_empty());
+        assert_eq!(result.removed.len(), 2);
+        assert_eq!(
+            names(tmp.path()),
+            vec!["state.db.bak-20260102-000000.2.2.tmp", "unrelated"]
+        );
+    }
+
+    #[test]
+    fn staging_prune_tolerates_a_missing_directory() {
+        let tmp = TempDir::new().unwrap();
+        assert!(
+            prune_staging(&tmp.path().join("never-created"))
+                .unwrap()
+                .removed
+                .is_empty()
+        );
     }
 
     #[test]
