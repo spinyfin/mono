@@ -63,6 +63,8 @@ struct WorkNavigatorAttention: View {
             case .openInput(let activity):
                 NavigatorOpenInputBody(activity: activity, model: context.model)
                     .disabled(context.isReadOnly)
+            case .intervention(_, let label):
+                NavigatorInterventionBody(label: label)
             }
         }
         .padding(12)
@@ -91,7 +93,7 @@ struct WorkNavigatorAttention: View {
             if action.type == "open_input" {
                 entry = action.activity.map { .openInput($0) }
             } else if action.type == "attention" {
-                entry = attentionEntry(for: action, model: model)
+                entry = attentionEntry(for: action, model: model, root: root)
             } else {
                 entry = nil
             }
@@ -102,9 +104,14 @@ struct WorkNavigatorAttention: View {
 
     private static func attentionEntry(
         for action: NavigatorAction,
-        model: ChatViewModel
+        model: ChatViewModel,
+        root: WorkTask
     ) -> NavigatorAttentionEntry? {
         let attentionID = action.attentionId ?? ""
+        if action.kind == "intervention" {
+            let id = attentionID.isEmpty ? (action.taskId ?? root.id) : attentionID
+            return .intervention(id: id, label: root.navigator?.root?.reasonLabel ?? "Intervention")
+        }
         if !attentionID.isEmpty, let group = model.attentionGroup(id: attentionID), group.isOpen {
             return .group(group)
         }
@@ -135,6 +142,8 @@ struct WorkNavigatorAttention: View {
             return "\(group.kindLabel) \(index + 1) of \(total)"
         case .openInput:
             return "Input needed · \(index + 1) of \(total)"
+        case .intervention(_, let label):
+            return "\(label) · \(index + 1) of \(total)"
         }
     }
 }
@@ -143,13 +152,32 @@ enum NavigatorAttentionEntry: Identifiable {
     case question(WorkTask, OperatorQuestionPresentation)
     case group(AttentionGroup)
     case openInput(NavigatorActivity)
+    case intervention(id: String, label: String)
 
     var id: String {
         switch self {
         case .question(_, let presentation): return "question:\(presentation.questionID)"
         case .group(let group): return "group:\(group.id):\(group.generation)"
         case .openInput(let activity): return "input:\(activity.executionId)"
+        case .intervention(let id, _): return "intervention:\(id)"
         }
+    }
+}
+
+/// Engine-mapped intervention with no structured question. Read-only: the
+/// person acts from Activity, Kanban, or the reason the engine already named.
+struct NavigatorInterventionBody: View {
+    let label: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(label)
+                .font(.callout)
+            Text("This task needs a person to act. There is no question to answer here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityIdentifier("navigator-intervention")
     }
 }
 

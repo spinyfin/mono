@@ -97,6 +97,7 @@ extension ChatViewModel {
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
             operatorAnswerInFlightByTaskID.removeAll()
+            attentionRequestGroupByRequestID.removeAll()
             // An archive in flight gets no reply either; drop its pending
             // mark so the row is not stuck reading "Archiving…".
             settleAllArchiveRequests()
@@ -615,10 +616,13 @@ extension ChatViewModel {
                 upsertAttentionMember(attention)
             }
             refreshSelectedProductAttentionCaches()
-        case .attentionGroupUpdated(let group, let members):
+            syncNavigatorAttention()
+        case .attentionGroupUpdated(let group, let members, let requestId):
             applyAttentionGroupSnapshot(group, members: members)
-        case .attentionGroupActioned(let group, let members):
+            settleAttentionRequest(requestId)
+        case .attentionGroupActioned(let group, let members, let requestId):
             applyAttentionGroupSnapshot(group, members: members)
+            settleAttentionRequest(requestId)
         case .attentionMergesList(let attentionID, let merges):
             attentionMergesByAttentionID[attentionID] = merges
         case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):

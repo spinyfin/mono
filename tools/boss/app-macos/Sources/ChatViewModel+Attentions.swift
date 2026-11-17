@@ -65,8 +65,8 @@ extension ChatViewModel {
             upsertAttentionGroup(group)
             setAttentionMembers(members, forGroup: group.id)
         }
-        settleAttentionRequests(forGroup: group.id)
         refreshSelectedProductAttentionCaches()
+        syncNavigatorAttention()
     }
 
     /// Insert or replace one member within its group's row list.
@@ -191,9 +191,12 @@ extension ChatViewModel {
         return true
     }
 
-    /// A snapshot for the group arrived, so its earlier requests are settled.
-    func settleAttentionRequests(forGroup groupID: String) {
-        attentionRequestGroupByRequestID = attentionRequestGroupByRequestID.filter { $0.value != groupID }
+    /// Drop the mapping for one request when *that* request's reply arrives.
+    /// A snapshot or broadcast for the same group must not clear other
+    /// in-flight request ids (Submit sends an answer then an action).
+    func settleAttentionRequest(_ requestId: String?) {
+        guard let requestId else { return }
+        attentionRequestGroupByRequestID.removeValue(forKey: requestId)
     }
 
     /// Dismiss a single member (`atn_…`) without producing anything.

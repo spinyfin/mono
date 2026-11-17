@@ -343,7 +343,11 @@ struct AttentionGroupBody: View {
     private func promptBinding(for member: Attention) -> Binding<String> {
         Binding(
             get: { AttentionPromptDraft.visibleText(promptDrafts[member.id], member: member) },
-            set: { promptDrafts[member.id] = AttentionPromptDraft(text: $0, base: member.answer) }
+            set: {
+                promptDrafts[member.id] = AttentionPromptDraft(
+                    text: $0, base: member.answer, baseState: member.answerState
+                )
+            }
         )
     }
 
@@ -373,22 +377,27 @@ struct AttentionGroupBody: View {
     }
 }
 
-/// A locally edited `prompt` answer plus the recorded answer it was edited
-/// from. If the engine's recorded answer changes (another client answered),
-/// the draft is stale: the field shows the recorded answer and Submit does
+/// A locally edited `prompt` answer plus the recorded answer and resolution
+/// state it was edited from. If another client answers or skips the member,
+/// the draft is stale: the field shows the recorded value and Submit does
 /// not send the draft; typing again starts a fresh draft.
 struct AttentionPromptDraft: Equatable {
     var text: String
     var base: String?
+    var baseState: String
+
+    static func isCurrent(_ draft: AttentionPromptDraft, member: Attention) -> Bool {
+        draft.base == member.answer && draft.baseState == member.answerState
+    }
 
     static func visibleText(_ draft: AttentionPromptDraft?, member: Attention) -> String {
-        guard let draft, draft.base == member.answer else { return member.answer ?? "" }
+        guard let draft, isCurrent(draft, member: member) else { return member.answer ?? "" }
         return draft.text
     }
 
     /// The trimmed text to send, or `nil` when empty, unchanged or stale.
     static func flushable(_ draft: AttentionPromptDraft?, member: Attention) -> String? {
-        guard let draft, draft.base == member.answer else { return nil }
+        guard let draft, isCurrent(draft, member: member) else { return nil }
         let trimmed = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty || trimmed == (member.answer ?? "") ? nil : trimmed
     }

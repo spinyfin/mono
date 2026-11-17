@@ -240,6 +240,54 @@ final class NavigatorAttentionTests: XCTestCase {
         XCTAssertEqual(sent.count, 2)
     }
 
+    func testSubmitActionRefusalStaysInlineAfterAnswerSnapshot() throws {
+        let group = makeGroup(id: "atg_submit", taskID: "root", generation: 1)
+        let member = makeMember(id: "atn_submit", groupID: group.id, type: "prompt", text: "Which channel?")
+        let model = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
+                          groups: [group], members: [member])
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertTrue(model.answerAttention(member.id, answer: "ops", expectedGeneration: 1))
+        let answerRequest = try XCTUnwrap(model.attentionRequestGroupByRequestID.keys.first)
+        XCTAssertTrue(model.actionAttentionGroup(group.id, expectedGeneration: 1))
+        XCTAssertEqual(model.attentionRequestGroupByRequestID.count, 2)
+        let actionRequest = try XCTUnwrap(
+            model.attentionRequestGroupByRequestID.keys.first { $0 != answerRequest }
+        )
+        let answered = makeMember(id: member.id, groupID: group.id, type: "prompt",
+                                  text: "Which channel?", answer: "ops", state: "answered")
+        // The answer's own reply must not drop the still-in-flight action id.
+        model.applyEventForTest(.attentionGroupUpdated(
+            group: group, members: [answered], requestId: answerRequest
+        ))
+        XCTAssertEqual(model.attentionRequestGroupByRequestID[actionRequest], group.id)
+        XCTAssertNil(model.attentionRequestGroupByRequestID[answerRequest])
+        model.applyEventForTest(.workError(message: "group is terminal", requestId: actionRequest))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: group.id), "group is terminal")
+        XCTAssertNil(model.workErrorMessage)
+    }
+
+    func testForeignSnapshotDoesNotDropPendingActionCorrelation() throws {
+        let group = makeGroup(id: "atg_foreign", taskID: "root", generation: 1)
+        let member = makeMember(id: "atn_foreign", groupID: group.id, type: "prompt", text: "Which channel?")
+        let model = model([makeRoot(actions: [attentionAction(id: group.id, task: "root")])],
+                          groups: [group], members: [member])
+        model.engine.simulateConnectedForTesting = true
+        XCTAssertTrue(model.actionAttentionGroup(group.id, expectedGeneration: 1))
+        let actionRequest = try XCTUnwrap(model.attentionRequestGroupByRequestID.keys.first)
+        let skipped = makeMember(id: member.id, groupID: group.id, type: "prompt",
+                                 text: "Which channel?", state: "skipped")
+        // Another client's broadcast has no matching request id.
+        model.applyEventForTest(.attentionGroupUpdated(group: group, members: [skipped]))
+        XCTAssertEqual(model.attentionRequestGroupByRequestID[actionRequest], group.id)
+        model.applyEventForTest(.workError(message: "group is already actioned", requestId: actionRequest))
+        XCTAssertEqual(model.attentionAnswerError(forGroup: group.id), "group is already actioned")
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertTrue(model.actionAttentionGroup(group.id, expectedGeneration: 1))
+        XCTAssertFalse(model.attentionRequestGroupByRequestID.isEmpty)
+        model.applyEventForTest(.disconnected)
+        XCTAssertTrue(model.attentionRequestGroupByRequestID.isEmpty)
+    }
+
     func testStaleDraftDoesNotOverwriteAnswerRecordedElsewhere() {
         let group = makeGroup(id: "atg_draft", taskID: "root", generation: 2)
         let open = makeMember(id: "atn_draft", groupID: group.id, type: "prompt", text: "Which channel?")
@@ -249,7 +297,7 @@ final class NavigatorAttentionTests: XCTestCase {
         var sent: [[String: Any]] = []
         model.engine.outboundRecorder = { sent.append($0) }
         // The user types draft A while the member is still open.
-        let draft = AttentionPromptDraft(text: "A", base: open.answer)
+        let draft = AttentionPromptDraft(text: "A", base: open.answer, baseState: open.answerState)
         XCTAssertEqual(AttentionPromptDraft.visibleText(draft, member: open), "A")
         // Another client records answer B for the same member and generation.
         let answered = makeMember(id: "atn_draft", groupID: group.id, type: "prompt",
@@ -261,8 +309,17 @@ final class NavigatorAttentionTests: XCTestCase {
                                   drafts: ["atn_draft": draft], generation: 2)
         XCTAssertEqual(sent.map { $0["type"] as? String }, ["action_attention_group"])
         // An explicit edit after the update is a fresh draft and is sent.
-        let edit = AttentionPromptDraft(text: "C", base: answered.answer)
+        let edit = AttentionPromptDraft(text: "C", base: answered.answer, baseState: answered.answerState)
         XCTAssertEqual(AttentionPromptDraft.flushable(edit, member: answered), "C")
+        // A skip recorded elsewhere also stale-dates a draft typed while open.
+        sent.removeAll()
+        let skipped = makeMember(id: "atn_draft", groupID: group.id, type: "prompt",
+                                 text: "Which channel?", state: "skipped")
+        XCTAssertEqual(AttentionPromptDraft.visibleText(draft, member: skipped), "")
+        XCTAssertNil(AttentionPromptDraft.flushable(draft, member: skipped))
+        AttentionGroupBody.submit(model: model, group: group, members: [skipped],
+                                  drafts: ["atn_draft": draft], generation: 2)
+        XCTAssertEqual(sent.map { $0["type"] as? String }, ["action_attention_group"])
     }
 
     func testBannerAndTabCountMatchRenderableEntries() {
@@ -273,9 +330,75 @@ final class NavigatorAttentionTests: XCTestCase {
         model.selectWorkCard("root")
         XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: root).count, 0)
         XCTAssertFalse(model.navigator.tabs.contains(.attention))
+        XCTAssertFalse(WorkNavigatorDetail.visibleTabs(model: model, root: root).contains(.attention))
         // An attention action whose task has no operator question also renders nothing.
         let unresolved = makeRoot(actions: [attentionAction(id: "oq_none", task: "root")])
         XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: unresolved).count, 0)
+    }
+
+    func testInterventionDefaultOpensAttentionWithReadOnlyEntry() throws {
+        let root = makeRoot(
+            section: "needs_attention",
+            detail: "attention",
+            reasonAction: "intervention",
+            actions: [[
+                "type": "attention", "kind": "intervention",
+                "attention_id": "intervention:root:deliberate_park", "task_id": "root",
+            ]]
+        )
+        let model = model([root])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        let selected = try XCTUnwrap(model.navigatorSelectedTask)
+        let entries = WorkNavigatorAttention.entries(model: model, root: selected)
+        XCTAssertEqual(entries.map(\.id), ["intervention:intervention:root:deliberate_park"])
+        XCTAssertEqual(model.navigator.tab, .attention)
+        XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
+        XCTAssertTrue(model.navigator.tabs.contains(.attention))
+    }
+
+    func testUnresolvedQuestionFallsBackFromEmptyAttentionTab() throws {
+        let root = makeRoot(
+            section: "needs_attention",
+            detail: "attention",
+            actions: [attentionAction(id: "oq_none", task: "root")]
+        )
+        let model = model([root])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        let selected = try XCTUnwrap(model.navigatorSelectedTask)
+        XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: selected).count, 0)
+        XCTAssertEqual(model.navigator.tab, .activity)
+        XCTAssertFalse(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
+        XCTAssertFalse(model.navigator.tabs.contains(.attention))
+    }
+
+    func testEntriesBecomingRenderableAgreeWithBannerAndTabs() throws {
+        let group = makeGroup(id: "atg_late", taskID: "root", generation: 1)
+        let member = makeMember(id: "atn_late", groupID: group.id, type: "yes_no")
+        let root = makeRoot(
+            section: "needs_attention",
+            detail: "attention",
+            actions: [attentionAction(id: group.id, task: "root")]
+        )
+        let model = model([root])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        var selected = try XCTUnwrap(model.navigatorSelectedTask)
+        XCTAssertEqual(WorkNavigatorAttention.entries(model: model, root: selected).count, 0)
+        XCTAssertEqual(model.navigator.tab, .activity)
+        XCTAssertFalse(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
+        model.applyEventForTest(.attentionCreated(attention: member, group: group))
+        selected = try XCTUnwrap(model.navigatorSelectedTask)
+        let entries = WorkNavigatorAttention.entries(model: model, root: selected)
+        XCTAssertEqual(entries.map(\.id), ["group:atg_late:1"])
+        XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
+        XCTAssertTrue(model.navigator.tabs.contains(.attention))
+        XCTAssertEqual(model.navigator.tab, .activity)
+        XCTAssertTrue(entries.count > 0 && model.navigator.tab != .attention)
+        model.navigator.tab = .attention
+        XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model, root: selected).contains(.attention))
+        XCTAssertEqual(model.navigator.tab, .attention)
     }
 
     func testQuestionFallbackDoesNotMismatchOrDuplicate() {
@@ -341,22 +464,27 @@ final class NavigatorAttentionTests: XCTestCase {
     private func makeRoot(
         section: String = "needs_attention",
         detail: String = "attention",
+        reasonAction: String = "question",
         actions: [[String: Any]]
     ) -> WorkTask {
         var task = NavigatorTestFixture.task(section: section, detail: detail)
-        task.navigator = makeProjection(section: section, detail: detail, actions: actions)
+        task.navigator = makeProjection(
+            section: section, detail: detail, reasonAction: reasonAction, actions: actions
+        )
         return task
     }
 
     private func makeProjection(
         section: String = "needs_attention",
         detail: String = "attention",
+        reasonAction: String = "question",
         actions: [[String: Any]]
     ) -> NavigatorProjection? {
-        NavigatorProjection.parse([
+        let reasonLabel = reasonAction == "intervention" ? "Intervention" : "Answer"
+        return NavigatorProjection.parse([
             "version": 1, "root_task_id": "root", "root": [
                 "section": section, "sort_key": "0", "default_detail": detail,
-                "reason": ["type": "human", "action": "question"], "reason_label": "Answer",
+                "reason": ["type": "human", "action": reasonAction], "reason_label": reasonLabel,
                 "revisions": ["open": 1, "total": 1, "current_task_id": "revision"],
                 "actions": actions,
             ] as [String: Any],

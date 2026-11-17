@@ -1500,7 +1500,7 @@ final class EngineClient: @unchecked Sendable {
             }
             let members = (payload["members"] as? [[String: Any]] ?? [])
                 .compactMap(parseAttention)
-            emit(.attentionGroupUpdated(group: group, members: members))
+            emit(.attentionGroupUpdated(group: group, members: members, requestId: envelopeRequestId))
         case "attention_group_actioned":
             guard let groupPayload = payload["group"] as? [String: Any],
                   let group = parseAttentionGroup(groupPayload)
@@ -1510,7 +1510,7 @@ final class EngineClient: @unchecked Sendable {
             }
             let members = (payload["members"] as? [[String: Any]] ?? [])
                 .compactMap(parseAttention)
-            emit(.attentionGroupActioned(group: group, members: members))
+            emit(.attentionGroupActioned(group: group, members: members, requestId: envelopeRequestId))
         case "attention_merges_list":
             let attentionID = payload["attention_id"] as? String ?? ""
             let merges = (payload["merges"] as? [[String: Any]] ?? [])
