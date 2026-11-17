@@ -187,6 +187,8 @@ def strip_prefixes(group):
             while index < len(group) and group[index].startswith('-'):
                 option = group[index]
                 index += 1
+                if base == 'command' and option in ('-v', '-V'):
+                    return []
                 if option == '--':
                     break
                 if option in value_options and index < len(group):
@@ -205,4 +207,27 @@ pub fn with_command_tokenizer(template: &str) -> String {
     template
         .replace("# COMMAND_TOKENIZER_FRAGMENT", CODEX_COMMAND_TOKENIZER_PY)
         .replace("# REVIEWER_BLOCKED_FRAGMENT", REVIEWER_BLOCKED_PROGRAMS_PY)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn command_queries_do_not_execute_the_queried_program() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+for command in ('command -v cube', 'command -V boss', 'command -v bossctl',
+                'env command -v cube', 'command -p -v cube'):
+    assert strip_prefixes(shlex.split(command)) == [], command
+assert strip_prefixes(shlex.split('command cube')) == ['cube']
+assert strip_prefixes(shlex.split('command -- bossctl')) == ['bossctl']
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
 }

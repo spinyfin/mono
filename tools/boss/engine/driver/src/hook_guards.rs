@@ -13,6 +13,8 @@ pub(crate) struct Guard {
     pub matcher: &'static str,
     /// Execution bound in seconds. Checkleft needs its longer build bound.
     pub timeout_sec: Option<u64>,
+    /// Run once on the combined command forms instead of on each inspection pass.
+    pub run_once: bool,
 }
 
 /// The five Boss `PreToolUse` guard commands, unchanged from Claude's. Order
@@ -36,6 +38,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
             ),
             matcher: "*",
             timeout_sec: None,
+            run_once: false,
         });
     }
 
@@ -47,6 +50,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
             command: crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref()),
             matcher: "Bash",
             timeout_sec: None,
+            run_once: false,
         });
     }
 
@@ -55,6 +59,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         command: BOSS_LAUNCH_GUARD_COMMAND.to_owned(),
         matcher: "Bash",
         timeout_sec: None,
+        run_once: false,
     });
 
     // 3. PR-redirect guard. Standard workers only (local + remote).
@@ -63,6 +68,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
             command: pr_redirect_guard_command(config.is_revision),
             matcher: "Bash",
             timeout_sec: None,
+            run_once: false,
         });
     }
 
@@ -77,6 +83,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
             ),
             matcher: "Bash",
             timeout_sec: Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
+            run_once: true,
         });
     }
 
@@ -87,6 +94,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
             command: REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND.to_owned(),
             matcher: "Bash",
             timeout_sec: None,
+            run_once: false,
         });
     }
 
@@ -96,6 +104,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
             command: REVISION_PR_GUARD_COMMAND.to_owned(),
             matcher: "Bash",
             timeout_sec: None,
+            run_once: false,
         });
     }
 
@@ -107,6 +116,7 @@ pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
             ),
             matcher: ".*",
             timeout_sec: None,
+            run_once: false,
         });
     }
     out

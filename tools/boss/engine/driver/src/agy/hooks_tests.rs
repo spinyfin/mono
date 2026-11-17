@@ -112,16 +112,11 @@ fn run_command_payload(command: &str) -> Value {
     })
 }
 
-fn authorize(process_home: &Path, payload: &Value, skip_forward: bool) -> (i32, Value, String) {
-    authorize_with_env(process_home, payload, skip_forward, &[])
+fn authorize(process_home: &Path, payload: &Value) -> (i32, Value, String) {
+    authorize_with_env(process_home, payload, &[])
 }
 
-fn authorize_with_env(
-    process_home: &Path,
-    payload: &Value,
-    skip_forward: bool,
-    env: &[(&str, &str)],
-) -> (i32, Value, String) {
+fn authorize_with_env(process_home: &Path, payload: &Value, env: &[(&str, &str)]) -> (i32, Value, String) {
     let adapter = adapter_path(process_home);
     let policy = policy_path(process_home);
     let policy_doc: Value = serde_json::from_str(&fs::read_to_string(&policy).unwrap()).unwrap();
@@ -133,15 +128,11 @@ fn authorize_with_env(
         .env("BOSS_RUN_ID", run_id)
         .env_remove("BOSS_BIN")
         .env_remove("CUBE_BIN")
+        .env_remove("BOSS_STRUCTURED_OUTPUT")
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if skip_forward {
-        cmd.env("BOSS_AGY_SKIP_FORWARD", "1");
-    } else {
-        cmd.env_remove("BOSS_AGY_SKIP_FORWARD");
-    }
     let mut child = cmd.spawn().expect("spawn python3 adapter");
     child
         .stdin
@@ -369,7 +360,7 @@ fn camelcase_toolcall_payload_translates_to_auto_approve() {
     );
     let fx = Fixture::new("run-translate-1");
     fx.install(WorkerKind::Standard);
-    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"), true);
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"));
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "auto_approve", "{body} stderr={stderr}");
 }
@@ -391,7 +382,7 @@ fn write_file_is_not_fail_closed_by_bash_only_guards() {
             "args": {"Path": fx.workspace().join("hello.txt").display().to_string(), "Contents": "hi"},
         }
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &payload, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &payload);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "auto_approve", "{body} stderr={stderr}");
 }
@@ -437,7 +428,7 @@ fn structural_denies_cover_bypass_mcp_stdin_sudo_and_unknown_tools() {
         (json!({"toolCall": {"name": "mystery_tool", "args": {}}}), "unknown"),
     ];
     for (payload, needle) in cases {
-        let (code, body, stderr) = authorize(&fx.process_home, &payload, true);
+        let (code, body, stderr) = authorize(&fx.process_home, &payload);
         assert_eq!(code, 0, "{needle} stderr={stderr}");
         assert_eq!(decision(&body), "deny", "{needle}: {body}");
         let reason = body["reason"].as_str().unwrap_or_default();
@@ -467,7 +458,7 @@ fn protected_configuration_is_denied() {
             "args": {"Path": gemini.display().to_string(), "Contents": "owned"},
         }
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &payload, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &payload);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
     assert!(
@@ -493,15 +484,15 @@ fn reviewer_native_and_shell_writes_are_denied() {
             "args": {"Path": fx.workspace().join("x.rs").display().to_string(), "Contents": "x"},
         }
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &write, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &write);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
     let redirect = run_command_payload("echo hi > /tmp/out");
-    let (code, body, stderr) = authorize(&fx.process_home, &redirect, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &redirect);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
     let touch = run_command_payload("touch /tmp/out");
-    let (code, body, stderr) = authorize(&fx.process_home, &touch, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &touch);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
 }
@@ -516,7 +507,7 @@ fn allowlist_kinds_return_deny_unless_prior_grant() {
     fx.install_with(WorkerKind::AnswerAgent, |c| {
         c.is_standard_worker = false;
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"), true);
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"));
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny_unless_prior_grant", "{body}");
 }
@@ -530,14 +521,14 @@ fn child_calls_share_the_same_authorization_entry() {
     let fx = Fixture::new("run-child-1");
     fx.install(WorkerKind::Standard);
     let invoke = json!({"toolCall": {"name": "invoke_subagent", "args": {"prompt": "hello"}}});
-    let (code, body, stderr) = authorize(&fx.process_home, &invoke, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &invoke);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "auto_approve", "{body}");
     let denied_child = json!({
         "conversationId": "child-1",
         "toolCall": {"name": "run_command", "args": {"CommandLine": "sudo echo hi"}},
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &denied_child, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &denied_child);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
 }
@@ -554,7 +545,7 @@ fn silent_forward_discards_forwarder_stdout() {
         "#!/bin/sh\necho '{\"decision\":\"allow\"}'\ncat >/dev/null\n",
     );
     fx.install(WorkerKind::Standard);
-    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"), false);
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"));
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(
         decision(&body),
@@ -572,7 +563,7 @@ fn forwarder_failure_denies() {
     let fx = Fixture::new("run-forward-fail");
     write_exec(&fx.forwarder(), "#!/bin/sh\nexit 1\n");
     fx.install(WorkerKind::Standard);
-    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"), false);
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo ok"));
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
     assert!(
@@ -592,7 +583,6 @@ fn pr_redirect_guard_denies_gh_pr_create_through_the_adapter() {
     let (code, body, stderr) = authorize(
         &fx.process_home,
         &run_command_payload("gh pr create --title x --body y"),
-        true,
     );
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
@@ -619,7 +609,6 @@ fn git_store_guard_refuses_store_writes_via_agy_payload() {
     let (code, body, stderr) = authorize(
         &fx.process_home,
         &run_command_payload(&format!("git -C {store} fetch --depth=200 origin main")),
-        true,
     );
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
@@ -653,7 +642,7 @@ fn never_emits_allow_ask_or_force_ask() {
     );
     let fx = Fixture::new("run-vocab-1");
     fx.install(WorkerKind::Standard);
-    let (code, body, _) = authorize(&fx.process_home, &run_command_payload("echo ok"), true);
+    let (code, body, _) = authorize(&fx.process_home, &run_command_payload("echo ok"));
     assert_eq!(code, 0);
     let decision = decision(&body);
     assert!(
@@ -670,3 +659,6 @@ mod failure_tests;
 
 #[path = "authorization_edge_tests.rs"]
 mod edge_tests;
+
+#[path = "review_regression_tests.rs"]
+mod review_regression_tests;

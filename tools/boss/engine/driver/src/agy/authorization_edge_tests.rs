@@ -51,7 +51,7 @@ fn standard_shell_execution_positions_preserve_denials() {
         "cd ~ && rm .gemini/config/hooks.*",
         "cat ~/.gem*/config/*",
     ] {
-        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), false);
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
         assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
     for command in [
@@ -61,7 +61,7 @@ fn standard_shell_execution_positions_preserve_denials() {
         "echo ok >/dev/null",
         "echo ok 2>&1",
     ] {
-        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), false);
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
 }
@@ -75,7 +75,7 @@ fn substitutions_are_denied_at_each_shell_depth() {
             let mut command = format!("echo {substitution}");
             for _ in 0..2 {
                 command = format!("sh -c {}", shell_quote(&command));
-                let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(&command), false);
+                let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(&command));
                 assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
             }
         }
@@ -122,7 +122,7 @@ fn readonly_redirects_distinguish_files_from_descriptors() {
             ("python3 -c \"open('f','w')\"", "deny"),
             ("if true; then touch f; fi", "deny"),
         ] {
-            let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), false);
+            let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
             assert_eq!(decision(&body), expected, "{kind:?} {command}: {body} {stderr}");
         }
     }
@@ -178,7 +178,6 @@ fn authorize_tools(fx: &Fixture, command: &str) -> (Value, String) {
     let (_, body, stderr) = authorize_with_env(
         &fx.process_home,
         &run_command_payload(command),
-        false,
         &[("BOSS_BIN", BOSS_BIN), ("CUBE_BIN", CUBE_BIN)],
     );
     (body, stderr)
@@ -240,17 +239,12 @@ fn engine_executable_variables_cannot_evade_structural_denies() {
         assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
     // Without an engine-provided value the variable stays unresolved.
-    let (_, body, stderr) = authorize(
-        &fx.process_home,
-        &run_command_payload("\"$BOSS_BIN\" propose done"),
-        false,
-    );
+    let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload("\"$BOSS_BIN\" propose done"));
     assert_eq!(decision(&body), "deny", "{body} {stderr}");
     // A relative value is not an engine-provided executable.
     let (_, body, stderr) = authorize_with_env(
         &fx.process_home,
         &run_command_payload("\"$BOSS_BIN\" propose done"),
-        false,
         &[("BOSS_BIN", "boss")],
     );
     assert_eq!(decision(&body), "deny", "{body} {stderr}");
