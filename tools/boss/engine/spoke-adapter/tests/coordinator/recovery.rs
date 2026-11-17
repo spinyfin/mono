@@ -30,6 +30,12 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
         until("launch attention", || attention_open(&fx, &execution.id)).await;
         let next = restarted(&fx, &env.coordinator, 1).await;
         if shape == "late_ok" {
+            until("spawn command", || {
+                peer.commands()
+                    .iter()
+                    .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+            })
+            .await;
             let spawn = peer
                 .commands()
                 .into_iter()
