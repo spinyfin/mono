@@ -1,5 +1,18 @@
 import Foundation
 
+/// Captured at send time because authoritative refreshes prune closed groups.
+struct AttentionRequestGroup {
+    let id: String
+    let groupingKey: String
+    let generation: Int
+
+    init(_ group: AttentionGroup) {
+        id = group.id
+        groupingKey = group.groupingKey
+        generation = group.generation
+    }
+}
+
 extension ChatViewModel {
     // MARK: Attentions (attentions.md — Notifications toolbar + window)
 
@@ -83,43 +96,37 @@ extension ChatViewModel {
 
     /// Record an answer for a question member (`yes`/`no`, a chosen value, or
     /// free text). The engine replies with `attention_group_updated`.
-    /// `expectedGeneration` binds the click to the group the body was showing;
-    /// a later generation is refused inline instead of resubmitting.
     @discardableResult
     func answerAttention(
         _ attentionID: String,
-        answer: String,
-        expectedGeneration: Int? = nil
+        answer: String
     ) -> Bool {
         submitAttentionAnswer(
             attentionID,
             answer: answer,
-            skip: false,
-            expectedGeneration: expectedGeneration
+            skip: false
         )
     }
 
     /// Accept a followup member (mark it `answered` with no value) so it is
     /// included when the group is actioned.
     @discardableResult
-    func acceptFollowup(_ attentionID: String, expectedGeneration: Int? = nil) -> Bool {
+    func acceptFollowup(_ attentionID: String) -> Bool {
         submitAttentionAnswer(
             attentionID,
             answer: nil,
-            skip: false,
-            expectedGeneration: expectedGeneration
+            skip: false
         )
     }
 
     /// Mark a member `skipped` — a rejected followup or a question the human
     /// chooses not to answer. Skipped members contribute nothing on action.
     @discardableResult
-    func skipAttention(_ attentionID: String, expectedGeneration: Int? = nil) -> Bool {
+    func skipAttention(_ attentionID: String) -> Bool {
         submitAttentionAnswer(
             attentionID,
             answer: nil,
-            skip: true,
-            expectedGeneration: expectedGeneration
+            skip: true
         )
     }
 
@@ -148,13 +155,19 @@ extension ChatViewModel {
         )
     }
 
-    /// Friendly copy when a click or refusal targeted a generation that
-    /// the engine has already replaced under a new group id.
+    /// Marker used by the engine for refusals to mutate a terminal group.
+    static let attentionTerminalRefusalMarker = "(terminal)"
+
+    /// Friendly copy when a click or refusal targets a replaced group.
     static let attentionReplacedMessage = "This question was replaced. Review the current question."
 
     /// The engine mints a new group id for each generation. A later open
     /// group with the same grouping key is the replacement of `group`.
     func newerOpenAttentionGroup(replacing group: AttentionGroup) -> AttentionGroup? {
+        newerOpenAttentionGroup(replacing: AttentionRequestGroup(group))
+    }
+
+    private func newerOpenAttentionGroup(replacing group: AttentionRequestGroup) -> AttentionGroup? {
         attentionGroupsByProductID.values
             .flatMap { $0 }
             .filter { candidate in
@@ -166,18 +179,12 @@ extension ChatViewModel {
     }
 
     /// True when this click should not reach the engine: a newer open group
-    /// already replaced `group`, or the body was bound to a generation this
-    /// id cannot have.
+    /// already replaced `group` under a different id.
     private func refuseReplacedAttentionGroup(
-        _ group: AttentionGroup,
-        expectedGeneration: Int?
+        _ group: AttentionGroup
     ) -> Bool {
         if let replacement = newerOpenAttentionGroup(replacing: group) {
             attentionAnswerErrorByGroupID[replacement.id] = Self.attentionReplacedMessage
-            return true
-        }
-        if let expectedGeneration, group.generation != expectedGeneration {
-            attentionAnswerErrorByGroupID[group.id] = Self.attentionReplacedMessage
             return true
         }
         return false
@@ -186,15 +193,13 @@ extension ChatViewModel {
     private func submitAttentionAnswer(
         _ attentionID: String,
         answer: String?,
-        skip: Bool,
-        expectedGeneration: Int?
+        skip: Bool
     ) -> Bool {
-        guard let member = attentionMember(id: attentionID) else { return false }
-        if let group = attentionGroup(id: member.groupID) {
-            attentionAnswerErrorByGroupID.removeValue(forKey: group.id)
-            if refuseReplacedAttentionGroup(group, expectedGeneration: expectedGeneration) {
-                return false
-            }
+        guard let member = attentionMember(id: attentionID),
+              let group = attentionGroup(id: member.groupID) else { return false }
+        attentionAnswerErrorByGroupID.removeValue(forKey: group.id)
+        if refuseReplacedAttentionGroup(group) {
+            return false
         }
         if !skip, let answer, member.isAnswered, member.answer == answer {
             return false
@@ -202,25 +207,25 @@ extension ChatViewModel {
         let requestID = engine.sendAnswerAttention(
             id: attentionID, answer: answer, skip: skip, dismiss: false
         )
-        if let requestID { attentionRequestGroupByRequestID[requestID] = member.groupID }
+        if let requestID { attentionRequestGroupByRequestID[requestID] = AttentionRequestGroup(group) }
         return true
     }
 
     /// An engine refusal (`work_error`) carrying the request id of an
     /// answer/action on a group — for example another client already
     /// actioned it. Painted inline beside that group while it is still
-    /// open; otherwise on the work-error banner, because a terminal
-    /// snapshot can drop the group body before this refusal arrives.
+    /// open, or beside its replacement using the identity captured at send
+    /// time. Without either surface, use the work-error banner.
     /// Returns whether the error belonged to an attention request.
     func settleAttentionWorkError(message: String, requestId: String?) -> Bool {
         guard let requestId,
-              let groupID = attentionRequestGroupByRequestID.removeValue(forKey: requestId)
+              let origin = attentionRequestGroupByRequestID.removeValue(forKey: requestId)
         else { return false }
-        if attentionGroup(id: groupID)?.isOpen == true {
-            attentionAnswerErrorByGroupID[groupID] = message
-        } else if let group = attentionGroup(id: groupID),
-                  let replacement = newerOpenAttentionGroup(replacing: group) {
-            attentionAnswerErrorByGroupID[replacement.id] = Self.attentionReplacedMessage
+        if let replacement = newerOpenAttentionGroup(replacing: origin) {
+            attentionAnswerErrorByGroupID[replacement.id] =
+                message.contains(Self.attentionTerminalRefusalMarker) ? Self.attentionReplacedMessage : message
+        } else if attentionGroup(id: origin.id)?.isOpen == true {
+            attentionAnswerErrorByGroupID[origin.id] = message
         } else {
             workErrorMessage = message
         }
@@ -264,14 +269,14 @@ extension ChatViewModel {
     /// design task, or a batch task-create) and close it. Open members are
     /// skipped first ("skip remaining") so the human needn't touch every row.
     @discardableResult
-    func actionAttentionGroup(_ groupID: String, expectedGeneration: Int? = nil) -> Bool {
+    func actionAttentionGroup(_ groupID: String) -> Bool {
         guard let group = attentionGroup(id: groupID) else { return false }
         attentionAnswerErrorByGroupID.removeValue(forKey: groupID)
-        if refuseReplacedAttentionGroup(group, expectedGeneration: expectedGeneration) {
+        if refuseReplacedAttentionGroup(group) {
             return false
         }
         if let requestID = engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true) {
-            attentionRequestGroupByRequestID[requestID] = groupID
+            attentionRequestGroupByRequestID[requestID] = AttentionRequestGroup(group)
         }
         return true
     }

@@ -48,7 +48,7 @@ struct WorkNavigatorAttention: View {
                 )
                 .disabled(context.isReadOnly)
             case .group(let group):
-                OwnedAttentionGroupBody(group: group, expectedGeneration: group.generation)
+                OwnedAttentionGroupBody(group: group)
                     .environmentObject(context.model)
                     .disabled(context.isReadOnly)
             case .openInput(let activity):

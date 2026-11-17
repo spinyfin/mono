@@ -202,7 +202,7 @@ final class ChatViewModel: ObservableObject {
     /// In-flight `answer_attention` / `action_attention_group` request ids
     /// mapped to the group they were for, so an engine refusal lands inline
     /// beside that group instead of the generic work error banner.
-    var attentionRequestGroupByRequestID: [String: String] = [:]
+    var attentionRequestGroupByRequestID: [String: AttentionRequestGroup] = [:]
     /// Planner audit rows (`planner_runs`) keyed by project id, newest
     /// first — as returned by `list_planner_runs`. Fetched on demand by the
     /// popover and the inspector only; the kanban affordance itself renders

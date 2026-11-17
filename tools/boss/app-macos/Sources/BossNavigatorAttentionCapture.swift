@@ -90,7 +90,7 @@ enum BossNavigatorAttentionCapture {
                     )
                 }
                 labeled("Attention group") {
-                    OwnedAttentionGroupBody(group: group, expectedGeneration: group.generation)
+                    OwnedAttentionGroupBody(group: group)
                         .environmentObject(model)
                 }
             }
