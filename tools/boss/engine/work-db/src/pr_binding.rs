@@ -110,6 +110,44 @@ pub(crate) fn query_other_work_item_bound_to_pr(
     .map_err(Into::into)
 }
 
+/// Live non-revision rows that currently hold a PR, excluding `work_item_id`.
+/// Each tuple is `(id, pr_url, product_id)`, oldest first. The stored URL is
+/// returned as-is; callers compare with [`boss_github::pr_url::same_pr`] so a
+/// decorated or mixed-case URL agrees with the holder policy above.
+pub(crate) fn query_live_pr_holders(
+    conn: &rusqlite::Connection,
+    work_item_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, pr_url, product_id FROM tasks
+         WHERE pr_url IS NOT NULL AND pr_url != '' AND deleted_at IS NULL
+           AND kind != 'revision' AND id != ?1
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    stmt.query_map([work_item_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(Into::into)
+}
+
+/// Live holders of `pr_url`, matching by normalised PR identity so a
+/// decorated or mixed-case stored URL is the same holder as the canonical form.
+pub(crate) fn query_live_holders_of_pr(
+    conn: &rusqlite::Connection,
+    pr_url: &str,
+    work_item_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    Ok(query_live_pr_holders(conn, work_item_id)?
+        .into_iter()
+        .filter(|(_, stored, _)| boss_github::pr_url::same_pr(stored, pr_url))
+        .collect())
+}
+
 /// SQL predicate: `t.pr_url` is the PR number the row was spawned from.
 const BOUND_TO_ORIGIN_SQL: &str = "(t.origin_pr_number IS NOT NULL AND t.pr_url LIKE '%/pull/' || t.origin_pr_number)";
 
