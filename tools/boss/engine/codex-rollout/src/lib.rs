@@ -432,6 +432,28 @@ mod tests {
     }
 
     #[test]
+    fn regex_literal_with_slashes_does_not_drop_a_following_exec_command() {
+        let call = canonical_exec_script(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""}); const n = "a/b".replace(/\//g, "_"); "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
+        let multiline = canonical_exec_script(concat!(
+            "await tools.write_stdin({session_id:8467,chars:\"\"});\nconst r = s.replace(/\\/*/g, \"\");\n",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert!(multiline.issues_command);
+        assert_eq!(
+            multiline.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
+    }
+
+    #[test]
     fn dont_comment_before_exec_command_still_recovers_the_cmd() {
         let call = canonical_exec_script(concat!("// don't\n", r#"await tools.exec_command({cmd:"echo hi"});"#,));
         assert!(call.issues_command);

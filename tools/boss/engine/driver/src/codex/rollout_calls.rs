@@ -1321,6 +1321,30 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_with_a_regex_literal_then_exec_drains_as_a_command() {
+        let script = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""}); const n = "a/b".replace(/\//g, "_"); "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        let mut tracker = RolloutCallTracker::default();
+        let call = cell_exec("regex", script);
+        assert!(call.issues_command);
+        tracker.observe_call("regex", call).unwrap();
+        assert_eq!(
+            tracker
+                .drain_open_calls()
+                .iter()
+                .map(rollout_call_command_display)
+                .collect::<Vec<_>>(),
+            ["sleep 999"]
+        );
+        let multiline = "await tools.write_stdin({session_id:8467,chars:\"\"});\nconst r = s.replace(/\\/*/g, \"\");\nawait tools.exec_command({cmd:\"sleep 999\"});\n";
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("ml", cell_exec("ml", multiline)).unwrap();
+        assert_eq!(tracker.drain_open_calls().len(), 1);
+    }
+
+    #[test]
     fn a_write_stdin_cell_without_exit_code_does_not_flag_the_poll_as_a_command() {
         let mut tracker = RolloutCallTracker::default();
         tracker
