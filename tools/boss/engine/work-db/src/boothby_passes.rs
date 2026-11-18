@@ -78,7 +78,7 @@ impl WorkDb {
     pub fn open_boothby_pass(&self, trigger: &str, now: &str) -> Result<Option<BoothbyPass>> {
         validate_boothby_trigger(trigger)?;
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let already_open: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM boothby_passes WHERE finished_at IS NULL)",
@@ -126,7 +126,7 @@ impl WorkDb {
     ) -> Result<BoothbyPass> {
         validate_boothby_outcome(outcome)?;
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let updated = tx.execute(
             "UPDATE boothby_passes
              SET finished_at = ?2, outcome = ?3, summary = ?4, session_id = ?5, transcript_path = ?6
