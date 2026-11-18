@@ -1188,15 +1188,6 @@ mod tests {
             execution.id
         }
 
-        /// A run the engine deliberately gave up on — what
-        /// `transient_recovery`'s orphan+respawn leaves behind when a worker
-        /// dies on a `529 Overloaded`.
-        fn orphaned_execution(&self) -> String {
-            let id = self.running_execution();
-            self.db.mark_execution_orphaned(&id, "529 Overloaded").unwrap();
-            id
-        }
-
         /// Record a genuine tmux spawn token for an execution — the same
         /// call `crate::tmux_adoption`'s spawn path makes before tmux ever
         /// creates the session. Deliberately distinct from the execution
@@ -1229,9 +1220,17 @@ mod tests {
         /// real terminal execution row, as opposed to
         /// [`HuskDeathEvidence::TokenUnknownToDb`], the other
         /// independently-confirmed shape.
+        ///
+        /// Stamp the token while the execution is still running: the intent
+        /// write refuses terminal rows so a late spawn cannot recreate a
+        /// session after the pane-attach deadline has already orphaned it.
         fn orphaned_session_token(&self) -> String {
-            let execution_id = self.orphaned_execution();
-            self.record_spawn_token(&execution_id)
+            let execution_id = self.running_execution();
+            let token = self.record_spawn_token(&execution_id);
+            self.db
+                .mark_execution_orphaned(&execution_id, "529 Overloaded")
+                .unwrap();
+            token
         }
 
         /// Every breaker attention item across every work item this fixture
