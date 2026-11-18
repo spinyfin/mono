@@ -539,10 +539,19 @@ async fn a_settled_uncertain_spawn_adopted_alive_is_stopped_then_released() {
 
 #[tokio::test]
 async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_reported_running() {
-    // Every command is answered (the spawn with an uncertain refusal), so no
-    // deadline is meant to fire here: keep them all far above what a loaded
-    // CI worker shared with dozens of sibling tests can take to deliver a reply.
-    let fx = Fixture::with(workspace_slack(10_000)).await;
+    // Spawn replies with OutcomeUncertain, then Adopt and Stop also reply.
+    // Only prompt acceptance intentionally times out; give every wire reply
+    // time to arrive while the integration tests share a loaded CI worker.
+    // `workspace_slack` would also stretch prompt_timeout, so this test would
+    // wait seconds for a timeout it is supposed to take in hundreds of ms.
+    let fx = Fixture::with(
+        SpokeAdapterConfig::builder()
+            .command_deadline(Duration::from_secs(5))
+            .spawn_deadline(Duration::from_secs(10))
+            .prompt_timeout(Duration::from_millis(300))
+            .build(),
+    )
+    .await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
