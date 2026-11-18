@@ -187,16 +187,13 @@ const LIVE_OR_PENDING: &str = "('queued','ready','waiting_dependency','claimed',
 const INFRASTRUCTURE_FAILED: &str = "('failed','orphaned','abandoned')";
 
 /// Whether progression execution `x` failed before its driver started. The
-/// dispatcher opens a run before spawning, so `started_at` on its own is not
-/// driver evidence. A persisted run without a driver session also covers slot
-/// collisions, which do not increment the driver's pre-start failure count.
-/// Rows without a run retain their execution start stamp as the fallback.
+/// durable marker includes slot collisions without counting them in the
+/// driver's pre-start streak. Session identities are transient teardown state.
+/// Keep the start-time and pre-start-count fallbacks for older executions.
 pub(crate) fn launch_failed_sql(x: &str) -> String {
     format!(
-        "({x}.status = 'failed' AND ({x}.pre_start_failure_count > 0 OR {x}.started_at IS NULL
-          OR (EXISTS (SELECT 1 FROM work_runs lr WHERE lr.execution_id = {x}.id)
-              AND NOT EXISTS (SELECT 1 FROM work_runs lr WHERE lr.execution_id = {x}.id
-                              AND lr.progress_session_id IS NOT NULL))))"
+        "({x}.status = 'failed' AND ({x}.launch_failed = 1
+          OR {x}.pre_start_failure_count > 0 OR {x}.started_at IS NULL))"
     )
 }
 

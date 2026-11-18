@@ -1033,6 +1033,13 @@ mod floor_tests {
                 "20261113_0633_dispatch_failure_history",
                 Box::new(|c| pre_start_failure::migrate_dispatch_failure_history(c).unwrap()),
             ),
+            (
+                "20261118_0258_execution_launch_failed",
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE work_executions ADD COLUMN launch_failed INTEGER NOT NULL DEFAULT 0")
+                        .unwrap();
+                }),
+            ),
         ];
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {

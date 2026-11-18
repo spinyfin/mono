@@ -645,8 +645,22 @@ fn slot_collisions_back_off_without_filing_a_question_and_retry_after_cooldown()
                     .build(),
             )
             .unwrap();
-        fx.db
+        let (_, run) = fx
+            .db
             .start_progression_run_on_local_host(&execution.id, "progression-41", "/tmp/scratch", true)
+            .unwrap();
+        fx.db
+            .finish_execution_run(
+                boss_protocol::FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::Failed)
+                    .run_status("failed")
+                    .launch_failed(true)
+                    .error_text("slot busy")
+                    .record_last_error(true)
+                    .build(),
+            )
             .unwrap();
         fx.finish(&execution.id, "failed", None, ago, "fp", S5);
         assert_eq!(fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count, 0);
@@ -670,7 +684,7 @@ fn slot_collisions_back_off_without_filing_a_question_and_retry_after_cooldown()
 fn failed_runs_with_driver_sessions_still_file_the_infrastructure_question() {
     let fx = fx();
     let id = fx.conflicted("Driver started and died");
-    for ago in [20 * HOUR, 10 * HOUR] {
+    for (ago, error) in [(2 * HOUR, "driver error"), (HOUR, "no disposition")] {
         let execution = fx
             .db
             .create_execution(
@@ -687,11 +701,17 @@ fn failed_runs_with_driver_sessions_still_file_the_infrastructure_question() {
         fx.db
             .claim_run_progress_session_identity(&execution.id, "driver-session")
             .unwrap();
+        fx.db.clear_run_progress_session_identity(&execution.id).unwrap();
+        fx.db.fail_progression_execution(&execution.id, error).unwrap().unwrap();
         fx.finish(&execution.id, "failed", None, ago, "fp", S5);
     }
     let pass = fx.pass();
     assert_eq!((pass.minted.len(), pass.asked.len()), (0, 1), "{pass:?}");
     assert_eq!(pass.asked[0].reason, LadderReason::InfrastructureFailure);
+    let question = fx.open_question(&id).unwrap();
+    let next = fx.pass();
+    assert!(next.retracted.is_empty(), "{next:?}");
+    assert_eq!(fx.open_question(&id).unwrap().question.id, question.question.id);
     assert!(fx.db.progression_launch_backoff().unwrap().is_none());
 }
 

@@ -1451,3 +1451,24 @@ fn the_report_shows_a_dead_run_as_stuck_not_as_being_handled() {
     ));
     assert_eq!(bucket(&f.db, &id), Some(StuckBucket::ProgressionInFlight));
 }
+
+#[test]
+fn torn_down_driver_failures_count_toward_the_cap_without_launch_backoff() {
+    for session in [Some("driver-session"), None] {
+        let f = fixture();
+        let id = f.stuck_chore("Driver stopped");
+        for error in ["driver error", "no disposition"] {
+            let execution = f.execution(&id, ExecutionKind::Progression, ExecutionStatus::Ready);
+            f.db.start_progression_run_on_local_host(&execution, "progression-41", "/tmp/scratch", true)
+                .unwrap();
+            if let Some(session) = session {
+                f.db.claim_run_progress_session_identity(&execution, session).unwrap();
+            }
+            f.db.clear_run_progress_session_identity(&execution).unwrap();
+            f.db.fail_progression_execution(&execution, error).unwrap().unwrap();
+            assert!(f.db.progression_launch_backoff().unwrap().is_none());
+        }
+        assert!(f.clauses(&id).infrastructure_failing);
+        f.assert_candidate(&id, false);
+    }
+}
