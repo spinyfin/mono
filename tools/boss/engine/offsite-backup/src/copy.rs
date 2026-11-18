@@ -1,9 +1,12 @@
-//! Atomic copy of a finished backup into the per-host destination folder.
+//! Publish a finished backup into the per-host destination folder as one
+//! complete file.
 
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use boss_engine_utils::atomic_blob::write_stream_atomic;
 
 /// File-name prefix of finished backups (shared with the local backup).
 pub const BACKUP_FILE_PREFIX: &str = "state.db.bak-";
@@ -17,12 +20,11 @@ pub struct CopyOutcome {
 
 /// Copy the finished backup `src` into `host_dir` under its own file name.
 ///
-/// Streams through the shared atomic publisher's exclusive staging sibling.
-/// Retention removes crash-orphaned staging files after 24 hours.
-pub fn copy_to_offsite(src: &Path, host_dir: &Path) -> Result<CopyOutcome> {
+/// See [`copy_open_to_offsite`] for how the copy is staged and published.
+pub fn copy_to_offsite(src: &Path, host_dir: &Path, staging_dir: &Path) -> Result<CopyOutcome> {
     let name = backup_file_name(src)?;
     let source = File::open(src).with_context(|| format!("open {}", src.display()))?;
-    copy_open_to_offsite(source, name, host_dir)
+    copy_open_to_offsite(source, name, host_dir, staging_dir)
 }
 
 /// Validate that `src` names a finished backup and return its file name.
@@ -41,83 +43,231 @@ pub fn backup_file_name(src: &Path) -> Result<&str> {
 
 /// Like [`copy_to_offsite`], streaming from an already-open `source` so the
 /// copy survives the local path being pruned in the meantime.
-pub fn copy_open_to_offsite(mut source: File, name: &str, host_dir: &Path) -> Result<CopyOutcome> {
+///
+/// The destination is watched by a sync agent, which uploads whatever it
+/// finds there, including a file that is still being written. So the copy is
+/// written and fsynced in `staging_dir`, a directory outside the destination
+/// that the caller owns, and only then renamed into `host_dir`. On the same
+/// volume that rename is atomic: the agent sees one complete new file that is
+/// never modified afterwards.
+///
+/// When `staging_dir` is on a different volume, a second copy is staged
+/// outside the configured destination on its volume and renamed into place.
+///
+/// Either way the published file is checked against the copied byte count
+/// before the copy is reported as done.
+pub fn copy_open_to_offsite(mut source: File, name: &str, host_dir: &Path, staging_dir: &Path) -> Result<CopyOutcome> {
+    copy_stream_to_offsite(&mut source, name, host_dir, staging_dir)
+}
+
+fn copy_stream_to_offsite(
+    source: &mut impl Read,
+    name: &str,
+    host_dir: &Path,
+    staging_dir: &Path,
+) -> Result<CopyOutcome> {
+    let same_volume = on_same_volume(staging_dir, host_dir);
+    copy_via_route(
+        source,
+        name,
+        host_dir,
+        staging_dir,
+        same_volume,
+        &relay_candidates(host_dir),
+    )
+}
+
+/// Directories outside the synced tree that may sit on the destination's
+/// volume, tried in order when the local staging directory is not.
+pub fn relay_candidates(host_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![std::env::temp_dir().join("boss-offsite-relay")];
+    // The configured destination is the host directory's parent. Its sibling
+    // can live on an external disk even when the system temp directory cannot.
+    if let Some(parent) = host_dir.parent().and_then(Path::parent) {
+        candidates.push(parent.join(".boss-offsite-relay"));
+    }
+    // Also protect the orphan sweep from a relay symlink into the destination.
+    if let Some(destination) = host_dir.parent().and_then(|dir| dir.canonicalize().ok()) {
+        candidates.retain(|dir| !dir.canonicalize().is_ok_and(|dir| dir.starts_with(&destination)));
+    }
+    candidates
+}
+
+/// The copy itself, with the volume decision made by the caller.
+///
+/// The backup is always written and fsynced to `staging_dir` first. The
+/// publish step then either renames it into place (same volume) or relays it
+/// across volumes; see [`publish_across_volumes`].
+fn copy_via_route(
+    source: &mut impl Read,
+    name: &str,
+    host_dir: &Path,
+    staging_dir: &Path,
+    same_volume: bool,
+    relays: &[PathBuf],
+) -> Result<CopyOutcome> {
     let final_path = host_dir.join(name);
-    let bytes = boss_engine_utils::atomic_blob::write_stream_atomic(&final_path, &mut source)
+    std::fs::create_dir_all(staging_dir).with_context(|| format!("create staging dir {}", staging_dir.display()))?;
+    let bytes = publish_from_local_staging(source, &staging_dir.join(name), &final_path, same_volume, relays)
         .with_context(|| format!("copy {name} to {}", final_path.display()))?;
+    verify_published(&final_path, bytes)?;
     Ok(CopyOutcome {
         copied_path: final_path,
         bytes,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn copies_content_and_leaves_no_partial() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("state.db.bak-20260101-120000");
-        std::fs::write(&src, b"snapshot").unwrap();
-        let host = tmp.path().join("dest").join("host");
-        std::fs::create_dir_all(&host).unwrap();
-        let out = copy_to_offsite(&src, &host).unwrap();
-        assert_eq!(out.copied_path, host.join("state.db.bak-20260101-120000"));
-        assert_eq!(out.bytes, 8);
-        assert_eq!(std::fs::read(&out.copied_path).unwrap(), b"snapshot");
-        let names: Vec<_> = std::fs::read_dir(&host)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names.len(), 1, "no .partial left behind: {names:?}");
-    }
-
-    #[test]
-    fn existing_partial_is_not_used_as_staging() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("state.db.bak-20260101-120000");
-        std::fs::write(&src, b"good").unwrap();
-        let host = tmp.path().join("host");
-        std::fs::create_dir_all(&host).unwrap();
-        std::fs::write(host.join(".state.db.bak-20260101-120000.partial"), b"half").unwrap();
-        let out = copy_to_offsite(&src, &host).unwrap();
-        assert_eq!(std::fs::read(out.copied_path).unwrap(), b"good");
-        assert_eq!(
-            std::fs::read(host.join(".state.db.bak-20260101-120000.partial")).unwrap(),
-            b"half"
-        );
-    }
-
-    #[test]
-    fn failure_leaves_no_final_file_and_cleans_temp() {
-        let tmp = TempDir::new().unwrap();
-        let missing_src = tmp.path().join("state.db.bak-20260101-120000");
-        let host = tmp.path().join("host");
-        std::fs::create_dir_all(&host).unwrap();
-        assert!(copy_to_offsite(&missing_src, &host).is_err());
-        assert_eq!(std::fs::read_dir(&host).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn non_directory_destination_fails() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("state.db.bak-20260101-120000");
-        std::fs::write(&src, b"x").unwrap();
-        let blocked = tmp.path().join("blocked");
-        std::fs::write(&blocked, b"not a directory").unwrap();
-        assert!(copy_to_offsite(&src, &blocked).is_err());
-    }
-
-    #[test]
-    fn refuses_live_database_files() {
-        let tmp = TempDir::new().unwrap();
-        for name in ["state.db", "state.db-wal", "state.db-shm"] {
-            let src = tmp.path().join(name);
-            std::fs::write(&src, b"live").unwrap();
-            let err = copy_to_offsite(&src, tmp.path()).unwrap_err();
-            assert!(err.to_string().contains("refusing"), "{err}");
-        }
+/// Removes its file when dropped, so a failed attempt leaves nothing behind.
+struct Cleanup<'a>(&'a Path);
+impl Drop for Cleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
     }
 }
+
+/// Write the whole copy to `staged`, then publish it at `final_path`.
+fn publish_from_local_staging(
+    source: &mut impl Read,
+    staged: &Path,
+    final_path: &Path,
+    same_volume: bool,
+    relays: &[PathBuf],
+) -> Result<u64> {
+    publish_with_ops(
+        source,
+        staged,
+        final_path,
+        same_volume,
+        relays,
+        &mut |from, to| std::fs::rename(from, to),
+        &mut |from, to| write_stream_atomic(to, &mut File::open(from)?),
+    )
+}
+
+fn publish_with_ops(
+    source: &mut impl Read,
+    staged: &Path,
+    final_path: &Path,
+    same_volume: bool,
+    relays: &[PathBuf],
+    rename: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    relay_copy: &mut impl FnMut(&Path, &Path) -> std::io::Result<u64>,
+) -> Result<u64> {
+    let _cleanup = Cleanup(staged);
+    let bytes = write_stream_atomic(staged, source).with_context(|| format!("stage {}", staged.display()))?;
+    if same_volume {
+        match rename(staged, final_path) {
+            Ok(()) => return Ok(bytes),
+            Err(err) if is_cross_device(&err) => {
+                tracing::warn!(
+                    staged = %staged.display(),
+                    destination = %final_path.display(),
+                    "offsite backup: rename crossed devices despite matching volume ids; relaying instead"
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("move {} into the destination", staged.display()));
+            }
+        }
+    }
+    publish_across_volumes(staged, final_path, relays, rename, relay_copy)?;
+    Ok(bytes)
+}
+
+fn is_cross_device(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::CrossesDevices || err.raw_os_error() == Some(18)
+}
+
+/// Publish the already-staged `staged` into a different volume.
+///
+/// Copy to a relay outside the configured destination on its volume, then
+/// rename it in. Device IDs are only a hint: EXDEV rejects a candidate even
+/// when they match. Never stream into the destination itself.
+fn publish_across_volumes(
+    staged: &Path,
+    final_path: &Path,
+    relays: &[PathBuf],
+    rename: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    relay_copy: &mut impl FnMut(&Path, &Path) -> std::io::Result<u64>,
+) -> Result<()> {
+    let host_dir = final_path.parent().context("destination has no parent directory")?;
+    let name = final_path.file_name().context("destination has no file name")?;
+    for relay in relays {
+        if std::fs::create_dir_all(relay).is_err() || !on_same_volume(relay, host_dir) {
+            tracing::warn!(staging_dir = %relay.display(), destination = %host_dir.display(),
+                "offsite backup: relay unavailable or on another volume; trying next staging directory");
+            continue;
+        }
+        let destination = host_dir
+            .parent()
+            .context("host directory has no destination root")?
+            .canonicalize()?;
+        if relay.canonicalize()?.starts_with(&destination) {
+            tracing::warn!(staging_dir = %relay.display(), destination = %destination.display(),
+                "offsite backup: relay is inside the destination; trying next staging directory");
+            continue;
+        }
+        // Unique per attempt: concurrent copies of the same backup name must
+        // not delete or rename each other's relayed file.
+        static RELAY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = RELAY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let relayed = relay.join(format!("{}.{}-{seq}.relay", name.to_string_lossy(), std::process::id()));
+        let _cleanup = Cleanup(&relayed);
+        relay_copy(staged, &relayed).with_context(|| format!("relay {}", relayed.display()))?;
+        match rename(&relayed, final_path) {
+            Ok(()) => {
+                tracing::warn!(staging_dir = %relay.display(), destination = %host_dir.display(),
+                    "offsite backup: published through outside staging on the destination volume");
+                return Ok(());
+            }
+            Err(err) if is_cross_device(&err) => {
+                tracing::warn!(staging_dir = %relay.display(), destination = %host_dir.display(),
+                    "offsite backup: relay rename crossed devices; trying next staging directory");
+            }
+            Err(err) => return Err(err).with_context(|| format!("move {} into the destination", relayed.display())),
+        }
+    }
+    tracing::warn!(
+        staging_dirs = ?relays,
+        destination = %host_dir.display(),
+        "offsite backup: no outside staging directory can publish into the destination"
+    );
+    bail!(
+        "no outside staging directory can publish into {}; choose a destination with writable outside staging that accepts a rename",
+        host_dir.display()
+    )
+}
+
+/// Whether a rename from `staging_dir` into `host_dir` stays on one volume.
+/// Unknown is treated as "different", which selects outside relay staging.
+fn on_same_volume(staging_dir: &Path, host_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let device = |dir: &Path| std::fs::metadata(dir).map(|meta| meta.dev()).ok();
+        matches!((device(staging_dir), device(host_dir)), (Some(a), Some(b)) if a == b)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (staging_dir, host_dir);
+        false
+    }
+}
+
+/// Confirm the destination holds the complete copy under its final name.
+fn verify_published(final_path: &Path, bytes: u64) -> Result<()> {
+    let meta =
+        std::fs::metadata(final_path).with_context(|| format!("verify published copy {}", final_path.display()))?;
+    if !meta.is_file() || meta.len() != bytes {
+        bail!(
+            "published copy {} is incomplete: expected a {bytes}-byte file, found {} bytes",
+            final_path.display(),
+            meta.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "copy_tests.rs"]
+mod tests;
