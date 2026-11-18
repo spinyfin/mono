@@ -101,17 +101,29 @@ impl WorkDb {
         execution_id: &str,
         verdict: &boss_engine_storage_values::RunReconcileVerdict,
     ) -> Result<Option<WorkExecution>> {
+        self.reap_startup_dead_execution_because(
+            execution_id,
+            verdict,
+            "engine startup: recovery probe proved worker dead across restart",
+        )
+    }
+
+    /// [`Self::reap_startup_dead_execution`] with the reason recorded on the
+    /// execution, for a death verdict whose cause is more specific than the
+    /// recovery probe (a spawn that never reached tmux, for one).
+    pub fn reap_startup_dead_execution_because(
+        &self,
+        execution_id: &str,
+        verdict: &boss_engine_storage_values::RunReconcileVerdict,
+        reason: &str,
+    ) -> Result<Option<WorkExecution>> {
         if !matches!(verdict, boss_engine_storage_values::RunReconcileVerdict::Dead) {
             return Ok(None);
         }
         if let Err(error) = self.release_persona(execution_id) {
             tracing::error!(execution_id, %error, "startup reaper: could not release persona of dead worker");
         }
-        self.mark_execution_orphaned(
-            execution_id,
-            "engine startup: recovery probe proved worker dead across restart",
-        )
-        .map(Some)
+        self.mark_execution_orphaned(execution_id, reason).map(Some)
     }
 
     pub fn with_persona_metrics(mut self, registry: Arc<boss_metrics::Registry>) -> Self {

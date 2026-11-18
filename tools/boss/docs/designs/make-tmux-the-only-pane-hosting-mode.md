@@ -218,7 +218,9 @@ Deletion proceeds from process ownership outward:
 6. Remove rollout UI, CLI, event stamps, and finally `workers.tmux_hosting` itself.
 7. Sweep source, tests, and docs and land a regression check that proves there is no reachable local app-hosted spawn path.
 
-Historical local rows with null tmux columns are migration input, not a supported mode. On startup, a provably dead row is orphaned with an audit reason and redispatched through tmux. A row with a live pid or indeterminate evidence is quarantined: local dispatch pauses, an attention explains that an older app-hosted worker may still exist, and the operator rolls back to the prior release to stop/drain it before retrying the tmux-only upgrade. The new build never reattaches it, reaps it on ambiguous pid identity, or redispatches over it, and no code can spawn a new null-identity local run.
+Historical local rows with null tmux columns are migration input, not a supported mode. On startup, a provably dead row is orphaned with an audit reason and redispatched through tmux. A row with a live pid or indeterminate evidence is held: nothing else is dispatched for its work item, and an attention explains that an older app-hosted worker may still exist. The new build never reattaches it, reaps it on ambiguous pid identity, or redispatches over it.
+
+This section originally said that no code can spawn a new null-identity local run. That was false, and it caused [incident 008](../postmortems/incident-008-local-dispatch-quarantined-by-update-mid-spawn.md). The spawn path creates the run row first and writes the session identity later, immediately before it asks tmux for a session, with setup work in between. A current-era run therefore has null identity columns for that whole window. What distinguishes it from a historical row is the `tmux_hosted` stamp, which is written in the same transaction as the run row. See [Unverified local workers](#unverified-local-workers) for how the stamp is used.
 
 ### Local engine spawn and teardown implementation
 
@@ -226,21 +228,37 @@ Historical local rows with null tmux columns are migration input, not a supporte
 
 `WorkerRegistry` records the presentation slot and session name without a hosting-mode bit. Local teardown detaches the viewer and requires durable tmux identity plus token verification before signalling the worker or destroying its session. Missing identity or an unreadable probe refuses teardown. Engine shutdown preserves workers for adoption after restart.
 
-Startup establishes the historical-worker quarantine before ordinary recovery runs. It selects nonterminal executions whose latest run is local and lacks any part of the durable tmux identity: server label, session name, or spawn token. The existing `durable_liveness` process probe supplies the evidence; neither a lost workspace lease nor missing app inventory proves death.
+#### Unverified local workers
 
-| Evidence                                             | Startup behavior                                                                            |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Recorded process is gone                             | Permit orphan recovery and redispatch through tmux.                                         |
-| Recorded process is alive                            | Preserve the execution, raise attention, and pause local dispatch.                          |
-| Process evidence is unknown, including a missing pid | Apply the same quarantine as a live process.                                                |
-| Latest run was last written before the kernel booted | Proven dead regardless of pid evidence: permit orphan recovery and redispatch through tmux. |
-| Historical inventory cannot be read                  | Fail closed: pause dispatch and prevent recovery from treating unknown executions as dead.  |
+Startup judges every non-terminal execution whose latest run is local and lacks any part of the durable tmux identity (server label, session name, or spawn token), before ordinary recovery runs. Neither a lost workspace lease nor missing app inventory proves death. The run's durable columns decide the outcome:
 
-The quarantine is persisted in database metadata and checked at host selection, local spawn, orphaning, and dispatch reconciliation. A quarantined work item cannot evade the hold by dispatching remotely; unrelated remote work remains eligible when the inventory scan succeeds. A later terminal status does not clear an established hold. On restart, the engine re-probes held executions and clears each hold and its attention only after proving process death.
+| Evidence                                                                                          | Startup behavior                                                                                        |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Run is stamped `tmux_hosted`, has no identity column and no pid, and no sibling run holds a token | The spawn never reached tmux. Fail the execution with that reason and let its work item dispatch again. |
+| Recorded process is gone                                                                          | Permit orphan recovery and redispatch through tmux.                                                     |
+| Latest run was last written before the kernel booted                                              | Proven dead regardless of pid evidence: permit orphan recovery and redispatch through tmux.             |
+| Recorded process is alive                                                                         | Hold the execution and its work item, and raise attention.                                              |
+| Process evidence is unknown, including a missing pid on a run without the `tmux_hosted` stamp     | Apply the same hold as a live process.                                                                  |
+| Run inventory cannot be read                                                                      | Fail closed: pause all local dispatch and prevent recovery from treating unknown executions as dead.    |
 
-This boundary takes effect on deploy without an enablement flag. For a live or unknown historical worker, the operator must stop or drain it using the prior release and restart the tmux-only engine. Missing evidence remains a hold; the upgrade does not infer death from elapsed time or a status change. A reboot is not elapsed time: no process survives the kernel, so a run whose newest durable write (`created_at`, `started_at` or `finished_at`) falls more than an hour before the kernel's boot time is proven dead. The margin covers a wall clock that was corrected after the row was written. Without this proof a historical row that never recorded a pid could never leave the hold, and rollback cannot drain a worker nobody can name. Attention items that explain the hold are filed best-effort; a held execution whose work item was since soft-deleted keeps its hold without failing startup.
+**A spawn that never reached tmux.** The spawn records the session identity before tmux receives any command, so a stamped run with no identity and no pid stopped between run creation and that write. The engine process spawning it went away first: a restart, a crash, or an app update. No worker process ever existed, so there is nothing to protect and nothing to hold. Startup marks the execution `orphaned` with a reason that names the cause, releases its persona, and the normal recovery path queues the work item again. This verdict is taken from durable state and not from elapsed time, so machine load cannot change it. While an engine process is alive, a spawn that stalls before reporting a pid is still bounded by the existing pane-attach deadline in the liveness sweep.
 
-Regression coverage exercises tmux creation failure without app fallback, viewer attachment failure, token-verified teardown, live/dead/unknown historical rows, partial identity, persistence across restart and terminalization, remote placement, and recovery through an isolated engine. The local gate builds and tests `//...`, including the macOS app and installer, then runs `checkleft run` serially.
+**A hold covers one work item.** A held execution is never orphaned, re-driven, or redispatched over, and nothing else is dispatched for its work item, on any host. Every other work item dispatches normally, including on the local host. Only an unreadable run inventory pauses local dispatch as a whole, because the engine then cannot name which work items are affected.
+
+**A hold is re-judged on every dispatch decision.** It is persisted in database metadata so recovery sweeps that run between decisions respect it, but it is never sticky:
+
+- An execution that reaches any terminal status stops holding at once. The storage readers check the execution's current status, so cancelling a held execution releases its work item on the next dispatch decision with no rescan.
+- Before every host selection the coordinator re-probes each held execution and releases one whose process is now proven gone.
+- After an unreadable inventory, every dispatch decision retries the read, and the pause lifts when one succeeds. A read that fails while the engine is dispatching leaves the existing record as it is; only startup, which has nothing to fall back on, turns an unreadable inventory into a pause.
+- Re-judging never adds an execution to a hold that a successful scan established. An unidentified run that appears while the engine is running is a spawn in flight, which the spawn itself completes or fails.
+
+No engine restart is ever needed to lift a hold. Refusal messages and the attention item name the held execution and what releases it.
+
+**Operator surface.** `bossctl dispatch quarantine status` lists each held execution with its work item, status, evidence, and what releases it. `recheck` runs the re-judgement by hand. `clear --execution <id> --confirm` (or `--all --confirm`) releases a hold the engine cannot lift, such as a worker with no recorded pid; it refuses a hold whose recorded process is alive. All three read and write `state.db` directly, so they work with the engine down. The steps are in the [unverified local worker runbook](../runbooks/unverified-local-worker-hold.md).
+
+The kernel-boot proof exists because a reboot is not elapsed time: no process survives the kernel, so a run whose newest durable write (`created_at`, `started_at` or `finished_at`) falls more than an hour before the kernel's boot time is proven dead. The margin covers a wall clock that was corrected after the row was written. Attention items that explain a hold are filed best-effort; a held execution whose work item was since soft-deleted keeps its hold without failing startup.
+
+Regression coverage exercises tmux creation failure without app fallback, viewer attachment failure, token-verified teardown, live/dead/unknown historical rows, partial identity, a spawn that never reached tmux, release on cancellation and on proven death without a restart, unrelated work dispatching past a hold, remote placement, and recovery through an isolated engine. The local gate builds and tests `//...`, including the macOS app and installer, then runs `checkleft run` serially.
 
 ### Setting removal behavior
 

@@ -1,10 +1,13 @@
 use super::*;
 
-// The baseline keeps tmux identity nullable for remote detached runs and
-// historical local rows. Local workers without complete identity enter startup
-// quarantine until proven dead. The spawn token is an exact-match adoption key;
-// its partial unique index permits NULL rows but rejects duplicate live claims.
-// tmux_hosted is the durable stamp written before every local spawn attempt.
+// The baseline keeps tmux identity nullable for remote detached runs, for
+// historical local rows, and for a current local run between its creation and
+// the moment its spawn reaches tmux. tmux_hosted is the durable stamp written
+// with every local run row, before any spawn attempt; it is what tells that
+// last case (a spawn that has not started) from a historical row, whose
+// worker is held until proven dead. The spawn token is an exact-match
+// adoption key; its partial unique index permits NULL rows but rejects
+// duplicate live claims.
 #[path = "schema_baseline.rs"]
 mod baseline;
 
