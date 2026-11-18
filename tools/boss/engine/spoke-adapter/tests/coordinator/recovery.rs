@@ -1,6 +1,151 @@
 use super::*;
 
 #[tokio::test]
+async fn a_preserved_work_refusal_blocks_without_retrying_or_starting_a_worker() {
+    use boss_engine_recovery::execution_bookmark as recovery;
+    use boss_protocol::{CreateChoreInput, CreateExecutionInput, ExecutionKind, TaskStatus, WorkItem};
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    let task = fx
+        .db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(&env.product_id)
+                .name("Recover a rewritten PR")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let prior = fx
+        .db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task.id)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    fx.db
+        .start_execution_run(
+            &prior.id,
+            "worker",
+            "repo",
+            "old-lease",
+            "old-workspace",
+            "/old-workspace",
+        )
+        .unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET run_done_outcome = 'blocked' WHERE id = ?1",
+            [&prior.id],
+        )
+        .unwrap();
+    fx.db
+        .record_worker_failure_with_basis(
+            &prior.id,
+            "needs a decision",
+            boss_protocol::WorkerFailureBasis::DeclaredBlocked,
+        )
+        .unwrap();
+    assert!(fx.db.claim_execution_workspace_release(&prior.id, "old-lease").unwrap());
+    let head = "b".repeat(40);
+    let tip = recovery::PreservedTip {
+        change_id: "k".repeat(32),
+        commit_id: "c".repeat(40),
+        count: 1,
+    };
+    fx.db
+        .record_execution_bookmark(
+            &recovery::ExecutionBookmark::builder()
+                .execution_id(&prior.id)
+                .host_id(HOST)
+                .repo_path("/spoke/repo".into())
+                .base_commit("a".repeat(40))
+                .build(),
+        )
+        .unwrap();
+    fx.db.record_preserved_tip(&prior.id, &tip).unwrap();
+    let next = fx
+        .db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task.id)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_url = 'https://github.com/acme/widget/pull/99' WHERE id = ?1",
+            [&next.id],
+        )
+        .unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'todo', autostart = 1 WHERE id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+    let detail = format!(
+        "preserved work is not contained in PR head {head}: preserved/{} at {}; current bookmarks: destination={head}",
+        prior.id, tip.commit_id
+    );
+    let expected = detail.clone();
+    let peer = fx.spoke(Box::new(move |c| {
+        if matches!(&c.body, Some(command::Body::Workspace(op)) if op.kind == i32::from(WorkspaceKind::RestorePreserved)) {
+            let command::Body::Workspace(op) = c.body.as_ref().unwrap() else { unreachable!() };
+            let request: recovery::HostRecoveryRequest = serde_json::from_slice(&op.request_json).unwrap();
+            assert!(request.pr_bound);
+            let wire = recovery::uncontained_refusal_to_wire(&recovery::uncontained_preserved_work(&detail)).unwrap();
+            let mut result = refused(c, ResultCode::Rejected, &detail);
+            result.value = Some(workspace(c, serde_json::from_slice(&wire).unwrap()));
+            Some(result)
+        } else { answer(c) }
+    }), None, 0).await;
+    // Keep the coordinator's normal, non-empty pre-start retry delays.
+    env.coordinator.kick();
+    let settled = tokio::time::timeout(Duration::from_secs(20), async {
+        while fx.db.get_execution(&next.id).unwrap().status != ExecutionStatus::Failed {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "refusal did not settle: execution={:?}, task={:?}, commands={:?}",
+        fx.db.get_execution(&next.id).unwrap(),
+        fx.db.get_work_item(&task.id).unwrap(),
+        peer.commands()
+    );
+    let WorkItem::Chore(blocked) = fx.db.get_work_item(&task.id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(blocked.status, TaskStatus::Blocked);
+    assert_eq!(blocked.blocked_reason.as_deref(), Some("execution_recovery_failed"));
+    assert!(blocked.blocked_detail.as_deref().unwrap().contains(&expected));
+    assert!(!blocked.autostart);
+    let failed = fx.db.get_execution(&next.id).unwrap();
+    assert!(failed.dispatch_not_before.is_none(), "no queued retry: {failed:?}");
+    assert_eq!(fx.db.list_executions(None).unwrap().len(), 2);
+    // Another scheduler pass cannot retry the refused recovery.
+    env.coordinator.kick();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let commands = peer.commands();
+    assert_eq!(commands.iter().filter(|c| matches!(&c.body, Some(command::Body::Workspace(op)) if op.kind == i32::from(WorkspaceKind::RestorePreserved))).count(), 1);
+    assert!(!commands.iter().any(|c| matches!(c.body, Some(command::Body::Spawn(_)))));
+    env.coordinator.abort_driving_runs();
+}
+
+#[tokio::test]
 async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
     for shape in ["unknown", "indeterminate", "late_ok", "unconfirmed_stop"] {
         let fx = Fixture::with(short(300)).await;

@@ -1576,8 +1576,11 @@ mod validation {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing recovery bookmark"))?;
             bookmark(value, &op.repo_id)?;
+            // A successor restores its predecessor's preserved work into its
+            // own lease; the source bookmark therefore names the prior run.
+            // All other operations act on the assignment's own pointers.
             ensure!(
-                value.execution_id == run.expect("validated assignment").execution_id,
+                kind == Kind::RestorePreserved || value.execution_id == run.expect("validated assignment").execution_id,
                 "bookmark belongs to another execution"
             );
             allowed.bookmark.clone_from(&op.bookmark);

@@ -227,9 +227,9 @@ async fn uncontained_preserved_work_after_a_sibling_rebase_starts_no_worker() {
         &["bookmark", "set", "main", "-r", "@", "--allow-backwards"],
     );
     JjRepo::run(&repo.replacement, &["new", "main", "-m", "PR change"]);
-    std::fs::write(repo.replacement.join("feature.txt"), "feature\n").unwrap();
+    std::fs::write(repo.replacement.join("feature.txt"), "feature\nsibling feature\n").unwrap();
     JjRepo::run(&repo.replacement, &["new", "-m", "Revision work"]);
-    std::fs::write(repo.replacement.join("src.txt"), "revision\n").unwrap();
+    std::fs::write(repo.replacement.join("src.txt"), "revision\nsibling revision\n").unwrap();
     JjRepo::run(&repo.replacement, &["new", "-m", "Regenerate lockfile"]);
     std::fs::write(repo.replacement.join("deps.lock"), "one\nthree\n").unwrap();
     JjRepo::run(
@@ -249,10 +249,12 @@ async fn uncontained_preserved_work_after_a_sibling_rebase_starts_no_worker() {
         position_real_workspace: true,
         ..FakeCubeClient::default()
     });
-    let coordinator = Arc::new(
-        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner.clone())
-            .with_pre_start_retry_delays(Vec::new()),
-    );
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube,
+        runner.clone(),
+    ));
     let worker = coordinator
         .pool_for_execution_for_test(&next)
         .claim_worker(&next.id, None)

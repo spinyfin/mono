@@ -262,8 +262,26 @@ async fn a_single_partly_contained_conflicting_commit_on_a_pr_is_refused() {
     let saved = teardown(&repo, &record).await;
     let original_tip = saved.commit_id.clone();
     sibling_rebase(&repo, "one\nthree\n");
+    // Every touched file differs from the preserved tip, even though the
+    // sibling retained the source hunks and added more work in those files.
+    std::fs::write(repo.replacement.join("feature.txt"), "feature\nsibling feature\n").unwrap();
+    std::fs::write(repo.replacement.join("src.txt"), "revision\nsibling revision\n").unwrap();
+    publish(&repo, &repo.replacement, PR);
+    JjRepo::run(&repo.replacement, &["new", PR]);
     let positioned = log(&repo.replacement, "@", "commit_id");
     let head = log(&repo.replacement, "@-", "commit_id");
+    let differing = JjRepo::run(
+        &repo.replacement,
+        &["diff", "--from", &head, "--to", &original_tip, "--name-only"],
+    );
+    for path in ["feature.txt", "src.txt", "deps.lock"] {
+        assert!(
+            differing
+                .lines()
+                .any(|line| Path::new(line).file_name() == Some(std::ffi::OsStr::new(path))),
+            "{differing}"
+        );
+    }
 
     let err = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
@@ -313,12 +331,34 @@ async fn a_refusal_puts_back_names_on_descendants_of_the_rebased_work() {
     let repo = fixture(dir.path());
     let record = first_run(&repo, "exec_refusal_names", false, false).await;
     let saved = teardown(&repo, &record).await;
+    // Track a remote behind the local name; the remote must never overwrite
+    // the local target while undoing the restage.
+    JjRepo::run(&repo.worker, &["bookmark", "set", "variant-marker", "-r", "main"]);
+    JjRepo::run(&repo.worker, &["git", "export"]);
+    JjRepo::run(&repo.repo, &["git", "fetch", "--branch", "variant-marker"]);
+    JjRepo::run(&repo.worker, &["bookmark", "track", "variant-marker@origin"]);
     // A variant name on a commit that shares an ancestor with the tip.
     JjRepo::run(
         &repo.worker,
         &["bookmark", "set", "variant-marker", "-r", "@", "--allow-backwards"],
     );
     let before = log(&repo.worker, "variant-marker", "commit_id");
+    let remote_before = log(&repo.worker, "variant-marker@origin", "commit_id");
+    assert_ne!(before, remote_before);
+    let listing = JjRepo::run(
+        &repo.worker,
+        &[
+            "bookmark",
+            "list",
+            "variant-marker",
+            "-T",
+            "name ++ \" remote=\" ++ remote ++ \" \" ++ normal_target.commit_id() ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        listing.contains(&remote_before) && listing.contains(&before),
+        "{listing}"
+    );
     sibling_rebase(&repo, "one\nthree\n");
     let head = log(&repo.replacement, "@-", "commit_id");
 
@@ -331,6 +371,10 @@ async fn a_refusal_puts_back_names_on_descendants_of_the_rebased_work() {
         log(&repo.replacement, "variant-marker", "commit_id"),
         before,
         "a name the rebase carried along is back on its original commit"
+    );
+    assert_eq!(
+        log(&repo.replacement, "variant-marker@origin", "commit_id"),
+        remote_before
     );
     let restaged = log(
         &repo.replacement,

@@ -224,6 +224,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executor_encodes_an_uncontained_restore_as_a_definitive_refusal() {
+        use boss_engine_test_git::jj::JjRepo;
+        let root = tempfile::tempdir().unwrap();
+        let repo = JjRepo::with_origin(root.path());
+        JjRepo::run(&repo.repo, &["git", "fetch"]);
+        let cube = Cube::new(root.path());
+        *cube.owner.lock().unwrap() = Some(workspace::lease_owner(&run()));
+        let executor = workspace::Executor {
+            cube,
+            host_id: "host".into(),
+        };
+        let created = executor.execute(&command(op(Kind::CreateBookmark)), false, 1).await;
+        assert_eq!(created.code, v1::ResultCode::Ok as i32, "{}", created.reason);
+        let Some(command_result::Value::Workspace(created)) = created.value else {
+            panic!("missing bookmark")
+        };
+        std::fs::write(repo.worker.join("work.txt"), "preserved\n").unwrap();
+        let mut confirm = op(Kind::ConfirmRecovery);
+        confirm.bookmark = created.bookmark.clone();
+        confirm.request_json = payload(&HostRecoveryRequest::default());
+        let confirmed = executor.execute(&command(confirm), false, 1).await;
+        assert_eq!(confirmed.code, v1::ResultCode::Ok as i32, "{}", confirmed.reason);
+        let Some(command_result::Value::Workspace(confirmed)) = confirmed.value else {
+            panic!("missing preserved outcome")
+        };
+        let outcome: recovery::PreserveOutcome = serde_json::from_slice(&confirmed.cube_result_json).unwrap();
+        let tip = outcome.tip.expect("preserved work");
+        JjRepo::run(&repo.worker, &["new", "main", "-m", "Changed PR head"]);
+        std::fs::write(repo.worker.join("work.txt"), "sibling\n").unwrap();
+        let head = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+        JjRepo::run(&repo.worker, &["new"]);
+        let mut restore = op(Kind::RestorePreserved);
+        restore.bookmark = created.bookmark;
+        restore.request_json = payload(&HostRecoveryRequest {
+            recorded: Some(tip.clone()),
+            pr_bound: true,
+            ..Default::default()
+        });
+        let successor = v1::Run {
+            execution_id: "exec_successor".into(),
+            ..run()
+        };
+        *executor.cube.owner.lock().unwrap() = Some(workspace::lease_owner(&successor));
+        let mut restore_command = command(restore);
+        restore_command.run = Some(successor);
+        // Only restoration may consume a predecessor's bookmark; confirming
+        // preservation still requires the assignment's own execution.
+        let mut foreign_confirm = restore_command.clone();
+        let Some(v1::command::Body::Workspace(op)) = foreign_confirm.body.as_mut() else {
+            unreachable!()
+        };
+        op.kind = Kind::ConfirmRecovery.into();
+        let rejected = executor.execute(&foreign_confirm, false, 1).await;
+        assert_eq!(rejected.code, v1::ResultCode::Rejected as i32);
+        assert!(
+            rejected.reason.contains("bookmark belongs to another execution"),
+            "{}",
+            rejected.reason
+        );
+        let refused = executor.execute(&restore_command, false, 1).await;
+        assert_eq!(refused.code, v1::ResultCode::Rejected as i32, "{}", refused.reason);
+        let Some(command_result::Value::Workspace(refused)) = refused.value else {
+            panic!("missing typed refusal")
+        };
+        let error = recovery::uncontained_refusal_from_wire(&refused.cube_result_json).expect("typed refusal payload");
+        assert!(recovery::is_uncontained_preserved_work(&error));
+        let detail = format!("{error:#}");
+        assert!(detail.contains(&head) && detail.contains(&tip.commit_id), "{detail}");
+    }
+
+    #[tokio::test]
     async fn executor_positions_confirms_and_restores_through_the_wire_kinds() {
         let root = tempfile::tempdir().unwrap();
         let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
