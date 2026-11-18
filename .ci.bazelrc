@@ -62,6 +62,32 @@ build:ci-darwin --xcode_version=27.2.0.27B52
 common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-27.2.0.app/Contents/Developer
 
 # ==========================================
+# SMALLER BINARIES FOR VERIFICATION BUILDS
+# ==========================================
+# Selected by bazel_verify_only in .buildkite/steps/ci-env.sh, i.e. only by
+# commands that build or test for their pass/fail result. Never selected by a
+# release build, whose binaries ship and keep their symbols.
+#
+# Rust executables and test binaries are by far the largest artifacts a CI
+# build uploads to the remote cache. They carry no DWARF in a fastbuild (rules_rust
+# already compiles with debuginfo=0 there); the weight is the symbol table:
+# Rust mangled names are long, and every generic instantiation is an exported
+# symbol. Linking with -Cstrip=symbols drops it, which takes 40-50% off each
+# macOS binary (see the pull request that added this for a size table).
+#
+# What is lost: function names in a panic backtrace from a CI run. The panic
+# message and its file:line:column are unaffected, since they are compiled
+# into the binary as data. To get a symbolised backtrace, re-run the test
+# locally, where this config is not selected.
+#
+# The flag is part of every target-configuration rustc action's cache key,
+# including rlib compiles whose output it does not change, so CI's verify-only
+# Rust actions are no longer shared with local builds or release builds. They
+# still share among CI steps. Exec-configuration tools (proc macros, build
+# scripts) are not re-keyed: they use extra_exec_rustc_flag.
+build:ci-strip --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
+
+# ==========================================
 # REMOTE EXECUTION (macOS)
 # ==========================================
 # Selected by .buildkite/steps/ci-env.sh, after --config=ci-darwin, together

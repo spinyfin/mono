@@ -158,10 +158,16 @@ bazel() {
 # pass/fail result. Adds CI_BAZEL_VERIFY_ONLY_FLAGS (see above) after the CI
 # flags. Do not use it for a build whose output is then executed, uploaded or
 # inspected -- on a remotely executing step that file will not be on the agent.
+#
+# It also selects --config=ci-strip (see .ci.bazelrc): nothing run through here
+# ships or is debugged from its binaries, so Rust executables and test binaries
+# are linked without symbol tables, which roughly halves what each one adds to
+# the remote cache. Release builds do not go through this function and keep
+# their symbols.
 bazel_verify_only() {
   local subcommand="$1"
   shift
-  bazel "$subcommand" $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
+  bazel "$subcommand" --config=ci-strip $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
 }
 
 # Shared by the release step scripts (checkleft-release.sh, release-release.sh)
