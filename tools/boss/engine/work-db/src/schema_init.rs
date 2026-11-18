@@ -985,6 +985,10 @@ mod floor_tests {
                 Box::new(|c| super::super::spoke_hub::migrate_host_commands_run_idx(c).unwrap()),
             ),
             (
+                super::super::host_load_db::MIGRATION_ID,
+                Box::new(|c| super::super::host_load_db::migrate(c).unwrap()),
+            ),
+            (
                 super::super::spoke_hub::LEGACY_DESTINATION_MIGRATION_ID,
                 Box::new(|c| super::super::spoke_hub::migrate_legacy_destinations(c).unwrap()),
             ),

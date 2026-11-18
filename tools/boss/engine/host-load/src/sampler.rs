@@ -2,8 +2,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::HostSample;
 use crate::probe::{CpuTicks, HostProbe, ProbeError, VmReading};
-use crate::sample::HostSample;
 
 /// CPU time split over one sampling interval, each in `0.0..=100.0`.
 #[derive(Debug, Clone, Copy, PartialEq)]

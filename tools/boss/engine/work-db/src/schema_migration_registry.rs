@@ -398,14 +398,14 @@ pub(super) fn all() -> Vec<Migration> {
             apply: spoke_hub::migrate_host_commands_run_idx,
         },
         Migration {
-            id: spoke_hub::LEGACY_DESTINATION_MIGRATION_ID.into(),
-            legacy_version: None,
-            apply: spoke_hub::migrate_legacy_destinations,
-        },
-        Migration {
             id: host_load_db::MIGRATION_ID.into(),
             legacy_version: None,
             apply: host_load_db::migrate,
+        },
+        Migration {
+            id: spoke_hub::LEGACY_DESTINATION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: spoke_hub::migrate_legacy_destinations,
         },
         Migration {
             id: legacy_store_cleanup::MIGRATION_ID.into(),

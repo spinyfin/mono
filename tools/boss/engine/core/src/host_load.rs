@@ -22,10 +22,8 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use boss_engine_host_load::{
-    DEFAULT_INTERVAL_SECONDS, DEFAULT_RETENTION_DAYS, LoopConfig, SampleObserver, SampleStore, platform_probe,
-    spawn_sampler,
+    DEFAULT_INTERVAL_SECONDS, DEFAULT_RETENTION_DAYS, LoopConfig, SampleObserver, platform_probe, spawn_sampler,
 };
 use tokio::task::JoinHandle;
 
@@ -202,6 +200,8 @@ pub fn spawn(registry: Arc<Registry>, work_db: Arc<WorkDb>, settings: &SettingsS
 
 #[cfg(test)]
 mod tests {
+    use boss_engine_host_load::SampleStore;
+
     use super::*;
 
     #[test]
