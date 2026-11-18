@@ -103,6 +103,17 @@ pub struct WorkerSetupInput {
     /// Ignored for every other worker kind.
     #[builder(default)]
     pub checkout_positioned_on_pr_head: bool,
+    /// Mirrors the `pr_created_proposals_seam` feature flag (composed with
+    /// the `worker_proposals` master flag) — gates the `boss propose
+    /// pr-created` teaching alongside the printed-URL line in the
+    /// standard-worker branch of [`render_claude_md`]. Ignored for
+    /// [`WorkerKind::Triage`] / [`WorkerKind::Reviewer`] /
+    /// [`WorkerKind::AnswerAgent`] workers, which never reach that branch.
+    /// The caller must pass the same value used to render this execution's
+    /// prompt so the preamble and CLAUDE.md never disagree about which
+    /// PR-declaration mechanism is live.
+    #[builder(default)]
+    pub pr_created_proposals_seam_enabled: bool,
 }
 
 /// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
@@ -200,6 +211,23 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
     } else {
         "If another PR must land first, report the dependency using the blocker channel below.".into()
     };
+    let execution_can_declare_created_pr = matches!(
+        input.execution_kind.as_str(),
+        "task_implementation" | "chore_implementation" | "project_design" | "investigation_implementation"
+    );
+    let declare_pr_directive = if input.pr_created_proposals_seam_enabled && execution_can_declare_created_pr {
+        format!(
+            "- Your terminal action after opening or updating a PR is `{boss} propose pr-created --url \
+             <the PR URL>` (add `--branch <branch-name>` when useful for verification). Submission is\n\
+             synchronous and validated immediately — a malformed URL or a URL from the wrong repo fails\n\
+             right away with a typed error you can fix and retry, unlike a printed line the engine only\n\
+             reads long after you've moved on.\n\
+             - Also print the PR URL on its own line as the last thing in your final response — kept as\n\
+               human-readable redundancy alongside the `propose` call.\n"
+        )
+    } else {
+        "- Print the PR URL on its own line as the last thing in your final response.\n".to_string()
+    };
     let revision_blocked_sentence = if input.worker_signal_proposals_seam_enabled {
         format!(
             "If a guard, policy, or decision blocks progress, use `{boss} propose blocked --reason \"<specific question>\"` instead of declaring you could not complete."
@@ -250,7 +278,7 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
            corrupts any body that contains inline code. Always write the body to\n\
            a file and use `--body-file` (see the recipe below).\n\
-         - Print the PR URL on its own line as the last thing in your final response.\n\
+         {declare_pr_directive}\
          - Confirm the published PR contains your commit with `gh pr view` and\n\
            its head SHA; pass `-R owner/repo` in a jj workspace (resolve the slug\n\
            from the PR URL or `jj git remote`).\n\

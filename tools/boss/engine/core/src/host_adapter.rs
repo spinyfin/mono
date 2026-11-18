@@ -1091,7 +1091,8 @@ impl HostAdapter for SshHostAdapter {
             // `false` applies — regardless of the engine's own (local) read
             // of `worker_signal_proposals_seam` /
             // `deferred_scope_proposals_seam` / `followup_proposals_seam` /
-            // `automation_outcome_proposals_seam` — the remote worker always
+            // `automation_outcome_proposals_seam` / `pr_created_proposals_seam`
+            // — the remote worker always
             // gets the legacy marker/artifact text, even when the engine's
             // read path is proposals-first. That marker/artifact then
             // always counts as a fallback hit in

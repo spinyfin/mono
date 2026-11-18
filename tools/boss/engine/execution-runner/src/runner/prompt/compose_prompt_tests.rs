@@ -13,6 +13,8 @@ mod blocked_recovery;
 mod invocation;
 #[path = "compose_prompt_tests/non_bazel_gate.rs"]
 mod non_bazel_gate;
+#[path = "compose_prompt_tests/pr_created_seam.rs"]
+mod pr_created_seam;
 #[path = "compose_prompt_tests/prepush_rebase.rs"]
 mod prepush_rebase;
 #[path = "compose_prompt_tests/revision_rebase.rs"]

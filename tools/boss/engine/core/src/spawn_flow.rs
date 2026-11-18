@@ -682,6 +682,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .automation_outcome_proposals_seam_enabled(input.automation_outcome_proposals_seam_enabled)
         .run_done_proposals_seam_enabled(input.run_done_proposals_seam_enabled)
         .worker_signal_proposals_seam_enabled(input.worker_signal_proposals_seam_enabled)
+        .pr_created_proposals_seam_enabled(input.pr_created_proposals_seam_enabled)
         .is_review_supervisor(input.is_review_supervisor)
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
@@ -1084,6 +1085,7 @@ mod tests {
             is_review_supervisor: false,
             is_post_merge_reviewer: false,
             checkout_positioned_on_pr_head: false,
+            pr_created_proposals_seam_enabled: false,
             live_metadata: Default::default(),
         }
     }

@@ -20,6 +20,8 @@ mod block_boundary;
 mod ci_monitoring;
 #[path = "prompt/design.rs"]
 mod design;
+#[path = "prompt/pr_terminal.rs"]
+mod pr_terminal;
 #[path = "prompt/repo_gate.rs"]
 mod repo_gate;
 #[path = "prompt/revision_rebase.rs"]
@@ -27,6 +29,7 @@ mod revision_rebase;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
+use pr_terminal::pr_terminal_directive;
 pub(super) use revision_rebase::revision_conflict_notice;
 
 #[derive(bon::Builder)]
@@ -113,6 +116,15 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// durable stamp regardless of the flag.
     #[builder(default)]
     run_done_proposals_seam_enabled: bool,
+    /// Whether `pr_created_proposals_seam` is on — gates the worker-facing
+    /// prompt half of the PR-created-declaration seam: [`pr_terminal_directive`]
+    /// teaches `propose pr-created` after a successful PR push, alongside the
+    /// printed-URL line. `false` reproduces the pre-migration printed-URL-only
+    /// text. The engine's `finalize_pr_transition` fallback-hit counter is
+    /// gated by the same flag; gating the prompt too is what makes "flag off"
+    /// restore today's behavior exactly, prompt included.
+    #[builder(default)]
+    pr_created_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
     /// must preserve (rendered lines). Empty for non-conflict revisions and
     /// for conflict revisions with no merged overlap partner.
@@ -227,6 +239,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         deferred_scope_proposals_seam_enabled,
         followup_proposals_seam_enabled,
         run_done_proposals_seam_enabled,
+        pr_created_proposals_seam_enabled,
         merge_order_preservation,
         bazel_workspace,
         remote_workspace,
@@ -508,10 +521,19 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         prompt.push_str(&format!(
             "- Record the PR URL in `{pr_url_artifact}` as `{{\"pr_url\": \"<the url>\"}}` (also exported as `$BOSS_PR_URL_OUTPUT`). This external artifact is the engine's primary URL channel; the final-response URL in the generated rules is its fallback.\n",
         ));
+        if pr_created_proposals_seam_enabled {
+            let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+            prompt.push_str(&format!(
+                "- After opening or updating the PR, submit `{boss} propose pr-created --url <the PR URL>` (add `--branch <branch-name>` when useful for verification). Submission is synchronous and validated immediately.\n",
+            ));
+        }
         // Warn that PR creation is terminal — the engine reaps the worker
         // immediately after the PR is opened. Workers must finish everything
         // BEFORE opening the PR; no followup turn is possible.
-        prompt.push_str(&pr_terminal_directive(run_done_proposals_seam_enabled));
+        prompt.push_str(&pr_terminal_directive(
+            run_done_proposals_seam_enabled,
+            pr_created_proposals_seam_enabled,
+        ));
         // Issue #899: hand the worker the engine's CI-completion definition
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
@@ -905,41 +927,6 @@ fn render_editorial_rules_block(
 
     out.push_str("[/editorial-rules]\n");
     out
-}
-
-/// Directive that warns workers PR creation is terminal: the engine reaps
-/// them immediately after the PR is opened. No followup turn is possible.
-/// Workers must finish all work — including consuming any in-flight reviews
-/// they started — BEFORE opening the PR. Incident: a worker opened a PR,
-/// then tried to wait for background review subagents and address their
-/// findings as followup commits. The engine terminated the worker the moment
-/// the PR was created, so the review was never consumed. This universal
-/// guidance applies to every execution kind and prevents that pattern.
-///
-/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done_directive`]'s
-/// declaration — not PR creation — is the act that is ALWAYS terminal:
-/// `boss propose done` ends the run synchronously the instant it is accepted
-/// (`completion::run_done_declaration` finalizes it at submit, no Stop
-/// boundary needed). The push must come first and the declaration last — the
-/// reverse of the ordering this block taught before declarations existed,
-/// when the push was the only thing that could reap a worker. Getting this
-/// backwards now would kill the worker's pane before it ever reaches `cube
-/// pr create`.
-fn pr_terminal_directive(seam_enabled: bool) -> String {
-    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
-    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
-    let terminal = if seam_enabled {
-        format!(
-            "## Important: declaring done is your terminal act\nFinish everything, open or update the PR with `{cube} pr create` / `{cube} pr update`, then call `{boss} propose done` as your last tool call. An accepted declaration ends the run immediately, before you see its response; PR creation/update still gives you a turn to declare. Never declare before pushing.\n"
-        )
-    } else {
-        format!(
-            "## Important: PR creation is your terminal act\nOpening the PR is the LAST thing you do. You will NOT get another turn after `{cube} pr create` or `{cube} pr update`: the engine reaps you immediately.\n"
-        )
-    };
-    format!(
-        "\n{terminal}Do not plan followup commits or defer work until after the PR: do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result. Consume review/self-review findings and address them before publishing. If you don't intend to wait for a review, don't start it.\n"
-    )
 }
 
 /// Worker Stop-boundary escalation/blocker protocol directive. `seam_enabled`
