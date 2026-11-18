@@ -1144,15 +1144,9 @@ impl ExecutionCoordinator {
                 // A global refusal carries the host exclusions it saw so a
                 // reader of the stream (`bossctl dispatch diagnose`, the
                 // engine's restart replay) follows the live record exactly.
-                let global_exclusions = err
-                    .downcast_ref::<HostSelectionFailure>()
-                    .and_then(|failure| failure.global_exclusions.clone());
-                let refusal_details = match &global_exclusions {
-                    Some(exclusions) => serde_json::json!({
-                        "reason": "no_eligible_host",
-                        "global_outage": true,
-                        "host_exclusions": exclusions,
-                    }),
+                let global_refusal = self.fold_dispatch_refusal(execution, &err);
+                let refusal_details = match &global_refusal {
+                    Some(refusal) => refusal.refusal_details(),
                     None => serde_json::json!({ "reason": "no_eligible_host" }),
                 };
                 self.dispatch_events
@@ -1164,7 +1158,9 @@ impl ExecutionCoordinator {
                             .with_details(refusal_details),
                     )
                     .await;
-                self.record_dispatch_refusal(execution, &err).await;
+                if let Some(refusal) = &global_refusal {
+                    self.announce_dispatch_outage(refusal).await;
+                }
                 if had_requested_host {
                     return Err(err);
                 }

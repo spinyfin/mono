@@ -576,16 +576,24 @@ impl ExecutionCoordinator {
             self.validate_requested_host(&input.work_item_id, &host_id)?;
         }
         let requested_host_id = input.requested_host_id.clone();
+        let work_item_id = input.work_item_id.clone();
         // The store asks about one run at most: the started run that governs
         // this work item. Answering "no worker" is what makes it stale.
         let mut judged_stale = None;
-        let execution = self.work_db.request_execution_with_live_check(input, |id| {
-            let live = has_worker(id);
-            if !live {
-                judged_stale = Some(id.to_owned());
-            }
-            live
-        })?;
+        let execution = self
+            .work_db
+            .request_execution_with_live_check(input, |id| {
+                let live = has_worker(id);
+                if !live {
+                    judged_stale = Some(id.to_owned());
+                }
+                live
+            })
+            .inspect_err(|_| {
+                // A failed startup worker scan holds every item, so this
+                // refusal is a global outage, not one item's problem.
+                self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+            })?;
         if let Some(stale) = judged_stale {
             self.release_abandoned_run(&stale);
         }

@@ -469,3 +469,102 @@ async fn dispatch_outage_start_and_recovery_push_engine_health_to_a_running_app(
         "a launch must clear the banner issue: {cleared:?}"
     );
 }
+
+/// One global refusal as the engine writes it: a `host_selected` error that
+/// names the outage it joined.
+fn outage_refusal_event(
+    item: &str,
+    outage_started_epoch_s: i64,
+    at_epoch_s: i64,
+) -> boss_dispatch_events::DispatchEvent {
+    use boss_dispatch_events::{DispatchEvent, Outcome, Stage};
+    let mut event = DispatchEvent::new(Stage::HostSelected, Outcome::Error, format!("exec_{item}"))
+        .with_work_item(item)
+        .with_details(serde_json::json!({
+            "reason": "no_eligible_host",
+            "global_outage": true,
+            "outage_started_epoch_s": outage_started_epoch_s,
+            "host_exclusions": dispatch_outage_exclusions(),
+        }));
+    event.ts_epoch_ms = u128::try_from(at_epoch_s).unwrap() * 1000;
+    event
+}
+
+/// Write an outage that began at `started` to the engine's own dispatch
+/// event stream: two refusals (one of them out of order, before the start
+/// event) for two items.
+async fn seed_outage_in_event_stream(state: &Arc<ServerState>, started: i64) {
+    use boss_dispatch_events::{DispatchEvent, DispatchEventSink, JsonlFileSink, Outcome, Stage};
+    let sink = JsonlFileSink::new(state.dispatch_event_root.clone());
+    sink.emit(outage_refusal_event("task_1", started, started)).await;
+    sink.emit(outage_refusal_event("task_2", started, started)).await;
+    let mut start = DispatchEvent::new(Stage::DispatchOutageStarted, Outcome::Error, "engine")
+        .with_work_item("task_1")
+        .with_details(serde_json::json!({
+            "started_epoch_s": started,
+            "triggering_execution_id": "exec_task_1",
+            "host_exclusions": dispatch_outage_exclusions(),
+        }));
+    start.ts_epoch_ms = u128::try_from(started).unwrap() * 1000;
+    sink.emit(start).await;
+}
+
+/// The production startup restore, end to end: an outage written to the
+/// event stream by a previous engine comes back with its original start and
+/// counters, shows in the health report, deduplicates retries of items it
+/// already counted, and ends on the first new claim.
+#[tokio::test]
+async fn a_restarted_engine_restores_the_outage_and_ends_it_on_the_first_claim() {
+    let (state, _dir) = test_server_state();
+    let started = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
+    seed_outage_in_event_stream(&state, started).await;
+
+    state.restore_dispatch_outage().await;
+
+    let report = build_engine_health_report(&state);
+    let outage = report.dispatch_outage.as_ref().expect("the outage is restored");
+    assert_eq!(
+        outage.started_epoch_s, started,
+        "the original start survives the restart"
+    );
+    assert_eq!(outage.refused_attempts, 2);
+    assert_eq!(outage.refused_work_items, 2);
+    assert_eq!(
+        report.issues[0].kind,
+        boss_execution_contracts::DISPATCH_OUTAGE_ISSUE_KIND
+    );
+
+    // A retry of an item the previous process already counted is one more
+    // attempt, not a third item; a new item is counted.
+    let tracker = state.execution_coordinator.dispatch_outage();
+    tracker.record_refusal(dispatch_outage_exclusions(), "task_2", "exec_task_2", started + 700);
+    let outage = tracker.active().unwrap();
+    assert_eq!((outage.refused_attempts, outage.refused_work_items), (3, 2));
+    tracker.record_refusal(dispatch_outage_exclusions(), "task_3", "exec_task_3", started + 710);
+    assert_eq!(tracker.active().unwrap().refused_work_items, 3);
+
+    let resolved = tracker.record_claim(started + 800).expect("the first claim ends it");
+    assert_eq!(resolved.duration_secs, 800);
+    assert_eq!(resolved.outage.refused_attempts, 4);
+    assert_eq!(build_engine_health_report(&state).dispatch_outage, None);
+}
+
+/// A claim that lands while the restore is still reading the stream already
+/// ended the pre-restart outage; the restore must not bring it back.
+#[tokio::test]
+async fn a_restore_that_loses_the_race_to_a_claim_does_not_revive_the_outage() {
+    let (state, _dir) = test_server_state();
+    let started = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
+    seed_outage_in_event_stream(&state, started).await;
+
+    let tracker = state.execution_coordinator.dispatch_outage();
+    assert_eq!(
+        tracker.record_claim(started + 601),
+        None,
+        "no outage in memory to end yet"
+    );
+    state.restore_dispatch_outage().await;
+
+    assert_eq!(tracker.active(), None);
+    assert_eq!(build_engine_health_report(&state).dispatch_outage, None);
+}

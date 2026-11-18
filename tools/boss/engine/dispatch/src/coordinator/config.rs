@@ -1205,6 +1205,14 @@ impl ExecutionCoordinator {
         &self.pre_start_streaks
     }
 
+    /// After startup reconcile: a failed startup worker scan holds every work
+    /// item, which reconcile skips silently, so report the active work it is
+    /// keeping from dispatching as a global dispatch outage. No-op without a
+    /// scan error.
+    pub fn note_startup_scan_hold(&self) {
+        self.note_scan_error_hold_blocking_active_work();
+    }
+
     /// The global dispatch outage record. The engine health report reads the
     /// active outage and `ServerState::spawn_dispatch_outage_health_broadcaster`
     /// subscribes to its changes.

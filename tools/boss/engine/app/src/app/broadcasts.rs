@@ -414,6 +414,39 @@ impl ServerState {
         })
     }
 
+    /// Rebuild the in-memory dispatch outage record from the dispatch event
+    /// stream, so an outage in progress when the engine stopped keeps its
+    /// start time and counters until a new dispatch claims a host. Called once
+    /// at startup, before anything that can claim a host; the tracker drops
+    /// the restore if a claim got there first.
+    pub(crate) async fn restore_dispatch_outage(&self) {
+        let root = self.dispatch_event_root.clone();
+        let replay = tokio::task::spawn_blocking(move || {
+            boss_dispatch_reader::read_current(&root)
+                .map(|read| boss_execution_contracts::replay_outage_events(&read.events))
+        })
+        .await;
+        match replay {
+            Ok(Ok(replay)) => {
+                if let Some(active) = replay.active {
+                    tracing::warn!(
+                        started_epoch_s = active.started_epoch_s,
+                        refused_attempts = active.refused_attempts,
+                        "dispatch outage was in progress when the engine stopped; restoring it",
+                    );
+                    self.execution_coordinator
+                        .dispatch_outage()
+                        .restore(active, replay.refused_work_items);
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(error = %format!("{err:#}"), "could not read the dispatch event stream to restore an in-progress dispatch outage");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "dispatch outage restore task failed");
+            }
+        }
+    }
     /// Push a fresh engine-health snapshot when a global dispatch outage
     /// starts, ends or changes its host exclusions, and every minute while
     /// one lasts so the banner's duration and refusal counts stay current.

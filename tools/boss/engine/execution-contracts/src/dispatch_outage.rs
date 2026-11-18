@@ -22,6 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use boss_dispatch_events::DispatchEvent;
 use boss_engine_storage_values::Host;
@@ -183,7 +184,20 @@ impl Active {
 /// The engine's single global-outage record.
 pub struct DispatchOutageTracker {
     active: Mutex<Option<Active>>,
+    /// Set by the first claim this process records. A restore of a pre-restart
+    /// outage that lands after it is stale: the claim already ended it.
+    claimed_since_start: AtomicBool,
     changed: tokio::sync::watch::Sender<u64>,
+}
+
+/// What recording one refusal did, and which outage it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedRefusal {
+    pub effect: RefusalEffect,
+    /// Start of the outage this refusal is part of. Stamped on the refusal's
+    /// own event so a replay attributes it to the right outage whatever order
+    /// concurrent dispatchers wrote their events in.
+    pub outage_started_epoch_s: i64,
 }
 
 impl Default for DispatchOutageTracker {
@@ -196,6 +210,7 @@ impl DispatchOutageTracker {
     pub fn new() -> Self {
         Self {
             active: Mutex::new(None),
+            claimed_since_start: AtomicBool::new(false),
             changed: tokio::sync::watch::channel(0).0,
         }
     }
@@ -212,51 +227,76 @@ impl DispatchOutageTracker {
         execution_id: &str,
         now_epoch_secs: i64,
     ) -> RefusalEffect {
-        let (effect, notify) = {
+        self.fold_refusal(exclusions, work_item_id, execution_id, now_epoch_secs)
+            .effect
+    }
+
+    /// [`Self::record_refusal`], also naming the outage the refusal joined.
+    /// An empty `work_item_id` counts an attempt without naming an item.
+    pub fn fold_refusal(
+        &self,
+        exclusions: Vec<DispatchOutageHostExclusion>,
+        work_item_id: &str,
+        execution_id: &str,
+        now_epoch_secs: i64,
+    ) -> RecordedRefusal {
+        let (effect, notify, outage_started_epoch_s) = {
             let mut slot = self.active.lock().expect("dispatch outage lock poisoned");
             match slot.as_mut() {
                 None => {
+                    let items: BTreeSet<String> = Some(work_item_id)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                        .into_iter()
+                        .collect();
                     *slot = Some(Active {
                         outage: DispatchOutage::builder()
                             .started_epoch_s(now_epoch_secs)
                             .host_exclusions(exclusions)
                             .refused_attempts(1)
-                            .refused_work_items(1)
+                            .refused_work_items(items.len() as u64)
                             .latest_refusal_epoch_s(now_epoch_secs)
                             .latest_work_item_id(work_item_id)
                             .latest_execution_id(execution_id)
                             .build(),
-                        refused_work_items: BTreeSet::from([work_item_id.to_owned()]),
+                        refused_work_items: items,
                     });
-                    (RefusalEffect::Started, true)
+                    (RefusalEffect::Started, true, now_epoch_secs)
                 }
                 Some(active) => {
                     let outage = &mut active.outage;
                     outage.refused_attempts = outage.refused_attempts.saturating_add(1);
-                    active.refused_work_items.insert(work_item_id.to_owned());
+                    if !work_item_id.is_empty() {
+                        active.refused_work_items.insert(work_item_id.to_owned());
+                    }
                     outage.latest_refusal_epoch_s = now_epoch_secs;
                     outage.latest_work_item_id = work_item_id.to_owned();
                     outage.latest_execution_id = execution_id.to_owned();
                     let exclusions_changed = outage.host_exclusions != exclusions;
                     outage.host_exclusions = exclusions;
-                    (RefusalEffect::Folded, exclusions_changed)
+                    (RefusalEffect::Folded, exclusions_changed, outage.started_epoch_s)
                 }
             }
         };
         if notify {
             self.notify_changed();
         }
-        effect
+        RecordedRefusal {
+            effect,
+            outage_started_epoch_s,
+        }
     }
 
     /// Reinstate an outage rebuilt from the dispatch event stream after an
     /// engine restart, so its original start time and counters survive until
     /// a new dispatch actually claims a host. A record already active (a
-    /// refusal that raced the restore) is kept.
+    /// refusal that raced the restore) is kept, and so is the absence of one
+    /// after a claim: a claim this process already recorded ended the outage
+    /// being restored, so the restore is dropped.
     pub fn restore(&self, outage: DispatchOutage, refused_work_items: BTreeSet<String>) {
         {
             let mut slot = self.active.lock().expect("dispatch outage lock poisoned");
-            if slot.is_some() {
+            if slot.is_some() || self.claimed_since_start.load(Ordering::SeqCst) {
                 return;
             }
             *slot = Some(Active {
@@ -270,7 +310,11 @@ impl DispatchOutageTracker {
     /// A new dispatch claimed a host: the outage, if one was active, is over.
     /// This is the only way it ends.
     pub fn record_claim(&self, now_epoch_secs: i64) -> Option<ResolvedOutage> {
-        let ended = self.active.lock().expect("dispatch outage lock poisoned").take()?;
+        let mut slot = self.active.lock().expect("dispatch outage lock poisoned");
+        // Under the lock, so a restore cannot slip between the claim and the flag.
+        self.claimed_since_start.store(true, Ordering::SeqCst);
+        let ended = slot.take()?;
+        drop(slot);
         self.notify_changed();
         Some(ResolvedOutage {
             outage: ended.to_wire(),
@@ -374,12 +418,19 @@ fn event_epoch_s(event: &DispatchEvent) -> i64 {
 }
 
 /// Rebuild outage state from dispatch `events` (any order), by the same rules
-/// the live [`DispatchOutageTracker`] applies. An outage runs from its
-/// `dispatch_outage_started` event until a new dispatch claims a host: either
-/// the `dispatch_outage_recovered` event or a `host_selected` success that was
-/// a fresh selection (an engine restarted mid-outage has no tracker to emit
-/// the former). Refusals count only when flagged `global_outage`, and carry
-/// the host exclusions as of that refusal.
+/// the live [`DispatchOutageTracker`] applies. An outage runs from its first
+/// global refusal until a new dispatch claims a host: either the
+/// `dispatch_outage_recovered` event or a `host_selected` success that was a
+/// fresh selection (an engine restarted mid-outage has no tracker to emit the
+/// former). Refusals count only when flagged `global_outage`, and carry the
+/// host exclusions as of that refusal.
+///
+/// Concurrent dispatchers can each write their refusal before either writes
+/// the `dispatch_outage_started` event, so the start event does not open the
+/// outage on its own and never counts an attempt: every refusal stamps the
+/// `outage_started_epoch_s` of the tracker record it joined, and a refusal or a
+/// start event with the active outage's start time belongs to it, whichever
+/// came first. A different start time is a new outage.
 ///
 /// `bossctl dispatch diagnose` reads this so it answers with the engine down;
 /// the engine replays it at startup to restore an outage that was in progress.
@@ -390,9 +441,23 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
     for event in ordered {
         match event.stage.as_str() {
             STAGE_STARTED => {
-                out.refused_work_items.clear();
-                out.refused_work_items.extend(event.work_item_id.clone());
-                out.active = Some(started_record(event));
+                let started = event
+                    .details
+                    .get("started_epoch_s")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_else(|| event_epoch_s(event));
+                let exclusions = event_exclusions(&event.details);
+                match out.active.as_mut() {
+                    Some(active) if active.started_epoch_s == started => {
+                        // The refusals that raised it were replayed already.
+                        if active.host_exclusions.is_empty()
+                            && let Some(exclusions) = exclusions
+                        {
+                            active.host_exclusions = exclusions;
+                        }
+                    }
+                    _ => open_outage(&mut out, started, exclusions.unwrap_or_default(), event_epoch_s(event)),
+                }
             }
             STAGE_RECOVERED => {
                 out.active = None;
@@ -400,28 +465,47 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
                 out.last_recovery = Some(event.details.clone());
             }
             "host_selected" => {
-                let Some(active) = out.active.as_mut() else { continue };
                 let details = &event.details;
                 if event.outcome == "error"
                     && details.get("global_outage").and_then(serde_json::Value::as_bool) == Some(true)
                 {
+                    let refused_at = event_epoch_s(event);
+                    let started = details
+                        .get("outage_started_epoch_s")
+                        .and_then(serde_json::Value::as_i64);
+                    let exclusions = event_exclusions(details);
+                    // A refusal that names no outage joins the active one.
+                    let joins_active = out
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| started.is_none_or(|started| active.started_epoch_s == started));
+                    if !joins_active {
+                        open_outage(
+                            &mut out,
+                            started.unwrap_or(refused_at),
+                            exclusions.clone().unwrap_or_default(),
+                            refused_at,
+                        );
+                    }
+                    let Some(active) = out.active.as_mut() else { continue };
                     active.refused_attempts += 1;
-                    if let Some(item) = event.work_item_id.as_deref() {
+                    if let Some(item) = event.work_item_id.as_deref().filter(|item| !item.is_empty()) {
                         out.refused_work_items.insert(item.to_owned());
                         active.latest_work_item_id = item.to_owned();
                     }
                     active.refused_work_items = out.refused_work_items.len() as u64;
-                    active.latest_refusal_epoch_s = event_epoch_s(event);
-                    active.latest_execution_id = event.execution_id.clone();
-                    if let Some(exclusions) = details
-                        .get("host_exclusions")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value::<Vec<DispatchOutageHostExclusion>>(value).ok())
-                    {
+                    active.latest_refusal_epoch_s = refused_at;
+                    // Refusals before any execution exists are recorded under "engine".
+                    active.latest_execution_id = Some(event.execution_id.as_str())
+                        .filter(|id| *id != "engine")
+                        .unwrap_or_default()
+                        .to_owned();
+                    if let Some(exclusions) = exclusions {
                         active.host_exclusions = exclusions;
                     }
                 } else if event.outcome == "ok"
                     && details.get("existing_assignment").and_then(serde_json::Value::as_bool) != Some(true)
+                    && let Some(active) = out.active.as_ref()
                 {
                     let recovered = event_epoch_s(event);
                     out.last_recovery = Some(serde_json::json!({
@@ -443,35 +527,28 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
     out
 }
 
-fn started_record(event: &DispatchEvent) -> DispatchOutage {
-    let exclusions = event
-        .details
+fn event_exclusions(details: &serde_json::Value) -> Option<Vec<DispatchOutageHostExclusion>> {
+    details
         .get("host_exclusions")
         .cloned()
-        .and_then(|value| serde_json::from_value::<Vec<DispatchOutageHostExclusion>>(value).ok())
-        .unwrap_or_default();
-    let started = event
-        .details
-        .get("started_epoch_s")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or_else(|| event_epoch_s(event));
-    let triggering = event
-        .details
-        .get("triggering_execution_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    DispatchOutage::builder()
-        .started_epoch_s(started)
-        .host_exclusions(exclusions)
-        // The refusal that raised the outage is the first attempt (its own
-        // `host_selected` event precedes this one); the refusals replayed
-        // after this event are the rest.
-        .refused_attempts(1)
-        .refused_work_items(u64::from(event.work_item_id.is_some()))
-        .latest_refusal_epoch_s(event_epoch_s(event))
-        .latest_work_item_id(event.work_item_id.clone().unwrap_or_default())
-        .latest_execution_id(triggering)
-        .build()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Begin a replayed outage with no attempts: the refusals that belong to it
+/// are counted as they are replayed, never by the event that opens it.
+fn open_outage(out: &mut OutageReplay, started: i64, exclusions: Vec<DispatchOutageHostExclusion>, now: i64) {
+    out.refused_work_items.clear();
+    out.active = Some(
+        DispatchOutage::builder()
+            .started_epoch_s(started)
+            .host_exclusions(exclusions)
+            .refused_attempts(0)
+            .refused_work_items(0)
+            .latest_refusal_epoch_s(now)
+            .latest_work_item_id("")
+            .latest_execution_id("")
+            .build(),
+    );
 }
 
 #[cfg(test)]
@@ -687,6 +764,19 @@ mod tests {
         assert_eq!(tracker.record_claim(1_100).unwrap().duration_secs, 100);
     }
 
+    #[test]
+    fn a_restore_after_a_claim_is_dropped_as_stale() {
+        let original = tracker_with_one_refusal();
+        let tracker = DispatchOutageTracker::new();
+        assert_eq!(tracker.record_claim(1_005), None, "nothing to end yet");
+        tracker.restore(original.active().unwrap(), BTreeSet::from(["task_1".to_owned()]));
+        assert_eq!(
+            tracker.active(),
+            None,
+            "a claim already ended the outage being restored"
+        );
+    }
+
     fn stream_event(
         stage: &str,
         outcome: &str,
@@ -733,7 +823,12 @@ mod tests {
             &format!("exec_{item}"),
             item,
             ts_ms,
-            serde_json::json!({ "reason": "no_eligible_host", "global_outage": global, "host_exclusions": exclusions }),
+            serde_json::json!({
+                "reason": "no_eligible_host",
+                "global_outage": global,
+                "outage_started_epoch_s": 1_000,
+                "host_exclusions": exclusions,
+            }),
         )
     }
 
@@ -741,16 +836,71 @@ mod tests {
     fn replay_counts_only_global_refusals_and_follows_exclusion_changes() {
         let narrowed = vec![exclusions().remove(1)];
         let replay = replay_outage_events(&[
+            refusal_event("task_1", 1_000_000, true, exclusions()),
             started_event(1_000_000),
             refusal_event("task_2", 1_100_000, true, exclusions()),
             refusal_event("task_3", 1_200_000, false, Vec::new()),
             refusal_event("task_2", 1_300_000, true, narrowed.clone()),
         ]);
         let active = replay.active.expect("still active");
-        assert_eq!(active.refused_attempts, 3, "the start plus two global refusals");
+        assert_eq!(active.started_epoch_s, 1_000);
+        assert_eq!(
+            active.refused_attempts, 3,
+            "three global refusals; the local one is not counted"
+        );
         assert_eq!(active.refused_work_items, 2);
         assert_eq!(active.host_exclusions, narrowed);
         assert_eq!(replay.refused_work_items.len(), 2);
+    }
+
+    #[test]
+    fn replay_matches_the_live_tracker_when_refusals_precede_the_start_event() {
+        // Two dispatchers each wrote their refusal before either wrote the
+        // start event; the tracker (which saw both) counts 2 attempts, 2 items.
+        let live = DispatchOutageTracker::new();
+        let first = live.fold_refusal(exclusions(), "task_1", "exec_task_1", 1_000);
+        let second = live.fold_refusal(exclusions(), "task_2", "exec_task_2", 1_000);
+        assert_eq!(first.effect, RefusalEffect::Started);
+        assert_eq!(second.effect, RefusalEffect::Folded);
+        assert_eq!(second.outage_started_epoch_s, 1_000);
+        let live = live.active().unwrap();
+
+        for events in [
+            // Both refusals, then the start event.
+            vec![
+                refusal_event("task_1", 1_000_000, true, exclusions()),
+                refusal_event("task_2", 1_000_000, true, exclusions()),
+                started_event(1_000_000),
+            ],
+            // A refusal landing after the start event.
+            vec![
+                refusal_event("task_1", 1_000_000, true, exclusions()),
+                started_event(1_000_000),
+                refusal_event("task_2", 1_000_001, true, exclusions()),
+            ],
+        ] {
+            let replayed = replay_outage_events(&events).active.expect("active");
+            assert_eq!(replayed.refused_attempts, live.refused_attempts);
+            assert_eq!(replayed.refused_work_items, live.refused_work_items);
+            assert_eq!(replayed.started_epoch_s, live.started_epoch_s);
+        }
+    }
+
+    #[test]
+    fn replay_treats_a_different_start_time_as_a_new_outage() {
+        let mut later_start = started_event(2_000_000);
+        later_start.details["started_epoch_s"] = serde_json::json!(2_000);
+        let replay = replay_outage_events(&[
+            refusal_event("task_1", 1_000_000, true, exclusions()),
+            started_event(1_000_000),
+            later_start,
+        ]);
+        let active = replay.active.unwrap();
+        assert_eq!(active.started_epoch_s, 2_000);
+        assert_eq!(
+            active.refused_attempts, 0,
+            "the earlier outage's attempts are not carried over"
+        );
     }
 
     #[test]

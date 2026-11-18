@@ -20,8 +20,8 @@ use boss_engine_storage_values::attention_kinds::{
 use boss_execution_contracts::{
     ChoreRequirements, DispatchOutageTracker, Eligibility, FailureEffect, HostSlot, IneligibilityReason,
     LeaseReleaseOutcome, LifecycleServices, LiveWorkerLiveness, LocalHold, PidStatus, PreStartStreakTracker,
-    RefusalEffect, TeardownReason, TerminalCause, WorkerPaneReleaser, classify_host_exclusions, driver_capability,
-    scan_error_exclusions, select_host,
+    RecordedRefusal, RefusalEffect, TeardownReason, TerminalCause, WorkerPaneReleaser, classify_host_exclusions,
+    driver_capability, scan_error_exclusions, select_host,
 };
 use boss_protocol::DispatchOutageHostExclusion;
 

@@ -100,8 +100,11 @@ mod tests {
     }
 
     fn refusal(execution: &str, item: &str, ts_ms: u128) -> DispatchEvent {
-        event(Stage::HostSelected, Outcome::Error, execution, item, ts_ms)
-            .with_details(serde_json::json!({ "reason": "no_eligible_host", "global_outage": true }))
+        event(Stage::HostSelected, Outcome::Error, execution, item, ts_ms).with_details(serde_json::json!({
+            "reason": "no_eligible_host",
+            "global_outage": true,
+            "outage_started_epoch_s": 1_000,
+        }))
     }
 
     fn claim(execution: &str, ts_ms: u128) -> DispatchEvent {
@@ -112,16 +115,16 @@ mod tests {
     #[test]
     fn a_start_with_no_recovery_is_an_active_outage_with_refusals_counted() {
         let events = vec![
+            refusal("exec_1", "task_1", 1_000_000),
             started(1_000_000),
-            refusal("exec_1", "task_1", 1_000_100),
             refusal("exec_2", "task_2", 1_100_000),
             refusal("exec_1", "task_1", 1_200_000),
         ];
         let active = from_events(&events).active.expect("outage still active");
         assert_eq!(active.started_epoch_s, 1_000);
         assert_eq!(
-            active.refused_attempts, 4,
-            "the starting refusal plus the three that followed"
+            active.refused_attempts, 3,
+            "the three global refusals; the start event counts none itself"
         );
         assert_eq!(active.refused_work_items, 2);
         assert_eq!(active.latest_execution_id, "exec_1");
@@ -159,10 +162,14 @@ mod tests {
     }
 
     #[test]
-    fn refusals_outside_an_outage_are_not_counted() {
-        let outages = from_events(&[refusal("exec_1", "task_1", 5_000)]);
+    fn only_global_refusals_open_an_outage() {
+        let not_global = event(Stage::HostSelected, Outcome::Error, "exec_1", "task_1", 5_000)
+            .with_details(serde_json::json!({ "reason": "no_eligible_host" }));
+        let outages = from_events(&[not_global]);
         assert!(outages.active.is_none());
         assert!(outages.last_recovery.is_none());
+        // A global refusal is an outage even if its start event was lost.
+        assert!(from_events(&[refusal("exec_1", "task_1", 5_000)]).active.is_some());
     }
 
     #[test]
@@ -187,6 +194,7 @@ mod tests {
             event(Stage::HostSelected, Outcome::Error, "exec_2", "task_2", 1_100_000).with_details(serde_json::json!({
                 "reason": "no_eligible_host",
                 "global_outage": true,
+                "outage_started_epoch_s": 1_000,
                 "host_exclusions": [{
                     "host_id": "anaplian",
                     "kind": "host_disabled",
@@ -195,8 +203,14 @@ mod tests {
                     "recovery_action": null,
                 }],
             }));
-        let active = from_events(&[started(1_000_000), not_global, changed]).active.unwrap();
-        assert_eq!(active.refused_attempts, 2, "the start plus one global refusal");
+        let first = refusal("exec_1", "task_1", 1_000_000);
+        let active = from_events(&[first, started(1_000_000), not_global, changed])
+            .active
+            .unwrap();
+        assert_eq!(
+            active.refused_attempts, 2,
+            "two global refusals; the local one is not counted"
+        );
         assert_eq!(active.refused_work_items, 2);
         assert_eq!(active.host_exclusions.len(), 1);
         assert_eq!(active.host_exclusions[0].host_id, "anaplian");

@@ -143,7 +143,9 @@ async fn a_held_local_host_with_a_usable_remote_is_not_an_outage() {
     let fixture = fixture(1);
     hold_local_dispatch(&fixture.db);
     // Remote stays enabled but lacks the driver the item needs: refused for
-    // that item, while the host itself is still accepting launches.
+    // that item, while the host itself is still accepting launches. This is
+    // the documented narrowing of the outage definition: placement is not
+    // checked across every queued item, only host-level exclusions are.
     fixture
         .db
         .replace_auto_host_capabilities("anaplian", &["drivers-probed=true".to_owned()])
@@ -277,4 +279,81 @@ async fn reconciling_a_held_spoke_execution_on_a_disabled_remote_does_not_end_th
             .contains(&"dispatch_outage_recovered".to_owned()),
         "a held-spoke reconciliation is not a new claim",
     );
+}
+
+fn hold_every_item_with_a_scan_error(db: &WorkDb) {
+    db.write_local_worker_quarantine(&LocalWorkerQuarantine {
+        executions: Default::default(),
+        scan_error: Some("tmux list-panes failed".to_owned()),
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_launch_refused_at_admission_by_a_startup_scan_failure_raises_the_outage() {
+    // The hold is in place before anything is requested, so the refusal
+    // happens at admission: no execution row is created, and host selection
+    // is never reached.
+    let fixture = fixture(1);
+    hold_every_item_with_a_scan_error(&fixture.db);
+    assert_eq!(fixture.coordinator.dispatch_outage().active(), None);
+
+    let err = fixture
+        .coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(fixture.executions[0].work_item_id.clone())
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("quarantined"), "{err:#}");
+
+    let outage = fixture
+        .coordinator
+        .dispatch_outage()
+        .active()
+        .expect("the admission refusal raises the outage");
+    assert_eq!(outage.refused_attempts, 1);
+    assert_eq!(outage.refused_work_items, 1);
+    assert_eq!(outage.latest_work_item_id, fixture.executions[0].work_item_id);
+    let local = outage.host_exclusions.iter().find(|h| h.host_id == "local").unwrap();
+    assert!(
+        local.cause.contains("tmux list-panes failed"),
+        "the scan error is carried verbatim: {}",
+        local.cause
+    );
+
+    // The events go out on a spawned task; both are replayable.
+    let mut stages = Vec::new();
+    for _ in 0..200 {
+        stages = engine_stages(&fixture).await;
+        if stages.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(stages, ["host_selected", "dispatch_outage_started"]);
+    let replay = boss_execution_contracts::replay_outage_events(&fixture.events.events().await);
+    assert_eq!(replay.active.expect("the stream shows the outage").refused_attempts, 1);
+}
+
+#[tokio::test]
+async fn the_startup_sweep_reports_active_work_a_scan_failure_is_holding_back() {
+    let fixture = fixture(1);
+    // Healthy: nothing held, nothing reported.
+    fixture.coordinator.note_startup_scan_hold();
+    assert_eq!(fixture.coordinator.dispatch_outage().active(), None);
+
+    // The chore is active work with no live worker, which reconcile skips
+    // under the hold.
+    fixture
+        .db
+        .force_task_status_for_test(&fixture.executions[0].work_item_id, "active")
+        .unwrap();
+    hold_every_item_with_a_scan_error(&fixture.db);
+    fixture.coordinator.note_startup_scan_hold();
+
+    let outage = fixture.coordinator.dispatch_outage().active().expect("outage raised");
+    assert_eq!(outage.refused_work_items, 1);
 }
