@@ -1,4 +1,4 @@
-//! Layer 4 speculative conflict prediction (T10, `future / not a v1
+//! Layer 4 speculative conflict prediction (`future / not a v1
 //! blocker` in
 //! `docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
 //!
@@ -6,7 +6,7 @@
 //! whose recheck interval has elapsed, lease a scratch workspace and run a
 //! throwaway, no-push engine-direct rebase (`cube workspace rebase --pr <n>
 //! --no-push`) against current `main`. No worker is spawned and the real PR
-//! branch is never mutated — [`crate::coordinator::CubeClient::rebase_workspace_no_push`]
+//! branch is never mutated — [`boss_execution_contracts::CubeClient::rebase_workspace_no_push`]
 //! is the same engine-direct mechanical rebase rung 1 uses, minus the push.
 //! Outcomes:
 //!
@@ -20,7 +20,7 @@
 //! Deliberately out of scope here (see this task's PR description):
 //! pre-emptively running rung 0/1 resolution against a predicted conflict,
 //! and converting two mutually-predicted-to-conflict in-flight branches
-//! into an ordered stack (T11) — the design marks both as separate,
+//! into an ordered stack — the design marks both as separate,
 //! optional follow-on work.
 //!
 //! Gated by the `speculative_conflict_prediction` feature flag (default
@@ -34,10 +34,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::coordinator::CubeClient;
 use crate::merge_poller::{sanitize_metric_name_component, stored_pr_number};
 use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, SpeculativeConflictInsertInput, WorkDb};
+use boss_execution_contracts::CubeClient;
 
 /// Minimum time between speculative rebase attempts for the same work
 /// item — the design's "must be rate-limited to avoid churn".
@@ -61,7 +61,7 @@ crate::register_counter!(
 );
 
 /// Register this module's counter handles. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn init(registry: &Registry) {
     registry.register_counter(&SPECULATIVE_CONFLICT_PREDICTED);
     registry.register_counter(&SPECULATIVE_CONFLICT_CLEAN);
@@ -137,7 +137,6 @@ pub async fn run_speculative_pass(
     let due: Vec<&PendingMergeCheck> = candidates
         .iter()
         .filter(|c| schedule.due(&c.work_item_id, now))
-        .take(MAX_CHECKS_PER_PASS)
         .collect();
     if due.is_empty() {
         return;
@@ -147,9 +146,25 @@ pub async fn run_speculative_pass(
         total_candidates = candidates.len(),
         "speculative_conflict: sweep starting",
     );
+    let mut checked = 0;
     for candidate in due {
+        if checked >= MAX_CHECKS_PER_PASS {
+            break;
+        }
+        // A live writer owns the PR branch, and dispatch must not start one
+        // while this candidate's rebase is running. Taken here, immediately
+        // before this candidate's rebase, because earlier candidates' checks
+        // take long enough for a writer to have started since the sweep
+        // began. Skip without marking the PR checked, so it is rechecked on
+        // the next pass once the writer is gone rather than waiting out a
+        // whole recheck interval; a skip does not consume the per-pass cap.
+        let Ok(_chain_hold) = crate::conflict_ladder::hold_chain_for_engine_rebase(work_db, &candidate.work_item_id)
+        else {
+            continue;
+        };
         schedule.mark_checked(&candidate.work_item_id, now);
         check_one(work_db, cube_client, metrics, candidate).await;
+        checked += 1;
     }
 }
 
@@ -262,7 +277,7 @@ async fn check_one(work_db: &WorkDb, cube_client: &dyn CubeClient, metrics: &Reg
 /// engine-direct rebase, and record the outcome. Split out so the caller
 /// can release the lease unconditionally regardless of which branch this
 /// returns from.
-async fn run_in_lease(
+pub(crate) async fn run_in_lease(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,
     metrics: &Registry,

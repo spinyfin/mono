@@ -68,8 +68,6 @@ use std::time::{Duration, SystemTime};
 use serde_json;
 use sha2::{Digest, Sha256};
 
-use boss_protocol::ExecutionKind;
-
 use crate::driver::{
     AgentDriver, HookWiringDestination, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
 };
@@ -77,16 +75,18 @@ use crate::ssh_transport::shell_quote;
 
 mod deny_rules;
 pub use deny_rules::{
-    answer_agent_allow_rules, answer_agent_deny_rules, review_guide_allow_rules, review_guide_deny_rules,
-    reviewer_deny_rules, triage_deny_rules,
+    answer_agent_allow_rules, answer_agent_deny_rules, progression_allow_rules, progression_deny_rules,
+    review_guide_allow_rules, review_guide_deny_rules, reviewer_deny_rules, triage_deny_rules,
 };
+mod git_store_guard;
+pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
 
 // Re-export guard command constants so the test module (which uses `use
 // super::*;`) can run the Python scripts end-to-end and verify their behaviour.
 // Scoped to test builds: the constants are not needed at runtime in this module.
 #[cfg(test)]
 pub(crate) use crate::driver::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
+    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, PR_REDIRECT_REVISION_ENV, REVISION_PR_GUARD_COMMAND,
 };
 // Only constructed directly by tests (`ProgressIngress::HookCallback(..)`
 // fixtures) — production code only destructures it via
@@ -96,578 +96,9 @@ pub(crate) use crate::driver::claude::{
 #[cfg(test)]
 pub(crate) use crate::driver::ProgressObservationWiring;
 
-/// The kind of worker being spawned, used to select the per-kind tool
-/// denylist. Kept in this module so the denylist rules and the kind
-/// definition are co-located and can evolve together.
-///
-/// New kinds should document their read/write access contract in a comment
-/// so reviewers can verify the deny rules match the stated posture.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum WorkerKind {
-    /// Normal implementation worker (task, chore, revision, etc.). Has
-    /// write access to its leased workspace; can push branches and open
-    /// PRs (subject to kind-specific guards such as the revision PR guard).
-    #[default]
-    Standard,
-    /// Read-only reviewer worker (design §9). Reads the PR diff and workspace
-    /// files; MUST NOT mutate files, push commits, or interact with GitHub
-    /// write endpoints. The deny rules in [`reviewer_deny_rules`] are the
-    /// primary enforcement layer for this mandate.
-    Reviewer,
-    /// Automation triage worker (Maint task 6). Investigates the repo and
-    /// emits a single decision marker (`automation: task <id>` /
-    /// `automation: skip — …`), optionally running one
-    /// `boss task create --automation`. It MUST NOT do the work itself: no
-    /// file edits, commits, pushes, or PRs — and crucially there is **no PR
-    /// deliverable**, so it must not receive the [`WorkerKind::Standard`]
-    /// "a PR is the deliverable / print the PR URL as your last line"
-    /// CLAUDE.md, which otherwise overrides the marker contract and leaves
-    /// the run ending without a decision marker. The deny rules in
-    /// [`triage_deny_rules`] enforce the no-work posture; `boss task create`
-    /// is intentionally left allowed.
-    Triage,
-    /// Read-only "mini-coordinator" answer agent (P3a of
-    /// `comment-triggered-document-revisions.md`). Answers one reviewer
-    /// question in a doc-comment thread. Unlike every other kind it is
-    /// enforced with an **allowlist, not a blocklist**: it is spawned in
-    /// deny-by-default `dontAsk` permission mode with an explicit
-    /// [`answer_agent_allow_rules`] allowlist (read-only tools + the single
-    /// thread-reply command), plus a comprehensive [`answer_agent_deny_rules`]
-    /// belt. It reads anything the coordinator can see and reads code in a
-    /// read-only checkout, but MUST NOT edit, push, open/modify a PR, mutate
-    /// task/comment/cube state, or take any action other than posting its one
-    /// reply. See [`crate::answer_agent`] for the worker-facing surface.
-    AnswerAgent,
-    /// PR review-guide generator on the fixed Codex Astra profile. Reads its pinned, read-only workspace and
-    /// the embedded source packet and submits Markdown with
-    /// `"$BOSS_BIN" propose review-guide --body`. A shared PreToolUse allowlist
-    /// allows only source reads and submission; Claude additionally uses dontAsk.
-    ReviewGuide,
-}
-
-impl WorkerKind {
-    /// The permission mode that MUST be forced at spawn (`--permission-mode
-    /// <mode>`) for this kind, overriding the model-derived default, if any.
-    ///
-    /// `Some("dontAsk")` for the capability-restricted answer agent so its
-    /// deny-by-default allowlist is authoritative and cannot be silently
-    /// downgraded to `auto` (allow-by-default) or `--dangerously-skip-permissions`
-    /// (bypasses settings entirely). `None` lets the model-derived default
-    /// apply.
-    ///
-    /// Deriving BOTH the settings posture (via [`worker_kind_for_execution`])
-    /// and the forced CLI mode from the same exhaustive `WorkerKind` closes the
-    /// divergence footgun where a restricted kind gets a `dontAsk` settings
-    /// file but a downgradable CLI flag: the match here is exhaustive, so a new
-    /// restricted kind must decide its mode rather than inheriting the
-    /// downgradable default.
-    pub fn forced_permission_mode(&self) -> Option<&'static str> {
-        match self {
-            WorkerKind::AnswerAgent | WorkerKind::ReviewGuide => Some("dontAsk"),
-            WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
-        }
-    }
-}
-
-/// Map a dispatched [`ExecutionKind`] to the [`WorkerKind`] whose permission
-/// posture it must run under. The single source of truth shared by the local
-/// spawn path ([`crate::runner`]) and the remote spawn path
-/// ([`crate::host_adapter`]) so the two can never diverge — a new execution
-/// kind that needs a restricted surface is wired here once.
-///
-/// Security-critical, so the match is **exhaustive** (no `_` arm): adding a new
-/// [`ExecutionKind`] forces a compile error here, making every new kind decide
-/// its permission posture explicitly rather than silently inheriting
-/// [`WorkerKind::Standard`] (full write/push access).
-pub fn worker_kind_for_execution(kind: &ExecutionKind) -> WorkerKind {
-    match kind {
-        ExecutionKind::PrReview => WorkerKind::Reviewer,
-        ExecutionKind::AutomationTriage => WorkerKind::Triage,
-        ExecutionKind::AnswerAgent => WorkerKind::AnswerAgent,
-        ExecutionKind::PrReviewGuide => WorkerKind::ReviewGuide,
-        ExecutionKind::ChoreImplementation
-        | ExecutionKind::CiRemediation
-        | ExecutionKind::ConflictResolution
-        | ExecutionKind::InvestigationImplementation
-        | ExecutionKind::ProductDesign
-        | ExecutionKind::ProjectDesign
-        | ExecutionKind::RevisionImplementation
-        | ExecutionKind::TaskImplementation => WorkerKind::Standard,
-    }
-}
-
-/// All the inputs a worker-config render needs. The shape is
-/// deliberately minimal — anything more (project-specific guidance,
-/// allowlisted tools) lives in higher layers and is rendered separately.
-#[derive(Debug, Clone, bon::Builder)]
-#[builder(on(String, into))]
-pub struct WorkerSetupInput {
-    /// Run id this spawn corresponds to. Baked into the hook command
-    /// in the worker settings file as a `BOSS_RUN_ID=<run_id>` inline-assignment
-    /// prefix so the `boss-event` shim always sees it on stdin's env,
-    /// regardless of whether claude propagates the worker pane's env
-    /// to its hook subprocess. The shim splices this into every hook
-    /// payload as `_boss_run_id`, which is how the engine correlates
-    /// hook events to live-worker-state slots.
-    pub run_id: String,
-    /// Cube lease id for this worker. Surfaced to claude via the
-    /// `BOSS_LEASE_ID` env var (set elsewhere); referenced in CLAUDE.md
-    /// so a confused worker can describe its own lease.
-    pub lease_id: String,
-    /// Filesystem path of the leased workspace (the worker's cwd).
-    pub workspace_path: PathBuf,
-    /// Engine events socket path; injected into the worker settings file via the
-    /// `BOSS_EVENTS_SOCKET` env var so the shim knows where to connect.
-    pub events_socket_path: PathBuf,
-    /// Absolute path to the `boss-event` shim binary the engine will
-    /// place into the worker's PATH per lease. This template
-    /// references the shim by absolute path so a hook fires even if
-    /// the user's PATH is unusual.
-    pub boss_event_path: PathBuf,
-    /// When `true`, the CLAUDE.md includes a directive to use
-    /// `--draft` when running `gh pr create`. Omitted when `false`
-    /// so workers on default installs see no behaviour change.
-    #[builder(default)]
-    pub draft_pr_mode: bool,
-    /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
-    /// Used to install kind-specific hook guards — currently a PreToolUse deny
-    /// for `gh pr create` on `revision_implementation` executions.
-    pub execution_kind: String,
-    /// Task kind from the underlying work item (e.g. `"revision"`, `"chore"`).
-    /// `None` for non-task work items (products, projects).
-    ///
-    /// Defense-in-depth: the `gh pr create` guard is keyed off the task kind
-    /// in ADDITION to the execution kind, so a mis-derived execution kind
-    /// (e.g. a revision re-dispatched as `task_implementation` due to a bug)
-    /// still cannot open a new PR.
-    pub task_kind: Option<String>,
-    /// Worker kind — determines the per-kind tool denylist installed in the
-    /// worker settings file. Defaults to [`WorkerKind::Standard`] which adds
-    /// no additional denies beyond the static sandbox rules. Set to
-    /// [`WorkerKind::Reviewer`] to enforce the read-only mandate (§9).
-    #[builder(default = WorkerKind::Standard)]
-    pub worker_kind: WorkerKind,
-    /// Mirrors the `automation_outcome_proposals_seam` feature flag
-    /// (composed with the `worker_proposals` master flag) — gates the
-    /// `boss propose automation-outcome` teaching in
-    /// [`crate::automation_triage::render_triage_claude_md`] for
-    /// [`WorkerKind::Triage`] workers (design implementation task 11).
-    /// Ignored for every other worker kind. The caller must pass the same
-    /// value used to render this triage execution's preamble
-    /// (`runner::worker_spawn::WorkerSpawnOpts::automation_outcome_proposals_seam_enabled`)
-    /// so the preamble and CLAUDE.md never disagree about which
-    /// decision-declaration mechanism is live.
-    #[builder(default)]
-    pub automation_outcome_proposals_seam_enabled: bool,
-    /// `true` when this [`WorkerKind::Reviewer`] execution is the batch's
-    /// consolidating supervisor rather than a leaf reviewer — selects
-    /// [`crate::pr_review::render_supervisor_claude_md`] over
-    /// [`crate::pr_review::render_reviewer_claude_md`]. Ignored for every
-    /// other worker kind.
-    #[builder(default)]
-    pub is_review_supervisor: bool,
-    /// `true` when this [`WorkerKind::Reviewer`] execution is a batch's sole
-    /// post-merge reviewer — selects
-    /// [`crate::pr_review::render_post_merge_reviewer_claude_md`], which
-    /// authorises `boss propose review-verdict` (the supervisor's submission
-    /// command; a post-merge reviewer submits its own verdict directly
-    /// rather than a `review-report`). Mutually exclusive with
-    /// `is_review_supervisor`; ignored for every other worker kind.
-    #[builder(default = false)]
-    pub is_post_merge_reviewer: bool,
-    /// `true` when this [`WorkerKind::AnswerAgent`] execution's leased
-    /// checkout was actually positioned on its target PR's head via `cube
-    /// workspace goto --pr` (stamped by the coordinator right after the
-    /// goto attempt — see `set_answer_agent_run_positioning`). `false`
-    /// means the checkout is a fresh `cube change create` off the default
-    /// base — positioning either wasn't applicable (no open PR target) or
-    /// was attempted and failed. Selects the conditional "current PR head"
-    /// sentence in [`crate::answer_agent::render_answer_agent_claude_md`].
-    /// Ignored for every other worker kind.
-    #[builder(default)]
-    pub checkout_positioned_on_pr_head: bool,
-}
-
-/// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
-///
-/// `preamble` is supplied by the driver via
-/// [`crate::driver::AgentDriver::agent_rules_preamble`] and names the
-/// hook mechanism and the config-dir gitignore contract.
-/// `config_dir` is the driver's `DriverDescriptor::config_dir`
-/// (e.g. `".claude"`) used to name the gitignored directory in the VCS
-/// instructions.
-///
-/// For [`WorkerKind::Reviewer`] workers, returns a reviewer-specific file
-/// that prominently states the read-only mandate and omits PR-creation
-/// instructions (reviewers never open or update PRs).
-pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
-    if input.worker_kind == WorkerKind::Reviewer && input.is_review_supervisor {
-        return crate::pr_review::render_supervisor_claude_md(
-            &input.lease_id,
-            &input.workspace_path.display().to_string(),
-            crate::prompt_fragments::absolute_paths_fragment(),
-            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
-        );
-    }
-    if input.worker_kind == WorkerKind::Reviewer && input.is_post_merge_reviewer {
-        return crate::pr_review::render_post_merge_reviewer_claude_md(
-            &input.lease_id,
-            &input.workspace_path.display().to_string(),
-            crate::prompt_fragments::absolute_paths_fragment(),
-            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
-        );
-    }
-    if input.worker_kind == WorkerKind::Reviewer {
-        return crate::pr_review::render_reviewer_claude_md(
-            &input.lease_id,
-            &input.workspace_path.display().to_string(),
-            crate::prompt_fragments::absolute_paths_fragment(),
-            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
-        );
-    }
-    if input.worker_kind == WorkerKind::Triage {
-        return crate::automation_triage::render_triage_claude_md(
-            &input.lease_id,
-            input.automation_outcome_proposals_seam_enabled,
-        );
-    }
-    if input.worker_kind == WorkerKind::AnswerAgent {
-        return crate::answer_agent::render_answer_agent_claude_md(
-            &input.lease_id,
-            &input.workspace_path.display().to_string(),
-            input.checkout_positioned_on_pr_head,
-        );
-    }
-    let workspace = input.workspace_path.display();
-    let lease = &input.lease_id;
-    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
-    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
-    let draft_directive = if input.draft_pr_mode {
-        format!(
-            "\n## PR creation mode\n\
-             \n\
-             Default PR creation mode: pass `--draft` to `{cube} pr create`\n\
-             unless the chore description explicitly says to create a non-draft PR.\n"
-        )
-    } else {
-        String::new()
-    };
-    // Sourced from //tools/boss/engine/core:engine_binary.bzl at build time
-    // (via the engine_lib rustc_env) so this advice can't drift from the
-    // real bazel target label the way the pre-crate-split
-    // `//tools/boss/engine:engine` string did.
-    let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
-    format!(
-        "# Boss worker rules\n\
-         \n\
-         {preamble}\n\
-         \n\
-         ## Pull requests are the deliverable\n\
-         \n\
-         **A task is not complete until a PR exists.** Local commits are NOT enough.\n\
-         \n\
-         - Open a PR with `{cube} pr create` once commits exist and tests pass.\n\
-         - **If a PR already exists** (resuming or addressing review),\n\
-           push new commits to it with `{cube} pr update`; do NOT open a\n\
-           duplicate. `{cube} pr create` is safe to retry: if a prior call\n\
-           already created the PR (e.g. your tool killed an earlier\n\
-           invocation on a timeout but the push had actually landed), it\n\
-           returns that PR's URL instead of erroring. Use `{cube} pr update`\n\
-           only when you have new commits to push onto an already-open PR;\n\
-           it errors if none does. Check first with `{boss} pr status` — one\n\
-           local round trip against the engine, not GitHub. Do NOT rely on\n\
-           `{boss} context`'s `task.pr_url` field for this: it is NULL for a\n\
-           revision task by design (a revision never owns its own PR — the\n\
-           chain root does), so an empty `task.pr_url` does NOT mean \"no\n\
-           PR exists\" when you're a revision worker. `{boss} pr status`\n\
-           resolves your actually-bound PR correctly either way.\n\
-         - Do not hard-wrap PR bodies.\n\
-         - **Declare work that ships inert prominently in the PR body.** If your change\n\
-           does not take effect on deploy (a default-off flag, per-environment config,\n\
-           unscheduled task, missing capability, or other human action), state that it\n\
-           ships inert, the specific action that makes it live, and who can take it.\n\
-           Treat this as disclosure, not an approval step or merge gate.\n\
-         - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
-           evaluates backticks and `$(...)` inside double-quoted strings, which\n\
-           corrupts any body that contains inline code. Always write the body to\n\
-           a file and use `--body-file` (see the recipe below).\n\
-         - Print the PR URL on its own line as the last thing in your final response.\n\
-         - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
-           do NOT commit, push, or open a PR — stop and explain.\n\
-         \n\
-         ## Checking your own PR's state\n\
-         \n\
-         Boss already stores most of what you'd otherwise ask GitHub for.\n\
-         These read your own PR only — never another run's — and cost one\n\
-         local round trip against the engine, not a GitHub API call:\n\
-         \n\
-         - `{boss} pr status` — includes your resolved `pr_url`, the\n\
-           cheapest way to answer \"do I already have a PR?\" before\n\
-           deciding between `{cube} pr create` and `{cube} pr update`. Prefer\n\
-           this over `{boss} context`'s `task.pr_url` field: that field is\n\
-           NULL for a revision task by design (the chain root owns the PR,\n\
-           not the revision), so it reads as \"no PR\" even when one exists.\n\
-           `{boss} pr status` also returns `mergeable`, `merge_state_status`,\n\
-           `head_sha`, and `observed_at` for your own PR, e.g.:\n\
-           ```sh\n\
-           {boss} pr status --json\n\
-           ```\n\
-           This is Boss's **last stored observation from the merge poller,\n\
-           not live GitHub truth** — `observed_at` (Unix epoch seconds) is\n\
-           the timestamp of that observation, not of your call. Right after\n\
-           a push, the stored snapshot usually still reflects the *pre-push*\n\
-           state. If you need current state (e.g. right after `{cube} pr\n\
-           update` to see whether the push cleared a conflict), pass\n\
-           `--refresh` for one bounded, rate-limited live check:\n\
-           ```sh\n\
-           {boss} pr status --refresh --json\n\
-           ```\n\
-           A refresh can be silently throttled (`refresh_throttled: true`\n\
-           in the response) if the engine-wide budget is exhausted — in\n\
-           that case you still get the last stored snapshot, never an error\n\
-           or a hang. Never loop calling `--refresh` waiting for a state\n\
-           change: the engine's own merge poller is what watches your PR to\n\
-           green after you push, not you — the same \"do not babysit CI\"\n\
-           principle your task prompt states applies here too.\n\
-         - `{boss} pr body` — the PR title and body/description Boss\n\
-           snapshotted when this run started, for a read-modify-write of\n\
-           the description without a `gh pr view` round trip. If the\n\
-           response's `body` is null (`--json`) or says \"(none stored)\"\n\
-           (text), it means this run began a brand-new PR flow — there is\n\
-           nothing to diff against yet, you are about to write the first\n\
-           description via `{cube} pr\n\
-           create --body-file`. It does NOT mean the PR has an empty\n\
-           description; an intentionally empty one is stored as `\"\"`, not\n\
-           null. Only fall back to `gh pr view --json body` if you must\n\
-           confirm the null case is not a fetch failure rather than a\n\
-           new-PR flow.\n\
-         \n\
-         If a `{boss}` command fails to run at all — not found, or it exits\n\
-         non-zero without answering — that is a finding, not noise. Say so\n\
-         explicitly in your final response and name the command. Do NOT\n\
-         quietly drop the step and carry on: a create-vs-update decision\n\
-         made without `{boss} pr status` is a decision made blind, and\n\
-         nobody downstream can tell that from a clean transcript.\n\
-         \n\
-         ## Your workspace\n\
-         \n\
-         - Workspace path: `{workspace}`\n\
-         - Cube lease id: `{lease}`\n\
-         \n\
-         Lease held for the lifetime of this run. Do not lease, release,\n\
-         or mutate cube state.\n\
-         \n\
-         {absolute_paths}\
-         \n\
-         ## VCS\n\
-         \n\
-         Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.\n\
-         \n\
-         - `jj git fetch` to sync; `jj new main@origin` for a fresh task;\n\
-           `jj edit <bookmark>` to resume.\n\
-         - `jj describe -m '...'` to set commit messages;\n\
-           `jj bookmark set <name> -r @` to create or advance a bookmark.\n\
-         - **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,\n\
-           `git push`, `gh pr create`). A PreToolUse hook blocks these. Use:\n\
-           - `{cube} pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)\n\
-           - `{cube} pr update --branch <name>` — existing PR (pushes new commits to it)\n\
-         - Never `jj git push --deleted` or `git push --delete`\n\
-           without explicit user approval.\n\
-         - `{config_dir}/` is gitignored by the engine. Do not force-track\n\
-           or commit anything inside it (no `--force`,\n\
-           no `jj file track {config_dir}/...`).\n\
-         \n\
-         ### Commit messages must be inline\n\
-         \n\
-         Always pass `-m \"…\"` to `git commit`, `git rebase`, `jj commit`,\n\
-         `jj describe`, and amend/squash flows (`git commit --amend`,\n\
-         `jj squash`, `jj split`). The worker environment has no usable\n\
-         `$EDITOR` — commands that fall through to one fail. Fix by\n\
-         re-running with `-m`.\n\
-         \n\
-         ## Creating a PR from a jj workspace\n\
-         \n\
-         Cube workspaces are secondary jj workspaces. There is no `.git/`\n\
-         at the workspace root, so bare `gh` calls fail with\n\
-         `fatal: not a git repository`. Use `{cube} pr create` instead —\n\
-         it resolves the remote `owner/repo` from `jj git remote` and\n\
-         passes `-R <owner/repo>` to `gh`, so no `GIT_DIR` guess is needed.\n\
-         \n\
-         ### Canonical PR creation recipe\n\
-         \n\
-         Write the PR body to a temp file — never embed it inline on the command\n\
-         line. This protects backticks, `$(...)`, and `${{VAR}}` from shell evaluation.\n\
-         \n\
-         ```sh\n\
-         jj describe -m \"your commit message\"\n\
-         jj bookmark set my-feature -r @\n\
-         body=$(mktemp)\n\
-         cat > \"$body\" << 'PRBODY'\n\
-         ## Summary\n\
-         Your description here. Inline code like `crate-name` and `$(cmd)` is safe.\n\
-         PRBODY\n\
-         {cube} pr create --branch my-feature --title \"Your PR title\" --body-file \"$body\"\n\
-         ```\n\
-         \n\
-         `{cube} pr create` is safe to retry: if an open PR already exists for\n\
-         the branch, it returns that PR's URL instead of erroring, without\n\
-         pushing again. Use `{cube} pr update` only when you have new commits\n\
-         to push onto an already-open PR (see below). `{cube} pr create` handles\n\
-         the push and `--allow-new` automatically; never call `jj git push` directly.\n\
-         \n\
-         To update an existing PR (push new commits to it):\n\
-         \n\
-         ```sh\n\
-         {cube} pr update --branch my-feature   # pushes to the PR; errors if none exists\n\
-         ```\n\
-         \n\
-         ### `origin` is the real GitHub upstream (shared object store)\n\
-         \n\
-         Every cube workspace is a **secondary jj workspace** that SHARES one\n\
-         object store with its siblings — there is no per-workspace clone. That\n\
-         store has a single `origin` remote pointing at the real GitHub upstream.\n\
-         \n\
-         - **Only use `{cube} pr create` / `{cube} pr update` for pushes and PR operations**:\n\
-           they push to GitHub by URL and resolve `-R <owner/repo>` for `gh`\n\
-           automatically, so PR creation Just Works without `.git/` at the root.\n\
-           Direct `jj git push`, `git push`, or `gh pr create` calls are blocked\n\
-           by a PreToolUse hook in every worker session.\n\
-         - Because the store is shared, a `jj git fetch` in ANY workspace\n\
-           advances the remote-tracking bookmarks (e.g. `main@origin`) seen by\n\
-           ALL of them. Don't be alarmed if refs move without you fetching.\n\
-         - A solid belt-and-suspenders check that a push actually landed is to\n\
-           compare your local commit against GitHub's head sha (do not infer\n\
-           success from the push command's own output alone):\n\
-         \n\
-         ```sh\n\
-         # local commit you intended to ship\n\
-         jj log -r my-feature --no-graph -T commit_id\n\
-         # what GitHub actually has (must match)\n\
-         gh api repos/<owner>/<repo>/branches/my-feature --jq .commit.sha\n\
-         # for a specific PR head:\n\
-         gh api repos/<owner>/<repo>/pulls/<n> --jq .head.sha\n\
-         ```\n\
-         \n\
-         ## Merge-conflict telemetry\n\
-         \n\
-         If you ever run `{cube} workspace rebase` mid-task (e.g. to sync with\n\
-         `main` before pushing, or because a push was rejected) and it reports\n\
-         `REBASED_WITH_CONFLICTS`, resolve the conflicts as normal, then\n\
-         AFTER resolving run:\n\
-         \n\
-         ```sh\n\
-         {boss} engine conflicts record-producer --execution-id <your execution id> \\\n\
-           --head-branch <branch> --base-branch <main_branch> --files <comma-separated conflicted paths>\n\
-         ```\n\
-         \n\
-         using the `branch`, `main_branch`, and conflicted-file list `cube\n\
-         workspace rebase` printed (or `jj resolve --list` if you need it\n\
-         again). This is telemetry only — best-effort, never blocks or\n\
-         reverts your actual work — but it is the only way the engine learns\n\
-         about conflicts you resolve on your own, before they'd ever reach\n\
-         the reviewed in-PR conflict-resolution flow.\n\
-         \n\
-         ## Reuse before you build\n\
-         \n\
-         Before implementing any cross-cutting capability (an API/HTTP client,\n\
-         config loading, caching, logging wiring, retry/backoff, or similar\n\
-         infrastructure), search the repo for an existing implementation\n\
-         first. If one exists, reuse or extend it instead of writing a new\n\
-         one. If duplication is genuinely necessary, say so explicitly in the\n\
-         PR description with the reason — a justified, operator-visible\n\
-         exception is the only way to avoid a \"revision required\"\n\
-         reuse/duplication finding from the automated reviewer.\n\
-         \n\
-         ## Boundaries\n\
-         \n\
-         - Do not modify files outside this workspace. Sibling workspaces\n\
-           belong to other workers.\n\
-         - Do not modify cube's database, lease state, or workspace registry.\n\
-         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
-           Never read, write, or touch it. Ask the coordinator for\n\
-           work-taxonomy context; do not query the DB yourself.\n\
-           `bossctl` is coordinator-only.\n\
-         \n\
-         ## Running Boss itself\n\
-         \n\
-         Never launch the installed `/Applications/Boss.app`, never `open -a\n\
-         Boss`, and never start an engine that can reach production state.\n\
-         This machine is someone's laptop: an unisolated app launch puts a\n\
-         window on their screen and terminates the engine they are using.\n\
-         Bare `bazel run //tools/boss/app-macos:Boss` (no isolation env) is\n\
-         also blocked.\n\
-         \n\
-         To exercise a real engine, start an isolated one:\n\
-         \n\
-         ```sh\n\
-         env -u BOSS_EVENTS_SOCKET {engine_bazel_run_command} -- \\\n\
-           --socket-path /tmp/boss-test-$(uuidgen).sock\n\
-         ```\n\
-         \n\
-         Any `--socket-path` other than the production socket puts the engine\n\
-         in test-fixture mode, where the db, events socket, pid file and\n\
-         control token are all derived from that socket's path — this\n\
-         includes the legacy `/tmp/boss-engine.sock`, which is a test\n\
-         fixture, not a safe alternative. Unset\n\
-         `BOSS_EVENTS_SOCKET` because your pane inherits one pointing at\n\
-         production. Point a client at the same `--socket-path` to drive it.\n\
-         \n\
-         To screenshot the real Boss UI quietly, launch an isolated capture\n\
-         instance (both env vars required):\n\
-         \n\
-         ```sh\n\
-         BOSS_SOCKET_PATH=/tmp/boss-shot-$(uuidgen).sock BOSS_ENGINE_AUTOSTART=0 \\\n\
-           bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png\n\
-         ```\n\
-         \n\
-         The instance renders itself in-process via `cacheDisplay` and exits;\n\
-         it never shows a window, never takes focus, and needs no\n\
-         screen-recording permission. Read the PNG back and state in the PR\n\
-         what you verified and what you could not.\n\
-         \n\
-         `bazel build` and `bazel test` are unaffected.\n\
-         \n\
-         ## Capturing a screenshot for your own verification\n\
-         \n\
-         **Do not commit capture PNGs** — and do not delete them either.\n\
-         Attach them:\n\
-         \n\
-         ```sh\n\
-         {boss} attach /tmp/shot.png --caption \"wide table, after the fix\"\n\
-         ```\n\
-         \n\
-         The engine stores the image outside this workspace (which is\n\
-         recycled after your run), for your own verification and for an\n\
-         operator looking at this run locally. `{boss} attach --list` shows\n\
-         what this work item already has, across runs.\n\
-         \n\
-         Validation is immediate and typed: a path outside this workspace or\n\
-         a temp dir, a file that is not really a PNG/JPEG, an oversize render,\n\
-         or a per-run cap all come back as an error you can fix and retry now,\n\
-         rather than a silent failure discovered after you are gone. Nothing\n\
-         is ever downscaled or truncated behind your back — an image is either\n\
-         stored exactly as you rendered it or refused.\n\
-         \n\
-         **Do not put an attachment URL — or any other localhost link — in a\n\
-         PR body.** The link it prints is only reachable on this machine;\n\
-         nobody reading the PR on GitHub can open it. This applies whether or\n\
-         not the evidence server is listening: if it isn't, the image is\n\
-         still stored, but that is still not a reason to paste a URL, describe\n\
-         the screenshot in prose, or inline it as base64 as a substitute. Where\n\
-         a PR body needs evidence a GitHub reader can actually open, use\n\
-         something that is — a CI artifact, a deploy preview, a code\n\
-         reference.\n\
-         \n\
-         ## Coordinator\n\
-         \n\
-         The coordinator may probe this session between turns. Treat probes\n\
-         as questions from a human reviewer — short, specific answers.\n\
-         {draft_directive}",
-        absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
-        boss = boss,
-        cube = cube,
-    )
-}
+pub use boss_execution_runner::worker_setup::{
+    WorkerKind, WorkerSetupInput, render_claude_md, worker_kind_for_execution,
+};
 
 /// Whether the worker settings should install the engine-data-dir
 /// sandbox: the `deny` globs over the Boss support dir plus the
@@ -891,6 +322,11 @@ fn settings_value(
             } else {
                 None
             },
+            git_store_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
+                Some(git_store_guard_script_path())
+            } else {
+                None
+            },
             is_revision,
             is_standard_worker: input.worker_kind == WorkerKind::Standard,
             is_reviewer: input.worker_kind == WorkerKind::Reviewer,
@@ -1002,6 +438,12 @@ fn permissions_value(input: &WorkerSetupInput, fence: DataDirFence) -> serde_jso
             "allow": review_guide_allow_rules(),
             "deny": deny_rules(input, fence),
         })
+    } else if input.worker_kind == WorkerKind::Progression {
+        serde_json::json!({
+            "defaultMode": "dontAsk",
+            "allow": progression_allow_rules(),
+            "deny": deny_rules(input, fence),
+        })
     } else if input.worker_kind == WorkerKind::AnswerAgent {
         serde_json::json!({
             "defaultMode": "dontAsk",
@@ -1091,6 +533,7 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
     // (see `claude::BOSS_LAUNCH_GUARD_COMMAND`), which is path-agnostic.
     rules.push("Bash(bossctl)".to_owned());
     rules.push("Bash(bossctl:*)".to_owned());
+    rules.push("Bash(boss handoff:*)".to_owned());
 
     // `boss` lifecycle verbs that bounce the engine out from under
     // the worker. The rest of the `boss` surface (list/show/etc.)
@@ -1123,6 +566,7 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
         WorkerKind::Triage => rules.extend(triage_deny_rules()),
         WorkerKind::AnswerAgent => rules.extend(answer_agent_deny_rules()),
         WorkerKind::ReviewGuide => rules.extend(review_guide_deny_rules()),
+        WorkerKind::Progression => rules.extend(progression_deny_rules()),
         WorkerKind::Standard => {}
     }
 
@@ -1263,12 +707,12 @@ import sys
     r#"
 
 MALFORMED = (
-    "Blocked (fail-closed): the Boss data-directory gate could not read this "
+    "Blocked (fail-closed): the data-directory gate could not read this "
     "tool call's payload, so it cannot tell whether the call targets the "
     "engine-owned data directory. Guards deny what they cannot parse rather "
     "than approving by default. Re-issue the operation as an ordinary shell "
-    "command or file edit, and report this payload shape to the operator -- it "
-    "means Boss guard wiring needs updating for this agent driver."
+    "command or file edit, and report this payload shape to the repo owner -- it "
+    "means guard wiring needs updating for this agent driver."
 )
 
 # Codex `apply_patch` header lines that name a target path. The patch body
@@ -1295,17 +739,15 @@ def patch_target_paths(patch):
     return found
 
 RECOVERY = (
-    "Blocked: direct access to the Boss data directory "
-    "(~/Library/Application Support/Boss) is not allowed from a coordinator "
-    "or worker session. That directory is engine-owned -- state.db, its "
+    "Blocked: direct access to the engine data directory "
+    "(~/Library/Application Support/Boss) is not allowed from this "
+    "session. That directory is engine-owned -- state.db, its "
     "-wal/-shm sidecars, the events socket, and engine pid/state files must "
     "never be read, copied, moved, edited, or opened by a session (no "
     "sqlite3, duckdb, litecli, sqlite-utils, cp/mv/rm, cat/head/tail/hexdump, "
-    "editors, lsof, etc.). To recover or inspect Boss state use the "
-    "sanctioned surface instead: ask the coordinator, file a shake with "
-    "'boss shake' describing what you need, or use the dedicated boss/bossctl "
-    "verb once it exists (e.g. 'boss task restore'). Do not work around this "
-    "gate."
+    "editors, lsof, etc.). If progress needs a human to inspect or recover "
+    "engine state, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"`. "
+    "Do not work around this gate."
 )
 
 # -- Broad-traversal boundary ------------------------------------------------
@@ -1356,12 +798,12 @@ RECURSIVE_LONG_FLAGS = frozenset((
 
 TRAVERSAL_RECOVERY = (
     "Blocked: this tool call starts a recursive directory walk rooted at %s, "
-    "which spans the operator's whole machine rather than the work. A Boss "
-    "worker reads inside its leased workspace, the cube workspace/repo "
-    "directories, and specific files a task names -- not the operator's home "
+    "which spans the whole machine rather than the work. This "
+    "session reads inside its leased workspace, the cube workspace/repo "
+    "directories, and specific files a task names -- not the machine owner's home "
     "directory, other users' home directories, mounted volumes, or /. A walk "
     "that wide also reads private files belonging to other people on a shared "
-    "Mac, and raises macOS privacy (TCC) prompts attributed to Boss for "
+    "Mac, and raises macOS privacy (TCC) prompts attributed to the app for "
     "Desktop, Documents, Downloads, Photos and network volumes. Re-run the "
     "search rooted at the directory you actually need -- the workspace root, "
     "or a named subdirectory under it. If you need one specific file outside "
@@ -1694,6 +1136,25 @@ def main():
         except Exception:
             tokens = command.split()
         candidates.extend(tokens)
+        # Arithmetic, subscripts and `[[ ]]` rebind BOSS_DATA_DIR without an
+        # assignment word. Bash joins backslash-newline first. In a command
+        # that expands the name, an arithmetic context that names it or holds
+        # any other expansion (which could compose the name) would make
+        # expandvars check the inherited path while bash opens another.
+        joined = raw_command.replace("\\\n", "")
+        data_dir_expansion = re.compile(r"\$(?:BOSS_DATA_DIR\b|\{BOSS_DATA_DIR\})")
+        data_dir_name = re.compile(r"(?<![A-Za-z0-9_])BOSS_DATA_DIR(?![A-Za-z0-9_])")
+        if data_dir_expansion.search(joined):
+            masked = data_dir_expansion.sub("", joined)
+            for context in (
+                r"\(\((.*?)(?:\)\)|\Z)",
+                r"\$\[(.*?)(?:\]|\Z)",
+                r"\[\[(.*?)(?:\]\]|\Z)",
+                r"\$\{[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[0-9]+|[@*])\]\})(.*?)(?:\]\}|\Z)",
+            ):
+                for found in re.finditer(context, masked, re.S):
+                    if "$" in found.group(1) or data_dir_name.search(found.group(1)):
+                        emit("block", RECOVERY)
     elif tool == "apply_patch":
         # Codex's freeform apply_patch: the patch body is the "command".
         patch = tool_input.get("command")
@@ -1777,7 +1238,8 @@ if __name__ == "__main__":
 ///
 /// The checkleft invocation is resolved from (in order): `BOSS_CHECKLEFT_BIN`
 /// (an override used by tests, used as-is); `repobin exec checkleft` via a
-/// `repobin` binary found at `<repo-root>/bin/repobin` or on `PATH`, but
+/// `repobin` binary found at `$BOSS_BIN_DIR/repobin` (the Boss-bundled copy),
+/// `<repo-root>/bin/repobin` or on `PATH`, in that order, but
 /// only once a cheap `repobin exec checkleft --version` probe confirms the
 /// dispatch actually works (see `probe_repobin_checkleft` below);
 /// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
@@ -1804,262 +1266,7 @@ if __name__ == "__main__":
 /// pushed. Probing with `--version` first, and falling back to the legacy
 /// `<repo-root>/bin/checkleft` / PATH resolution when it fails, keeps a
 /// broken repobin dispatch from taking down the push gate.
-const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
-"""Deterministic pre-push checkleft gate (Claude Code PreToolUse hook).
-
-Boss workers push with jj. `jj git push` is a native implementation that does
-not run git's pre-push hook, so an installed git hook is inert for the worker
-fleet. This hook restores the gate at the harness layer: it inspects every Bash
-command and, when the command is a push (`jj git push` or `git push`), runs the
-repository's checkleft against the outgoing changes before the push proceeds.
-If checkleft reports errors the push is blocked and the findings (plus bypass
-guidance) are echoed back so the worker can fix them or add a BYPASS_ directive.
-
-All policy lives in checkleft: this script shells out and trusts the exit code
-(0 = allow, non-zero = block). It is fail-open by construction -- a non-push
-command, a repo with no checkleft binary, or any error resolving/running
-checkleft all approve -- so the gate can never wedge a session; its only
-deterministic action is to block a push that checkleft itself rejected.
-
-The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
-stdout. The checkleft invocation is resolved from (in order) the
-BOSS_CHECKLEFT_BIN env var (used as-is), `repobin exec checkleft` via a
-`repobin` found at `<repo-root>/bin/repobin` or on PATH -- gated on a
-`repobin exec checkleft --version` probe succeeding first -- then
-`<repo-root>/bin/checkleft` (a repobin-installed tool symlink), and finally a
-bare `checkleft` on PATH. See resolve_checkleft_command()'s docstring for why
-repobin is preferred and why it is probed rather than trusted outright.
-"""
-import json
-import os
-import re
-import shlex
-import shutil
-import subprocess
-import sys
-
-# The probe (`repobin exec checkleft --version`) is what pays a cold
-# dispatch-cache miss: a full `bazel build //tools/checkleft:checkleft`, which
-# can run into the tens of seconds to a few minutes depending on host
-# contention. Budget generously for it since it runs at most once per push
-# (repobin's dispatch cache is content-hash keyed, so a warm cache after the
-# probe means the subsequent `run` invocation below hits it too). On timeout
-# the probe is treated as failed and resolution falls through to the legacy
-# bin/checkleft / PATH lookup -- it does NOT fail open, since a fallback
-# checkleft may still exist and would otherwise be skipped for no reason.
-CHECKLEFT_PROBE_TIMEOUT_SECONDS = 240
-
-# Once the probe above has (if needed) warmed the dispatch cache, the actual
-# `checkleft run` is a fast, already-built invocation -- measured at 85-95s on
-# this repo -- but this budget is kept well above that measurement (roughly
-# 3x headroom) rather than trimmed close to it, because a run timeout takes
-# the fail-open path below and silently approves an unchecked push, which is
-# exactly the outcome this gate exists to prevent. On timeout we fail open
-# (approve) rather than strand the session -- the cube verb gates are the
-# belt for that rare case.
-CHECKLEFT_TIMEOUT_SECONDS = 300
-
-ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-DELIMS = {"&&", "||", ";", "|", "&"}
-
-
-def emit(decision, reason=None):
-    out = {"decision": decision}
-    if reason is not None:
-        out["reason"] = reason
-    sys.stdout.write(json.dumps(out))
-    sys.exit(0)
-
-
-def command_groups(command):
-    try:
-        tokens = shlex.split(command, posix=True)
-    except Exception:
-        tokens = command.split()
-    groups = []
-    cur = []
-    for tok in tokens:
-        if tok in DELIMS:
-            if cur:
-                groups.append(cur)
-            cur = []
-        else:
-            cur.append(tok)
-    if cur:
-        groups.append(cur)
-    return groups
-
-
-def is_push_command(command):
-    # shlex tokenisation means a push phrase inside a quoted argument (a commit
-    # message, a --body string) is a single token and never matches, so
-    # `jj describe -m "git push the fix"` is correctly not treated as a push.
-    for group in command_groups(command):
-        i = 0
-        while i < len(group) and ENV_ASSIGN_RE.match(group[i]):
-            i += 1
-        rest = group[i:]
-        if not rest:
-            continue
-        prog = os.path.basename(rest[0])
-        if prog == "jj":
-            for j in range(1, len(rest) - 1):
-                if rest[j] == "git" and rest[j + 1] == "push":
-                    return True
-        elif prog == "git":
-            if "push" in rest[1:]:
-                return True
-    return False
-
-
-def find_repo_root(start):
-    cur = os.path.abspath(start)
-    while True:
-        if os.path.isdir(os.path.join(cur, ".jj")) or os.path.exists(os.path.join(cur, ".git")):
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            return os.path.abspath(start)
-        cur = parent
-
-
-def resolve_repobin(root):
-    candidate = os.path.join(root, "bin", "repobin")
-    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-        return candidate
-    return shutil.which("repobin")
-
-
-def probe_repobin_checkleft(repobin):
-    """Confirm `repobin exec checkleft` can actually dispatch before the
-    gate trusts it for the real `run` invocation.
-
-    `repobin exec checkleft` builds checkleft with `bazel build` on a
-    dispatch-cache miss. If that build fails (a broken crate elsewhere in
-    the tree, a bazel toolchain problem, a missing REPOBIN.toml entry),
-    `repobin exec checkleft run` itself exits non-zero with nothing on
-    stdout -- indistinguishable, from the gate's point of view, from a
-    checkleft "internal error" -- so it would hard-block every push with no
-    BYPASS_ escape, for a failure that has nothing to do with the change
-    being pushed. `--version` is cheap (no CHECKS.yaml / VCS context
-    needed) and shares the same on-disk dispatch cache as `run`, so probing
-    with it first pays the build cost at most once and never twice.
-    """
-    try:
-        proc = subprocess.run(
-            [repobin, "exec", "checkleft", "--version"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=CHECKLEFT_PROBE_TIMEOUT_SECONDS,
-        )
-        return proc.returncode == 0
-    except Exception:
-        return False
-
-
-def resolve_checkleft_command(root):
-    """Return the argv prefix that runs checkleft's `run` subcommand.
-
-    Preferred over a bare `checkleft` lookup: `repobin exec checkleft`
-    dispatches through repobin's normal build-from-source path (per
-    REPOBIN.toml), so it can never run a binary older than the current
-    source tree. A plain PATH search for `checkleft` has no such
-    guarantee -- it can resolve an unrelated, stale build (e.g. an old
-    `cargo install checkleft`) that still runs and still exits non-zero,
-    which fails the gate *closed* with "unknown implementation" errors
-    for every check added since that build, rather than failing open.
-
-    The repobin path is only used once `probe_repobin_checkleft` confirms
-    it actually works -- a repobin whose underlying bazel dispatch is
-    broken falls through to the legacy resolution below instead of taking
-    the whole push gate down with it.
-    """
-    override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
-    if override:
-        return [override] if os.path.exists(override) else None
-
-    repobin = resolve_repobin(root)
-    if repobin and probe_repobin_checkleft(repobin):
-        return [repobin, "exec", "checkleft"]
-
-    candidate = os.path.join(root, "bin", "checkleft")
-    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-        return [candidate]
-    which = shutil.which("checkleft")
-    return [which] if which else None
-
-
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        emit("approve")
-    if not isinstance(payload, dict):
-        emit("approve")
-    if (payload.get("tool_name") or "") != "Bash":
-        emit("approve")
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        emit("approve")
-    command = tool_input.get("command")
-    if not isinstance(command, str) or not command.strip():
-        emit("approve")
-    if not is_push_command(command):
-        emit("approve")
-
-    cwd = payload.get("cwd") or os.getcwd()
-    root = find_repo_root(cwd)
-    checkleft_cmd = resolve_checkleft_command(root)
-    if not checkleft_cmd:
-        # No checkleft available -> nothing to enforce (repo may not use it).
-        emit("approve")
-
-    try:
-        proc = subprocess.run(
-            checkleft_cmd + ["run"],
-            cwd=root,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=CHECKLEFT_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        # Could not run checkleft (timeout / exec error) -> fail open.
-        emit("approve")
-
-    if proc.returncode == 0:
-        emit("approve")
-
-    findings = (proc.stdout or "").strip()
-    extra = (proc.stderr or "").strip()
-    # Empty stdout with non-empty stderr means checkleft exited nonzero before
-    # producing any findings -- this is an internal/operational error (e.g. a
-    # VCS detection failure), not a policy violation. Use a clearly distinct
-    # message so users don't try to fix policy or reach for BYPASS unnecessarily.
-    if not findings:
-        reason = (
-            "Push blocked: checkleft internal error — this is "
-            "a bug, not a policy violation. Please report it.\n\n"
-            + extra
-        )
-    else:
-        reason = (
-            "Push blocked: checkleft found errors that must be fixed before "
-            "pushing to GitHub.\n\n"
-            + findings
-            + "\n\nFix the findings above and retry the push. If a finding is a "
-            "genuine false positive, add a `BYPASS_<CHECK_NAME>=<reason>` line to "
-            "your commit message (jj describe) or the PR description, then retry. "
-            "Do not bypass without a real justification."
-        )
-    emit("block", reason)
-
-
-if __name__ == "__main__":
-    main()
-"#;
+use boss_engine_driver::CHECKLEFT_PUSH_GUARD_SCRIPT;
 
 /// Directory holding all per-workspace worker settings files. The
 /// engine writes into it at spawn time and heals stale `boss-event`
@@ -2347,7 +1554,11 @@ fn prune_unreferenced_guard_dirs(dir: &Path, kind: &str, filename: &str, keep_di
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let referenced = referenced_guard_dir_names(dir);
+    // Read on first use. Finding what the settings files reference means
+    // reading every one of them, and this runs for each guard on every worker
+    // spawn; a directory holding only this build's guards has nothing to
+    // prune, so the common spawn reads none.
+    let mut referenced: Option<Vec<String>> = None;
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -2360,15 +1571,19 @@ fn prune_unreferenced_guard_dirs(dir: &Path, kind: &str, filename: &str, keep_di
         if !is_content_addressed_guard_dir_name(name, kind) {
             continue;
         }
-        if referenced.iter().any(|r| r == name) {
-            continue;
-        }
         let script = path.join(filename);
         let mtime = std::fs::metadata(&script)
             .and_then(|m| m.modified())
             .or_else(|_| std::fs::metadata(&path).and_then(|m| m.modified()));
         if let Ok(mtime) = mtime
             && now.duration_since(mtime).unwrap_or(Duration::ZERO) < GUARD_SCRIPT_PRUNE_GRACE
+        {
+            continue;
+        }
+        if referenced
+            .get_or_insert_with(|| referenced_guard_dir_names(dir))
+            .iter()
+            .any(|r| r == name)
         {
             continue;
         }
@@ -2393,11 +1608,12 @@ fn prune_unreferenced_guard_dirs(dir: &Path, kind: &str, filename: &str, keep_di
 }
 
 fn is_content_addressed_guard_dir_name(name: &str, kind: &str) -> bool {
-    let prefix = format!("{kind}-");
-    let Some(hash) = name.strip_prefix(&prefix) else {
+    // Allocation-free: a prune that does scan asks this of every token in
+    // every settings file under the directory.
+    let Some(hash) = name.strip_prefix(kind).and_then(|rest| rest.strip_prefix('-')) else {
         return false;
     };
-    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Directory names (`path-guard-<sha256>`, …) mentioned by any `*.json`
@@ -2420,6 +1636,7 @@ fn referenced_guard_dir_names(dir: &Path) -> Vec<String> {
         for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-') {
             if is_content_addressed_guard_dir_name(token, PATH_GUARD_KIND)
                 || is_content_addressed_guard_dir_name(token, CHECKLEFT_PUSH_GUARD_KIND)
+                || is_content_addressed_guard_dir_name(token, git_store_guard::GIT_STORE_GUARD_KIND)
             {
                 names.push(token.to_owned());
             }
@@ -2631,6 +1848,7 @@ pub fn write_workspace_files(
         // them whenever we materialise the settings file.
         ensure_path_guard_script_in(parent)?;
         ensure_checkleft_push_guard_script_in(parent)?;
+        ensure_git_store_guard_script_in(parent)?;
     }
     std::fs::write(&settings_path, render_settings_json(input, driver))?;
 
@@ -2641,15 +1859,7 @@ pub fn write_workspace_files(
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct WrittenFiles {
-    pub claude_md_path: PathBuf,
-    /// Absolute path to the worker settings file. Lives *outside* the
-    /// workspace (under [`worker_settings_dir`]); the runner threads it
-    /// into the spawn invocation as `claude --settings <path>`.
-    pub settings_path: PathBuf,
-    pub gitignore_path: PathBuf,
-}
+pub use boss_execution_runner::host::WrittenFiles;
 
 /// Convenience: absolute path to the per-lease `.claude/` dir.
 pub fn claude_dir_for(workspace: &Path) -> PathBuf {
@@ -2736,6 +1946,13 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
             dir = %settings_dir.display(),
             ?err,
             "failed to refresh checkleft push-guard script during settings heal",
+        );
+    }
+    if let Err(err) = ensure_git_store_guard_script_in(settings_dir) {
+        tracing::warn!(
+            dir = %settings_dir.display(),
+            ?err,
+            "failed to refresh shared-source-store guard script during settings heal",
         );
     }
 

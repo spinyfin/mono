@@ -1,0 +1,1949 @@
+//! Running an execution to completion: spawn, conflict-diagnosis capture,
+//! worker release, and run-completion bookkeeping. Part of the `coordinator`
+//! module split; see [`super`] for the struct and shared types.
+use super::spoke_in_doubt::execution_no_longer_runnable;
+use super::*;
+
+pub use boss_engine_storage_values::attention_kinds::PANE_SPAWN_FAILED_ATTENTION_KIND;
+
+/// Keep a previously successful diagnosis when a respawn re-probe fails.
+/// A transient fetch error must not wipe the file list the resolver prompt uses.
+fn keep_stored_conflict_diagnosis(
+    stored_json: Option<&str>,
+    new_diagnosis: &conflict_diagnosis::ConflictDiagnosis,
+) -> bool {
+    if new_diagnosis.error.is_none() {
+        return false;
+    }
+    stored_json
+        .and_then(|json| serde_json::from_str::<conflict_diagnosis::ConflictDiagnosis>(json).ok())
+        .is_some_and(|stored| stored.error.is_none())
+}
+
+/// Emit the per-product class counter only the first time a class is stored,
+/// or when a later successful probe changes it. Respawn must not inflate the metric.
+fn should_record_conflict_class(stored_class: Option<&str>, new_class: Option<&str>) -> bool {
+    match new_class {
+        Some(new) => stored_class != Some(new),
+        None => false,
+    }
+}
+
+fn pane_spawn_failed_attention_body(
+    exec_id: &str,
+    workspace_id: &str,
+    err: &anyhow::Error,
+    released: bool,
+    abort_unconfirmed: bool,
+) -> String {
+    let release_state = if released {
+        "released back to cube"
+    } else if abort_unconfirmed {
+        "intentionally retained because worker process teardown could not be confirmed. \
+         Manual recovery is required: confirm the worker has stopped, clean up its driver \
+         state, release the retained cube lease, and requeue the failed work item. \
+         The pool sweep only reclaims the slot; it does not perform workspace cleanup or requeue"
+    } else {
+        "still held by the engine (release failed — see the engine log)"
+    };
+    let err_detail = format!("{err:#}");
+    let lead = match boss_execution_contracts::spawn_confirmation_error(err) {
+        Some(boss_execution_contracts::SpawnConfirmationError::TurnDidNotStart { .. }) => {
+            format!(
+                "Execution `{exec_id}` leased workspace `{workspace_id}` and the driver started, \
+                 but spawn confirmation failed and the pane was reaped."
+            )
+        }
+        Some(boss_execution_contracts::SpawnConfirmationError::ComposerNotReady { .. }) => {
+            format!(
+                "Execution `{exec_id}` leased workspace `{workspace_id}`: spawn confirmation failed \
+                 and the pane was reaped."
+            )
+        }
+        Some(
+            boss_execution_contracts::SpawnConfirmationError::PromptNotSubmitted { .. }
+            | boss_execution_contracts::SpawnConfirmationError::RemotePromptNotSubmitted { .. }
+            | boss_execution_contracts::SpawnConfirmationError::PromptNotDelivered { .. },
+        ) => {
+            format!(
+                "Execution `{exec_id}` leased workspace `{workspace_id}` and the driver started, \
+                 but it never began working on its prompt, so the pane was reaped."
+            )
+        }
+        None => {
+            format!("Execution `{exec_id}` leased workspace `{workspace_id}` but the worker pane never came up.")
+        }
+    };
+    format!(
+        "{lead}\n\n**Error:** {err_detail}\n\nThe lease was {release_state}. Inspect \
+         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline."
+    )
+}
+
+impl ExecutionCoordinator {
+    // `change` is `None` for `pr_review` executions that checked out the PR
+    // head directly; `Some` for all other executions that created a jj change.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_run_execution(
+        self: &Arc<Self>,
+        execution: WorkExecution,
+        run: WorkRun,
+        work_item: WorkItem,
+        worker_id: String,
+        lease: CubeWorkspaceLease,
+        change: Option<CubeChangeHandle>,
+        adapter: Arc<dyn HostAdapter>,
+    ) {
+        let execution_id = execution.id.clone();
+        self.begin_driving_run(&execution_id);
+        let coordinator = Arc::clone(self);
+        let handle = boss_task_scope::spawn(async move {
+            coordinator
+                .run_execution(execution, run, work_item, worker_id, lease, change, adapter)
+                .await;
+        });
+        self.store_driving_handle(&execution_id, handle.abort_handle());
+    }
+
+    // Same argument list as `spawn_run_execution`; clippy counts the Arc receiver.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_execution(
+        self: Arc<Self>,
+        execution: WorkExecution,
+        run: WorkRun,
+        work_item: WorkItem,
+        worker_id: String,
+        lease: CubeWorkspaceLease,
+        change: Option<CubeChangeHandle>,
+        adapter: Arc<dyn HostAdapter>,
+    ) {
+        let _driving = DrivingRunGuard {
+            coordinator: Arc::clone(&self),
+            execution_id: execution.id.clone(),
+        };
+        // Keep the cube lease alive for blocking runners (in-process test)
+        // fakes, ACP-style runners). For pane-spawn (the production path),
+        // spawn_worker returns immediately and this guard is dropped below
+        // without ever firing — pane workers are covered instead by the
+        // engine-wide periodic sweep in `boss_engine::cube_lease_heartbeat`.
+        // See the HeartbeatGuard doc comment for the full coverage split.
+        let heartbeat = HeartbeatGuard::spawn(
+            Arc::clone(&adapter),
+            lease.lease_id.clone(),
+            execution.id.clone(),
+            run.id.clone(),
+            worker_id.clone(),
+        );
+
+        // Pre-spawn: collect the merge-tree diagnosis for revision_implementation
+        // executions with merge-conflict provenance so compose_revision_directive
+        // injects it into the worker prompt. No-op for other provenance.
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            self.collect_revision_conflict_diagnosis_pre_spawn(&execution, &work_item, &lease)
+                .await;
+        }
+
+        // Which (driver, worker kind) combination this spawn counts towards
+        // in the pre-start failure streak tracker. Resolved before the spawn
+        // so both outcomes below record against the same key.
+        let streak_key = self.pre_start_streak_key(&execution, &worker_id);
+
+        let timing = self.spoke_in_doubt_timing;
+        let mut unsettled_retries = 0_u32;
+        // Set once the spawn has been parked as in doubt: the pool slot was
+        // handed back then, so the tail below must not release it again.
+        let mut parked = false;
+        let mut last_uncertain: Option<SpawnOutcomeUncertain> = None;
+        let run_outcome = loop {
+            // Only after a spawn has been sent can a cancellation leave a worker
+            // that may still start. A failed read is not a cancellation.
+            if let Some(uncertain) = last_uncertain.as_ref() {
+                match execution_no_longer_runnable(&self.work_db, &execution.id) {
+                    Ok(true) => {
+                        break Err(anyhow::Error::new(uncertain.clone()).context(format!(
+                            "execution {} was cancelled or became terminal while its spoke spawn was in doubt",
+                            execution.id
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{error:#}"),
+                        "could not read the execution while its spoke spawn is in doubt; treating it as still runnable"
+                    ),
+                }
+            }
+            let outcome = adapter
+                .spawn_worker(
+                    &worker_id,
+                    &execution,
+                    &work_item,
+                    lease.workspace_path.as_path(),
+                    change.as_ref().map(|c| c.change_id.as_str()),
+                )
+                .await;
+            let uncertain = match outcome.as_ref().err() {
+                None => break outcome,
+                Some(error) => {
+                    match error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<SpawnOutcomeUncertain>())
+                    {
+                        Some(uncertain) => uncertain.clone(),
+                        // A failure on this side, before the host was asked
+                        // anything, says nothing about the spawn an earlier
+                        // attempt may have started: keep that uncertainty.
+                        None if last_uncertain.is_some()
+                            && error.chain().any(|cause| cause.is::<LocalSpawnFailure>()) =>
+                        {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                error = %format!("{error:#}"),
+                                "spoke spawn retry failed locally; the earlier in-doubt spawn stays in doubt"
+                            );
+                            last_uncertain.clone().expect("checked above")
+                        }
+                        None => break outcome,
+                    }
+                }
+            };
+            let detail = format!("{:#}", outcome.as_ref().unwrap_err());
+            if !parked && !uncertain.settled && unsettled_retries < SPOKE_UNSETTLED_RETRY_LIMIT {
+                unsettled_retries += 1;
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    command_id = %uncertain.command_id,
+                    attempt = unsettled_retries,
+                    error = %detail,
+                    "spoke spawn unanswered; reconciling the stored command"
+                );
+                last_uncertain = Some(uncertain);
+                tokio::time::sleep(timing.spawn_retry_sleep).await;
+                continue;
+            }
+            // The host has still not said whether the worker started. The
+            // execution is not failed and nothing is re-dispatched: it keeps
+            // its assignment, lease and persona, hands back only the local
+            // pool capacity, and keeps asking the host about the stored
+            // spawn until the host (or an Adopt of the session) answers.
+            if !parked {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    command_id = %uncertain.command_id,
+                    settled = uncertain.settled,
+                    error = %detail,
+                    "spoke spawn outcome unknown; parking the execution as in doubt"
+                );
+                self.park_in_doubt_spawn(&execution, &worker_id, outcome.as_ref().unwrap_err())
+                    .await;
+                parked = true;
+            }
+            last_uncertain = Some(uncertain);
+            tokio::time::sleep(timing.spawn_poll).await;
+        };
+        let cancelled_in_doubt = run_outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.chain().any(|cause| cause.is::<SpawnOutcomeUncertain>()));
+        if !cancelled_in_doubt {
+            // The host answered, one way or the other. Clear the sticky flag
+            // so the restart sweep stops treating the spawn as unanswered; this
+            // also covers a run resumed after a restart that was parked by a
+            // previous process.
+            if self.clear_spoke_in_doubt(&execution.id) || parked {
+                self.resolve_spoke_in_doubt_attention(&execution.id);
+            }
+        }
+        drop(heartbeat);
+
+        // Pane-spawn runs hand the slot to a live tmux worker; the
+        // WorkerPool slot must remain claimed until that pane is torn
+        // down by `ServerState::release_worker_pane` (completion, force
+        // release). Releasing it here would let a
+        // concurrent dispatch re-claim the same slot while the pane
+        // still owns it, and the app would reject `AttachWorkerPane`
+        // with `SlotBusy`. Non-pane runs (test fakes, future
+        // ACP-style runners) leave `slot_id = None` and still need
+        // the inline release.
+        let defer_pool_slot_release = matches!(
+            run_outcome.as_ref(),
+            Ok(outcome) if outcome.slot_id.is_some()
+        );
+        // A successful remote launch (`WorkerPaneAlive`, no local slot) frees
+        // the local dispatch-pool claim below, but the remote process keeps
+        // running: its persona lease and live-state entry must survive until
+        // terminal remote cleanup in `release_worker_pane`, or the persona could
+        // be handed to another worker while this one is still alive.
+        let remote_worker_alive = matches!(
+            run_outcome.as_ref(),
+            Ok(outcome) if outcome.slot_id.is_none()
+                && outcome.wait_state == RunWaitState::WorkerPaneAlive
+        );
+
+        // Set inside the `Err(err)` arm below once a `SlotBusy` pane-spawn
+        // rejection has actually been recorded as a terminal `failed`
+        // execution (i.e. `finish_execution_run` itself succeeded).
+        // Hoisted above the match so the tail of this function (worker-pool
+        // release decision) can see it after `run_outcome` is consumed.
+        // Deliberately left `false` if `finish_execution_run` errors: in
+        // that rare double-fault the execution may still be non-terminal
+        // in the DB, and holding the slot for a row `pool_claim_sweep`
+        // will never consider terminal would leak it forever — releasing
+        // normally is the safe fallback there.
+        let mut hold_slot_busy = false;
+        // Set when spawn teardown could not confirm the rejected worker
+        // is gone. A replacement dispatch would violate the single-worker
+        // invariant while that tmux process may still be alive.
+        let mut abort_unconfirmed = false;
+
+        match run_outcome {
+            // Mid-spawn cancel: the worker was cancelled while it
+            // was still spawning. The runner has already reaped the
+            // just-spawned pane; our job is to release the cube lease the
+            // cancel path deliberately left held (so a still-occupied
+            // workspace was never handed back to cube) and to skip the
+            // normal completion recording — the row is already
+            // `cancelled`, so `finish_execution_run` would reject it.
+            Ok(outcome) if outcome.wait_state == RunWaitState::CancelledDuringSpawn => {
+                self.lifecycle
+                    .teardown_driver_workspace(
+                        &execution.id,
+                        execution.workspace_path.as_deref().map(std::path::Path::new),
+                        TeardownReason::CancelledDuringSpawn,
+                    )
+                    .await;
+                let released = matches!(
+                    self.lifecycle
+                        .apply_proven_workspace_release(
+                            &execution,
+                            &lease.lease_id,
+                            TerminalCause::ProvenStopped,
+                            adapter.as_ref(),
+                        )
+                        .await,
+                    LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
+                );
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    released_workspace = released,
+                    "reconciled mid-spawn cancel: worker pane reaped, deferred lease released",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "cancelled_during_spawn": true,
+                                "released_workspace": released,
+                            })),
+                    )
+                    .await;
+                // The pane was already torn down by the runner (which
+                // also released the pool slot), and `defer_pool_slot_release`
+                // is false for this outcome (slot_id = None), so the tail
+                // below frees the pool slot idempotently.
+            }
+            Ok(outcome) => {
+                // The spawn got past every pre-start step, which ends any
+                // pre-start failure streak for this (driver, worker kind)
+                // and resolves its alert. Recorded first so nothing below
+                // can leave a stale alert up after a real success.
+                if let Some(resolved) = self.pre_start_streaks.record_success(&streak_key) {
+                    tracing::info!(
+                        driver = %resolved.driver,
+                        worker_kind = %resolved.worker_kind,
+                        consecutive_failures = resolved.consecutive_failures,
+                        first_failure_epoch_s = resolved.first_failure_epoch_s,
+                        execution_id = %execution.id,
+                        "pre-start spawn failure streak resolved: a spawn for this driver and worker \
+                         kind succeeded",
+                    );
+                }
+                // Capture the resolved spawn knobs (effort level,
+                // claude effort value, model) before `outcome` moves
+                // into `record_run_completion` — they ride along on
+                // the `pane_spawned` dispatch event below so a
+                // diagnose verb can answer "what did the worker
+                // actually launch with" without scraping process
+                // argv. `None` from test fake runners that don't go
+                // through `effort::resolve_spawn_config`.
+                let spawn_config_for_event = outcome.spawn_config.clone();
+                // If the runner allocated a real pane slot for this
+                // run, stamp it onto the run record's agent_id so
+                // `bossctl agents list` and related views show one
+                // entry per active pane. Test runners that don't
+                // allocate a pane leave slot_id as None and the
+                // worker-pool placeholder (worker_id) stays as the
+                // agent_id.
+                let run = if let Some(slot_id) = outcome.slot_id {
+                    let agent_id = worker_id_for_slot(slot_id);
+                    match self.work_db.set_run_agent_id(&run.id, &agent_id) {
+                        Ok(updated) => updated,
+                        Err(err) => {
+                            tracing::error!(
+                                ?err,
+                                execution_id = %execution.id,
+                                run_id = %run.id,
+                                slot_id,
+                                "failed to stamp pane slot onto run record"
+                            );
+                            run
+                        }
+                    }
+                } else {
+                    run
+                };
+                if let Some(spawn) = spawn_config_for_event.as_ref()
+                    && let Err(err) = self.work_db.record_execution_launch_config(
+                        &execution.id,
+                        &spawn.driver,
+                        &spawn.model,
+                        spawn.effort_level,
+                    )
+                {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        "failed to persist resolved worker launch configuration"
+                    );
+                }
+                if let Err(err) = self
+                    .record_run_completion(&execution, &run, &lease, &worker_id, outcome, &adapter)
+                    .await
+                {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        run_id = %run.id,
+                        worker_id = %worker_id,
+                        "failed to record execution completion"
+                    );
+                }
+                // Successful spawn → emit a structured `pane_spawned`
+                // event so consumers can pair it with the
+                // `cube_workspace_leased` event that preceded it and
+                // see the full timeline. The `spawn_config` details
+                // carry the effort + model tuple the dispatcher just
+                // resolved — design §Q2 calls this out explicitly so
+                // `bossctl dispatch diagnose <exec-id>` can answer
+                // "which model / effort did this worker actually
+                // launch with."
+                let mut details = serde_json::json!({
+                    "run_id": run.id,
+                    "slot_id": slot_id_from_worker_id(&worker_id),
+                    "page": slot_id_from_worker_id(&worker_id).and_then(worker_page_label),
+                });
+                if let Some(spawn) = spawn_config_for_event {
+                    details["spawn_config"] = serde_json::json!({
+                        "effort_level": spawn.effort_level.map(|level| level.as_str()),
+                        "effort_value": spawn.effort_value,
+                        // The capability signal is what actually picked the
+                        // model for any classified row, so the dispatch stream
+                        // has to carry it to answer *why* this model — without
+                        // it, an Opus spawn on a `small` row looks like a bug.
+                        // `null` here means the row was unclassified and the
+                        // legacy kind-floor / effort-table path chose instead.
+                        "reasoning": spawn.reasoning.map(|mode| mode.as_str()),
+                        "model": spawn.model,
+                        "model_source": spawn.model_source.as_str(),
+                        "driver": spawn.driver,
+                        "driver_source": spawn.driver_source.as_str(),
+                        "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
+                    });
+                }
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Ok, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(details),
+                    )
+                    .await;
+            }
+            // Cancelled (or otherwise ended) while the host had still not said
+            // whether the worker started. The stored spawn may yet run, so the
+            // workspace lease and driver state stay with the assignment: only
+            // a confirmed stop of the worker may release them. The row is
+            // already terminal, so there is no failure to record.
+            Err(err) if cancelled_in_doubt => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    cube_lease_id = %lease.lease_id,
+                    error = %format!("{err:#}"),
+                    "spoke spawn still in doubt when the execution ended; keeping the workspace lease",
+                );
+                // Whether or not the spawn was ever parked, the held lease and
+                // persona need an item that stays until a confirmed stop.
+                self.raise_spoke_in_doubt_attention(&execution, "worker spawn", &err, Duration::ZERO);
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "spawn_in_doubt": true,
+                                "released_workspace": false,
+                            })),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                // FIRST, before anything that can block or fail: say what
+                // went wrong, in the log and in the dispatch stream.
+                //
+                // Everything below this point — driver teardown, the cube
+                // release, `finish_execution_run` — is either slow (the cube
+                // release can run for minutes) or fallible (a cancel landing
+                // mid-release makes `finish_execution_run` reject the
+                // terminalizing write and take its `execution run failed` log
+                // line with it). Emitting here is what guarantees the abort
+                // reaches the log and the dispatch stream no matter what the
+                // tail does.
+                //
+                // `err` here is already a full anyhow chain naming the failing
+                // spawn step (prompt composition, driver provision, permission
+                // config, the initial-input script, or tmux session creation).
+                let err_detail = format!("{err:#}");
+                let slot_id = slot_id_from_worker_id(&worker_id);
+                // Reconciliation already retried stale occupants. A remaining
+                // rejection must be recorded as a spawn failure.
+                let slot_busy = slot_busy_occupant(&err).is_some();
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    slot_id,
+                    slot_busy,
+                    cube_lease_id = %lease.lease_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    error = %err_detail,
+                    "spawn aborted: run_execution failed during spawn or spawn confirmation; \
+                     tearing down and releasing the workspace",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::SpawnFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "slot_id": slot_id,
+                                "page": slot_id.and_then(worker_page_label),
+                            })),
+                    )
+                    .await;
+
+                // Count the failure towards its (driver, worker kind) streak.
+                // This is what turns "every spawn of this kind is failing"
+                // into one fleet-level alert instead of N unrelated
+                // per-execution failures nobody is looking at (incident
+                // 008). Purely a visibility signal: it changes nothing about
+                // how this failure is handled below, and it never pauses
+                // dispatch.
+                //
+                // `SlotBusy` is excluded for the same reason it does not
+                // count as a pre-start failure on the execution row: it is a
+                // self-healing engine/app slot desync, not evidence that
+                // this driver or worker kind cannot start.
+                if !slot_busy {
+                    let effect = self.pre_start_streaks.record_failure(
+                        streak_key.clone(),
+                        &execution.id,
+                        &err_detail,
+                        boss_engine_utils::epoch_time::now_epoch_secs(),
+                    );
+                    if effect != FailureEffect::BelowThreshold {
+                        tracing::error!(
+                            driver = %streak_key.driver,
+                            worker_kind = streak_key.worker_kind.label(),
+                            newly_raised = effect == FailureEffect::Raised,
+                            execution_id = %execution.id,
+                            error = %err_detail,
+                            "pre-start spawn failure streak: consecutive spawns for this driver and \
+                             worker kind have failed during spawn or spawn confirmation, with no worker starting its first turn",
+                        );
+                    }
+                }
+
+                // A rejected viewer may already have a running tmux process.
+                // If verified teardown failed, preserve its workspace and driver
+                // state for recovery rather than leasing them to another worker.
+                abort_unconfirmed = self.lifecycle.is_unconfirmed_spawn_abort(&err);
+                let released = if abort_unconfirmed {
+                    false
+                } else {
+                    // Pane-spawn-failure termination path: the run is
+                    // unconditionally terminal from here (marked `failed`
+                    // below regardless of whether the cube release below
+                    // succeeds), so tear down any driver-owned state outside
+                    // the workspace now — before the cube release, matching
+                    // `force_release`'s ordering, so a driver that derives
+                    // out-of-workspace state from the workspace path never
+                    // races a concurrent re-lease of the same workspace once
+                    // cube has it back.
+                    self.lifecycle
+                        .teardown_driver_workspace(
+                            &execution.id,
+                            Some(&lease.workspace_path),
+                            TeardownReason::SpawnFailed,
+                        )
+                        .await;
+                    matches!(
+                        self.lifecycle
+                            .apply_proven_workspace_release(
+                                &execution,
+                                &lease.lease_id,
+                                TerminalCause::ProvenStopped,
+                                adapter.as_ref(),
+                            )
+                            .await,
+                        LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
+                    )
+                };
+                // Persist the same full cause chain the abort log and
+                // attention body already use (`{err:#}`). `Display` without
+                // `#` would keep only the outermost context (e.g. pane_spawn's
+                // "writing permission/hook config…" wrapper) and drop the
+                // underlying refusal reason that last_error, the card and the
+                // JSON must show.
+                let error_text = err_detail.clone();
+
+                // A `SlotBusy` app rejection means the engine and the app
+                // disagree about this specific slot's occupancy — the app
+                // documents this as "the engine should reconcile rather
+                // than retry blindly" (see the doc comment on
+                // `WorkersWorkspaceModel.hostAttachedPane`).
+                // `ServerState::attach_worker_viewer` already treats a
+                // same-run SlotBusy as success and only detaches a
+                // provably stale occupant.
+                // It is an engine/app desync, not a genuine task or
+                // automation failure, so it is handled differently below:
+                // the work stays queued instead of bouncing to a terminal
+                // state, and the offending slot is held out of rotation
+                // (rather than freed) so the very next dispatch pass
+                // doesn't just re-select the same bad slot and repeat the
+                // rejection — see the tail of this function.
+                let is_slot_busy = slot_busy;
+                // Dialog refusals park the task in the same transaction as
+                // the run finish. Retrying the spawn would hit the same
+                // modal, so this path must not bounce the card to To-Do.
+                let blocking_dialog = boss_host_execution::worker::is_blocking_dialog_on_screen(&err);
+
+                // Historical silent-release path: a pane-spawn
+                // failure (tmux creation failure, viewer rejection, prompt
+                // composition error) inside `run_execution` marked
+                // the run `failed` and released the lease without
+                // raising anything the operator could see. Attach a
+                // `WorkAttentionItem` to this run so the failure
+                // turns up in the kanban "Attention" lane and via
+                // `ListAttentionItems`. The structured event below
+                // gives tooling a parallel signal.
+                let attention = Some(CreateAttentionItemInput {
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
+                    kind: PANE_SPAWN_FAILED_ATTENTION_KIND.to_owned(),
+                    status: None,
+                    title: "Worker pane failed to spawn".to_owned(),
+                    body_markdown: pane_spawn_failed_attention_body(
+                        &execution.id,
+                        &lease.workspace_id,
+                        &err,
+                        released,
+                        abort_unconfirmed,
+                    ),
+                    resolved_at: None,
+                });
+
+                match self.work_db.finish_execution_run(
+                    FinishExecutionRunInput::builder()
+                        .execution_id(&execution.id)
+                        .run_id(&run.id)
+                        .execution_status(ExecutionStatus::Failed)
+                        .run_status("failed")
+                        .error_text(error_text.as_str())
+                        .increment_pre_start_failure_count(!is_slot_busy)
+                        .record_last_error(true)
+                        .maybe_worker_failure_basis(
+                            blocking_dialog.then_some(crate::work::WorkerFailureBasis::BlockingDialogOnScreen),
+                        )
+                        .maybe_attention(attention)
+                        .build(),
+                ) {
+                    Ok((execution, _run, attention_item)) => {
+                        self.notify_review_guide_pre_start_failure(&execution);
+                        // Driver teardown ran before cube release unless the
+                        // worker abort was unconfirmed. That path deliberately
+                        // retains driver state and the lease for manual recovery.
+                        // The execution is now durably `failed` in the DB —
+                        // safe to have `pool_claim_sweep` own reclaiming this
+                        // slot instead of releasing it immediately (see the
+                        // `hold_slot_busy` declaration above and the tail of
+                        // this function).
+                        hold_slot_busy = is_slot_busy;
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            run_id = %run.id,
+                            worker_id = %worker_id,
+                            error = %err,
+                            released_workspace = released,
+                            "execution run failed"
+                        );
+                        // Keep the dispatch trace linked to the attention item,
+                        // which the work-item listing resolves through the execution
+                        // and, for review guides, its source series' root task.
+                        let attention_item_id = attention_item.as_ref().map(|item| item.id.clone());
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            execution_kind = %execution.kind,
+                            attention_item_id = attention_item_id.as_deref().unwrap_or(""),
+                            attention_kind = PANE_SPAWN_FAILED_ATTENTION_KIND,
+                            "filed pane_spawn_failed attention item for the failed spawn",
+                        );
+                        let mut error_details = serde_json::json!({
+                            "run_id": run.id,
+                            "attention_item_id": attention_item_id,
+                            "released_workspace": released,
+                            "slot_id": slot_id,
+                            "page": slot_id.and_then(worker_page_label),
+                            "pre_start_failure_count": execution.pre_start_failure_count,
+                            "transient_failure_count": execution.transient_failure_count,
+                        });
+                        // A `SlotBusy` spawn rejection means the engine and
+                        // the app disagree about slot occupancy — the
+                        // engine already knew which slot it requested
+                        // (`worker_id` above), but not which pane the app
+                        // reports as squatting it. Surface both explicitly
+                        // so `dispatch.jsonl` is self-diagnosing instead of
+                        // requiring a coordinator to cross-reference the
+                        // husk pane by hand.
+                        if let Some(occupying_run_id) = slot_busy_occupant(&err) {
+                            error_details["slot_busy"] = serde_json::json!({
+                                "slot_id": slot_id,
+                                "occupying_run_id": occupying_run_id,
+                            });
+                        }
+                        self.dispatch_events
+                            .emit(
+                                DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Error, &execution.id)
+                                    .with_work_item(&execution.work_item_id)
+                                    .with_worker(&worker_id)
+                                    .with_cube_lease(&lease.lease_id)
+                                    .with_cube_workspace(&lease.workspace_id)
+                                    .with_error(&err)
+                                    .with_details(error_details),
+                            )
+                            .await;
+                        // Clear the card out of `active`. The run is
+                        // already recorded `failed` and the workspace
+                        // released, but the work item itself stays
+                        // `active` — so the kanban keeps the green
+                        // "Doing" card and the orphan-active sweep
+                        // re-dispatches the same doomed spawn every
+                        // cycle. Demote it back to To-Do so the failure
+                        // (already surfaced as a `pane_spawn_failed`
+                        // attention item) is recoverable rather than a
+                        // silent green-flicker strand.
+                        //
+                        // Exception: PrReview spawn failures are engine
+                        // infrastructure bugs (e.g. slot-range mismatch),
+                        // not task regressions. Demoting the work item
+                        // here would silently move a reviewed PR back to
+                        // To-Do, erasing the review context. Leave the
+                        // task in place — the attention item already
+                        // surfaces the failure for the operator.
+                        //
+                        // Exception: a `SlotBusy` rejection is likewise an
+                        // engine-side infrastructure issue (see `is_slot_busy`
+                        // above), not a real dispatch failure of the task
+                        // itself — demoting to To-Do would require a human to
+                        // notice and manually re-drag the card. Leaving the
+                        // item `active` lets the tail of this function's
+                        // rescan (`rescan_active_dispatch_after_release`)
+                        // queue a fresh execution automatically, so the item
+                        // stays in Doing and dispatches onto the next free
+                        // slot exactly like a plain pool-exhaustion wait.
+                        if execution.kind != ExecutionKind::PrReview && !is_slot_busy && !blocking_dialog {
+                            match self.work_db.bounce_dispatch_failed_to_backlog(
+                                &execution.work_item_id,
+                                "pane_spawn_failed",
+                                error_text.as_str(),
+                            ) {
+                                Ok(true) => {
+                                    tracing::info!(
+                                        execution_id = %execution.id,
+                                        work_item_id = %execution.work_item_id,
+                                        "demoted work item to todo after pane-spawn failure",
+                                    );
+                                    self.dispatch_events
+                                        .emit(
+                                            DispatchEvent::new(
+                                                Stage::StatusTransition,
+                                                DispatchOutcome::Ok,
+                                                &execution.id,
+                                            )
+                                            .with_work_item(&execution.work_item_id)
+                                            .with_worker(&worker_id)
+                                            .with_details(
+                                                serde_json::json!({
+                                                    "from_status": "active",
+                                                    "to_status": "todo",
+                                                    "did_dispatch": false,
+                                                    "reason": "pane_spawn_failure",
+                                                    "failed_execution_id": execution.id,
+                                                }),
+                                            ),
+                                        )
+                                        .await;
+                                }
+                                Ok(false) => {}
+                                Err(demote_err) => tracing::error!(
+                                    ?demote_err,
+                                    work_item_id = %execution.work_item_id,
+                                    "failed to demote work item out of active after pane-spawn failure",
+                                ),
+                            }
+                        } else {
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                work_item_id = %execution.work_item_id,
+                                is_slot_busy,
+                                "skipping demote for pr_review, slot-busy, or blocking-dialog spawn failure",
+                            );
+                        }
+                        self.publisher
+                            .publish(
+                                &execution.id,
+                                &execution.work_item_id,
+                                execution.status.as_str(),
+                                "execution_run_failed",
+                            )
+                            .await;
+                        if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
+                            self.publisher
+                                .publish_work_item_changed(
+                                    item.product_id(),
+                                    &execution.work_item_id,
+                                    "execution_run_failed",
+                                )
+                                .await;
+                        }
+                        // A pane-spawn failure is terminal — the execution is
+                        // now `failed` and the workspace has been released. If
+                        // this was an automation triage run, the matching
+                        // `automation_runs` row is still sitting at the
+                        // pessimistic `failed_will_retry` that the scheduler
+                        // stamped when it dispatched the triage execution.
+                        //
+                        // A genuine spawn failure (bad config, tmux unavailable, …)
+                        // flips it to `failed_gave_up` so the Automations tab
+                        // shows an accurate terminal state instead of implying
+                        // a self-healing retry is pending — it will not
+                        // recover on its own. A `SlotBusy` rejection is the
+                        // opposite: it self-heals as soon as the offending
+                        // slot is reconciled (see the tail of this function),
+                        // so instead of giving up we fire a fresh triage
+                        // execution immediately — same automation, same repo
+                        // — and re-point this occurrence's `automation_runs`
+                        // row at it, mirroring `EngineTriageDispatcher::fire`
+                        // rather than waiting for the automation's next
+                        // scheduled occurrence.
+                        if execution.kind == ExecutionKind::AutomationTriage {
+                            if is_slot_busy && !abort_unconfirmed {
+                                match self.work_db.create_automation_triage_execution(
+                                    &execution.work_item_id,
+                                    &execution.repo_remote_url,
+                                ) {
+                                    Ok(retry_execution) => {
+                                        if let Err(err) =
+                                            self.work_db.requeue_automation_run_after_transient_spawn_failure(
+                                                &execution.id,
+                                                &retry_execution.id,
+                                                &format!("slot busy at spawn; requeued as {}", retry_execution.id),
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                execution_id = %execution.id,
+                                                retry_execution_id = %retry_execution.id,
+                                                ?err,
+                                                "failed to re-point automation run at retry execution after slot-busy spawn failure",
+                                            );
+                                        }
+                                        tracing::info!(
+                                            execution_id = %execution.id,
+                                            retry_execution_id = %retry_execution.id,
+                                            "requeued automation triage after slot-busy pane-spawn failure",
+                                        );
+                                    }
+                                    Err(create_err) => {
+                                        tracing::error!(
+                                            execution_id = %execution.id,
+                                            ?create_err,
+                                            "failed to create retry triage execution after slot-busy spawn failure; giving up",
+                                        );
+                                        if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
+                                            &execution.id,
+                                            boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                                            None,
+                                            Some(&format!(
+                                                "pane spawn failed: {error_text}; retry creation also failed: {create_err:#}"
+                                            )),
+                                        ) {
+                                            tracing::warn!(
+                                                execution_id = %execution.id,
+                                                ?finalize_err,
+                                                "failed to mark automation run failed_gave_up after retry-creation failure",
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if abort_unconfirmed {
+                                tracing::warn!(
+                                    execution_id = %execution.id,
+                                    "skipping automation triage replacement after unconfirmed spawn teardown",
+                                );
+                            } else if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
+                                &execution.id,
+                                boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                                None,
+                                Some(&format!("pane spawn failed: {error_text}")),
+                            ) {
+                                tracing::warn!(
+                                    execution_id = %execution.id,
+                                    ?finalize_err,
+                                    "failed to mark automation run failed_gave_up after pane-spawn failure",
+                                );
+                            }
+                        }
+                    }
+                    Err(record_err) => {
+                        // Double fault: the spawn failed AND the terminalizing
+                        // write was rejected (in the field: the row had been
+                        // cancelled during the minutes this arm spent in the
+                        // cube release, so `finish_execution_run` refused with
+                        // "cannot finish a run from status `cancelled`").
+                        //
+                        // Carry the original spawn error on this line too.
+                        // Without it, this arm was the one path where the
+                        // abort cause reached no log at all — the
+                        // `execution run failed` line that renders it lives in
+                        // the sibling `Ok` branch and never runs here. The
+                        // `spawn_failed` dispatch event emitted at the top of
+                        // this arm is the structured counterpart, and is
+                        // likewise unaffected by this failure.
+                        tracing::error!(
+                            ?record_err,
+                            execution_id = %execution.id,
+                            run_id = %run.id,
+                            worker_id = %worker_id,
+                            spawn_error = %err_detail,
+                            released_workspace = released,
+                            "failed to record execution run failure"
+                        );
+                    }
+                }
+            }
+        }
+
+        if !defer_pool_slot_release {
+            if hold_slot_busy {
+                // Do NOT hand the slot back to `select_claim_index` — the
+                // app just told us it still has a viewer attached there, so
+                // freeing it now would let the very next dispatch pass
+                // re-select the same slot and repeat the rejection (an
+                // effective blind retry loop). Instead leave the claim
+                // attributed to this (now terminal) execution: the existing
+                // pool-claim reconciler (`pool_claim_sweep::run_one_pass`)
+                // already frees exactly this shape of stuck claim — terminal
+                // execution, no live worker pane backing it — once its
+                // `LEAK_GRACE_SECS` grace period has passed and the engine
+                // has confirmed both process teardown and viewer detach.
+                // Still rescan + kick so OTHER free slots pick up the work
+                // this failure just requeued.
+                self.rescan_active_dispatch_after_release();
+                // `rescan_active_dispatch` only requeues items with
+                // `autostart = 1` — but `start_execution_run_on_host`
+                // consumes (clears) `autostart` the moment a run first
+                // starts (deliberate single-shot semantics: an item that
+                // already got its automatic shot doesn't respawn forever
+                // unattended). A `SlotBusy` desync isn't that case at
+                // all — it's the engine deciding, on the work item's
+                // behalf, that THIS dispatch attempt needs to be retried
+                // because it never really ran on the merits — so route
+                // around the autostart gate entirely for the ordinary
+                // task/chore/revision family by requesting a fresh
+                // execution directly. Excluded: `PrReview` (needs the
+                // dedicated re-fire path, not a plain `request_execution`,
+                // to land the right kind) and `AutomationTriage` /
+                // `AnswerAgent` (synthetic work items with no `tasks` row
+                // — `AutomationTriage` already got its own fresh execution
+                // above; `AnswerAgent` is unhandled here, matching its
+                // pre-existing scope). Also excluded: unconfirmed abort
+                // of a SlotBusy-rejected spawn (`ViewerAbortFailed`).
+                // Do not request a replacement while the rejected spawn may still run.
+                if !abort_unconfirmed
+                    && !matches!(
+                        execution.kind,
+                        ExecutionKind::PrReview | ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
+                    )
+                    && let Err(err) = self.work_db.request_execution(
+                        boss_protocol::RequestExecutionInput::builder()
+                            .work_item_id(execution.work_item_id.clone())
+                            .audit_basis("slot_busy_replacement")
+                            .build(),
+                    )
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "failed to queue a fresh execution after slot-busy pane-spawn failure",
+                    );
+                }
+                self.kick();
+            } else {
+                // Failed spawns can release immediately. Successful remote
+                // launches retain their lease until terminal remote cleanup;
+                // deferred local panes retain it until verified tmux teardown.
+                // A spawn still in doubt when the execution ended may yet start
+                // a worker under this persona, so persona and live-state
+                // tracking stay until a confirmed stop (see
+                // `reconcile_ended_in_doubt_spokes`).
+                if !remote_worker_alive && !cancelled_in_doubt {
+                    if let Some(states) = &self.live_worker_states {
+                        states.release_slot_for_run(&execution.id);
+                        states.release_persona_for_run(&execution.id);
+                    } else if let Err(error) = self.work_db.release_persona(&execution.id) {
+                        tracing::error!(execution_id = %execution.id, %error, "could not release persona after runner cleanup");
+                    }
+                }
+                if parked {
+                    // The pool slot went back when the spawn was parked; it may
+                    // be another execution's by now.
+                    self.rescan_active_dispatch_after_release();
+                    self.kick();
+                } else {
+                    self.release_worker_and_kick(&worker_id, &execution.id, Some(lease.workspace_id.as_str()))
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Hand back the local capacity a spawn in doubt holds and say so. The
+    /// execution stays running, with its assignment, lease, persona and live
+    /// state, so nothing can be dispatched onto its workspace and the stored
+    /// spawn can still be reconciled; only the pool slot (and with it the
+    /// dispatch pass) is freed.
+    async fn park_in_doubt_spawn(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str, err: &anyhow::Error) {
+        if let Ok(Some(assignment)) = self.work_db.spoke_assignment_for_execution(&execution.id)
+            && let Err(error) = self
+                .work_db
+                .set_spoke_in_doubt(&execution.id, assignment.assignment_generation, true)
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{error:#}"),
+                "could not flag the spoke assignment as in doubt"
+            );
+        }
+        self.raise_spoke_in_doubt_attention(execution, "worker spawn", err, Duration::ZERO);
+        self.pool_for_worker_id(worker_id)
+            .release_worker_if_execution(worker_id, &execution.id, None)
+            .await;
+        self.rescan_active_dispatch_after_release();
+        self.kick();
+    }
+
+    /// Phase 3 cutover: for revision_implementation executions with merge-conflict
+    /// provenance, resolve the linked `conflict_resolutions` row (via
+    /// `created_via = "merge-conflict:<crz_id>"`) and collect its diagnosis:
+    /// resolve the `conflict_resolutions` row a merge-conflict revision was
+    /// spawned from (via `created_via = "merge-conflict:<crz_id>"`) and
+    /// collect its diagnosis. No-op when the revision's provenance is not a
+    /// merge conflict (e.g. operator/CI-fix revisions). Respawns probe again:
+    /// the base branch may have advanced since the previous diagnosis.
+    async fn collect_revision_conflict_diagnosis_pre_spawn(
+        &self,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        lease: &CubeWorkspaceLease,
+    ) {
+        let created_via = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task.created_via.as_str(),
+            _ => return,
+        };
+        let Some(crz_id) = created_via.strip_prefix(boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX) else {
+            return;
+        };
+        let attempt = match self.work_db.get_conflict_resolution(crz_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    crz_id,
+                    "collect_conflict_diagnosis: revision's linked attempt row missing; skipping",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    crz_id,
+                    ?err,
+                    "collect_conflict_diagnosis: failed to look up revision's linked attempt; skipping",
+                );
+                return;
+            }
+        };
+        self.collect_conflict_diagnosis_for_attempt(&attempt, lease).await;
+    }
+
+    /// Fetch the base branch and collect a diagnosis in the leased workspace; persist
+    /// the result on `attempt`. Shared by the bespoke `conflict_resolution`
+    /// path and the Phase 3 merge-conflict revision path. Best-effort —
+    /// failures are logged but never propagate.
+    async fn collect_conflict_diagnosis_for_attempt(
+        &self,
+        attempt: &crate::work::ConflictResolution,
+        lease: &CubeWorkspaceLease,
+    ) {
+        let head_sha = attempt.head_sha_before.as_deref().unwrap_or("");
+        if attempt.base_branch.is_empty() || head_sha.is_empty() {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                "collect_conflict_diagnosis: missing base branch/head sha; skipping",
+            );
+            return;
+        }
+
+        let diagnosis =
+            match conflict_diagnosis::collect_current_base(&lease.workspace_path, &attempt.base_branch, head_sha).await
+            {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        workspace_path = %lease.workspace_path.display(),
+                        ?err,
+                        "collect_conflict_diagnosis: git spawn failed; using errored diagnosis",
+                    );
+                    conflict_diagnosis::ConflictDiagnosis::errored("", head_sha, format!("git spawn failed: {err}"))
+                }
+            };
+
+        if keep_stored_conflict_diagnosis(attempt.conflict_diagnosis.as_deref(), &diagnosis) {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                error = diagnosis.error.as_deref().unwrap_or("unknown"),
+                "collect_conflict_diagnosis: re-probe failed; keeping stored diagnosis",
+            );
+            return;
+        }
+
+        let json = match serde_json::to_string(&diagnosis) {
+            Ok(j) => j,
+            Err(err) => {
+                tracing::warn!(attempt_id = %attempt.id, ?err, "collect_conflict_diagnosis: failed to serialize diagnosis");
+                return;
+            }
+        };
+
+        match self.work_db.set_conflict_resolution_diagnosis(&attempt.id, &json) {
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "collect_conflict_diagnosis: failed to persist diagnosis; continuing without it",
+                );
+            }
+            Ok(updated) => {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    conflicted_files = diagnosis.files.len(),
+                    "collect_conflict_diagnosis: diagnosis persisted",
+                );
+                let counted = updated.and_then(|row| row.conflict_class.clone().map(|class| (row.product_id, class)));
+                if let Some((product_id, class)) = counted
+                    && should_record_conflict_class(attempt.conflict_class.as_deref(), Some(&class))
+                {
+                    self.lifecycle
+                        .record_conflict_class_counter(&self.metrics, &product_id, &class);
+                }
+            }
+        }
+    }
+
+    /// Release `worker_id` only while owned by `execution_id`, then rescan + kick to
+    /// pick up newly-eligible work. Used at the tail of non-pane
+    /// `run_execution` calls and from [`ServerState::release_worker_pane`]
+    /// for the deferred pane-spawn case. The WorkerPool free signal
+    /// follows token-verified tmux teardown and viewer detach, keeping
+    /// the slot occupied until the worker has been released.
+    /// A pane reaper and its spawn-failure tail can both reach this helper.
+    /// The first release wakes dispatch, so the second must not free a new
+    /// occupant or overwrite its workspace affinity.
+    pub async fn release_worker_and_kick(
+        self: &Arc<Self>,
+        worker_id: &str,
+        execution_id: &str,
+        last_workspace_id: Option<&str>,
+    ) {
+        if self
+            .pool_for_worker_id(worker_id)
+            .release_worker_if_execution(worker_id, execution_id, last_workspace_id)
+            .await
+        {
+            self.rescan_active_dispatch_after_release();
+            self.kick();
+        }
+    }
+
+    /// Pool-claim reconciler cleanup: free `worker_id` only if it is
+    /// still claimed by exactly `execution_id`, then rescan + kick if it
+    /// was actually freed. Returns whether the slot was released.
+    ///
+    /// The execution-id guard makes this safe against the re-claim race
+    /// the reconciler is exposed to (snapshot a leaked claim, release it
+    /// later) — see [`WorkerPool::release_worker_if_execution`]. The
+    /// rescan + kick only fire on a real release so a no-op (already
+    /// freed, or re-claimed by a live execution) doesn't churn the
+    /// scheduler.
+    pub async fn release_pool_claim_if_execution(self: &Arc<Self>, worker_id: &str, execution_id: &str) -> bool {
+        let released = self
+            .pool_for_worker_id(worker_id)
+            .release_worker_if_execution(worker_id, execution_id, None)
+            .await;
+        if released {
+            if let Err(error) = self.work_db.release_persona(execution_id) {
+                tracing::error!(execution_id, %error, "could not release persona for reconciled pool claim");
+            }
+            self.rescan_active_dispatch_after_release();
+            self.kick();
+        }
+        released
+    }
+
+    /// Steady-state rescan of `tasks.status = 'active'` work that
+    /// never made it onto a worker. The create-time path already
+    /// queues a `ready` execution and `kick()`s the scheduler, but a
+    /// chore whose dispatch failed (cube lease error, kanban drag
+    /// while the pool was full, worker died after starting) leaves
+    /// the kanban card in `active` with a *terminal* (or absent)
+    /// execution row — `list_ready_executions` skips it and `kick()`
+    /// alone is not enough to reanimate it. Running
+    /// [`WorkDb::rescan_active_dispatch`] before each kick fixes
+    /// that: items whose latest execution is terminal (or missing)
+    /// get a fresh `ready` row, and the scheduler picks them up on
+    /// the just-released worker. Errors are logged and swallowed —
+    /// the rescan is a best-effort opportunistic sweep, not a hard
+    /// invariant.
+    fn rescan_active_dispatch_after_release(&self) {
+        match self.work_db.rescan_active_dispatch() {
+            Ok(redispatched) if !redispatched.is_empty() => {
+                tracing::info!(
+                    count = redispatched.len(),
+                    ids = ?redispatched,
+                    "rescanned waiting active work after worker release",
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(?err, "active-dispatch rescan failed after worker release; continuing",);
+            }
+        }
+    }
+
+    async fn record_run_completion(
+        &self,
+        execution: &WorkExecution,
+        run: &WorkRun,
+        lease: &CubeWorkspaceLease,
+        worker_id: &str,
+        outcome: RunOutcome,
+        adapter: &Arc<dyn HostAdapter>,
+    ) -> Result<()> {
+        let release_workspace = outcome.wait_state.release_workspace();
+
+        // Normal-completion termination path: `release_workspace` (not
+        // `released` below) is the actual terminality signal — a park
+        // (`release_workspace == false`) correctly skips teardown, but a
+        // release that is *attempted* and merely fails to reach cube is
+        // still a terminated run, so teardown must not be gated on the cube
+        // call's own success. Runs before the cube release (matching
+        // `force_release`'s ordering) so a driver that derives
+        // out-of-workspace state from the workspace path never races a
+        // concurrent re-lease of the same workspace once cube has it back.
+        if release_workspace {
+            self.lifecycle
+                .teardown_driver_workspace(&execution.id, Some(&lease.workspace_path), TeardownReason::RunCompleted)
+                .await;
+        }
+
+        let released = if release_workspace {
+            matches!(
+                self.lifecycle
+                    .apply_proven_workspace_release(
+                        execution,
+                        &lease.lease_id,
+                        TerminalCause::ProvenCompleted,
+                        adapter.as_ref(),
+                    )
+                    .await,
+                LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease
+            )
+        } else {
+            false
+        };
+
+        let attention = outcome.attention.map(|attention| CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: attention.kind,
+            status: None,
+            title: attention.title,
+            body_markdown: attention.body_markdown,
+            resolved_at: None,
+        });
+
+        let (execution, run, attention) = self.work_db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(outcome.wait_state.execution_status())
+                .run_status("completed")
+                .maybe_result_summary(outcome.result_summary.as_deref())
+                .maybe_attention(attention)
+                .build(),
+        )?;
+
+        // NOTE: for a normal pane spawn this fires ~milliseconds after the
+        // pane comes up — the `WorkRun` tracks the engine's dispatch/spawn
+        // ACTION (a ~5-8s lifetime), NOT the worker's lifetime. `run_status`
+        // going `completed` here while `execution_status` is a LIVE park
+        // (`waiting_human` / `running`) is the worker handing off to its
+        // pane, not the worker finishing. The `parked_live` field makes that
+        // explicit so this line is not misread as "the worker terminalized
+        // 3ms after spawn" (the shell_pid-0-window false alarm); a genuine
+        // terminalization instead logs "execution terminalized: …".
+        tracing::info!(
+            execution_id = %execution.id,
+            run_id = %run.id,
+            worker_id,
+            execution_status = %execution.status,
+            run_status = %run.status,
+            parked_live = execution.status.is_live(),
+            attention_created = attention.is_some(),
+            released_workspace = released,
+            "execution run completed (dispatch/spawn run finalized; execution parks at its wait state — LIVE unless a terminal status is shown)"
+        );
+        self.publisher
+            .publish(
+                &execution.id,
+                &execution.work_item_id,
+                execution.status.as_str(),
+                "execution_run_completed",
+            )
+            .await;
+        if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
+            self.publisher
+                .publish_work_item_changed(item.product_id(), &execution.work_item_id, "execution_run_completed")
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Re-enter the pane-spawn path for a `running` execution that already
+    /// holds a cube lease. Used by startup recovery when the previous engine
+    /// process died after `start_execution_run` and before `start_worker`.
+    ///
+    /// Skips lease/repo-ensure/`start_execution_run` (those already
+    /// committed). Claims a pool slot, reconstructs the lease from the
+    /// execution row, and hands off to [`Self::run_execution`] the same way
+    /// a successful `schedule_execution` does after `run_started`.
+    pub async fn resume_pane_spawn_for_running_execution(self: &Arc<Self>, execution: &WorkExecution) -> Result<()> {
+        // The already-held workspace is the live source of truth. Resuming a
+        // pane must neither inspect legacy pointers nor reposition its edits.
+        let leaseless = !execution.kind.holds_cube_lease();
+        let lease_id = match execution.cube_lease_id.as_deref() {
+            Some(id) => id,
+            None if leaseless => "",
+            None => anyhow::bail!("cannot resume pane spawn for {}: missing cube_lease_id", execution.id),
+        };
+        let workspace_id = match execution.cube_workspace_id.as_deref() {
+            Some(id) => id,
+            None if leaseless => "",
+            None => anyhow::bail!(
+                "cannot resume pane spawn for {}: missing cube_workspace_id",
+                execution.id
+            ),
+        };
+        let workspace_path = execution
+            .workspace_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| anyhow!("cannot resume pane spawn for {}: missing workspace_path", execution.id))?;
+
+        let work_item = self.resolve_execution_work_item(execution)?;
+        let run = self
+            .work_db
+            .list_runs(&execution.id)?
+            .into_iter()
+            .rev()
+            .find(|run| run.status != "failed")
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot resume pane spawn for {}: no agent-session work_runs row",
+                    execution.id
+                )
+            })?;
+
+        let pool = self.pool_for_execution(execution);
+        let worker_id = match self.work_db.latest_run_agent_id_for_execution(&execution.id)? {
+            Some(agent_id) if pool.reclaim_slot(&agent_id, &execution.id).await => agent_id,
+            _ => {
+                let worker_id = pool
+                    .claim_worker(&execution.id, execution.cube_workspace_id.as_deref())
+                    .await
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cannot resume pane spawn for {}: no free worker slot in the {} pool",
+                            execution.id,
+                            self.attributed_pool_label(execution)
+                        )
+                    })?;
+                pool.mark_working(&worker_id).await;
+                worker_id
+            }
+        };
+
+        let host_id = self
+            .work_db
+            .latest_run_host_for_execution(&execution.id)?
+            .or_else(|| self.work_db.spoke_host_holding_execution(&execution.id).ok().flatten())
+            .unwrap_or_else(|| "local".to_owned());
+        let adapter = if host_id == "local" {
+            self.host_adapter()
+        } else {
+            let host = self.work_db.get_host(&host_id)?.ok_or_else(|| {
+                anyhow!(
+                    "cannot resume pane spawn for {}: host `{host_id}` is gone",
+                    execution.id
+                )
+            })?;
+            self.host_adapter_provider
+                .adapter_for_execution(&host, &execution.id)
+                .await?
+        };
+
+        if leaseless {
+            // A checkout-free run re-enters its own spawn path: the scratch
+            // directory is recreated (it lives in the temp dir) and nothing
+            // lease-shaped is built.
+            let scratch = boss_execution_contracts::progression_scratch::create_scratch_dir(&execution.id)?;
+            let execution = execution.clone();
+            let coordinator = Arc::clone(self);
+            boss_task_scope::spawn(async move {
+                coordinator
+                    .run_progression_execution(execution, run, work_item, worker_id, scratch, adapter)
+                    .await;
+            });
+            return Ok(());
+        }
+
+        let lease = CubeWorkspaceLease {
+            lease_id: lease_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            workspace_path: PathBuf::from(workspace_path),
+            dirty_verified: None,
+        };
+        self.spawn_run_execution(execution.clone(), run, work_item, worker_id, lease, None, adapter);
+        Ok(())
+    }
+}
+
+struct DrivingRunGuard {
+    coordinator: Arc<ExecutionCoordinator>,
+    execution_id: String,
+}
+
+impl Drop for DrivingRunGuard {
+    fn drop(&mut self) {
+        self.coordinator.forget_driving_run(&self.execution_id);
+    }
+}
+
+#[cfg(test)]
+mod pane_spawn_failed_attention_body_tests {
+    use super::pane_spawn_failed_attention_body;
+    use boss_execution_contracts::{
+        composer_not_ready_error, prompt_not_delivered_error, prompt_not_submitted_error, turn_did_not_start_error,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn an_unsubmitted_prompt_says_the_driver_started_but_never_began_work() {
+        let unsubmitted = prompt_not_submitted_error("claude", "exec-1", 2, Duration::from_secs(90));
+        let undelivered = prompt_not_delivered_error("claude", "exec-1", "the launcher reported a failure");
+        for (err, detail) in [
+            (unsubmitted, "Return re-sent 2 time(s)"),
+            (undelivered, "the launcher reported a failure"),
+        ] {
+            let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+            assert!(body.contains("never began working on its prompt"), "{body}");
+            assert!(body.contains("the pane was reaped"), "{body}");
+            assert!(!body.contains("never came up"), "{body}");
+            assert!(body.contains(detail), "{body}");
+        }
+    }
+
+    #[test]
+    fn composer_timeout_uses_neutral_wording() {
+        let err = composer_not_ready_error("claude", "exec-1", Duration::from_secs(20));
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        assert!(
+            body.contains("spawn confirmation failed and the pane was reaped"),
+            "{body}"
+        );
+        assert!(!body.contains("the driver started"), "{body}");
+        assert!(!body.contains("never came up"), "{body}");
+        assert!(body.contains("composer never became ready"), "{body}");
+    }
+
+    #[test]
+    fn turn_start_timeout_says_the_driver_started() {
+        let err = turn_did_not_start_error("claude", "exec-1", Duration::from_secs(45));
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        assert!(body.contains("the driver started"), "{body}");
+        assert!(body.contains("the pane was reaped"), "{body}");
+        assert!(!body.contains("never came up"), "{body}");
+        assert!(body.contains("no driver hook or session event"), "{body}");
+    }
+
+    #[test]
+    fn other_spawn_failure_says_the_pane_never_came_up() {
+        let err = anyhow::anyhow!("worker prompt failed");
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        assert!(body.contains("worker pane never came up"), "{body}");
+        assert!(!body.contains("the driver started"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod conflict_diagnosis_for_attempt_tests {
+    use super::*;
+    use crate::work::ConflictResolutionInsertInput;
+    use crate::work::test_support::{create_active_chore, create_product, open_db};
+    use boss_execution_contracts::{
+        CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceStatus, ExecutionPublisher, HostAdapter,
+        HostAdapterProvider, LeaseReleaseOutcome, LifecycleServices, LiveWorkerLiveness, PaneStatus, PidStatus,
+        ReattachSummary, RemoteLeaseReconcileOutcome, RunOutcome, TeardownReason, TerminalCause, WorkerPaneReleaser,
+    };
+    use boss_protocol::{WorkExecution, WorkItem};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[derive(Default)]
+    struct RecordingLifecycle {
+        classes: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LifecycleServices for RecordingLifecycle {
+        async fn apply_proven_workspace_release(
+            &self,
+            _: &WorkExecution,
+            _: &str,
+            _: TerminalCause,
+            _: &dyn HostAdapter,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn release_lease_after_proven_never_started(
+            &self,
+            _: &WorkExecution,
+            _: &str,
+            _: &dyn HostAdapter,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn release_refused_workspace(
+            &self,
+            _: &WorkExecution,
+            _: &str,
+            _: &dyn HostAdapter,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn release_lease_after_inferred_death(
+            &self,
+            _: &WorkExecution,
+            _: PaneStatus,
+            _: &dyn HostAdapter,
+            _: &str,
+        ) -> LeaseReleaseOutcome {
+            unimplemented!()
+        }
+        async fn refresh_predecessor_lease(
+            &self,
+            _: &WorkExecution,
+            _: Option<&dyn boss_execution_contracts::LiveWorkerLiveness>,
+            _: &dyn HostAdapterProvider,
+            _: Arc<dyn HostAdapter>,
+            _: bool,
+        ) {
+            unimplemented!()
+        }
+        async fn teardown_driver_workspace(&self, _: &str, _: Option<&Path>, _: TeardownReason) {}
+        fn report_bookmark_failure(&self, _: &WorkExecution, _: &str) {}
+        fn block_unrecoverable_bookmark(&self, _: &WorkExecution, _: &anyhow::Error) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn reconcile_if_execution_dead(&self, _: &WorkExecution, _: &dyn DispatchEventSink) -> bool {
+            false
+        }
+        async fn reconcile_if_pane_dead(
+            &self,
+            _: &WorkExecution,
+            _: &dyn DispatchEventSink,
+            _: i64,
+            _: Option<&dyn LiveWorkerLiveness>,
+        ) -> bool {
+            false
+        }
+        fn probe_pid(&self, _: i32) -> PidStatus {
+            PidStatus::Unknown
+        }
+        async fn reattach_remote_runs(&self, _: &dyn HostAdapterProvider, _: &str) -> ReattachSummary {
+            ReattachSummary::default()
+        }
+        async fn reconcile_remote_leases(
+            &self,
+            _: &dyn HostAdapterProvider,
+            _: &dyn DispatchEventSink,
+            _: Option<&dyn WorkerPaneReleaser>,
+        ) -> RemoteLeaseReconcileOutcome {
+            RemoteLeaseReconcileOutcome::default()
+        }
+        fn register_answer_agent_metrics(&self, _: &crate::metrics::Registry) {}
+        fn record_answer_agent_started(&self, _: &crate::metrics::Registry, _: u64) {}
+        fn record_conflict_class_counter(&self, _: &crate::metrics::Registry, product_id: &str, conflict_class: &str) {
+            self.classes
+                .lock()
+                .unwrap()
+                .push((product_id.to_owned(), conflict_class.to_owned()));
+        }
+        async fn notify_review_guide_changed(&self, _: &Arc<dyn ExecutionPublisher>, _: &str, _: &str) {}
+        fn is_unconfirmed_spawn_abort(&self, _: &anyhow::Error) -> bool {
+            false
+        }
+        async fn verify_deletion_tripwire(&self, _: &str, _: &str, _: &str, _: u64) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct UnusedHost;
+
+    #[async_trait::async_trait]
+    impl HostAdapter for UnusedHost {
+        fn host_id(&self) -> &str {
+            "local"
+        }
+        async fn ensure_repo(&self, _: &str) -> anyhow::Result<CubeRepoHandle> {
+            unimplemented!()
+        }
+        async fn lease_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+            _: &[&str],
+        ) -> anyhow::Result<CubeWorkspaceLease> {
+            unimplemented!()
+        }
+        async fn release_workspace(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn create_change(&self, _: &Path, _: &str) -> anyhow::Result<CubeChangeHandle> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn workspace_status(&self, _: &Path) -> anyhow::Result<CubeWorkspaceStatus> {
+            unimplemented!()
+        }
+        async fn list_workspaces(&self) -> anyhow::Result<Vec<CubeWorkspaceStatus>> {
+            Ok(vec![])
+        }
+        async fn list_repos(&self) -> anyhow::Result<Vec<CubeRepoSummary>> {
+            Ok(vec![])
+        }
+        fn command_repr(&self, _: &[&str]) -> Option<(String, String)> {
+            None
+        }
+        async fn spawn_worker(
+            &self,
+            _: &str,
+            _: &WorkExecution,
+            _: &WorkItem,
+            _: &Path,
+            _: Option<&str>,
+        ) -> anyhow::Result<RunOutcome> {
+            unimplemented!()
+        }
+    }
+
+    fn diagnosis_harness(db: crate::work::WorkDb) -> (ExecutionCoordinator, Arc<RecordingLifecycle>) {
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
+            Arc::new(db),
+            WorkerPool::new(1),
+            Arc::new(UnusedHost),
+            Arc::new(NoopExecutionPublisher),
+            Arc::clone(&lifecycle) as Arc<dyn LifecycleServices>,
+        );
+        (coordinator, lifecycle)
+    }
+
+    fn conflicting_fetched_base_fixture() -> (tempfile::TempDir, tempfile::TempDir, String, String, String) {
+        let remote = tempfile::tempdir().unwrap();
+        let repo = remote.path();
+        boss_engine_test_git::init_repo_with_branch(repo, "main");
+        git(repo, &["config", "user.email", "test@example.invalid"]);
+        git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.txt"), "original\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-m", "Initial"]);
+        let recorded_base = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("a.txt"), "feature\n").unwrap();
+        git(repo, &["commit", "-am", "Feature"]);
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        let workspace = tempfile::tempdir().unwrap();
+        git(workspace.path(), &["clone", repo.to_str().unwrap(), "."]);
+        git(repo, &["checkout", "main"]);
+        std::fs::write(repo.join("a.txt"), "main\n").unwrap();
+        git(repo, &["commit", "-am", "Conflicting main change"]);
+        let tip = git(repo, &["rev-parse", "HEAD"]);
+        (remote, workspace, recorded_base, head, tip)
+    }
+
+    #[test]
+    fn keep_stored_conflict_diagnosis_only_when_reprobe_errored() {
+        let good = conflict_diagnosis::ConflictDiagnosis {
+            schema_version: 2,
+            base_sha: "aaa".into(),
+            head_sha: "bbb".into(),
+            files: vec![conflict_diagnosis::ConflictedFile {
+                path: "a.txt".into(),
+                marker_count: None,
+                shape: "content".into(),
+            }],
+            error: None,
+        };
+        let stored = serde_json::to_string(&good).unwrap();
+        let failed = conflict_diagnosis::ConflictDiagnosis::errored("", "bbb", "base branch fetch failed");
+        assert!(keep_stored_conflict_diagnosis(Some(&stored), &failed));
+        assert!(!keep_stored_conflict_diagnosis(Some(&stored), &good));
+        assert!(!keep_stored_conflict_diagnosis(None, &failed));
+    }
+
+    #[test]
+    fn should_record_conflict_class_only_when_unset_or_changed() {
+        assert!(should_record_conflict_class(None, Some("lockfile")));
+        assert!(!should_record_conflict_class(Some("lockfile"), Some("lockfile")));
+        assert!(should_record_conflict_class(Some("lockfile"), Some("semantic")));
+        assert!(!should_record_conflict_class(Some("lockfile"), None));
+    }
+
+    #[tokio::test]
+    async fn fetched_base_probe_persists_the_remote_tip_not_the_recorded_base() {
+        let (_remote, workspace, recorded_base, head, tip) = conflicting_fetched_base_fixture();
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let chore = create_active_chore(&db, &product, "conflict");
+        let attempt = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(product.clone())
+                    .work_item_id(chore)
+                    .pr_url("https://github.com/foo/bar/pull/1")
+                    .pr_number(1)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger(recorded_base.clone())
+                    .head_sha_before(head.clone())
+                    .build(),
+            )
+            .unwrap()
+            .expect("pending attempt");
+        assert_ne!(recorded_base, tip, "the recorded base must be an ancestor of the tip");
+
+        let (coordinator, lifecycle) = diagnosis_harness(db);
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease".into(),
+            workspace_id: "ws".into(),
+            workspace_path: workspace.path().to_path_buf(),
+            dirty_verified: None,
+        };
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&attempt, &lease)
+            .await;
+
+        let stored = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        let diagnosis: conflict_diagnosis::ConflictDiagnosis =
+            serde_json::from_str(stored.conflict_diagnosis.as_deref().unwrap()).unwrap();
+        assert!(diagnosis.error.is_none(), "{diagnosis:?}");
+        assert_eq!(diagnosis.schema_version, 2);
+        assert_eq!(diagnosis.base_sha, tip);
+        assert_eq!(diagnosis.head_sha, head);
+        assert_eq!(diagnosis.files.len(), 1);
+        assert_eq!(diagnosis.files[0].path, "a.txt");
+        assert_eq!(
+            lifecycle.classes.lock().unwrap().as_slice(),
+            &[(product, "semantic".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_keeps_a_good_diagnosis_when_the_reprobe_fails() {
+        let (_remote, workspace, recorded_base, head, tip) = conflicting_fetched_base_fixture();
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let chore = create_active_chore(&db, &product, "conflict");
+        let attempt = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(product)
+                    .work_item_id(chore)
+                    .pr_url("https://github.com/foo/bar/pull/1")
+                    .pr_number(1)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger(recorded_base)
+                    .head_sha_before(head)
+                    .build(),
+            )
+            .unwrap()
+            .expect("pending attempt");
+
+        let (coordinator, lifecycle) = diagnosis_harness(db);
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease".into(),
+            workspace_id: "ws".into(),
+            workspace_path: workspace.path().to_path_buf(),
+            dirty_verified: None,
+        };
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&attempt, &lease)
+            .await;
+        git(workspace.path(), &["remote", "remove", "origin"]);
+        let stored = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&stored, &lease)
+            .await;
+
+        let after = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        let diagnosis: conflict_diagnosis::ConflictDiagnosis =
+            serde_json::from_str(after.conflict_diagnosis.as_deref().unwrap()).unwrap();
+        assert!(diagnosis.error.is_none(), "{diagnosis:?}");
+        assert_eq!(diagnosis.base_sha, tip);
+        assert_eq!(diagnosis.files[0].path, "a.txt");
+        assert_eq!(lifecycle.classes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_respawn_does_not_reemit_the_class_counter() {
+        let (_remote, workspace, recorded_base, head, _tip) = conflicting_fetched_base_fixture();
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let chore = create_active_chore(&db, &product, "conflict");
+        let attempt = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(product)
+                    .work_item_id(chore)
+                    .pr_url("https://github.com/foo/bar/pull/1")
+                    .pr_number(1)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger(recorded_base)
+                    .head_sha_before(head)
+                    .build(),
+            )
+            .unwrap()
+            .expect("pending attempt");
+
+        let (coordinator, lifecycle) = diagnosis_harness(db);
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease".into(),
+            workspace_id: "ws".into(),
+            workspace_path: workspace.path().to_path_buf(),
+            dirty_verified: None,
+        };
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&attempt, &lease)
+            .await;
+        let stored = coordinator
+            .work_db
+            .get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap();
+        coordinator
+            .collect_conflict_diagnosis_for_attempt(&stored, &lease)
+            .await;
+        assert_eq!(lifecycle.classes.lock().unwrap().len(), 1);
+    }
+}

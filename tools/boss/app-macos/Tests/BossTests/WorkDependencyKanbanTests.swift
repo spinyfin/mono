@@ -101,6 +101,8 @@ final class WorkDependencyKanbanTests: XCTestCase {
     /// and surfaces the engine's reason verbatim in the inline notice.
     func testAttemptDropForwardsGatedDragAndSurfacesEngineRefusal() {
         let model = makeFixture()
+        // This refusal answers an in-flight move, not a drag parked for Retry.
+        model.engine.simulateConnectedForTesting = true
         guard let dependent = model.taskByName("Phase 4") else {
             XCTFail("expected fixture"); return
         }

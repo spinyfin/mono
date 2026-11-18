@@ -84,11 +84,15 @@ pub async fn fetch_pr_changed_files(pr_url: &str) -> Result<Vec<String>> {
 /// transport used elsewhere in Boss. A missing fork head repository or any
 /// missing SHA is an error: source collection must not fall back to the
 /// mutable base repository or branch tip.
+///
+/// Sends `Cache-Control: no-cache` to request revalidation of the pulls response.
+/// Completion capture cross-checks `head.sha` against the delivered revision
+/// head or the live head from the head-ref fetch before pinning a packet.
 pub async fn fetch_pr_comparison_metadata(pr_url: &str) -> Result<PrComparisonMetadata> {
     let (owner, repo, number) = parse_pr_url_parts(pr_url)
         .with_context(|| format!("PR source capture requires a canonical GitHub PR URL, got `{pr_url}`"))?;
     let endpoint = format!("repos/{owner}/{repo}/pulls/{number}");
-    let output = gh_output(&["api", &endpoint]).await?;
+    let output = gh_output(&["api", "-H", "Cache-Control: no-cache", &endpoint]).await?;
     if !output.status.success() {
         bail!(
             "`gh api {endpoint}` failed (exit {:?}): {}",

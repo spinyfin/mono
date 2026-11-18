@@ -49,10 +49,9 @@ use boss_ssh_transport::shell_quote;
 use serde_json::json;
 
 use super::home::hooks_file_path;
-use crate::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND,
-    REVISION_PR_GUARD_COMMAND,
-};
+#[cfg(test)]
+use crate::claude::{BOSS_LAUNCH_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
+use crate::hook_guards::{guard_commands, write_executable};
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig};
 
 /// Filename of the canonicalisation adapter under `$GROK_HOME/hooks/`.
@@ -91,23 +90,8 @@ const GROK_HOOK_EVENTS: &[&str] = &[
 /// `tools/boss/event-shim`'s retry budget.
 pub const FORWARDER_HOOK_TIMEOUT_SEC: u64 = 15;
 
-/// Build the `boss-event` forwarder command line — byte-for-byte the same
-/// env-prefix shape [`crate::claude::ClaudeDriver`]'s
-/// `progress_observation_wiring` uses. The raw Grok payload is forwarded
-/// unchanged (see module docs for why).
-fn forwarder_command(config: &ProgressObservationConfig) -> String {
-    format!(
-        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
-        socket = shell_quote(&config.events_socket_path.display().to_string()),
-        lease = shell_quote(&config.lease_id),
-        run_id = shell_quote(&config.run_id),
-        workspace = shell_quote(&config.workspace_path.display().to_string()),
-        shim = shell_quote(&config.forwarder_binary.display().to_string()),
-    )
-}
-
 /// The forwarder-only hooks map: every [`GROK_HOOK_EVENTS`] entry wired to
-/// [`forwarder_command`], matcher `*`. Returned both by
+/// [`crate::hook_settings::forwarder_command`], matcher `*`. Returned both by
 /// [`super::GrokDriver::progress_observation_wiring`] (so the capability's
 /// declared wiring reflects what is actually installed) and used as the
 /// starting point for [`write_hooks`], which appends the guard entries onto
@@ -118,7 +102,7 @@ pub fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_json::Ma
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": forwarder_command(config),
+            "command": crate::hook_settings::forwarder_command(config),
             // Explicit on every event — critical on Stop, which otherwise
             // inherits Grok's 600s stop-gate default and can freeze the pane.
             "timeout": FORWARDER_HOOK_TIMEOUT_SEC,
@@ -129,95 +113,6 @@ pub fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_json::Ma
         hooks.insert((*event).to_owned(), json!([forward_hook.clone()]));
     }
     hooks
-}
-
-/// One unchanged Boss guard command plus the Grok matcher that should fire
-/// it (mirrors the matcher `claude::ClaudeDriver::tool_use_interception_wiring`
-/// uses for the same guard: Grok's matcher engine resolves the `Bash` alias
-/// to `run_terminal_command` — design §Hooks — so reusing `"Bash"` here fires
-/// on Grok shell calls without a Grok-specific matcher spelling).
-struct Guard {
-    command: String,
-    matcher: &'static str,
-}
-
-/// The five Boss `PreToolUse` guard commands, unchanged from Claude's. Order
-/// matches `claude::ClaudeDriver::tool_use_interception_wiring` exactly.
-/// Guards are omitted per the same rules Claude/Codex use (path guard +
-/// checkleft guard need their materialised script path; PR-redirect +
-/// checkleft are Standard-worker-only; revision guard is revision-only) —
-/// the Boss-launch guard is the only one that is always present, so this
-/// never returns empty as long as `config` reaches this function at all.
-fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
-    let mut out = Vec::new();
-
-    // 1. Path guard (data-dir sandbox). Matcher `*`: it inspects
-    //    file_path/notebook_path/path on every tool, not just Bash.
-    if let (Some(data_dir), Some(guard_script)) = (&config.data_dir, &config.path_guard_script) {
-        out.push(Guard {
-            command: format!(
-                "BOSS_DATA_DIR={dir} python3 {script}",
-                dir = shell_quote(&data_dir.display().to_string()),
-                script = shell_quote(&guard_script.display().to_string()),
-            ),
-            matcher: "*",
-        });
-    }
-
-    // 2. Boss-launch guard. Always on, all workers.
-    out.push(Guard {
-        command: BOSS_LAUNCH_GUARD_COMMAND.to_owned(),
-        matcher: "Bash",
-    });
-
-    // 3. PR-redirect guard. Standard workers only (local + remote).
-    if config.is_standard_worker {
-        out.push(Guard {
-            command: PR_REDIRECT_GUARD_COMMAND.to_owned(),
-            matcher: "Bash",
-        });
-    }
-
-    // 4. Checkleft push guard. Local Standard workers only.
-    if config.is_standard_worker
-        && let Some(checkleft_script) = &config.checkleft_guard_script
-    {
-        out.push(Guard {
-            command: format!(
-                "python3 {script}",
-                script = shell_quote(&checkleft_script.display().to_string())
-            ),
-            matcher: "Bash",
-        });
-    }
-
-    // 5. Reviewer static-analysis guard. The shared Claude command is run by
-    // Grok's adapter, so the three drivers enforce the same command policy.
-    if config.is_reviewer {
-        out.push(Guard {
-            command: REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND.to_owned(),
-            matcher: "Bash",
-        });
-    }
-
-    // 6. Revision PR guard.
-    if config.is_revision {
-        out.push(Guard {
-            command: REVISION_PR_GUARD_COMMAND.to_owned(),
-            matcher: "Bash",
-        });
-    }
-
-    if config.is_review_guide {
-        out.push(Guard {
-            command: format!(
-                "python3 -c {}",
-                shell_quote(&crate::codex::codex_review_guide_guard_script())
-            ),
-            matcher: ".*",
-        });
-    }
-    out
 }
 
 /// Write the canonicalisation adapter script and the full hooks wiring
@@ -258,9 +153,16 @@ pub fn write_hooks(
             adapter = shell_quote(&adapter_path.display().to_string()),
             guard = shell_quote(&guard.command),
         );
+        let mut hook = json!({
+            "type": "command",
+            "command": wrapped_command,
+        });
+        if let Some(timeout) = guard.timeout_sec {
+            hook["timeout"] = json!(timeout);
+        }
         pre_tool_use.push(json!({
             "matcher": guard.matcher,
-            "hooks": [{"type": "command", "command": wrapped_command}],
+            "hooks": [hook],
         }));
     }
 
@@ -270,18 +172,6 @@ pub fn write_hooks(
         .with_context(|| format!("writing {}", hooks_path.display()))?;
 
     Ok(vec![hooks_path, adapter_path])
-}
-
-fn write_executable(path: &Path, body: &str) -> anyhow::Result<()> {
-    fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).with_context(|| format!("chmod +x {}", path.display()))?;
-    }
-    Ok(())
 }
 
 /// The driver-owned canonicalisation adapter (design T-09 / A-2).
@@ -475,7 +365,7 @@ def main():
     # quoting, exactly as it would if Claude's hook runner invoked it
     # directly. No timeout is imposed here beyond whatever the outer Grok
     # hook runner enforces: the checkleft push guard already carries its own
-    # multi-minute internal timeout budget and fails open on its own terms;
+    # two-hour internal timeout budget and fails open on its own terms;
     # an adapter-imposed shorter timeout would cut that budget short and
     # fail-closed a guard that was about to fail open correctly on its own.
     try:
@@ -502,12 +392,14 @@ if __name__ == "__main__":
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude::{PR_REDIRECT_GUARD_COMMAND, PR_REDIRECT_REVISION_ENV};
 
     fn interception_config(overrides: impl FnOnce(&mut ToolUseInterceptionConfig)) -> ToolUseInterceptionConfig {
         let mut config = ToolUseInterceptionConfig {
             data_dir: None,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
@@ -543,6 +435,103 @@ mod tests {
         assert_eq!(guards[1].command, BOSS_LAUNCH_GUARD_COMMAND);
         assert_eq!(guards[2].command, PR_REDIRECT_GUARD_COMMAND);
         assert!(guards[3].command.contains("boss-checkleft-push-guard.py"));
+        assert_eq!(
+            guards[3].timeout_sec,
+            Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
+            "checkleft hook must outlive a contended Bazel compile"
+        );
+        assert!(
+            guards.iter().take(3).all(|g| g.timeout_sec.is_none()),
+            "ordinary guards retain the CLI default timeout"
+        );
+    }
+
+    #[test]
+    fn guard_commands_places_git_store_guard_after_the_path_guard() {
+        let config = interception_config(|c| {
+            c.data_dir = Some(PathBuf::from("/tmp/boss-data"));
+            c.path_guard_script = Some(PathBuf::from("/tmp/settings/boss-path-guard.py"));
+            c.git_store_guard_script = Some(PathBuf::from("/tmp/settings/boss-git-store-guard.py"));
+        });
+        let guards = guard_commands(&config);
+        assert_eq!(guards.len(), 4, "path + git store + launch + pr-redirect: {config:?}");
+        assert!(
+            guards[1].command.contains("BOSS_WORKSPACE='/tmp/ws'"),
+            "{}",
+            guards[1].command
+        );
+        assert!(
+            guards[1]
+                .command
+                .contains("python3 '/tmp/settings/boss-git-store-guard.py'"),
+            "{}",
+            guards[1].command
+        );
+        assert_eq!(guards[1].matcher, "Bash");
+        assert_eq!(guards[2].command, BOSS_LAUNCH_GUARD_COMMAND);
+    }
+
+    /// Acceptance: the shared-source-store gate, reached through the
+    /// unmodified Grok adapter with a raw `run_terminal_command` payload,
+    /// refuses the incident shapes and lets read-only git through.
+    #[test]
+    fn git_store_guard_refuses_store_writes_via_grok_payload() {
+        if !python3_available() {
+            eprintln!("python3 not available; skipping adapter acceptance test");
+            return;
+        }
+        let layout = crate::git_store_guard::tests::cube_layout();
+        let config = interception_config(|c| {
+            c.git_store_guard_script = Some(layout.script.clone());
+            c.workspace_path = Some(layout.workspace.clone());
+            c.is_standard_worker = false;
+        });
+        let guards = guard_commands(&config);
+        let guard = guards
+            .iter()
+            .find(|g| g.command.contains(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME))
+            .expect("shared-source-store guard must be armed");
+        let adapter_path = write_adapter_script(layout.dir.path());
+        let store = layout.store.display().to_string();
+        let decide = |command: String| -> (String, String) {
+            let payload = json!({
+                "hookEventName": "pre_tool_use",
+                "sessionId": "s-1",
+                "cwd": layout.workspace.display().to_string(),
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": command},
+            });
+            let (code, stdout, stderr) = run_adapter(&adapter_path, &guard.command, &payload, true);
+            assert_eq!(code, 0, "stderr={stderr}");
+            let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+            (
+                decision["decision"].as_str().unwrap_or_default().to_owned(),
+                decision["reason"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+        for command in [
+            format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
+            format!("cd {store} && git fetch --depth=200 origin main"),
+            format!("git -C {store} checkout main"),
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::bypass_commands(&layout))
+        {
+            let (decision, reason) = decide(command.clone());
+            assert_eq!(decision, "deny", "{command}: {reason}");
+            assert!(reason.contains("jj"), "{command}: {reason}");
+        }
+        for command in [
+            format!("git --git-dir {store}/.git log -1"),
+            format!("GIT_DIR={store}/.git git show HEAD:README.md"),
+            "jj git fetch".to_owned(),
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::approved_commands(&layout))
+        {
+            let (decision, reason) = decide(command.clone());
+            assert_eq!(decision, "allow", "{command}: {reason}");
+        }
     }
 
     #[test]
@@ -550,6 +539,11 @@ mod tests {
         let config = interception_config(|c| c.is_revision = true);
         let guards = guard_commands(&config);
         assert_eq!(guards.len(), 3, "launch + pr-redirect + revision: {config:?}");
+        assert!(
+            guards[1].command.starts_with(&format!("{PR_REDIRECT_REVISION_ENV}=1 ")),
+            "revision PR-redirect must set {PR_REDIRECT_REVISION_ENV}: {}",
+            guards[1].command
+        );
         assert_eq!(guards.last().unwrap().command, REVISION_PR_GUARD_COMMAND);
     }
 
@@ -689,6 +683,40 @@ mod tests {
         assert!(guard_1.contains("BOSS_DATA_DIR="));
         let guard_2 = pre_tool_use[2]["hooks"][0]["command"].as_str().unwrap();
         assert!(guard_2.contains("python3 -c"));
+    }
+
+    #[test]
+    fn write_hooks_gives_checkleft_a_two_hour_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let grok_home = tmp.path().join("grok-home");
+        fs::create_dir_all(&grok_home).unwrap();
+        let obs_config = ProgressObservationConfig {
+            events_socket_path: PathBuf::from("/tmp/events.sock"),
+            lease_id: "lease-1".into(),
+            run_id: "run-1".into(),
+            workspace_path: PathBuf::from("/tmp/ws"),
+            forwarder_binary: PathBuf::from("/tmp/boss-event"),
+        };
+        let interception = interception_config(|c| {
+            c.checkleft_guard_script = Some(PathBuf::from("/tmp/settings/boss-checkleft-push-guard.py"));
+        });
+        write_hooks(&grok_home, &obs_config, &interception).unwrap();
+        let hooks_doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(hooks_file_path(&grok_home)).unwrap()).unwrap();
+        let pre_tool_use = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
+        let checkleft = pre_tool_use
+            .iter()
+            .find(|entry| {
+                entry["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("boss-checkleft-push-guard.py"))
+            })
+            .expect("standard worker must arm the checkleft push guard");
+        assert_eq!(
+            checkleft["hooks"][0]["timeout"].as_u64(),
+            Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
+            "Grok must not cut the checkleft gate at a short default: {checkleft}"
+        );
     }
 
     fn python3_available() -> bool {
@@ -926,16 +954,23 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let adapter_path = write_adapter_script(tmp.path());
 
-        let payload = json!({
-            "hookEventName": "pre_tool_use",
-            "toolName": "run_terminal_command",
-            "toolInput": {"command": "open -a Boss"},
-        });
+        for command in [
+            "open -a Boss",
+            "open -a Boss # it's installed",
+            "# don't restart\n\"$BOSS_BIN\" engine stop",
+            "echo 'unterminated\nopen -a Boss",
+        ] {
+            let payload = json!({
+                "hookEventName": "pre_tool_use",
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": command},
+            });
 
-        let (code, stdout, _stderr) = run_adapter(&adapter_path, BOSS_LAUNCH_GUARD_COMMAND, &payload, true);
-        assert_eq!(code, 0);
-        let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
-        assert_eq!(decision["decision"], "deny", "must refuse to launch Boss.app: {stdout}");
+            let (code, stdout, _stderr) = run_adapter(&adapter_path, BOSS_LAUNCH_GUARD_COMMAND, &payload, true);
+            assert_eq!(code, 0);
+            let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+            assert_eq!(decision["decision"], "deny", "must refuse to launch Boss.app: {stdout}");
+        }
     }
 
     /// Path guard: a `write` tool call targeting a path under the Boss data

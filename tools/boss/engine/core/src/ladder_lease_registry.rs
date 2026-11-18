@@ -44,7 +44,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::coordinator::{CubeClient, CubeWorkspaceLease};
+use boss_execution_contracts::CubeClient;
+
+use boss_host_execution::types::CubeWorkspaceLease;
 
 static ACTIVE_LEASES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 

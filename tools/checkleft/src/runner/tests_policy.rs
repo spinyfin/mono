@@ -503,7 +503,7 @@ allow_bypass = true
 
     let bypass_results = runner
         .run_changeset(
-            &oversized.with_commit_description(Some(
+            &oversized.clone().with_commit_description(Some(
                 "BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
             )),
         )
@@ -527,6 +527,28 @@ allow_bypass = true
             .any(|r| r.contains("Coordinated rename")),
         "bypass reason should be recorded; got {:?}",
         bypassed.findings[0].remediations
+    );
+
+    // Bypass reasons are free-form text: a numeric prefix is not parsed as a
+    // limit, and the whole value is recorded verbatim as the reason.
+    let numeric_reason = "2:Coordinated rename with a numeric-looking prefix.";
+    let numeric_results = runner
+        .run_changeset(&oversized.with_commit_description(Some(format!("BYPASS_CHANGE_FILE_COUNT={numeric_reason}"))))
+        .await
+        .expect("run with numeric-prefixed bypass reason");
+    let numeric_bypassed = numeric_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran with numeric-prefixed bypass");
+    assert_eq!(numeric_bypassed.findings.len(), 1);
+    assert_eq!(numeric_bypassed.findings[0].severity, Severity::Warning);
+    assert!(
+        numeric_bypassed.findings[0]
+            .remediations
+            .iter()
+            .any(|r| r.contains(numeric_reason)),
+        "numeric-prefixed reason should be recorded verbatim; got {:?}",
+        numeric_bypassed.findings[0].remediations
     );
 }
 

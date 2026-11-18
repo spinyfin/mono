@@ -52,6 +52,14 @@ pub struct BoardRow {
     pub merge_queue_state: Option<String>,
 }
 
+/// Whether a blocked reason belongs to the PR review phase.
+pub fn is_review_phase_blocked_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("merge_conflict" | "ci_failure" | "ci_failure_exhausted" | "review_feedback")
+    )
+}
+
 impl BoardRow {
     /// `true` when the row is blocked for a review-phase reason: it has an
     /// open PR and the block is transient (conflict resolution, a CI fix, or
@@ -59,10 +67,7 @@ impl BoardRow {
     ///
     /// Mirror of `WorkTask.isReviewPhaseBlocked` in the macOS client.
     fn is_review_phase_blocked(&self) -> bool {
-        matches!(
-            self.blocked_reason.as_deref(),
-            Some("merge_conflict") | Some("ci_failure") | Some("ci_failure_exhausted") | Some("review_feedback")
-        )
+        is_review_phase_blocked_reason(self.blocked_reason.as_deref())
     }
 
     /// `true` when the row renders in the Done column's "Merging" group.

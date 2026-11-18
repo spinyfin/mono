@@ -182,7 +182,11 @@ extension EngineClient {
             designDocRepoRemoteURL: payload["design_doc_repo_remote_url"] as? String,
             designDocBranch: payload["design_doc_branch"] as? String,
             designDocPath: payload["design_doc_path"] as? String,
-            shortID: (payload["short_id"] as? NSNumber)?.intValue
+            shortID: (payload["short_id"] as? NSNumber)?.intValue,
+            parkedAt: payload["parked_at"] as? String,
+            parkedBy: payload["parked_by"] as? String,
+            parkedReason: payload["parked_reason"] as? String,
+            parkedVia: payload["parked_via"] as? String
         )
     }
 
@@ -250,11 +254,22 @@ extension EngineClient {
             reasoning: (payload["reasoning"] as? String)
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
             sourceAutomationId: payload["source_automation_id"] as? String,
+            parkedAt: payload["parked_at"] as? String,
+            parkedBy: payload["parked_by"] as? String,
+            parkedReason: payload["parked_reason"] as? String,
+            parkedVia: payload["parked_via"] as? String,
             aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false,
+            aiReviewStage: payload["ai_review_stage"] as? String,
+            boardFoldedRevision: payload["board_folded_revision"] as? Bool ?? false,
             aiReviewState: payload["ai_review_state"] as? String,
             aiReviewBadge: AIReviewBadgePresentation.parse(payload["ai_review_badge"]),
             aiReviewFindingsRevisionId: payload["ai_review_findings_revision_id"] as? String,
             readyForReview: (payload["ready_for_review"] as? Bool) ?? false,
+            reviewSection: (payload["review_section"] as? String).flatMap(ReviewSection.init(rawValue:)),
+            // Key presence, not value: a section-aware engine sends `null`
+            // for a non-Review row, a pre-field engine omits the key.
+            reviewSectionReported: payload["review_section"] != nil,
+            prUpdatedAt: payload["pr_updated_at"] as? String,
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             reviewGuideLifecycle: payload["review_guide_lifecycle"] as? String,
             reviewGuideReadableVersionId: payload["review_guide_readable_version_id"] as? String,
@@ -268,7 +283,8 @@ extension EngineClient {
             dispatchFailedError: payload["dispatch_failed_error"] as? String,
             dispatchFailedAt: payload["dispatch_failed_at"] as? String,
             tags: parseWorkItemTags(payload["tags"]),
-            operatorQuestion: OperatorQuestion.parse(payload["operator_question"])
+            operatorQuestion: OperatorQuestion.parse(payload["operator_question"]),
+            navigator: NavigatorProjection.parse(payload["navigator"])
         )
     }
 
@@ -465,7 +481,10 @@ extension EngineClient {
             dispatchWaitReason: payload["dispatch_wait_reason"] as? String,
             dispatchWaitSince: payload["dispatch_wait_since"] as? String,
             dispatchNotBefore: payload["dispatch_not_before"] as? String,
-            dispatchWaitBlocker: (payload["dispatch_wait_blocker"] as? [String: Any]).flatMap(DispatchWaitBlocker.init)
+            dispatchWaitBlocker: (payload["dispatch_wait_blocker"] as? [String: Any]).flatMap(DispatchWaitBlocker.init),
+            dispatchWaitLabel: payload["dispatch_wait_label"] as? String,
+            dispatchFailures: (payload["dispatch_failures"] as? [[String: Any]] ?? [])
+                .compactMap(DispatchFailureAttempt.init)
         )
     }
 
@@ -597,7 +616,25 @@ extension EngineClient {
             recoveryStatus: payload["recovery_status"] as? String,
             tmuxHosted: (payload["tmux_hosted"] as? NSNumber)?.boolValue,
             waitReason: payload["wait_reason"] as? String,
-            waitExpiresAt: payload["wait_expires_at"] as? String
+            waitExpiresAt: payload["wait_expires_at"] as? String,
+            agentType: payload["agent_type"] as? String,
+            reviewStage: payload["review_stage"] as? String,
+            executionKind: payload["kind"] as? String,
+            projectId: payload["project_id"] as? String,
+            projectName: payload["project_name"] as? String,
+            hostId: payload["host_id"] as? String,
+            startedAt: payload["started_at"] as? String,
+            pool: payload["pool"] as? String,
+            viewerAttachError: payload["viewer_attach_error"] as? String,
+            hungSince: payload["hung_since"] as? String,
+            workItemId: payload["work_item_id"] as? String,
+            workItemName: payload["work_item_name"] as? String,
+            owningWorkItemId: payload["owning_work_item_id"] as? String,
+            owningWorkItemTitle: payload["owning_work_item_title"] as? String,
+            workItemShortId: (payload["work_item_short_id"] as? NSNumber)?.intValue,
+            productId: payload["product_id"] as? String,
+            productName: payload["product_name"] as? String,
+            prURL: payload["pr_url"] as? String
         )
     }
 
@@ -732,6 +769,8 @@ extension EngineClient {
         // -> root-task join and hands it back as `owning_task_id` so this
         // row still groups under the right task's transcript list.
         let owningTaskId = payload["owning_task_id"] as? String
+        let startedAt = payload["started_at"] as? String
+        let endedAt = payload["ended_at"] as? String
         return ExecutionVM(
             id: id,
             workItemId: owningTaskId ?? workItemId,
@@ -741,8 +780,10 @@ extension EngineClient {
             model: payload["model"] as? String,
             effortLevel: payload["effort_level"] as? String,
             runId: payload["run_id"] as? String,
-            startedAt: payload["started_at"] as? String,
-            endedAt: payload["ended_at"] as? String
+            startedAt: startedAt,
+            endedAt: endedAt,
+            startedDate: startedAt.flatMap(BackgroundWorkElapsed.parse),
+            endedDate: endedAt.flatMap(BackgroundWorkElapsed.parse)
         )
     }
 

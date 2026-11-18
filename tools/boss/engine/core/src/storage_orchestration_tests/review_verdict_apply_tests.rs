@@ -1,0 +1,2388 @@
+//! Asynchronous `review_verdict` application: clean advancement, open-origin
+//! revision, merged-origin follow-up, merge-during-apply race, and
+//! proposal-id idempotency.
+
+use boss_protocol::{
+    ProposalKind, ProposalState, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus,
+    ReviewClassification, ReviewLanguageBucket, ReviewProfile, TaskKind, TaskStatus,
+};
+
+use super::{insert_revision_row, raw};
+use crate::test_support::*;
+use crate::test_support::{apply_pending_review_verdicts as apply_pending, apply_review_verdict as apply_verdict};
+use crate::work::{
+    ConflictResolutionInsertInput, CreateProjectInput, CreateRevisionInput, CreateTaskInput, FakePrStateChecker,
+    PrOpenState, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, PrStateChecker, PublishReviewGuideOutcome,
+    REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS, REVIEW_GATE_OUTCOME_STALE_HEAD, ReviewBatchCreateInput,
+    ReviewBatchMemberCreateInput, ReviewFindingsFollowupInsert, ReviewVerdictApplyStats, SubmitWorkerProposalInput,
+    WorkDb, is_informative_gate_outcome,
+};
+use boss_engine_storage_values::attention_kinds::REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND;
+use boss_protocol::{CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX};
+use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, Task, WorkItem};
+use rusqlite::params;
+
+fn read_task(db: &WorkDb, id: &str) -> Task {
+    match db.get_work_item(id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected task, got {other:?}"),
+    }
+}
+
+const PR_URL: &str = "https://github.com/example/repo/pull/42";
+
+fn classification() -> ReviewClassification {
+    ReviewClassification::builder()
+        .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
+        .complexity_flags(vec![])
+        .has_production_code(true)
+        .metadata_missing(vec![])
+        .production_languages(vec![ReviewLanguageBucket::Rust])
+        .profile(ReviewProfile::Light)
+        .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+        .additions(12)
+        .deletions(3)
+        .build()
+}
+
+fn batch_input(cycle_root_id: String, target_sha: &str) -> ReviewBatchCreateInput {
+    ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root_id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PreMerge)
+        .pr_number(42)
+        .pr_url(PR_URL)
+        .target_sha(target_sha)
+        .build()
+}
+
+fn member(
+    role: ReviewBatchMemberRole,
+    execution_id: Option<String>,
+    status: ReviewBatchMemberStatus,
+) -> ReviewBatchMemberCreateInput {
+    ReviewBatchMemberCreateInput::builder()
+        .attempt(1)
+        .provider_effort("medium")
+        .requested_driver(match role {
+            ReviewBatchMemberRole::ClaudeReviewer => "claude",
+            ReviewBatchMemberRole::CodexReviewer => "codex",
+            ReviewBatchMemberRole::GrokReviewer => "grok",
+            ReviewBatchMemberRole::Supervisor => "claude",
+            ReviewBatchMemberRole::PostMergeReviewer => "claude",
+        })
+        .resolved_model("test-model")
+        .role(role)
+        .status(status)
+        .maybe_execution_id(execution_id)
+        .build()
+}
+
+fn force_batch_supervising(db: &WorkDb, batch_id: &str) {
+    raw(db)
+        .execute(
+            "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
+            rusqlite::params![batch_id],
+        )
+        .unwrap();
+}
+
+fn bind_open_pr(db: &WorkDb, task_id: &str) {
+    raw(db)
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, PR_URL],
+        )
+        .unwrap();
+}
+
+/// incident-002 postmortem hold: a cycle root the deletion tripwire halted,
+/// pending explicit operator sign-off (`WorkerPrCompletionTarget::
+/// BlockedDeletionSignoff` / `conflict_ladder.rs`).
+fn bind_blocked_deletion_signoff(db: &WorkDb, task_id: &str) {
+    raw(db)
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'deletion_signoff', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, PR_URL],
+        )
+        .unwrap();
+}
+
+fn bind_merged_pr(db: &WorkDb, task_id: &str) {
+    raw(db)
+        .execute(
+            "UPDATE tasks SET status = 'done', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, PR_URL],
+        )
+        .unwrap();
+}
+
+/// Seed `tasks.last_reviewed_sha` directly, modelling the SHA a prior
+/// PreMerge verdict already stamped via `commit_applied_review_verdict`
+/// (`review_verdict_apply.rs::commit_applied_review_verdict` ->
+/// `increment_review_cycle_once_in_tx`). Used to construct the exact
+/// duplicate-head condition a `PostMerge` verdict must be exempt from.
+fn seed_last_reviewed_sha(db: &WorkDb, task_id: &str, sha: &str) {
+    raw(db)
+        .execute(
+            "UPDATE tasks SET last_reviewed_sha = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, sha],
+        )
+        .unwrap();
+}
+
+fn post_merge_batch_input(cycle_root_id: String, merge_sha: &str) -> ReviewBatchCreateInput {
+    ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root_id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url(PR_URL)
+        .target_sha(merge_sha)
+        .merge_sha(merge_sha)
+        .build()
+}
+
+fn post_merge_findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
+    format!(
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"post_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#
+    )
+}
+
+fn clean_verdict_payload(batch_id: &str, target_sha: &str) -> String {
+    format!(
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"pre_merge","summary":"Clean.","revision_warranted":false,"findings":[],"contradictions":[]}}}}"#
+    )
+}
+
+fn findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
+    format!(
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"pre_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#
+    )
+}
+
+/// Helper: create a revision under `cycle_root_id`, simulate its worker
+/// completing (a terminal `revision_implementation` execution stamped with
+/// `revision_stop_contributed_head = contributed_sha`), and hold it `active`
+/// with the cycle root's `pr_url` stamped on it — exactly the state
+/// `pr_flow.rs`'s `PendingReview` completion target leaves a revision in
+/// while an automated review pass runs. Returns the revision's task id.
+fn make_held_revision(db: &WorkDb, cycle_root_id: &str, cycle_root_pr_url: &str, contributed_sha: &str) -> String {
+    let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha");
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(cycle_root_id)
+                .description("test revision ask")
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    raw(db)
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![exec.id],
+        )
+        .unwrap();
+    db.set_revision_stop_contributed_head(&exec.id, contributed_sha)
+        .unwrap();
+    raw(db)
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, cycle_root_pr_url],
+        )
+        .unwrap();
+    revision.id
+}
+
+/// A revision under the cycle root, held `active` pending exactly the push
+/// this batch reviews, must ALSO reach `in_review` when the verdict lands —
+/// alongside the cycle root, which was already in Review the whole time.
+/// Nothing else advances the revision: its own worker never opens a PR, so
+/// the normal `record_worker_pr_completion` `InReview` target never applies
+/// to it directly.
+#[test]
+fn clean_verdict_advances_both_cycle_root_and_the_held_revision_it_reviewed() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    let revision_id = make_held_revision(&db, &cycle_root.id, PR_URL, "head-sha");
+
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    apply_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+
+    let root_after = read_task(&db, &cycle_root.id);
+    assert_eq!(root_after.status, TaskStatus::InReview, "cycle root must reach Review");
+    let revision_after = read_task(&db, &revision_id);
+    assert_eq!(
+        revision_after.status,
+        TaskStatus::InReview,
+        "the held revision whose push this batch reviewed must ALSO reach Review, \
+         not stay stranded in Doing with no live worker"
+    );
+}
+
+/// A revision whose contributed head DIFFERS from the batch's reviewed
+/// `target_sha` must NOT be advanced — it was superseded by a later push
+/// before this verdict landed, so a verdict for that later push (not this
+/// one) is what should eventually release it. Guards against matching by
+/// heuristic (task/parent identity alone) instead of the exact SHA.
+#[test]
+fn clean_verdict_does_not_advance_a_revision_with_a_different_contributed_head() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    // The held revision contributed a DIFFERENT sha than the one this batch
+    // reviews below ("head-sha" vs "superseded-sha").
+    let revision_id = make_held_revision(&db, &cycle_root.id, PR_URL, "superseded-sha");
+
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    apply_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+
+    let revision_after = read_task(&db, &revision_id);
+    assert_eq!(
+        revision_after.status,
+        TaskStatus::Active,
+        "a revision whose contributed head differs from the reviewed sha must not be advanced"
+    );
+}
+
+/// The newest producing execution controls a held revision. A historical
+/// matching stamp must not release a revision after it contributed a newer
+/// head that awaits its own review batch.
+#[test]
+fn clean_verdict_does_not_advance_revision_when_only_an_older_execution_matches() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &root.id);
+    let revision_id = make_held_revision(&db, &root.id, PR_URL, "head-a");
+    let later = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    db.set_revision_stop_contributed_head(&later.id, "head-b").unwrap();
+    raw(&db)
+        .execute(
+            "UPDATE work_executions SET created_at = '9999-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![later.id],
+        )
+        .unwrap();
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(root.id.clone(), "head-a"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let proposal = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-a"),
+            idempotency_key: "historical-head",
+        })
+        .unwrap()
+        .unwrap();
+    apply_verdict(
+        &db,
+        &proposal.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(read_task(&db, &revision_id).status, TaskStatus::Active);
+}
+
+/// Nested variant of the above: a residual pre-flatten-migration chain
+/// (R2 -> R1 -> root) must still advance R2 when the verdict for its exact
+/// contributed head lands, not just a revision directly parented to the
+/// cycle root. `advance_held_revision_after_verdict_in_tx` sources
+/// candidates from the full review-cycle chain under `cycle_root_id`
+/// rather than a direct `parent_task_id` equality, so this must not regress
+/// to stranding R2 `active` in Doing.
+#[test]
+fn clean_verdict_advances_a_revision_nested_under_another_revision() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let product_id = product.id.clone();
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+
+    // R1: an ordinary direct child under the cycle root, not itself held
+    // for review — just the intermediate hop the residual-nesting case
+    // requires.
+    let r1_id = insert_revision_row(&db, &product_id, &cycle_root.id);
+    // R2: nested under R1 (pre-flatten-migration shape), held `active`
+    // pending exactly this batch's reviewed push.
+    let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+    let r2_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(r2_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    raw(&db)
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![r2_exec.id],
+        )
+        .unwrap();
+    db.set_revision_stop_contributed_head(&r2_exec.id, "head-sha").unwrap();
+    raw(&db)
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![r2_id, PR_URL],
+        )
+        .unwrap();
+
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    apply_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+
+    let root_after = read_task(&db, &cycle_root.id);
+    assert_eq!(root_after.status, TaskStatus::InReview, "cycle root must reach Review");
+    let r2_after = read_task(&db, &r2_id);
+    assert_eq!(
+        r2_after.status,
+        TaskStatus::InReview,
+        "a revision nested under another revision must ALSO reach Review when the verdict \
+         covering its exact contributed head lands, not stay stranded in Doing"
+    );
+}
+
+/// incident-002 postmortem gate: a cycle root held `blocked:
+/// deletion_signoff` must not be silently advanced to `in_review` (with the
+/// hold erased) by the async verdict-apply path — that hold is an explicit
+/// operator sign-off gate, and only a human clearing it should move the task
+/// on. See `advance_cycle_root_to_in_review_in_tx`.
+#[test]
+fn clean_verdict_does_not_release_a_deletion_signoff_hold() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_blocked_deletion_signoff(&db, &cycle_root.id);
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    let created = apply_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(created, None);
+
+    let after = read_task(&db, &cycle_root.id);
+    assert_eq!(
+        after.status,
+        TaskStatus::Blocked,
+        "a deletion_signoff hold must survive verdict apply"
+    );
+    assert_eq!(after.blocked_reason.as_deref(), Some("deletion_signoff"));
+    // Bookkeeping (verdict row, review cycle, proposal state) still lands —
+    // only the status advance/hold-clear is suppressed.
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed
+    );
+    let (cycle, sha) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
+    assert_eq!(cycle, 1);
+    assert_eq!(sha.as_deref(), Some("head-sha"));
+}
+
+#[test]
+fn qualifying_findings_on_an_open_origin_create_a_revision() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    let (batch_id, proposal_id, supervisor_id) = {
+        let supervisor = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let claude = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(cycle_root.id.clone(), "head-sha"),
+                &[
+                    member(
+                        ReviewBatchMemberRole::ClaudeReviewer,
+                        Some(claude.id),
+                        ReviewBatchMemberStatus::Reported,
+                    ),
+                    member(
+                        ReviewBatchMemberRole::Supervisor,
+                        Some(supervisor.id.clone()),
+                        ReviewBatchMemberStatus::Pending,
+                    ),
+                ],
+            )
+            .unwrap();
+        force_batch_supervising(&db, &batch.id);
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &supervisor.id,
+                work_item_id: &cycle_root.id,
+                kind: ProposalKind::ReviewVerdict,
+                payload_json: &findings_verdict_payload(&batch.id, "head-sha"),
+                idempotency_key: "verdict-1",
+            })
+            .unwrap()
+            .unwrap();
+        (batch.id, outcome.proposal.id, supervisor.id)
+    };
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("open origin with findings must mint a revision");
+    let task = read_task(&db, &created);
+    assert_eq!(task.kind, TaskKind::Revision);
+    assert!(task.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX));
+    assert!(task.description.contains("finalising this revision"));
+    assert_eq!(
+        db.review_batch(&batch_id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed
+    );
+    let (cycle, _) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
+    assert_eq!(cycle, 1);
+
+    // Model the supervisor finishing before the completed review is displayed.
+    raw(&db)
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&supervisor_id],
+        )
+        .unwrap();
+
+    // Losing the fix-task link must not lose the accepted supervisor findings.
+    let conn = raw(&db);
+    conn.execute(
+        "UPDATE pr_review_verdicts SET revision_task_id = NULL WHERE proposal_id = ?1",
+        [&proposal_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET pr_head_sha = 'head-sha' WHERE id = ?1",
+        [&cycle_root.id],
+    )
+    .unwrap();
+    let cards = [read_task(&db, &cycle_root.id)];
+    assert_eq!(cards[0].ai_review_state.as_deref(), Some("reviewed_with_findings"));
+    assert!(cards[0].ai_review_findings_revision_id.is_none());
+    let badge = cards[0].ai_review_badge.as_ref().unwrap();
+    let markdown = badge.findings_markdown.as_deref().unwrap();
+    assert!(markdown.contains("Unchecked index"));
+    assert!(markdown.contains("Out of bounds read."));
+    assert!(markdown.contains("One high-severity defect."));
+    // A new observed head must not expose these as its current findings.
+    conn.execute(
+        "UPDATE tasks SET pr_head_sha = 'new-head' WHERE id = ?1",
+        [&cycle_root.id],
+    )
+    .unwrap();
+    let cards = [read_task(&db, &cycle_root.id)];
+    assert!(cards[0].ai_review_badge.as_ref().unwrap().findings_markdown.is_none());
+    drop(conn);
+
+    let replay = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(replay, None, "an already-applied proposal is a no-op");
+    let (cycle_after, _) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
+    assert_eq!(cycle_after, 1, "reapply must not increment the review cycle again");
+}
+
+#[test]
+fn qualifying_findings_on_a_merged_origin_create_a_followup() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+    let (_, proposal_id, _) = {
+        let supervisor = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let claude = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(cycle_root.id.clone(), "head-sha"),
+                &[
+                    member(
+                        ReviewBatchMemberRole::ClaudeReviewer,
+                        Some(claude.id),
+                        ReviewBatchMemberStatus::Reported,
+                    ),
+                    member(
+                        ReviewBatchMemberRole::Supervisor,
+                        Some(supervisor.id.clone()),
+                        ReviewBatchMemberStatus::Pending,
+                    ),
+                ],
+            )
+            .unwrap();
+        force_batch_supervising(&db, &batch.id);
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &supervisor.id,
+                work_item_id: &cycle_root.id,
+                kind: ProposalKind::ReviewVerdict,
+                payload_json: &findings_verdict_payload(&batch.id, "head-sha"),
+                idempotency_key: "verdict-1",
+            })
+            .unwrap()
+            .unwrap();
+        (batch.id, outcome.proposal.id, supervisor.id)
+    };
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("merged origin with findings must mint a follow-up");
+    let task = read_task(&db, &created);
+    assert_eq!(task.kind, TaskKind::Followup);
+    assert_eq!(task.origin_pr_number, Some(42));
+    assert!(task.description.contains("closing this follow-up"));
+    assert!(!task.description.contains("finalising this revision"));
+    let parent = read_task(&db, &cycle_root.id);
+    assert_eq!(
+        parent.status,
+        TaskStatus::Done,
+        "merged origin must not be yanked back to review"
+    );
+}
+
+#[test]
+fn merge_during_apply_creates_a_followup_instead_of_discarding_findings() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    // Cached status is still in_review (poller has not flipped it) but the
+    // live probe reports Merged — the merge-during-apply race.
+    bind_open_pr(&db, &cycle_root.id);
+    let (_, proposal_id, _) = {
+        let supervisor = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let claude = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(cycle_root.id.clone(), "head-sha"),
+                &[
+                    member(
+                        ReviewBatchMemberRole::ClaudeReviewer,
+                        Some(claude.id),
+                        ReviewBatchMemberStatus::Reported,
+                    ),
+                    member(
+                        ReviewBatchMemberRole::Supervisor,
+                        Some(supervisor.id.clone()),
+                        ReviewBatchMemberStatus::Pending,
+                    ),
+                ],
+            )
+            .unwrap();
+        force_batch_supervising(&db, &batch.id);
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &supervisor.id,
+                work_item_id: &cycle_root.id,
+                kind: ProposalKind::ReviewVerdict,
+                payload_json: &findings_verdict_payload(&batch.id, "head-sha"),
+                idempotency_key: "verdict-1",
+            })
+            .unwrap()
+            .unwrap();
+        (batch.id, outcome.proposal.id, supervisor.id)
+    };
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("merge-during-apply must mint a follow-up, not drop findings");
+    let task = read_task(&db, &created);
+    assert_eq!(task.kind, TaskKind::Followup);
+    assert!(
+        db.list_chores(&task.product_id, None, false)
+            .unwrap()
+            .iter()
+            .all(|row| row.kind != TaskKind::Revision),
+        "merge-during-apply must not leave a revision row behind"
+    );
+}
+
+#[test]
+fn reapplying_a_merged_followup_returns_the_same_work_item() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+    let (_, proposal_id, _) = {
+        let supervisor = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let claude = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(cycle_root.id.clone(), "head-sha"),
+                &[
+                    member(
+                        ReviewBatchMemberRole::ClaudeReviewer,
+                        Some(claude.id),
+                        ReviewBatchMemberStatus::Reported,
+                    ),
+                    member(
+                        ReviewBatchMemberRole::Supervisor,
+                        Some(supervisor.id.clone()),
+                        ReviewBatchMemberStatus::Pending,
+                    ),
+                ],
+            )
+            .unwrap();
+        force_batch_supervising(&db, &batch.id);
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &supervisor.id,
+                work_item_id: &cycle_root.id,
+                kind: ProposalKind::ReviewVerdict,
+                payload_json: &findings_verdict_payload(&batch.id, "head-sha"),
+                idempotency_key: "verdict-1",
+            })
+            .unwrap()
+            .unwrap();
+        (batch.id, outcome.proposal.id, supervisor.id)
+    };
+
+    let first = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .unwrap();
+    // Simulate a crash after materialisation but before the proposal was
+    // marked applied: reset the proposal to proposed and the batch to applying.
+    raw(&db)
+        .execute(
+            "UPDATE worker_proposals SET state = 'proposed', applied_ref = NULL, decided_at = NULL, decided_by = NULL WHERE id = ?1",
+            rusqlite::params![proposal_id],
+        )
+        .unwrap();
+    raw(&db)
+        .execute(
+            "UPDATE pr_review_batches SET status = 'applying', completed_at = NULL WHERE final_verdict_proposal_id = ?1",
+            rusqlite::params![proposal_id],
+        )
+        .unwrap();
+    let second = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(first, second, "proposal id is the materialisation idempotency key");
+}
+
+/// A PostMerge follow-up minted by a pre-upgrade engine used
+/// `pr_review:<proposal_id>` (no `post_merge:` sub-prefix). Materialisation
+/// commits in its own transaction before `commit_applied_review_verdict`, so
+/// a crash between those two leaves the proposal `proposed` for retry with
+/// that old-key row already on disk. Retry on a build that computes
+/// `pr_review:post_merge:<proposal_id>` must still resolve to that row.
+#[test]
+fn reapplying_a_post_merge_followup_seeded_under_the_legacy_created_via_returns_the_same_work_item() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let merge_sha = "merge-commit-sha";
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), merge_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, merge_sha),
+            idempotency_key: "post-merge-legacy-created-via",
+        })
+        .unwrap()
+        .unwrap();
+    let proposal_id = outcome.proposal.id;
+
+    let seeded = db
+        .create_review_findings_followup(
+            ReviewFindingsFollowupInsert::builder()
+                .product_id(product.id)
+                .name("legacy post-merge follow-up")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}{proposal_id}"))
+                .description("Address ALL findings before closing this follow-up.")
+                .chain_root_id(cycle_root.id.clone())
+                .build(),
+        )
+        .unwrap();
+
+    let applied = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("retry must recover the follow-up already materialised under the legacy created_via key");
+    assert_eq!(
+        applied, seeded.id,
+        "PostMerge retry after a created_via key change must return the existing work item"
+    );
+
+    let new_key = format!("{CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX}{proposal_id}");
+    let legacy_key = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{proposal_id}");
+    let materialisation_count = db
+        .list_tasks(&cycle_root.product_id, None, None, true)
+        .unwrap()
+        .iter()
+        .filter(|task| task.created_via == new_key || task.created_via == legacy_key)
+        .count();
+    assert_eq!(
+        materialisation_count, 1,
+        "upgrade recovery must not mint a second follow-up under the new created_via key"
+    );
+}
+
+/// Stage one clean verdict and one findings-warranting verdict (each its own
+/// cycle root / batch / proposal), plus one proposal already `applied`
+/// before the sweep runs, then drive the sweep entry point
+/// (`apply_pending_review_verdicts`) directly — the surface both
+/// `review_verdict_apply_sweep::run_one_pass` and the crash-recovery path
+/// actually call, and which every other test in this file bypasses by
+/// calling `apply_review_verdict_proposal` on a known proposal id. Pins the
+/// listing predicate (`kind = 'review_verdict' AND state = 'proposed'`,
+/// which must skip the already-applied proposal) and the stats accounting
+/// (`applied` must count only proposals this pass actually applied, not
+/// every proposal it looked at — see the `Ok(None)` note on
+/// `apply_pending_review_verdicts`).
+#[test]
+fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_ones() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+
+    // Batch 1: clean verdict, no findings, no revision.
+    let clean_root = create_test_chore_manual(&db, product.id.clone(), "clean review target");
+    bind_open_pr(&db, &clean_root.id);
+    let clean_supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(clean_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (clean_batch, _) = db
+        .create_review_batch(
+            batch_input(clean_root.id.clone(), "clean-head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(clean_supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &clean_batch.id);
+    let clean_outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &clean_supervisor.id,
+            work_item_id: &clean_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&clean_batch.id, "clean-head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(clean_outcome.proposal.state, ProposalState::Proposed);
+
+    // Batch 2: findings verdict on an open origin, must mint a revision.
+    let findings_root = create_test_chore_manual(&db, product.id.clone(), "findings review target");
+    bind_open_pr(&db, &findings_root.id);
+    let findings_supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(findings_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let findings_claude = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(findings_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (findings_batch, _) = db
+        .create_review_batch(
+            batch_input(findings_root.id.clone(), "head-sha"),
+            &[
+                member(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(findings_claude.id),
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member(
+                    ReviewBatchMemberRole::Supervisor,
+                    Some(findings_supervisor.id.clone()),
+                    ReviewBatchMemberStatus::Pending,
+                ),
+            ],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &findings_batch.id);
+    let findings_outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &findings_supervisor.id,
+            work_item_id: &findings_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &findings_verdict_payload(&findings_batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(findings_outcome.proposal.state, ProposalState::Proposed);
+
+    // Batch 3: already applied before the sweep runs — must not be
+    // re-counted or re-materialised by the sweep.
+    let applied_root = create_test_chore_manual(&db, product.id, "already applied review target");
+    bind_open_pr(&db, &applied_root.id);
+    let applied_supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(applied_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (applied_batch, _) = db
+        .create_review_batch(
+            batch_input(applied_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(applied_supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &applied_batch.id);
+    let applied_outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &applied_supervisor.id,
+            work_item_id: &applied_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&applied_batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    apply_verdict(
+        &db,
+        &applied_outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    let applied_proposals = db
+        .list_worker_proposals(
+            None,
+            Some(&applied_root.id),
+            Some(ProposalKind::ReviewVerdict),
+            Some(ProposalState::Applied),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        applied_proposals.len(),
+        1,
+        "batch 3's proposal must already be applied before the sweep runs"
+    );
+
+    let stats = apply_pending(
+        &db,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(
+        stats,
+        ReviewVerdictApplyStats {
+            applied: 2,
+            failed: 0,
+            created_work: 1,
+            superseded: 0,
+        }
+    );
+
+    assert_eq!(
+        db.review_batch(&clean_batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed
+    );
+    assert_eq!(
+        db.review_batch(&findings_batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed
+    );
+    assert_eq!(
+        db.review_batch(&applied_batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed,
+        "already-applied batch was completed before the sweep ran and stays completed"
+    );
+}
+
+#[test]
+fn verdict_citing_an_unreported_role_is_rejected() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &findings_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+    assert!(
+        outcome
+            .proposal
+            .decision_reason
+            .unwrap_or_default()
+            .contains("no accepted report")
+    );
+}
+
+struct DeletingPrChecker {
+    inner: FakePrStateChecker,
+    deletions: Vec<String>,
+}
+
+impl PrStateChecker for DeletingPrChecker {
+    fn check(&self, pr_url: &str) -> anyhow::Result<PrOpenState> {
+        self.inner.check(pr_url)
+    }
+
+    fn inspect(&self, pr_url: &str) -> anyhow::Result<crate::work::PrInspect> {
+        self.inner.inspect(pr_url)
+    }
+
+    fn merged_parent_deletions(
+        &self,
+        _repo_slug: &str,
+        _head_before: &str,
+        _base_sha: &str,
+        _head_after: &str,
+    ) -> Vec<String> {
+        self.deletions.clone()
+    }
+}
+
+fn stage_clean_verdict(db: &WorkDb, cycle_root_id: &str, target_sha: &str) -> (String, String) {
+    stage_clean_verdict_with_key(db, cycle_root_id, target_sha, "verdict-1")
+}
+
+fn stage_clean_verdict_with_key(
+    db: &WorkDb,
+    cycle_root_id: &str,
+    target_sha: &str,
+    idempotency_key: &str,
+) -> (String, String) {
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root_id.to_owned())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root_id.to_owned(), target_sha),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: cycle_root_id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, target_sha),
+            idempotency_key,
+        })
+        .unwrap()
+        .unwrap();
+    (batch.id, outcome.proposal.id)
+}
+
+fn stage_findings_verdict(db: &WorkDb, cycle_root_id: &str, target_sha: &str) -> (String, String) {
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root_id.to_owned())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let claude = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root_id.to_owned())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root_id.to_owned(), target_sha),
+            &[
+                member(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(claude.id),
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member(
+                    ReviewBatchMemberRole::Supervisor,
+                    Some(supervisor.id.clone()),
+                    ReviewBatchMemberStatus::Pending,
+                ),
+            ],
+        )
+        .unwrap();
+    force_batch_supervising(db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: cycle_root_id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &findings_verdict_payload(&batch.id, target_sha),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    (batch.id, outcome.proposal.id)
+}
+
+fn seed_succeeded_conflict_resolution(db: &WorkDb, product_id: String, cycle_root_id: &str) {
+    db.mark_chore_blocked_merge_conflict(cycle_root_id, PR_URL).unwrap();
+    let attempt = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id,
+            work_item_id: cycle_root_id.to_owned(),
+            pr_url: PR_URL.to_owned(),
+            pr_number: 42,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("base-sha".to_owned()),
+            head_sha_before: Some("head-before".to_owned()),
+        })
+        .unwrap()
+        .unwrap();
+    db.mark_conflict_resolution_succeeded(&attempt.id, Some("head-sha"))
+        .unwrap();
+    raw(db)
+        .execute(
+            "UPDATE tasks SET status = 'in_review', blocked_reason = NULL, pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![cycle_root_id, PR_URL],
+        )
+        .unwrap();
+}
+
+/// Supersedes an in-flight verdict during the tripwire probe, so
+/// `commit_applied_review_verdict` observes the race when it re-reads state.
+struct SupersedeOnTripwireCheck {
+    inner: FakePrStateChecker,
+    db: WorkDb,
+    proposal_id: String,
+}
+
+impl PrStateChecker for SupersedeOnTripwireCheck {
+    fn check(&self, pr_url: &str) -> anyhow::Result<PrOpenState> {
+        self.inner.check(pr_url)
+    }
+
+    fn inspect(&self, pr_url: &str) -> anyhow::Result<crate::work::PrInspect> {
+        self.inner.inspect(pr_url)
+    }
+
+    fn merged_parent_deletions(
+        &self,
+        _repo_slug: &str,
+        _head_before: &str,
+        _base_sha: &str,
+        _head_after: &str,
+    ) -> Vec<String> {
+        raw(&self.db)
+            .execute(
+                "UPDATE worker_proposals SET state = 'superseded' WHERE id = ?1",
+                rusqlite::params![self.proposal_id],
+            )
+            .expect("supersede in-flight proposal");
+        Vec::new()
+    }
+}
+
+#[test]
+fn tombstone_cancels_the_orphaned_revision_ready_execution() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let claude = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[
+                member(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(claude.id),
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member(
+                    ReviewBatchMemberRole::Supervisor,
+                    Some(supervisor.id.clone()),
+                    ReviewBatchMemberStatus::Pending,
+                ),
+            ],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &findings_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    let created = apply_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("findings must mint a revision");
+    let before = db.list_executions(Some(&created)).unwrap();
+    assert!(
+        before.iter().any(|e| e.status == ExecutionStatus::Ready),
+        "autostart revision is born with a ready execution"
+    );
+
+    crate::work::test_support::tombstone_orphaned_remediation(&db, &created);
+
+    let after_task = db
+        .list_tasks(&cycle_root.product_id, None, None, true)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == created)
+        .unwrap();
+    assert!(after_task.deleted_at.is_some());
+    let after = db.list_executions(Some(&created)).unwrap();
+    assert!(
+        after.iter().all(|e| e.status == ExecutionStatus::Cancelled),
+        "tombstone must cancel never-started executions so list_ready_executions will not keep draining them"
+    );
+    assert!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .all(|e| e.work_item_id != created),
+        "cancelled execution must drop out of the ready dispatch queue"
+    );
+}
+
+#[test]
+fn clean_verdict_runs_the_merge_parent_deletion_tripwire() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    seed_succeeded_conflict_resolution(&db, product.id, &cycle_root.id);
+
+    let (batch_id, proposal_id) = stage_clean_verdict(&db, &cycle_root.id, "head-sha");
+    let checker = DeletingPrChecker {
+        inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        deletions: vec!["`src/lib.rs` — added by a merged parent, removed by this resolution".to_owned()],
+    };
+    let created = apply_verdict(&db, &proposal_id, &checker).unwrap();
+    assert_eq!(created, None, "tripwire must not mint a revision");
+
+    let after = read_task(&db, &cycle_root.id);
+    assert_eq!(after.status, TaskStatus::Blocked);
+    assert_eq!(after.blocked_reason.as_deref(), Some("deletion_signoff"));
+    assert_eq!(
+        db.review_batch(&batch_id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed
+    );
+    let attentions = db.list_attention_items_for_work_item(&cycle_root.id).unwrap();
+    assert!(
+        attentions.iter().any(|item| item.kind
+            == boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND
+            && item.status == "open"),
+        "tripwire must file the same sign-off attention as the legacy finalize path"
+    );
+}
+
+#[test]
+fn supervising_batch_is_re_advanced_to_applying_then_applied() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    let (batch_id, proposal_id) = stage_clean_verdict(&db, &cycle_root.id, "head-sha");
+    assert_eq!(
+        db.review_batch(&batch_id).unwrap().unwrap().status,
+        ReviewBatchStatus::Applying
+    );
+    force_batch_supervising(&db, &batch_id);
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(created, None);
+    assert_eq!(
+        db.review_batch(&batch_id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed
+    );
+    let after = read_task(&db, &cycle_root.id);
+    assert_eq!(after.status, TaskStatus::InReview);
+}
+
+#[test]
+fn persistent_not_applying_bail_files_attention_once_and_is_not_counted_applied() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    let (batch_id, proposal_id) = stage_clean_verdict(&db, &cycle_root.id, "head-sha");
+    raw(&db)
+        .execute(
+            "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+            rusqlite::params![batch_id],
+        )
+        .unwrap();
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(created, None);
+    let proposal = db
+        .list_worker_proposals(
+            None,
+            Some(&cycle_root.id),
+            Some(ProposalKind::ReviewVerdict),
+            Some(ProposalState::Proposed),
+            None,
+        )
+        .unwrap();
+    assert_eq!(proposal.len(), 1, "stranded apply must leave the proposal proposed");
+
+    apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    let attentions: Vec<_> = db
+        .list_attention_items_for_work_item(&cycle_root.id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND)
+        .collect();
+    assert_eq!(
+        attentions.len(),
+        1,
+        "a persistent not-applying bail must file attention once, not on every sweep pass"
+    );
+
+    let stats = apply_pending(
+        &db,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(
+        stats,
+        ReviewVerdictApplyStats {
+            applied: 0,
+            failed: 0,
+            created_work: 0,
+            superseded: 0,
+        }
+    );
+}
+
+#[test]
+fn sweep_does_not_list_an_already_superseded_proposal() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    let (_, proposal_id) = stage_clean_verdict(&db, &cycle_root.id, "head-sha");
+    raw(&db)
+        .execute(
+            "UPDATE worker_proposals SET state = 'superseded' WHERE id = ?1",
+            rusqlite::params![proposal_id],
+        )
+        .unwrap();
+
+    let stats = apply_pending(
+        &db,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+    assert_eq!(
+        stats,
+        ReviewVerdictApplyStats {
+            applied: 0,
+            failed: 0,
+            created_work: 0,
+            superseded: 0,
+        },
+        "a proposal already superseded is not listed as proposed, so the superseded counter is not touched"
+    );
+}
+
+#[test]
+fn tripwire_retry_tombstones_an_already_materialised_remediation() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    seed_succeeded_conflict_resolution(&db, product.id, &cycle_root.id);
+    let (batch_id, proposal_id) = stage_findings_verdict(&db, &cycle_root.id, "head-sha");
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("first apply must mint a revision");
+    let before = db.list_executions(Some(&created)).unwrap();
+    assert!(
+        before.iter().any(|e| e.status == ExecutionStatus::Ready),
+        "autostart revision is born with a ready execution"
+    );
+
+    // Simulate the retry window: materialisation committed, bookkeeping did not.
+    let conn = raw(&db);
+    conn.execute(
+        "UPDATE worker_proposals
+         SET state = 'proposed', applied_ref = NULL, decided_by = NULL, decided_at = NULL
+         WHERE id = ?1",
+        rusqlite::params![proposal_id],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM pr_review_verdicts WHERE batch_id = ?1",
+        rusqlite::params![batch_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE pr_review_batches SET status = 'applying', completed_at = NULL WHERE id = ?1",
+        rusqlite::params![batch_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let checker = DeletingPrChecker {
+        inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        deletions: vec!["`src/lib.rs` — added by a merged parent, removed by this resolution".to_owned()],
+    };
+    let replay = apply_verdict(&db, &proposal_id, &checker).unwrap();
+    assert_eq!(replay, None, "tripwire retry must not keep the minted revision");
+
+    let after_task = db
+        .list_tasks(&cycle_root.product_id, None, None, true)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == created)
+        .unwrap();
+    assert!(
+        after_task.deleted_at.is_some(),
+        "already-materialised remediation must be tombstoned when the tripwire fires on retry"
+    );
+    let after = db.list_executions(Some(&created)).unwrap();
+    assert!(
+        after.iter().all(|e| e.status == ExecutionStatus::Cancelled),
+        "tombstone must cancel never-started executions so the hold is not racing a live worker"
+    );
+    let after_root = read_task(&db, &cycle_root.id);
+    assert_eq!(after_root.status, TaskStatus::Blocked);
+    assert_eq!(after_root.blocked_reason.as_deref(), Some("deletion_signoff"));
+    let verdict = db
+        .latest_review_verdict(&cycle_root.id)
+        .unwrap()
+        .expect("retry still records the verdict");
+    assert_eq!(
+        verdict.revision_task_id, None,
+        "held apply must not keep remediating_task_id pointing at the tombstoned revision"
+    );
+}
+
+#[test]
+fn sweep_counts_a_proposal_superseded_during_apply() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let applied_root = create_test_chore_manual(&db, product.id.clone(), "applied root");
+    bind_open_pr(&db, &applied_root.id);
+    let superseded_root = create_test_chore_manual(&db, product.id.clone(), "superseded root");
+    bind_open_pr(&db, &superseded_root.id);
+    seed_succeeded_conflict_resolution(&db, product.id, &superseded_root.id);
+
+    let _ = stage_clean_verdict_with_key(&db, &applied_root.id, "head-sha", "verdict-applied");
+
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(superseded_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(superseded_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let first = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &superseded_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-first",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.proposal.state, ProposalState::Proposed);
+
+    let checker = SupersedeOnTripwireCheck {
+        inner: FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+        db: db.clone(),
+        proposal_id: first.proposal.id,
+    };
+    let stats = apply_pending(&db, &checker).unwrap();
+    assert_eq!(
+        stats,
+        ReviewVerdictApplyStats {
+            applied: 1,
+            failed: 0,
+            created_work: 0,
+            superseded: 1,
+        },
+        "a proposal still proposed at list time that lands superseded in commit must increment superseded"
+    );
+}
+
+/// A `PostMerge` verdict must materialise its follow-up even when
+/// `verdict.target_sha` equals `tasks.last_reviewed_sha` — the duplicate-head
+/// guard exists to suppress a re-review of an unchanged *pre-merge* head, and
+/// has no meaning here: a post-merge verdict's `target_sha` is always either
+/// the merge commit or (the `head_ref_oid` fallback in
+/// `maybe_trigger_post_merge_review`) the PR's own head SHA, which is
+/// precisely the SHA the pre-merge verdict already stamped into
+/// `last_reviewed_sha`. Before the `batch.phase != PostMerge` exemption in
+/// `apply_review_verdict_proposal`, this exact equality tripped
+/// `duplicate_head` and silently dropped every post-merge finding with no
+/// attention item — this test seeds that same equality and asserts the
+/// finding survives instead. One target-sha value stands in for both the
+/// merge-SHA and head-SHA-fallback cases named in the review finding: the
+/// apply-level guard only ever sees the final `target_sha`, so it cannot
+/// distinguish which of the two produced it — the equality-with-prior-head
+/// condition is identical either way.
+#[test]
+fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewed_head() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let shared_sha = "shared-head-and-merge-sha";
+    seed_last_reviewed_sha(&db, &cycle_root.id, shared_sha);
+
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), shared_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    // A post-merge batch's sole member moves it straight to `applying` on
+    // report — no `force_batch_supervising` needed (unlike the pre-merge
+    // supervisor path above).
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, shared_sha),
+            idempotency_key: "post-merge-verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Applying
+    );
+
+    let created = apply_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("a post-merge verdict's findings must materialise a follow-up even at the prior reviewed head");
+    let task = read_task(&db, &created);
+    assert_eq!(task.kind, TaskKind::Followup);
+
+    let verdict = db
+        .latest_review_verdict(&cycle_root.id)
+        .unwrap()
+        .expect("apply must record the verdict");
+    assert_eq!(
+        verdict.gate_outcome,
+        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+        "gate_outcome must not be dropped_duplicate_head for a PostMerge batch"
+    );
+    assert_eq!(verdict.revision_task_id.as_deref(), Some(created.as_str()));
+}
+
+/// A follow-up minted from a `PostMerge` batch must be recognisable in the
+/// work-item title and in the description the worker uses to compose its PR
+/// body: the title is prefixed, and the description names the post-merge
+/// review and links the origin PR from the batch's durable `pr_url`, not left
+/// to the reviewing worker to remember. `PreMerge` follow-ups are unaffected
+/// (see the ordinary merged-origin-at-apply-time coverage elsewhere in this
+/// file), since only a `PostMerge` batch takes this branch.
+#[test]
+fn post_merge_verdict_followup_states_title_and_origin_provenance() {
+    assert_post_merge_followup_membership(false);
+}
+
+#[test]
+fn post_merge_verdict_followup_inherits_origin_project() {
+    assert_post_merge_followup_membership(true);
+}
+
+fn assert_post_merge_followup_membership(in_project: bool) {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let cycle_root = if in_project {
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Origin project".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+                no_design_task: true,
+                design_reasoning_effort_xhigh: false,
+            })
+            .unwrap();
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id)
+                .name("review target")
+                .build(),
+        )
+        .unwrap()
+    } else {
+        create_test_chore_manual(&db, product.id.clone(), "review target")
+    };
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let merge_sha = "merge-commit-sha";
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), merge_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, merge_sha),
+            idempotency_key: "post-merge-verdict-title-provenance",
+        })
+        .unwrap()
+        .unwrap();
+
+    let created = apply_verdict(
+        &db,
+        &outcome.proposal.id,
+        &FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha"),
+    )
+    .unwrap()
+    .expect("a post-merge verdict's findings must materialise a follow-up");
+    let task = read_task(&db, &created);
+    assert_eq!(task.kind, TaskKind::Followup);
+    assert_eq!(task.project_id, cycle_root.project_id);
+    assert_eq!(task.ordinal, cycle_root.ordinal.map(|ordinal| ordinal + 1));
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let lane = if in_project { &tree.tasks } else { &tree.chores };
+    let tree_task = lane.iter().find(|tree_task| tree_task.id == task.id).unwrap();
+    assert_eq!(tree_task.project_id, cycle_root.project_id);
+    assert_eq!(
+        tree.tasks.iter().filter(|row| row.id == task.id).count(),
+        usize::from(in_project)
+    );
+    assert_eq!(
+        tree.chores.iter().filter(|row| row.id == task.id).count(),
+        usize::from(!in_project)
+    );
+    if let Some(project_id) = &cycle_root.project_id {
+        let listed = db.list_tasks(&product.id, Some(project_id), None, false).unwrap();
+        assert!(listed.iter().any(|listed_task| listed_task.id == task.id));
+        let next_task = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project_id.clone())
+                    .name("Next project task")
+                    .build(),
+            )
+            .unwrap();
+        assert_eq!(next_task.ordinal, task.ordinal.map(|ordinal| ordinal + 1));
+    }
+    assert!(
+        task.name.starts_with("Post-merge review findings: "),
+        "follow-up title must identify it as post-merge review findings; got {:?}",
+        task.name
+    );
+    assert!(
+        task.description.contains("found in post-merge review of"),
+        "follow-up description must state it was found in post-merge review; got {:?}",
+        task.description
+    );
+    assert!(
+        task.description.contains(PR_URL),
+        "follow-up description must link the origin PR; got {:?}",
+        task.description
+    );
+    assert!(
+        task.created_via
+            .starts_with(boss_protocol::CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX),
+        "post-merge follow-up must carry the post_merge created_via sub-prefix so the worker-facing \
+         backlink can label it distinctly; got {:?}",
+        task.created_via
+    );
+    let leaked_short_id = cycle_root
+        .short_id
+        .map(|short_id| format!("T{short_id}"))
+        .filter(|marker| task.description.contains(marker.as_str()));
+    assert_eq!(
+        leaked_short_id, None,
+        "a post-merge follow-up's description must never embed a bare Boss work-item id \
+         (boss-ism/pr-text-leakage forbids it in worker-authored PR text); got {:?}",
+        task.description
+    );
+}
+
+#[path = "review_guide_findings_tests.rs"]
+mod review_guide_findings_tests;
+
+#[path = "held_revision_review_tests.rs"]
+mod held_revision_review_tests;
+
+// ── stale-head verdicts ─────────────────────────────────────────────────────
+
+/// Stand up a cycle root held `active` pending review (the PendingReview
+/// hold), with a `supervising` batch at `target_sha` whose supervisor has
+/// already stopped. Returns `(root_id, batch, supervisor_execution_id)`.
+fn supervising_batch_on_held_root(db: &WorkDb, target_sha: &str) -> (String, boss_protocol::ReviewBatch, String) {
+    let product = create_test_product(db);
+    let cycle_root = create_test_chore_manual(db, product.id, "review target");
+    bind_open_pr(db, &cycle_root.id);
+    raw(db)
+        .execute(
+            "UPDATE tasks SET status = 'active' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    // A reported claude leaf, so the findings' cited `claude` source is a
+    // known member of the batch (`review_verdict_unknown_source_reason`).
+    let claude = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), target_sha),
+            &[
+                member(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(claude.id),
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member(
+                    ReviewBatchMemberRole::Supervisor,
+                    Some(supervisor.id.clone()),
+                    ReviewBatchMemberStatus::Pending,
+                ),
+            ],
+        )
+        .unwrap();
+    force_batch_supervising(db, &batch.id);
+    (cycle_root.id, batch, supervisor.id)
+}
+
+/// Stage a findings verdict from the supervisor, then stop the supervisor
+/// (the production order: the verdict is acknowledged before teardown).
+fn stage_stale_scenario_findings_verdict(
+    db: &WorkDb,
+    root_id: &str,
+    batch_id: &str,
+    supervisor_id: &str,
+    target_sha: &str,
+) -> String {
+    let proposal_id = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: supervisor_id,
+            work_item_id: root_id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &findings_verdict_payload(batch_id, target_sha),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap()
+        .proposal
+        .id;
+    raw(db)
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![supervisor_id],
+        )
+        .unwrap();
+    proposal_id
+}
+
+fn revision_count(db: &WorkDb, root_id: &str) -> i64 {
+    let root = read_task(db, root_id);
+    db.list_tasks(&root.product_id, None, None, false)
+        .unwrap()
+        .iter()
+        .filter(|task| task.kind == TaskKind::Revision && task.parent_task_id.as_deref() == Some(root_id))
+        .count() as i64
+}
+
+/// mono PR #3110: the previous head's supervisor reported after a later push
+/// had already moved the PR on (a batch for the new head exists). The
+/// verdict must be recorded as `stale_head` with no revision minted, the
+/// batch completed, the proposal applied, and the root left held for the
+/// current head's review — with neither cycle count nor `last_reviewed_sha`
+/// stamped from a superseded SHA.
+#[test]
+fn findings_verdict_for_a_superseded_head_is_recorded_stale_and_mints_nothing() {
+    let (_dir, db) = open_db();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    // The push that moved the head already created the next head's batch.
+    let (newer, _) = db
+        .create_review_batch(
+            batch_input(root_id.clone(), "head-b"),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                None,
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha"),
+    )
+    .unwrap();
+
+    assert_eq!(created, None, "a stale-head verdict must mint no remediation");
+    assert_eq!(revision_count(&db, &root_id), 0);
+    let verdict = db.review_verdict_for_execution(&supervisor_id).unwrap().unwrap();
+    assert_eq!(verdict.gate_outcome, REVIEW_GATE_OUTCOME_STALE_HEAD);
+    assert_eq!(verdict.head_sha.as_deref(), Some("head-a"));
+    assert_eq!(verdict.findings_count, 1);
+    assert!(
+        verdict.revision_warranted,
+        "the gate's own answer is preserved on the row"
+    );
+    assert!(
+        !is_informative_gate_outcome(&verdict.gate_outcome),
+        "a stale verdict says nothing about the current head"
+    );
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Completed,
+        "the stale batch still settles and releases its reservation"
+    );
+    assert_eq!(
+        db.review_batch(&newer.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Collecting,
+        "the current head's batch is untouched"
+    );
+    let proposal = db
+        .list_worker_proposals(None, None, Some(ProposalKind::ReviewVerdict), None, None)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .unwrap();
+    assert_eq!(proposal.state, ProposalState::Applied);
+    let root = read_task(&db, &root_id);
+    assert_eq!(
+        root.status,
+        TaskStatus::Active,
+        "the root stays held for the batch that reviews the head it actually has"
+    );
+    assert_eq!(
+        db.get_task_review_cycle_state(&root_id).unwrap(),
+        (0, None),
+        "a superseded head is neither a cycle nor the last reviewed SHA"
+    );
+}
+
+/// Without a newer batch in the DB, the live PR head (one `gh pr view`,
+/// via `PrStateChecker::inspect`) is the second source of truth for a move.
+/// The revision whose push produced the stale head is still released from
+/// its hold — nothing else ever will — while the root stays held.
+#[test]
+fn verdict_for_a_head_the_live_pr_has_moved_past_is_stale_and_releases_the_held_revision() {
+    let (_dir, db) = open_db();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    let revision_id = make_held_revision(&db, &root_id, PR_URL, "head-a");
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-b");
+    let created = apply_verdict(&db, &proposal_id, &checker).unwrap();
+
+    assert_eq!(created, None);
+    assert_eq!(
+        db.review_verdict_for_execution(&supervisor_id)
+            .unwrap()
+            .unwrap()
+            .gate_outcome,
+        REVIEW_GATE_OUTCOME_STALE_HEAD
+    );
+    // The held revision's own work is done (its push was reviewed, if
+    // stalely) and nothing newer will release it; the root is not advanced.
+    let revision = read_task(&db, &revision_id);
+    assert_eq!(revision.status, TaskStatus::InReview);
+    // The stale findings' revision was never minted: the only revision is
+    // the pre-existing held one.
+    assert_eq!(revision_count(&db, &root_id), 1);
+    let root = read_task(&db, &root_id);
+    assert_eq!(root.status, TaskStatus::Active);
+}
+
+/// A live head that still matches the target is not a move: the verdict
+/// applies normally.
+#[test]
+fn verdict_whose_target_is_still_the_live_head_applies_normally() {
+    let (_dir, db) = open_db();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-a");
+    let created = apply_verdict(&db, &proposal_id, &checker).unwrap();
+
+    assert!(created.is_some(), "findings on the current head mint a revision");
+    assert_eq!(revision_count(&db, &root_id), 1);
+    assert_eq!(
+        db.review_verdict_for_execution(&supervisor_id)
+            .unwrap()
+            .unwrap()
+            .gate_outcome,
+        REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
+    );
+    assert_eq!(
+        db.get_task_review_cycle_state(&root_id).unwrap(),
+        (1, Some("head-a".to_owned()))
+    );
+}
+
+/// An explicit (`bossctl review start`) batch targets the head at request
+/// time; if the PR is pushed again while it runs, its findings are recorded
+/// as `stale_head` and mint no automatic remediation against moved code.
+#[test]
+fn explicit_batch_verdict_for_a_moved_head_is_recorded_stale() {
+    let (_dir, db) = open_db();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    raw(&db)
+        .execute(
+            "UPDATE pr_review_batches SET explicit = 1 WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    db.create_review_batch(
+        batch_input(root_id.clone(), "head-b"),
+        &[member(
+            ReviewBatchMemberRole::ClaudeReviewer,
+            None,
+            ReviewBatchMemberStatus::Pending,
+        )],
+    )
+    .unwrap();
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let created = apply_verdict(&db, &proposal_id, &FakePrStateChecker::always(PrOpenState::Open)).unwrap();
+
+    assert_eq!(created, None, "a stale explicit verdict mints no remediation");
+    assert_eq!(revision_count(&db, &root_id), 0);
+    let verdict = db.review_verdict_for_execution(&supervisor_id).unwrap().unwrap();
+    assert_eq!(verdict.gate_outcome, REVIEW_GATE_OUTCOME_STALE_HEAD);
+    assert_eq!(verdict.findings_count, 1, "the findings stay visible on the row");
+}
+
+/// An explicit batch whose target is still the live head applies normally.
+#[test]
+fn explicit_batch_verdict_for_the_current_head_is_applied() {
+    let (_dir, db) = open_db();
+    let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+    raw(&db)
+        .execute(
+            "UPDATE pr_review_batches SET explicit = 1 WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+    let created = apply_verdict(
+        &db,
+        &proposal_id,
+        &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-a"),
+    )
+    .unwrap();
+
+    assert!(
+        created.is_some(),
+        "an explicit batch's findings on the current head materialise"
+    );
+}
+
+fn proposal_state(db: &WorkDb, proposal_id: &str) -> ProposalState {
+    db.list_worker_proposals(None, None, Some(ProposalKind::ReviewVerdict), None, None)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .unwrap()
+        .state
+}
+
+/// A `PrStateChecker` whose live-head lookup fails.
+struct FailingInspectChecker;
+
+impl PrStateChecker for FailingInspectChecker {
+    fn check(&self, _pr_url: &str) -> anyhow::Result<PrOpenState> {
+        Ok(PrOpenState::Open)
+    }
+
+    fn inspect(&self, _pr_url: &str) -> anyhow::Result<crate::work::PrInspect> {
+        Err(anyhow::anyhow!("github unavailable"))
+    }
+}
+
+/// When the live head cannot be established (inspect errors, or reports no
+/// head), the verdict's freshness is unknown: nothing is remediated, the
+/// cycle does not advance, and the proposal stays `proposed` until a later
+/// pass can see the head.
+#[test]
+fn verdict_with_an_unknown_live_head_is_held_until_inspect_succeeds() {
+    for (label, unknown) in [("inspect-error", true), ("missing-head", false)] {
+        let (_dir, db) = open_db();
+        let (root_id, batch, supervisor_id) = supervising_batch_on_held_root(&db, "head-a");
+        let proposal_id = stage_stale_scenario_findings_verdict(&db, &root_id, &batch.id, &supervisor_id, "head-a");
+
+        let created = if unknown {
+            apply_verdict(&db, &proposal_id, &FailingInspectChecker)
+        } else {
+            apply_verdict(&db, &proposal_id, &FakePrStateChecker::always(PrOpenState::Open))
+        }
+        .unwrap();
+
+        assert_eq!(created, None, "{label}: no remediation while freshness is unknown");
+        assert_eq!(revision_count(&db, &root_id), 0, "{label}");
+        assert_eq!(
+            db.get_task_review_cycle_state(&root_id).unwrap(),
+            (0, None),
+            "{label}: cycle must not advance"
+        );
+        assert!(
+            db.review_verdict_for_execution(&supervisor_id).unwrap().is_none(),
+            "{label}: no verdict row is committed"
+        );
+        assert_eq!(proposal_state(&db, &proposal_id), ProposalState::Proposed, "{label}");
+
+        // Once the head is visible and matches, the same proposal applies.
+        let created = apply_verdict(
+            &db,
+            &proposal_id,
+            &FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-a"),
+        )
+        .unwrap();
+        assert!(created.is_some(), "{label}: applies once inspect succeeds");
+        assert_eq!(proposal_state(&db, &proposal_id), ProposalState::Applied, "{label}");
+    }
+}

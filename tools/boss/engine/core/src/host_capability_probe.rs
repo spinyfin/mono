@@ -84,20 +84,11 @@ pub fn gh_authed_capability(authed: bool) -> String {
     format!("gh-authed={authed}")
 }
 
-/// Capability key for an installed agent driver. Spelling is load-bearing:
-/// host selection requires `driver=<slug>` for the execution's resolved
-/// driver and compares by exact string equality.
-pub fn driver_capability(slug: &str) -> String {
-    format!("driver={slug}")
-}
+/// Re-exported from `boss_execution_contracts`.
+pub use boss_execution_contracts::driver_capability;
 
-/// Marker emitted whenever the driver probe section has run, even when no
-/// driver binary was found. Distinguishes "never probed for drivers" from
-/// "probed and found none" — both leave the host without any `driver=` tag,
-/// but only a probed host has this marker. Host selection treats either as
-/// lacking the required driver (fail-closed), and operator-facing reasons
-/// can name the distinction.
-pub const DRIVERS_PROBED_CAPABILITY: &str = "drivers-probed=true";
+/// Re-exported from `boss_execution_contracts`.
+pub use boss_execution_contracts::DRIVERS_PROBED_CAPABILITY;
 
 /// `(slug, binary)` pairs the driver probe checks. Source of truth is the
 /// engine's registered drivers — the candidate set is whatever this binary
@@ -395,6 +386,7 @@ mod tests {
     fn registered_driver_binaries_covers_built_ins_in_sorted_order() {
         let pairs = registered_driver_binaries();
         let slugs: Vec<&str> = pairs.iter().map(|(s, _)| *s).collect();
+        assert!(slugs.contains(&"agy"));
         assert!(slugs.contains(&"claude"));
         assert!(slugs.contains(&"codex"));
         assert!(slugs.contains(&"grok"));

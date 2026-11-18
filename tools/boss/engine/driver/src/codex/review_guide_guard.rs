@@ -1,5 +1,5 @@
 //! Read-only source inspection and literal submission allowlist for guide workers.
-use super::guard_python::with_command_tokenizer;
+use crate::guard_python::with_command_tokenizer;
 #[path = "review_guide_reads.rs"]
 mod reads;
 
@@ -13,6 +13,11 @@ pub fn review_guide_allow_rules() -> Vec<String> {
         "Bash(git --no-pager show:*)".to_owned(),
         "Bash(git diff --no-ext-diff --no-textconv:*)".to_owned(),
         "Bash(git --no-pager diff --no-ext-diff --no-textconv:*)".to_owned(),
+        // The prompt names the pinned object store explicitly (`git --git-dir
+        // <store> show …`) instead of relying on an exported GIT_DIR; the
+        // shared command guard still pins the store path and the revisions.
+        "Bash(git --git-dir:*)".to_owned(),
+        "Bash(git --no-pager --git-dir:*)".to_owned(),
         "Bash(cat:*)".to_owned(),
         "Bash(nl:*)".to_owned(),
         "Bash(wc -l:*)".to_owned(),
@@ -83,7 +88,7 @@ else:
 /// The fragment avoids shell-sensitive quotes so Claude can embed it in python -c.
 #[macro_export]
 macro_rules! render_review_guide_guard {
-    ($before:literal, $after:literal) => {
+    ($before:expr, $after:expr) => {
         concat!(
             $before,
             r#"def review_guide_masked_command(command):
@@ -194,6 +199,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn allows_read_only_pipelines_and_multi_range_sed() {
+        let pinned = "a".repeat(40);
+        let approved = [
+            "nl -ba /repo/src/a.rs | sed -n '1,76p'".to_owned(),
+            "nl -ba /repo/src/a.rs | sed -n '105,164p;245,335p'".to_owned(),
+            "cat -n /repo/src/a.rs | head -n 40".to_owned(),
+            format!("git show {pinned}:src/a.rs | sed -n '10,20p'"),
+            "sed -n '1,5p;9p' /repo/src/a.rs".to_owned(),
+        ];
+        let blocked = [
+            "nl -ba /repo/src/a.rs | sed -i 's/a/b/'".to_owned(),
+            "nl -ba /repo/src/a.rs | sed -n '1p' /repo/src/b.rs".to_owned(),
+            "cat /repo/src/a.rs | sh".to_owned(),
+            "nl -ba /repo/src/a.rs > out".to_owned(),
+            "nl -ba /etc/passwd | sed -n '1p'".to_owned(),
+            "nl -ba | sed -n '1p'".to_owned(),
+            "sed -n '1p'".to_owned(),
+            "cat /repo/src/a.rs | head -n 3 ; touch x".to_owned(),
+            "cat /repo/src/a.rs | head -n 3 || touch x".to_owned(),
+            "cat /repo/src/a.rs | rg foo".to_owned(),
+            "cat /repo/src/a.rs | sed -n '1p;w out'".to_owned(),
+        ];
+        for (commands, expected) in [(&approved[..], "approve"), (&blocked[..], "block")] {
+            for command in commands {
+                assert_eq!(
+                    decide_with_source(
+                        serde_json::json!({"tool_name":"Bash","cwd":"/repo","tool_input":{"command":command}}),
+                        true
+                    )
+                    .0,
+                    expected,
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    /// The pinned object store the engine hands a guide worker as
+    /// `BOSS_REVIEW_GUIDE_GIT_DIR` (a fixed, nonexistent path: the guard
+    /// compares spellings, it never opens the store).
+    const PINNED_GIT_DIR: &str = "/repo-store/flunge/.git";
+
+    #[test]
+    fn explicit_git_dir_is_accepted_only_for_the_pinned_store() {
+        let base = "b".repeat(40);
+        let head = "a".repeat(40);
+        for command in [
+            format!("git --git-dir {PINNED_GIT_DIR} show {base}:src/a.rs"),
+            format!("git --no-pager --git-dir {PINNED_GIT_DIR} show {base}:src/a.rs"),
+            format!("git --git-dir {PINNED_GIT_DIR} diff --no-ext-diff --no-textconv {base} {head} -- src/a.rs"),
+            format!("git --git-dir /repo-store/flunge/../flunge/.git show {base}:src/a.rs"),
+        ] {
+            let payload = serde_json::json!({"tool_name":"Bash","cwd":"/repo","tool_input":{"command":command}});
+            assert_eq!(decide_with_source(payload, true).0, "approve", "{command}");
+        }
+        for command in [
+            // A foreign repository, the shared store's sibling, a relative
+            // spelling, the `=` form (not in the literal grammar), and a bare
+            // `--git-dir` with nothing after it.
+            format!("git --git-dir /repo-store/other/.git show {base}:src/a.rs"),
+            format!("git --git-dir /repo/.git show {base}:src/a.rs"),
+            format!("git --git-dir .git show {base}:src/a.rs"),
+            format!("git --git-dir={PINNED_GIT_DIR} show {base}:src/a.rs"),
+            "git --git-dir".to_owned(),
+            format!("git --git-dir {PINNED_GIT_DIR} fetch --depth=200"),
+            format!("git --git-dir {PINNED_GIT_DIR} show main:src/a.rs"),
+        ] {
+            let payload = serde_json::json!({"tool_name":"Bash","cwd":"/repo","tool_input":{"command":command}});
+            assert_eq!(decide_with_source(payload, true).0, "block", "{command}");
+        }
+    }
+
+    #[test]
+    fn allow_rules_cover_the_explicit_git_dir_form() {
+        let allow = review_guide_allow_rules();
+        assert!(allow.contains(&"Bash(git --git-dir:*)".into()));
+        assert!(allow.contains(&"Bash(git --no-pager --git-dir:*)".into()));
+    }
+
     fn decide(payload: serde_json::Value) -> (String, String) {
         decide_with_source(payload, false)
     }
@@ -203,6 +288,10 @@ mod tests {
     }
 
     fn decide_at(payload: serde_json::Value, root: &str) -> (String, String) {
+        decide_at_with_previous(payload, root, "")
+    }
+
+    fn decide_at_with_previous(payload: serde_json::Value, root: &str, previous: &str) -> (String, String) {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("boss-codex-review-guide-{0}-{seq}", std::process::id()));
@@ -213,6 +302,8 @@ mod tests {
             .env("BOSS_REVIEW_GUIDE_WORKSPACE", root)
             .env("BOSS_REVIEW_GUIDE_HEAD_SHA", "a".repeat(40))
             .env("BOSS_REVIEW_GUIDE_BASE_SHA", "b".repeat(40))
+            .env("BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA", previous)
+            .env("BOSS_REVIEW_GUIDE_GIT_DIR", PINNED_GIT_DIR)
             .arg(script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -237,6 +328,22 @@ mod tests {
             output["decision"].as_str().unwrap().to_owned(),
             output["reason"].as_str().unwrap_or_default().to_owned(),
         )
+    }
+
+    #[test]
+    fn update_reads_allow_only_the_additional_pinned_previous_head() {
+        let previous = "c".repeat(40);
+        for command in [
+            format!("git show {previous}:src/a.rs"),
+            format!("git diff --no-ext-diff --no-textconv {previous} {}", "a".repeat(40)),
+        ] {
+            let payload = serde_json::json!({"tool_name": "Bash", "cwd": "/repo", "tool_input": {"command": command}});
+            assert_eq!(
+                decide_at_with_previous(payload.clone(), "/repo", &previous).0,
+                "approve"
+            );
+            assert_eq!(decide_at(payload, "/repo").0, "block");
+        }
     }
 
     #[test]
@@ -325,7 +432,7 @@ mod tests {
                 ("$FILE", "block"),
                 ("$(cat src/a.rs)", "block"),
                 ("src/*", "block"),
-                ("src/a.rs | cat", "block"),
+                ("src/a.rs | sh", "block"),
                 ("src/a.rs > src/b.rs", "block"),
                 ("", "block"),
                 ("-", "block"),

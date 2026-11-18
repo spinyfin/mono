@@ -12,7 +12,31 @@ extension ChatViewModel {
         defaults.set(width, forKey: bossPanelWidthDefaultsKey)
     }
 
-    func setNavigationMode(_ mode: NavigationMode) {
+    /// Run-keyed focus shared by `bossctl agents focus` and Doing-card clicks:
+    /// validate and reveal the run, then switch to Agents so the pending
+    /// responder request can focus the mounted terminal or card.
+    @discardableResult
+    func focusAgentRun(_ runId: String) -> EngineFocusResult {
+        guard let handler = paneFocusHandler else {
+            return .failure(.internalFailure(Self.noPaneAllocatorReason))
+        }
+        let result = handler(runId)
+        if case .success = result { setNavigationMode(.agents) }
+        return result
+    }
+
+    func focusAgentFromWorkCard(_ runId: String) {
+        switch focusAgentRun(runId) {
+        case .success:
+            workErrorMessage = nil
+        case .failure(.unknownSlot):
+            workErrorMessage = "This agent is no longer available in this window."
+        case .failure(.internalFailure(let reason)):
+            workErrorMessage = "Could not show agent: \(reason)"
+        }
+    }
+
+    func setNavigationMode(_ mode: NavigationMode, refreshWorkOnEntry: Bool = true) {
         // Instrument the tab switch so the pane-grid relayout it provokes
         // (how many panes rebuild, the settle wall-time, any unexpected
         // teardown) is measurable for the high-CPU investigation. See
@@ -25,71 +49,120 @@ extension ChatViewModel {
         }
         navigationMode = mode
         defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
-        if mode == .work {
-            refreshWork()
+        if mode != .work {
+            workSearchText = ""
         }
-        if mode == .automations {
-            refreshAutomations()
+        if mode == .work && refreshWorkOnEntry {
+            refreshWork()
         }
     }
 
     func selectWorkProduct(_ productID: String) {
-        let isAlreadyShowingProductBoard =
-            selectedWorkProductID == productID
-            && selectedProjectFilterIDs.isEmpty
-            && selectedWorkCardID == nil
-        guard !isAlreadyShowingProductBoard else { return }
-        selectedWorkProductID = productID
-        selectedProjectFilterIDs = []
-        selectedWorkCardID = nil
-        workErrorMessage = nil
-        persistSelectedProductID(productID)
-        persistProjectFilterIDs()
-        refreshWorkSubscriptions()
-        if isConnected {
-            engine.sendGetWorkTree(productId: productID, flow: .productSwitch)
-            engine.sendListAttentionItemsForWorkItem(workItemID: productID)
-            engine.sendListAttentionGroups(productId: productID)
-            engine.sendListDeferredScopeAttentions(productId: productID)
+        changeNavigatorScope {
+            if selectedWorkProductID == productID { selectionHistory.useProduct(productID) }
+            let isAlreadyShowingProductBoard =
+                selectedWorkProductID == productID
+                && selectedProjectFilterIDs.isEmpty
+                && selectedWorkCardID == nil
+            guard !isAlreadyShowingProductBoard else { return }
+            selectedWorkProductID = productID
+            selectedProjectFilterIDs = []
+            selectedWorkCardID = nil
+            workErrorMessage = nil
+            persistSelectedProductID(productID)
+            persistProjectFilterIDs()
+            refreshWorkSubscriptions()
+            if isConnected {
+                engine.sendGetWorkTree(productId: productID, flow: .productSwitch)
+                engine.sendListDeferredScopeAttentions(productId: productID)
+            }
         }
     }
 
     func toggleProjectFilter(_ projectID: String) {
-        if filterToChoresOnly {
-            filterToChoresOnly = false
-            defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
+        changeNavigatorScope {
+            if filterToChoresOnly {
+                filterToChoresOnly = false
+                defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
+            }
+            if selectedProjectFilterIDs.contains(projectID) {
+                selectedProjectFilterIDs.remove(projectID)
+            } else {
+                selectedProjectFilterIDs.insert(projectID)
+            }
+            selectedWorkCardID = nil
+            persistProjectFilterIDs()
         }
-        if selectedProjectFilterIDs.contains(projectID) {
-            selectedProjectFilterIDs.remove(projectID)
-        } else {
-            selectedProjectFilterIDs.insert(projectID)
-        }
-        selectedWorkCardID = nil
-        persistProjectFilterIDs()
     }
 
     func clearProjectFilters() {
-        guard !selectedProjectFilterIDs.isEmpty || filterToChoresOnly else { return }
-        selectedProjectFilterIDs = []
-        filterToChoresOnly = false
-        defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
-        selectedWorkCardID = nil
-        persistProjectFilterIDs()
+        changeNavigatorScope {
+            guard !selectedProjectFilterIDs.isEmpty || filterToChoresOnly else { return }
+            selectedProjectFilterIDs = []
+            filterToChoresOnly = false
+            defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
+            selectedWorkCardID = nil
+            persistProjectFilterIDs()
+        }
     }
 
     func setFilterToChoresOnly(_ value: Bool) {
-        guard filterToChoresOnly != value else { return }
-        filterToChoresOnly = value
-        defaults.set(value, forKey: filterToChoresOnlyDefaultsKey)
-        if value {
-            selectedProjectFilterIDs = []
-            persistProjectFilterIDs()
+        changeNavigatorScope {
+            guard filterToChoresOnly != value else { return }
+            filterToChoresOnly = value
+            defaults.set(value, forKey: filterToChoresOnlyDefaultsKey)
+            if value {
+                selectedProjectFilterIDs = []
+                persistProjectFilterIDs()
+            }
+            selectedWorkCardID = nil
         }
-        selectedWorkCardID = nil
     }
 
+    /// Navigator right-click → Archive. Sends the status patch and marks
+    /// the project as archiving so the row reacts immediately; the engine's
+    /// `work_item_updated` reply (see `handleUpdatedWorkItem`) applies the
+    /// archived project in place and clears the pending state. A second
+    /// click while the first is in flight is a no-op rather than a second
+    /// RPC.
     func archiveProject(id: String) {
-        engine.sendUpdateWorkItem(id: id, patch: ["status": "archived"])
+        guard !archivingProjectIDs.contains(id) else { return }
+        archivingProjectIDs.insert(id)
+        guard let requestID = engine.sendUpdateWorkItem(id: id, patch: ["status": "archived"]) else {
+            // Not sent (socket down): the `.notConnected` event reports it;
+            // there is nothing in flight to wait for.
+            archivingProjectIDs.remove(id)
+            return
+        }
+        archiveRequestProjectIDs[requestID] = id
+    }
+
+    /// Clear the pending-archive mark for `projectID` (and any request id
+    /// that pointed at it). Called on the engine's reply, on an error for
+    /// that request, and on paths where no reply can ever arrive.
+    func settleArchiveRequest(projectID: String) {
+        archivingProjectIDs.remove(projectID)
+        archiveRequestProjectIDs = archiveRequestProjectIDs.filter { $0.value != projectID }
+    }
+
+    /// A `work_error` (or undecodable reply) carrying a pending archive's own
+    /// request id belongs to that archive alone: drop its pending mark and
+    /// surface the message, without touching any other in-flight state.
+    /// Returns whether the request id matched an archive.
+    func settleArchiveWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId, let projectID = archiveRequestProjectIDs[requestId] else { return false }
+        abandonBackgroundWorkRequest(requestId: requestId)
+        settleArchiveRequest(projectID: projectID)
+        workErrorMessage = message
+        return true
+    }
+
+    /// Clear every pending archive: used when the link drops or an error
+    /// arrives that cannot be attributed to one request.
+    func settleAllArchiveRequests() {
+        guard !archivingProjectIDs.isEmpty || !archiveRequestProjectIDs.isEmpty else { return }
+        archivingProjectIDs.removeAll()
+        archiveRequestProjectIDs.removeAll()
     }
 
     func setIncludeChores(_ value: Bool) {
@@ -110,10 +183,10 @@ extension ChatViewModel {
         defaults.set(value, forKey: showArchivedProjectsDefaultsKey)
     }
 
-    func setReviewReadyOnly(_ value: Bool) {
-        guard reviewReadyOnly != value else { return }
-        reviewReadyOnly = value
-        defaults.set(value, forKey: reviewReadyOnlyDefaultsKey)
+    func setShowParked(_ value: Bool) {
+        guard showParked != value else { return }
+        showParked = value
+        defaults.set(value, forKey: showParkedDefaultsKey)
     }
 
     /// Persist (or clear, when `nil`) the selected product so the next
@@ -149,9 +222,13 @@ extension ChatViewModel {
     }
 
     func selectWorkCard(_ taskID: String?) {
+        if taskID == nil {
+            navigator.selectedRootID = nil
+            navigator.retainedTask = nil
+            if navigator.mode == .navigator { selectionHistory.rememberRoot(nil, scope: navigatorScopeKey) }
+        }
+        if let taskID, let task = task(withID: taskID) { selectedWorkProductID = task.productID }
         selectedWorkCardID = taskID
-        guard let taskID, let task = task(withID: taskID) else { return }
-        selectedWorkProductID = task.productID
     }
 
     /// One click on the findings badge does both jobs: open the findings
@@ -195,24 +272,27 @@ extension ChatViewModel {
         }
         switch revealCardTarget(for: revision.id) {
         case .revealed(let cardID) where cardID != revision.id:
-            return "Click to open the findings. The fix is already in review or done, so it is shown as a line on this card rather than as its own card."
+            return "Click to open the findings. The fix is folded into its parent, so it is shown as a line on this card rather than as its own card."
         default:
             return "Click to open the findings and reveal the fix task's card."
         }
     }
 
     /// Navigate the kanban to `taskID` and play a 1.5 s highlight.
-    /// Switches to the Work tab, selects the task's product, clears
-    /// every active board filter, and queues a scroll. If the task's
-    /// product is not the one currently loaded, the scroll is deferred
-    /// until the `workTree` event for that product arrives.
+    /// Switches to the Work tab, selects the task's product, clears the
+    /// search / blocked-only / chores-only / hidden-chores filters,
+    /// reconciles the project filter (see
+    /// `reconcileProjectFilterForReveal`), and queues a scroll. If the
+    /// task's product is not the one currently loaded, the scroll is
+    /// deferred until the `workTree` event for that product arrives, and
+    /// the project filter is reconciled then.
     ///
     /// Reveal's contract is "show me this card", so it must override any
     /// filter that would hide the target — a stale search query, a
-    /// blocked-only / chores-only toggle, a project filter, or chores
-    /// being hidden — all of which can exclude the card and make the
-    /// scroll silently land on nothing (#1249). We reset the board to its
-    /// unfiltered state before asking the view to expand and scroll.
+    /// blocked-only / chores-only toggle, a project filter that excludes
+    /// the card, or chores being hidden — all of which can make the
+    /// scroll silently land on nothing (#1249). A project filter that
+    /// already contains the target is left alone.
     ///
     /// `taskID` itself is not always the card that gets scrolled to/
     /// highlighted — see `revealCardTarget(for:)`: a revision rolled up
@@ -229,35 +309,70 @@ extension ChatViewModel {
         revealHighlightID = nil
         revealCompletion = completion
         revealProductID = productID
-        setNavigationMode(.work)
-        clearWorkFiltersForReveal()
+        // Reveal owns its refresh: entering Work must not fetch the old
+        // product before selection, or refetch the target a second time.
+        setNavigationMode(.work, refreshWorkOnEntry: false)
         let switching = currentSelectedProductID != productID
-        if switching { selectWorkProduct(productID) }
+        let hadProjectFilter = !selectedProjectFilterIDs.isEmpty
+        clearWorkFiltersForReveal()
+        if switching {
+            // Selecting a product resets the project filter; the user's
+            // filter intent is carried in `hadProjectFilter` instead.
+            selectWorkProduct(productID)
+        } else {
+            refreshWork()
+        }
         let outcome: RevealCardResult
         if switching || task(withID: taskID) == nil {
             pendingRevealScrollID = taskID
+            pendingRevealReconcilesProjectFilter = hadProjectFilter
             armRevealDeadline(taskID: taskID, waitingForTree: true)
-            if !switching { engine.sendGetWorkTree(productId: productID, flow: .manualRefresh) }
             outcome = .deferred
         } else {
+            reconcileProjectFilterForReveal(taskID, hadProjectFilter: hadProjectFilter)
             outcome = prepareReveal(taskID)
         }
         return outcome
     }
 
-    /// Reset every board filter that could hide a reveal target so the
-    /// full work board for the product is shown. Each assignment is a
-    /// no-op when the filter is already in its neutral state, so this is
-    /// cheap to call unconditionally. Keep this in sync with
-    /// `computeVisibleWorkItems` — any new narrowing filter added there
-    /// must be neutralized here too, or reveal can silently fail again.
+    /// Reset every board filter that could hide a reveal target other than
+    /// the project filter, which `reconcileProjectFilterForReveal` handles.
+    /// Each assignment is a no-op when the filter is already in its neutral
+    /// state, so this is cheap to call unconditionally. Keep this in sync
+    /// with `computeVisibleWorkItems` — any new narrowing filter added there
+    /// must be neutralized here (or reconciled in
+    /// `reconcileProjectFilterForReveal`), or reveal can silently fail again.
     private func clearWorkFiltersForReveal() {
-        selectedProjectFilterIDs = []
         workSearchText = ""
         showBlockedOnly = false
         filterToChoresOnly = false
         includeChores = true
-        reviewReadyOnly = false
+    }
+
+    /// Leave the project filter alone when the reveal target's card is
+    /// already in it. Only when the card would be hidden does the filter
+    /// change: to the card's project, or to All when it has none.
+    /// `hadProjectFilter` is whether a filter was active when the reveal
+    /// began; it matters for a cross-product reveal, where selecting the
+    /// product has already emptied the filter, so an empty filter with
+    /// `hadProjectFilter` means "switch to the target's project". A
+    /// target that cannot be resolved yet leaves the filter untouched.
+    func reconcileProjectFilterForReveal(_ taskID: String, hadProjectFilter: Bool) {
+        guard hadProjectFilter || !selectedProjectFilterIDs.isEmpty else { return }
+        guard let item = task(withID: taskID) else { return }
+        var cardTask = item
+        if case .revealed(let cardID) = revealCardTarget(for: taskID), let host = task(withID: cardID) {
+            cardTask = host
+        }
+        let updated: Set<String>
+        if let projectID = cardTask.projectID {
+            updated = selectedProjectFilterIDs.contains(projectID) ? selectedProjectFilterIDs : [projectID]
+        } else {
+            updated = []
+        }
+        guard updated != selectedProjectFilterIDs else { return }
+        selectedProjectFilterIDs = updated
+        persistProjectFilterIDs()
     }
 
     func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {

@@ -7,11 +7,12 @@ use tempfile::tempdir;
 use tokio::sync::Mutex;
 
 use super::*;
-use crate::coordinator::{CubeRepoHandle, CubeWorkspaceLease, RebaseOutcome};
 use crate::test_support::*;
 use crate::work::{
     ConflictResolution, ConflictResolutionInsertInput, PendingMergeCheck, WorkDb, WorkItem, WorkItemPatch,
 };
+use boss_execution_contracts::RebaseOutcome;
+use boss_host_execution::types::{CubeRepoHandle, CubeWorkspaceLease};
 
 /// What the scripted cube double's `rebase_workspace` returns.
 #[derive(Clone)]
@@ -34,7 +35,7 @@ enum Script {
 #[builder(on(String, into))]
 struct ScriptCube {
     script: Script,
-    /// T9/T2562: what `verify_deletion_tripwire` should report. Empty
+    /// What `verify_deletion_tripwire` should report. Empty
     /// (the default via [`Self::new`]) means "clean" — no network call is
     /// made since this is a scripted double, not `CommandCubeClient`.
     tripwire_findings: Vec<String>,
@@ -274,7 +275,7 @@ async fn rung1_clean_rebase_retires_attempt_at_rung_1_with_no_worker() {
 
 #[tokio::test]
 async fn rung1_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
-    // T9/T2562: a clean, pushed rung-1 rebase whose result the deletion
+    // A clean, pushed rung-1 rebase whose result the deletion
     // tripwire flags must NOT auto-retire as a success — it must halt
     // identically to how a worker-driven (rung 2/3) resolution halts on
     // the same tripwire: blocked:deletion_signoff + an attention item, no
@@ -295,6 +296,7 @@ async fn rung1_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
     // The attempt still gets stamped rung 1 / succeeded — it did push a
     // mechanical resolution; the safety gate is orthogonal telemetry.
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(row.ladder_reason.as_deref().unwrap().contains("deletion tripwire"));
     assert_eq!(row.status, "succeeded");
     assert_eq!(row.resolved_by_rung, Some(1));
     // Parent halted in blocked:deletion_signoff, NOT back in Review.
@@ -459,7 +461,7 @@ async fn rung1_ensure_repo_error_falls_through_without_lease() {
     assert_eq!(row.status, "pending");
 }
 
-/// Incident defense-in-depth (T501/flunge PR #917): a rung-1 lease failure
+/// Incident defense-in-depth (flunge PR #917): a rung-1 lease failure
 /// that clears on retry must NOT fall through — the ladder proceeds exactly
 /// as if the first attempt had never failed.
 #[tokio::test]
@@ -479,7 +481,7 @@ async fn rung1_lease_fails_once_then_retry_succeeds_and_proceeds() {
     assert_eq!(row.resolved_by_rung, Some(1));
 }
 
-/// Incident defense-in-depth (T501/flunge PR #917): a rung-1 lease that
+/// Incident defense-in-depth (flunge PR #917): a rung-1 lease that
 /// fails on both the initial attempt and the retry must NOT escalate
 /// straight to a full worker — it reports
 /// [`LadderOutcome::MechanicalRungsUnavailable`] so the caller
@@ -506,6 +508,12 @@ async fn rung1_lease_fails_twice_reports_mechanical_rungs_unavailable() {
     assert!(cube.gotos.lock().await.is_empty());
     assert!(cube.released.lock().await.is_empty());
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(
+        row.ladder_reason
+            .as_deref()
+            .unwrap()
+            .contains("workspace lease failed after retry")
+    );
     assert_eq!(row.status, "pending");
 }
 
@@ -541,7 +549,7 @@ fn second_conflict_attempt(db: &WorkDb, product_id: &str, chore_id: &str) -> (Pe
 
 #[tokio::test]
 async fn rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_conflict() {
-    // Regression test for spinyfin/mono#2032 (chore T2680): with
+    // Regression test for spinyfin/mono#2032: with
     // RUNG0_APPLY_LIVE now true, a residual conflict whose files are ones
     // the deterministic-resolver registry recognizes (here: Cargo.lock —
     // see `registry.rs`'s
@@ -553,24 +561,20 @@ async fn rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_confl
     // SECOND, independent conflict for the same PR (the "main churns fast,
     // PR re-conflicts after a prior resolution" case from the operator
     // report), not just the first time.
-    if which("cargo").is_none() {
-        eprintln!("skipping: cargo not on PATH");
-        return;
-    }
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
     let pub_ = Arc::new(RecordingPublisher::default());
 
     let ws = tempdir().unwrap();
-    write_resolvable_cargo_lock_fixture(ws.path(), "fixture-r0-live");
+    write_conflicted_lock_workspace(ws.path());
     let cube = ScriptCube::with_workspace_path(
-        Script::Conflicts(vec!["Cargo.lock".to_owned()]),
+        Script::Conflicts(vec!["Cargo.lock".to_owned(), "MODULE.bazel.lock".to_owned()]),
         ws.path().to_path_buf(),
     );
 
     // First conflict.
-    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+    let outcome = try_mechanical_rungs_with(&db, pub_.as_ref(), &cube, &candidate, &attempt, &hermetic_resolvers).await;
     assert_eq!(
         outcome,
         LadderOutcome::Retired,
@@ -579,6 +583,10 @@ async fn rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_confl
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "succeeded");
     assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(
+        row.revision_task_id.is_none(),
+        "a lockfile-only conflict must not spawn a worker revision"
+    );
     let (status, reason) = chore_state(&db, &chore_id);
     assert_eq!(status, "InReview");
     assert!(reason.is_none(), "block should be cleared, got {reason:?}");
@@ -587,13 +595,22 @@ async fn rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_confl
         vec![42],
         "rung 0 must land via push_resolution"
     );
+    assert_eq!(*cube.rebases.lock().await, vec![42]);
+    for lock in ["Cargo.lock", "MODULE.bazel.lock"] {
+        let content = std::fs::read_to_string(ws.path().join(lock)).unwrap();
+        assert!(
+            !content.contains("<<<<<<<"),
+            "{lock} must be regenerated, got {content:?}"
+        );
+    }
 
     // main churns again: a SECOND, independent conflict on the same PR.
     // The re-arm path re-blocks the chore and inserts a fresh attempt row
     // rather than ever reusing the first (already-succeeded) one.
     let (candidate2, attempt2) = second_conflict_attempt(&db, &candidate.product_id, &chore_id);
 
-    let outcome2 = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate2, &attempt2).await;
+    let outcome2 =
+        try_mechanical_rungs_with(&db, pub_.as_ref(), &cube, &candidate2, &attempt2, &hermetic_resolvers).await;
     assert_eq!(
         outcome2,
         LadderOutcome::Retired,
@@ -627,7 +644,7 @@ async fn rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_confl
 /// default.
 struct Rung0Cube {
     push_ok: bool,
-    /// T9/T2562: what `verify_deletion_tripwire` should report; empty (the
+    /// What `verify_deletion_tripwire` should report; empty (the
     /// default via [`Self::new`]) means "clean".
     tripwire_findings: Vec<String>,
     pushes: Mutex<Vec<(PathBuf, u64)>>,
@@ -670,30 +687,410 @@ crate::stub_cube_client! { Rung0Cube {
     }
 } }
 
-fn which(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(program);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+/// Hermetic stand-in for the lockfile regeneration tools: claims the
+/// lockfiles a test conflicts on and rewrites them with fresh content,
+/// without shelling out to `cargo`/`bazel`.
+struct RegeneratingLockResolver {
+    fail_with: Option<&'static str>,
 }
 
-/// Write a workspace fixture with a conflicted `Cargo.lock` that
-/// `CargoLockResolver` (a `ResolverRegistry::with_builtins()` built-in) can
-/// regenerate cleanly against the sibling `Cargo.toml`.
-fn write_resolvable_cargo_lock_fixture(ws: &std::path::Path, package_name: &str) {
+#[async_trait::async_trait]
+impl boss_deterministic_resolvers::DeterministicResolver for RegeneratingLockResolver {
+    fn class(&self) -> boss_deterministic_resolvers::ConflictClass {
+        boss_deterministic_resolvers::ConflictClass::CargoLock
+    }
+
+    fn applies_to(&self, file: &ConflictedFile) -> bool {
+        boss_deterministic_resolvers::is_generated_lockfile(&file.path)
+    }
+
+    async fn resolve(
+        &self,
+        workspace_path: &std::path::Path,
+        file: &ConflictedFile,
+    ) -> boss_deterministic_resolvers::ResolveOutcome {
+        if let Some(reason) = self.fail_with {
+            return boss_deterministic_resolvers::ResolveOutcome::Failed {
+                reason: reason.to_owned(),
+            };
+        }
+        std::fs::write(workspace_path.join(&file.path), "# regenerated\n").unwrap();
+        boss_deterministic_resolvers::ResolveOutcome::Resolved {
+            summary: "regenerated".to_owned(),
+        }
+    }
+}
+
+async fn attempt_rung0_hermetic(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: &dyn CubeClient,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    lease: &CubeWorkspaceLease,
+    residual_paths: &[String],
+) -> LadderOutcome {
+    let workspace = RungWorkspace {
+        lease,
+        resolvers: &hermetic_resolvers,
+    };
+    attempt_rung0_with(
+        work_db,
+        publisher,
+        cube_client,
+        candidate,
+        attempt,
+        &workspace,
+        residual_paths,
+    )
+    .await
+}
+
+fn hermetic_resolvers(_base_revision: &str) -> ResolverRegistry {
+    let mut registry = ResolverRegistry::empty();
+    registry.register(Box::new(RegeneratingLockResolver { fail_with: None }));
+    registry
+}
+
+/// A base that deleted its lockfile while the PR modified it. The merged
+/// manifest remains valid, so absence of a seed must not prevent regeneration.
+struct MissingBaseLock;
+
+#[async_trait::async_trait]
+impl boss_command_runner::CommandRunner for MissingBaseLock {
+    async fn run(
+        &self,
+        program: &std::path::Path,
+        args: &[std::ffi::OsString],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<boss_command_runner::CommandOutput> {
+        use boss_command_runner::CommandOutput;
+        let args: Vec<_> = args.iter().map(|s| s.to_str().unwrap()).collect();
+        if args.first() == Some(&"file") {
+            assert_eq!(args[2..], ["-r", "main@origin", "--", "MODULE.bazel.lock"]);
+            let success = match args[1] {
+                "show" => false,
+                "list" => true,
+                other => panic!("unexpected jj command: {other}"),
+            };
+            return Ok(CommandOutput {
+                success,
+                code: Some(if success { 0 } else { 1 }),
+                stdout: String::new(),
+                stderr: if success {
+                    String::new()
+                } else {
+                    "No such path: MODULE.bazel.lock".into()
+                },
+            });
+        }
+        assert_eq!(program, std::path::Path::new("bazel"));
+        assert_eq!(args, ["mod", "deps", "--lockfile_mode=update"]);
+        let cwd = cwd.unwrap();
+        assert!(!cwd.join("MODULE.bazel.lock").exists());
+        assert_eq!(std::fs::read_to_string(cwd.join("MODULE.bazel"))?, "merged manifest\n");
+        std::fs::write(cwd.join("MODULE.bazel.lock"), "regenerated from merged manifest\n")?;
+        Ok(CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn module_lock_absent_on_base_regenerates_and_retires_without_an_agent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel"), "merged manifest\n").unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel.lock"), "<<<<<<< conflicted\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["MODULE.bazel.lock".into()]),
+        ws.path().to_path_buf(),
+    );
+    let factory = |base: &str| {
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(
+            boss_deterministic_resolvers::inject::bazel_module_lock(Arc::new(MissingBaseLock))
+                .with_base_revision(base.into()),
+        ));
+        registry
+    };
+    let outcome = try_mechanical_rungs_with(&db, &publisher, &cube, &candidate, &attempt, &factory).await;
+    assert_eq!(outcome, LadderOutcome::Retired);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(row.revision_task_id.is_none());
+    assert_eq!(*cube.pushes.lock().await, vec![42]);
+    assert_eq!(chore_state(&db, &chore_id).0, "InReview");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("MODULE.bazel.lock")).unwrap(),
+        "regenerated from merged manifest\n"
+    );
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions[0].tier, "engine_rebase");
+    assert_eq!(decisions[0].outcome, "residual_conflicts");
+    assert_eq!(decisions[1].tier, "deterministic");
+    assert_eq!(decisions[1].outcome, "retired");
+    assert!(row.ladder_reason.as_deref().is_some_and(|r| !r.is_empty()));
+    assert_eq!(
+        db.metrics_registry()
+            .counter_value("conflict_ladder.deterministic.retired"),
+        Some(1)
+    );
+}
+
+/// Seeds regeneration from a base that already has the lockfile (the
+/// production shape: `MODULE.bazel.lock` / `Cargo.lock` are checked in on
+/// main), then regenerates and retires without an agent.
+///
+/// These tests prove the resolver's present-base seed path: a successful
+/// `jj file show` of the lockfile, the owner command seeing that seed, and
+/// the ladder retiring at rung 0. They use a fake `CommandRunner` and
+/// `ScriptCube`, so they do not exercise a real-jj push or the cube
+/// bookmark gate.
+#[derive(Clone, Copy)]
+struct PresentBaseLock {
+    lock_path: &'static str,
+    tool: &'static str,
+    tool_args: &'static [&'static str],
+}
+
+#[async_trait::async_trait]
+impl boss_command_runner::CommandRunner for PresentBaseLock {
+    async fn run(
+        &self,
+        program: &std::path::Path,
+        args: &[std::ffi::OsString],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<boss_command_runner::CommandOutput> {
+        use boss_command_runner::CommandOutput;
+        let args: Vec<_> = args.iter().map(|s| s.to_str().unwrap()).collect();
+        if args.first() == Some(&"file") {
+            assert_eq!(args[2..], ["-r", "main@origin", "--", self.lock_path]);
+            assert_eq!(args[1], "show");
+            return Ok(CommandOutput {
+                success: true,
+                code: Some(0),
+                stdout: "base lockfile\n".into(),
+                stderr: String::new(),
+            });
+        }
+        assert_eq!(program, std::path::Path::new(self.tool));
+        assert_eq!(args, self.tool_args);
+        let cwd = cwd.unwrap();
+        assert_eq!(std::fs::read_to_string(cwd.join(self.lock_path))?, "base lockfile\n");
+        std::fs::write(cwd.join(self.lock_path), "regenerated from seeded base\n")?;
+        Ok(CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn module_lock_present_on_base_regenerates_and_retires_without_an_agent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel"), "merged manifest\n").unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel.lock"), "<<<<<<< conflicted\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["MODULE.bazel.lock".into()]),
+        ws.path().to_path_buf(),
+    );
+    let factory = |base: &str| {
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(
+            boss_deterministic_resolvers::inject::bazel_module_lock(Arc::new(PresentBaseLock {
+                lock_path: "MODULE.bazel.lock",
+                tool: "bazel",
+                tool_args: &["mod", "deps", "--lockfile_mode=update"],
+            }))
+            .with_base_revision(base.into()),
+        ));
+        registry
+    };
+    let outcome = try_mechanical_rungs_with(&db, &publisher, &cube, &candidate, &attempt, &factory).await;
+    assert_eq!(outcome, LadderOutcome::Retired);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(row.revision_task_id.is_none());
+    assert_eq!(*cube.pushes.lock().await, vec![42]);
+    assert_eq!(chore_state(&db, &chore_id).0, "InReview");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("MODULE.bazel.lock")).unwrap(),
+        "regenerated from seeded base\n"
+    );
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions.last().unwrap().tier, "deterministic");
+    assert_eq!(decisions.last().unwrap().outcome, "retired");
+}
+
+#[tokio::test]
+async fn cargo_lock_present_on_base_regenerates_and_retires_without_an_agent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let ws = tempdir().unwrap();
     std::fs::write(
-        ws.join("Cargo.toml"),
-        format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
     )
     .unwrap();
-    std::fs::create_dir(ws.join("src")).unwrap();
-    std::fs::write(ws.join("src").join("lib.rs"), "").unwrap();
+    std::fs::write(ws.path().join("Cargo.lock"), "<<<<<<< conflicted\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(Script::Conflicts(vec!["Cargo.lock".into()]), ws.path().to_path_buf());
+    let factory = |base: &str| {
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(
+            boss_deterministic_resolvers::inject::cargo_lock(Arc::new(PresentBaseLock {
+                lock_path: "Cargo.lock",
+                tool: "cargo",
+                tool_args: &["update", "--workspace"],
+            }))
+            .with_base_revision(base.into()),
+        ));
+        registry
+    };
+    let outcome = try_mechanical_rungs_with(&db, &publisher, &cube, &candidate, &attempt, &factory).await;
+    assert_eq!(outcome, LadderOutcome::Retired);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(row.revision_task_id.is_none());
+    assert_eq!(*cube.pushes.lock().await, vec![42]);
+    assert_eq!(chore_state(&db, &chore_id).0, "InReview");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("Cargo.lock")).unwrap(),
+        "regenerated from seeded base\n"
+    );
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions.last().unwrap().tier, "deterministic");
+    assert_eq!(decisions.last().unwrap().outcome, "retired");
+}
+
+#[tokio::test]
+async fn mechanical_exits_persist_reasons_and_list_json_survives_reopen() {
+    for script in [
+        Script::CleanPushed,
+        Script::CleanUnpushed,
+        Script::EnsureRepoErrors,
+        Script::RebaseErrors,
+        Script::Conflicts(vec!["src/semantic.rs".into()]),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (candidate, attempt, _) = blocked_with_attempt(&db);
+        let publisher = RecordingPublisher::default();
+        let cube = ScriptCube::new(script);
+        try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt).await;
+        drop(db);
+        let reopened = WorkDb::open(path).unwrap();
+        // This is the query and serialization used by conflicts list --json.
+        let rows = reopened
+            .list_conflict_resolutions(None, &[], Some(&candidate.work_item_id), None)
+            .unwrap();
+        let json = serde_json::to_value(&rows).unwrap();
+        assert!(json[0]["ladder_reason"].as_str().is_some_and(|s| !s.is_empty()));
+        let decisions = json[0]["ladder_outcomes"]
+            .as_array()
+            .expect("ladder_outcomes is an array of decision objects, not a nested JSON string");
+        assert!(!decisions.is_empty());
+        for decision in decisions {
+            for field in ["tier", "outcome", "reason", "recorded_at"] {
+                assert!(decision[field].as_str().is_some_and(|s| !s.is_empty()), "{decision}");
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_scheduling_keeps_the_mechanical_fallthrough_reason() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    record_tier(
+        &db,
+        &attempt,
+        "deterministic",
+        "push_failed",
+        "push gate rejected the regenerated tree",
+    );
+    record_tier(&db, &attempt, "small_agent", "spawned", "one residual file");
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(
+        row.ladder_reason.as_deref(),
+        Some("push gate rejected the regenerated tree")
+    );
+    let events = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].outcome, "push_failed");
+    assert_eq!(events[1].outcome, "spawned");
+}
+
+#[test]
+fn rung0_declined_with_empty_lists_still_persists_a_reason() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    record_rung0_registry_decline(
+        &db,
+        &attempt,
+        &[],
+        &[],
+        "rung 0 declined: one or more residual files have no applicable deterministic resolver, or a matched resolver declined",
+    );
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(
+        row.ladder_reason.as_deref().is_some_and(|reason| !reason.is_empty()),
+        "every ladder exit must write a non-null reason, even with empty decline lists"
+    );
+    let events = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tier, "deterministic");
+    assert_eq!(events[0].outcome, "declined");
+    assert!(!events[0].reason.is_empty());
+}
+
+#[test]
+fn record_tier_falls_back_when_the_detail_string_is_empty() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_, attempt, _) = blocked_with_attempt(&db);
+    record_tier(&db, &attempt, "engine_rebase", "deferred", "   ");
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.ladder_reason.as_deref(), Some("engine_rebase deferred"));
+}
+
+fn failing_resolvers(_base_revision: &str) -> ResolverRegistry {
+    let mut registry = ResolverRegistry::empty();
+    registry.register(Box::new(RegeneratingLockResolver {
+        fail_with: Some("regeneration tool exited 1"),
+    }));
+    registry
+}
+
+/// A workspace whose lockfile still carries conflict markers.
+fn write_conflicted_lock_workspace(ws: &std::path::Path) {
     std::fs::write(
         ws.join("Cargo.lock"),
+        "<<<<<<< ours\ngarbage\n=======\n>>>>>>> theirs\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws.join("MODULE.bazel.lock"),
         "<<<<<<< ours\ngarbage\n=======\n>>>>>>> theirs\n",
     )
     .unwrap();
@@ -701,21 +1098,15 @@ fn write_resolvable_cargo_lock_fixture(ws: &std::path::Path, package_name: &str)
 
 #[tokio::test]
 async fn rung0_all_resolved_pushes_and_retires_at_rung_0() {
-    // Exercises the real built-in CargoLockResolver (ResolverRegistry has no
-    // injection seam for a fake one here), so this needs a real `cargo` —
-    // skip gracefully where it's absent, mirroring
-    // `boss_deterministic_resolvers`'s own real-execution test.
-    if which("cargo").is_none() {
-        eprintln!("skipping: cargo not on PATH");
-        return;
-    }
+    // Drives rung 0 with a hermetic lockfile resolver injected through the
+    // registry seam, so it needs no host `cargo` and never skips.
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
     let pub_ = Arc::new(RecordingPublisher::default());
 
     let ws = tempdir().unwrap();
-    write_resolvable_cargo_lock_fixture(ws.path(), "fixture-r0");
+    write_conflicted_lock_workspace(ws.path());
     let lease = CubeWorkspaceLease {
         lease_id: "lease-r0".to_owned(),
         workspace_id: "ws-r0".to_owned(),
@@ -724,7 +1115,7 @@ async fn rung0_all_resolved_pushes_and_retires_at_rung_0() {
     };
     let cube = Rung0Cube::new(true);
 
-    let outcome = attempt_rung0(
+    let outcome = attempt_rung0_hermetic(
         &db,
         pub_.as_ref(),
         &cube,
@@ -760,19 +1151,15 @@ async fn rung0_all_resolved_pushes_and_retires_at_rung_0() {
 
 #[tokio::test]
 async fn rung0_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
-    // T9/T2562: same halt contract as rung 1 — a rung-0 push the deletion
+    // Same halt contract as rung 1 — a rung-0 push the deletion
     // tripwire flags must not auto-retire as a success.
-    if which("cargo").is_none() {
-        eprintln!("skipping: cargo not on PATH");
-        return;
-    }
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
     let pub_ = Arc::new(RecordingPublisher::default());
 
     let ws = tempdir().unwrap();
-    write_resolvable_cargo_lock_fixture(ws.path(), "fixture-r0-sig");
+    write_conflicted_lock_workspace(ws.path());
     let lease = CubeWorkspaceLease {
         lease_id: "lease-r0d".to_owned(),
         workspace_id: "ws-r0d".to_owned(),
@@ -784,7 +1171,7 @@ async fn rung0_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
         vec!["`components/Foo.tsx` — added by a merged parent, removed by this resolution".to_owned()],
     );
 
-    let outcome = attempt_rung0(
+    let outcome = attempt_rung0_hermetic(
         &db,
         pub_.as_ref(),
         &cube,
@@ -797,6 +1184,7 @@ async fn rung0_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
 
     assert_eq!(outcome, LadderOutcome::HaltedForSignoff);
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(row.ladder_reason.as_deref().unwrap().contains("deletion tripwire"));
     assert_eq!(row.status, "succeeded");
     assert_eq!(row.resolved_by_rung, Some(0));
     let (status, reason) = chore_state(&db, &chore_id);
@@ -862,11 +1250,54 @@ async fn rung0_declined_file_falls_through_without_pushing() {
 }
 
 #[tokio::test]
+async fn lockfile_only_tool_failure_fails_the_attempt_loudly_without_pushing_or_worker_fallback() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _) = blocked_with_attempt(&db);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let workspace = tempdir().unwrap();
+    // A cold workspace without the owning manifest cannot regenerate this file.
+    // This must surface as an explicit, terminal tooling failure, never an
+    // invitation to hand-merge it and never a silent per-tick retry.
+    std::fs::write(workspace.path().join("MODULE.bazel.lock"), "<<<<<<< conflict\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["MODULE.bazel.lock".into()]),
+        workspace.path().to_path_buf(),
+    );
+    let outcome = try_mechanical_rungs(&db, publisher.as_ref(), &cube, &candidate, &attempt).await;
+    assert_eq!(outcome, LadderOutcome::LockfileRegenerationFailed);
+    assert!(cube.pushes.lock().await.is_empty());
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "failed");
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("lockfile_regeneration_failed: MODULE.bazel.lock")),
+        "failure reason must name the lockfile and resolver failure: {:?}",
+        row.failure_reason
+    );
+    assert!(row.revision_task_id.is_none());
+    // Terminal: no pending attempt remains for the next tick to re-enter.
+    assert!(
+        db.active_conflict_resolution_for_work_item(&candidate.work_item_id)
+            .unwrap()
+            .is_none()
+    );
+    let items = db.list_attention_items_for_work_item(&candidate.work_item_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND),
+        "expected a lockfile regeneration attention item, got {items:?}"
+    );
+}
+
+#[tokio::test]
 async fn rung0_declines_both_no_resolver_and_resolver_ran_files_together() {
     // Regression coverage for the decline-log mislabeling defect: a residue
     // can mix a file no resolver claims at all ("docs/readme.md") with a
     // file a resolver *does* claim (`lib.rs`, per
-    // `RegistryAppendUnionResolver::applies_to`) but that resolver itself
+    // `KeepBothUnionResolver::applies_to`) but that resolver itself
     // declines (here because the workspace path doesn't exist, so its read
     // fails) — the two are genuinely different failure classes
     // (`DeclinedFile::matched_resolver`) and the ladder must fall through
@@ -913,17 +1344,13 @@ async fn rung0_declines_both_no_resolver_and_resolver_ran_files_together() {
 
 #[tokio::test]
 async fn rung0_push_failure_falls_through_without_marking_succeeded() {
-    if which("cargo").is_none() {
-        eprintln!("skipping: cargo not on PATH");
-        return;
-    }
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
     let pub_ = Arc::new(RecordingPublisher::default());
 
     let ws = tempdir().unwrap();
-    write_resolvable_cargo_lock_fixture(ws.path(), "fixture-r0-pf");
+    write_conflicted_lock_workspace(ws.path());
     let lease = CubeWorkspaceLease {
         lease_id: "lease-r0c".to_owned(),
         workspace_id: "ws-r0c".to_owned(),
@@ -932,7 +1359,7 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     };
     let cube = Rung0Cube::new(false);
 
-    let outcome = attempt_rung0(
+    let outcome = attempt_rung0_hermetic(
         &db,
         pub_.as_ref(),
         &cube,
@@ -952,6 +1379,9 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     );
     // Every file resolved, but the push failed — must not mark succeeded.
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(row.ladder_reason.as_deref().unwrap().contains("push boom"));
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(decisions[0].outcome, "push_failed");
     assert_eq!(row.status, "pending");
     assert_eq!(row.resolved_by_rung, None);
     let (_status, reason) = chore_state(&db, &chore_id);
@@ -969,6 +1399,36 @@ fn chore_blocked_attempt_id(db: &WorkDb, id: &str) -> Option<String> {
         WorkItem::Chore(t) => t.blocked_attempt_id,
         other => panic!("expected chore, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn retire_with_already_terminal_attempt_still_clears_signal_and_broadcasts() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    // A concurrent abandon wins the race: the succeeded mark becomes a no-op.
+    db.mark_conflict_resolution_abandoned(&attempt.id, "raced").unwrap();
+
+    retire_attempt_at_rung(&db, pub_.as_ref(), &candidate, &attempt, 1, &[]).await;
+
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "abandoned");
+    let (status, _) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(
+        pub_.lifecycle_reasons()
+            .await
+            .contains(&"merge_conflict_resolved".to_owned()),
+        "parent transition must still be broadcast"
+    );
+    let typed = pub_.typed_events.lock().await;
+    assert!(
+        !typed
+            .iter()
+            .any(|(_, e)| matches!(e, FrontendEvent::ConflictResolutionSucceeded { .. })),
+        "no success push for an attempt that did not succeed"
+    );
 }
 
 #[tokio::test]
@@ -1216,4 +1676,197 @@ async fn reconcile_leaves_revision_backed_and_terminal_attempts_alone() {
     let (status2, reason2) = chore_state(&db2, &chore2);
     assert_eq!(status2, "Blocked");
     assert_eq!(reason2.as_deref(), Some("merge_conflict"));
+}
+
+/// A resolver that runs and fails on a lockfile-only residue is reported as a
+/// terminal regeneration failure — never a silent fall-through to a worker —
+/// through the full ladder entry point.
+#[tokio::test]
+async fn lockfile_only_conflict_with_failing_resolver_never_falls_through_to_a_worker() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = tempdir().unwrap();
+    write_conflicted_lock_workspace(ws.path());
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["Cargo.lock".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    let outcome = try_mechanical_rungs_with(&db, pub_.as_ref(), &cube, &candidate, &attempt, &failing_resolvers).await;
+
+    assert_eq!(outcome, LadderOutcome::LockfileRegenerationFailed);
+    assert!(cube.pushes.lock().await.is_empty());
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert!(
+        row.ladder_reason
+            .as_deref()
+            .unwrap()
+            .contains("regeneration tool exited 1")
+    );
+    assert_eq!(row.status, "failed");
+    assert!(row.revision_task_id.is_none());
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "Blocked");
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+// ──────────────── per-path rules and keep-both at rung 0 ────────────────
+//
+// These go through `try_mechanical_rungs`, the production entry point, so
+// they cover the rules being read from the file beside the work database
+// and reaching the registry rung 0 uses. The rule under test needs no
+// formatter, which keeps the tests free of host tools; the keep-both
+// logic itself is unit-tested in the resolver crate.
+
+/// A list file in which both sides added one entry at the same spot.
+const SAME_SPOT_INSERTIONS: &str = "alpha\n<<<<<<< Conflict 1 of 1\n%%%%%%% Changes from base to side #1\n+from-main\n+++++++ Contents of side #2\nfrom-pr\n>>>>>>> Conflict 1 of 1 ends\nomega\n";
+
+const KEEP_BOTH_RULE: &str = "[[keep_both]]\nname = \"entry_list\"\nglob = \"registry.list\"\n";
+
+/// A leased workspace holding `registry.list` with [`SAME_SPOT_INSERTIONS`].
+fn conflicted_list_workspace() -> tempfile::TempDir {
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("registry.list"), SAME_SPOT_INSERTIONS).unwrap();
+    ws
+}
+
+#[tokio::test]
+async fn rung0_applies_a_per_path_rule_from_the_recipes_file_beside_the_database() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    std::fs::write(dir.path().join("conflict-recipes.toml"), KEEP_BOTH_RULE).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["registry.list".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(outcome, LadderOutcome::Retired);
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("registry.list")).unwrap(),
+        "alpha\nfrom-main\nfrom-pr\nomega\n",
+        "both insertions must be kept, the base branch's first"
+    );
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert!(
+        row.revision_task_id.is_none(),
+        "no worker revision for a keep-both rule"
+    );
+    assert_eq!(*cube.pushes.lock().await, vec![42]);
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(reason.is_none(), "block should be cleared, got {reason:?}");
+}
+
+#[tokio::test]
+async fn rung0_without_a_rule_leaves_the_same_conflict_to_a_worker() {
+    // No recipes file: the rule mechanism is inert until a
+    // `conflict-recipes.toml` exists, and nothing built in claims this path.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["registry.list".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert!(
+        matches!(
+            outcome,
+            LadderOutcome::FellThrough {
+                residual_conflict_files: Some(1),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(cube.pushes.lock().await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("registry.list")).unwrap(),
+        SAME_SPOT_INSERTIONS,
+        "an unresolved file must be left exactly as it was"
+    );
+}
+
+#[tokio::test]
+async fn rung0_keep_both_resolution_is_still_halted_by_the_deletion_tripwire() {
+    // Keeping both sides is preserving by construction, but the tripwire
+    // judges the pushed result, not the resolver's intent. A flagged
+    // deletion halts a keep-both resolution like any other.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    std::fs::write(dir.path().join("conflict-recipes.toml"), KEEP_BOTH_RULE).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube {
+        tripwire_findings: vec!["`registry.list` — added by a merged parent, removed by this resolution".to_owned()],
+        workspace_path: ws.path().to_path_buf(),
+        ..ScriptCube::new(Script::Conflicts(vec!["registry.list".to_owned()]))
+    };
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(outcome, LadderOutcome::HaltedForSignoff);
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "Blocked");
+    assert_eq!(reason.as_deref(), Some("deletion_signoff"));
+    let typed = pub_.typed_events.lock().await;
+    assert!(
+        !typed
+            .iter()
+            .any(|(_, e)| matches!(e, FrontendEvent::ConflictResolutionSucceeded { .. })),
+        "a tripwire-halted attempt must not publish ConflictResolutionSucceeded"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_recipes_file_applies_none_of_its_rules() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    // The first rule is fine; the second has an unparsable glob.
+    std::fs::write(
+        dir.path().join("conflict-recipes.toml"),
+        format!("{KEEP_BOTH_RULE}\n[[keep_both]]\nname = \"broken\"\nglob = \"[\"\n"),
+    )
+    .unwrap();
+    assert!(load_conflict_rules(&db).is_empty());
+
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let ws = conflicted_list_workspace();
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["registry.list".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert!(matches!(outcome, LadderOutcome::FellThrough { .. }), "{outcome:?}");
+    assert!(cube.pushes.lock().await.is_empty());
+}
+
+#[test]
+fn conflict_rules_are_read_from_beside_the_work_database() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    assert!(load_conflict_rules(&db).is_empty(), "no file means no rules");
+
+    std::fs::write(dir.path().join("conflict-recipes.toml"), KEEP_BOTH_RULE).unwrap();
+    let rules = load_conflict_rules(&db);
+    assert_eq!(rules.keep_both.len(), 1);
+    assert_eq!(rules.keep_both[0].name, "entry_list");
+    assert!(rules.recipes.is_empty());
 }

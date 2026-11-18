@@ -487,6 +487,9 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
         TopicEventPayload::ResyncRequired => {
             panic!("unexpected resync marker on work topic")
         }
+        TopicEventPayload::WorkerPaneCapture { .. } => {
+            panic!("unexpected pane capture on work topic")
+        }
     }
 
     Ok(())
@@ -558,8 +561,10 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             reason,
             product_id,
             item_ids,
+            class,
         } => {
             assert_eq!(reason, "work_item_updated");
+            assert_eq!(class, boss_protocol::InvalidationClass::Structural);
             assert_eq!(product_id.as_deref(), Some(product.id.as_str()));
             assert_eq!(item_ids, vec![task.id.clone()]);
         }
@@ -571,6 +576,9 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
         }
         TopicEventPayload::ResyncRequired => {
             panic!("unexpected resync marker on work topic")
+        }
+        TopicEventPayload::WorkerPaneCapture { .. } => {
+            panic!("unexpected pane capture on work topic")
         }
     }
 
@@ -745,7 +753,7 @@ async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatc
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: id.to_owned(),
-            patch,
+            patch: Box::new(patch),
         })
         .await?
     {

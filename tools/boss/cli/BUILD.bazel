@@ -55,6 +55,7 @@ rust_binary(
         "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
     },
     visibility = [
+        "//tools/boss/engine/spoke-worker-api:__pkg__",
         "//tools/boss/app-macos:__pkg__",
         # Runfiles-only: the engine ships the CLI so dev-mode workers get
         # an already-built `boss` instead of a build-from-source shim.
@@ -76,11 +77,30 @@ rust_binary(
 rust_test(
     name = "boss_test",
     size = "small",
+    # Prompt sources are consumed only by `#[cfg(test)]` in src/handoff.rs.
+    # Keeping them off the production binary means an edit to
+    # BossPaneModel.swift does not rebuild `boss` or the installer/app
+    # bundles that embed it.
+    compile_data = [
+        "//tools/boss/app-macos:handoff_prompt_source",
+        "//tools/boss/engine/core:handoff_reset_prompt_source",
+    ],
     crate = ":boss",
+    # rustc_env $(execpath) expansion requires these as declared
+    # prerequisites of the test rule; compile_data alone is not enough
+    # when `crate =` wraps the production binary.
+    data = [
+        "//tools/boss/app-macos:handoff_prompt_source",
+        "//tools/boss/engine/core:handoff_reset_prompt_source",
+    ],
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    rustc_env = {
+        "HANDOFF_SYSTEM_PROMPT": "$(execpath //tools/boss/app-macos:handoff_prompt_source)",
+        "HANDOFF_RESET_PROMPT": "$(execpath //tools/boss/engine/core:handoff_reset_prompt_source)",
+    },
     deps = [
         "//lib/rust/git_utils",
         "//tools/boss/build-info",
@@ -575,6 +595,7 @@ rust_test(
         ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/engine/host-execution",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

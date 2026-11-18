@@ -104,7 +104,7 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut backoff = INITIAL_BACKOFF;
         loop {
             let started = Instant::now();
@@ -123,7 +123,7 @@ where
                 }
             };
 
-            match AbortOnDrop(tokio::spawn(attempt_fut)).await {
+            match AbortOnDrop(boss_task_scope::spawn(attempt_fut)).await {
                 Ok(()) => return,
                 Err(err) if err.is_panic() => {
                     tracing::warn!(

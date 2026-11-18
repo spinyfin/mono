@@ -1,0 +1,43 @@
+# spoke-release build fragment — uploaded dynamically by the prepare step when a
+# release is actually being cut. Never used as a standalone pipeline.
+#
+# Each build step builds, packages and signs for the platform of the agent it
+# lands on (the script derives the platform from `uname`), so a step pinned to
+# `os: darwin` can only produce macos-arm64 and one pinned to `os: linux` only a
+# Linux package. There is no Linux arm64 agent yet; add a step here with the
+# right agent tags when one exists (its assets are already optional in
+# tools/boss/spoke-release.toml).
+#
+# `publish` depends on every build step: it must not run until each has had its
+# chance to upload (or fail).
+
+steps:
+  - label: ":apple: spoke-release (macos-arm64)"
+    key: "spoke-release-macos-arm64"
+    command: ".buildkite/steps/spoke-release.sh build"
+    agents:
+      queue: bazel-any
+      os: darwin
+    retry:
+      automatic: false
+
+  - label: ":linux: spoke-release (linux-amd64)"
+    key: "spoke-release-linux-amd64"
+    command: ".buildkite/steps/spoke-release.sh build"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
+  - label: ":white_check_mark: spoke-release (publish)"
+    key: "spoke-release-publish"
+    command: ".buildkite/steps/spoke-release.sh publish"
+    depends_on:
+      - "spoke-release-macos-arm64"
+      - "spoke-release-linux-amd64"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false

@@ -1,0 +1,41 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Host readiness checks run as the spoke's service user. The daemon publishes
+# the failing check names through its capacity reports; the installer's
+# `preflight` command prints them for the person setting the host up.
+rust_library(
+    name = "spoke-preflight",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_preflight",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/spoke-package:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/engine/driver-quota",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/tmux",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "spoke-preflight_test",
+    size = "small",
+    crate = ":spoke-preflight",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

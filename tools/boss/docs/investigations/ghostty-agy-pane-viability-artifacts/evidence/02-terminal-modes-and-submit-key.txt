@@ -1,0 +1,146 @@
+Terminal modes agy sets at startup, and what tmux delivers for Return
+====================================================================
+
+agy 1.1.12: mode and query sequences in the pane's raw output, in order of first use (tools.py seqs)
+(provisioned pane: onboarding and trust pre-seeded; captured with tmux pipe-pane)
+
+    offset=      0 n=    1 CSI ?2026$p    synchronized output query
+    offset=      9 n=    1 CSI ?2027$p    grapheme clustering query
+    offset=     18 n=    3 CSI >4m        xterm modifyOtherKeys reset
+    offset=     23 n=    3 CSI =0;1u      kitty keyboard set, flags 0
+    offset=     30 n=    1 CSI ?1049h     alt screen on
+    offset=     38 n=    1 CSI ?25l       cursor hide
+    offset=     44 n=    1 CSI ?5W        
+    offset=     49 n=    1 CSI ?2004h     bracketed paste on
+    offset=     57 n=    2 CSI >4;2m      xterm modifyOtherKeys mode 2
+    offset=     64 n=    2 CSI =1;1u      kitty keyboard set, flags 1
+    offset=     71 n=    2 CSI ?u         kitty keyboard query
+    offset=    593 n=    2 CSI 5b         
+    offset=    737 n=   11 CSI ?2026h     synchronized output begin
+    offset=    751 n=   11 CSI ?2026l     synchronized output end
+    offset=    881 n=    1 CSI ?1049l     alt screen off
+    offset=    915 n=    2 CSI 0 q        
+    offset=   2256 n=    1 CSI ?25h       cursor show
+    offset=   2991 n=    1 CSI ?2004l     bracketed paste off
+    OSC numbers: {}
+    bytes: 3004
+
+agy 1.5.5: mode and query sequences in the pane's raw output, in order of first use (tools.py seqs)
+(provisioned pane: onboarding and trust pre-seeded; captured with tmux pipe-pane)
+
+    offset=      0 n=    1 CSI ?2026$p    synchronized output query
+    offset=      9 n=    1 CSI ?2027$p    grapheme clustering query
+    offset=     34 n=    3 CSI >4m        xterm modifyOtherKeys reset
+    offset=     39 n=    1 CSI ?1049h     alt screen on
+    offset=     47 n=    1 CSI ?25l       cursor hide
+    offset=     53 n=    1 CSI ?5W        
+    offset=     58 n=    2 CSI ?2004h     bracketed paste on
+    offset=     66 n=    3 CSI >4;2m      xterm modifyOtherKeys mode 2
+    offset=     73 n=    2 CSI >5u        kitty keyboard push, flags 5
+    offset=     78 n=    2 CSI ?u         kitty keyboard query
+    offset=    600 n=    4 CSI 5b         
+    offset=    744 n=   16 CSI ?2026h     synchronized output begin
+    offset=    758 n=   16 CSI ?2026l     synchronized output end
+    offset=    969 n=    2 CSI <1u        kitty keyboard pop
+    offset=    974 n=    1 CSI ?1049l     alt screen off
+    offset=   1006 n=    2 CSI 0 q        
+    offset=   2346 n=    1 CSI ?25h       cursor show
+    offset=   4261 n=    2 CSI 10b        
+    offset=   4383 n=    1 CSI 11b        
+    offset=   6611 n=    1 CSI ?2004l     bracketed paste off
+    OSC numbers: {'7501': 1, '11': 1}
+    bytes: 6624
+
+Bytes a raw-mode pane application receives for tmux send-keys, on the spike's tmux server
+(tmux 3.8, Boss server options: extended-keys on, terminal-features xterm*:extkeys, focus-events on).
+Keys sent, in order: C-m, Enter, Escape, literal 'a', C-c  (tools.py keyprobe)
+
+  application sets no keyboard mode
+      b'\r'
+      b'\r'
+      b'\x1b'
+      b'a'
+      b'\x03'
+
+  application emits CSI > 4 ; 2 m  (xterm modifyOtherKeys mode 2) — agy emits this
+      b'\x1b[27;5;109~'
+      b'\r'
+      b'\x1b'
+      b'a'
+      b'\x1b[27;5;99~'
+
+  application emits CSI > 5 u  (kitty keyboard push) only
+      b'\r'
+      b'\r'
+      b'\x1b'
+      b'a'
+      b'\x03'
+
+  application emits both, as agy 1.5.5 does
+      b'\x1b[27;5;109~'
+      b'\r'
+      b'\x1b'
+      b'a'
+      b'\x1b[27;5;99~'
+
+agy 1.1.12: the same thing against the real composer (scenario submitkey)
+    04:21:48.477  script  new-session (direct)
+    04:21:48.828  script  viewer attached
+    04:21:50.139  script  pane shows /\? for shortcuts/
+    04:21:51.268  script  literal text sent
+    04:21:51.891  script  C-m sent (tmux send-keys C-m)
+    04:21:56.111  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token SUBMITKEY_…
+    04:21:56.145  script  Enter sent (tmux send-keys Enter)
+    04:21:56.205  hook    SessionStart
+    04:21:56.268  hook    PreInvocation invocationNum=0
+    04:21:59.097  hook    PostInvocation invocationNum=0
+    04:21:59.180  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:21:59.286  script  hook Stop count>=1
+
+    after C-m: pre_invocation_hooks=0 handle_user_input_lines=0
+    after Enter: pre_invocation_hooks=1 handle_user_input_lines=1
+
+  pane 4 s after C-m (text still in the composer, nothing submitted):
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | > Reply with exactly the single token SUBMITKEY_OK. Do not use tools.
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |                                                                                                       Gemini 3.8 Flash · low
+
+  pane after Enter:
+    | > Reply with exactly the single token SUBMITKEY_OK. Do not use tools.
+    |   SUBMITKEY_OK
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+agy 1.5.5: the same thing against the real composer (scenario submitkey)
+    04:21:34.532  script  new-session (direct)
+    04:21:34.707  script  viewer attached
+    04:21:35.047  script  pane shows /\? for shortcuts/
+    04:21:36.122  script  literal text sent
+    04:21:36.703  script  C-m sent (tmux send-keys C-m)
+    04:21:40.877  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token SUBMITKEY_…
+    04:21:40.912  script  Enter sent (tmux send-keys Enter)
+    04:21:40.960  hook    SessionStart
+    04:21:41.049  hook    PreInvocation invocationNum=0
+    04:21:42.470  hook    PostInvocation invocationNum=0
+    04:21:42.516  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:21:42.736  script  hook Stop count>=1
+
+    after C-m: pre_invocation_hooks=0 handle_user_input_lines=0
+    after Enter: pre_invocation_hooks=1 handle_user_input_lines=1
+
+  pane 4 s after C-m (text still in the composer, nothing submitted):
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | > Reply with exactly the single token SUBMITKEY_OK. Do not use tools.
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |                                                                                                       Gemini 3.8 Flash · low
+
+  pane after Enter:
+    | > Reply with exactly the single token SUBMITKEY_OK. Do not use tools.
+    |   SUBMITKEY_OK
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low

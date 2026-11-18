@@ -9,9 +9,43 @@ use boss_protocol::{WorkRun, WorkerTierDenial};
 // `items_after_test_module`).
 pub(crate) use boss_protocol::{WorkItemSelector, is_typed_work_item_id, parse_work_item_selector};
 
-pub(crate) async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
+/// Preserve ordinary CLI payloads while making spoke cache freshness visible.
+pub(crate) struct WorkerClient(BossClient);
+
+impl std::ops::Deref for WorkerClient {
+    type Target = BossClient;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WorkerClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl WorkerClient {
+    pub(crate) async fn send_request(&mut self, request: &FrontendRequest) -> anyhow::Result<FrontendEvent> {
+        match self.0.send_request(request).await? {
+            FrontendEvent::WorkerGatewayResult { status, value } if matches!(status.as_str(), "cached" | "hub") => {
+                eprintln!(
+                    "Spoke {status}: revision {}, observed at {} unix milliseconds.",
+                    value["revision"], value["observed_unix_ms"]
+                );
+                Ok(serde_json::from_value(
+                    value[if status == "cached" { "event" } else { "result" }].clone(),
+                )?)
+            }
+            event => Ok(event),
+        }
+    }
+}
+
+pub(crate) async fn connect_for_work(ctx: &RunContext) -> Result<WorkerClient, CliError> {
     BossClient::connect(&ctx.discovery)
         .await
+        .map(WorkerClient)
         .map_err(|err| CliError::engine_unavailable(err.to_string()))
 }
 
@@ -571,6 +605,7 @@ pub(crate) async fn run_list_revisions(
             .ids(&resolved_ids)
             .maybe_limit(args.limit)
             .include_archived(args.include_archived)
+            .parked(args.parked.filter())
             .build(),
         None,
         product.repo_remote_url.as_deref(),
@@ -751,9 +786,28 @@ pub(crate) async fn update_work_item(
         client,
         FrontendRequest::UpdateWorkItem {
             id: id.to_owned(),
-            patch,
+            patch: Box::new(patch),
         },
         "work item update",
+        FrontendEvent::WorkItemUpdated { item } => item,
+    )
+}
+
+pub(crate) async fn park_work_item(
+    client: &mut BossClient,
+    id: &str,
+    parked: bool,
+    reason: Option<String>,
+) -> Result<WorkItem, CliError> {
+    let label = if parked { "work item park" } else { "work item unpark" };
+    rpc_call!(
+        client,
+        FrontendRequest::ParkWorkItem {
+            id: id.to_owned(),
+            parked,
+            reason,
+        },
+        label,
         FrontendEvent::WorkItemUpdated { item } => item,
     )
 }

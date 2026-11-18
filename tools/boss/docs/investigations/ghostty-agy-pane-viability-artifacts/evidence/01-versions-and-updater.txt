@@ -1,0 +1,64 @@
+Versions under test and the self-updater
+========================================
+
+Host: macOS 27.0.1 (arm64), tmux 3.8, swift-driver version: 1.168.6 Apple Swift version 6.4.2 (swiftlang-6.4.2.1.9 clang-2100.4.1.1)
+GhosttyKit: ghosttykit-71c2d68e, the MODULE.bazel @ghostty_kit pin (http_archive sha256 cdab2165aa9c4a157401c4c6fa494d3a1fc02633a2b5ea6d923ab9f9c696816e),
+            linked from Bazel's fetched copy of that repository; libghostty-internal.a sha256 1958d3183926abc1df8a855428f07ccad92d2caaf282ca85b37d1a53688df371
+
+agy binaries (scenarios ran private copies; the installed binary was run three times at the outset, for
+--version, --help and changelog, before the copies were taken)
+  1.1.12  sha256 c8fd3c0016e101689f923f82da1c068b0e6dce3abcb0089e282742693ad4d344  172267536 bytes
+          source: ~/.local/bin/agy.1794388520372515000.old, the copy the updater left behind
+  1.5.5   sha256 42b591f206a868dd0b924d5b6b396638a108539367695a5dbe2f7dcfdbf4d6f3  209824176 bytes
+          source: ~/.local/bin/agy as installed at the time of the study (mtime 2026-11-11 03:15 local)
+  --version of the 1.1.12 copy: 1.1.12
+  --version of the 1.5.5 copy: 1.5.5
+  code signature, both: Developer ID Application: Google LLC (EQHXZ8M8AV) , Identifier=cli, hardened runtime
+
+How 1.1.12 became 1.5.5 on this host
+  The installed binary replaced itself on the day of the study, during an ordinary interactive session that was not
+  part of it. From that session's log (~/.gemini/antigravity-cli/log/cli-20261111_031520.log):
+      server.go:1493] Language server version: 1.1.12
+      auto_updater.go:270] Spawned background update process with PID 96336
+  and from the next session's log, 79 seconds later:
+      server.go:2400] Language server version: 1.5.5
+
+The updater, probed with `agy models` in a fresh scoped HOME (no model call is made)
+
+  agy 1.1.12 copy, AGY_CLI_DISABLE_AUTO_UPDATE=1, writable binary directory (first probe of the study):
+      auto_updater.go:270] Spawned background update process with PID 60567
+      updater/update_status.json: {"success":true,"message":"Update successful, restart CLI to use"}
+      binary sha256 before: c8fd3c0016e101689f923f82da1c068b0e6dce3abcb0089e282742693ad4d344 (1.1.12)
+      binary sha256 after:  42b591f206a868dd0b924d5b6b396638a108539367695a5dbe2f7dcfdbf4d6f3 (1.5.5), with the old file renamed agy.<ns>.old beside it
+      The copy was restored from that .old file; every later run used =true and a read-only binary directory.
+
+  agy 1.1.12, AGY_CLI_DISABLE_AUTO_UPDATE=true:
+      auto_updater.go:183] Auto-update disabled via environment variable AGY_CLI_DISABLE_AUTO_UPDATE
+      binary sha256 afterwards: c8fd3c0016e101689f923f82da1c068b0e6dce3abcb0089e282742693ad4d344
+  agy 1.5.5, AGY_CLI_DISABLE_AUTO_UPDATE=true:
+      auto_updater.go:247] Auto-update disabled via environment variable AGY_CLI_DISABLE_AUTO_UPDATE
+      binary sha256 afterwards: 42b591f206a868dd0b924d5b6b396638a108539367695a5dbe2f7dcfdbf4d6f3
+  agy 1.1.12, AGY_CLI_DISABLE_AUTO_UPDATE=1, binary directory read-only (chmod 555):
+      auto_updater.go:210] Directory <spike>/bin-1.1.12 is not fully accessible (readable: true, writable: false), skipping update
+      binary sha256 afterwards: c8fd3c0016e101689f923f82da1c068b0e6dce3abcb0089e282742693ad4d344
+  agy 1.5.5, AGY_CLI_DISABLE_AUTO_UPDATE=1, binary directory read-only (chmod 555):
+      auto_updater.go:274] Directory <spike>/bin-1.5.5 is not fully accessible (readable: true, writable: false), skipping update
+      binary sha256 afterwards: 42b591f206a868dd0b924d5b6b396638a108539367695a5dbe2f7dcfdbf4d6f3
+  agy 1.5.5, no variable, binary directory read-only (chmod 555):
+      auto_updater.go:274] Directory <spike>/bin-1.5.5 is not fully accessible (readable: true, writable: false), skipping update
+      binary sha256 afterwards: 42b591f206a868dd0b924d5b6b396638a108539367695a5dbe2f7dcfdbf4d6f3
+
+`agy models` under a scoped HOME with the keychain bridged
+  agy 1.1.12:
+      gemini-3.8-flash-high gemini-3.8-flash-medium gemini-3.8-flash-low claude-opus-5-5-low claude-opus-5-5-medium 
+      claude-opus-5-5-high claude-sonnet-5-5-low claude-sonnet-5-5-medium claude-sonnet-5-5-high 
+      gpt-oss-120b-medium 
+  agy 1.5.5:
+      gemini-4-carbon-medium gemini-4-carbon-high gemini-4-carbon-low gemini-4-argon-medium gemini-4-argon-high 
+      gemini-4-argon-low gemini-3.8-flash-high gemini-3.8-flash-medium gemini-3.8-flash-low claude-opus-5-5-low 
+      claude-opus-5-5-medium claude-opus-5-5-high claude-sonnet-5-5-low claude-sonnet-5-5-medium 
+      claude-sonnet-5-5-high gpt-oss-120b-medium 
+
+--effort, from --help: 1.1.12 low|medium|high ; 1.5.5 low|medium|high|xhigh|max
+--mode,   from --help: 1.1.12 accept-edits, plan ; 1.5.5 accept-edits, auto, plan
+flags present only in 1.5.5 --help: --input-format, --remote-agent, --remote-control, --settings ; subcommands acp, mcp, mic-serve, remote-control

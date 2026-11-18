@@ -52,6 +52,8 @@ use crate::metrics::Registry;
 use crate::transcript_tail::TranscriptTail;
 use crate::utility_model::UtilityModel;
 
+pub use crate::worker_refresh_liveness::WorkerRefreshPermit;
+
 #[cfg(test)]
 #[path = "live_status_refresh_tests.rs"]
 mod refresh_tests;
@@ -86,6 +88,9 @@ pub struct SlotDebugSnapshot {
     /// Outcome tag of the most recent summarizer call (the four
     /// distinguishable cases from [`SummarizerOutcome::tag`]).
     pub last_outcome_tag: Option<String>,
+    /// Completed attempts skipped because the transcript buffer was empty
+    /// (no content after polling).
+    pub empty_transcript_polls: u64,
     /// Human-readable detail for the most recent summarizer call.
     pub last_outcome_detail: Option<String>,
     pub last_outcome_at_epoch_s: Option<i64>,
@@ -144,8 +149,8 @@ fn epoch_now() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
-// Phase-4 counter handles for DispatcherStats. Registered via
-// `register_metrics` which is called from `crate::metrics_init::init_all` at
+// Counter handles for DispatcherStats. Registered via
+// `register_metrics` which is called from `boss_engine_app::metrics_init::init_all` at
 // engine startup.
 crate::register_counter!(
     DISPATCHER_HOOK_EVENTS_TOTAL,
@@ -200,7 +205,7 @@ crate::register_counter!(
 );
 
 /// Register every DispatcherStats counter handle with `registry`.
-/// Called once from `crate::metrics_init::init_all` at engine startup so duplicate-name
+/// Called once from `boss_engine_app::metrics_init::init_all` at engine startup so duplicate-name
 /// panics surface at boot rather than on the first increment.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DISPATCHER_HOOK_EVENTS_TOTAL);
@@ -377,7 +382,13 @@ pub struct DispatcherStatsSnapshot {
 /// same run finally win.
 #[derive(Default)]
 pub struct TranscriptPathCache {
-    inner: StdMutex<HashMap<String, String>>,
+    inner: StdMutex<HashMap<String, CachedTranscriptPath>>,
+}
+
+#[derive(Clone)]
+struct CachedTranscriptPath {
+    path: String,
+    generation: Option<String>,
 }
 
 impl TranscriptPathCache {
@@ -396,8 +407,44 @@ impl TranscriptPathCache {
         if guard.contains_key(run_id) {
             return false;
         }
-        guard.insert(run_id.to_owned(), path.to_owned());
+        guard.insert(
+            run_id.to_owned(),
+            CachedTranscriptPath {
+                path: path.to_owned(),
+                generation: None,
+            },
+        );
         true
+    }
+
+    /// Point `run_id` at `path` when `generation` is newer than the one
+    /// already cached, so a replaced spoke transcript is not pinned to its
+    /// first file. Replaying an older generation does not roll the pointer
+    /// back.
+    pub fn record_if_newer<E>(
+        &self,
+        run_id: &str,
+        path: &str,
+        generation: &str,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let rank = generation_rank(generation);
+        let mut guard = self.inner.lock().expect("transcript path cache poisoned");
+        if let Some(cached) = guard.get(run_id)
+            && let Some(current) = &cached.generation
+            && generation_rank(current) >= rank
+        {
+            return Ok(false);
+        }
+        persist()?;
+        guard.insert(
+            run_id.to_owned(),
+            CachedTranscriptPath {
+                path: path.to_owned(),
+                generation: Some(generation.to_owned()),
+            },
+        );
+        Ok(true)
     }
 
     pub fn get(&self, run_id: &str) -> Option<String> {
@@ -405,7 +452,7 @@ impl TranscriptPathCache {
             .lock()
             .expect("transcript path cache poisoned")
             .get(run_id)
-            .cloned()
+            .map(|cached| cached.path.clone())
     }
 
     /// Drop the cache entry for `run_id`. Called when a run is
@@ -424,6 +471,13 @@ impl TranscriptPathCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn generation_rank(generation: &str) -> (u64, u64) {
+    let mut parts = generation.split('-');
+    let incarnation = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let cursor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    (incarnation, cursor)
 }
 
 fn trigger_kind(t: &Trigger) -> &'static str {
@@ -484,6 +538,30 @@ pub trait LiveStatusBroadcaster: Send + Sync {
 #[async_trait]
 pub trait TranscriptPathResolver: Send + Sync {
     async fn transcript_path(&self, run_id: &str) -> Option<PathBuf>;
+
+    /// Rechecked before every poll; errors suspend even an already-open tail.
+    async fn transcript_read_limit(&self, _path: &std::path::Path) -> Result<u64, String> {
+        Ok(u64::MAX)
+    }
+
+    /// Check process/session liveness before reading a cached transcript.
+    ///
+    /// Default is [`WorkerRefreshPermit::Refresh`]. Production consults
+    /// [`crate::worker_refresh_liveness::evaluate`] once per call; the
+    /// per-slot loop reuses that permit for the pre-model gates in a cycle
+    /// and re-checks only before publishing a model response. Confirmed
+    /// death parks the loop until a later Alive inspection or re-adoption.
+    async fn worker_can_refresh(&self, _run_id: &str) -> WorkerRefreshPermit {
+        WorkerRefreshPermit::Refresh
+    }
+
+    /// Trusted directory the transcript path must stay inside. Spoke runs
+    /// return the hub custody directory for the run so Codex and Grok tails
+    /// open the copy the hub holds rather than a local driver home that does
+    /// not exist for a remote worker. `None` uses the driver's own root.
+    async fn transcript_containment_root(&self, _run_id: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Per-slot handle stored on the manager. Dropping the sender closes
@@ -708,7 +786,7 @@ impl LiveStatusManager {
             disabled: self.disabled.clone(),
             debug_store: self.debug_store.clone(),
         };
-        let join = tokio::spawn(run_slot_loop(cfg, receiver));
+        let join = boss_task_scope::spawn(run_slot_loop(cfg, receiver));
         guard.insert(
             slot_id,
             SlotHandle {
@@ -788,7 +866,7 @@ impl LiveStatusManager {
     /// True iff the manager currently has a task for `slot_id`. Used
     /// by tests; the production dispatcher just calls [`Self::notify`]
     /// and lets a missing slot fall through.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_slot(&self, slot_id: u8) -> bool {
         self.slots
             .lock()
@@ -816,11 +894,19 @@ fn normalize_lines(
         .collect()
 }
 
-fn start_transcript_tail(driver: &dyn AgentDriver, run_id: &str, path: PathBuf) -> Result<TranscriptTail, String> {
-    match driver
-        .transcript_containment_root(run_id)
-        .map_err(|err| format!("{err:#}"))?
-    {
+fn start_transcript_tail(
+    driver: &dyn AgentDriver,
+    run_id: &str,
+    path: PathBuf,
+    resolver_root: Option<PathBuf>,
+) -> Result<TranscriptTail, String> {
+    let root = match resolver_root {
+        Some(root) => Some(root),
+        None => driver
+            .transcript_containment_root(run_id)
+            .map_err(|err| format!("{err:#}"))?,
+    };
+    match root {
         Some(root) => TranscriptTail::new_contained(path, root).map_err(|err| err.to_string()),
         None => Ok(TranscriptTail::new(path)),
     }
@@ -855,6 +941,8 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         debug_store,
     } = cfg;
     let mut tail: Option<TranscriptTail> = None;
+    let mut last_path_lookup: Option<Instant> = None;
+    let mut tailed_path: Option<PathBuf> = None;
     let mut transcript_session = driver.transcript_session();
     let mut transcript_buffer: Vec<Value> = Vec::new();
     let mut post_tool_use_count: u32 = 0;
@@ -865,10 +953,18 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
     let mut last_refresh_attempt = Instant::now();
     let mut last_activity = WorkerActivity::Spawning;
     let mut idle_since: Option<Instant> = None;
+    // A timer wake whose liveness check said `SkipThisCycle` leaves the
+    // activity deadline expired; without this the next wake clamps to 50ms
+    // and re-probes tmux and the durable PID in a hot loop. Real triggers
+    // still pre-empt the sleep.
+    let mut skip_retry_at: Option<Instant> = None;
 
     loop {
-        let timer_remaining =
-            compute_timer_delay(last_activity, Some(last_refresh_attempt), idle_since, Instant::now());
+        let now = Instant::now();
+        let mut timer_remaining = compute_timer_delay(last_activity, Some(last_refresh_attempt), idle_since, now);
+        if let Some(retry_at) = skip_retry_at {
+            timer_remaining = timer_remaining.max(retry_at.saturating_duration_since(now));
+        }
         let (trigger, synthetic) = tokio::select! {
             t = rx.recv() => match t {
                 Some(t) => (t, false),
@@ -876,6 +972,45 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             },
             _ = tokio::time::sleep(timer_remaining) => (Trigger::PostToolUse, true),
         };
+
+        let Some(state) = registry.get(slot_id).filter(|state| state.run_id == run_id) else {
+            return;
+        };
+        // One inspection per wake: the three call sites below reuse this
+        // permit so a cycle does not spawn three tmux probes. Confirmed
+        // death still stops the loop; inferred death with a live PID skips
+        // the refresh without teardown.
+        let permit = resolver.worker_can_refresh(&run_id).await;
+        if permit == WorkerRefreshPermit::Stop {
+            // Confirmed death: stop refreshing, keep the task so a later
+            // Alive inspection or same-run re-adoption can unpark it.
+            last_activity = WorkerActivity::Terminated;
+            continue;
+        }
+        if state.activity == WorkerActivity::Terminated {
+            // A driver SessionEnd can precede a resumed hook. Park until a
+            // new activity event, unless this inspection just revived the
+            // slot (session reappeared / PID still live).
+            if permit != WorkerRefreshPermit::Refresh {
+                last_activity = WorkerActivity::Terminated;
+                continue;
+            }
+            last_activity = registry
+                .get(slot_id)
+                .map(|state| state.activity)
+                .unwrap_or(WorkerActivity::Terminated);
+            if last_activity == WorkerActivity::Terminated {
+                continue;
+            }
+            idle_since = (last_activity == WorkerActivity::Idle).then(Instant::now);
+        } else if last_activity == WorkerActivity::Terminated {
+            // Parked on a Stop permit, but another path (sweep `Alive` arm,
+            // same-run re-adoption) restored the registry without sending
+            // this loop a transition. Resync from the registry on every
+            // wake so a worker that is visibly running again un-parks.
+            last_activity = state.activity;
+            idle_since = (last_activity == WorkerActivity::Idle).then(Instant::now);
+        }
 
         let kind = trigger_kind(&trigger);
         tracing::debug!(
@@ -896,6 +1031,16 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 snap.last_real_trigger_at_epoch_s = Some(now_epoch);
             }
         });
+
+        // Literal status transitions also write live_status_at; they need
+        // the same liveness check as model-generated summaries.
+        if matches!(
+            trigger,
+            Trigger::ActivityChanged(WorkerActivity::Errored | WorkerActivity::WaitingForInput)
+        ) && permit != WorkerRefreshPermit::Refresh
+        {
+            continue;
+        }
 
         match trigger {
             Trigger::Shutdown => return,
@@ -961,6 +1106,14 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             continue;
         }
 
+        if permit != WorkerRefreshPermit::Refresh {
+            if synthetic {
+                skip_retry_at = Some(Instant::now() + WORKING_TIMER_FLOOR);
+            }
+            continue;
+        }
+        skip_retry_at = None;
+
         last_refresh_attempt = Instant::now();
 
         // Per-slot off-switch (Q9). When the human has disabled this
@@ -1016,46 +1169,68 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             }
         }
 
-        // Resolve the transcript path lazily on the first tick (the
-        // path is recorded on the WorkRun row some time after spawn).
-        if tail.is_none() {
-            if let Some(path) = resolver.transcript_path(&run_id).await {
-                let path_str = path.display().to_string();
-                tracing::info!(
-                    slot_id,
-                    run_id = %run_id,
-                    transcript_path = %path_str,
-                    "live_status: resolved transcript path; tail started",
-                );
-                debug_store.update(slot_id, |snap| {
-                    snap.transcript_path = Some(path_str);
-                });
-                match start_transcript_tail(driver.as_ref(), &run_id, path) {
-                    Ok(started) => tail = Some(started),
-                    Err(err) => {
-                        tracing::warn!(
-                            slot_id,
-                            run_id = %run_id,
-                            %err,
-                            "live_status: transcript path failed driver containment policy",
-                        );
-                        continue;
+        // Resolve the transcript path lazily, and again when a newer
+        // generation attaches so the tail is not stuck on a closed file.
+        let resolved = if tail.is_none() || last_path_lookup.is_none_or(|at| at.elapsed() >= SUCCESS_COOLDOWN) {
+            last_path_lookup = Some(Instant::now());
+            resolver.transcript_path(&run_id).await.or_else(|| tailed_path.clone())
+        } else {
+            tailed_path.clone()
+        };
+        if tailed_path.as_ref() != resolved.as_ref() {
+            match resolved {
+                Some(path) => {
+                    let path_str = path.display().to_string();
+                    tracing::info!(
+                        slot_id,
+                        run_id = %run_id,
+                        transcript_path = %path_str,
+                        "live_status: resolved transcript path; tail started",
+                    );
+                    debug_store.update(slot_id, |snap| {
+                        snap.transcript_path = Some(path_str);
+                    });
+                    let containment = resolver.transcript_containment_root(&run_id).await;
+                    match start_transcript_tail(driver.as_ref(), &run_id, path.clone(), containment) {
+                        Ok(started) => {
+                            tail = Some(started);
+                            tailed_path = Some(path);
+                            transcript_buffer.clear();
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                slot_id,
+                                run_id = %run_id,
+                                %err,
+                                "live_status: transcript path failed driver containment policy",
+                            );
+                            continue;
+                        }
                     }
                 }
-            } else {
-                tracing::info!(
-                    slot_id,
-                    run_id = %run_id,
-                    "live_status: skip — no transcript path yet (work_runs row has NULL)",
-                );
-                continue;
+                None => {
+                    tracing::info!(
+                        slot_id,
+                        run_id = %run_id,
+                        "live_status: skip — no transcript path yet (work_runs row has NULL)",
+                    );
+                    continue;
+                }
             }
         }
 
         // Pull any new transcript content into the buffer.
         let mut new_lines_count = 0usize;
         if let Some(t) = tail.as_mut() {
-            match t.poll().await {
+            let limit = match resolver.transcript_read_limit(t.path()).await {
+                Ok(limit) => limit,
+                Err(error) => {
+                    transcript_buffer.clear();
+                    tracing::warn!(%error, "live_status: transcript unavailable");
+                    continue;
+                }
+            };
+            match t.poll_through(limit).await {
                 Ok(new_lines) => {
                     new_lines_count = new_lines.len();
                     // Normalise through the run's driver before anything
@@ -1072,6 +1247,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             transcript_buffer.drain(0..drop_n);
         }
         if transcript_buffer.is_empty() {
+            debug_store.update(slot_id, |snap| snap.empty_transcript_polls += 1);
             tracing::debug!(slot_id, "live_status: skip — transcript buffer empty after poll",);
             continue;
         }
@@ -1114,6 +1290,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
 
         match outcome {
             SummarizerOutcome::Success(text) => {
+                if let Some(t) = tail.as_ref()
+                    && resolver.transcript_read_limit(t.path()).await.is_err()
+                {
+                    transcript_buffer.clear();
+                    continue;
+                }
                 let prior = registry.get(slot_id).and_then(|s| s.live_status);
                 let transition = match (&prior, &Some(text.clone())) {
                     (None, Some(_)) => "none->some",
@@ -1132,8 +1314,19 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     snap.last_success_at_epoch_s = Some(now_epoch);
                     snap.last_success_text = Some(preview);
                 });
-                if registry.set_live_status(slot_id, Some(text)) {
-                    broadcaster.broadcast_live_worker_states().await;
+                match resolver.worker_can_refresh(&run_id).await {
+                    WorkerRefreshPermit::Stop => {
+                        last_activity = WorkerActivity::Terminated;
+                        continue;
+                    }
+                    WorkerRefreshPermit::SkipThisCycle => {}
+                    WorkerRefreshPermit::Refresh
+                        if registry.get(slot_id).is_some_and(|state| state.run_id == run_id)
+                            && registry.set_live_status(slot_id, Some(text)) =>
+                    {
+                        broadcaster.broadcast_live_worker_states().await;
+                    }
+                    WorkerRefreshPermit::Refresh => {}
                 }
                 last_success_at = Some(Instant::now());
             }
@@ -1142,11 +1335,17 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             // next eligible event or from the Working timer floor
             // measured from last_refresh_attempt. The outcome is
             // already in the debug store + tracing above.
+            // `InsufficientInput` and `MalformedReply` belong here too: the
+            // model's own "I can't tell" is an engine error (already
+            // logged at `error` with its cause by the summarizer), never a
+            // sentence for the card.
             SummarizerOutcome::NoApiKey(_)
             | SummarizerOutcome::EmptyAfterRedaction
             | SummarizerOutcome::ApiError { .. }
             | SummarizerOutcome::Transport(_)
-            | SummarizerOutcome::PostFilterDropped => {}
+            | SummarizerOutcome::PostFilterDropped
+            | SummarizerOutcome::InsufficientInput { .. }
+            | SummarizerOutcome::MalformedReply(_) => {}
         }
     }
 }
@@ -1406,12 +1605,21 @@ mod tests {
 
     struct CannedResolver {
         path: TokioMutex<Option<PathBuf>>,
+        containment: Option<PathBuf>,
     }
 
     impl CannedResolver {
         fn new(path: Option<PathBuf>) -> Self {
             Self {
                 path: TokioMutex::new(path),
+                containment: None,
+            }
+        }
+
+        fn with_containment(path: PathBuf, containment: PathBuf) -> Self {
+            Self {
+                path: TokioMutex::new(Some(path)),
+                containment: Some(containment),
             }
         }
     }
@@ -1420,6 +1628,10 @@ mod tests {
     impl TranscriptPathResolver for CannedResolver {
         async fn transcript_path(&self, _run_id: &str) -> Option<PathBuf> {
             self.path.lock().await.clone()
+        }
+
+        async fn transcript_containment_root(&self, _run_id: &str) -> Option<PathBuf> {
+            self.containment.clone()
         }
     }
 
@@ -1491,9 +1703,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content":[{"type":"text","text":"reading the Codex rollout"}]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::live_status::test_support::status_reply(
+                    "reading the Codex rollout",
+                )),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -1541,6 +1755,166 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_spoke_custody_tail_summarizes_outside_the_driver_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes = tmp.path().join("homes");
+        let custody = tmp.path().join("executions/exec-1/spoke/run-1");
+        std::fs::create_dir_all(&custody).unwrap();
+        let transcript = custody.join("transcript-gen.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"agent_message","message":"spoke custody transcript for Codex"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"spoke custody transcript for Codex"}]}
+            }),
+        ];
+        let jsonl = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript, jsonl).unwrap();
+        let _env = codex_homes_override(&homes);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(codex_spoke_custody_tail_body(&transcript, &custody));
+    }
+
+    async fn codex_spoke_custody_tail_body(transcript: &Path, custody: &Path) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::live_status::test_support::status_reply("reading the spoke copy")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let utility: Arc<dyn UtilityModel> = Arc::new(
+            crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri())),
+        );
+        let run_id = "run-codex-spoke-custody";
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(4, run_id, "gpt-5.6-terra", 0, None);
+        let manager = LiveStatusManager::new();
+        let broadcaster: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::with_containment(
+            transcript.to_path_buf(),
+            custody.to_path_buf(),
+        ));
+        manager.start_slot(
+            4,
+            LiveStatusRun::new(run_id, Arc::new(crate::driver::CodexDriver::default())),
+            utility,
+            registry.clone(),
+            broadcaster,
+            resolver,
+        );
+        manager.notify(4, Trigger::ActivityChanged(WorkerActivity::Working));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(4).and_then(|state| state.live_status).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex spoke slot did not summarize the custody transcript");
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests.first().expect("summarizer request").body);
+        assert!(body.contains("spoke custody transcript for Codex"), "{body}");
+        assert_eq!(
+            registry.get(4).unwrap().live_status.as_deref(),
+            Some("reading the spoke copy")
+        );
+        manager.stop_slot(4);
+    }
+
+    /// Run one summarizer attempt against `reply` with a prior label already
+    /// on the slot, and return the registry plus the debug snapshot once the
+    /// attempt's outcome has been recorded.
+    async fn run_attempt_with_prior_status(
+        reply: serde_json::Value,
+    ) -> (Option<String>, Option<String>, SlotDebugSnapshot) {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("t.jsonl");
+        let line = serde_json::json!({"type":"user","message":{"role":"user","content":"keep going on the refactor"}});
+        std::fs::write(&transcript, format!("{line}\n")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&server)
+            .await;
+        let utility: Arc<dyn UtilityModel> = Arc::new(
+            crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri())),
+        );
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(9, "run-keep-prior", "claude-opus-4-7", 0, None);
+        registry.set_live_status(9, Some("prior label".to_owned()));
+        let prior_at = registry.get(9).unwrap().live_status_at;
+        let manager = LiveStatusManager::new();
+        let broadcaster: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(Some(transcript)));
+        manager.start_slot(
+            9,
+            live_run("run-keep-prior"),
+            utility,
+            registry.clone(),
+            broadcaster,
+            resolver,
+        );
+        manager.notify(9, Trigger::ActivityChanged(WorkerActivity::Working));
+        let debug_store = manager.debug_store();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while debug_store.snapshot_for(9).last_outcome_tag.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("summarizer outcome was never recorded");
+        let snapshot = debug_store.snapshot_for(9);
+        let state = registry.get(9).unwrap();
+        assert_eq!(state.live_status_at, prior_at, "last_status_at must not advance");
+        manager.stop_slot(9);
+        (state.live_status, prior_at, snapshot)
+    }
+
+    #[tokio::test]
+    async fn insufficient_input_reply_keeps_the_prior_status() {
+        let (status, _, snapshot) = run_attempt_with_prior_status(
+            crate::live_status::test_support::insufficient_input_reply("only a turn-start marker is present"),
+        )
+        .await;
+        assert_eq!(status.as_deref(), Some("prior label"));
+        assert_eq!(snapshot.last_outcome_tag.as_deref(), Some("insufficient_input"));
+    }
+
+    #[tokio::test]
+    async fn free_text_reply_keeps_the_prior_status() {
+        let (status, _, snapshot) = run_attempt_with_prior_status(serde_json::json!({
+            "content": [{"type": "text", "text": "I cannot tell what the worker is doing."}],
+            "stop_reason": "end_turn",
+        }))
+        .await;
+        assert_eq!(status.as_deref(), Some("prior label"));
+        assert_eq!(snapshot.last_outcome_tag.as_deref(), Some("malformed_reply"));
+    }
+
+    #[test]
     fn manager_start_replaces_existing_slot() {
         // start_slot on a slot that's already running tears down the
         // prior task before installing the new one. Otherwise a
@@ -1570,6 +1944,98 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(!mgr.has_slot(3));
         });
+    }
+
+    /// Resolver whose liveness permit is scripted and whose probes are counted.
+    struct ScriptedPermitResolver {
+        permit: std::sync::Mutex<WorkerRefreshPermit>,
+        probes: AtomicUsize,
+    }
+
+    impl ScriptedPermitResolver {
+        fn new(permit: WorkerRefreshPermit) -> Self {
+            Self {
+                permit: std::sync::Mutex::new(permit),
+                probes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranscriptPathResolver for ScriptedPermitResolver {
+        async fn transcript_path(&self, _run_id: &str) -> Option<PathBuf> {
+            None
+        }
+
+        async fn worker_can_refresh(&self, _run_id: &str) -> WorkerRefreshPermit {
+            self.probes.fetch_add(1, Ordering::Relaxed);
+            *self.permit.lock().unwrap()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_this_cycle_does_not_poll_liveness_at_the_floor() {
+        let mgr = LiveStatusManager::new();
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(11, "run-11", "claude-opus-4-7", 0, None);
+        registry.apply_event(
+            11,
+            &WorkerEvent::UserPromptSubmit {
+                session_id: "s".into(),
+                prompt: "go".into(),
+            },
+        );
+        let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let res = Arc::new(ScriptedPermitResolver::new(WorkerRefreshPermit::SkipThisCycle));
+        let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
+        mgr.start_slot(11, live_run("run-11"), keyless_utility(), registry, bc, res_dyn);
+
+        // Pass the Working deadline, then sit well beyond it.
+        tokio::time::sleep(WORKING_TIMER_FLOOR + Duration::from_secs(1)).await;
+        let at_deadline = res.probes.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let after = res.probes.load(Ordering::Relaxed);
+        assert!(
+            after - at_deadline <= 1,
+            "a skipped cycle must not re-probe liveness every 50ms: {at_deadline} -> {after}"
+        );
+        mgr.stop_slot(11);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_parked_on_stop_resumes_after_external_revival() {
+        let mgr = LiveStatusManager::new();
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(12, "run-12", "claude-opus-4-7", 0, None);
+        registry.apply_event(
+            12,
+            &WorkerEvent::UserPromptSubmit {
+                session_id: "s".into(),
+                prompt: "go".into(),
+            },
+        );
+        let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let res = Arc::new(ScriptedPermitResolver::new(WorkerRefreshPermit::Stop));
+        let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
+        mgr.start_slot(12, live_run("run-12"), keyless_utility(), registry, bc, res_dyn);
+        // The seeded activity wake parks the loop on the Stop permit.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(res.probes.load(Ordering::Relaxed) >= 1);
+
+        // Another path revived the worker (registry already Working); the
+        // loop is told nothing except an ordinary tool event.
+        *res.permit.lock().unwrap() = WorkerRefreshPermit::Refresh;
+        mgr.notify(12, Trigger::PostToolUse);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before_timer = res.probes.load(Ordering::Relaxed);
+
+        // Timer-driven refresh must resume instead of parking for an hour.
+        tokio::time::sleep(WORKING_TIMER_FLOOR + Duration::from_secs(1)).await;
+        assert!(
+            res.probes.load(Ordering::Relaxed) > before_timer,
+            "the Working timer floor must fire again after external revival"
+        );
+        mgr.stop_slot(12);
     }
 
     #[tokio::test]
@@ -1829,7 +2295,7 @@ mod tests {
         mgr.stop_slot(5);
     }
 
-    /// Phase-4 acceptance test: an increment via the legacy `inc_*`
+    /// Acceptance test: an increment via the legacy `inc_*`
     /// wrapper and a direct increment via the framework handle both
     /// show up in `snapshot()` and in `registry.counter_value()`.
     #[test]

@@ -6,8 +6,15 @@ exports_files([
 ])
 
 exports_files(
-    [".bazelrc"],
-    visibility = ["//tools/test-sandbox:__pkg__"],
+    [
+        ".bazelrc",
+        ".ci.bazelrc",
+    ],
+    visibility = [
+        "//.buildkite/steps/tests:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/test-sandbox:__pkg__",
+    ],
 )
 
 # Exported narrowly so `engine/core`'s self-test can embed the root
@@ -18,5 +25,8 @@ exports_files(
 # there.
 exports_files(
     ["CHECKS.yaml"],
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
+    ],
 )

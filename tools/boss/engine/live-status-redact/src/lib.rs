@@ -25,11 +25,12 @@
 //! - [`redact_text`] — apply the secret-pattern regexes to any string.
 //!   Used for both the redacted transcript window fed to the model
 //!   *and* the model's reply before it's written to `live_status`.
-//! - [`truncate_large_values`] — collapse any `tool_input` or
-//!   `tool_response` JSON value longer than [`MAX_VALUE_BYTES`] to a
-//!   single `<truncated>` placeholder. Removes the "we just sent the
+//! - [`truncate_large_values`] — clip any string value longer than
+//!   [`MAX_VALUE_BYTES`] anywhere in the entry to a short head plus a
+//!   `<truncated>` placeholder, leaving the entry's structure (content
+//!   blocks, tool names, keys) intact. Removes the "we just sent the
 //!   whole file contents to the summarizer" attack surface before any
-//!   string scanning happens.
+//!   string scanning happens, without erasing *which* tool ran.
 //! - [`should_drop_entry`] — return `true` for transcript JSONL
 //!   entries whose tool name or argument path matches a deny-list
 //!   (anything reading `~/.config`, `/Users/*/secrets`, env-var dumps
@@ -51,13 +52,21 @@ pub const REDACTED: &str = "<redacted>";
 /// exceeded the per-value byte ceiling.
 pub const TRUNCATED: &str = "<truncated>";
 
-/// Per-value byte ceiling for `tool_input` / `tool_response` JSON
-/// payloads inside a transcript line. Anything longer (a file body, a
-/// big bash dump) is replaced by [`TRUNCATED`] before pattern
-/// matching even runs. 2 KiB matches the figure called out in the
-/// design doc and is comfortably below the per-call input cap fed to
-/// the model.
+/// Per-value byte ceiling for any string inside a transcript line.
+/// Anything longer (a file body, a big bash dump, a code-mode cell
+/// script) keeps only its first [`TRUNCATED_HEAD_BYTES`] followed by
+/// [`TRUNCATED`] before pattern matching even runs. 2 KiB matches the
+/// figure called out in the design doc and is comfortably below the
+/// per-call input cap fed to the model.
 pub const MAX_VALUE_BYTES: usize = 2 * 1024;
+
+/// Bytes of an oversize string kept ahead of the [`TRUNCATED`] marker.
+/// Enough for the summarizer's renderer (which clips commands to 80
+/// bytes and text to 200) to still see *what* the value was — the
+/// command a cell ran, the opening of an assistant message — while
+/// sending strictly fewer bytes than a value just under the ceiling
+/// does untouched.
+pub const TRUNCATED_HEAD_BYTES: usize = 256;
 
 /// Worst-case fraction of a redacted string that may be the
 /// [`REDACTED`] / [`TRUNCATED`] placeholders before the output filter
@@ -111,16 +120,16 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     count
 }
 
-/// Walk a JSONL transcript line and replace any `tool_input` or
-/// `tool_response` value whose serialised length exceeds
-/// [`MAX_VALUE_BYTES`] with a `<truncated>` string.
+/// Walk a JSONL transcript line and clip every string value longer
+/// than [`MAX_VALUE_BYTES`] to its first [`TRUNCATED_HEAD_BYTES`] plus
+/// the `<truncated>` marker.
 ///
 /// The function mutates a copy and returns it, so the caller can keep
-/// the original line around for debugging if needed. We only need to
-/// inspect a fixed set of top-level keys: the claude transcript
-/// format puts the tool payload either at the top level (legacy
-/// shape) or inside the assistant message's content blocks
-/// (`type == "tool_use"` / `"tool_result"`). Both shapes are handled.
+/// the original line around for debugging if needed.
+///
+/// Only string leaves are ever replaced; objects and arrays are walked,
+/// never collapsed, so content blocks, tool names and keys always survive
+/// and the renderer can still tell a tool call happened.
 pub fn truncate_large_values(mut value: Value) -> Value {
     truncate_in_place(&mut value);
     value
@@ -128,15 +137,13 @@ pub fn truncate_large_values(mut value: Value) -> Value {
 
 fn truncate_in_place(value: &mut Value) {
     match value {
+        Value::String(s) if s.len() > MAX_VALUE_BYTES => {
+            let head = boss_engine_utils::string_clip::floor_char_boundary(s, TRUNCATED_HEAD_BYTES);
+            *s = format!("{}{TRUNCATED}", &s[..head]);
+        }
         Value::Object(obj) => {
-            for (k, v) in obj.iter_mut() {
-                if matches!(k.as_str(), "tool_input" | "tool_response" | "input" | "content")
-                    && value_byte_len(v) > MAX_VALUE_BYTES
-                {
-                    *v = Value::String(TRUNCATED.to_owned());
-                } else {
-                    truncate_in_place(v);
-                }
+            for v in obj.values_mut() {
+                truncate_in_place(v);
             }
         }
         Value::Array(arr) => {
@@ -145,15 +152,6 @@ fn truncate_in_place(value: &mut Value) {
             }
         }
         _ => {}
-    }
-}
-
-fn value_byte_len(v: &Value) -> usize {
-    match v {
-        Value::String(s) => s.len(),
-        // Cheap upper bound: serialise back to JSON only when we
-        // could not have decided from the variant alone.
-        _ => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0),
     }
 }
 
@@ -434,7 +432,24 @@ mod tests {
             "tool_response": big,
         });
         let out = truncate_large_values(line);
-        assert_eq!(out["tool_response"], TRUNCATED);
+        let kept = out["tool_response"].as_str().unwrap();
+        assert_eq!(kept, format!("{}{TRUNCATED}", "x".repeat(TRUNCATED_HEAD_BYTES)));
+        assert!(
+            kept.len() < MAX_VALUE_BYTES,
+            "the body must not pass through: {}",
+            kept.len()
+        );
+    }
+
+    #[test]
+    fn truncate_head_respects_char_boundaries() {
+        // 'é' is two bytes; a head cut mid-character would panic on slice.
+        let big = "é".repeat(MAX_VALUE_BYTES);
+        let line = json!({"type": "user", "tool_response": big});
+        let out = truncate_large_values(line);
+        let kept = out["tool_response"].as_str().unwrap();
+        assert!(kept.ends_with(TRUNCATED));
+        assert!(kept.len() <= TRUNCATED_HEAD_BYTES + TRUNCATED.len());
     }
 
     #[test]
@@ -462,10 +477,37 @@ mod tests {
             },
         });
         let out = truncate_large_values(line);
-        // The container "content" key got pattern-matched and the
-        // whole array exceeds the cap — verify the top-level walk
-        // collapsed it to a sentinel.
-        assert_eq!(out["message"]["content"], TRUNCATED);
+        // The oversize command is clipped; the surrounding `tool_use`
+        // block keeps its type and tool name.
+        let block = &out["message"]["content"][0];
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["name"], "Bash");
+        let command = block["input"]["command"].as_str().unwrap();
+        assert!(command.starts_with(&"y".repeat(TRUNCATED_HEAD_BYTES)), "{command}");
+        assert!(command.ends_with(TRUNCATED), "{command}");
+        assert!(command.len() < MAX_VALUE_BYTES);
+    }
+
+    #[test]
+    fn truncate_keeps_many_small_blocks_even_when_the_array_is_large() {
+        // Forty small blocks serialise past the ceiling together, but no
+        // single value is oversize: nothing should be touched.
+        let blocks: Vec<_> = (0..40)
+            .map(|i| json!({"type": "tool_use", "name": "Read", "input": {"file_path": format!("src/file_{i}.rs{}", "p".repeat(60))}}))
+            .collect();
+        let line = json!({"type": "assistant", "content": blocks.clone()});
+        let out = truncate_large_values(line);
+        assert_eq!(out["content"], Value::Array(blocks));
+    }
+
+    #[test]
+    fn truncate_clips_long_assistant_text_but_keeps_its_opening() {
+        let text = format!("Investigating the scroll handler bug. {}", "z".repeat(MAX_VALUE_BYTES));
+        let line = json!({"type": "assistant", "content": [{"type": "text", "text": text}]});
+        let out = truncate_large_values(line);
+        let kept = out["content"][0]["text"].as_str().unwrap();
+        assert!(kept.starts_with("Investigating the scroll handler bug."), "{kept}");
+        assert!(kept.ends_with(TRUNCATED));
     }
 
     #[test]

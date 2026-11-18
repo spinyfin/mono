@@ -9,6 +9,74 @@ final class EngineClient: @unchecked Sendable {
     private var socketIndex = 0
     private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
+    /// Retained user mutations and delivery tracking. Lock-guarded (not
+    /// `queue`) so the main actor can read/clear it without blocking on
+    /// the socket I/O queue; payloads are held as sorted-key JSON so the
+    /// state stays value-typed.
+    private struct ActionLedger {
+        /// Never reached the wire; safe to resend on explicit Retry.
+        var unsent: [(id: String, data: Data)] = []
+        /// Accepted by the caller, but still waiting on the socket queue.
+        /// Reserve retry capacity before a form is allowed to close.
+        var scheduled: [String: Data] = [:]
+        /// Written to the socket, awaiting an engine reply echoing the
+        /// envelope id, keyed by that id. If the connection ends first the
+        /// outcome is uncertain and the action is NOT replayed (the engine
+        /// has no dedupe), only reported.
+        var awaiting: [String: (data: Data, generation: Int)] = [:]
+        /// Subset of `awaiting`/in-flight ids sent via Retry; drives the
+        /// "Sending pending actions…" banner.
+        var retried: Set<String> = []
+        var uncertain: [String: String] = [:]
+        var retryAdmissionTasks: Set<String> = []
+    }
+    private let ledger = OSAllocatedUnfairLock(initialState: ActionLedger())
+    static let maxUnsentActions = 64
+    static func isRetainable(_ payload: [String: Any]) -> Bool {
+        isUserMutation(payload)
+    }
+
+    /// Read-only evaluations are tracked for reply correlation but can never
+    /// have completed an action, so a drop before their reply is not an
+    /// uncertain delivery.
+    static func isSideEffectFree(kind: String) -> Bool {
+        kind == "evaluate_dispatch_admission" || kind == "evaluate_editorial_rules"
+    }
+
+    /// "update_work_item" -> "update work item" for user-facing text.
+    static func describeAction(kind: String) -> String {
+        kind.replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// Request kinds a person initiates and can lose to a dropped connection.
+    /// An explicit allowlist: automatic traffic (reads, session housekeeping,
+    /// the comment layer's `comments_resolve` re-anchor on every reload) must
+    /// never be retained for Retry or reported as an uncertain action.
+    static let userMutationKinds: Set<String> = [
+        "create_task", "create_chore", "create_idea", "create_project", "create_product",
+        "create_automation", "delete_work_item", "update_idea", "update_automation",
+        "enable_automation", "disable_automation", "delete_automation", "set_automation_paused",
+        "reorder_project_tasks", "merge_when_ready", "request_execution", "release_project",
+        "unpopulate_project", "answer_attention", "dismiss_attention",
+        "comments_create", "comments_set_status", "comments_set_intent",
+        "comments_dismiss", "comments_post_followup", "comments_update_anchor",
+        "set_setting", "set_feature_flag", "set_dispatch_paused",
+        "set_driver_traffic_split", "set_offsite_backup", "set_product_editorial_rules",
+        "set_product_external_tracker", "set_product_merge_mechanism", "set_host_enabled",
+        "add_host", "remove_host", "add_host_tag", "remove_host_tag",
+        "update_work_item", "move_work_item_on_board", "evaluate_dispatch_admission",
+        "evaluate_editorial_rules",
+        "accept_deferred_scope_attention", "action_attention_group", "answer_operator_question", "dismiss_operator_question",
+        "create_task_from_deferred_scope_attention", "comments_revise_doc", "retry_review_guide",
+        "recreate_coordinator", "generate_review_guide", "open_live_workspace_terminal",
+        "open_review_terminal", "git_hub_auth_start", "git_hub_auth_cancel",
+        "git_hub_auth_disconnect", "trunk_set_token", "shutdown",
+    ]
+
+    static func isUserMutation(_ payload: [String: Any]) -> Bool {
+        guard let kind = payload["type"] as? String else { return false }
+        return userMutationKinds.contains(kind)
+    }
     private var buffer = Data()
     /// Connection whose read loop is suspended by decode backpressure.
     private var readPause = ReadLoopPauseGate<NWConnection>()
@@ -57,6 +125,8 @@ final class EngineClient: @unchecked Sendable {
     /// Generation of the live connection attempt, from `terminationLatch`.
     private var connectionGeneration = 0
     private let decodeHook = OSAllocatedUnfairLock<(@Sendable (Data) -> Void)?>(initialState: nil)
+    private let beforeWriteHook = OSAllocatedUnfairLock<(@Sendable (String, Int) -> Void)?>(initialState: nil)
+    private let failedWriteCompletions = OSAllocatedUnfairLock(initialState: 0)
 
     /// Thread-safe liveness signal for `EngineProcessController`'s
     /// supervision tick: true only while this connection is `.ready`. Lets
@@ -80,12 +150,15 @@ final class EngineClient: @unchecked Sendable {
     /// above the largest observed single reply (~25 MB `work_tree`) so
     /// backpressure only engages under a genuine decode backlog.
     static let maxPendingDecodeBytes = 128 * 1024 * 1024
+    private var pendingDecodeByteLimit = EngineClient.maxPendingDecodeBytes
     // Accessed only on the serial decode queue.
     private var decodingGeneration = 0
     private var rejectedDecodeGeneration: Int?
+    // Accessed only on the serial decode queue.
+    private var workTreeCache = WorkTreeDeltaCache()
 
     private lazy var handoff = LineDecodeHandoff(
-        maxPendingBytes: Self.maxPendingDecodeBytes,
+        maxPendingBytes: pendingDecodeByteLimit,
         decode: { [weak self] data, recvNanos in
             self?.decodeHook.withLock { $0 }?(data)
             self?.decodeLine(data, lineRecvNanos: recvNanos)
@@ -101,8 +174,9 @@ final class EngineClient: @unchecked Sendable {
         }
     )
 
-    init(socketPath: String) {
+    init(socketPath: String, pendingDecodeByteLimit: Int = EngineClient.maxPendingDecodeBytes) {
         self.socketPaths = [socketPath]
+        self.pendingDecodeByteLimit = pendingDecodeByteLimit
     }
 
     init(socketPaths: [String]) {
@@ -165,6 +239,7 @@ final class EngineClient: @unchecked Sendable {
                 self.reachableState.withLock { $0 = true }
                 self.reachedReady = true
                 self.socketIndex = 0
+                self.connectTreeClaims.withLock { $0.removeAll() }
                 // Ordered behind any previous connection's pending lines
                 // and `.disconnected`, so a fast reconnect cannot land
                 // `.connected` before the old connection's teardown.
@@ -204,6 +279,12 @@ final class EngineClient: @unchecked Sendable {
     /// no behaviour change.
     var outboundRecorder: (([String: Any]) -> Void)?
 
+    /// Called with the product id each time a `get_work_tree` is issued, from
+    /// whichever thread issued it. `ChatViewModel` uses it to order tree reads
+    /// against runtime patches (`BoardReadFence`); it is set once at start-up.
+    var onWorkTreeRequested: ((String, String) -> Void)?
+    var onQueuedWorkTreeRetired: ((String, String) -> Void)?
+
     /// Test-only: report sends as accepted without a socket, so view-model
     /// tests can exercise the connected path.
     var simulateConnectedForTesting = false
@@ -215,9 +296,11 @@ final class EngineClient: @unchecked Sendable {
     /// self-retrying background polls may opt out of disconnected reports;
     /// user actions must either queue or report a visible failure.
     @discardableResult
-    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true) -> String? {
-        let envelopeRequestId = UUID().uuidString
+    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString) -> String? {
         outboundRecorder?(payload)
+        if payload["type"] as? String == "merge_when_ready" {
+            Self.log.info("merge RPC scheduled: request=\(envelopeRequestId, privacy: .public)")
+        }
 
         // Log outbound engine_response messages so both sides of every
         // IPC round-trip have a disk record.
@@ -234,44 +317,201 @@ final class EngineClient: @unchecked Sendable {
         }
 
         if simulateConnectedForTesting { return envelopeRequestId }
-        guard connection != nil else {
-            // A send while the socket is down is a transport condition,
-            // not an engine-reported error. Idempotent reads are held and
-            // delivered on reconnect when the caller opts in with
-            // `queueIfDisconnected`; anything else is failed back to the
-            // app as a typed `.notConnected`.
-            let kind = (payload["type"] as? String) ?? "unknown"
-            if queueIfDisconnected {
-                Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
-                // Held as sorted-key JSON so the queue is Sendable and an
-                // identical newer request supersedes the queued one.
-                if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
-                    queuedReads.withLock { state in
-                        state.removeAll { $0.data == data }
-                        state.append((envelopeRequestId, data))
-                        if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
-                    }
-                } else {
-                    emit(.notConnected(requestKind: kind))
-                    return nil
-                }
-                return envelopeRequestId
-            }
-            if !reportIfDisconnected {
-                Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
-                return nil
-            }
-            Self.log.info("dropped \(kind, privacy: .public) while disconnected; reporting not-connected")
-            emit(.notConnected(requestKind: kind))
+        guard reachableState.withLock({ $0 }) else {
+            return handleDisconnectedSend(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+        }
+        guard let encoded = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            emit(.error(message: "failed to encode outbound request"))
             return nil
         }
-        return write(payload, envelopeRequestId: envelopeRequestId)
+        if Self.isUserMutation(payload) {
+            let reserved = ledger.withLock { state in
+                guard state.unsent.count + state.scheduled.count < Self.maxUnsentActions else { return false }
+                state.scheduled[envelopeRequestId] = encoded
+                return true
+            }
+            guard reserved else {
+                emit(.actionNotSaved(requestKind: payload["type"] as? String ?? "action"))
+                return nil
+            }
+        }
+        // The write runs on the socket queue (FIFO with other writes);
+        // the caller never blocks on it. If the socket died after the
+        // reachability check, `write` re-applies the disconnected policy.
+        queue.async {
+            guard let payload = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any] else { return }
+            self.write(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+        }
+        return envelopeRequestId
     }
+
+    /// A send while the socket is down is a transport condition, not an
+    /// engine-reported error. Idempotent reads are held and delivered on
+    /// reconnect when the caller opts in with `queueIfDisconnected`;
+    /// retainable user mutations are kept for explicit Retry; everything
+    /// else reported as typed `.notConnected` and dropped. Thread-safe.
+    private func handleDisconnectedSend(
+        _ payload: [String: Any], envelopeRequestId: String,
+        queueIfDisconnected: Bool, reportIfDisconnected: Bool
+    ) -> String? {
+        let kind = (payload["type"] as? String) ?? "unknown"
+        if queueIfDisconnected {
+            Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
+            // Tree reads supersede by product even when fetch_seq changes;
+            // other reads preserve their existing exact-payload identity.
+            if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                let treeProductID = kind == "get_work_tree" ? payload["product_id"] as? String : nil
+                let retired = queuedReads.withLock { state in
+                    let previous = state
+                    state.removeAll { treeProductID != nil ? $0.treeProductID == treeProductID : $0.data == data }
+                    state.append((envelopeRequestId, data, treeProductID))
+                    if state.count > Self.maxQueuedReads { state.removeFirst(state.count - Self.maxQueuedReads) }
+                    return previous.filter { old in !state.contains { $0.id == old.id } }
+                }
+                for item in retired {
+                    if let productID = item.treeProductID {
+                        onQueuedWorkTreeRetired?(productID, item.id)
+                    }
+                }
+            } else {
+                emit(.notConnected(requestKind: kind))
+                return nil
+            }
+            return envelopeRequestId
+        }
+        if !reportIfDisconnected {
+            Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
+            return nil
+        }
+        if retainUnsent(payload, envelopeRequestId: envelopeRequestId) == .full {
+            emit(.actionNotSaved(requestKind: kind))
+            return nil
+        }
+        emit(.notConnected(requestKind: kind))
+        return nil
+    }
+
+    private enum RetentionOutcome { case retained, ineligible, full }
+
+    /// Explicit outcome prevents a rejected action being described as saved.
+    private func retainUnsent(_ payload: [String: Any], envelopeRequestId: String) -> RetentionOutcome {
+        let kind = (payload["type"] as? String) ?? "unknown"
+        guard Self.isRetainable(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        else {
+            Self.log.info("not retaining \(kind, privacy: .public); not an eligible user mutation")
+            return .ineligible
+        }
+        return retainUnsent(data, id: envelopeRequestId, kind: kind)
+    }
+
+    private func retainUnsent(_ data: Data, id: String, kind: String) -> RetentionOutcome {
+        let retained = ledger.withLock { state -> Bool in
+            guard state.unsent.count + state.scheduled.count < Self.maxUnsentActions else { return false }
+            state.unsent.append((id: id, data: data))
+            return true
+        }
+        Self.log.info("\(retained ? "retained" : "dropped (buffer full)", privacy: .public) \(kind, privacy: .public); awaiting explicit retry")
+        return retained ? .retained : .full
+    }
+
+    /// Only actions never handed to Network.framework are eligible. Once a
+    /// write is attempted its delivery is uncertain, so it must not be replayed.
+    func retryUnsentActions() -> Bool {
+        guard reachableState.withLock({ $0 }) else { return false }
+        let actions = ledger.withLock { state -> [(id: String, data: Data)] in
+            // Reuse each action's original envelope id so a reply to the retried
+            // send still correlates with the caller's pending state.
+            let drained = state.unsent
+            state.unsent.removeAll()
+            for action in drained { state.scheduled[action.id] = action.data }
+            // Registered before the write so a fast reply cannot race it.
+            state.retried.formUnion(drained.map(\.id))
+            return drained
+        }
+        queue.async {
+            for action in actions {
+                guard let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any] else {
+                    self.ledger.withLock { _ = $0.retried.remove(action.id) }
+                    continue
+                }
+                self.write(payload, envelopeRequestId: action.id)
+            }
+        }
+        return true
+    }
+
+    func discardUnsentActions() {
+        ledger.withLock { state in
+            for action in state.unsent {
+                if let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any],
+                   payload["type"] as? String == "move_work_item_on_board",
+                   let taskID = payload["id"] as? String {
+                    state.retryAdmissionTasks.remove(taskID)
+                }
+            }
+            state.unsent.removeAll()
+        }
+    }
+
+    func finishAdmissionRetry(taskID: String) {
+        let finished = ledger.withLock { state in
+            state.retryAdmissionTasks.remove(taskID) != nil && state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
+        }
+        if finished { emit(.retriedActionsStatus(message: nil)) }
+    }
+
+    /// The user has checked the outcome of every action reported uncertain.
+    func acknowledgeUncertainActions() {
+        ledger.withLock { $0.uncertain.removeAll() }
+    }
+
+    var hasUnsentActions: Bool { ledger.withLock { !$0.unsent.isEmpty } }
+    var hasRetriedActions: Bool { ledger.withLock { !$0.retried.isEmpty || !$0.retryAdmissionTasks.isEmpty } }
+
+    func hasRoomForDisconnectedActions(_ count: Int = 1) -> Bool {
+        ledger.withLock { $0.unsent.count + $0.scheduled.count + count <= Self.maxUnsentActions }
+    }
+
+    func hasUnsentAction(kind: String) -> Bool {
+        ledger.withLock { state in
+            state.unsent.contains {
+                ((try? JSONSerialization.jsonObject(with: $0.data)) as? [String: Any])?["type"] as? String == kind
+            }
+        }
+    }
+
+    /// Task ids whose drag (admission check or board move) is parked in the
+    /// unsent queue awaiting Retry, as opposed to in flight or settled.
+    func unsentDragTaskIDs() -> Set<String> {
+        ledger.withLock { state in
+            var ids = Set<String>()
+            for action in state.unsent {
+                guard let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any] else { continue }
+                switch payload["type"] as? String {
+                case "evaluate_dispatch_admission": if let id = payload["work_item_id"] as? String { ids.insert(id) }
+                case "move_work_item_on_board": if let id = payload["id"] as? String { ids.insert(id) }
+                default: break
+                }
+            }
+            return ids
+        }
+    }
+
+    /// Test hooks.
+    var unsentActionCountForTesting: Int { ledger.withLock { $0.unsent.count } }
+    var awaitingReplyCountForTesting: Int { ledger.withLock { $0.awaiting.count } }
+    var uncertainActionsForTesting: [String: String] { ledger.withLock { $0.uncertain } }
+    var failedWriteCompletionsForTesting: Int { failedWriteCompletions.withLock { $0 } }
 
     private static let log = Logger(subsystem: "Boss", category: "EngineClient")
     private static let maxQueuedReads = 64
     private let queuedReads = OSAllocatedUnfairLock(
-        initialState: [(id: String, data: Data)]()
+        initialState: [(id: String, data: Data, treeProductID: String?)]()
     )
 
     /// Number of reads waiting for a connection. Test hook.
@@ -281,23 +521,58 @@ final class EngineClient: @unchecked Sendable {
         queuedReads.withLock { $0.contains { $0.id == requestId } }
     }
 
-    private func flushQueuedReads() {
-        let drained = queuedReads.withLock { state -> [(id: String, data: Data)] in
-            let copy = state
+    /// Products whose post-connect tree has been issued on the current
+    /// connection, by either the queue flush or the connect handler, so
+    /// whichever runs second does not send a duplicate.
+    private let connectTreeClaims = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    /// True when the caller may send the connect-time tree for `productId`
+    /// (the queue flush has not already sent one on this connection).
+    func claimConnectTree(productId: String) -> Bool {
+        connectTreeClaims.withLock { $0.insert(productId).inserted }
+    }
+
+    func resetConnectTreeClaims() {
+        connectTreeClaims.withLock { $0.removeAll() }
+    }
+
+    func flushQueuedReads() {
+        let drained = queuedReads.withLock { state -> [(id: String, data: Data, treeProductID: String?)] in
+            let copy = state.map { (id: $0.id, data: $0.data, treeProductID: $0.treeProductID) }
             state.removeAll()
             return copy
         }
         for item in drained {
+            if let productID = item.treeProductID, !claimConnectTree(productId: productID) { continue }
             guard let payload = (try? JSONSerialization.jsonObject(with: item.data)) as? [String: Any] else { continue }
+            if let productID = item.treeProductID {
+                onWorkTreeRequested?(productID, item.id)
+            }
+            if simulateConnectedForTesting { continue }
             write(payload, envelopeRequestId: item.id)
         }
     }
 
     @discardableResult
-    private func write(_ payload: [String: Any], envelopeRequestId: String) -> String? {
+    private func write(
+        _ payload: [String: Any], envelopeRequestId: String,
+        queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true
+    ) -> String? {
         guard let connection else {
-            emit(.notConnected(requestKind: (payload["type"] as? String) ?? "unknown"))
-            return nil
+            let (retained, finished) = ledger.withLock { state in
+                let reserved = state.scheduled.removeValue(forKey: envelopeRequestId)
+                if let reserved { state.unsent.append((id: envelopeRequestId, data: reserved)) }
+                let finished = state.retried.remove(envelopeRequestId) != nil && state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
+                return (reserved != nil, finished)
+            }
+            if finished { emit(.retriedActionsStatus(message: nil)) }
+            if retained {
+                emit(.notConnected(requestKind: payload["type"] as? String ?? "action"))
+                return nil
+            }
+            return handleDisconnectedSend(
+                payload, envelopeRequestId: envelopeRequestId,
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
         }
         do {
             let envelope: [String: Any] = [
@@ -307,14 +582,44 @@ final class EngineClient: @unchecked Sendable {
             var data = try JSONSerialization.data(withJSONObject: envelope, options: [])
             data.append(0x0A)
 
+            if payload["type"] as? String == "merge_when_ready" {
+                Self.log.info("merge RPC socket write: request=\(envelopeRequestId, privacy: .public)")
+            }
+
+            if payload["type"] as? String == "recreate_coordinator" {
+                IpcLog.shared.log(requestId: envelopeRequestId, direction: "app→engine",
+                                  kind: "coordinator_reset_rpc_send", body: payload)
+            }
+
+            // Track every user mutation independently of replay eligibility.
+            if Self.isUserMutation(payload),
+               let saved = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                let generation = connectionGeneration
+                let moveTaskID = payload["type"] as? String == "move_work_item_on_board" ? payload["id"] as? String : nil
+                ledger.withLock { state in
+                    state.scheduled.removeValue(forKey: envelopeRequestId)
+                    state.awaiting[envelopeRequestId] = (saved, generation)
+                    if let moveTaskID, state.retryAdmissionTasks.remove(moveTaskID) != nil {
+                        state.retried.insert(envelopeRequestId)
+                    }
+                }
+            }
+
+            beforeWriteHook.withLock { $0 }?(envelopeRequestId, connectionGeneration)
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                guard let self, self.connection === connection else { return }
+                guard let self else { return }
                 if let error {
+                    self.failedWriteCompletions.withLock { $0 += 1 }
+                    // Failed completion does not prove that the peer received no bytes.
+                    // Teardown reports unanswered writes as uncertain, never replayable.
+                    guard self.connection === connection else { return }
                     self.emit(.transportError(message: "socket send failed: \(error.localizedDescription)"))
+                    self.closeConnection()
                 }
             })
             return envelopeRequestId
         } catch {
+            ledger.withLock { _ = $0.scheduled.removeValue(forKey: envelopeRequestId) }
             emit(.error(message:"failed to encode payload: \(error.localizedDescription)"))
             return nil
         }
@@ -353,6 +658,7 @@ final class EngineClient: @unchecked Sendable {
                 let recvNanos = PopulationTiming.now()
                 let generation = self.connectionGeneration
                 self.handoff.afterPendingLines { [weak self] in
+                    self?.workTreeCache.startConnection(generation)
                     self?.decodingGeneration = generation
                 }
                 let lines = self.frameLines().map { (data: $0, recvNanos: recvNanos) }
@@ -376,7 +682,36 @@ final class EngineClient: @unchecked Sendable {
     /// have been decoded and emitted, so stale replies from the dropped
     /// connection never arrive after the disconnect.
     private func emitDisconnectedAfterPendingLines() {
-        handoff.afterPendingLines { [weak self] in self?.emit(.disconnected) }
+        let generation = connectionGeneration
+        handoff.afterPendingLines { [weak self] in
+            guard let self else { return }
+            // Only ids that became uncertain on THIS drop are reported; earlier
+            // ones were already surfaced and stay until acknowledged.
+            let (fresh, hadPending) = self.ledger.withLock { state -> ([(id: String, kind: String)], Bool) in
+                let pending = state.awaiting.filter { $0.value.generation == generation }
+                var fresh = [(id: String, kind: String)]()
+                for id in pending.keys.sorted() {
+                    if let data = state.awaiting.removeValue(forKey: id)?.data,
+                       let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                        let kind = payload["type"] as? String ?? "action"
+                        if !Self.isSideEffectFree(kind: kind) {
+                            state.uncertain[id] = kind
+                            fresh.append((id, kind))
+                        }
+                    }
+                    state.retried.remove(id)
+                }
+                return (fresh, !pending.isEmpty)
+            }
+            if !fresh.isEmpty {
+                let actions = fresh.map { Self.describeAction(kind: $0.kind) }.joined(separator: ", ")
+                self.emit(.retriedActionsStatus(message: "Connection lost before confirmation: \(actions). Check whether these actions completed before trying again."))
+            } else if hadPending {
+                // Only read-only evaluations were in flight: settle the retry state.
+                self.emit(.retriedActionsStatus(message: nil))
+            }
+            self.emit(.disconnected)
+        }
     }
 
     /// Pull every complete line out of `buffer`. Framing only — no JSON
@@ -409,8 +744,8 @@ final class EngineClient: @unchecked Sendable {
         let lineByteCount = lineData.count
 
         let envelope: [String: Any]
-        let payload: [String: Any]
-        let type: String
+        var payload: [String: Any]
+        var type: String
         do {
             (envelope, payload, type) = try Self.decodeEnvelope(lineData)
         } catch {
@@ -422,8 +757,51 @@ final class EngineClient: @unchecked Sendable {
             }
             return
         }
+        if type == "work_tree_update" {
+            guard let update = payload["update"] as? [String: Any],
+                  let tree = workTreeCache.apply(update) else {
+                emit(.boardReadFailed(requestId: envelope["request_id"] as? String))
+                if let update = payload["update"] as? [String: Any],
+                   let productID = update["product_id"] as? String {
+                    sendGetWorkTree(productId: productID, flow: .itemRefetch, delta: false)
+                }
+                return
+            }
+            payload = tree
+            type = "work_tree"
+        } else if type == "work_tree" {
+            workTreeCache.resetBase()
+        }
         let envelopeRequestId = envelope["request_id"] as? String
+        let isAdmissionReply = type == "dispatch_admission_evaluated"
+        if let id = envelopeRequestId {
+            let finished = ledger.withLock { state -> Bool in
+                let sent = state.awaiting.removeValue(forKey: id)
+                guard state.retried.remove(id) != nil else { return false }
+                if isAdmissionReply, let sent,
+                   let request = (try? JSONSerialization.jsonObject(with: sent.data)) as? [String: Any],
+                   let taskID = request["work_item_id"] as? String {
+                    state.retryAdmissionTasks.insert(taskID)
+                }
+                return state.retried.isEmpty && state.retryAdmissionTasks.isEmpty
+            }
+            if finished { emit(.retriedActionsStatus(message: nil)) }
+        }
 
+        if decodeBoardReply(type: type, payload: payload, envelope: envelope, lineRecvNanos: lineRecvNanos, lineByteCount: lineByteCount) { return }
+        if decodeReviewReply(type: type, payload: payload, requestId: envelopeRequestId) { return }
+        if decodeSettingsReply(type: type, payload: payload, requestId: envelopeRequestId) { return }
+        _ = decodeActionReply(type: type, payload: payload, requestId: envelopeRequestId)
+    }
+
+    // Keep reply families in separate stack frames: the large event values in a
+    // single unoptimized switch can exhaust a Dispatch worker thread stack.
+    @inline(never)
+    private func decodeBoardReply(
+        type: String, payload: [String: Any], envelope: [String: Any],
+        lineRecvNanos: UInt64, lineByteCount: Int
+    ) -> Bool {
+        let envelopeRequestId = envelope["request_id"] as? String
         switch type {
         case "topic_event":
             let topic = payload["topic"] as? String ?? ""
@@ -435,9 +813,17 @@ final class EngineClient: @unchecked Sendable {
             if eventType == "work_invalidated" {
                 let productId = eventPayload["product_id"] as? String
                 let itemIds = eventPayload["item_ids"] as? [String] ?? []
-                emit(.workInvalidated(topic: topic, productId: productId, itemIds: itemIds))
+                emit(.workInvalidated(
+                    topic: topic,
+                    productId: productId,
+                    itemIds: itemIds,
+                    invalidationClass: InvalidationClass(wire: eventPayload["class"] as? String)
+                ))
             } else if eventType == "resync_required" {
                 emit(.resyncRequired)
+            } else if eventType == "worker_pane_capture",
+                      let capture = RemotePaneCapture(wire: eventPayload) {
+                emit(.workerPaneCapture(capture))
             }
         case "products_list":
             let products = (payload["products"] as? [[String: Any]] ?? []).compactMap(parseProduct)
@@ -450,7 +836,7 @@ final class EngineClient: @unchecked Sendable {
             guard let productPayload = payload["product"] as? [String: Any],
                   let product = parseProduct(productPayload)
             else {
-                emit(.error(message:"received invalid work tree payload from engine"))
+                emit(.boardReadFailed(requestId: envelopeRequestId))
                 break
             }
             let projects = (payload["projects"] as? [[String: Any]] ?? []).compactMap(parseProject)
@@ -493,7 +879,38 @@ final class EngineClient: @unchecked Sendable {
                 chores: chores,
                 taskRuntimes: taskRuntimes,
                 dependencies: dependencies,
-                ideas: ideas
+                ideas: ideas,
+                attentionItems: (payload["attention_items"] as? [[String: Any]] ?? []).compactMap(parseAttentionItem),
+                attentionGroups: (payload["attention_groups"] as? [[String: Any]] ?? []).compactMap(parseAttentionGroup),
+                attentionMembers: (payload["attention_members"] as? [[String: Any]] ?? []).compactMap(parseAttention),
+                plannerRuns: (payload["planner_runs"] as? [[String: Any]] ?? [])
+                    .compactMap { decodeWire(PlannerRunSummary.self, from: $0) },
+                requestId: envelopeRequestId, revision: envelope["revision"] as? UInt64
+            ))
+        case "work_runtime_patch":
+            guard let productId = payload["product_id"] as? String else {
+                emit(.boardReadFailed(requestId: envelopeRequestId))
+                break
+            }
+            var cards: [WorkRuntimePatchCard] = []
+            var isComplete = true
+            for entry in payload["items"] as? [[String: Any]] ?? [] {
+                if let itemPayload = entry["item"] as? [String: Any],
+                   let item = parseWorkItem(itemPayload),
+                   let runtimePayload = entry["runtime"] as? [String: Any],
+                   let runtime = parseTaskRuntime(runtimePayload)
+                {
+                    cards.append(WorkRuntimePatchCard(item: item, runtime: runtime))
+                } else {
+                    isComplete = false
+                }
+            }
+            emit(.workRuntimePatch(
+                productId: productId,
+                cards: cards,
+                absent: payload["absent"] as? [String] ?? [],
+                isComplete: isComplete,
+                requestId: envelopeRequestId, revision: envelope["revision"] as? UInt64
             ))
         case "work_item_created":
             guard let itemPayload = payload["item"] as? [String: Any],
@@ -509,14 +926,22 @@ final class EngineClient: @unchecked Sendable {
             if !items.isEmpty {
                 emit(.workItemsCreated(items: items))
             }
+        case "critical_priority_requests":
+            let requests = (payload["requests"] as? [[String: Any]] ?? []).compactMap(CriticalPriorityRequest.init)
+            emit(.criticalPriorityRequests(requests))
+        case "critical_priority_resolved":
+            if let id = payload["id"] as? String { emit(.criticalPriorityResolved(id)) }
         case "work_item_updated":
             guard let itemPayload = payload["item"] as? [String: Any],
                   let item = parseWorkItem(itemPayload)
             else {
-                emit(.error(message: "received invalid work item payload from engine"))
+                emit(.workItemUpdateDecodeFailed(
+                    message: "received invalid work item payload from engine",
+                    requestId: envelopeRequestId
+                ))
                 break
             }
-            emit(.workItemUpdated(item: item))
+            emit(.workItemUpdated(item: item, revision: envelope["revision"] as? UInt64))
         case "project_tasks_reordered":
             let projectId = payload["project_id"] as? String ?? ""
             let taskIds = payload["task_ids"] as? [String] ?? []
@@ -530,6 +955,12 @@ final class EngineClient: @unchecked Sendable {
         case "work_error":
             let message = payload["message"] as? String ?? "unknown work error"
             emit(.workError(message: message, requestId: envelopeRequestId))
+        case "operator_decision_snapshot":
+            if let raw = payload["questions"],
+               let data = try? JSONSerialization.data(withJSONObject: raw),
+               let questions = try? JSONDecoder().decode([DecisionNotification].self, from: data) {
+                emit(.operatorDecisionSnapshot(questions: questions))
+            }
         case "operator_question_error":
             emit(.operatorQuestionError(
                 message: OperatorQuestionFailure.message(from: payload["error"]),
@@ -537,7 +968,7 @@ final class EngineClient: @unchecked Sendable {
             ))
         case "error":
             let message = payload["message"] as? String ?? "unknown engine error"
-            emit(.error(message: message))
+            emit(.error(message: message, requestId: envelopeRequestId))
         case "app_session_registered":
             // Only a completed handshake counts as "recovered" — resetting
             // on the raw socket `.ready` state instead would let a session
@@ -607,13 +1038,13 @@ final class EngineClient: @unchecked Sendable {
                     ))
                 ))
             case "detach_worker_pane":
-                let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
-                emit(.engineRequest(requestId: requestId, request: .detachWorkerPane(slotId: slotId)))
+                let runId = request["run_id"] as? String ?? ""
+                emit(.engineRequest(requestId: requestId, request: .detachWorkerPane(runId: runId)))
             case "focus_worker_pane":
-                let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
+                let runId = request["run_id"] as? String ?? ""
                 emit(.engineRequest(
                     requestId: requestId,
-                    request: .focusWorkerPane(slotId: slotId)
+                    request: .focusWorkerPane(runId: runId)
                 ))
             case "reveal_work_item":
                 let workItemId = request["work_item_id"] as? String ?? ""
@@ -633,26 +1064,33 @@ final class EngineClient: @unchecked Sendable {
         case "worker_live_states_list":
             guard let raw = payload["states"] as? [[String: Any]] else {
                 emit(.error(message: "worker_live_states_list missing states"))
-                return
+                return true
             }
             let states = raw.compactMap(parseWorkerLiveState)
             guard states.count == raw.count else {
                 emit(.error(message: "worker_live_states_list contains invalid state"))
-                return
+                return true
             }
             guard WorkerLiveState.hasUniqueIds(states) else {
                 emit(.error(message: "worker_live_states_list contains duplicate ids"))
-                return
+                return true
             }
-            emit(.workerLiveStatesList(states: states))
-        case "live_status_disabled_slots_list":
-            let raw = payload["slot_ids"] as? [Any] ?? []
-            let slotIds = raw.compactMap { ($0 as? NSNumber)?.intValue }
-            emit(.liveStatusDisabledSlotsList(slotIds: slotIds))
-        case "live_status_enabled_set":
-            let slotId = (payload["slot_id"] as? NSNumber)?.intValue ?? 0
-            let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
-            emit(.liveStatusEnabledSet(slotId: slotId, enabled: enabled))
+            let rawSections = payload["doing_sections"] as? [String: String] ?? [:]
+            let sections = rawSections.compactMapValues(DoingSection.init(rawValue:))
+            let rawDispatch = payload["queued_dispatch"] as? [String: [String: Any]] ?? [:]
+            let queuedDispatch = rawDispatch.compactMapValues(QueuedDispatch.init(payload:))
+            emit(.workerLiveStatesList(states: states, doingSections: sections, queuedDispatch: queuedDispatch))
+        default:
+            return false
+        }
+        return true
+    }
+
+    @inline(never)
+    private func decodeReviewReply(
+        type: String, payload: [String: Any], requestId envelopeRequestId: String?
+    ) -> Bool {
+        switch type {
         case "project_design_doc_resolved":
             guard let outputPayload = payload["output"] as? [String: Any],
                   let outputData = try? JSONSerialization.data(withJSONObject: outputPayload),
@@ -665,6 +1103,15 @@ final class EngineClient: @unchecked Sendable {
                 break
             }
             emit(.projectDesignDocResolved(output: output))
+        case "execution_labels_resolved":
+            guard let labelPayloads = payload["labels"] as? [[String: Any]],
+                  let labelData = try? JSONSerialization.data(withJSONObject: labelPayloads),
+                  let labels = try? JSONDecoder().decode([ExecutionWorkLabel].self, from: labelData)
+            else {
+                emit(.error(message: "received invalid execution_labels_resolved payload"))
+                break
+            }
+            emit(.executionLabelsResolved(labels: labels))
         case "review_guide_summary":
             if let summary = payload["summary"] as? [String: Any],
                let rootTaskId = summary["root_task_id"] as? String,
@@ -686,7 +1133,7 @@ final class EngineClient: @unchecked Sendable {
                 else { return nil }
                 return try? JSONDecoder().decode(ReviewGuideVersionContent.self, from: contentData)
             }()
-            emit(.reviewGuideContent(versionId: versionId, content: content))
+            emit(.reviewGuideContent(versionId: versionId, content: content, requestId: envelopeRequestId))
         case "review_guide_retry_queued":
             guard let rootTaskId = payload["root_task_id"] as? String,
                   let attemptPayload = payload["attempt"] as? [String: Any],
@@ -703,7 +1150,7 @@ final class EngineClient: @unchecked Sendable {
                   let admissionData = try? JSONSerialization.data(withJSONObject: admissionPayload),
                   let admission = try? JSONDecoder().decode(DispatchAdmission.self, from: admissionData)
             else {
-                emit(.error(message: "received invalid dispatch_admission_evaluated payload"))
+                emit(.error(message: "received invalid dispatch_admission_evaluated payload", requestId: envelopeRequestId))
                 break
             }
             emit(.dispatchAdmissionEvaluated(admission: admission))
@@ -772,14 +1219,16 @@ final class EngineClient: @unchecked Sendable {
                 productID: payload["product_id"] as? String ?? "",
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
-                prURL: payload["pr_url"] as? String ?? ""
+                prURL: payload["pr_url"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "conflict_resolution_succeeded":
             emit(.conflictResolutionSucceeded(
                 productID: payload["product_id"] as? String ?? "",
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
-                prURL: payload["pr_url"] as? String ?? ""
+                prURL: payload["pr_url"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "conflict_resolution_failed":
             emit(.conflictResolutionFailed(
@@ -787,7 +1236,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "conflict_resolution_abandoned":
             emit(.conflictResolutionAbandoned(
@@ -795,7 +1245,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_started":
             emit(.ciRemediationStarted(
@@ -803,14 +1254,16 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                attemptKind: payload["attempt_kind"] as? String ?? ""
+                attemptKind: payload["attempt_kind"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_succeeded":
             emit(.ciRemediationSucceeded(
                 productID: payload["product_id"] as? String ?? "",
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
-                prURL: payload["pr_url"] as? String ?? ""
+                prURL: payload["pr_url"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_failure_cleared":
             emit(.ciFailureCleared(
@@ -824,7 +1277,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_abandoned":
             emit(.ciRemediationAbandoned(
@@ -832,7 +1286,8 @@ final class EngineClient: @unchecked Sendable {
                 workItemID: payload["work_item_id"] as? String ?? "",
                 attemptID: payload["attempt_id"] as? String ?? "",
                 prURL: payload["pr_url"] as? String ?? "",
-                failureReason: payload["failure_reason"] as? String ?? ""
+                failureReason: payload["failure_reason"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_exhausted":
             emit(.ciRemediationExhausted(
@@ -842,6 +1297,17 @@ final class EngineClient: @unchecked Sendable {
                 attemptsUsed: (payload["attempts_used"] as? NSNumber)?.intValue ?? 0,
                 budget: (payload["budget"] as? NSNumber)?.intValue ?? 0
             ))
+        default:
+            return false
+        }
+        return true
+    }
+
+    @inline(never)
+    private func decodeSettingsReply(
+        type: String, payload: [String: Any], requestId envelopeRequestId: String?
+    ) -> Bool {
+        switch type {
         case "feature_flags_list":
             let raw = payload["flags"] as? [[String: Any]] ?? []
             let flags = raw.compactMap(parseFeatureFlag)
@@ -852,6 +1318,20 @@ final class EngineClient: @unchecked Sendable {
             if !name.isEmpty {
                 emit(.featureFlagSet(name: name, enabled: enabled))
             }
+        case "board_population_progress":
+            guard let productId = payload["product_id"] as? String,
+                  let phase = payload["phase"] as? String
+            else {
+                break
+            }
+            emit(.boardPopulationProgress(
+                productId: productId,
+                phase: phase,
+                stage: payload["stage"] as? String,
+                elapsedMs: (payload["elapsed_ms"] as? NSNumber)?.intValue ?? 0,
+                items: (payload["items"] as? NSNumber)?.intValue,
+                bytes: (payload["bytes"] as? NSNumber)?.intValue
+            ))
         case "engine_health_result":
             let report = payload["report"] as? [String: Any] ?? [:]
             let apiKeyPresent = (report["anthropic_api_key_present"] as? NSNumber)?.boolValue ?? false
@@ -860,16 +1340,23 @@ final class EngineClient: @unchecked Sendable {
             emit(.engineHealthResult(apiKeyPresent: apiKeyPresent, issues: issues))
         case "driver_traffic_split_result":
             let raw = payload["split"] as? [String: Any] ?? [:]
-            // A share the engine did not send would make the decoded
-            // split fail its sum-to-100 invariant, so fall back to the
-            // engine default wholesale rather than to a partly-decoded
-            // split the UI would then treat as real.
+            // Require the complete atomic value, including zero shares.
+            // A missing share must not look like a valid zero allocation.
+            guard let grok = raw["grok"] as? Int,
+                  let claude = raw["claude"] as? Int,
+                  let codex = raw["codex"] as? Int,
+                  let agy = raw["agy"] as? Int else {
+                emit(.driverTrafficSplitResult(split: .engineDefault))
+                return true
+            }
             let decoded = DriverTrafficSplit(
-                grok: (raw["grok"] as? NSNumber)?.intValue ?? 0,
-                claude: (raw["claude"] as? NSNumber)?.intValue ?? 0,
-                codex: (raw["codex"] as? NSNumber)?.intValue ?? 0
+                grok: grok, claude: claude, codex: codex, agy: agy
             )
             emit(.driverTrafficSplitResult(split: decoded.isValid ? decoded : .engineDefault))
+        case "codex_sol_percentage":
+            guard let percentage = (payload["percentage"] as? NSNumber)?.intValue,
+                  (0...100).contains(percentage) else { return true }
+            emit(.codexSolPercentage(percentage: percentage))
         case "driver_quota_usage_result":
             let raw = payload["snapshot"] as? [String: Any] ?? [:]
             emit(.driverQuotaUsageResult(snapshot: DriverQuotaSnapshot.decode(raw)))
@@ -883,6 +1370,14 @@ final class EngineClient: @unchecked Sendable {
             let raw = payload["settings"] as? [[String: Any]] ?? []
             let settings = raw.compactMap(parseEngineSetting)
             emit(.settingsList(settings: settings))
+        case "offsite_backup_settings":
+            emit(.offsiteBackupSettings(OffsiteBackupSettings(
+                enabled: (payload["enabled"] as? NSNumber)?.boolValue ?? false,
+                destination: payload["destination"] as? String,
+                keepHourly: (payload["keep_hourly"] as? NSNumber)?.intValue ?? OffsiteBackupSettings.defaultKeepHourly,
+                keepDaily: (payload["keep_daily"] as? NSNumber)?.intValue ?? OffsiteBackupSettings.defaultKeepDaily,
+                loadError: payload["load_error"] as? String
+            ), requestId: envelopeRequestId))
         case "setting_set":
             let key = payload["key"] as? String ?? ""
             let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
@@ -1005,7 +1500,7 @@ final class EngineClient: @unchecked Sendable {
             }
             let members = (payload["members"] as? [[String: Any]] ?? [])
                 .compactMap(parseAttention)
-            emit(.attentionGroupUpdated(group: group, members: members))
+            emit(.attentionGroupUpdated(group: group, members: members, requestId: envelopeRequestId))
         case "attention_group_actioned":
             guard let groupPayload = payload["group"] as? [String: Any],
                   let group = parseAttentionGroup(groupPayload)
@@ -1015,7 +1510,7 @@ final class EngineClient: @unchecked Sendable {
             }
             let members = (payload["members"] as? [[String: Any]] ?? [])
                 .compactMap(parseAttention)
-            emit(.attentionGroupActioned(group: group, members: members))
+            emit(.attentionGroupActioned(group: group, members: members, requestId: envelopeRequestId))
         case "attention_merges_list":
             let attentionID = payload["attention_id"] as? String ?? ""
             let merges = (payload["merges"] as? [[String: Any]] ?? [])
@@ -1043,6 +1538,17 @@ final class EngineClient: @unchecked Sendable {
                     workspacePath: workspacePath
                 ))
             }
+        default:
+            return false
+        }
+        return true
+    }
+
+    @inline(never)
+    private func decodeActionReply(
+        type: String, payload: [String: Any], requestId envelopeRequestId: String?
+    ) -> Bool {
+        switch type {
         case "merge_confirmation_required":
             guard let workItemID = payload["work_item_id"] as? String,
                   let raw = payload["revisions"],
@@ -1055,6 +1561,7 @@ final class EngineClient: @unchecked Sendable {
             }
             emit(.mergeConfirmationRequired(workItemID: workItemID, revisions: revisions))
         case "merge_when_ready_accepted":
+            Self.log.info("merge RPC acknowledgement received: request=\(envelopeRequestId ?? "unknown", privacy: .public)")
             let workItemID = payload["work_item_id"] as? String ?? ""
             let prURL = payload["pr_url"] as? String ?? ""
             let action = payload["action"] as? String ?? ""
@@ -1127,33 +1634,42 @@ final class EngineClient: @unchecked Sendable {
                 }
             }
             if !productID.isEmpty {
-                emit(.automationsList(productID: productID, automations: automations, openTaskCounts: openTaskCounts))
+                let lastRuns = (payload["last_runs"] as? [String: [String: Any]] ?? [:])
+                    .compactMapValues(parseAutomationRun)
+                emit(.automationsList(productID: productID, automations: automations,
+                                      openTaskCounts: openTaskCounts, lastRuns: lastRuns))
             }
         case "automation_created":
             if let automationPayload = payload["automation"] as? [String: Any],
                let automation = parseAutomation(automationPayload) {
-                emit(.automationCreated(automation: automation))
+                emit(.automationCreated(
+                    automation: automation,
+                    openTaskCount: (payload["open_task_count"] as? NSNumber)?.intValue,
+                    lastRun: (payload["last_run"] as? [String: Any]).flatMap(parseAutomationRun)
+                ))
             }
         case "automation_result":
             if let automationPayload = payload["automation"] as? [String: Any],
                let automation = parseAutomation(automationPayload) {
-                emit(.automationResult(automation: automation))
+                emit(.automationResult(
+                    automation: automation,
+                    openTaskCount: (payload["open_task_count"] as? NSNumber)?.intValue,
+                    lastRun: (payload["last_run"] as? [String: Any]).flatMap(parseAutomationRun)
+                ))
             }
         case "automation_updated":
             if let automationPayload = payload["automation"] as? [String: Any],
                let automation = parseAutomation(automationPayload) {
-                emit(.automationUpdated(automation: automation))
+                emit(.automationUpdated(
+                    automation: automation,
+                    openTaskCount: (payload["open_task_count"] as? NSNumber)?.intValue,
+                    lastRun: (payload["last_run"] as? [String: Any]).flatMap(parseAutomationRun)
+                ))
             }
         case "automation_deleted":
             let automationID = payload["automation_id"] as? String ?? ""
             if !automationID.isEmpty {
                 emit(.automationDeleted(automationID: automationID))
-            }
-        case "automation_open_task_count":
-            let automationID = payload["automation_id"] as? String ?? ""
-            let count = (payload["count"] as? NSNumber)?.intValue ?? 0
-            if !automationID.isEmpty {
-                emit(.automationOpenTaskCount(automationID: automationID, count: count))
             }
         case "automation_runs_list":
             let automationID = payload["automation_id"] as? String ?? ""
@@ -1240,8 +1756,9 @@ final class EngineClient: @unchecked Sendable {
             }
             emit(.commentsReviseDocResult(outcome: outcome))
         default:
-            break
+            return false
         }
+        return true
     }
 
     /// Decode a `Codable` wire type from a `JSONSerialization` dict, mirroring
@@ -1326,6 +1843,11 @@ final class EngineClient: @unchecked Sendable {
     /// block a specific decode to exercise lifecycle ordering.
     func setDecodeHookForTesting(_ hook: (@Sendable (Data) -> Void)?) {
         decodeHook.withLock { $0 = hook }
+    }
+
+    /// Runs on the socket queue immediately before handing an envelope to Network.
+    func setBeforeWriteHookForTesting(_ hook: (@Sendable (String, Int) -> Void)?) {
+        beforeWriteHook.withLock { $0 = hook }
     }
 
     /// Feed one complete wire envelope through the production decoder.

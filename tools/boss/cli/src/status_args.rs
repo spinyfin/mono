@@ -28,13 +28,19 @@ pub(crate) enum ProjectPriority {
     High,
 }
 
-/// Priority enum for tasks and chores. Mirrors `ProjectPriority`
-/// exactly so kanban surfaces and CLI flags speak one vocabulary.
+/// Priority enum for tasks and chores. The first three mirror
+/// `ProjectPriority` exactly so kanban surfaces and CLI flags speak one
+/// vocabulary. `critical` is the human owner's escape hatch above
+/// `high`: the engine accepts it only from a human session (never from
+/// the coordinator's CLI tier or a worker pane), and a critical item
+/// dispatches ahead of everything, past the interactive concurrency
+/// cap, and through an operator dispatch pause.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub(crate) enum TaskPriority {
     Low,
     Medium,
     High,
+    Critical,
 }
 
 /// CLI surface for `tasks.effort_level` (design §Q1):
@@ -229,6 +235,7 @@ impl TaskPriority {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::Critical => "critical",
         }
     }
 }

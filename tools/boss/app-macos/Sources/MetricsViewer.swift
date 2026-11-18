@@ -18,6 +18,10 @@ struct MetricsViewer: View {
 
     private let pollTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
+    init(filter: String = "") {
+        _searchText = State(initialValue: filter)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header

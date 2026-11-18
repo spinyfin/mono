@@ -135,6 +135,8 @@ fn run_declarative_check_impl(
         repo_root,
         check_id: package_id,
         deadline: CheckDeadline::new(timeout_ms),
+        environment: config.get("environment"),
+        binaries: None,
     };
     let binaries = if package
         .invocations
@@ -144,6 +146,11 @@ fn run_declarative_check_impl(
         resolve::resolve_all_with_deadline(repo_root, &package.needs, config, context.check_id, context.deadline)?
     } else {
         BTreeMap::new()
+    };
+
+    let context = CheckExecutionContext {
+        binaries: Some(&binaries),
+        ..context
     };
 
     // Extract top-level string values from the config blob for {{config.KEY}}
@@ -435,6 +442,7 @@ fn run_tool_invocation(
             let mut findings = Vec::new();
             let mut processed = 0usize;
             for file in files {
+                crate::progress::note_active(file);
                 let args = with_prefix(expand_per_file_args(
                     context.repo_root,
                     &tool.args,
@@ -499,6 +507,60 @@ fn run_tool_invocation(
     }
 }
 
+/// Args for a `bazel query` that resolves labels; always led by `startup_flags`.
+fn aspect_query_args(startup_flags: &[String], query: String) -> Vec<String> {
+    let mut args = startup_flags.to_vec();
+    args.extend([
+        "query".to_owned(),
+        "--keep_going".to_owned(),
+        "--output=label".to_owned(),
+        query,
+    ]);
+    args
+}
+
+/// Flags shared by the aspect build and cquery: CI's per-command flags first,
+/// then the aspect and its output groups.
+fn aspect_invocation_flags(ci_flags: Vec<String>, aspect: &BazelAspectInvocation) -> Vec<String> {
+    let mut flags = ci_flags;
+    flags.extend([
+        format!("--aspects={}", aspect.aspect),
+        format!("--output_groups={}", aspect.output_groups.join(",")),
+    ]);
+    flags
+}
+
+/// Args for the aspect `bazel build`; always led by `startup_flags`.
+fn aspect_build_args(
+    startup_flags: &[String],
+    aspect_flags: &[String],
+    build_flags: &[String],
+    targets: &[String],
+) -> Vec<String> {
+    let mut args = startup_flags.to_vec();
+    args.push("build".to_owned());
+    args.extend(aspect_flags.iter().cloned());
+    args.extend(build_flags.iter().cloned());
+    args.extend(targets.iter().cloned());
+    args
+}
+
+/// Args for the artifact-discovery `bazel cquery`; always led by `startup_flags`.
+fn aspect_cquery_args(
+    startup_flags: &[String],
+    aspect_flags: &[String],
+    build_flags: &[String],
+    targets: &[String],
+) -> Vec<String> {
+    let mut args = startup_flags.to_vec();
+    args.push("cquery".to_owned());
+    args.extend(aspect_flags.iter().cloned());
+    args.extend(build_flags.iter().cloned());
+    args.push("--output=files".to_owned());
+    args.push(format!("set({})", targets.join(" ")));
+    args
+}
+
 /// Expand `{{severity_deny_flag}}` in a single `build_flags` entry.
 ///
 /// Returns `Some(expanded)` to keep the entry (with the template replaced), or
@@ -550,13 +612,7 @@ fn run_bazel_aspect_invocation(
         .collect::<Vec<_>>()
         .join(" ");
     let query = format!("same_pkg_direct_rdeps(set({set}))");
-    let mut query_args = startup_flags.clone();
-    query_args.extend([
-        "query".to_owned(),
-        "--keep_going".to_owned(),
-        "--output=label".to_owned(),
-        query,
-    ]);
+    let query_args = aspect_query_args(&startup_flags, query);
     let query_output = spawn(context, &bazel, &query_args, &invocation.id)?;
     if !matches!(query_output.exit_code, Some(0) | Some(3)) {
         bail!(
@@ -604,13 +660,7 @@ fn run_bazel_aspect_invocation(
             .join(" ");
         let kinds = aspect.test_rdeps_kinds.join("|");
         let test_query = format!("kind(\"{kinds}\", same_pkg_direct_rdeps(set({targets_set})))");
-        let mut test_query_args = startup_flags.clone();
-        test_query_args.extend([
-            "query".to_owned(),
-            "--keep_going".to_owned(),
-            "--output=label".to_owned(),
-            test_query,
-        ]);
+        let test_query_args = aspect_query_args(&startup_flags, test_query);
         let test_query_output = spawn(context, &bazel, &test_query_args, &invocation.id)?;
         if matches!(test_query_output.exit_code, Some(0) | Some(3)) {
             for line in String::from_utf8_lossy(&test_query_output.stdout).lines() {
@@ -641,20 +691,16 @@ fn run_bazel_aspect_invocation(
 
     // 2. Build the targets with the aspect. Exit semantics from the manifest
     //    classify the build's exit code (typically `0 → findings, default → error`).
-    let aspect_flags = [
-        format!("--aspects={}", aspect.aspect),
-        format!("--output_groups={}", aspect.output_groups.join(",")),
-    ];
+    // CI's per-command flags (`--config=ci-<os>` and the host-sized disk-cache
+    // GC cap) lead the build and cquery so this build writes to the same capped
+    // cache as every other CI bazel invocation. See `ci_bazel_flags`.
+    let aspect_flags = aspect_invocation_flags(super::ci_bazel_flags(), aspect);
     let expanded_build_flags: Vec<String> = aspect
         .build_flags
         .iter()
         .filter_map(|f| expand_build_flag(f, effective_severity))
         .collect();
-    let mut build_args: Vec<String> = startup_flags;
-    build_args.push("build".to_owned());
-    build_args.extend(aspect_flags.iter().cloned());
-    build_args.extend(expanded_build_flags.iter().cloned());
-    build_args.extend(targets.iter().cloned());
+    let build_args = aspect_build_args(&startup_flags, &aspect_flags, &expanded_build_flags, &targets);
     let build_output = spawn(context, &bazel, &build_args, &invocation.id)?;
     match invocation.exit.classify(build_output.exit_code) {
         ExitOutcome::Ok => return Ok(Vec::new()),
@@ -671,11 +717,7 @@ fn run_bazel_aspect_invocation(
     //    same aspect/flags prints one workspace-relative path per line. Unlike
     //    `build`, cquery takes a single query EXPRESSION — multiple positional
     //    targets are a parse error — so the targets are wrapped in `set(...)`.
-    let mut cquery_args: Vec<String> = vec!["cquery".to_owned()];
-    cquery_args.extend(aspect_flags.iter().cloned());
-    cquery_args.extend(expanded_build_flags.iter().cloned());
-    cquery_args.push("--output=files".to_owned());
-    cquery_args.push(format!("set({})", targets.join(" ")));
+    let cquery_args = aspect_cquery_args(&startup_flags, &aspect_flags, &expanded_build_flags, &targets);
     let cquery_output = spawn(context, &bazel, &cquery_args, &invocation.id)?;
     if cquery_output.exit_code != Some(0) {
         bail!(
@@ -887,6 +929,10 @@ fn extract_config_string_values(config: &toml::Value) -> BTreeMap<String, String
         .collect()
 }
 
+#[cfg(test)]
+#[path = "tests_bazel_environment.rs"]
+mod bazel_environment_tests;
+
 struct InvocationOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -898,6 +944,37 @@ struct CheckExecutionContext<'a> {
     repo_root: &'a Path,
     check_id: &'a str,
     deadline: CheckDeadline,
+    environment: Option<&'a toml::Value>,
+    binaries: Option<&'a BTreeMap<String, resolve::ResolvedBinary>>,
+}
+
+fn invocation_command(context: CheckExecutionContext<'_>, binary: &Path, args: &[String]) -> Result<Command> {
+    let mut command = Command::new(crate::external::environment::locate(binary));
+    if !crate::external::environment::is_bazel_launcher(Path::new(command.get_program()))
+        && let Some(binaries) = context.binaries
+    {
+        let path = crate::external::environment::check_path(
+            Path::new(command.get_program()),
+            binaries.values().filter_map(|binary| binary.program.parent()),
+        )?;
+        command.env("PATH", path);
+    }
+    if let Some(environment) = context.environment {
+        let entries = environment
+            .as_table()
+            .context("config.environment must be a string map")?;
+        for (key, value) in entries {
+            if key == "PATH" {
+                bail!("config.environment cannot override the framework-owned PATH");
+            }
+            command.env(
+                key,
+                value.as_str().context("config.environment values must be strings")?,
+            );
+        }
+    }
+    command.args(args).current_dir(context.repo_root);
+    Ok(command)
 }
 
 fn spawn(
@@ -906,8 +983,7 @@ fn spawn(
     args: &[String],
     invocation_id: &str,
 ) -> Result<InvocationOutput> {
-    let mut command = Command::new(binary);
-    command.args(args).current_dir(context.repo_root);
+    let mut command = invocation_command(context, binary, args)?;
     let output = output_with_timeout(
         &mut command,
         context.check_id,
@@ -1064,6 +1140,8 @@ pub fn run_declarative_fix(
         repo_root: context.repo_root,
         check_id: context.check_id,
         deadline: CheckDeadline::new(timeout_ms),
+        environment: config.get("environment"),
+        binaries: None,
     };
     let binaries = match resolve::resolve_all_with_deadline(
         context.repo_root,
@@ -1092,6 +1170,10 @@ pub fn run_declarative_fix(
     };
 
     let config_values = extract_config_string_values(config);
+    let context = CheckExecutionContext {
+        binaries: Some(&binaries),
+        ..context
+    };
     let ceiling = HostCeiling::new(context.repo_root);
     let mut outcomes = Vec::new();
     let mut total_processed = 0usize;
@@ -1310,6 +1392,7 @@ fn execute_fix_per_file(
     let mut per_file_errors: Vec<(PathBuf, String)> = Vec::new();
 
     for file in files {
+        crate::progress::note_active(file);
         let mut args = prefix_args.to_vec();
         args.extend(expand_per_file_args(context.repo_root, &fix.args, file, config_values)?);
         let sandbox_context = CheckExecutionContext {
@@ -1481,6 +1564,8 @@ case "$1" in *b.txt) exit 1 ;; *) exit 0 ;; esac"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(5_000),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1544,6 +1629,8 @@ exit 1"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(5_000),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1595,6 +1682,8 @@ exit 1"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(5_000),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1640,6 +1729,8 @@ exit 1"#,
                 repo_root: dir.path(),
                 check_id: "test/fix",
                 deadline: CheckDeadline::new(25),
+                environment: None,
+                binaries: None,
             },
             Path::new("/bin/sh"),
             &prefix,

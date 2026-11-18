@@ -11,10 +11,13 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-preflight:__pkg__",
     ],
     deps = all_crate_deps(normal = True) + [
         "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/http_retry",
         "//tools/boss/protocol",
@@ -35,6 +38,7 @@ rust_test(
         normal_dev = True,
     ) + [
         "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/http_retry",
         "//tools/boss/protocol",

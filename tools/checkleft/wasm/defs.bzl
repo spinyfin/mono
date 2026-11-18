@@ -15,10 +15,10 @@ Pipeline:
   3. Emit the component `.wasm` and a `.wasm.sha256` sidecar. The sidecar holds
      the bare hex digest that a CHECKS manifest pins as `artifact_sha256`.
 
-This is the guest-side build infrastructure described in the design doc's
-§Build (bazel) / T9. It is deliberately NOT rules_rust's `rust_wasm_bindgen`,
-which wraps wasm-bindgen (JS interop, wasm32-unknown-unknown) and has no
-connection to WASI or the Component Model.
+This builds checkleft Component Model guests (see the design doc's Build
+section). It is deliberately NOT rules_rust's `rust_wasm_bindgen`, which wraps
+wasm-bindgen (JS interop, wasm32-unknown-unknown) and has no connection to WASI
+or the Component Model.
 """
 
 WasmComponentInfo = provider(
@@ -31,13 +31,27 @@ WasmComponentInfo = provider(
 
 # Outgoing transition: build the guest crate for the Component Model guest
 # platform regardless of the host configuration the rule is analyzed in.
+#
+# Guests are always built with `-c opt`, independent of the invoking build's
+# compilation mode. Checks like rust/giant-structs run `syn` over every changed
+# file inside the wasm sandbox under a wall-clock budget; an opt-level-0
+# (fastbuild) guest is an order of magnitude slower and times out on large
+# changesets. repobin already passes `-c opt`, so this matters for any other
+# route to a checkleft binary (a plain `bazel build`/`run`, or a
+# REPOBIN_BAZEL_FLAGS override to fastbuild).
 def _wasip2_transition_impl(_settings, _attr):
-    return {"//command_line_option:platforms": str(Label("//platforms:wasm32_wasip2"))}
+    return {
+        "//command_line_option:compilation_mode": "opt",
+        "//command_line_option:platforms": str(Label("//platforms:wasm32_wasip2")),
+    }
 
 _wasip2_transition = transition(
     implementation = _wasip2_transition_impl,
     inputs = [],
-    outputs = ["//command_line_option:platforms"],
+    outputs = [
+        "//command_line_option:compilation_mode",
+        "//command_line_option:platforms",
+    ],
 )
 
 def _single_wasm_output(target):

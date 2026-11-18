@@ -13,6 +13,7 @@ import SwiftUI
 /// each chip needs; closures are on the view, not the slice.
 struct WorkBoardCardBadgeStripSlice: Equatable {
     let showsHighPriorityChip: Bool
+    let showsCriticalPriorityChip: Bool
     let showsEffortChip: Bool
     let effortLevel: String?
     let showsReasoningChip: Bool
@@ -42,7 +43,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
     let showsExternalRefLink: Bool
     let externalRefLink: ExternalRefLinkPresentation?
     let showsDesignDocAffordance: Bool
-    let designDocState: ProjectDesignDocState?
+    let designDocPresentation: ProjectDesignDocAffordancePresentation?
     let reviewGuidePresentation: ReviewGuideCardPresentation?
     let showsAttachmentsAffordance: Bool
     let showsTerminalButton: Bool
@@ -54,6 +55,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
 
     init(snapshot: WorkCardSnapshot) {
         self.showsHighPriorityChip = snapshot.showsHighPriorityChip
+        self.showsCriticalPriorityChip = snapshot.showsCriticalPriorityChip
         self.showsEffortChip = snapshot.showsEffortChip
         self.effortLevel = snapshot.effortLevel
         self.showsReasoningChip = snapshot.showsReasoningChip
@@ -83,7 +85,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
         self.showsExternalRefLink = snapshot.showsExternalRefLink
         self.externalRefLink = snapshot.externalRefLink
         self.showsDesignDocAffordance = snapshot.showsDesignDocAffordance
-        self.designDocState = snapshot.designDocState
+        self.designDocPresentation = snapshot.designDocPresentation
         self.reviewGuidePresentation = snapshot.reviewGuidePresentation
         self.showsAttachmentsAffordance = snapshot.showsAttachmentsAffordance
         self.showsTerminalButton = snapshot.showsTerminalButton
@@ -109,6 +111,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     var onOpenTerminal: (() -> Void)? = nil
     /// Merge-when-ready confirm; also gated by `slice.showsMergeWhenReady`.
     var onMergeWhenReady: (() -> Void)? = nil
+    var isRequestingMerge = false
     /// Open the review guide; gated by `slice.reviewGuidePresentation`
     /// having a readable version to show.
     var onOpenReviewGuide: (() -> Void)? = nil
@@ -127,6 +130,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
+            && lhs.isRequestingMerge == rhs.isRequestingMerge
     }
 
     var body: some View {
@@ -134,7 +138,9 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
         // additional lines within the lane width instead of overflowing
         // past the card's right edge and clipping (#1172).
         FlowLayout(horizontalSpacing: 6, verticalSpacing: 4) {
-            if slice.showsHighPriorityChip {
+            if slice.showsCriticalPriorityChip {
+                PriorityChip(priority: .critical)
+            } else if slice.showsHighPriorityChip {
                 PriorityChip(priority: .high)
             }
             if slice.showsEffortChip, let effortLevel = slice.effortLevel {
@@ -217,10 +223,9 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 ExternalRefLinkView(presentation: extRef)
             }
             // Doc-link icon. Eligibility is already encoded in
-            // `showsDesignDocAffordance` + `designDocState`.
+            // `showsDesignDocAffordance` + `designDocPresentation`.
             if slice.showsDesignDocAffordance,
-               let state = slice.designDocState,
-               let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+               let presentation = slice.designDocPresentation {
                 Button {
                     onOpenDesignDoc?()
                 } label: {
@@ -264,7 +269,7 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 )
             }
             if slice.showsMergeWhenReady {
-                MergeWhenReadyControl(onConfirm: { onMergeWhenReady?() })
+                MergeWhenReadyControl(isRequesting: isRequestingMerge, onConfirm: { onMergeWhenReady?() })
             }
             if slice.showsDeferredScopeBadge {
                 DeferredScopeCardBadge(

@@ -132,6 +132,9 @@ struct DriverQuotaSnapshot: Equatable, Sendable {
     /// recently. Surfaced so a reader who pressed Refresh and saw nothing
     /// change learns why.
     var refreshThrottled: Bool = false
+    /// Drivers whose probe is still running for the request this snapshot
+    /// answers. Empty means nothing is left to wait for.
+    var pendingDrivers: [String] = []
 
     static let empty = DriverQuotaSnapshot()
 
@@ -154,7 +157,8 @@ extension DriverQuotaSnapshot {
         return DriverQuotaSnapshot(
             entries: rawEntries.compactMap(DriverQuotaEntry.decode),
             generatedAtEpochS: (payload["generated_at_epoch_s"] as? NSNumber)?.intValue,
-            refreshThrottled: (payload["refresh_throttled"] as? NSNumber)?.boolValue ?? false
+            refreshThrottled: (payload["refresh_throttled"] as? NSNumber)?.boolValue ?? false,
+            pendingDrivers: payload["pending_drivers"] as? [String] ?? []
         )
     }
 }
@@ -333,11 +337,13 @@ struct DriverQuotaSection: View {
                 DriverQuotaRow(
                     entry: entry,
                     now: now,
-                    checking: chatModel.isRefreshingDriverQuota
+                    checking: chatModel.driverQuota.pendingDrivers.contains(entry.driver)
                 )
             }
             HStack(spacing: 8) {
-                Text(chatModel.driverQuota.checkedText(now: now))
+                Text(chatModel.isRefreshingDriverQuota
+                     ? "Checking…"
+                     : chatModel.driverQuota.checkedText(now: now))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if chatModel.driverQuota.refreshThrottled {
@@ -346,6 +352,9 @@ struct DriverQuotaSection: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if chatModel.isRefreshingDriverQuota {
+                    ProgressView().controlSize(.small)
+                }
                 Button("Refresh") {
                     chatModel.refreshDriverQuota(force: true)
                 }
@@ -374,7 +383,7 @@ struct DriverQuotaSection: View {
     /// the engine has stopped refreshing and this reading is genuinely old.
     static let staleThreshold: TimeInterval = 2 * 60 * 60
 
-    /// Every driver Boss implements, in a stable order, with the engine's
+    /// Every driver with a quota probe, in a stable order, with the engine's
     /// entry where there is one.
     ///
     /// A driver the engine omitted entirely still gets a row, marked as
@@ -384,7 +393,9 @@ struct DriverQuotaSection: View {
     /// three drivers or is told why they do not.
     static func roster(from snapshot: DriverQuotaSnapshot) -> [DriverQuotaEntry] {
         let known = Dictionary(uniqueKeysWithValues: snapshot.entries.map { ($0.driver, $0) })
-        return DriverSlug.allCases
+        // Traffic allocation also includes Antigravity, which has no quota
+        // probe. Its allocation share must not imply a failed quota reading.
+        return [DriverSlug.claude, .codex, .grok]
             .map(\.rawValue)
             .sorted()
             .map { slug in
@@ -427,6 +438,9 @@ struct DriverQuotaRow: View {
                     .font(.body.weight(.medium))
                     .frame(minWidth: 64, alignment: .leading)
                 Spacer()
+                if checking {
+                    ProgressView().controlSize(.small)
+                }
                 switch entry.outcome {
                 case .reading(let reading):
                     Text(entry.outcome.headline(checking: checking))

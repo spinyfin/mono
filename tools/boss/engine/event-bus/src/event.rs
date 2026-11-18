@@ -5,6 +5,8 @@
 /// add a variant here without touching unrelated topics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A committed task mutation changed inputs used by the work board.
+    WorkItemChanged { product_id: String, task_id: String },
     /// A task reached a terminal status (`done`/`archived`).
     TaskTerminal { task_id: String, project_id: String },
     /// The last non-terminal impl task of a project reached terminal.
@@ -16,6 +18,13 @@ pub enum Event {
         task_id: String,
         host_id: String,
         pool_claim: Option<String>,
+    },
+    /// A reconciler moved a not-yet-started execution between `queued`,
+    /// `ready` and `waiting_dependency`. `status` is the new status.
+    ExecutionStatusChanged {
+        execution_id: String,
+        task_id: String,
+        status: String,
     },
     /// The merge poller confirmed a PR merge.
     PrMerged { pr_url: String, task_id: String },
@@ -46,9 +55,11 @@ pub enum Event {
 /// [`TopicFilter`](crate::TopicFilter) matches against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
+    WorkItemChanged,
     TaskTerminal,
     ProjectImplDrained,
     ExecutionTerminal,
+    ExecutionStatusChanged,
     PrMerged,
     HostDisabled,
     DependencyPrereqsSatisfied,
@@ -68,9 +79,11 @@ impl EventKind {
     /// metric-name-safe string. Snake_case mirror of the variant name.
     pub fn topic_name(&self) -> &'static str {
         match self {
+            EventKind::WorkItemChanged => "work_item_changed",
             EventKind::TaskTerminal => "task_terminal",
             EventKind::ProjectImplDrained => "project_impl_drained",
             EventKind::ExecutionTerminal => "execution_terminal",
+            EventKind::ExecutionStatusChanged => "execution_status_changed",
             EventKind::PrMerged => "pr_merged",
             EventKind::HostDisabled => "host_disabled",
             EventKind::DependencyPrereqsSatisfied => "dependency_prereqs_satisfied",
@@ -88,9 +101,11 @@ impl EventKind {
 impl Event {
     pub fn kind(&self) -> EventKind {
         match self {
+            Event::WorkItemChanged { .. } => EventKind::WorkItemChanged,
             Event::TaskTerminal { .. } => EventKind::TaskTerminal,
             Event::ProjectImplDrained { .. } => EventKind::ProjectImplDrained,
             Event::ExecutionTerminal { .. } => EventKind::ExecutionTerminal,
+            Event::ExecutionStatusChanged { .. } => EventKind::ExecutionStatusChanged,
             Event::PrMerged { .. } => EventKind::PrMerged,
             Event::HostDisabled { .. } => EventKind::HostDisabled,
             Event::DependencyPrereqsSatisfied { .. } => EventKind::DependencyPrereqsSatisfied,
@@ -114,9 +129,11 @@ impl Event {
     /// pending at a time.
     pub fn coalesce_key(&self) -> String {
         match self {
+            Event::WorkItemChanged { task_id, .. } => task_id.clone(),
             Event::TaskTerminal { task_id, .. } => task_id.clone(),
             Event::ProjectImplDrained { project_id } => project_id.clone(),
             Event::ExecutionTerminal { execution_id, .. } => execution_id.clone(),
+            Event::ExecutionStatusChanged { execution_id, .. } => execution_id.clone(),
             Event::PrMerged { pr_url, .. } => pr_url.clone(),
             Event::HostDisabled { host_id } => host_id.clone(),
             Event::DependencyPrereqsSatisfied { task_id } => task_id.clone(),

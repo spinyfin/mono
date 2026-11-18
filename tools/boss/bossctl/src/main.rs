@@ -25,16 +25,22 @@ use boss_client::{BossClient, Discovery};
 mod agents;
 mod command_types;
 mod comments;
+mod dispatch_concurrency;
 mod dispatch_stats;
 mod doctor;
+mod enrollment;
+mod focus;
+mod homes;
 mod hosts;
 mod logs;
 mod pause;
 mod probe;
+mod progression;
 mod proposals;
 mod review;
 mod selected_product;
 mod stream_integrity;
+mod stuck_report;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
@@ -92,15 +98,9 @@ enum Command {
         #[command(subcommand)]
         action: AgentsAction,
     },
-    /// Inject a probe prompt into a worker, delivered at the earliest
-    /// opportunity its pane offers. A parked worker (idle between turns, or
-    /// sitting at its prompt after a Stop that followed a
-    /// notification/permission prompt) takes the text immediately. A worker
-    /// that is mid-task also takes it immediately, buffered in its agent's
-    /// composer the same way text typed into the pane by hand would be — so
-    /// a probe can steer a worker in the middle of a long autonomous run
-    /// rather than reaching it as it exits. Only a worker whose driver reads
-    /// no mid-turn input at all waits for a boundary.
+    /// Deliver a probe promptly, interrupting a busy worker and confirming
+    /// its turn ended before submitting the text. An idle worker receives
+    /// it directly. Use --no-interrupt for buffered/boundary delivery.
     ///
     /// The engine checks that the probe can actually be delivered before
     /// accepting it, and prints the boundary it committed to. If it cannot
@@ -198,6 +198,11 @@ enum Command {
         /// is `state`, since that verb only prints status.
         #[arg(long)]
         reason: Option<String>,
+        /// Dispatch only: hold every spawn, PR reviews and review guides
+        /// included, except explicit `bossctl agents launch` overrides. Rejected
+        /// when dispatch is not among the systems being paused.
+        #[arg(long)]
+        all_spawns: bool,
     },
     /// Resume one or more Boss systems in a single call. Defaults to
     /// every pausable system when no SYSTEMS are given. Symmetric with
@@ -208,7 +213,9 @@ enum Command {
         systems: Vec<PauseSystem>,
     },
     /// Show pause status for every system (dispatch, automation, ...) in
-    /// one view, including `paused_since` for whichever are paused.
+    /// one view, including `paused_since` for whichever are paused, plus
+    /// any active pre-start spawn-failure streak alert (a driver and worker
+    /// kind whose spawns keep failing, with the count and latest error).
     /// Equivalent to `bossctl pause state`.
     State,
     /// Inspect the dispatch-pipeline event stream (file-scan only —
@@ -250,6 +257,15 @@ enum Command {
         #[command(subcommand)]
         action: hosts::HostsAction,
     },
+    /// Enroll spoke worker hosts by hand: mint a single-use token, list the
+    /// hosts the hub has authorized, and revoke one.
+    ///
+    /// Opens the hub's host-credential directory directly, so it works while
+    /// the engine is stopped. See the manual host enrollment runbook.
+    Enrollment {
+        #[command(subcommand)]
+        action: enrollment::EnrollmentAction,
+    },
     /// Cancel never-started executions, or prune terminal ones (retention).
     ///
     /// `cancel` talks to the running engine and marks `queued` /
@@ -273,7 +289,7 @@ enum Command {
     /// stopped.
     CodexHomes {
         #[command(subcommand)]
-        action: CodexHomesAction,
+        action: homes::CodexHomesAction,
     },
     /// Reclaim Boss-owned per-run Grok home containers past retention
     /// policy. Mirrors `codex-homes` — see that verb's doc for the shared
@@ -289,7 +305,24 @@ enum Command {
     /// followed to its target.
     GrokHomes {
         #[command(subcommand)]
-        action: GrokHomesAction,
+        action: homes::GrokHomesAction,
+    },
+    /// Reclaim Boss-owned per-run Antigravity (`agy`) home containers past
+    /// retention policy. Mirrors `grok-homes` — see that verb's doc for the
+    /// shared shape (only recorded roots are candidates, live executions
+    /// are never touched, a running engine already sweeps on its own
+    /// schedule and this verb is for on-demand cleanup between sweeps or
+    /// while the engine is stopped).
+    ///
+    /// An `agy` "home" is a run **container** holding `process-home/` (the
+    /// scoped worker `HOME`, with a SQLite conversation DB and a `brain/`
+    /// tree), `control/`, and `rules-root/`; a reclaim removes the whole
+    /// container. The login-keychain symlink under
+    /// `process-home/Library/Keychains/login.keychain-db` is removed as a
+    /// directory entry, never followed to its target.
+    AgyHomes {
+        #[command(subcommand)]
+        action: homes::AgyHomesAction,
     },
     /// Inspect and reclaim stored screenshot evidence (`boss attach`).
     ///
@@ -412,8 +445,8 @@ enum Command {
         #[arg(long)]
         until: Option<String>,
         /// Match the JSON `target` field (tracing module path). Exact match
-        /// or module-prefix (`boss_engine::app` matches
-        /// `boss_engine::app::server`). Does **not** search message bodies.
+        /// or module-prefix (`boss_engine_app::app` matches
+        /// `boss_engine_app::app::server`). Does **not** search message bodies.
         #[arg(long)]
         target: Option<String>,
         /// Match the JSON `level` field case-insensitively (`info`, `ERROR`).
@@ -444,6 +477,11 @@ enum LiveStatusAction {
 
 #[derive(Subcommand, Debug)]
 enum DispatchAction {
+    /// Items without live work, grouped by the reason they are waiting.
+    Stuck {
+        #[arg(long, default_value = "7d")]
+        since: String,
+    },
     /// Print recent dispatch events from `current.jsonl`. Filterable
     /// by stage / outcome. Defaults to the last 50 events.
     Tail {
@@ -533,6 +571,17 @@ enum DispatchAction {
         /// one.
         #[arg(long)]
         reason: String,
+        /// Hold every spawn, PR reviews and review guides included. By
+        /// default a dispatch pause holds new work only and lets PR
+        /// reviews and review guides keep dispatching (a review is the
+        /// lifecycle of a change already in flight). Use this when the
+        /// spawn path itself is suspect, so a review would only burn an
+        /// attempt against it. The scope is persisted with the pause and
+        /// survives an engine restart. Like every operator pause it is
+        /// manual-resume-only: no breaker recovery probe is admitted. Explicit
+        /// `bossctl agents launch` overrides remain available.
+        #[arg(long)]
+        all_spawns: bool,
     },
     /// Resume global dispatch. The engine immediately drains any executions
     /// that queued while paused and resumes normal dispatch. Idempotent —
@@ -573,6 +622,23 @@ enum DispatchAction {
         /// Maximum number of currently-blocked items to print.
         #[arg(long, default_value_t = 10)]
         top: usize,
+    },
+    /// Restrict automatic dispatch to chosen projects and products ("focus
+    /// mode"). While the focus set is non-empty, only rows in a focused
+    /// project or product — plus the revisions and followups the engine
+    /// mints for them (review, CI-fix, merge-conflict, post-merge review) —
+    /// dispatch automatically; everything else stays queued with the
+    /// `focus_mode` hold reason and dispatches normally once focus is cleared
+    /// or its project/product is added. Nothing is rewritten: it is only an
+    /// admission gate. The global pause still overrides it, `bossctl agents
+    /// launch` still bypasses it, and the concurrency cap still applies.
+    /// An explicit launch also admits that item's engine-minted revisions
+    /// and followups through focus for the item's lifetime, including review,
+    /// CI-fix, merge-conflict and post-merge review. This launch intent and
+    /// the focus set persist across engine restarts.
+    Focus {
+        #[command(subcommand)]
+        action: focus::FocusAction,
     },
     /// Get or set the interactive-pool ("Bridge Crew" + "Lower Decks")
     /// concurrency cap — the ceiling `drain_ready_queue` enforces on live
@@ -716,7 +782,7 @@ enum AgentsAction {
         /// see `agents --help` for resolution order.
         agent: String,
     },
-    /// Send text to a worker as if user-typed.
+    /// Send a nudge, interrupting a busy interactive worker before submission.
     Send {
         /// Worker reference: run id, slot id, or crew name; see `agents
         /// --help` for resolution order.
@@ -1106,53 +1172,6 @@ enum ExecutionsAction {
 }
 
 #[derive(Subcommand, Debug)]
-enum CodexHomesAction {
-    /// Reclaim recorded Boss-owned `CODEX_HOME` trees past the retention
-    /// policy (age, with a total-bytes backstop). Only roots stored on
-    /// execution rows are candidates; live executions are never touched.
-    Sweep {
-        /// Only reclaim homes whose execution age anchor (`finished_at`,
-        /// else `created_at`) is older than this many days.
-        #[arg(long, default_value_t = boss_engine::codex_rollout_retention::DEFAULT_MAX_AGE_DAYS)]
-        older_than_days: u64,
-        /// Total-bytes backstop across retained terminal homes: once
-        /// exceeded, the oldest are reclaimed first regardless of age.
-        #[arg(long, default_value_t = boss_engine::codex_rollout_retention::DEFAULT_MAX_TOTAL_BYTES)]
-        max_total_bytes: u64,
-        /// Preview what would be deleted without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum GrokHomesAction {
-    /// Reclaim recorded Boss-owned Grok run-container trees past the
-    /// retention policy (age, with a total-bytes backstop). Only roots
-    /// stored on execution rows are candidates; live executions are never
-    /// touched.
-    Sweep {
-        /// Only reclaim homes whose execution age anchor (`finished_at`,
-        /// else `created_at`) is older than this many days.
-        #[arg(long, default_value_t = boss_engine::grok_home_retention::DEFAULT_MAX_AGE_DAYS)]
-        older_than_days: u64,
-        /// Total-bytes backstop across retained terminal homes: once
-        /// exceeded, the oldest are reclaimed first regardless of age.
-        #[arg(long, default_value_t = boss_engine::grok_home_retention::DEFAULT_MAX_TOTAL_BYTES)]
-        max_total_bytes: u64,
-        /// Preview what would be deleted without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum AttachmentsAction {
     /// List stored evidence, newest first, with the run that produced each
     /// image and whether retention has reclaimed its bytes.
@@ -1357,6 +1376,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: DoctorAction::Tmux,
         } => doctor::run_tmux_preflight(cli.json).await,
         Command::Dispatch {
+            action: DispatchAction::Stuck { since },
+        } => stuck_report::run(&cli.socket_path, cli.json, &since).await,
+        Command::Dispatch {
             action:
                 DispatchAction::Tail {
                     state_root,
@@ -1381,7 +1403,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     include_stalled,
                 },
         } => dispatch_ghost_active(cli.json, state_root, stalled_after_secs, include_stalled),
-        Command::Pause { systems, reason } => {
+        Command::Pause {
+            systems,
+            reason,
+            all_spawns,
+        } => {
             if systems.iter().any(|s| matches!(s, PauseArg::State)) {
                 if systems.len() > 1 {
                     bail!("`bossctl pause state` does not take additional systems");
@@ -1390,7 +1416,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 let reason = pause::require_pause_reason(reason)?;
                 let targets = pause::pause_arg_targets(&systems);
-                pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, Some(reason)).await
+                if all_spawns && !targets.contains(&PauseSystem::Dispatch) {
+                    bail!("--all-spawns applies to dispatch only, but dispatch is not among the systems being paused");
+                }
+                let scope = pause::dispatch_pause_scope(all_spawns);
+                pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, Some(reason), scope).await
             }
         }
         Command::Resume { systems } => {
@@ -1399,15 +1429,23 @@ async fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 systems
             };
-            pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, None).await
+            pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, None, Default::default()).await
         }
         Command::State => pause::unified_state(&cli.socket_path, cli.json).await,
         Command::Dispatch {
-            action: DispatchAction::Pause { reason },
-        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
+            action: DispatchAction::Pause { reason, all_spawns },
+        } => {
+            pause::dispatch_set_paused(
+                &cli.socket_path,
+                cli.json,
+                Some(reason),
+                pause::dispatch_pause_scope(all_spawns),
+            )
+            .await
+        }
         Command::Dispatch {
             action: DispatchAction::Resume,
-        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, None).await,
+        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, None, Default::default()).await,
         Command::Dispatch {
             action: DispatchAction::State { history, n, state_root },
         } => {
@@ -1421,8 +1459,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: DispatchAction::Stats { state_root, since, top },
         } => dispatch_stats::dispatch_stats(cli.json, state_root, since.as_deref(), top),
         Command::Dispatch {
+            action: DispatchAction::Focus { action },
+        } => focus::run(&cli.socket_path, cli.json, action).await,
+        Command::Dispatch {
             action: DispatchAction::Concurrency { set },
-        } => dispatch_concurrency(&cli.socket_path, cli.json, set).await,
+        } => dispatch_concurrency::dispatch_concurrency(&cli.socket_path, cli.json, set).await,
         Command::Automation {
             action: AutomationAction::Pause { reason },
         } => pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
@@ -1464,6 +1505,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     state_root,
                 },
         } => hosts::hosts_add(cli.json, state_root, id, ssh_target, pool_size, tags, skip_wrapper_push).await,
+        Command::Enrollment { action } => enrollment::run(cli.json, action),
         Command::Hosts {
             action: hosts::HostsAction::List { enabled, state_root },
         } => hosts::hosts_list(cli.json, state_root, enabled),
@@ -1513,22 +1555,31 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => executions_prune(cli.json, state_root, older_than_days, keep_per_work_item, dry_run),
         Command::CodexHomes {
             action:
-                CodexHomesAction::Sweep {
+                homes::CodexHomesAction::Sweep {
                     older_than_days,
                     max_total_bytes,
                     dry_run,
                     state_root,
                 },
-        } => codex_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
+        } => homes::codex_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
         Command::GrokHomes {
             action:
-                GrokHomesAction::Sweep {
+                homes::GrokHomesAction::Sweep {
                     older_than_days,
                     max_total_bytes,
                     dry_run,
                     state_root,
                 },
-        } => grok_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
+        } => homes::grok_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
+        Command::AgyHomes {
+            action:
+                homes::AgyHomesAction::Sweep {
+                    older_than_days,
+                    max_total_bytes,
+                    dry_run,
+                    state_root,
+                },
+        } => homes::agy_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
         Command::Attachments {
             action: AttachmentsAction::List { work_item, state_root },
         } => attachments_list(cli.json, state_root, work_item),
@@ -1806,93 +1857,6 @@ fn drop_closed_work_items(
         .collect()
 }
 
-/// Current interactive-pool concurrency cap as returned by
-/// [`FrontendRequest::SetDispatchConcurrency`] / [`FrontendRequest::GetDispatchConcurrency`].
-struct DispatchConcurrencyState {
-    limit: usize,
-    max: usize,
-    clamped_from: Option<usize>,
-}
-
-async fn get_dispatch_concurrency_raw(socket_path: &Option<String>) -> Result<DispatchConcurrencyState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::GetDispatchConcurrency)
-        .await
-        .context("sending GetDispatchConcurrency")?;
-    match response {
-        FrontendEvent::DispatchConcurrencyResult {
-            limit,
-            max,
-            clamped_from,
-        } => Ok(DispatchConcurrencyState {
-            limit,
-            max,
-            clamped_from,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected GetDispatchConcurrency: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-async fn set_dispatch_concurrency_raw(socket_path: &Option<String>, limit: usize) -> Result<DispatchConcurrencyState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::SetDispatchConcurrency { limit })
-        .await
-        .context("sending SetDispatchConcurrency")?;
-    match response {
-        FrontendEvent::DispatchConcurrencyResult {
-            limit,
-            max,
-            clamped_from,
-        } => Ok(DispatchConcurrencyState {
-            limit,
-            max,
-            clamped_from,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected SetDispatchConcurrency: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-fn print_dispatch_concurrency(json: bool, state: &DispatchConcurrencyState) {
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "limit": state.limit,
-                "max": state.max,
-                "clamped_from": state.clamped_from,
-            })
-        );
-    } else {
-        println!(
-            "interactive concurrency cap: {} (worker-pool ceiling: {})",
-            state.limit, state.max
-        );
-        if let Some(requested) = state.clamped_from {
-            println!(
-                "  requested {requested} exceeded the ceiling — clamped to {}",
-                state.limit
-            );
-        }
-    }
-}
-
-async fn dispatch_concurrency(socket_path: &Option<String>, json: bool, set: Option<usize>) -> Result<()> {
-    let state = match set {
-        Some(limit) => set_dispatch_concurrency_raw(socket_path, limit).await?,
-        None => get_dispatch_concurrency_raw(socket_path).await?,
-    };
-    print_dispatch_concurrency(json, &state);
-    Ok(())
-}
-
 fn filter_and_tail<'a>(
     events: &'a [DispatchEvent],
     n: usize,
@@ -2069,7 +2033,7 @@ fn executions_prune(
             "{}",
             serde_json::json!({
                 "deleted": outcome.deleted,
-                "codex_homes_reclaimed": outcome.codex_homes_reclaimed,
+                "driver_homes_reclaimed": outcome.driver_homes_reclaimed,
                 "dry_run": dry_run,
                 "older_than_days": older_than_days,
                 "keep_per_work_item": keep_per_work_item,
@@ -2082,109 +2046,8 @@ fn executions_prune(
         );
     } else {
         println!(
-            "deleted {} terminal execution row(s) older than {}d (kept {} most recent per work item); reclaimed {} Codex home(s)",
-            outcome.deleted, older_than_days, keep_per_work_item, outcome.codex_homes_reclaimed
-        );
-    }
-    Ok(())
-}
-
-/// `bossctl codex-homes sweep` — on-demand reclaim of recorded Boss-owned
-/// CODEX_HOME trees past retention. Never scans `~/.codex`.
-async fn codex_homes_sweep(
-    json: bool,
-    state_root: Option<PathBuf>,
-    older_than_days: u64,
-    max_total_bytes: u64,
-    dry_run: bool,
-) -> Result<()> {
-    let db = open_state_db(state_root)?;
-    let policy = boss_engine::codex_rollout_retention::CodexHomeRetentionPolicy::new(
-        std::time::Duration::from_secs(older_than_days.saturating_mul(24 * 60 * 60)),
-        max_total_bytes,
-    );
-    let outcome = boss_engine::codex_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "scanned": outcome.scanned,
-                "deleted": outcome.deleted,
-                "deleted_bytes": outcome.deleted_bytes,
-                "skipped_live": outcome.skipped_live,
-                "kept_in_policy": outcome.kept_in_policy,
-                "errors": outcome.errors,
-                "dry_run": dry_run,
-                "older_than_days": older_than_days,
-                "max_total_bytes": max_total_bytes,
-            })
-        );
-    } else if dry_run {
-        println!(
-            "would reclaim {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
-            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
-        );
-    } else {
-        println!(
-            "reclaimed {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
-            outcome.deleted,
-            outcome.deleted_bytes,
-            outcome.scanned,
-            outcome.skipped_live,
-            outcome.kept_in_policy,
-            outcome.errors
-        );
-    }
-    Ok(())
-}
-
-/// `bossctl grok-homes sweep` — on-demand reclaim of recorded Boss-owned
-/// Grok run-container trees past retention. Never scans `~/.grok`. Mirrors
-/// [`codex_homes_sweep`].
-async fn grok_homes_sweep(
-    json: bool,
-    state_root: Option<PathBuf>,
-    older_than_days: u64,
-    max_total_bytes: u64,
-    dry_run: bool,
-) -> Result<()> {
-    let db = open_state_db(state_root)?;
-    let policy = boss_engine::grok_home_retention::GrokHomeRetentionPolicy::new(
-        std::time::Duration::from_secs(older_than_days.saturating_mul(24 * 60 * 60)),
-        max_total_bytes,
-    );
-    let outcome = boss_engine::grok_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "scanned": outcome.scanned,
-                "deleted": outcome.deleted,
-                "deleted_bytes": outcome.deleted_bytes,
-                "skipped_live": outcome.skipped_live,
-                "kept_in_policy": outcome.kept_in_policy,
-                "errors": outcome.errors,
-                "dry_run": dry_run,
-                "older_than_days": older_than_days,
-                "max_total_bytes": max_total_bytes,
-            })
-        );
-    } else if dry_run {
-        println!(
-            "would reclaim {} recorded Grok home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
-            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
-        );
-    } else {
-        println!(
-            "reclaimed {} recorded Grok home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
-            outcome.deleted,
-            outcome.deleted_bytes,
-            outcome.scanned,
-            outcome.skipped_live,
-            outcome.kept_in_policy,
-            outcome.errors
+            "deleted {} terminal execution row(s) older than {}d (kept {} most recent per work item); reclaimed {} driver home(s)",
+            outcome.deleted, older_than_days, keep_per_work_item, outcome.driver_homes_reclaimed
         );
     }
     Ok(())
@@ -2241,7 +2104,7 @@ fn attachments_list(json: bool, state_root: Option<PathBuf>, work_item: Option<S
 }
 
 /// `bossctl attachments sweep` — on-demand evidence retention. Mirrors
-/// [`grok_homes_sweep`]: same age + total-bytes policy shape, same
+/// [`homes::grok_homes_sweep`]: same age + total-bytes policy shape, same
 /// `--dry-run`, same "a running engine already does this on a schedule".
 async fn attachments_sweep(
     json: bool,

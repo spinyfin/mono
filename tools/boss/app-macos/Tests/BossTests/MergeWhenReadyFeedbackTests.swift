@@ -12,6 +12,102 @@ import XCTest
 /// duplicate click is not presented as a fresh submission.
 @MainActor
 final class MergeWhenReadyFeedbackTests: XCTestCase {
+    func testProgressInvalidatesBothCardAndBadgeStrip() {
+        let snapshot = WorkCardSnapshot.build(task: makeMergeTask(id: "progress"), context: WorkCardSnapshotContext(column: .review))
+        XCTAssertNotEqual(
+            WorkBoardCardView(snapshot: snapshot),
+            WorkBoardCardView(snapshot: snapshot, isRequestingMerge: true)
+        )
+        let slice = WorkBoardCardBadgeStripSlice(snapshot: snapshot)
+        XCTAssertNotEqual(
+            WorkBoardCardBadgeStrip(slice: slice),
+            WorkBoardCardBadgeStrip(slice: slice, isRequestingMerge: true)
+        )
+    }
+
+    func testClickPublishesProgressImmediatelyAndDoesNotSendTwice() {
+        let model = makeModel()
+        let task = makeMergeTask(id: "merge_progress")
+        model.engine.simulateConnectedForTesting = true
+        var sends = 0
+        model.engine.outboundRecorder = { _ in sends += 1 }
+        var published = false
+        let subscription = model.$mergingWhenReadyIDs.sink { published = $0.contains(task.id) }
+        model.mergeWhenReady(for: task)
+        XCTAssertTrue(published)
+        XCTAssertNil(model.mergeFeedbackNotice)
+        model.mergeWhenReady(for: task)
+        XCTAssertEqual(sends, 1)
+        model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: task.id, prURL: "u", action: "merge_requested"))
+        XCTAssertFalse(published)
+        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merge requested")
+        withExtendedLifetime(subscription) {}
+    }
+
+    func testTimeoutRestoresControlAndOldTimeoutCannotExpireRetry() {
+        let model = makeModel()
+        let task = makeMergeTask(id: "merge_timeout")
+        model.engine.simulateConnectedForTesting = true
+        model.mergeWhenReady(for: task)
+        let first = model.mergeRequestStartedAt[task.id]!
+        model.expireMergeRequest(for: task.id, startedAt: first)
+        XCTAssertFalse(model.mergingWhenReadyIDs.contains(task.id))
+        XCTAssertTrue(model.mergeErrorNoticesByTaskID[task.id]!.contains("timed out"))
+        model.mergeWhenReady(for: task)
+        model.expireMergeRequest(for: task.id, startedAt: first)
+        XCTAssertTrue(model.mergingWhenReadyIDs.contains(task.id))
+        XCTAssertNil(model.mergeErrorNoticesByTaskID[task.id])
+        model.applyEventForTest(.workError(message: "rejected", requestId: nil))
+        XCTAssertFalse(model.mergingWhenReadyIDs.contains(task.id))
+        XCTAssertEqual(model.mergeErrorNoticesByTaskID[task.id], "rejected")
+    }
+
+    func testConfirmationWaitDoesNotTimeOutAndDisconnectedConfirmRestoresControl() {
+        let model = makeModel()
+        let task = makeMergeTask(id: "merge_confirmation")
+        model.engine.simulateConnectedForTesting = true
+        model.mergeWhenReady(for: task)
+        let started = model.mergeRequestStartedAt[task.id]!
+        model.handleMergeConfirmation(workItemID: task.id, revisions: [OpenMergeRevision(id: "r", label: "revision", status: "open")])
+        model.expireMergeRequest(for: task.id, startedAt: started)
+        XCTAssertTrue(model.mergingWhenReadyIDs.contains(task.id))
+        XCTAssertNil(model.mergeErrorNoticesByTaskID[task.id])
+        model.engine.simulateConnectedForTesting = false
+        model.confirmMergeRevision(workItemID: task.id)
+        XCTAssertFalse(model.mergingWhenReadyIDs.contains(task.id))
+        XCTAssertNotNil(model.mergeErrorNoticesByTaskID[task.id])
+    }
+
+    func testDisconnectReplacesProgressWithAnErrorImmediately() {
+        let model = makeModel()
+        let task = makeMergeTask(id: "merge_disconnect")
+        model.engine.simulateConnectedForTesting = true
+        model.mergeWhenReady(for: task)
+        model.applyEventForTest(.disconnected)
+        XCTAssertFalse(model.mergingWhenReadyIDs.contains(task.id))
+        XCTAssertNotNil(model.mergeErrorNoticesByTaskID[task.id])
+        XCTAssertNil(model.mergeRequestStartedAt[task.id])
+    }
+
+    func testConfirmationAfterReconnectRestoresTheDuplicateGuard() {
+        let model = makeModel()
+        let task = makeMergeTask(id: "merge_reconnect")
+        model.engine.simulateConnectedForTesting = true
+        model.mergeWhenReady(for: task, origin: .reviewGuideViewer)
+        model.handleMergeConfirmation(workItemID: task.id, revisions: [OpenMergeRevision(id: "r", label: "revision", status: "open")])
+        model.engine.simulateConnectedForTesting = false
+        model.applyEventForTest(.disconnected)
+        model.engine.simulateConnectedForTesting = true
+        var sends = 0
+        model.engine.outboundRecorder = { _ in sends += 1 }
+        model.confirmMergeRevision(workItemID: task.id)
+        model.mergeWhenReady(for: task)
+        XCTAssertEqual(sends, 1)
+        XCTAssertTrue(model.mergingWhenReadyIDs.contains(task.id))
+        XCTAssertNotNil(model.mergeRequestStartedAt[task.id])
+        XCTAssertNil(model.mergeErrorNoticesByTaskID[task.id])
+        XCTAssertEqual(model.mergeRevisionConfirmationOrigins[task.id], .reviewGuideViewer)
+    }
 
     func testTrunkEnqueuedSetsDistinctFeedbackText() {
         let model = makeModel()
@@ -166,6 +262,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
     func testOpenRevisionConfirmationRequiresExplicitConsent() {
         let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
         let revisions = [OpenMergeRevision(id: "revision", label: "ID-test", status: "blocked")]
         var requests: [[String: Any]] = []
         model.engine.outboundRecorder = { requests.append($0) }
@@ -206,6 +303,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
     func testConfirmingFirstPromotesQueuedSecondAndSendsOnlyFirstRevisions() async {
         let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
         let first = [OpenMergeRevision(id: "r1", label: "one", status: "open")]
         let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked")]
         var requests: [[String: Any]] = []
@@ -252,6 +350,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
     func testDeferredPromotionDoesNotOverwriteNewerPendingConfirmation() async {
         let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
         let first = [OpenMergeRevision(id: "r1", label: "one", status: "open")]
         let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked")]
         let third = [OpenMergeRevision(id: "r3", label: "three", status: "open")]

@@ -1,7 +1,15 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 exports_files(["Cargo.toml"])
+
+# Scanned by worker-policy's exhaustive-vocabulary test so a new classified
+# verb is exercised there without reading an undeclared checkout path.
+exports_files(
+    ["src/request_contract.rs"],
+    visibility = ["//tools/boss/engine/worker-policy:__pkg__"],
+)
 
 rust_library(
     name = "protocol",
@@ -9,7 +17,7 @@ rust_library(
     crate_name = "boss_protocol",
     crate_root = "src/lib.rs",
     edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True),
+    proc_macro_deps = ["//tools/boss/protocol-macros:protocol_macros"] + all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss:__subpackages__",
     ],
@@ -21,7 +29,7 @@ rust_test(
     size = "small",
     crate = ":protocol",
     edition = "2024",
-    proc_macro_deps = all_crate_deps(
+    proc_macro_deps = ["//tools/boss/protocol-macros:protocol_macros"] + all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
@@ -36,5 +44,20 @@ rust_test(
 filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
+)
+
+# Keeps the Rust roster and the crew portrait grid (and the
+# bundled sheet's size) in step by parsing the real sources.
+sh_test(
+    name = "worker_roster_parity_test",
+    size = "small",
+    srcs = ["tests/worker_roster_parity_test.sh"],
+    data = [
+        "src/worker_names.rs",
+        "tests/worker_roster_parity_test.py",
+        "//tools/boss/app-macos:crew_roster_sources",
+    ],
 )

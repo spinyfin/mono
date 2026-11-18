@@ -5,10 +5,11 @@
 //! tests. Both sides go through [`AgentDriver::normalize_progress_event`].
 
 use crate::conformance::fixtures::{
-    CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, GROK_HOOK_SESSION_JSONL,
-    codex_shaped_driver, decode_jsonl, expected_session_events, normalize_session_id, normalize_session_start_source,
+    AGY_HOOK_SESSION_JSONL, CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL,
+    GROK_HOOK_SESSION_JSONL, codex_shaped_driver, decode_jsonl, decode_progress, expected_agy_session_events,
+    expected_session_events, normalize_session_id, normalize_session_start_source, project_command,
 };
-use crate::driver::{ClaudeDriver, GrokDriver};
+use crate::driver::{AgyDriver, ClaudeDriver, GrokDriver};
 
 #[test]
 fn hook_ingress_matches_expected_session_sequence() {
@@ -86,6 +87,60 @@ fn claude_and_grok_hook_ingress_produce_identical_worker_event_sequences() {
         claude_events, grok_events,
         "Claude hook ingress and Grok hook ingress must produce identical WorkerEvent sequences \
          for equivalent activity",
+    );
+}
+
+#[test]
+fn agy_hook_ingress_matches_expected_session_sequence() {
+    for event in decode_progress(&AgyDriver::default(), AGY_HOOK_SESSION_JSONL) {
+        if let boss_protocol::WorkerEvent::PreToolUse { tool_input, .. }
+        | boss_protocol::WorkerEvent::PostToolUse { tool_input, .. } = event
+        {
+            assert_eq!(tool_input["CommandLine"], "echo hooktest-exec");
+            assert_eq!(tool_input["command"], "echo hooktest-exec");
+        }
+    }
+
+    let events: Vec<_> = decode_progress(&AgyDriver::default(), AGY_HOOK_SESSION_JSONL)
+        .into_iter()
+        .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(project_command)
+        .collect();
+    assert_eq!(
+        events,
+        expected_agy_session_events(),
+        "agy hook ingress must decode to the canonical activity-machine sequence, \
+         minus UserPromptSubmit and with empty PostToolUse.tool_response",
+    );
+}
+
+#[test]
+fn claude_and_agy_hook_ingress_agree_except_documented_dialect_gaps() {
+    // agy has no UserPromptSubmit hook, and PostToolUse carries no command
+    // output (empty error → tool_response `{}`). Those are pinned dialect
+    // gaps, not normalisation bugs. After folding them, the remaining
+    // SessionStart / PreToolUse / PostToolUse / Stop sequence matches Claude.
+    let claude_events: Vec<_> = decode_jsonl(&ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL)
+        .into_iter()
+        .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(project_command)
+        .filter(|e| !matches!(e, boss_protocol::WorkerEvent::UserPromptSubmit { .. }))
+        .map(|mut event| {
+            if let boss_protocol::WorkerEvent::PostToolUse { tool_response, .. } = &mut event {
+                *tool_response = serde_json::json!({});
+            }
+            event
+        })
+        .collect();
+    let agy_events: Vec<_> = decode_progress(&AgyDriver::default(), AGY_HOOK_SESSION_JSONL)
+        .into_iter()
+        .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(project_command)
+        .collect();
+    assert_eq!(
+        claude_events, agy_events,
+        "Claude and agy hook ingress must produce identical WorkerEvent sequences \
+         after folding agy's documented UserPromptSubmit and tool_response gaps",
     );
 }
 

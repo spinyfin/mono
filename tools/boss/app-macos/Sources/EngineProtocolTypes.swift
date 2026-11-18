@@ -148,8 +148,8 @@ struct EngineHostedPaneEntry: Sendable {
 enum EngineRequestKind: Sendable {
     case attachWorkerPane(EngineAttachRequest)
     case attachCoordinatorPane(EngineCoordinatorAttachRequest)
-    case detachWorkerPane(slotId: Int)
-    case focusWorkerPane(slotId: Int)
+    case detachWorkerPane(runId: String)
+    case focusWorkerPane(runId: String)
     case revealWorkItem(workItemId: String, productId: String)
     /// Engine asks the app to open a markdown document — the
     /// `bossctl open` path. `path` is an absolute, engine-validated

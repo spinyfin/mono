@@ -13,11 +13,16 @@
 # depends on //tools/boss/app-macos:Boss (Swift), which has no Linux toolchain.
 set -euo pipefail
 
+# This step may execute its bazel actions on remote workers; ci-env.sh
+# decides whether it does (see remote-execution.sh). It qualifies because
+# nothing it passes to bazel is a credential and its build and
+# test commands are run only for their result.
+CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [bazel-build] building"
 
-if ! bazel build --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
+if ! bazel_verify_only build --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
   echo "^^^ +++"
   echo "[bazel-build] FAILED"
   exit 1
@@ -27,7 +32,7 @@ echo "[bazel-build] ok"
 
 echo "--- [bazel-test] testing"
 
-if ! bazel test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
+if ! bazel_verify_only test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
   echo "^^^ +++"
   echo "[bazel-test] FAILED"
   exit 1

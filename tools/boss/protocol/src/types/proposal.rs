@@ -14,6 +14,7 @@
 //! `boss_engine::app::proposals` / `boss_engine_proposal_validation`, and
 //! the auto-apply pipeline in `boss_engine::work::proposal_apply`.
 
+use super::answer_labels::AnswerOptionLabels;
 use super::common::EffortLevel;
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,28 @@ pub enum ProposalKind {
     /// ladder should hold until the wait expires. Re-running renews the
     /// wait, subject to the per-declaration and per-execution caps.
     Wait,
+    /// Progression verbs (design 2.4). Each is accepted only from a
+    /// `progression` execution, scope-checked against the neighbourhood that
+    /// execution was spawned with, and applied through the existing engine path
+    /// it names. See [`ProposalKind::is_progression_verb`].
+    ///
+    /// Create a revision on the stuck item's own open PR.
+    Revise,
+    /// Create a precursor chore and make the stuck item depend on it.
+    Precursor,
+    /// Add a dependency edge inside the neighbourhood.
+    Depend,
+    /// Remove a dependency edge inside the neighbourhood.
+    Undepend,
+    /// Explicitly restart the stuck item.
+    Redispatch,
+    /// Clear a `blocked_reason` whose probe is already clear.
+    ClearSignal,
+    /// Archive a dead revision of the item's chain.
+    ArchiveRevision,
+    /// Move the item `blocked -> todo` (or `in_review` when it already owns a
+    /// bound PR) once its block reason is cleared.
+    Unblock,
 }
 
 impl ProposalKind {
@@ -57,7 +80,56 @@ impl ProposalKind {
         ProposalKind::ReviewVerdict,
         ProposalKind::RunDone,
         ProposalKind::Wait,
+        ProposalKind::Revise,
+        ProposalKind::Precursor,
+        ProposalKind::Depend,
+        ProposalKind::Undepend,
+        ProposalKind::Redispatch,
+        ProposalKind::ClearSignal,
+        ProposalKind::ArchiveRevision,
+        ProposalKind::Unblock,
     ];
+
+    /// The verbs only a progression execution may submit (design 2.4). Every
+    /// one of them mutates the work taxonomy, so none goes through the generic
+    /// auto-apply pipeline: they are scope-checked and applied by
+    /// `WorkDb::submit_progression_verb`.
+    pub const PROGRESSION_VERBS: &'static [ProposalKind] = &[
+        ProposalKind::Revise,
+        ProposalKind::Precursor,
+        ProposalKind::Depend,
+        ProposalKind::Undepend,
+        ProposalKind::Redispatch,
+        ProposalKind::ClearSignal,
+        ProposalKind::ArchiveRevision,
+        ProposalKind::Unblock,
+    ];
+
+    /// `true` for the kinds in [`Self::PROGRESSION_VERBS`].
+    pub fn is_progression_verb(self) -> bool {
+        match self {
+            ProposalKind::Revise
+            | ProposalKind::Precursor
+            | ProposalKind::Depend
+            | ProposalKind::Undepend
+            | ProposalKind::Redispatch
+            | ProposalKind::ClearSignal
+            | ProposalKind::ArchiveRevision
+            | ProposalKind::Unblock => true,
+            ProposalKind::Attention
+            | ProposalKind::EffortEscalation
+            | ProposalKind::Blocked
+            | ProposalKind::DeferredScope
+            | ProposalKind::FollowupTask
+            | ProposalKind::AutomationOutcome
+            | ProposalKind::PrCreated
+            | ProposalKind::ReviewGuide
+            | ProposalKind::ReviewReport
+            | ProposalKind::ReviewVerdict
+            | ProposalKind::RunDone
+            | ProposalKind::Wait => false,
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -73,6 +145,14 @@ impl ProposalKind {
             ProposalKind::ReviewVerdict => "review_verdict",
             ProposalKind::RunDone => "run_done",
             ProposalKind::Wait => "wait",
+            ProposalKind::Revise => "revise",
+            ProposalKind::Precursor => "precursor",
+            ProposalKind::Depend => "depend",
+            ProposalKind::Undepend => "undepend",
+            ProposalKind::Redispatch => "redispatch",
+            ProposalKind::ClearSignal => "clear_signal",
+            ProposalKind::ArchiveRevision => "archive_revision",
+            ProposalKind::Unblock => "unblock",
         }
     }
 }
@@ -99,10 +179,19 @@ impl std::str::FromStr for ProposalKind {
             "review_verdict" => Ok(ProposalKind::ReviewVerdict),
             "run_done" => Ok(ProposalKind::RunDone),
             "wait" => Ok(ProposalKind::Wait),
+            "revise" => Ok(ProposalKind::Revise),
+            "precursor" => Ok(ProposalKind::Precursor),
+            "depend" => Ok(ProposalKind::Depend),
+            "undepend" => Ok(ProposalKind::Undepend),
+            "redispatch" => Ok(ProposalKind::Redispatch),
+            "clear_signal" => Ok(ProposalKind::ClearSignal),
+            "archive_revision" => Ok(ProposalKind::ArchiveRevision),
+            "unblock" => Ok(ProposalKind::Unblock),
             other => Err(format!(
                 "unknown proposal kind `{other}`; expected one of: attention, effort_escalation, \
                  blocked, deferred_scope, followup_task, automation_outcome, pr_created, review_guide, review_report, \
-                 review_verdict, run_done, wait"
+                 review_verdict, run_done, wait, revise, precursor, depend, undepend, redispatch, clear_signal, \
+                 archive_revision, unblock"
             )),
         }
     }
@@ -402,7 +491,8 @@ pub enum RunDoneOutcome {
     /// The run verified there was nothing to produce — the change is
     /// already on the base branch, the reviewer finding needs no code
     /// change, the automation found a clean repo. The same claim the
-    /// `NO_CHANGES_NEEDED` marker makes, on the declaration channel.
+    /// retired `NO_CHANGES_NEEDED` text marker used to make, on the typed
+    /// declaration channel.
     NoChangesNeeded,
     /// The run is over without delivering: the worker cannot proceed. This
     /// is a *terminal* declaration, distinct from
@@ -472,6 +562,8 @@ pub struct RunDoneProposalPayload {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<super::OperatorQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_ci_evidence: Option<super::QueueCiEvidence>,
 }
 
 /// Payload for [`ProposalKind::Wait`]. Auto-applies to a time-bounded
@@ -501,6 +593,233 @@ pub const WAIT_MAX_DURATION_SECS: u64 = 2 * 60 * 60;
 /// (4 hours). Each declaration's requested duration counts in full against
 /// this cap, including renewals, so overlapping waits cannot run forever.
 pub const WAIT_MAX_TOTAL_SECS_PER_EXECUTION: u64 = 4 * 60 * 60;
+
+// ---------------------------------------------------------------------------
+// Progression verbs (design 2.4 / 2.5)
+// ---------------------------------------------------------------------------
+
+/// Payload for [`ProposalKind::Revise`]: the brief of a revision on the item's
+/// own open PR. Counts against the create budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviseProposalPayload {
+    pub brief: String,
+}
+
+/// Payload for [`ProposalKind::Precursor`]: a chore the stuck item will depend
+/// on (a red check that belongs on `main`, a missing prerequisite). Counts
+/// against the create budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrecursorProposalPayload {
+    pub name: String,
+    pub brief: String,
+}
+
+/// Payload for [`ProposalKind::Depend`]: `on` is a work-item id (`task_…` or a
+/// short `T<n>`) inside the run's neighbourhood. The stuck item becomes its
+/// dependent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependProposalPayload {
+    pub on: String,
+}
+
+/// Payload for [`ProposalKind::Undepend`]: drop the edge from the stuck item to
+/// `on`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndependProposalPayload {
+    pub on: String,
+}
+
+/// Payload for [`ProposalKind::Redispatch`]. The addendum quotes a declared
+/// blocker and the evidence that it is stale (design 2.9); it is appended to the
+/// item's description so the next worker does not re-declare it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedispatchProposalPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_addendum: Option<String>,
+}
+
+/// The block reasons [`ProposalKind::ClearSignal`] may name: the ones the merge
+/// poller's polymorphic clear path owns.
+pub const CLEARABLE_BLOCK_REASONS: &[&str] = &["merge_conflict", "ci_failure", "ci_failure_exhausted"];
+
+/// Payload for [`ProposalKind::ClearSignal`]. `reason` is the `blocked_reason`
+/// to clear (one of [`CLEARABLE_BLOCK_REASONS`]), not an explanation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClearSignalProposalPayload {
+    pub reason: String,
+}
+
+/// Payload for [`ProposalKind::ArchiveRevision`]: a revision of the item's own
+/// chain that is dead and whose parent PR is green.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveRevisionProposalPayload {
+    pub revision: String,
+    pub reason: String,
+}
+
+/// Payload for [`ProposalKind::Unblock`]. It carries nothing: the verb names
+/// the stuck item and moves it `blocked -> todo`, or `in_review` when the item
+/// already owns a bound PR.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnblockProposalPayload {}
+
+/// How a progression run ended, recorded on its execution
+/// (`work_executions.progression_disposition`) when it declares `done`
+/// (design 2.5). There is deliberately no "needs a human" value: a run that
+/// needs the owner must say what it needs, as a question (`Asked`).
+/// `Withdrawn` is written at finalization when that question never reached
+/// the owner because work resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressionDisposition {
+    /// `done --outcome delivered`: the run acted, or diagnosed and left the
+    /// item for the work it created.
+    Progressed,
+    /// `done --outcome no-changes-needed`: the run judged the item not stuck in
+    /// a way any verb addresses. Files nothing.
+    NoAction,
+    /// `done --outcome blocked` with a question: the owner was asked.
+    Asked,
+    /// A question was filed at submission, then withdrawn at finalization
+    /// because work had resumed. Distinct from [`Self::Asked`] (the question
+    /// never reached the owner) and from [`Self::NoAction`] (three consecutive
+    /// `no_action` runs fire the escalation ladder).
+    Withdrawn,
+}
+
+impl ProgressionDisposition {
+    pub const ALL: &'static [ProgressionDisposition] = &[
+        ProgressionDisposition::Progressed,
+        ProgressionDisposition::NoAction,
+        ProgressionDisposition::Asked,
+        ProgressionDisposition::Withdrawn,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgressionDisposition::Progressed => "progressed",
+            ProgressionDisposition::NoAction => "no_action",
+            ProgressionDisposition::Asked => "asked",
+            ProgressionDisposition::Withdrawn => "withdrawn",
+        }
+    }
+
+    /// The disposition a `done` outcome records.
+    pub fn for_outcome(outcome: RunDoneOutcome) -> Self {
+        match outcome {
+            RunDoneOutcome::Delivered => ProgressionDisposition::Progressed,
+            RunDoneOutcome::NoChangesNeeded => ProgressionDisposition::NoAction,
+            RunDoneOutcome::Blocked => ProgressionDisposition::Asked,
+        }
+    }
+}
+
+impl std::fmt::Display for ProgressionDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProgressionDisposition {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "progressed" => Ok(ProgressionDisposition::Progressed),
+            "no_action" => Ok(ProgressionDisposition::NoAction),
+            "asked" => Ok(ProgressionDisposition::Asked),
+            "withdrawn" => Ok(ProgressionDisposition::Withdrawn),
+            other => Err(format!(
+                "unknown progression disposition `{other}`; expected one of: progressed, no_action, asked, withdrawn"
+            )),
+        }
+    }
+}
+
+/// Which of the four numbered reasons in design 2.5 ("When a question is
+/// permitted") a progression question cites. Required on a progression `ask`,
+/// carried on the `done` payload under `criterion` and stored with it, so the
+/// stuck report can list the criterion each progression question cited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressionQuestionCriterion {
+    /// Criterion 1: the action the item needs is human-only (park, archive the
+    /// item itself, change priority, merge, reap a worker, answer an open question).
+    HumanOnlyAction,
+    /// Criterion 2: every direct verb that applies to the stuck kind has been tried or is
+    /// refused (fingerprint, redispatch bound, budget).
+    VerbsExhausted,
+    /// Criterion 3: a declared blocker, or the item's own brief and design doc, names a
+    /// decision only the owner can make.
+    HumanDecision,
+    /// Criterion 4: the evidence contradicts itself in a way that changes product
+    /// behaviour, so any direct action would be a guess.
+    ContradictoryEvidence,
+}
+
+impl ProgressionQuestionCriterion {
+    pub const ALL: &'static [ProgressionQuestionCriterion] = &[
+        ProgressionQuestionCriterion::HumanOnlyAction,
+        ProgressionQuestionCriterion::VerbsExhausted,
+        ProgressionQuestionCriterion::HumanDecision,
+        ProgressionQuestionCriterion::ContradictoryEvidence,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgressionQuestionCriterion::HumanOnlyAction => "human_only_action",
+            ProgressionQuestionCriterion::VerbsExhausted => "verbs_exhausted",
+            ProgressionQuestionCriterion::HumanDecision => "human_decision",
+            ProgressionQuestionCriterion::ContradictoryEvidence => "contradictory_evidence",
+        }
+    }
+
+    /// The number the brief gives this criterion (1 to 4).
+    pub fn number(self) -> u8 {
+        match self {
+            ProgressionQuestionCriterion::HumanOnlyAction => 1,
+            ProgressionQuestionCriterion::VerbsExhausted => 2,
+            ProgressionQuestionCriterion::HumanDecision => 3,
+            ProgressionQuestionCriterion::ContradictoryEvidence => 4,
+        }
+    }
+}
+
+impl std::fmt::Display for ProgressionQuestionCriterion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProgressionQuestionCriterion {
+    type Err = String;
+    /// Accepts the numbered form the brief teaches (`3`) and the stored name
+    /// (`human_decision`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|criterion| s == criterion.as_str() || s == criterion.number().to_string())
+            .ok_or_else(|| {
+                format!(
+                    "unknown question criterion `{s}`; expected 1-4 or one of: human_only_action, \
+                     verbs_exhausted, human_decision, contradictory_evidence"
+                )
+            })
+    }
+}
+
+/// The question criterion a stored `run_done` payload cites, if any. The
+/// criterion rides beside the typed [`RunDoneProposalPayload`] (as a `criterion`
+/// key of the stored JSON) rather than inside it, so the many existing payload
+/// literals are unaffected; readers that predate it ignore the key.
+pub fn run_done_question_criterion(payload_json: &str) -> Option<ProgressionQuestionCriterion> {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()?
+        .get("criterion")?
+        .as_str()?
+        .parse()
+        .ok()
+}
 
 // ---------------------------------------------------------------------------
 // Submission errors and rate caps (the `SubmitProposal` / `ListProposals` RPCs)
@@ -547,6 +866,15 @@ pub enum ProposalErrorCode {
     /// work item is unreadable) — a stale registry entry for a pruned
     /// execution.
     UnknownExecution,
+    /// The engine declined the submission on state or content grounds and
+    /// stored **nothing**: the message says why (for a review guide: the
+    /// execution has no running attempt, the comparison changed, or the
+    /// guide body failed validation). Distinct from a stored `rejected`
+    /// proposal row — there is no row, so a later retry is a fresh
+    /// submission that is judged on the engine's state at that moment,
+    /// never a replay of this refusal. Remediation: fix the content, or
+    /// wait for the state the message names, then submit again.
+    NotAccepted,
     /// The engine failed to persist or read the proposal. Distinguished
     /// from every code above so a worker does not "fix" a payload that was
     /// never the problem.
@@ -561,6 +889,7 @@ impl ProposalErrorCode {
         ProposalErrorCode::AttributionUnresolved,
         ProposalErrorCode::AttributionMismatch,
         ProposalErrorCode::UnknownExecution,
+        ProposalErrorCode::NotAccepted,
         ProposalErrorCode::Internal,
     ];
 
@@ -572,6 +901,7 @@ impl ProposalErrorCode {
             ProposalErrorCode::AttributionUnresolved => "attribution_unresolved",
             ProposalErrorCode::AttributionMismatch => "attribution_mismatch",
             ProposalErrorCode::UnknownExecution => "unknown_execution",
+            ProposalErrorCode::NotAccepted => "not_accepted",
             ProposalErrorCode::Internal => "internal",
         }
     }
@@ -616,6 +946,18 @@ pub struct ProposalSubmissionError {
 }
 
 impl ProposalSubmissionError {
+    /// Reject a replay key that belongs to a different proposal kind.
+    pub fn idempotency_key_kind_mismatch(key: &str, existing: &WorkerProposal) -> Self {
+        Self::validation(vec![ProposalFieldError::new(
+            "idempotency_key",
+            format!(
+                "idempotency_key `{key}` was already used for a `{}` proposal (id {}); reuse it \
+                 only for a genuine retry of the same submission, or choose a different key",
+                existing.kind, existing.id
+            ),
+        )])
+    }
+
     /// A non-validation refusal: a code plus a human-readable explanation,
     /// with no per-field detail.
     pub fn new(code: ProposalErrorCode, message: impl Into<String>) -> Self {
@@ -671,6 +1013,34 @@ pub struct ReviewGuideProposalPayload {
     pub body_markdown: String,
 }
 
+/// Body of a labelled `No:` section, stopping at `Recommendation:`.
+pub fn explanation_no_section(explanation: &str) -> Option<String> {
+    explanation_section(explanation, "No:")
+}
+
+/// Body of the section introduced by `heading` (for example `Bypass limit:`),
+/// stopping at `Recommendation:`.
+pub fn explanation_section(explanation: &str, heading: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut body = Vec::new();
+    for line in explanation.lines() {
+        let trimmed = line.trim();
+        if !in_section {
+            if trimmed == heading {
+                in_section = true;
+            }
+            continue;
+        }
+        if trimmed == "Recommendation:" {
+            break;
+        }
+        if !trimmed.is_empty() {
+            body.push(trimmed);
+        }
+    }
+    if body.is_empty() { None } else { Some(body.join(" ")) }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorQuestion {
@@ -680,6 +1050,45 @@ pub struct OperatorQuestion {
     pub text: String,
     pub answer_type: OperatorAnswerType,
     pub explanation: String,
+}
+
+/// Counts that turn a `create_prerequisite_task` question into split-vs-bypass.
+///
+/// The affirmative answer (`Split`) still creates `name`. The other
+/// (`Bypass limit`) authorizes a `change/file-count` exception for
+/// this PR only, and redispatches so the next worker
+/// finishes in one PR. Absent on ordinary prerequisite questions, whose No
+/// records the declined path and redispatches with no authorization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileCountBypassSpec {
+    /// Projected upper-bound non-deleted file count of the single-PR change.
+    /// Recorded approval bound; checkleft does not enforce it. Before pushing,
+    /// the worker must compare the non-deleted count from `jj diff --stat`
+    /// against the PR base with this bound and ask again if it is over.
+    pub files: u32,
+    /// The repository `change/file-count` `max_files` limit.
+    pub limit: u32,
+}
+
+impl FileCountBypassSpec {
+    /// `files` and `limit` must both be at least 1, and `files` must exceed
+    /// `limit` — otherwise there is no over-limit change to split or keep.
+    pub fn validate(self) -> Result<(), String> {
+        if self.files == 0 {
+            return Err("file count must be at least 1".into());
+        }
+        if self.limit == 0 {
+            return Err("file-count limit must be at least 1".into());
+        }
+        if self.files <= self.limit {
+            return Err(format!(
+                "file count ({}) must exceed the limit ({}) to ask a split-or-bypass question",
+                self.files, self.limit
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -692,24 +1101,218 @@ pub enum OperatorAnswerType {
     /// description (or reuse an equivalent open task) and gate the blocked task
     /// behind it. The "why this task cannot unblock without it" line is the
     /// question's `explanation`.
+    ///
+    /// When `file_count_bypass` is set, No authorizes a file-count exception
+    /// for this PR instead of taking the ordinary declined path.
+    ///
+    /// `existing_id` / `existing_pr` are optional hints. When the engine
+    /// resolves either to an open task that already owns the work, it
+    /// rewrites the stored question to [`Self::LinkPrerequisiteTask`]
+    /// instead of offering to create a duplicate.
     CreatePrerequisiteTask {
         name: String,
         brief: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_count_bypass: Option<FileCountBypassSpec>,
+        /// Names for the two answers when they are distinct actions rather than
+        /// a genuine Yes/No (see [`AnswerOptionLabels`]). The stored answer is
+        /// still [`OperatorAnswer::YesNo`]. Absent on ordinary prerequisite
+        /// questions and on every question stored before labels existed, which
+        /// keep Yes / No.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_labels: Option<AnswerOptionLabels>,
+        /// Worker-supplied task id (canonical or friendly). The engine
+        /// resolves it; it is never matched by name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_id: Option<String>,
+        /// Worker-supplied GitHub PR URL, `owner/repo#n`, or PR number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_pr: Option<String>,
+    },
+    /// Gate this task behind an existing open task the worker named by id
+    /// or PR. Yes adds a `blocks` edge to that task and parks the asker;
+    /// it never creates a new task. `existing_id` / `existing_pr` are what
+    /// the worker sent; `work_item_id` / `name` / `pr_url` are filled by
+    /// the engine before the question is stored.
+    LinkPrerequisiteTask {
+        /// Worker-supplied task id (canonical or friendly).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_id: Option<String>,
+        /// Worker-supplied GitHub PR URL, `owner/repo#n`, or PR number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        existing_pr: Option<String>,
+        /// Canonical id the engine resolved. Empty on the worker payload;
+        /// required on a stored question.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        work_item_id: String,
+        /// Display name of the resolved task. Empty on the worker payload.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        /// Bound PR URL when the resolved task owns one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr_url: Option<String>,
+    },
+    /// One of `choices` is selected; the answer is
+    /// [`OperatorAnswer::MultipleChoice`] carrying the chosen string verbatim.
+    /// The card renders one button per choice. Producers must keep `choices`
+    /// valid per [`OperatorAnswerType::validate_choices`].
+    MultipleChoice {
+        choices: Vec<String>,
     },
 }
 
 impl OperatorAnswerType {
+    /// A multiple-choice question offers at least this many options (one
+    /// option is not a choice; use Yes/No for approval).
+    pub const MIN_CHOICES: usize = 2;
+    /// A multiple-choice question offers at most this many options: each is a
+    /// button on the kanban card.
+    pub const MAX_CHOICES: usize = 6;
+    /// Longest single choice, in characters; it is a button label.
+    pub const MAX_CHOICE_CHARS: usize = 80;
+
+    /// Check a multiple-choice option list: [`Self::MIN_CHOICES`] to
+    /// [`Self::MAX_CHOICES`] entries, each a non-empty single line of at most
+    /// [`Self::MAX_CHOICE_CHARS`] characters with no surrounding whitespace,
+    /// and no two equal. The same rule runs in the CLI, proposal validation
+    /// and the answer path so a stored question is always answerable.
+    pub fn validate_choices(choices: &[String]) -> Result<(), String> {
+        if !(Self::MIN_CHOICES..=Self::MAX_CHOICES).contains(&choices.len()) {
+            return Err(format!(
+                "a multiple-choice question needs between {} and {} choices, got {}",
+                Self::MIN_CHOICES,
+                Self::MAX_CHOICES,
+                choices.len()
+            ));
+        }
+        for (index, choice) in choices.iter().enumerate() {
+            if choice.trim().is_empty() {
+                return Err(format!("choice {} is empty", index + 1));
+            }
+            if choice.trim() != choice {
+                return Err(format!("choice {} has leading or trailing whitespace", index + 1));
+            }
+            if choice.contains(['\n', '\r']) {
+                return Err(format!("choice {} must be a single line", index + 1));
+            }
+            if choice.chars().count() > Self::MAX_CHOICE_CHARS {
+                return Err(format!(
+                    "choice {} is longer than {} characters",
+                    index + 1,
+                    Self::MAX_CHOICE_CHARS
+                ));
+            }
+            if choices[..index].contains(choice) {
+                return Err(format!("choice `{choice}` is listed more than once"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `answer` is the right shape for a question of this type. A
+    /// multiple-choice answer must be exactly one of the offered choices; the
+    /// other types are answered with Yes/No.
+    pub fn check_answer(&self, answer: &OperatorAnswer) -> Result<(), String> {
+        match (self, answer) {
+            (
+                Self::YesNo | Self::CreatePrerequisiteTask { .. } | Self::LinkPrerequisiteTask { .. },
+                OperatorAnswer::YesNo { .. },
+            ) => Ok(()),
+            (Self::MultipleChoice { choices }, OperatorAnswer::MultipleChoice { value }) => {
+                if choices.contains(value) {
+                    Ok(())
+                } else {
+                    Err(format!("`{value}` is not one of the offered choices"))
+                }
+            }
+            (Self::MultipleChoice { .. }, OperatorAnswer::YesNo { .. }) => {
+                Err("this question is answered by choosing one of its options, not Yes/No".into())
+            }
+            (Self::CreatePrerequisiteTask { .. }, OperatorAnswer::MultipleChoice { .. })
+                if self.option_labels().is_some() =>
+            {
+                let labels = self.option_labels().expect("guarded by is_some");
+                Err(format!(
+                    "this question is answered by choosing `{}` or `{}`",
+                    labels.yes, labels.no
+                ))
+            }
+            (
+                Self::YesNo | Self::CreatePrerequisiteTask { .. } | Self::LinkPrerequisiteTask { .. },
+                OperatorAnswer::MultipleChoice { .. },
+            ) => Err("this question is answered Yes or No, not by choosing an option".into()),
+        }
+    }
+
     /// The question wording the kanban shows for a prerequisite proposal. The
     /// engine owns the phrasing so every producer (CLI, validation) agrees.
     pub fn prerequisite_question_text(name: &str) -> String {
         format!("Create prerequisite task '{name}'? This task will wait for it.")
+    }
+
+    /// Placeholder wording for a link request before the engine resolves the
+    /// named task. Apply overwrites this with [`Self::link_prerequisite_question_text`].
+    pub fn link_prerequisite_unresolved_question_text() -> String {
+        "Wait for the existing work this request names? This task will wait for it.".into()
+    }
+
+    /// Wording for a stored link question. `pr_label` is a compact public
+    /// citation such as `acme/widget#9` when the task owns a PR.
+    pub fn link_prerequisite_question_text(name: &str, pr_label: Option<&str>) -> String {
+        match pr_label.filter(|label| !label.is_empty()) {
+            Some(label) => format!("Wait for '{name}' ({label})? This task will wait for it."),
+            None => format!("Wait for '{name}'? This task will wait for it."),
+        }
+    }
+
+    /// Worker-supplied id and PR hints, when this question names existing work.
+    pub fn existing_prerequisite_refs(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::CreatePrerequisiteTask {
+                existing_id,
+                existing_pr,
+                ..
+            }
+            | Self::LinkPrerequisiteTask {
+                existing_id,
+                existing_pr,
+                ..
+            } => (existing_id.as_deref(), existing_pr.as_deref()),
+            _ => (None, None),
+        }
+    }
+
+    /// The question wording for a split-vs-file-count-bypass proposal. States
+    /// the projected upper-bound file count, the repository limit, and the
+    /// first PR's name, and names both paths as the buttons do.
+    pub fn file_count_split_question_text(name: &str, spec: FileCountBypassSpec) -> String {
+        format!(
+            "Split this {}-file change (limit {}) by landing '{name}' first, or bypass the limit and keep it in one PR?",
+            spec.files, spec.limit
+        )
+    }
+
+    /// The recorded file-count approval spec on a split-vs-bypass prerequisite question.
+    pub fn file_count_bypass(&self) -> Option<FileCountBypassSpec> {
+        match self {
+            Self::CreatePrerequisiteTask { file_count_bypass, .. } => *file_count_bypass,
+            Self::YesNo | Self::LinkPrerequisiteTask { .. } | Self::MultipleChoice { .. } => None,
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorAnswer {
-    YesNo { value: bool },
+    YesNo {
+        value: bool,
+    },
+    /// The chosen option, verbatim from the question's
+    /// [`OperatorAnswerType::MultipleChoice`] `choices`. The engine records
+    /// the string; whatever consumes the answer interprets it.
+    MultipleChoice {
+        value: String,
+    },
 }
 
 /// The open question projected onto a task for board and detail readers.
@@ -732,7 +1335,16 @@ pub struct OperatorQuestionView {
 pub enum OperatorQuestionStatus {
     Open,
     Answered,
+    Dismissed,
     Withdrawn,
+}
+
+/// Who closed a question without choosing an answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorQuestionDismissal {
+    pub by: String,
+    pub at: String,
+    pub note: Option<String>,
 }
 
 /// Immutable question and durable answer/withdrawal history.
@@ -747,6 +1359,8 @@ pub struct OperatorQuestionRecord {
     pub answered_by: Option<String>,
     pub answered_at: Option<String>,
     pub withdrawn_reason: Option<String>,
+    #[serde(default)]
+    pub dismissal: Option<OperatorQuestionDismissal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -768,8 +1382,12 @@ impl std::fmt::Display for OperatorQuestionError {
             Self::NotFound => write!(f, "no operator question found for that id"),
             Self::Conflict { state, answer } => {
                 write!(f, "the question can no longer be answered (state: {state}")?;
-                if let Some(OperatorAnswer::YesNo { value }) = answer {
-                    write!(f, ", recorded answer: {}", if *value { "yes" } else { "no" })?;
+                match answer {
+                    Some(OperatorAnswer::YesNo { value }) => {
+                        write!(f, ", recorded answer: {}", if *value { "yes" } else { "no" })?;
+                    }
+                    Some(OperatorAnswer::MultipleChoice { value }) => write!(f, ", recorded answer: {value}")?,
+                    None => {}
                 }
                 write!(f, ")")
             }
@@ -791,6 +1409,7 @@ mod tests {
             explanation: "The requested change exceeds the current limit.".into(),
         };
         let payload = super::RunDoneProposalPayload {
+            queue_ci_evidence: None,
             outcome: super::RunDoneOutcome::Blocked,
             summary: "A decision is required.".into(),
             question: Some(question),
@@ -808,7 +1427,7 @@ mod tests {
                 answer
             );
         }
-        for kind in ["multiple_choice", "prompt", "unknown"] {
+        for kind in ["prompt", "unknown"] {
             let json = serde_json::json!({"kind": kind});
             assert!(serde_json::from_value::<OperatorAnswerType>(json.clone()).is_err());
             assert!(serde_json::from_value::<OperatorAnswer>(json).is_err());
@@ -817,6 +1436,10 @@ mod tests {
         let prerequisite = OperatorAnswerType::CreatePrerequisiteTask {
             name: "Fix fixture race".into(),
             brief: "Stand-alone brief".into(),
+            file_count_bypass: None,
+            option_labels: None,
+            existing_id: None,
+            existing_pr: None,
         };
         let json = serde_json::to_value(&prerequisite).unwrap();
         assert_eq!(
@@ -827,6 +1450,30 @@ mod tests {
             serde_json::from_value::<OperatorAnswerType>(json).unwrap(),
             prerequisite
         );
+        let split = OperatorAnswerType::CreatePrerequisiteTask {
+            name: "Extract the first PR".into(),
+            brief: "Stand-alone brief".into(),
+            file_count_bypass: Some(super::FileCountBypassSpec { files: 48, limit: 30 }),
+            option_labels: None,
+            existing_id: None,
+            existing_pr: None,
+        };
+        let json = serde_json::to_value(&split).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "create_prerequisite_task",
+                "name": "Extract the first PR",
+                "brief": "Stand-alone brief",
+                "file_count_bypass": {"files": 48, "limit": 30}
+            })
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), split);
+        assert_eq!(
+            split.file_count_bypass(),
+            Some(super::FileCountBypassSpec { files: 48, limit: 30 })
+        );
+        assert_eq!(prerequisite.file_count_bypass(), None);
         assert!(
             serde_json::from_value::<OperatorAnswerType>(
                 serde_json::json!({"kind": "create_prerequisite_task", "name": "x"})
@@ -834,13 +1481,154 @@ mod tests {
             .is_err(),
             "a prerequisite proposal without a brief is not decodable"
         );
+        let link = OperatorAnswerType::LinkPrerequisiteTask {
+            existing_id: Some("task_abc".into()),
+            existing_pr: Some("https://github.com/acme/widget/pull/9".into()),
+            work_item_id: String::new(),
+            name: String::new(),
+            pr_url: None,
+        };
+        let json = serde_json::to_value(&link).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "link_prerequisite_task",
+                "existing_id": "task_abc",
+                "existing_pr": "https://github.com/acme/widget/pull/9"
+            })
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), link);
+        let resolved = OperatorAnswerType::LinkPrerequisiteTask {
+            existing_id: None,
+            existing_pr: None,
+            work_item_id: "task_abc".into(),
+            name: "Land the wiring".into(),
+            pr_url: Some("https://github.com/acme/widget/pull/9".into()),
+        };
+        assert_eq!(
+            OperatorAnswerType::link_prerequisite_question_text("Land the wiring", Some("acme/widget#9")),
+            "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it."
+        );
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap()["kind"],
+            "link_prerequisite_task"
+        );
         assert_eq!(
             OperatorAnswerType::prerequisite_question_text("Fix fixture race"),
             "Create prerequisite task 'Fix fixture race'? This task will wait for it."
+        );
+        assert_eq!(
+            OperatorAnswerType::file_count_split_question_text(
+                "Extract the first PR",
+                super::FileCountBypassSpec { files: 48, limit: 30 }
+            ),
+            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or bypass the limit and keep it in one PR?"
         );
         let old: super::RunDoneProposalPayload =
             serde_json::from_str(r#"{"outcome":"blocked","summary":"Waiting"}"#).unwrap();
         assert!(old.question.is_none());
         assert!(serde_json::to_value(old).unwrap().get("question").is_none());
+    }
+
+    fn choices(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn multiple_choice_question_and_answer_round_trip() {
+        let question = OperatorAnswerType::MultipleChoice {
+            choices: choices(&["Ship now", "Wait a week"]),
+        };
+        let json = serde_json::to_value(&question).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "multiple_choice", "choices": ["Ship now", "Wait a week"]})
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), question);
+        let answer = OperatorAnswer::MultipleChoice {
+            value: "Ship now".into(),
+        };
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "multiple_choice", "value": "Ship now"})
+        );
+        assert_eq!(serde_json::from_value::<OperatorAnswer>(json).unwrap(), answer);
+        // A multiple-choice type without options, or answer without a value, is not decodable.
+        assert!(serde_json::from_value::<OperatorAnswerType>(serde_json::json!({"kind": "multiple_choice"})).is_err());
+        assert!(serde_json::from_value::<OperatorAnswer>(serde_json::json!({"kind": "multiple_choice"})).is_err());
+    }
+
+    #[test]
+    fn choice_lists_must_be_two_to_six_distinct_non_empty_single_lines() {
+        let ok = |items: &[&str]| OperatorAnswerType::validate_choices(&choices(items));
+        assert!(ok(&["a", "b"]).is_ok());
+        assert!(ok(&["a", "b", "c", "d", "e", "f"]).is_ok());
+        assert!(ok(&[]).is_err());
+        assert!(ok(&["only"]).is_err());
+        assert!(ok(&["a", "b", "c", "d", "e", "f", "g"]).is_err());
+        assert!(ok(&["a", ""]).is_err());
+        assert!(ok(&["a", "  "]).is_err());
+        assert!(ok(&["a", " b"]).is_err());
+        assert!(ok(&["a", "b "]).is_err());
+        assert!(ok(&["a", "b\nc"]).is_err());
+        assert!(ok(&["a", "a"]).is_err());
+        assert!(ok(&["a", "A"]).is_ok(), "distinctness is exact, not case-folded");
+        let long = "x".repeat(OperatorAnswerType::MAX_CHOICE_CHARS + 1);
+        assert!(ok(&["a", &long]).is_err());
+        let limit = "é".repeat(OperatorAnswerType::MAX_CHOICE_CHARS);
+        assert!(ok(&["a", &limit]).is_ok(), "the limit counts characters, not bytes");
+    }
+
+    #[test]
+    fn answers_must_fit_the_question_type() {
+        let pick = OperatorAnswerType::MultipleChoice {
+            choices: choices(&["Ship now", "Wait a week"]),
+        };
+        let choose = |value: &str| OperatorAnswer::MultipleChoice { value: value.into() };
+        let yes = OperatorAnswer::YesNo { value: true };
+        assert!(pick.check_answer(&choose("Wait a week")).is_ok());
+        assert!(pick.check_answer(&choose("wait a week")).is_err());
+        assert!(pick.check_answer(&choose("Something else")).is_err());
+        assert!(pick.check_answer(&yes).is_err());
+        assert!(OperatorAnswerType::YesNo.check_answer(&yes).is_ok());
+        assert!(OperatorAnswerType::YesNo.check_answer(&choose("Ship now")).is_err());
+        let prerequisite = OperatorAnswerType::CreatePrerequisiteTask {
+            name: "n".into(),
+            brief: "b".into(),
+            file_count_bypass: None,
+            option_labels: None,
+            existing_id: None,
+            existing_pr: None,
+        };
+        assert!(prerequisite.check_answer(&yes).is_ok());
+        assert!(prerequisite.check_answer(&choose("n")).is_err());
+        let spec = super::FileCountBypassSpec { files: 48, limit: 30 };
+        assert!(spec.validate().is_ok());
+        assert!(super::FileCountBypassSpec { files: 0, limit: 30 }.validate().is_err());
+        assert!(super::FileCountBypassSpec { files: 48, limit: 0 }.validate().is_err());
+        assert!(super::FileCountBypassSpec { files: 30, limit: 30 }.validate().is_err());
+        assert!(super::FileCountBypassSpec { files: 29, limit: 30 }.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod explanation_tests {
+    #[test]
+    fn no_section_stops_before_details() {
+        assert_eq!(
+            super::explanation_no_section(
+                "Context:\nContext\nYes:\nYes\nNo:\n  Ship the smaller change.\n\n Keep the rest.\nRecommendation:\nYes\nDetails:\nNo:\nStay blocked."
+            ),
+            Some("Ship the smaller change. Keep the rest.".into())
+        );
+        assert_eq!(super::explanation_no_section("Context:\nNo answer section"), None);
+        assert_eq!(
+            super::explanation_section(
+                "Context:\nC\nSplit:\nLand the first PR.\nBypass limit:\n Keep one PR.\nRecommendation:\nBypass limit",
+                "Bypass limit:"
+            ),
+            Some("Keep one PR.".into())
+        );
     }
 }

@@ -674,9 +674,11 @@ struct WorkEditSheet: View {
                         Text(status.replacingOccurrences(of: "_", with: " ").capitalized).tag(status)
                     }
                 }
+                // `critical` is human-only on the engine side; the app is a
+                // human surface, so it is offered here. See `WorkPriority`.
                 Picker("Priority", selection: $priority) {
-                    ForEach(["low", "medium", "high"], id: \.self) { priority in
-                        Text(priority.capitalized).tag(priority)
+                    ForEach(WorkPriority.allCases) { priority in
+                        Text(priority.label).tag(priority.rawValue)
                     }
                 }
                 TextField("PR URL", text: $prURL)
@@ -889,17 +891,81 @@ struct GitHubAccountSection: View {
     }
 }
 
-/// Capsule chip surfacing a repo's short name on a kanban card or
-/// product header. Hover tooltip carries the full URL plus the
-/// provenance string ("Inherited from product" vs "Repo set on this
-/// card") so the reader can tell where the URL came from without
-/// digging into the popover. Pure view — all the mode/provenance
-/// logic lives on `RepoChipPresentation` so tests don't need a
-/// SwiftUI host.
-///
-/// The chip renders in a neutral style matching `WorkStatusBadge`
-/// (used by `Blocked` and the project tag). Earlier the override
-/// variant carried an accent-blue tint, but the color had no stable
-/// meaning to readers — and with per-card chips now only appearing
-/// on rows that carry their own repo, the "this row is special" signal
-/// is already conveyed by the chip's mere presence on the card.
+/// Inline markdown preview/edit for a work-item description. Save is
+/// explicit; the caller owns dirty text so a remote update cannot wipe it.
+struct WorkItemBriefEditor: View {
+    let title: String
+    let source: String
+    @Binding var draft: String
+    let isEditing: Bool
+    let remoteChanged: Bool
+    let readOnly: Bool
+    var showsAgentNotice: Bool = false
+    var onEdit: () -> Void
+    var onCancel: () -> Void
+    var onSave: () -> Void
+    var onReload: () -> Void
+    @State private var showsEditor = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(title).font(.headline)
+                Spacer()
+                Picker("Mode", selection: $showsEditor) {
+                    Text("Preview").tag(false)
+                    Text("Edit").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 180)
+                .disabled(readOnly)
+                .onChange(of: showsEditor) { _, editing in
+                    if editing { onEdit() }
+                }
+                if isEditing || showsEditor {
+                    Button("Cancel") {
+                        showsEditor = false
+                        onCancel()
+                    }
+                    Button("Save", action: onSave)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(readOnly || draft == source)
+                        .accessibilityIdentifier("navigator-brief-save")
+                }
+            }
+            if remoteChanged {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label("Brief changed remotely", systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                    Button("Reload", action: onReload)
+                    Text("Reload takes the latest stored text. Save keeps this draft.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityIdentifier("navigator-brief-remote-change")
+            }
+            if showsAgentNotice, showsEditor {
+                Text("Saving updates the stored brief. It is not delivered to a running agent.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if showsEditor {
+                TextEditor(text: $draft)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 120)
+                    .disabled(readOnly)
+                    .accessibilityIdentifier("navigator-brief-editor")
+            } else {
+                MarkdownDocumentChrome(title: title, source: draft, commentsEnabled: false)
+                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: isEditing) { _, editing in
+            if editing { showsEditor = true }
+            if !editing && draft == source { showsEditor = false }
+        }
+        .onAppear { if isEditing { showsEditor = true } }
+    }
+}

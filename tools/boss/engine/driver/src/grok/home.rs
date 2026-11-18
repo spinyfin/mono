@@ -6,7 +6,6 @@
 //! and lock. Permission isolation (T-01 findings) additionally scopes the
 //! worker process `HOME` so `~/.claude/settings.local.json` cannot load.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -17,11 +16,9 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use super::environment::GrokProcessEnvironment;
-#[cfg(test)]
-use super::environment::resolve_gh_config_dir;
-#[cfg(test)]
-use super::environment::resolve_login_keychain_source;
 use super::preflight::run_worker_preflight;
+#[cfg(test)]
+use crate::scoped_home::{resolve_gh_config_dir, resolve_login_keychain_source};
 use crate::transcript_store::provision_durable_sessions;
 
 /// Env override for the root under which per-run `GROK_HOME` directories live.
@@ -38,7 +35,7 @@ pub const GROK_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_GROK_SKIP_POSTURE_ASSERT";
 
 /// Process-global lock for tests that mutate [`GROK_HOMES_ROOT_ENV`] /
 /// [`GROK_AUTH_SOURCE_ENV`] / [`GROK_SKIP_POSTURE_ASSERT_ENV`].
-pub static GROK_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK as GROK_HOMES_ENV_TEST_LOCK;
 
 /// Default leaf under the system temp when [`GROK_HOMES_ROOT_ENV`] is unset.
 pub(crate) const GROK_HOMES_DIR_NAME: &str = "boss-grok-homes";
@@ -278,36 +275,7 @@ pub fn render_trusted_folders_toml(workspace: &Path) -> String {
 }
 
 /// Absolute path forms Grok's folder-trust store may key by on macOS.
-pub fn trust_path_variants(workspace: &Path) -> Vec<String> {
-    let mut paths = BTreeSet::new();
-    push_path_and_symlink_forms(&mut paths, workspace);
-    if let Ok(canon) = fs::canonicalize(workspace) {
-        push_path_and_symlink_forms(&mut paths, &canon);
-    }
-    paths.into_iter().collect()
-}
-
-fn push_path_and_symlink_forms(paths: &mut BTreeSet<String>, path: &Path) {
-    let s = path.display().to_string();
-    if s.is_empty() {
-        return;
-    }
-    paths.insert(s.clone());
-    // macOS /tmp → /private/tmp
-    if let Some(rest) = s.strip_prefix("/tmp") {
-        paths.insert(format!("/private/tmp{rest}"));
-    }
-    if let Some(rest) = s.strip_prefix("/private/tmp") {
-        paths.insert(format!("/tmp{rest}"));
-    }
-    // macOS /var → /private/var (cube workspaces often live under /var/folders…)
-    if let Some(rest) = s.strip_prefix("/var/") {
-        paths.insert(format!("/private/var/{rest}"));
-    }
-    if let Some(rest) = s.strip_prefix("/private/var/") {
-        paths.insert(format!("/var/{rest}"));
-    }
-}
+pub use crate::scoped_home::trust_path_variants;
 
 /// Provisional global hooks so `grok inspect` reports a registered inventory
 /// at `provision_workspace` time, before `write_permission_config` (which
@@ -508,8 +476,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     // rules from the repo root AGENTS.md, never `.grok/AGENTS.md`).
     let config_dir = workspace.join(".grok");
     fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
-    fs::write(config_dir.join("initial-prompt.txt"), prompt_text)
-        .with_context(|| format!("writing initial prompt to {}/initial-prompt.txt", config_dir.display()))?;
+    crate::initial_prompt::provision(&config_dir, &grok_home, prompt_text, &super::GrokDriver::default())?;
     fs::write(config_dir.join(".gitignore"), "*\n")
         .with_context(|| format!("writing gitignore under {}", config_dir.display()))?;
 
@@ -577,14 +544,15 @@ fn assert_grok_posture_with_environment(
     let mut command = Command::new("grok");
     command.arg("inspect").arg("--json").current_dir(workspace);
     environment.apply_to_command(&mut command);
-    let output = command.output().with_context(|| {
-        format!(
-            "running `grok inspect --json` with GROK_HOME={} HOME={} cwd={}",
-            grok_home.display(),
-            process_home.display(),
-            workspace.display()
-        )
-    })?;
+    let output = super::preflight::run_bounded(&mut command, super::preflight::PREFLIGHT_COMMAND_TIMEOUT)
+        .with_context(|| {
+            format!(
+                "running `grok inspect --json` with GROK_HOME={} HOME={} cwd={}",
+                grok_home.display(),
+                process_home.display(),
+                workspace.display()
+            )
+        })?;
 
     if !output.status.success() {
         bail!(
@@ -1312,5 +1280,20 @@ mod tests {
         // No Library/Keychains under this HOME at all.
         let _guard = MultiEnvGuard::set(&[("HOME", tmp.path())]);
         assert_eq!(resolve_login_keychain_source(), None);
+    }
+
+    #[test]
+    fn grok_process_home_preserves_host_bazel_disk_cache() {
+        let tmp = TempDir::new().unwrap();
+        let host = tmp.path().join("host");
+        let cache = host.join(".cache/bazelcache");
+        fs::create_dir_all(&cache).unwrap();
+        let _guard = MultiEnvGuard::set_and_clear(&[("HOME", &host)], &[]);
+        let process_home = tmp.path().join("process-home");
+        let environment =
+            GrokProcessEnvironment::resolve(&tmp.path().join("grok"), &process_home, &tmp.path().join("auth.json"))
+                .unwrap();
+        environment.provision_home_delegates().unwrap();
+        assert_eq!(fs::read_link(process_home.join(".cache/bazelcache")).unwrap(), cache);
     }
 }

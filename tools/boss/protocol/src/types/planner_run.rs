@@ -184,3 +184,21 @@ pub struct PlannerRun {
     pub created_at: String,
     pub updated_at: String,
 }
+
+/// Blob-free projection of a project's most recent settled (non-`running`)
+/// [`PlannerRun`], carried per project in [`crate::WorkTree`] so the kanban
+/// planner affordance renders without a `list_planner_runs` round trip.
+/// Holds exactly what the affordance needs to pick its glyph and to decide
+/// whether a locally cached full row is still current; the verbatim model
+/// output, audit lines and result text stay behind `list_planner_runs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct PlannerRunSummary {
+    /// `planner_runs.id` of the latest settled run.
+    pub run_id: String,
+    pub project_id: String,
+    /// One of the `PLANNER_OUTCOME_*` constants other than `running`.
+    pub outcome: String,
+    pub created_at: String,
+    pub updated_at: String,
+}

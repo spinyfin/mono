@@ -3,6 +3,11 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
+exports_files(
+    ["jj_repository.bzl"],
+    visibility = ["//tools/cube:__pkg__"],
+)
+
 rust_library(
     name = "recovery",
     srcs = glob(["src/**/*.rs"]),
@@ -11,16 +16,30 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/dispatch:__pkg__",
+        "//tools/boss/engine/execution-contracts:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
+        "//tools/boss/engine/recovery-fixtures:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
     ],
-    deps = [
-        "//tools/boss/log-files",
-    ] + all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True),
 )
 
 rust_test(
     name = "recovery_test",
-    size = "small",
+    size = "medium",
+    # Every bookmark/reconcile test drives a real `jj` subprocess against a
+    # scratch repo. Observed on the linux-amd64 CI runners over 60 recent
+    # main builds: p50 25 s, max 57 s against small's 60 s default budget;
+    # locally on an Apple Silicon dev box the whole target takes 12 s.
+    # Keep the moderate (300 s) timeout and medium size for loaded CI hosts.
+    timeout = "moderate",
     crate = ":recovery",
     data = ["@jj_test_tools//:jj"],
     edition = "2024",
@@ -31,9 +50,19 @@ rust_test(
     ),
     deps = [
         "//tools/boss/engine/test-git",
-        "//tools/boss/log-files",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
+)
+
+# Share the pinned recovery fixture tool without widening its repository exports.
+filegroup(
+    name = "jj_test_binary",
+    testonly = True,
+    srcs = ["@jj_test_tools//:jj"],
+    visibility = [
+        "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
+    ],
 )

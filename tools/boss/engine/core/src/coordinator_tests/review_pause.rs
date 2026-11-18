@@ -38,7 +38,7 @@ async fn pr_review_execution_routes_to_review_pool() {
     // pool_for_execution must hand back the review pool — claiming from
     // it yields a `review-` worker id.
     let wid = coord
-        .pool_for_execution(&review_exec)
+        .pool_for_execution_for_test(&review_exec)
         .claim_worker("exec-review", None)
         .await
         .unwrap();
@@ -58,7 +58,7 @@ async fn pr_review_execution_routes_to_review_pool() {
         .build();
     assert!(!coord.execution_targets_review_pool(&chore_exec));
     let wid2 = coord
-        .pool_for_execution(&chore_exec)
+        .pool_for_execution_for_test(&chore_exec)
         .claim_worker("exec-chore", None)
         .await
         .unwrap();
@@ -95,7 +95,7 @@ async fn review_prefix_worker_id_releases_to_review_pool() {
     assert_eq!(coordinator.review_worker_pool().idle_count().await, 1);
 
     // Release routes by prefix → the review-pool slot is freed.
-    coordinator.release_worker_and_kick(&wid, None).await;
+    coordinator.release_worker_and_kick(&wid, "exec-r", None).await;
     assert_eq!(
         coordinator.review_worker_pool().idle_count().await,
         2,
@@ -225,13 +225,13 @@ async fn pr_review_with_pr_url_positions_via_goto_not_create_change() {
     let coordinator = Arc::new(coord);
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
@@ -286,13 +286,13 @@ async fn pr_review_lease_failure_records_start_failure() {
     let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "schedule_execution must fail when the lease fails");
 
@@ -342,21 +342,25 @@ async fn pr_review_goto_failure_records_positioning_failed() {
     let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "schedule_execution must fail when goto fails");
 
-    // The workspace was leased and must be released after goto failure.
-    assert_eq!(
-        cube.release_calls.lock().await.len(),
-        1,
-        "workspace must be released after goto failure"
+    // Positioning failed before any recovery bookmark existed, so the
+    // workspace holds nothing of this run's and is handed straight back.
+    assert!(!cube.release_calls.lock().await.is_empty());
+    assert_eq!(db.get_execution(&execution.id).unwrap().cube_lease_id.as_deref(), None);
+    assert!(
+        !db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .any(|i| i.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND),
     );
 
     // A cube_workspace_positioning_failed attention item must exist.
@@ -399,13 +403,13 @@ async fn pr_review_without_pr_url_uses_create_change_path() {
     let coordinator = Arc::new(coord);
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_ok(),
@@ -759,10 +763,12 @@ async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row
     // `reconcile_product_executions` below does not also mint an ordinary
     // main-pool execution for this root chore itself.
     let root = create_test_chore_manual(&db, product.clone(), "Review guide root").id;
-    let (_series_id, comparison_id) = seed_review_guide_series(&db, &root);
-    let guide_execution = db
-        .create_pr_review_guide_execution(&comparison_id, "https://github.com/test/repo")
+    let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, boss_review_guide::PROMPT_VERSION)
         .unwrap();
+    let bound = db.dispatch_pr_review_guide_attempt(&attempt.id, &root).unwrap();
+    let guide_execution = db.get_execution(bound.execution_id.as_deref().unwrap()).unwrap();
 
     // An automation-produced chore, whose execution targets the automation
     // pool — mirrors `automation_pause_holds_automation_pool_row_until_resume`.
@@ -815,12 +821,32 @@ async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row
         1,
         "only the review-guide execution should have dispatched while automation is paused"
     );
+    assert_eq!(
+        calls[0].1, guide_execution.id,
+        "the runner must receive the execution bound to the guide attempt"
+    );
     assert!(
         calls[0].0.starts_with(REVIEW_WORKER_ID_PREFIX),
         "pr_review_guide must claim a review-pool worker id, got {:?}",
         calls[0].0
     );
     drop(calls);
+
+    let running = db
+        .pr_review_guide_attempt_for_execution(&guide_execution.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.id, attempt.id);
+    assert_eq!(running.status, "running");
+    assert_eq!(
+        db.get_pr_review_guide_summary_for_root(&root)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        "generating"
+    );
+    assert_eq!(coordinator.review_worker_pool().idle_count().await, 0);
+    assert_eq!(coordinator.automation_worker_pool().idle_count().await, 1);
 
     assert_eq!(
         db.get_execution(&auto_execution_id).unwrap().status,
@@ -855,7 +881,7 @@ async fn review_guide_refuses_an_explicit_remote_host_before_leasing() {
     .with_dispatch_events(recording.clone());
     coord.set_review_pool(WorkerPool::new_review(1));
     coord
-        .requested_host_ids
+        .requested_host_ids()
         .lock()
         .unwrap()
         .insert(execution.id.clone(), "remote".to_owned());

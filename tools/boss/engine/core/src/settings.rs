@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use boss_engine_offsite_backup::{CONFIG_SECTION, OffsiteConfig};
 use serde::{Deserialize, Serialize};
 
 /// One registered setting entry. Boolean-valued for v1; extend the
@@ -71,6 +72,9 @@ fn reject_removed_tmux_hosting_key(settings: &HashMap<String, toml::Value>) -> R
     Ok(())
 }
 
+/// Top-level table preserved verbatim across writes (`[backup.offsite]`).
+const BACKUP_TABLE_KEY: &str = "backup";
+
 /// Static registry. Append here, read with `SettingsStore::is_enabled`.
 pub const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
@@ -120,6 +124,10 @@ struct FileShape {
 #[derive(Debug, Default)]
 struct SettingsState {
     booleans: HashMap<String, bool>,
+    /// The `[backup]` table. Not a boolean setting (it is read straight from
+    /// the file by `database_backup::OffsiteRuntime`), but carried through
+    /// so that toggling a boolean setting never erases it from disk.
+    backup: Option<toml::Value>,
 }
 
 /// Thread-safe store. In-memory overrides keyed by setting key;
@@ -163,7 +171,10 @@ impl SettingsStore {
         let parsed: FileShape =
             toml::from_str(&contents).with_context(|| format!("parse settings file: {}", self.path.display()))?;
         reject_removed_tmux_hosting_key(&parsed.settings)?;
-        let mut next = SettingsState::default();
+        let mut next = SettingsState {
+            backup: parsed.settings.get(BACKUP_TABLE_KEY).cloned(),
+            ..SettingsState::default()
+        };
         for (key, value) in parsed.settings {
             // `workers.always_use_opus` was replaced by
             // `workers.non_opus_permission_mode`. If the old key is still in the
@@ -213,6 +224,72 @@ impl SettingsStore {
         self.write_to_disk()
     }
 
+    /// The stored `[backup.offsite]` configuration. `Err` when the section
+    /// is present but does not parse as an off-machine config.
+    pub fn offsite_config(&self) -> Result<OffsiteConfig> {
+        let backup = self.state.lock().expect("settings lock poisoned").backup.clone();
+        let Some(backup) = backup else {
+            return Ok(OffsiteConfig::default());
+        };
+        let mut root = toml::Table::new();
+        root.insert(BACKUP_TABLE_KEY.to_owned(), backup);
+        OffsiteConfig::from_toml_str(&toml::to_string(&root).context("serialize backup table")?)
+    }
+
+    /// Replace `[backup.offsite]` with `config` and atomically persist. An
+    /// enabled config must name an absolute destination and keep at least one
+    /// copy; a rejected config leaves memory and disk untouched. Other keys of
+    /// the `[backup]` table are preserved. The running engine does not pick
+    /// the change up until it restarts.
+    pub fn set_offsite_config(&self, config: &OffsiteConfig) -> Result<()> {
+        if config.enabled {
+            config.destination_setting()?;
+        }
+        let mut offsite = toml::Table::new();
+        offsite.insert("enabled".to_owned(), toml::Value::Boolean(config.enabled));
+        if let Some(destination) = &config.destination {
+            let destination = destination
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("{CONFIG_SECTION} destination is not valid UTF-8"))?;
+            offsite.insert("destination".to_owned(), toml::Value::String(destination.to_owned()));
+        }
+        offsite.insert(
+            "keep_hourly".to_owned(),
+            toml::Value::Integer(config.keep_hourly as i64),
+        );
+        offsite.insert("keep_daily".to_owned(), toml::Value::Integer(config.keep_daily as i64));
+
+        let mut backup = self
+            .state
+            .lock()
+            .expect("settings lock poisoned")
+            .backup
+            .clone()
+            .and_then(|value| match value {
+                toml::Value::Table(table) => Some(table),
+                _ => None,
+            })
+            .unwrap_or_default();
+        backup.insert("offsite".to_owned(), toml::Value::Table(offsite));
+        let backup = toml::Value::Table(backup);
+
+        // Round-trip through the real parser so the stored section is exactly
+        // what the engine will accept at startup.
+        let mut root = toml::Table::new();
+        root.insert(BACKUP_TABLE_KEY.to_owned(), backup.clone());
+        OffsiteConfig::from_toml_str(&toml::to_string(&root).context("serialize backup table")?)?;
+
+        let prior = {
+            let mut guard = self.state.lock().expect("settings lock poisoned");
+            guard.backup.replace(backup)
+        };
+        if let Err(err) = self.write_to_disk() {
+            self.state.lock().expect("settings lock poisoned").backup = prior;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Snapshot of every registered setting in registry order.
     pub fn snapshot_all(&self) -> Vec<SettingSnapshot> {
         let guard = self.state.lock().expect("settings lock poisoned");
@@ -235,6 +312,10 @@ impl SettingsStore {
                 .iter()
                 .map(|(key, value)| (key.clone(), toml::Value::Boolean(*value)))
                 .collect::<HashMap<_, _>>();
+            let mut settings = settings;
+            if let Some(backup) = &guard.backup {
+                settings.insert(BACKUP_TABLE_KEY.to_owned(), backup.clone());
+            }
             let shape = FileShape { settings };
             toml::to_string_pretty(&shape).context("serialize settings to TOML")?
         };
@@ -289,6 +370,78 @@ mod tests {
         let store = make_store(&tmp);
         let err = store.set("not_a_real_setting", true).unwrap_err();
         assert!(err.to_string().contains("not_a_real_setting"));
+    }
+
+    #[test]
+    fn backup_table_survives_a_boolean_toggle() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "[backup.offsite]\nenabled = true\ndestination = \"/mnt/sync\"\n").unwrap();
+        let store = SettingsStore::new(path.clone());
+        store.load().unwrap();
+        store.set("default_pr_draft_mode", true).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("/mnt/sync"), "backup table lost: {on_disk}");
+        let cfg = boss_engine_offsite_backup::OffsiteConfig::from_toml_str(&on_disk).unwrap();
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn offsite_config_round_trips_and_keeps_booleans() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(!store.offsite_config().unwrap().enabled);
+        store.set("default_pr_draft_mode", true).unwrap();
+        let config = OffsiteConfig {
+            enabled: true,
+            destination: Some(PathBuf::from("/mnt/sync")),
+            keep_hourly: 6,
+            keep_daily: 3,
+        };
+        store.set_offsite_config(&config).unwrap();
+        let reloaded = make_store(&tmp);
+        reloaded.load().unwrap();
+        assert_eq!(reloaded.offsite_config().unwrap(), config);
+        assert!(reloaded.is_enabled("default_pr_draft_mode"));
+    }
+
+    #[test]
+    fn invalid_offsite_config_is_rejected_without_writing() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        for config in [
+            OffsiteConfig {
+                enabled: true,
+                destination: None,
+                ..OffsiteConfig::default()
+            },
+            OffsiteConfig {
+                enabled: true,
+                destination: Some(PathBuf::from("relative")),
+                ..OffsiteConfig::default()
+            },
+            OffsiteConfig {
+                enabled: true,
+                destination: Some(PathBuf::from("/mnt/sync")),
+                keep_hourly: 0,
+                keep_daily: 0,
+            },
+        ] {
+            assert!(store.set_offsite_config(&config).is_err(), "{config:?}");
+        }
+        assert!(!store.path().exists());
+        assert!(!store.offsite_config().unwrap().enabled);
+    }
+
+    #[test]
+    fn disabled_offsite_config_may_keep_an_unset_destination() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        store.set_offsite_config(&OffsiteConfig::default()).unwrap();
+        assert_eq!(store.offsite_config().unwrap(), OffsiteConfig::default());
     }
 
     #[test]

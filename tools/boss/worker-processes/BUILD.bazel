@@ -1,0 +1,33 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "worker-processes",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["src/*.py"]),
+    crate_name = "boss_worker_processes",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/core/runtime:__pkg__",
+        "//tools/boss/engine/worker-bin:__pkg__",
+        "//tools/boss/tmux:__pkg__",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "worker_processes_test",
+    size = "small",
+    compile_data = glob(["src/*.py"]),
+    crate = ":worker-processes",
+    data = select({
+        "@platforms//os:macos": ["@worker_zsh//:zsh"],
+        "//conditions:default": [],
+    }),
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)

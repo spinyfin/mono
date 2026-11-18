@@ -51,7 +51,7 @@
 //! lease + workspace *columns* on the row for provenance). This sweep's
 //! redispatch path creates a fresh execution that never reclaims that lease
 //! in place, so a successful reconcile follows up with a best-effort
-//! [`crate::execution_liveness::force_release_lease_best_effort`] — gated on
+//! [`crate::workspace_lease_release::release_lease_after_inferred_death`] — gated on
 //! the absence of a non-terminal live-registry entry, because this reconcile
 //! is DB-only and does not tear the worker process down. Triage
 //! automation-run bookkeeping is finalized the same way
@@ -102,12 +102,12 @@ use std::time::Duration;
 
 use boss_protocol::WorkExecution;
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEventSink, Stage};
 use crate::durable_liveness::WorkerProcess;
-use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
 use crate::worker_readoption::LiveWorkerConvergence;
+use boss_execution_contracts::{CubeClient, LiveWorkerLiveness};
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
 /// interval — fast enough that a pane killed mid-run is cleared and its work
@@ -185,7 +185,13 @@ pub async fn run_one_pass(
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     let live_states = coordinator.live_worker_states();
 
-    let candidates = match work_db.list_non_terminal_executions_with_local_shell_pid() {
+    let db = work_db.clone();
+    let candidates = match crate::work::db_diagnostics::spawn_blocking(move || {
+        db.list_non_terminal_executions_with_local_shell_pid()
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.into()))
+    {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(
@@ -217,29 +223,15 @@ pub async fn run_one_pass(
     // clears), and hand the fact to the existing two-way policy. A bounded
     // probe is mandatory because convergence may signal the recorded process
     // group; an old recycled pid is not evidence.
-    let terminal_candidates = match work_db.list_recent_terminal_executions_with_local_shell_pid(
-        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-        now_epoch_secs,
-    ) {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(
-                error = %format!("{err:#}"),
-                "pane-death sweep: failed to list terminal executions with recent pids; skipping terminal convergence",
-            );
-            Vec::new()
-        }
-    };
-    for execution in terminal_candidates {
-        let process = crate::durable_liveness::probe_execution_worker_within(
-            work_db,
-            &execution.id,
-            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-            now_epoch_secs,
-        );
-        if !process.is_alive() {
-            continue;
-        }
+    let db = work_db.clone();
+    let terminal_candidates =
+        crate::work::db_diagnostics::spawn_blocking(move || gather_live_terminal_candidates(&db, now_epoch_secs))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(?error, "pane-death sweep: terminal gathering did not complete");
+                Vec::new()
+            });
+    for (execution, process) in terminal_candidates {
         tracing::warn!(
             execution_id = %execution.id,
             work_item_id = %execution.work_item_id,
@@ -263,6 +255,39 @@ pub async fn run_one_pass(
     outcome
 }
 
+/// Collect recent terminal rows with live local processes on the blocking pool.
+pub(crate) fn gather_live_terminal_candidates(
+    work_db: &WorkDb,
+    now_epoch_secs: i64,
+) -> Vec<(crate::work::TerminalExecutionRef, WorkerProcess)> {
+    let registry = work_db.metrics_registry();
+    let timer = crate::sweep_metrics::DEAD_PANE_TERMINAL.begin();
+    let rows = work_db
+        .list_recent_terminal_execution_refs_with_local_shell_pid(
+            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+            now_epoch_secs,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(?error, "pane-death sweep: could not list terminal candidates");
+            Vec::new()
+        });
+    let count = rows.len();
+    let candidates = rows
+        .into_iter()
+        .filter_map(|execution| {
+            let process = crate::durable_liveness::probe_execution_worker_within(
+                work_db,
+                &execution.id,
+                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                now_epoch_secs,
+            );
+            process.is_alive().then_some((execution, process))
+        })
+        .collect();
+    timer.finish(registry, count);
+    candidates
+}
+
 /// Durable, restart-robust evidence that a LOCAL execution's worker shell pid
 /// is dead (`kill(pid, 0) == ESRCH`), gated by `is_live()` and the grace
 /// window. Returns `Some(shell_pid)` only on positive evidence of death;
@@ -279,7 +304,7 @@ pub(crate) async fn shell_pid_death_evidence(
     work_db: &WorkDb,
     execution: &WorkExecution,
     now_epoch_secs: i64,
-    live_states: Option<&LiveWorkerStateRegistry>,
+    live_states: Option<&dyn LiveWorkerLiveness>,
 ) -> Option<i64> {
     // Only reconcile states where the design expects a LIVE pane to still be
     // holding the workspace: `running` (a pr_review reviewer pane) and
@@ -321,7 +346,13 @@ pub(crate) async fn shell_pid_death_evidence(
     // probe is still the right *read* here (this path's verb is "reconcile a
     // row", not "signal a process", and its failure direction is to decline);
     // corroboration is what stops a false `Gone` from becoming a false reap.
-    let process = crate::durable_liveness::probe_execution_worker(work_db, &execution.id);
+    let db = work_db.clone();
+    let execution_id = execution.id.clone();
+    let process = crate::work::db_diagnostics::spawn_blocking(move || {
+        crate::durable_liveness::probe_execution_worker(&db, &execution_id)
+    })
+    .await
+    .ok()?;
 
     // Corroborate a `Gone` verdict against the (in-memory) live-worker
     // registry before trusting it. Unlike `dead_pid_sweep`, this probe reads
@@ -387,7 +418,7 @@ pub async fn reconcile_if_pane_dead(
     dispatch_events: &dyn DispatchEventSink,
     execution: &WorkExecution,
     now_epoch_secs: i64,
-    live_states: Option<&LiveWorkerStateRegistry>,
+    live_states: Option<&dyn LiveWorkerLiveness>,
     cube_client: Option<&dyn CubeClient>,
 ) -> bool {
     let Some(shell_pid) = shell_pid_death_evidence(work_db, execution, now_epoch_secs, live_states).await else {
@@ -395,10 +426,6 @@ pub async fn reconcile_if_pane_dead(
     };
 
     let prior_status = execution.status.as_str();
-
-    // Export the recorded shared-store reference, independently of the lease.
-    // A failed inspection raises recovery attention while the reap continues.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
 
     // State only what was observed. This previously asserted "pane died with
     // its host app", which is a hardcoded causal claim this code never
@@ -432,7 +459,6 @@ pub async fn reconcile_if_pane_dead(
             "prior_status": prior_status,
             "shell_pid": shell_pid,
             "kind": execution.kind.as_str(),
-            "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
         }),
     )
     .await;
@@ -474,9 +500,12 @@ pub async fn reconcile_if_pane_dead(
                      still tracks this execution — worker may still be writing the workspace",
                 );
             } else {
-                crate::execution_liveness::force_release_lease_best_effort(
-                    &execution.id,
-                    lease_id,
+                crate::workspace_lease_release::release_lease_after_inferred_death(
+                    work_db,
+                    execution,
+                    crate::workspace_lease_release::PaneStatus::Gone,
+                    None,
+                    Some(cube),
                     cube.force_release_lease(lease_id, Some("pane-death reconcile: worker pane gone")),
                 )
                 .await;
@@ -491,6 +520,7 @@ pub async fn reconcile_if_pane_dead(
 mod tests {
     use super::*;
     use crate::dispatch_events::NoopDispatchEventSink;
+    use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
     use crate::work::{AutomationFireRecord, WorkDb};
     use boss_protocol::{
@@ -1109,7 +1139,7 @@ mod tests {
     /// row reaped without this release leaks its lease forever. This is the
     /// "leases leak durably" half of the false-reap incident.
     #[tokio::test]
-    async fn run_one_pass_force_releases_the_reaped_executions_lease() {
+    async fn run_one_pass_reaps_and_releases_a_lease_without_recovery_proof() {
         let (_d, db) = open_db();
         let product = create_product(&db);
         let automation = create_automation(&db, &product);
@@ -1129,10 +1159,16 @@ mod tests {
         let outcome = run_one_pass(db.as_ref(), coordinator, &sink, &convergence, &cube).await;
 
         assert_eq!(outcome.reaped, 1);
-        assert_eq!(
-            cube.force_release_calls(),
-            vec!["lease-1".to_owned()],
-            "the reaped execution's cube lease must be force-released",
+        assert_eq!(cube.force_release_calls(), ["lease-1"]);
+        assert_eq!(db.get_execution(&exec.id).unwrap().cube_lease_id.as_deref(), None);
+        // Nothing was recorded to preserve from, which is reported rather than
+        // a reason to keep the workspace leased.
+        let items = db.list_attention_items(&exec.id).unwrap();
+        assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
         );
     }
 

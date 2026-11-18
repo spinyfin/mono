@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../.."
 
 [dependencies]
+git-utils = { path = "../../../lib/rust/git_utils" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }

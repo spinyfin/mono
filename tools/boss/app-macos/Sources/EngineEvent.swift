@@ -1,20 +1,64 @@
 import Foundation
 
+/// How much of a product's board one `work_invalidated` push can have
+/// changed. Mirrors `boss_protocol::InvalidationClass`; the engine chooses it
+/// where it publishes.
+enum InvalidationClass: Equatable, Sendable {
+    /// A card may have been added, removed, moved or re-wired, or the writer
+    /// does not say otherwise: re-read the whole board. This is also what a
+    /// push without a class (an older engine) and an unknown class mean.
+    case structural
+    /// Only runtime fields of the named cards changed (dispatch wait, PR poll
+    /// state, merge-queue position, doc pointer): the named cards can be
+    /// re-read alone.
+    case runtime
+
+    init(wire: String?) {
+        self = wire == "runtime" ? .runtime : .structural
+    }
+}
+
+/// One card of a `work_runtime_patch` reply, with the runtime the board tree
+/// would have carried for it.
+struct WorkRuntimePatchCard {
+    let item: WorkItemPayload
+    let runtime: WorkTaskRuntime
+}
+
 enum EngineEvent {
+    case criticalPriorityRequests([CriticalPriorityRequest])
+    case criticalPriorityResolved(String)
+    case operatorDecisionSnapshot(questions: [DecisionNotification])
     case connected
     case disconnected
     /// The engine had to drop pending invalidations for this session's
     /// outbound queue while riding out a publish burst (e.g. a
     /// merge-poller sweep across many products/executions) instead of
-    /// disconnecting. The socket is still up — treat this like the
-    /// refetch-on-reconnect path, silently, with no connection-lost UI.
+    /// disconnecting. The socket is still up — refetch what a dropped push
+    /// could have covered (coalesced and backed off, see
+    /// `ChatViewModel+ResyncRefetch.swift`), silently, with no
+    /// connection-lost UI.
     case resyncRequired
-    case workInvalidated(topic: String, productId: String?, itemIds: [String])
+    /// A read-only text snapshot (or the reason there is none) of a remote
+    /// worker's pane, pushed on `pane_capture.<run_id>` while subscribed.
+    case workerPaneCapture(RemotePaneCapture)
+    case workInvalidated(topic: String, productId: String?, itemIds: [String], invalidationClass: InvalidationClass = .structural)
+    /// Reply to `get_work_runtime_patch`: the named cards, and the rest of
+    /// each one's revision chain, re-read without a board assembly. `absent`
+    /// lists requested ids that are no longer live cards of the product.
+    /// `isComplete` is false when a card in the reply could not be decoded:
+    /// the consumer must not trust such a patch.
+    case workRuntimePatch(productId: String, cards: [WorkRuntimePatchCard], absent: [String], isComplete: Bool, requestId: String? = nil, revision: UInt64? = nil)
     case appSessionRegistered
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
-    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency], ideas: [WorkIdea])
+    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency], ideas: [WorkIdea], attentionItems: [WorkAttentionItem] = [], attentionGroups: [AttentionGroup] = [], attentionMembers: [Attention] = [], plannerRuns: [PlannerRunSummary] = [], requestId: String? = nil, revision: UInt64? = nil)
+    /// The engine is running a full (cold) board build for `productId`
+    /// (`board_population_progress`). `phase` is `started`, `stage` or
+    /// `done`; `stage` names the current stage on `stage` events. Never a
+    /// reply and never board state: it only describes the wait.
+    case boardPopulationProgress(productId: String, phase: String, stage: String?, elapsedMs: Int, items: Int?, bytes: Int?)
     case workItemCreated(item: WorkItemPayload)
     /// Batch counterpart of `workItemCreated`, pushed on a product's work
     /// topic by background jobs that create many rows at once with no
@@ -24,38 +68,47 @@ enum EngineEvent {
     /// Unlike `workItemCreated`, applying this must not steal the
     /// user's current selection/filters — it's a passive data refresh.
     case workItemsCreated(items: [WorkItemPayload])
-    case workItemUpdated(item: WorkItemPayload)
+    case workItemUpdated(item: WorkItemPayload, revision: UInt64? = nil)
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
+    case boardReadFailed(requestId: String?)
     case workError(message: String, requestId: String?)
+    /// A `work_item_updated` reply whose payload failed to decode. Carries
+    /// the envelope request id so a pending request waiting on that reply
+    /// (e.g. a project archive) can settle instead of waiting forever.
+    case workItemUpdateDecodeFailed(message: String, requestId: String?)
     /// Typed refusal of an `answer_operator_question` request (`not_found`,
     /// `conflict`, `validation_failed`). `message` is user-readable;
     /// `requestId` is the envelope id of the answer request it refuses.
     case operatorQuestionError(message: String, requestId: String?)
-    case error(message: String)
+    case error(message: String, requestId: String? = nil)
     /// Socket-level failure (connect/send/receive). Never drives a modal:
     /// the debounced connection-lost banner is the user-facing signal.
     case transportError(message: String)
-    /// A request was issued while the socket was down and could not be
-    /// queued (non-idempotent). `requestKind` is the wire `type`.
+    /// A request was issued while the socket was down. Mutations are held
+    /// for explicit Retry, never automatically replayed. `requestKind` is
+    /// the wire `type`.
     case notConnected(requestKind: String)
+    case actionNotSaved(requestKind: String)
+    /// A retried batch was acknowledged (nil) or its delivery is uncertain.
+    case retriedActionsStatus(message: String?)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on
     /// `worker.live_states` whenever any slot changes.
-    case workerLiveStatesList(states: [WorkerLiveState])
-    /// Snapshot of slot ids whose live-status summarizer has been
-    /// manually disabled by the human. Sourced from a one-shot reply
-    /// to `list_live_status_disabled_slots`.
-    case liveStatusDisabledSlotsList(slotIds: [Int])
-    /// Echoed result of a `set_live_status_enabled` toggle. The UI
-    /// uses this to confirm the engine accepted the change before
-    /// flipping local state.
-    case liveStatusEnabledSet(slotId: Int, enabled: Bool)
+    case workerLiveStatesList(
+        states: [WorkerLiveState],
+        doingSections: [String: DoingSection] = [:],
+        queuedDispatch: [String: QueuedDispatch] = [:]
+    )
     /// Engine reply to a `ResolveProjectDesignDoc` RPC. Carries the
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.
     case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
+    /// Engine reply to `ResolveExecutionLabels`: one label per requested
+    /// execution id, in request order. Names the work item (and PR) of a run
+    /// the engine has already released.
+    case executionLabelsResolved(labels: [ExecutionWorkLabel])
     /// Engine-owned live supplement returned by GetReviewGuideSummary.
     /// `seriesId` is the summary's series id; the app caches findings by
     /// that id so a late reply for another series cannot hide or replace
@@ -64,7 +117,7 @@ enum EngineEvent {
     /// Engine reply to `GetReviewGuideContent`. `content` is `nil` when the
     /// version id is unknown (e.g. a stale open racing a history change).
     /// `versionId` is echoed from the request — the response-identity guard.
-    case reviewGuideContent(versionId: String, content: ReviewGuideVersionContent?)
+    case reviewGuideContent(versionId: String, content: ReviewGuideVersionContent?, requestId: String? = nil)
     /// Engine reply to `RetryReviewGuide`. `alreadyRequested` is true when
     /// the idempotency token matched an existing attempt rather than
     /// creating a new one.
@@ -110,25 +163,25 @@ enum EngineEvent {
     /// created (or a `retry` reset an existing one) and a worker is
     /// about to take over. The Engine tab refreshes; the badge state
     /// is unaffected (only `succeeded` counts as a "cleared" event).
-    case conflictResolutionStarted(productID: String, workItemID: String, attemptID: String, prURL: String)
+    case conflictResolutionStarted(productID: String, workItemID: String, attemptID: String, prURL: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: an attempt finished successfully. Drives the
     /// "🔧 conflict cleared" PR-card badge (Phase 5 #15) and refreshes
     /// the Engine tab.
-    case conflictResolutionSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String)
+    case conflictResolutionSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: an attempt failed terminally.
-    case conflictResolutionFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case conflictResolutionFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: an attempt was abandoned on purpose.
-    case conflictResolutionAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case conflictResolutionAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: a fresh CI-remediation attempt was created
     /// for an in-review PR. `attemptKind` is `"fix"` or `"retrigger"`
     /// per the engine's pre-spawn triage. Mirrors
     /// `conflictResolutionStarted` (merge-conflict-handling-in-review
     /// Phase 10 #34).
-    case ciRemediationStarted(productID: String, workItemID: String, attemptID: String, prURL: String, attemptKind: String)
+    case ciRemediationStarted(productID: String, workItemID: String, attemptID: String, prURL: String, attemptKind: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: the engine observed the parent PR back at
     /// CI clean and retired the remediation attempt. The parent has
     /// been flipped from `blocked: ci_failure` back to `in_review`.
-    case ciRemediationSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String)
+    case ciRemediationSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: the engine cleared `blocked: ci_failure` on a
     /// task but found no active remediation attempt to retire — the prior
     /// attempt was already terminal (failed/abandoned). Distinct from
@@ -139,10 +192,10 @@ enum EngineEvent {
     /// `failed`. Fired when the worker calls
     /// `boss engine ci mark-failed` or when the completion-path
     /// catch-all (`no_push_no_classification`) fires.
-    case ciRemediationFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case ciRemediationFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: a CI-remediation attempt was abandoned on
     /// purpose (parent PR closed externally, manual move, etc.).
-    case ciRemediationAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    case ciRemediationAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: the engine has given up auto-fixing this
     /// PR's CI. The parent is now `blocked: ci_failure_exhausted` and
     /// the user is the next actor (typically via
@@ -165,10 +218,11 @@ enum EngineEvent {
     /// silently broke summarization with no UI affordance.
     case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue])
     /// Response to `get_driver_traffic_split` / `set_driver_traffic_split`
-    /// — the current effective three-way allocation of eligible,
+    /// — the current effective four-way allocation of eligible,
     /// `standard`-reasoning implementation work between the `grok`,
-    /// `claude`, and `codex` drivers. Its shares always sum to 100.
+    /// `claude`, `codex`, and `agy` drivers. Its shares always sum to 100.
     case driverTrafficSplitResult(split: DriverTrafficSplit)
+    case codexSolPercentage(percentage: Int)
     /// Response to `get_driver_quota_usage` — one entry per implemented
     /// driver, each either the provider's own reported figure or an explicit
     /// typed failure. Never a blank that could read as headroom.
@@ -197,6 +251,9 @@ enum EngineEvent {
     /// persisted the new value. The Settings window uses this as the
     /// "saved" signal.
     case settingSet(key: String, enabled: Bool)
+    /// Response to `get_offsite_backup` and `set_offsite_backup` — the
+    /// persisted `[backup.offsite]` configuration.
+    case offsiteBackupSettings(OffsiteBackupSettings, requestId: String? = nil)
     /// Response to `list_hosts` — all registered hosts with capabilities.
     case hostsList(hosts: [EngineHost])
     /// Response to `add_host` or `get_host` — one host with capabilities.
@@ -291,20 +348,18 @@ enum EngineEvent {
     /// (rotated, GC'd, or never recorded). `reason` is human-readable and
     /// surfaced as a "transcript unavailable" state, never an error.
     case executionTranscriptUnavailable(executionId: String, reason: String)
-    // MARK: Automation events (maintenance-tasks.md T7)
+    // MARK: Automation events
     /// Response to `list_automations` — all automations for a product.
     /// `openTaskCounts` maps automation id → open-task count, batched inline.
-    case automationsList(productID: String, automations: [AppAutomation], openTaskCounts: [String: Int])
+    case automationsList(productID: String, automations: [AppAutomation], openTaskCounts: [String: Int], lastRuns: [String: AppAutomationRun] = [:])
     /// Response to `create_automation` — the newly created automation.
-    case automationCreated(automation: AppAutomation)
+    case automationCreated(automation: AppAutomation, openTaskCount: Int? = nil, lastRun: AppAutomationRun? = nil)
     /// Response to `get_automation` — a single automation row.
-    case automationResult(automation: AppAutomation)
+    case automationResult(automation: AppAutomation, openTaskCount: Int? = nil, lastRun: AppAutomationRun? = nil)
     /// Response to `update_automation`, `enable_automation`, or `disable_automation`.
-    case automationUpdated(automation: AppAutomation)
+    case automationUpdated(automation: AppAutomation, openTaskCount: Int? = nil, lastRun: AppAutomationRun? = nil)
     /// Response to `delete_automation` — the id of the deleted row.
     case automationDeleted(automationID: String)
-    /// Response to `get_automation_open_task_count`.
-    case automationOpenTaskCount(automationID: String, count: Int)
     /// Response to `list_automation_runs` — the run history for one automation.
     case automationRunsList(automationID: String, runs: [AppAutomationRun])
     // MARK: Idea events
@@ -329,10 +384,14 @@ enum EngineEvent {
     /// Pushed (and returned) whenever a group's state or a member's
     /// answer-state changes — e.g. after `answer_attention` /
     /// `dismiss_attention`. Carries the group's refreshed members.
-    case attentionGroupUpdated(group: AttentionGroup, members: [Attention])
+    /// `requestId` is the envelope id of *this* client's matching reply;
+    /// a broadcast from another session leaves it `nil`.
+    case attentionGroupUpdated(group: AttentionGroup, members: [Attention], requestId: String? = nil)
     /// Pushed after `action_attention_group` succeeds: the now-`actioned`
     /// group, its terminal members, and the produced-artifact ref.
-    case attentionGroupActioned(group: AttentionGroup, members: [Attention])
+    /// `requestId` is the envelope id of *this* client's matching reply;
+    /// a broadcast from another session leaves it `nil`.
+    case attentionGroupActioned(group: AttentionGroup, members: [Attention], requestId: String? = nil)
     /// Reply to `list_attention_merges` — the `attention_merges` provenance
     /// rows folded into one canonical `Attention`, chronological.
     case attentionMergesList(attentionID: String, merges: [AttentionMerge])

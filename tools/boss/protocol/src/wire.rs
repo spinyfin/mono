@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dispatch_focus::{DispatchFocusAction, DispatchFocusState};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::health_wire::EngineHealthReport;
 use crate::host_registry_wire::HostSnapshot;
@@ -9,82 +10,12 @@ use crate::hosted_pane_status::HostedPaneStatus;
 use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::tmux_worker_status::TmuxWorkerStatus;
-use crate::types::{
-    AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
-    AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
-    ConflictResolution, CoordinatorGuidanceView, CoordinatorHandoffView, CreateAttentionInput,
-    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateDecisionInput,
-    CreateExecutionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
-    DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
-    DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
-    GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch, LinkExternalRefInput,
-    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
-    ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt,
-    ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
-    Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle,
-    WorkerProposal, WorkerTierDenial,
-};
 
-/// Outcome of the live `getQueue` smoke check `boss engine trunk status`
-/// runs against a `trunk_queue`-mechanism product's queue, once one exists.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrunkQueueCheckDto {
-    pub ok: bool,
-    pub detail: String,
-}
+mod type_imports;
+use type_imports::*;
 
-pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
-
-/// Global topic carrying GitHub OAuth auth-state pushes
-/// ([`FrontendEvent::GitHubAuthState`]). Unlike work topics this is not
-/// per-product: the engine owns a single per-host (github.com) auth state and
-/// fans every transition out on this one topic. The macOS app subscribes to it
-/// to render the issue-sync "GitHub account" section as the device flow
-/// advances. See the OAuth device-flow design (§3 state machine, §4 RPC).
-pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
-
-/// Global topic carrying engine-health pushes
-/// ([`FrontendEvent::EngineHealthResult`]). The engine fans every
-/// health-state change (dispatch pause/resume, API key changes, etc.)
-/// out on this topic so subscribed frontends update without polling.
-pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
-
-pub fn work_product_topic(product_id: &str) -> String {
-    format!("work.product.{product_id}")
-}
-
-pub fn execution_topic(execution_id: &str) -> String {
-    format!("executions.{execution_id}")
-}
-
-/// Per-run topic that carries probe lifecycle pushes for `run_id`.
-/// Subscribers (e.g. a `bossctl probe` invocation that wants to wait
-/// for the worker's reply) join this topic on the run they care about
-/// and observe [`FrontendEvent::ProbeReplied`] when the engine pops a
-/// queued probe and watches the next Stop boundary land.
-pub fn probe_topic(run_id: &str) -> String {
-    format!("probes.{run_id}")
-}
-
-/// Per-artifact comment topic. Fires whenever any comment row on the
-/// artifact changes (create / status flip / re-anchor); subscribers
-/// refetch via `comments_list` / `comments_resolve`. Grammar:
-/// `comments.artifact.<artifact_kind>:<artifact_id>`.
-pub fn comment_topic(artifact_kind: &str, artifact_id: &str) -> String {
-    format!("comments.artifact.{artifact_kind}:{artifact_id}")
-}
-
-/// Per-product editorial-actions topic. The engine pushes a
-/// [`TopicEventPayload::WorkEditorialAction`] on this topic after every
-/// PreToolUse hook decision so the UI can badge product cards.
-pub fn editorial_actions_topic(product_id: &str) -> String {
-    format!("editorial_actions.{product_id}")
-}
+mod topics;
+pub use topics::*;
 
 fn default_pool_size() -> i64 {
     1
@@ -339,6 +270,8 @@ pub enum FrontendRequest {
     ClassifyCiRemediation {
         attempt_id: String,
         triage_class: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_ci_evidence: Option<crate::QueueCiEvidence>,
     },
 
     /// Read-only summary of the `[Revise]` banner's state for an
@@ -504,8 +437,10 @@ pub enum FrontendRequest {
     /// source fields in the input. Replies with
     /// [`FrontendEvent::AttentionCreated`].
     CreateAttention {
+        /// Boxed so `FrontendRequest` stays within clippy's
+        /// `large_enum_variant` budget; serde output is identical.
         #[serde(flatten)]
-        input: CreateAttentionInput,
+        input: Box<CreateAttentionInput>,
     },
 
     CreateAttentionItem {
@@ -678,6 +613,15 @@ pub enum FrontendRequest {
         reason: Option<String>,
     },
 
+    /// Close an open question without applying any answer effects.
+    DismissOperatorQuestion {
+        id: String,
+        #[serde(default)]
+        question_id: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+
     /// Set `enabled = true` on an automation. Idempotent.
     /// Replies with [`FrontendEvent::AutomationUpdated`].
     EnableAutomation {
@@ -826,8 +770,11 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
+    /// Current share of eligible Codex executions assigned to Sol (default 100; lower values send the remainder to Astra).
+    GetCodexSolPercentage,
+
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
-    /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
+    /// hotspot report (`boss engine conflicts hotspots`):
     /// per-file frequency, per-file-pair co-conflict frequency, per-class
     /// counts. `top` caps each ranked list. Replies with
     /// [`FrontendEvent::ConflictHotspots`].
@@ -844,14 +791,18 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
-    /// Read-only: the stored coordinator session handoff (see
+    /// Read the stored coordinator session handoff (see
     /// [`CoordinatorHandoffView`]), or `None` when no coordinator session
     /// has ever written one. Backs `boss handoff show`. Replies with
     /// [`FrontendEvent::CoordinatorHandoffResult`]; a stored handoff that
     /// cannot be decoded is a [`FrontendEvent::WorkError`], never an empty
     /// success — "nothing stored" and "stored but unreadable" are
     /// different states and the caller must be able to tell them apart.
-    GetCoordinatorHandoff,
+    GetCoordinatorHandoff {
+        /// Explicitly request credential recovery through the main session inbox.
+        #[serde(default)]
+        redeliver: bool,
+    },
 
     /// Cost recorded in `[since_epoch_s, until_epoch_s)`, broken down
     /// by execution kind, model, reasoning mode, and effort level.
@@ -874,6 +825,11 @@ pub enum FrontendRequest {
     /// Query the current interactive-pool concurrency cap without changing
     /// it. Replies with [`FrontendEvent::DispatchConcurrencyResult`].
     GetDispatchConcurrency,
+
+    /// Query the dispatch focus set and how many ready executions it is
+    /// holding, without changing anything. Replies with
+    /// [`FrontendEvent::DispatchFocusResult`].
+    GetDispatchFocus,
 
     /// Query the current dispatch-pause state without changing it.
     /// Replies with [`FrontendEvent::DispatchStateResult`].
@@ -898,12 +854,11 @@ pub enum FrontendRequest {
         refresh: bool,
     },
 
-    /// Query the current driver traffic split (the three-way `grok` /
-    /// `claude` / `codex` allocation of eligible `standard`-reasoning
+    /// Query the current driver traffic split (the four-way `grok` /
+    /// `claude` / `codex` / `agy` allocation of eligible `standard`-reasoning
     /// implementation work) without changing it. Replies with
     /// [`FrontendEvent::DriverTrafficSplitResult`].
     GetDriverTrafficSplit,
-
     /// One-shot snapshot of the engine's user-visible configuration
     /// health — currently a single ANTHROPIC_API_KEY presence bit plus
     /// any rendered [`EngineHealthIssue`]s the UI should surface as a
@@ -912,6 +867,14 @@ pub enum FrontendRequest {
     /// app calls this on session start so a missing API key cannot
     /// silently break summarization the way it did before #699.
     GetEngineHealth,
+
+    /// One-shot read of the pool sizes and coordinator model the engine
+    /// pushes as [`FrontendEvent::EnginePoolConfig`] at session
+    /// registration. Read-only and idempotent; replies with that same
+    /// event, correlated by request id. The app sends it on
+    /// `resync_required`, because the registration push is uncorrelated
+    /// and can be evicted from the session queue.
+    GetEnginePoolConfig,
 
     /// Ask the engine to identify itself. Replies with
     /// [`FrontendEvent::EngineVersionResult`] carrying the stamped
@@ -941,6 +904,10 @@ pub enum FrontendRequest {
     GetIdea {
         id: String,
     },
+
+    /// Read the `[backup.offsite]` off-machine backup configuration.
+    /// Replies with [`FrontendEvent::OffsiteBackupSettings`]. Read-only.
+    GetOffsiteBackup,
 
     /// Worker → engine, read-only: the caller's own PR's body as Boss
     /// snapshotted it at the start of this execution's run (see
@@ -1049,6 +1016,14 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::SettingsList`]. Read-only; no side effects.
     GetSettings,
 
+    /// Compare eligible PR families by their original Sol/Astra arm.
+    GetSolComparisonReport,
+
+    /// Read-only age and provenance report for inactive work items.
+    GetStuckReport {
+        minimum_age_secs: i64,
+    },
+
     /// Per-work-item runtime snapshot — single-item flavour of the
     /// `task_runtimes` block carried in `WorkTree`. Used by
     /// `boss chore show` / `boss task show` to enrich the rendered work
@@ -1088,7 +1063,7 @@ pub enum FrontendRequest {
     /// Replies with [`FrontendEvent::WorkerContextResult`], or
     /// [`FrontendEvent::ProposalRejected`] when attribution fails — reused
     /// from the proposal API, which faces the identical attribution
-    /// failure modes (see `engine/core/src/app/context.rs`).
+    /// failure modes (see `engine/app/src/app/context.rs`).
     GetWorkerContext {
         run_id: String,
     },
@@ -1117,8 +1092,24 @@ pub enum FrontendRequest {
         estimate_usd: bool,
     },
 
+    /// Re-read a few cards of one product without assembling its board. The
+    /// reply ([`FrontendEvent::WorkRuntimePatch`]) carries each named card
+    /// and the other members of its revision chain (their derived flags
+    /// depend on each other), each projected as `GetWorkTree` projects it,
+    /// plus its `TaskRuntime`, all from one database snapshot. Ids that are
+    /// not live cards of the product (deleted, archived, moved to another
+    /// product) come back in `absent` rather than as an error. Backs the
+    /// app's handling of a runtime-class [`InvalidationClass`] push.
+    GetWorkRuntimePatch {
+        product_id: String,
+        item_ids: Vec<String>,
+    },
+
     GetWorkTree {
         product_id: String,
+        /// Opt in to session-local snapshot/delta replies.
+        #[serde(default)]
+        delta: bool,
         /// App-side per-product population-fetch sequence number. Purely a correlation id: the macOS app mints a 1-based
         /// per-product `fetch_seq` for every `GetWorkTree` it issues and
         /// stamps it on its `population-timing-*.jsonl` lines. Propagating
@@ -1389,6 +1380,9 @@ pub enum FrontendRequest {
         product_id: Option<String>,
     },
 
+    /// Pending critical-priority confirmations, visible only to the app.
+    ListCriticalPriorityRequests,
+
     /// List product-scoped decision records, newest first. By default
     /// only `active` rows are returned; set `include_inactive` to also
     /// include `superseded` / `revoked`. Replies with
@@ -1454,6 +1448,9 @@ pub enum FrontendRequest {
     /// a five-second poller does not re-fetch attempt history it
     /// already has.
     ListEngineAttempts {
+        /// Recover card state for current PRs, without reading history or blobs.
+        #[serde(default)]
+        open_prs_only: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         kinds: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1622,6 +1619,14 @@ pub enum FrontendRequest {
         execution_id: String,
     },
 
+    /// Every recorded change to a task's `deferred` and `autostart` flags,
+    /// oldest first, each with its actor and basis. Backs the
+    /// `field_audit` key of `boss task show --json`. Replies with
+    /// [`FrontendEvent::TaskFieldAuditList`].
+    ListTaskFieldAudit {
+        id: String,
+    },
+
     ListTasks {
         product_id: String,
         project_id: Option<String>,
@@ -1659,6 +1664,8 @@ pub enum FrontendRequest {
     MarkCiRemediationFailed {
         attempt_id: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_ci_evidence: Option<crate::QueueCiEvidence>,
     },
 
     /// Worker → engine, *validated* terminal signal: "there is no CI
@@ -1728,12 +1735,18 @@ pub enum FrontendRequest {
     /// reason. The CLI surface is `boss engine conflicts mark-failed
     /// <attempt-id> --reason <r>` — workers call it when they hit one
     /// of the stop conditions (semantic obsolescence, product decision
-    /// required, architectural mismatch) and decide not to push. See
+    /// required, architectural mismatch) and decide not to push. `reason`
+    /// must be one of [`crate::CONFLICT_MARK_FAILED_REASONS`]; any other
+    /// string is rejected. See
     /// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`
     /// Q4 / Q11.
     MarkConflictResolutionFailed {
         attempt_id: String,
         reason: String,
+        /// Required (and validated) when `reason` is
+        /// `architectural_mismatch`; ignored for every other reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<crate::ArchitecturalMismatchEvidence>,
     },
 
     /// User-initiated "Merge When Ready" for a Review-lane task's PR.
@@ -1879,6 +1892,13 @@ pub enum FrontendRequest {
         work_item_id: String,
     },
 
+    ParkWorkItem {
+        id: String,
+        parked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Operator entry point for the auto-populate Planner/Materializer
     /// (design P783 §2 "Reusability" #2 — "plan this project now" /
     /// replan). Builds the same `PlannerInput` the design-PR-merge
@@ -1942,7 +1962,7 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::ProbeReplied`] on the [`probe_topic`] for
     /// `run_id`, and delivery progress can be polled with
     /// [`FrontendRequest::ProbeStatus`]. Mid-turn probes are prefixed with
-    /// `[coordinator-nudge]` in the transcript so the worker and human
+    /// `[nudge]` in the transcript so the worker and human
     /// readers can identify coordinator-injected text.
     ProbeRun {
         run_id: String,
@@ -2048,6 +2068,9 @@ pub enum FrontendRequest {
         expected_spawn_token: String,
         #[serde(default)]
         reason: CoordinatorRecreateReason,
+        /// Explicit override when no fresh handoff is available.
+        #[serde(default)]
+        force_without_handoff: bool,
     },
 
     /// App self-identifies as the singleton app session. The engine
@@ -2145,9 +2168,46 @@ pub enum FrontendRequest {
         product_id: Option<String>,
     },
 
+    /// Coordinator proposal only; confirmation requires the pinned app process.
+    RequestCriticalPriority {
+        ids: Vec<String>,
+        ask: String,
+    },
+
     RequestExecution {
         #[serde(flatten)]
         input: RequestExecutionInput,
+    },
+
+    /// App → engine: the Agents view is showing a live local worker it has
+    /// no viewer (terminal pane) for, and asks the engine to send
+    /// `AttachWorkerPane` for that run again. Sent when the view (or the
+    /// page holding the worker) becomes visible, never on a timer — the
+    /// engine's own bounded retry covers a failed attach while the user is
+    /// not looking. Idempotent: an attach for a run the app already hosts
+    /// succeeds without creating a second viewer. Fire-and-forget; the
+    /// outcome arrives as `AttachWorkerPane` (or as
+    /// `LiveWorkerState::viewer_attach_error` on the live-state topic).
+    RequestWorkerPaneAttach {
+        run_id: String,
+    },
+
+    /// Consume an unexpired request after an app confirmation or denial.
+    ResolveCriticalPriorityRequest {
+        id: String,
+        confirm: bool,
+    },
+
+    /// App → engine, read-only: resolve the human label (work item short id
+    /// and title, PR, and what the run was for) of each listed execution
+    /// from the durable execution → work item → PR binding. The Agents view
+    /// sends the ids of runs the engine has released, whose live-worker
+    /// state is gone, so a finished pane keeps naming its work item. Replies
+    /// with [`FrontendEvent::ExecutionLabelsResolved`] carrying one label per
+    /// requested id (a deleted work item or unknown execution is a label
+    /// with that status, never an error). No DB writes; no topic events.
+    ResolveExecutionLabels {
+        execution_ids: Vec<String>,
     },
 
     /// Read-only: resolve a project's design-doc pointer into the
@@ -2223,11 +2283,16 @@ pub enum FrontendRequest {
     },
 
     /// Reset a terminal-failure attempt back to `pending` so the
-    /// dispatcher re-spawns a worker. Only valid for rows whose status
+    /// dispatcher re-spawns a worker. Valid for rows whose status
     /// is `failed` or `abandoned`; calling on a non-terminal row
     /// (`pending` / `running`) is rejected. The parent work item is
     /// re-flipped to `blocked: merge_conflict` and the new
     /// `blocked_attempt_id` points at the reset row. See Phase 5 #13.
+    ///
+    /// Also valid for a `deferred` row, where it means "resolve this
+    /// conflict now": the deferral ends as `human_request`, the parent
+    /// stays in review, and the conflict watcher starts the resolution on
+    /// its next pass. The reply carries the ended deferral row.
     RetryConflictResolution {
         attempt_id: String,
     },
@@ -2327,6 +2392,11 @@ pub enum FrontendRequest {
         budget: Option<i64>,
     },
 
+    /// Human engine setting, independent of the four-way driver allocation.
+    SetCodexSolPercentage {
+        percentage: u8,
+    },
+
     /// Replace the coordinator session handoff with `body`. Written by the
     /// coordinator session itself (`boss handoff write`), never
     /// synthesized by the engine. The engine stamps the write with the
@@ -2335,8 +2405,13 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::WorkError`] when `body` is blank or exceeds the
     /// engine's size cap — a handoff is a brief, not a transcript. Replies
     /// with [`FrontendEvent::CoordinatorHandoffSet`].
+    /// Requires coordinator peer ancestry and the private session authorization;
+    /// an omitted credential from an older client fails closed.
     SetCoordinatorHandoff {
         body: String,
+        /// Session credential from the private start brief, never an environment variable.
+        #[serde(default)]
+        authorization: String,
     },
 
     /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency
@@ -2390,21 +2465,30 @@ pub enum FrontendRequest {
     /// queueing and drain once dispatch resumes. Pausing dispatch never
     /// sets or implies the automation-pause flag, and vice versa. Replies
     /// with [`FrontendEvent::DispatchStateResult`].
+    ///
+    /// `scope` chooses what the pause holds (see [`DispatchPauseScope`]).
+    /// Absent means the default, [`DispatchPauseScope::NewWork`]: new work is
+    /// held and PR-review / review-guide executions stay exempt.
+    /// [`DispatchPauseScope::AllSpawns`] holds every pool, reviews included —
+    /// for when the spawn path itself is suspect. Ignored when
+    /// `paused = false`.
     SetDispatchPaused {
         paused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<DispatchPauseScope>,
     },
 
     /// Set the driver traffic split: how eligible `standard`-reasoning
     /// implementation work (`task_implementation`, `chore_implementation`,
-    /// `revision_implementation`) is allocated three ways between the
-    /// `grok`, `claude`, and `codex` drivers.
+    /// `revision_implementation`) is allocated four ways between the
+    /// `grok`, `claude`, `codex`, and `agy` drivers.
     ///
-    /// The three shares must sum to exactly 100. A split that does not is
+    /// The four shares must sum to exactly 100. A split that does not is
     /// **rejected** with [`FrontendEvent::WorkError`] — never clamped,
-    /// redistributed, or normalised into something valid-looking. Any one
-    /// or any two shares may be `0`, and a share of `0` sends that driver
+    /// redistributed, or normalised into something valid-looking. Any one,
+    /// two, or three shares may be `0`, and a share of `0` sends that driver
     /// literally nothing.
     ///
     /// Persisted to `state.db` as a single value, so an edit is one atomic
@@ -2453,6 +2537,21 @@ pub enum FrontendRequest {
     SetLiveStatusEnabled {
         slot_id: u8,
         enabled: bool,
+    },
+
+    /// Replace the `[backup.offsite]` off-machine backup configuration.
+    /// The engine validates (an enabled config needs an absolute
+    /// `destination`; retention cannot be 0/0), persists to
+    /// `settings.toml` atomically, and replies with
+    /// [`FrontendEvent::OffsiteBackupSettings`] carrying the saved
+    /// values. The engine reads this section at startup, so a change
+    /// takes effect on the next engine restart.
+    SetOffsiteBackup {
+        enabled: bool,
+        #[serde(default)]
+        destination: Option<String>,
+        keep_hourly: u32,
+        keep_daily: u32,
     },
 
     /// Set (or clear) a product's `default_driver`. `driver` is a
@@ -2535,7 +2634,6 @@ pub enum FrontendRequest {
         key: String,
         enabled: bool,
     },
-
     /// Set (or clear) a task's per-task doc pointer. Independent of
     /// `kind` — any leaf work item may carry one. Persists the three
     /// `tasks.doc_*` columns per [`SetTaskDocPointerInput`]'s semantics
@@ -2799,6 +2897,19 @@ pub enum FrontendRequest {
         patch: AutomationPatch,
     },
 
+    /// Change the dispatch focus set (focus mode is on while it is non-empty).
+    /// Targets are project or product ids, short ids, or product slugs; an
+    /// unresolvable target rejects the whole request and changes nothing.
+    /// `Clear` takes no targets. Persisted so it survives an engine restart,
+    /// and kicks the scheduler so rows that just came into scope (or out of
+    /// a cleared focus) dispatch immediately. Replies with
+    /// [`FrontendEvent::DispatchFocusResult`] or [`FrontendEvent::WorkError`].
+    UpdateDispatchFocus {
+        action: DispatchFocusAction,
+        #[serde(default)]
+        targets: Vec<String>,
+    },
+
     /// Apply an `IdeaPatch` to an idea. `None` fields are left unchanged.
     /// Replies with [`FrontendEvent::IdeaUpdated`].
     UpdateIdea {
@@ -2808,7 +2919,9 @@ pub enum FrontendRequest {
 
     UpdateWorkItem {
         id: String,
-        patch: WorkItemPatch,
+        /// Boxed so `FrontendRequest` stays within clippy's
+        /// `large_enum_variant` budget; serde output is identical.
+        patch: Box<WorkItemPatch>,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)
@@ -2830,7 +2943,10 @@ pub enum FrontendRequest {
 }
 
 mod events;
-pub use events::FrontendEvent;
+pub use events::{FrontendEvent, FrontendEventWorkerVisitor};
+
+mod invalidation;
+pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePatchItem};
 
 // Feature-flag / setting snapshots and workspace / worker pool summary
 // rows live in the `snapshot_wire` submodule (extracted to keep this file
@@ -2838,49 +2954,24 @@ pub use events::FrontendEvent;
 // `boss_protocol::{..}` paths are unchanged.
 mod snapshot_wire;
 pub use snapshot_wire::{
-    FeatureFlagSnapshot, SettingSnapshot, WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
+    FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, TrunkQueueCheckDto,
+    WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TopicEventPayload {
-    WorkInvalidated {
-        reason: String,
-        product_id: Option<String>,
-        item_ids: Vec<String>,
-    },
-    ExecutionInvalidated {
-        reason: String,
-        execution_id: String,
-        work_item_id: String,
-        status: String,
-    },
-    /// An editorial hook decision was recorded for a product's execution.
-    /// Emitted to the `"editorial_actions.<product_id>"` topic so the UI
-    /// can badge product cards when actions accumulate.
-    WorkEditorialAction { action: EditorialAction },
-    /// The engine dropped one or more pending invalidations for this
-    /// session's outbound queue while riding out a publish burst (a
-    /// merge-poller sweep across many products/executions, for example)
-    /// rather than disconnecting a client that was draining fine, just not
-    /// fast enough for an instant. The app should treat this the same way
-    /// it treats reconnecting — refetch its subscribed topics — without
-    /// tearing down or reporting the connection as lost, since it never
-    /// was.
-    ResyncRequired,
-}
+// The topic-push payload enum lives in `topic_event_payload`; re-exported as
+// `boss_protocol::TopicEventPayload` next to `PaneCaptureState`.
+mod topic_event_payload;
+pub use topic_event_payload::{PaneCaptureState, TopicEventPayload};
 
+#[cfg(test)]
+mod coordinator_reset_tests;
 #[cfg(test)]
 mod editorial_controls_tests;
-
-#[cfg(test)]
-mod frontend_event_wire_tests;
-
 #[cfg(test)]
 mod feature_flags_wire_tests;
-
 #[cfg(test)]
-mod topic_and_envelope_tests;
-
+mod frontend_event_wire_tests;
 #[cfg(test)]
 mod sorted_request_variants_test;
+#[cfg(test)]
+mod topic_and_envelope_tests;

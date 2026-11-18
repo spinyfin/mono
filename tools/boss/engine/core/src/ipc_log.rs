@@ -25,9 +25,9 @@
 //!
 //! # Correlation
 //!
-//! `request_id` is minted by [`crate::app::AppSessionHandle::allocate_request_id`]
+//! `request_id` is minted by `boss_engine::app::AppSessionHandle::allocate_request_id`
 //! as `<session_id>-eng-req-<n>`, where `session_id` is itself
-//! `session-<boot_id>-<n>` (see [`crate::app::ServerState::allocate_session_id`]),
+//! `session-<boot_id>-<n>` (see `boss_engine::app::ServerState::allocate_session_id`),
 //! and echoed back verbatim by the app, so it is the join key with
 //! `ipc-*.jsonl`: `(request_id, direction, kind)` identifies one exchange
 //! leg on either side. The `<boot_id>` component (a millisecond epoch
@@ -179,11 +179,17 @@ mod tests {
                 "attach_coordinator_pane",
             ),
             (
-                EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput { slot_id: 1 }),
+                EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput {
+                    run_id: "run-test".into(),
+                    slot_id: 1,
+                }),
                 "detach_worker_pane",
             ),
             (
-                EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 1 }),
+                EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput {
+                    run_id: "run-test".into(),
+                    slot_id: 1,
+                }),
                 "focus_worker_pane",
             ),
             (
@@ -269,7 +275,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let logger = IpcLogger::new(dir.path());
 
-        let req = EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput { slot_id: 3 });
+        let req = EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput {
+            run_id: "run-test".into(),
+            slot_id: 3,
+        });
         logger.log_request("session-1-eng-req-42", &req);
 
         let resp = EngineToAppResponse::DetachWorkerPane {

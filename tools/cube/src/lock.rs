@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
 
@@ -9,8 +9,49 @@ pub struct RepoLock {
     _file: File,
 }
 
+/// The jj repo directory shared by every workspace of the store `cwd` belongs
+/// to (the `.jj/repo` of the colocated source checkout, even from a secondary
+/// workspace).
+pub fn shared_repo_dir(cwd: &Path) -> Result<PathBuf, CubeError> {
+    let marker = cwd
+        .ancestors()
+        .map(|p| p.join(".jj/repo"))
+        .find(|p| p.exists())
+        .ok_or_else(|| CubeError::InvalidArgument(format!("no jj repository in {}", cwd.display())))?;
+    let repo = if marker.is_dir() {
+        marker
+    } else {
+        let target = std::fs::read_to_string(&marker).map_err(CubeError::Io)?;
+        marker.parent().unwrap().join(target.trim())
+    };
+    std::fs::canonicalize(repo).map_err(CubeError::Io)
+}
+
 impl RepoLock {
+    /// Transfer the locked file to a detached child without a lock-free gap.
+    pub(crate) fn into_file(self) -> File {
+        self._file
+    }
+
+    /// Serialize git remote changes and temporary-remote fetches across processes
+    /// sharing the store `cwd` belongs to. jj rewrites the store's git config
+    /// for each remote change under a fail-fast lock, so unserialized
+    /// concurrent changes make one side fail. Separate from
+    /// the pool/registry lock. Fetches share it to avoid git's shallow.lock race.
+    pub fn for_git_remotes(cwd: &Path) -> Result<Self, CubeError> {
+        crate::lock::RepoLock::acquire(&shared_repo_dir(cwd)?.join("cube-git-remotes.lock"))
+    }
+
     pub fn acquire(lock_path: &Path) -> Result<Self, CubeError> {
+        Self::open_and_lock(lock_path, true)?.ok_or_else(|| unreachable!("a blocking lock always acquires"))
+    }
+
+    /// Take the lock if nobody holds it; `None` when it is held elsewhere.
+    pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>, CubeError> {
+        Self::open_and_lock(lock_path, false)
+    }
+
+    fn open_and_lock(lock_path: &Path, blocking: bool) -> Result<Option<Self>, CubeError> {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).map_err(|e| CubeError::LockIo {
                 path: parent.to_path_buf(),
@@ -27,11 +68,16 @@ impl RepoLock {
                 path: lock_path.to_path_buf(),
                 source: e,
             })?;
-        FileExt::lock_exclusive(&file).map_err(|e| CubeError::LockIo {
+        let io_error = |source| CubeError::LockIo {
             path: lock_path.to_path_buf(),
-            source: e,
-        })?;
-        Ok(Self { _file: file })
+            source,
+        };
+        if blocking {
+            FileExt::lock_exclusive(&file).map_err(io_error)?;
+        } else if !FileExt::try_lock_exclusive(&file).map_err(io_error)? {
+            return Ok(None);
+        }
+        Ok(Some(Self { _file: file }))
     }
 }
 
@@ -49,6 +95,16 @@ mod tests {
         let lock_path = dir.path().join("nested/locks/repo.lock");
         let _lock = RepoLock::acquire(&lock_path).unwrap();
         assert!(lock_path.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn try_acquire_reports_a_held_lock_instead_of_waiting() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("repo.lock");
+        let held = RepoLock::try_acquire(&lock_path).unwrap().expect("free lock");
+        assert!(RepoLock::try_acquire(&lock_path).unwrap().is_none());
+        drop(held);
+        assert!(RepoLock::try_acquire(&lock_path).unwrap().is_some());
     }
 
     #[test]

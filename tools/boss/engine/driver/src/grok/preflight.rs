@@ -1,16 +1,29 @@
 //! Fail-fast capability checks for the scoped Grok worker environment.
+//!
+//! Every subprocess here is bounded: a wall-clock timeout kills the child and
+//! its whole process group, and a timeout is a loud preflight failure naming
+//! the command — never a silent pass. These calls run synchronously, so the
+//! caller ([`super::GrokDriver::provision_workspace`]) must keep them off the
+//! async worker threads with `spawn_blocking`; an unbounded call here once
+//! pinned two runtime threads for hours and stopped the engine from exiting.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 
 use super::environment::GrokProcessEnvironment;
+use super::oauth_refresh::{GROK_LOGIN_AFFIRMATION, with_credential_reprobe};
+use crate::bounded_command::run_bounded_as;
 
 /// Wall-clock limit for the OAuth-sensitive `grok models` probe.
 const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wall-clock limit for every other preflight subprocess. Generous enough for
+/// `cube workspace status` to reach the git remote, short enough that a hung
+/// remote fails the dispatch instead of holding a thread for hours.
+pub(super) const PREFLIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct PreflightOutput {
     success: bool,
@@ -46,18 +59,14 @@ impl PreflightRunner for RealPreflightRunner {
         }
         let mut command = Command::new(program);
         command.args(args).current_dir(workspace);
-        if program == "grok" {
+        let timeout = if program == "grok" {
             environment.apply_to_command(&mut command);
+            GROK_MODELS_TIMEOUT
         } else {
             environment.apply_tool_sandbox_environment(&mut command);
-        }
-        let output = if program == "grok" {
-            run_grok_models_with_timeout(&mut command, GROK_MODELS_TIMEOUT)?
-        } else {
-            command
-                .output()
-                .with_context(|| format!("starting Grok worker preflight capability `{program}`"))?
+            PREFLIGHT_COMMAND_TIMEOUT
         };
+        let output = run_bounded(&mut command, timeout)?;
         Ok(PreflightOutput {
             success: output.status.success(),
             status: output.status.to_string(),
@@ -67,69 +76,17 @@ impl PreflightRunner for RealPreflightRunner {
     }
 }
 
-/// Run `command` with a wall-clock deadline, capturing stdout/stderr.
+/// Prefix on every preflight error, so a failure reads as what it is wherever
+/// it surfaces.
+const PREFLIGHT_FAILURE_PREFIX: &str = "Grok worker preflight failed";
+
+/// Run `command` capturing stdout/stderr, killing it and its process group if
+/// it has not finished within `timeout`.
 ///
-/// `Command::spawn` inherits stdio by default; pipes must be set explicitly so
-/// the OAuth affirmation in stdout is available to the caller. Pipes are drained
-/// on dedicated threads while the parent only polls exit status — otherwise a
-/// child that fills the ~64KiB pipe buffer deadlocks against a non-reading wait.
-fn run_grok_models_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("starting Grok worker preflight capability `grok`")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("missing stdout pipe for Grok worker preflight capability `grok`")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("missing stderr pipe for Grok worker preflight capability `grok`")?;
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = stdout;
-        reader.read_to_end(&mut buf).map(|_| buf)
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = stderr;
-        reader.read_to_end(&mut buf).map(|_| buf)
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("waiting for Grok worker preflight capability `grok`")?
-        {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child
-                .kill()
-                .context("killing timed-out Grok worker preflight capability `grok`")?;
-            let _ = child.wait();
-            // Reap drain threads so a timed-out probe does not leak join handles.
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            bail!(
-                "grok models did not complete while waiting for OAuth refresh coordination within {}s",
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked for Grok preflight"))?
-        .context("reading stdout from Grok worker preflight capability `grok`")?;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked for Grok preflight"))?
-        .context("reading stderr from Grok worker preflight capability `grok`")?;
-    Ok(Output { status, stdout, stderr })
+/// A timeout is an error that names the command; it is never mapped to an
+/// empty success.
+pub(super) fn run_bounded(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    run_bounded_as(command, timeout, PREFLIGHT_FAILURE_PREFIX)
 }
 
 /// Prove that every capability the worker needs is usable before the pane is
@@ -147,14 +104,7 @@ fn run_worker_preflight_with(
 ) -> anyhow::Result<()> {
     assert_grok_oauth_with_reprobe(runner, workspace, environment)?;
 
-    let workspace_arg = workspace.display().to_string();
-    let cube = runner.run(
-        "cube",
-        &["--json", "workspace", "status", "--workspace", &workspace_arg],
-        workspace,
-        environment,
-    )?;
-    assert_cube_workspace(&cube, workspace)?;
+    probe_cube_workspace(runner, workspace, environment)?;
 
     let gh = runner.run(
         "gh",
@@ -173,6 +123,29 @@ fn run_worker_preflight_with(
     assert_session_store_writable(runner, workspace, environment)?;
 
     Ok(())
+}
+
+/// Prove the Boss-bundled `cube` can see the leased workspace.
+///
+/// `cube` is run by the absolute path of the binary that ships with the engine
+/// ([`GrokProcessEnvironment::bundled_cube`]), never by bare name: the engine's
+/// own `PATH` can put the user's repobin shim ahead of the bundle, and that
+/// shim builds the CLI from source with Bazel. When the bundled binary is
+/// missing, or genuinely cannot do the job, this still fails loudly.
+fn probe_cube_workspace(
+    runner: &dyn PreflightRunner,
+    workspace: &Path,
+    environment: &GrokProcessEnvironment,
+) -> anyhow::Result<()> {
+    let cube_program = environment.bundled_cube()?.to_string_lossy().into_owned();
+    let workspace_arg = workspace.display().to_string();
+    let cube = runner.run(
+        &cube_program,
+        &["--json", "workspace", "status", "--workspace", &workspace_arg],
+        workspace,
+        environment,
+    )?;
+    assert_cube_workspace(&cube, workspace)
 }
 
 /// Absolute path of the probe file, under the sessions directory itself so
@@ -219,24 +192,6 @@ fn assert_session_store_writable(
     Ok(())
 }
 
-/// Cheap, content-blind snapshot of the shared OAuth credential's on-disk
-/// state, used to detect whether a refresh rewrote the file during the
-/// probe. Never reads the credential bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AuthFingerprint {
-    modified: SystemTime,
-    len: u64,
-}
-
-fn fingerprint_auth_credential(auth_path: &Path) -> Option<AuthFingerprint> {
-    let metadata = std::fs::metadata(auth_path).ok()?;
-    let modified = metadata.modified().ok()?;
-    Some(AuthFingerprint {
-        modified,
-        len: metadata.len(),
-    })
-}
-
 /// Run the Grok OAuth probe and assert its affirmation, tolerating exactly
 /// one race: the probe's own invocation of `grok models` can refresh an
 /// expired-but-refreshable shared token as a side effect, so that first run
@@ -251,26 +206,17 @@ fn assert_grok_oauth_with_reprobe(
     workspace: &Path,
     environment: &GrokProcessEnvironment,
 ) -> anyhow::Result<()> {
-    let before = fingerprint_auth_credential(environment.auth_path());
-    let output = runner.run("grok", &["models"], workspace, environment)?;
-    if assert_grok_oauth(&output).is_ok() {
-        return Ok(());
-    }
-    let after = fingerprint_auth_credential(environment.auth_path());
-    if before.is_none() || before == after {
-        return assert_grok_oauth(&output);
-    }
-    tracing::info!(
-        auth_path = %environment.auth_path().display(),
-        "Grok OAuth credential was rewritten during the preflight probe (likely an expiry refresh); re-probing once"
-    );
-    let output = runner.run("grok", &["models"], workspace, environment)?;
+    let output = with_credential_reprobe(
+        environment.auth_path(),
+        || runner.run("grok", &["models"], workspace, environment),
+        |output| assert_grok_oauth(output).is_ok(),
+    )?;
     assert_grok_oauth(&output)
 }
 
 fn assert_grok_oauth(output: &PreflightOutput) -> anyhow::Result<()> {
     require_success("Grok OAuth", output)?;
-    if !output.stdout.contains("You are logged in with grok.com.") {
+    if !output.stdout.contains(GROK_LOGIN_AFFIRMATION) {
         bail!(
             "Grok worker preflight failed: Grok OAuth is unavailable; `grok models` did not affirm a grok.com login. {}",
             rendered_output(output)
@@ -423,8 +369,139 @@ mod tests {
         run_worker_preflight_with(&runner, workspace, &environment()).unwrap();
         assert_eq!(
             runner.programs.into_inner(),
-            ["grok", "cube", "gh", "jj", "jj", "/usr/bin/touch"]
+            ["grok", "/bundle/bin/cube", "gh", "jj", "jj", "/usr/bin/touch"]
         );
+    }
+
+    /// With no bundled `cube`, the preflight must fail loudly and name the
+    /// problem — before it runs anything, and without substituting a `PATH`
+    /// lookup of the bare name.
+    #[test]
+    fn a_missing_bundled_cube_fails_the_preflight_without_a_path_fallback() {
+        let runner = FakeRunner::new(vec![success("You are logged in with grok.com.\n")]);
+        let environment = environment().with_bundled_cube(None);
+
+        let error = run_worker_preflight_with(&runner, Path::new("/workspace"), &environment)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Boss-bundled `cube` could not be located"), "{error}");
+        assert!(error.contains("refusing a PATH lookup"), "{error}");
+        assert_eq!(
+            runner.programs.into_inner(),
+            ["grok"],
+            "nothing past the OAuth probe may run, and no bare `cube` may be tried"
+        );
+    }
+
+    /// Runs real processes the way the engine does, but with a `PATH` whose
+    /// first entry holds a decoy `cube` — the shape of `~/bin/cube`, the repobin
+    /// shim that wins a bare-name lookup on a developer machine.
+    struct DecoyPathRunner {
+        decoy_dir: PathBuf,
+    }
+
+    impl PreflightRunner for DecoyPathRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            workspace: &Path,
+            _environment: &GrokProcessEnvironment,
+        ) -> anyhow::Result<PreflightOutput> {
+            // Another test thread can fork while a freshly written script is still open
+            // for writing, which makes exec fail with ETXTBSY (os error 26) until the
+            // forked child execs. Retry that transient failure briefly.
+            let mut attempts = 0;
+            let output = loop {
+                let result = Command::new(program)
+                    .args(args)
+                    .current_dir(workspace)
+                    .env("PATH", format!("{}:/usr/bin:/bin", self.decoy_dir.display()))
+                    .output();
+                match result {
+                    Err(err) if err.raw_os_error() == Some(26) && attempts < 50 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => break other?,
+                }
+            };
+            Ok(PreflightOutput {
+                success: output.status.success(),
+                status: output.status.to_string(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Regression: the cube probe ran a bare `cube`, so a repobin shim earlier on
+    /// the engine's `PATH` tried to build `//tools/cube:cube` from source and
+    /// killed the run before the pane started. The decoy here records that it ran
+    /// and fails; the bundled copy answers properly.
+    #[cfg(unix)]
+    #[test]
+    fn the_cube_probe_runs_the_bundled_binary_not_a_decoy_earlier_on_path() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let decoy_dir = root.path().join("home-bin");
+        let marker = root.path().join("decoy-ran");
+        write_script(
+            &decoy_dir.join("cube"),
+            &format!(
+                "#!/bin/sh\ntouch '{}'\necho 'repobin: building //tools/cube:cube' >&2\nexit 1\n",
+                marker.display()
+            ),
+        );
+        let bundled = root.path().join("Boss.app/Contents/Resources/bin/cube");
+        write_script(
+            &bundled,
+            &format!(
+                "#!/bin/sh\nprintf '%s' '{{\"workspace\":{{\"workspace_path\":\"{}\"}}}}'\n",
+                workspace.display()
+            ),
+        );
+
+        let environment = environment().with_bundled_cube(Some(bundled));
+        let runner = DecoyPathRunner { decoy_dir };
+        probe_cube_workspace(&runner, &workspace, &environment).unwrap();
+        assert!(!marker.exists(), "the decoy `cube` on PATH must never be executed");
+    }
+
+    /// The probe must keep failing when the bundled `cube` itself cannot do its
+    /// job — a decoy must not mask that either.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_bundled_cube_still_fails_the_probe_loudly() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let decoy_dir = root.path().join("home-bin");
+        write_script(
+            &decoy_dir.join("cube"),
+            &format!(
+                "#!/bin/sh\nprintf '%s' '{{\"workspace\":{{\"workspace_path\":\"{}\"}}}}'\n",
+                workspace.display()
+            ),
+        );
+        let bundled = root.path().join("bundle/cube");
+        write_script(&bundled, "#!/bin/sh\necho 'bundled cube is broken' >&2\nexit 7\n");
+
+        let environment = environment().with_bundled_cube(Some(bundled));
+        let error = probe_cube_workspace(&DecoyPathRunner { decoy_dir }, &workspace, &environment)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Cube workspace access command exited"), "{error}");
+        assert!(error.contains("bundled cube is broken"), "{error}");
     }
 
     /// The failure this check exists for: the session store is unwritable
@@ -626,10 +703,10 @@ mod tests {
     }
 
     #[test]
-    fn run_grok_models_with_timeout_captures_stdout() {
+    fn run_bounded_captures_stdout() {
         let mut command = Command::new("/bin/echo");
         command.arg("You are logged in with grok.com.");
-        let output = run_grok_models_with_timeout(&mut command, Duration::from_secs(5)).unwrap();
+        let output = run_bounded(&mut command, Duration::from_secs(5)).unwrap();
         assert!(output.status.success(), "status={}", output.status);
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("You are logged in with grok.com."),
@@ -638,39 +715,22 @@ mod tests {
         );
     }
 
+    /// A hung preflight command is killed at the timeout and surfaces as a
+    /// preflight failure that names the command — it is not a silent pass.
     #[test]
-    fn run_grok_models_with_timeout_kills_and_reports_deadline() {
+    fn a_hung_command_is_killed_and_fails_the_preflight_naming_it() {
         let mut command = Command::new("/bin/sleep");
-        command.arg("5");
-        let error = run_grok_models_with_timeout(&mut command, Duration::from_millis(200))
+        command.arg("60");
+        let started = std::time::Instant::now();
+        let error = run_bounded(&mut command, Duration::from_millis(300))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("within"), "{error}");
-        assert!(error.contains("0s") || error.contains("OAuth refresh"), "{error}");
-    }
-
-    #[test]
-    fn run_grok_models_with_timeout_drains_large_stdout() {
-        // ~200KiB exceeds the typical 64KiB pipe buffer; without concurrent drain
-        // this would deadlock the try_wait poll loop. Prefer pure shell so the
-        // Bazel sandbox need not grant /dev/zero or PATH-resolved helpers.
-        let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            // 4000 * 50 = 200_000 bytes of stdout.
-            "i=0; while [ \"$i\" -lt 4000 ]; do printf '%050d' \"$i\"; i=$((i + 1)); done",
-        ]);
-        let output = run_grok_models_with_timeout(&mut command, Duration::from_secs(30)).unwrap();
         assert!(
-            output.status.success(),
-            "status={} stderr={:?}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            started.elapsed() < Duration::from_secs(30),
+            "timeout did not bound the call"
         );
-        assert!(
-            output.stdout.len() > 100_000,
-            "expected large captured stdout, got {} bytes",
-            output.stdout.len()
-        );
+        assert!(error.contains("Grok worker preflight failed"), "{error}");
+        assert!(error.contains("`/bin/sleep 60`"), "{error}");
+        assert!(error.contains("did not complete within"), "{error}");
     }
 }

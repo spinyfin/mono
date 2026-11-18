@@ -33,6 +33,14 @@ fn run_boss(socket: &str, extra: &[&str], max_wait_secs: &str) -> Output {
     boss_command(socket, extra, max_wait_secs).output().expect("spawn boss")
 }
 
+/// The CLI's own wait, from `gave up after waiting X.Ys`. That clock starts
+/// after process bring-up, so it is the retry budget rather than wall-clock
+/// that includes binary spawn under a loaded CI agent.
+fn reported_wait_secs(stderr: &str) -> Option<f64> {
+    let rest = stderr.split("gave up after waiting ").nth(1)?;
+    rest.split('s').next()?.parse().ok()
+}
+
 /// Run `boss`, calling `on_first_notice` as soon as it prints its first
 /// "engine not reachable" progress line. That ties the engine's appearance to
 /// the CLI's own progress (at least one connect has failed) instead of to a
@@ -141,14 +149,15 @@ fn exhausted_budget_exits_5_naming_socket_and_time_waited_with_clean_stdout() {
         elapsed >= Duration::from_millis(900),
         "waited out the 1s budget: {elapsed:?}"
     );
-    assert!(
-        elapsed < Duration::from_secs(20),
-        "bounded by the override, not the 600s env: {elapsed:?}"
-    );
     assert!(output.stdout.is_empty(), "nothing on stdout: {:?}", output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&socket), "{stderr}");
-    assert!(stderr.contains("waiting"), "message states the time waited: {stderr}");
+    let reported =
+        reported_wait_secs(&stderr).unwrap_or_else(|| panic!("stderr must report the time waited: {stderr}"));
+    assert!(
+        (0.9..5.0).contains(&reported),
+        "CLI-reported wait must follow the 1s override, not the 600s env: {reported}s ({stderr})"
+    );
 }
 
 #[test]

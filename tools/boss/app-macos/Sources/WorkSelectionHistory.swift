@@ -1,0 +1,134 @@
+import Foundation
+
+/// Selection history is local; opening the switcher never waits for the engine.
+struct WorkSelectionHistory {
+    static let storageKey = "boss.work.selectionHistory"
+    private struct Snapshot: Codable {
+        var products: [String] = []
+        var projects: [String: [String]] = [:]
+        var roots: [String: String]?
+    }
+    private let defaults: UserDefaults
+    private var snapshot: Snapshot
+
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+        snapshot = defaults.data(forKey: Self.storageKey)
+            .flatMap { try? JSONDecoder().decode(Snapshot.self, from: $0) } ?? Snapshot()
+        if snapshot.roots == nil {
+            snapshot.roots = defaults.dictionary(forKey: "boss.work.rootsByScope") as? [String: String] ?? [:]
+            save()
+            defaults.removeObject(forKey: "boss.work.rootsByScope")
+        }
+    }
+
+    func root(scope: String) -> String? {
+        snapshot.roots?[scope]
+    }
+
+    mutating func rememberRoot(_ id: String?, scope: String) {
+        guard snapshot.roots?[scope] != id else { return }
+        snapshot.roots?[scope] = id
+        save()
+    }
+
+    private mutating func pruneRoots(_ keep: ([String]) -> Bool) {
+        snapshot.roots = snapshot.roots?.filter { keep($0.key.components(separatedBy: "|")) }
+    }
+
+    mutating func useProduct(_ id: String) {
+        snapshot.products.removeAll { $0 == id }
+        snapshot.products.insert(id, at: 0)
+        save()
+    }
+
+    mutating func useProjects(_ ids: Set<String>, productID: String) {
+        guard !ids.isEmpty else { return }
+        var history = snapshot.projects[productID] ?? []
+        history.removeAll { ids.contains($0) }
+        history.insert(contentsOf: ids.sorted(), at: 0)
+        snapshot.projects[productID] = history
+        save()
+    }
+
+    mutating func pruneProducts(validIDs: Set<String>) {
+        pruneRoots { validIDs.contains($0[0]) }
+        snapshot.products.removeAll { !validIDs.contains($0) }
+        snapshot.projects = snapshot.projects.filter { validIDs.contains($0.key) }
+        save()
+    }
+
+    mutating func forgetProduct(_ id: String) {
+        pruneRoots { $0[0] != id }
+        snapshot.products.removeAll { $0 == id }
+        snapshot.projects.removeValue(forKey: id)
+        save()
+    }
+
+    mutating func forgetProject(_ id: String, productID: String) {
+        pruneRoots { $0[0] != productID || !$0.dropFirst().contains(id) }
+        snapshot.projects[productID]?.removeAll { $0 == id }
+        save()
+    }
+
+    /// Only prune products with a loaded snapshot: an unvisited product's
+    /// missing work tree does not mean that its projects were deleted.
+    mutating func pruneProjects(productID: String, validIDs: Set<String>) {
+        pruneRoots { parts in
+            parts[0] != productID || parts.dropFirst().allSatisfy { $0 == "unprojected" || validIDs.contains($0) }
+        }
+        snapshot.projects[productID]?.removeAll { !validIDs.contains($0) }
+        save()
+    }
+
+    func products(fallback: [String], selected: String?) -> [String] {
+        ranked(snapshot.products, fallback: fallback, selected: Set([selected].compactMap { $0 }))
+    }
+
+    func projects(productID: String, fallback: [String], selected: Set<String>) -> [String] {
+        ranked(snapshot.projects[productID] ?? [], fallback: fallback, selected: selected)
+    }
+
+    private func ranked(_ history: [String], fallback: [String], selected: Set<String>) -> [String] {
+        let valid = Set(fallback)
+        var seen: Set<String> = []
+        let ordered = (history + fallback).filter { valid.contains($0) && seen.insert($0).inserted }
+        // Keep every active filter, even if a multi-selection exceeds seven.
+        let active = selected.intersection(valid)
+        var included = active
+        for id in ordered where included.count < max(7, active.count) { included.insert(id) }
+        return ordered.filter { included.contains($0) }
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(snapshot) { defaults.set(data, forKey: Self.storageKey) }
+    }
+}
+
+extension ChatViewModel {
+    var recentWorkProducts: [WorkProduct] {
+        let fallback = activeProducts.sorted { ($0.name.localizedLowercase, $0.id) < ($1.name.localizedLowercase, $1.id) }
+        return selectionHistory.products(fallback: fallback.map(\.id), selected: selectedWorkProductID)
+            .compactMap { id in fallback.first { $0.id == id } }
+    }
+
+    var recentWorkProjects: [WorkProject] {
+        guard let productID = selectedWorkProductID else { return [] }
+        let fallback = allProjectsForSelectedProduct.filter { $0.status != "archived" }
+            .sorted { ($0.name.localizedLowercase, $0.id) < ($1.name.localizedLowercase, $1.id) }
+        return selectionHistory.projects(productID: productID, fallback: fallback.map(\.id), selected: selectedProjectFilterIDs)
+            .compactMap { id in fallback.first { $0.id == id } }
+    }
+
+    /// Every project the sidebar would list (honouring Show archived) that
+    /// is not already in the recent list, so the switcher reaches them all.
+    var moreWorkProjects: [WorkProject] {
+        let recent = Set(recentWorkProjects.map(\.id))
+        return projectsForSelectedProduct.filter { !recent.contains($0.id) }
+    }
+
+    var workSwitcherLabel: String {
+        let product = selectedProduct?.name ?? "Choose product"
+        return hasProjectFilters ? "\(product) · \(projectFilterDescription)" : product
+    }
+}

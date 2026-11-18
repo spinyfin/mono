@@ -11,10 +11,16 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
+        "//tools/boss/engine/execution-contracts:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/spoke-custody:__pkg__",
         "//tools/boss/engine/stdout-progress:__pkg__",
     ],
     deps = [

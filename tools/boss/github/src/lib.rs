@@ -19,9 +19,10 @@ pub mod pr_url;
 pub mod trees;
 
 pub use check_runs::{
-    CiProvider, RequiredCheckFailure, StatusContextVerdict, classify_status_context_state,
-    fetch_failing_checks_for_commit, parse_check_runs_for_failures, parse_commit_statuses_for_failures,
-    parse_provider_job_id, provider_for_url,
+    CiProvider, LeafVerdict, RequiredCheckFailure, classify_rollup_leaf, classify_status_context_state,
+    fetch_failing_checks_for_commit, is_failure_conclusion, is_pass_conclusion, leaf_is_failure, leaf_is_pass,
+    leaf_verdict_token, parse_check_runs_for_failures, parse_commit_statuses_for_failures, parse_provider_job_id,
+    provider_for_url,
 };
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

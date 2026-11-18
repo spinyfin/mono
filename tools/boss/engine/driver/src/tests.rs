@@ -9,14 +9,10 @@ use super::*;
 /// literal.
 #[test]
 fn large_effort_addendum_is_shared_across_drivers() {
-    let codex = CodexDriver::default();
-    let grok = GrokDriver::default();
-    let drivers: [(&DriverDescriptor, &str); 3] = [
-        (ClaudeDriver.descriptor(), "claude"),
-        (codex.descriptor(), "codex"),
-        (grok.descriptor(), "grok"),
-    ];
-    for (descriptor, slug) in drivers {
+    let registry = registry::DriverRegistry::default();
+    for slug in registry.slugs() {
+        let driver = registry.require(slug).expect("slug came from the registry");
+        let descriptor = driver.descriptor();
         for level in [EffortLevel::Large, EffortLevel::Max] {
             assert_eq!(
                 (descriptor.model_menu.prompt_addendum_for_level)(level),
@@ -201,16 +197,16 @@ fn ordinary_execution_kinds_do_not_require_strict_command_outcome_observation() 
     }
 }
 
-/// Codex and Grok both fail the dispatch gate for conflict resolution / CI
-/// remediation because neither declares `CommandOutcomeObservation`; Claude,
-/// which does declare it, clears the gate. This is the actual mechanism
-/// behind PR #2625's fix — allocation and spawn both go through
+/// Codex, Grok, and Agy fail the dispatch gate for conflict resolution / CI
+/// remediation because none of them declares `CommandOutcomeObservation`;
+/// Claude, which does declare it, clears the gate. This is the actual
+/// mechanism behind PR #2625's fix — allocation and spawn both go through
 /// `check_dispatch`, so proving it here proves both call sites.
 #[test]
-fn codex_and_grok_refuse_conflict_resolution_and_ci_remediation() {
+fn codex_grok_and_agy_refuse_conflict_resolution_and_ci_remediation() {
     let registry = crate::registry::DriverRegistry::default();
     for execution_kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
-        for slug in ["codex", "grok"] {
+        for slug in ["codex", "grok", "agy"] {
             let err = registry
                 .resolver(slug)
                 .unwrap()
@@ -338,6 +334,7 @@ fn tool_use_interception_config_fields_are_accessible() {
         data_dir: Some(PathBuf::from("/Library/Boss")),
         path_guard_script: Some(PathBuf::from("/tmp/boss-path-guard.py")),
         checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
+        git_store_guard_script: None,
         is_revision: true,
         is_standard_worker: true,
         is_reviewer: false,
@@ -799,7 +796,7 @@ fn interrupt_plan_defaults_to_none_and_agrees_with_the_transport() {
     assert_eq!(stub.interrupt(), InterruptDelivery::Unsupported);
 }
 
-/// Every registered driver must declare an interrupt plan that its own
+/// Every launch-ready driver must declare an interrupt plan that its own
 /// transport declaration agrees with, and the plan must be able to run at all
 /// (at least one press, at least one attempt).
 ///
@@ -807,10 +804,15 @@ fn interrupt_plan_defaults_to_none_and_agrees_with_the_transport() {
 /// driver added tomorrow is covered the day it is registered rather than the
 /// day someone remembers to extend this list.
 #[test]
-fn every_registered_driver_declares_a_runnable_interrupt_plan() {
+fn launch_ready_drivers_have_plans_and_skeletons_declare_unsupported() {
     let registry = registry::DriverRegistry::default();
     for slug in registry.slugs() {
         let driver = registry.require(slug).expect("slug came from the registry");
+        if !driver.launch_ready() {
+            assert_eq!(driver.interrupt(), InterruptDelivery::Unsupported, "{slug}");
+            assert!(driver.interrupt_plan().is_none(), "{slug}");
+            continue;
+        }
         let plan = driver
             .interrupt_plan()
             .unwrap_or_else(|| panic!("driver {slug} declares no interrupt plan"));
@@ -862,15 +864,19 @@ fn a_recovery_observer_plan_comes_with_a_recovery_implementation() {
             continue;
         }
         // The trait default recognises nothing, so a driver relying on the
-        // observer must have overridden the matcher.
+        // observer must have overridden the matcher. Each built-in that
+        // uses RecoveryObserver has its own cancellation record shape.
+        let cancellation_records = [
+            serde_json::json!({"type": "turn_ended", "outcome": "cancelled"}),
+            serde_json::json!({"type": "turn.aborted", "reason": "interrupted"}),
+            serde_json::json!(
+                "I1111 04:17:39.400 conversation_manager.go:123] Cancelling in-progress response for conversation 9476903e-615e-4a03-b5b5-ea82733cc97b"
+            ),
+        ];
         assert!(
-            driver.is_interrupt_recovery_turn_end(&serde_json::json!({
-                "type": "turn_ended",
-                "outcome": "cancelled",
-            })) || driver.is_interrupt_recovery_turn_end(&serde_json::json!({
-                "type": "turn.aborted",
-                "reason": "interrupted",
-            })),
+            cancellation_records
+                .iter()
+                .any(|raw| driver.is_interrupt_recovery_turn_end(raw)),
             "driver {slug} declares RecoveryObserver evidence but recognises no cancellation \
              record, so nothing could ever confirm its interrupts",
         );

@@ -26,7 +26,7 @@
 //! It samples `syspolicyd`'s CPU usage on a fixed cadence and, once the
 //! daemon has been saturated (≥ [`SATURATION_CPU_PCT`]) for
 //! [`SATURATION_SAMPLES_TO_ALERT`] consecutive samples, flips a shared
-//! [`SyspolicydHealth`] flag. [`crate::app::build_engine_health_report`]
+//! [`SyspolicydHealth`] flag. `boss_engine::app::build_engine_health_report`
 //! reads that flag and emits an `EngineHealthIssue` so the macOS app
 //! raises a banner naming the cause and the remedy.
 //!
@@ -201,7 +201,7 @@ async fn sample_via_ps() -> Option<SyspolicydSample> {
 /// (not every tick) so the engine log carries the signature without
 /// flooding while the wedge persists.
 pub fn spawn_loop(health: Arc<SyspolicydHealth>, interval: Duration) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut was_wedged = false;
         loop {
             match sample_via_ps().await {

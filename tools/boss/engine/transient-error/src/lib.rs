@@ -12,8 +12,8 @@
 //! ## Why Boss owns this rather than the agent
 //!
 //! A Boss worker is an interactive `claude` session in a libghostty
-//! pane (`runner.rs` launches `claude … "$(cat initial-prompt.txt)"`
-//! with no `--print`). When claude hits a fatal API error mid-run it
+//! pane (`runner.rs` launches `claude …` behind the PTY brief launcher,
+//! which pastes the brief into the composer, with no `--print`). When claude hits a fatal API error mid-run it
 //! prints the error, ends the turn, and returns to its REPL — the
 //! process stays **alive but idle**. The events socket reports the
 //! turn-ending `Stop` as `Idle`, so the worker looks "done" while
@@ -368,9 +368,9 @@ impl EscalateReason {
 /// transcript entry was an API error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryDecision {
-    /// Auto-resume on the same workspace. `attempt` is 1-based (the
-    /// attempt number this resume represents) and `backoff` is how long
-    /// to defer the resume dispatch.
+    /// Auto-resume in a new execution that continues from the stalled run's
+    /// preserved work. `attempt` is 1-based (the attempt number this resume
+    /// represents) and `backoff` is how long to defer the resume dispatch.
     Resume { attempt: u32, backoff: Duration },
     /// Stop retrying and surface for human attention.
     Escalate { reason: EscalateReason },

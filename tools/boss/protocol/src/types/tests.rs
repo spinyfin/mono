@@ -455,8 +455,23 @@ fn conflict_resolution_roundtrips_with_all_fields() {
         conflict_class: Some("semantic".into()),
         resolved_by_rung: Some(3),
         mechanical_rung_in_flight: None,
+        mismatch_exit_barred: false,
+        deferral_arm: Some("control".into()),
+        deferral_end_reason: None,
+        ladder_outcomes: Some(vec![LadderDecision {
+            tier: "deterministic".into(),
+            outcome: "retired".into(),
+            reason: "resolution pushed".into(),
+            recorded_at: "1747000100".into(),
+        }]),
+        ladder_reason: Some("resolution pushed".into()),
     };
     let raw = serde_json::to_value(&attempt).unwrap();
+    assert!(
+        raw["ladder_outcomes"].is_array(),
+        "conflicts list --json must emit decisions as an array, not a nested JSON string: {raw}"
+    );
+    assert_eq!(raw["ladder_outcomes"][0]["tier"], "deterministic");
     let back: ConflictResolution = serde_json::from_value(raw).unwrap();
     assert_eq!(attempt, back);
 }
@@ -488,6 +503,11 @@ fn conflict_resolution_pending_skips_optional_fields_on_encode() {
         conflict_class: None,
         resolved_by_rung: None,
         mechanical_rung_in_flight: None,
+        mismatch_exit_barred: false,
+        deferral_arm: None,
+        deferral_end_reason: None,
+        ladder_outcomes: None,
+        ladder_reason: None,
     };
     let encoded = serde_json::to_value(&attempt).unwrap();
     let obj = encoded.as_object().unwrap();
@@ -505,6 +525,10 @@ fn conflict_resolution_pending_skips_optional_fields_on_encode() {
         "conflict_class",
         "resolved_by_rung",
         "mechanical_rung_in_flight",
+        "deferral_arm",
+        "deferral_end_reason",
+        "ladder_outcomes",
+        "ladder_reason",
     ] {
         assert!(!obj.contains_key(absent), "expected {absent} omitted on encode",);
     }
@@ -613,12 +637,13 @@ fn task_roundtrips_with_effort_provenance() {
 // ── StatusActor round-trip / classification tests ────────────────────────
 
 #[test]
-fn status_actor_parses_all_four_values() {
+fn status_actor_parses_all_values() {
     use std::str::FromStr;
     assert_eq!(StatusActor::from_str("human").unwrap(), StatusActor::Human);
     assert_eq!(StatusActor::from_str("boss").unwrap(), StatusActor::Boss);
     assert_eq!(StatusActor::from_str("engine").unwrap(), StatusActor::Engine);
     assert_eq!(StatusActor::from_str("boothby").unwrap(), StatusActor::Boothby);
+    assert_eq!(StatusActor::from_str("progression").unwrap(), StatusActor::Progression);
 }
 
 #[test]
@@ -627,7 +652,7 @@ fn status_actor_rejects_unknown_values_with_documented_message() {
     let err = StatusActor::from_str("gremlin").unwrap_err();
     assert!(err.contains("gremlin"), "error should echo the offending value: {err}");
     // The message documents the full closed set of accepted actors.
-    for expected in ["human", "boss", "engine", "boothby"] {
+    for expected in ["human", "boss", "engine", "boothby", "progression"] {
         assert!(err.contains(expected), "error should list `{expected}`: {err}");
     }
 }
@@ -657,6 +682,7 @@ fn status_actor_is_engine_cascade_true_only_for_engine() {
     assert!(!StatusActor::Human.is_engine_cascade());
     assert!(!StatusActor::Boss.is_engine_cascade());
     assert!(!StatusActor::Boothby.is_engine_cascade());
+    assert!(!StatusActor::Progression.is_engine_cascade());
 }
 
 // ── short_id_label tests ─────────────────────────────────────────────────
@@ -973,6 +999,7 @@ fn ci_remediation_roundtrips_with_all_fields() {
         finished_at: Some("1747000100".into()),
         failure_kind: Some("pr_branch_ci".into()),
         before_commit_sha: None,
+        queue_base_sha: None,
         revision_task_id: None,
     };
     let raw = serde_json::to_value(&attempt).unwrap();
@@ -1107,6 +1134,7 @@ fn ci_remediation_pending_skips_optional_fields_on_encode() {
         finished_at: None,
         failure_kind: None,
         before_commit_sha: None,
+        queue_base_sha: None,
         revision_task_id: None,
     };
     let encoded = serde_json::to_value(&attempt).unwrap();
@@ -2009,6 +2037,7 @@ fn run_done_outcome_display_and_parse_are_inverses() {
 #[test]
 fn run_done_payload_roundtrips() {
     let payload = RunDoneProposalPayload {
+        queue_ci_evidence: None,
         outcome: RunDoneOutcome::Delivered,
         summary: "opened https://github.com/foo/bar/pull/1 with the md5 crate swap".into(),
         question: None,

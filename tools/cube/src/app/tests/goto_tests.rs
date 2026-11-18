@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::rebase_tests::failing_cmd;
 use super::support::{ExpectedCommand, FakeRunner};
 
-use crate::app::errors::Result;
+use crate::app::errors::{CubeError, Result};
 use crate::app::workspace_ops::workspace_goto;
 
 pub(super) const GOTO_CWD: &str = "/goto-ws";
@@ -32,7 +32,14 @@ fn goto_exists_cmd(branch: &str, sha: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         goto_cwd(),
         "jj",
-        &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            &format!("present({remote_ref})"),
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
         sha,
     )
 }
@@ -47,14 +54,45 @@ fn goto_set_bookmark_cmd(branch: &str) -> ExpectedCommand {
     )
 }
 
-fn goto_set_pr_bookmark_cmd(pr: u64, branch: &str) -> ExpectedCommand {
-    let remote_ref = format!("{branch}@{GOTO_REMOTE}");
-    let pr_bm = format!("pr/{pr}");
-    ExpectedCommand::ok(
-        goto_cwd(),
-        "jj",
-        &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
-        "",
+fn goto_jj(args: &[&str], out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(goto_cwd(), "jj", args, out)
+}
+
+/// What `goto --pr` runs after GitHub's PR JSON: confirm `head` is in the
+/// store and check whether the working copy is already on it (`positioned`
+/// is that probe's output; empty means `jj new` follows). The head branch
+/// bookmark is set only after the working copy has moved.
+fn goto_pr_head_cmds(head: &str, positioned: &str) -> Vec<ExpectedCommand> {
+    let mut cmds = vec![
+        goto_jj(
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({head})"),
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ],
+            head,
+        ),
+        goto_pr_positioned_cmd(head, positioned),
+    ];
+    if positioned.is_empty() {
+        cmds.push(goto_jj(&["new", head], ""));
+    }
+    cmds
+}
+
+fn goto_pr_json(branch: &str, head: &str) -> String {
+    format!(
+        r#"{{"head":{{"repo":{{"full_name":"spinyfin/mono"}},"ref":"{branch}","sha":"{head}"}},"state":"open","merged":false}}"#
+    )
+}
+
+fn goto_pr_positioned_cmd(head: &str, out: &str) -> ExpectedCommand {
+    goto_jj(
+        &["log", "-r", &format!("{head} & ::@"), "--no-graph", "-T", "commit_id"],
+        out,
     )
 }
 
@@ -116,9 +154,9 @@ fn goto_bookmark_not_yet_positioned_creates_new_commit() {
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         goto_exists_cmd(branch, "abc1"),
-        goto_set_bookmark_cmd(branch),
         goto_positioned_cmd(branch, ""), // not yet positioned
         goto_new_cmd(branch),
+        goto_set_bookmark_cmd(branch),
     ];
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, Some(branch), None).expect("goto succeeds");
@@ -134,9 +172,9 @@ fn goto_bookmark_already_positioned_skips_jj_new() {
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         goto_exists_cmd(branch, "def2"),
-        goto_set_bookmark_cmd(branch),
         goto_positioned_cmd(branch, "def2"), // already positioned
-                                             // no jj new expected
+        goto_set_bookmark_cmd(branch),
+        // no jj new expected
     ];
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, Some(branch), None).expect("idempotent goto");
@@ -146,23 +184,33 @@ fn goto_bookmark_already_positioned_skips_jj_new() {
 }
 
 #[test]
-fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
+/// `goto --pr` positions on GitHub's head and tracks the head branch. The
+/// scripted runner is a strict FIFO, so any `pr/<n>` import, set or export
+/// would panic as unexpected.
+fn goto_pr_resolves_branch_and_creates_no_pr_bookmark() {
     let branch = "boss/exec_gotopr";
-    let cmds = vec![
+    let mut cmds = vec![
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
         ExpectedCommand::ok(
             goto_cwd(),
             "gh",
             &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
-            &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
+            &goto_pr_json(branch, "e42e42e42e42e42e42e42e42e42e42e42e42e42e"),
         ),
-        goto_exists_cmd(branch, "e42"),
-        goto_set_bookmark_cmd(branch),
-        goto_set_pr_bookmark_cmd(42, branch),
-        goto_positioned_cmd(branch, ""),
-        goto_new_cmd(branch),
     ];
+    cmds.extend(goto_pr_head_cmds("e42e42e42e42e42e42e42e42e42e42e42e42e42e", ""));
+    cmds.push(goto_jj(
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            "e42e42e42e42e42e42e42e42e42e42e42e42e42e",
+            "--allow-backwards",
+        ],
+        "",
+    ));
     let runner = FakeRunner::new(cmds);
     let result = run_goto(&runner, None, Some(42)).expect("pr goto");
     runner.assert_exhausted();
@@ -177,16 +225,24 @@ fn goto_missing_bookmark_errors_clearly() {
     let cmds = vec![
         goto_remote_list_cmd(),
         goto_fetch_cmd(),
-        failing_cmd(
+        ExpectedCommand::ok(
             goto_cwd(),
             "jj",
-            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
-            &format!("Error: Revision \"{remote_ref}\" doesn't exist"),
+            &[
+                "log",
+                "-r",
+                &format!("present({remote_ref})"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "",
         ),
     ];
     let runner = FakeRunner::new(cmds);
     let err = run_goto(&runner, Some(branch), None).expect_err("missing bookmark");
     runner.assert_exhausted();
+    assert!(matches!(err, CubeError::PositioningRefused(_)));
     let msg = format!("{err}");
     assert!(msg.contains(branch), "names the branch: {msg}");
     assert!(msg.contains("was not found on remote"), "{msg}");
@@ -240,4 +296,70 @@ fn goto_revision_already_positioned_skips_new() {
     let result = run_goto_revision(&runner, sha).expect("idempotent revision goto");
     runner.assert_exhausted();
     assert_eq!(result.payload["already_positioned"], true);
+}
+
+#[test]
+fn goto_closed_pr_is_a_structured_refusal_without_mutating_bookmarks() {
+    for state in ["closed", "merged"] {
+        let info = if state == "merged" {
+            r#"{"state":"closed","merged":true,"head":{"ref":"feature"}}"#
+        } else {
+            r#"{"state":"closed","merged":false,"head":{"ref":"feature"}}"#
+        };
+        let runner = FakeRunner::new(vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            ExpectedCommand::ok(
+                goto_cwd(),
+                "gh",
+                &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
+                info,
+            ),
+        ]);
+        let error = run_goto(&runner, None, Some(42)).unwrap_err();
+        runner.assert_exhausted();
+        assert!(matches!(error, CubeError::PositioningRefused(_)));
+        assert_eq!(error.json_error()["error_kind"], "workspace_positioning_refused");
+        assert_eq!(error.json_error()["retryable"], false);
+        assert!(error.to_string().contains("cannot position"));
+    }
+}
+
+#[test]
+fn goto_fetch_failure_does_not_claim_retryability() {
+    let runner = FakeRunner::new(vec![
+        goto_remote_list_cmd(),
+        failing_cmd(
+            goto_cwd(),
+            "jj",
+            &["git", "fetch", "--remote", GOTO_REMOTE],
+            "network unavailable",
+        ),
+    ]);
+    let error = run_goto(&runner, None, Some(42)).unwrap_err();
+    assert!(matches!(error, CubeError::CommandFailed { .. }));
+    assert!(error.json_error().get("retryable").is_none());
+    assert!(error.json_error().get("error_kind").is_none());
+}
+
+#[test]
+fn unclassified_errors_do_not_claim_to_be_retryable() {
+    let error = CubeError::InvalidArgument("bad flag".to_string());
+    assert!(error.json_error().get("retryable").is_none());
+    assert!(error.json_error().get("error_kind").is_none());
+    assert!(
+        CubeError::RepoNotFound("mono".into())
+            .json_error()
+            .get("error_kind")
+            .is_none()
+    );
+    assert_eq!(
+        CubeError::PositioningRefused("x".into()).json_error()["retryable"],
+        false
+    );
+    assert_eq!(
+        CubeError::PositioningRefused("x".into()).json_error()["error_kind"],
+        "workspace_positioning_refused"
+    );
+    assert_eq!(CubeError::MaintenanceBusy.json_error()["retryable"], true);
 }

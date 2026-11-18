@@ -6,18 +6,23 @@
 //! The engine core stays agnostic to any particular repo's tooling: all
 //! format knowledge lives behind the [`DeterministicResolver`] trait and
 //! its [`ResolverRegistry`], which is the extension seam the design calls
-//! out: built-ins today, plus [`RecipeResolver`] — the declarative
-//! recipe mechanism (design §"Extension mechanism — declarative
-//! resolution recipes", tracked as T13) — for user-configured formulas
-//! that don't warrant a compiled-in resolver. See [`recipe_config`] for
-//! the recipe format and its boss-side config file. This crate is
-//! standalone and unit-tested against fixture conflicts; it is wired into
+//! out: built-ins today, plus [`RecipeResolver`] and
+//! [`KeepBothRuleResolver`] — the declarative mechanism (design
+//! §"Extension mechanism — declarative resolution recipes") — for
+//! user-configured per-path rules that don't warrant a compiled-in
+//! resolver. See [`recipe_config`] for the rule formats and their
+//! boss-side config file, which [`ResolverRegistry::with_rules_from_base`]
+//! turns into registered resolvers. This crate is standalone and
+//! unit-tested against fixture conflicts; it is wired into
 //! `conflict_watch` via `boss_engine_core::conflict_ladder::attempt_rung0`,
 //! live by default (see that module's `RUNG0_APPLY_LIVE`) whenever the
 //! `conflict_ladder_mechanical_rebase` feature flag is enabled.
 
 mod command;
+mod keep_both;
 mod lockfile;
+#[cfg(test)]
+mod lockfile_base_tests;
 mod recipe_config;
 mod registry;
 mod resolvers;
@@ -27,11 +32,31 @@ use std::path::Path;
 use async_trait::async_trait;
 pub use boss_conflict_diagnosis::ConflictedFile;
 
-pub use recipe_config::{ConflictRecipe, ConflictRecipesStore};
+pub use keep_both::{InsertionKind, KeepBothResolution, KeepBothScope, keep_both_insertions};
+pub use recipe_config::{ConflictRecipe, ConflictRecipesStore, ConflictRules, KeepBothRule};
 pub use registry::{DeclinedFile, FailedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
 pub use resolvers::{
-    BazelModuleLockResolver, CargoLockResolver, InvalidRecipe, RecipeResolver, RegistryAppendUnionResolver,
+    BazelModuleLockResolver, CargoLockResolver, InvalidRecipe, KeepBothRuleResolver, KeepBothUnionResolver,
+    RecipeResolver, is_generated_lockfile, rustfmt_command,
 };
+
+/// Ladder-fixture constructors that inject a
+/// [`boss_command_runner::CommandRunner`]. Production code uses
+/// [`BazelModuleLockResolver::new`] / [`CargoLockResolver::new`].
+#[cfg(any(test, feature = "test-support"))]
+pub mod inject {
+    use std::sync::Arc;
+
+    use super::*;
+
+    pub fn bazel_module_lock(runner: Arc<dyn boss_command_runner::CommandRunner>) -> BazelModuleLockResolver {
+        BazelModuleLockResolver::with_runner(runner)
+    }
+
+    pub fn cargo_lock(runner: Arc<dyn boss_command_runner::CommandRunner>) -> CargoLockResolver {
+        CargoLockResolver::with_runner(runner)
+    }
+}
 
 /// Coarse classification of a conflicted file's resolution strategy, kept
 /// for telemetry attribution (`conflict_resolutions.conflict_class`,
@@ -39,20 +64,25 @@ pub use resolvers::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictClass {
     CargoLock,
+    GeneratedLock,
     BazelModuleLock,
-    RegistryAppendUnion,
-    /// Resolved by a [`RecipeResolver`] — a user-configured declarative
-    /// recipe rather than a compiled-in resolver. Coarse on purpose;
-    /// [`ResolvedFile::summary`] carries the specific recipe name.
+    /// Both sides inserted whole items or imports at the same spot and
+    /// the built-in [`KeepBothUnionResolver`] kept both.
+    KeepBothUnion,
+    /// Resolved by a user-configured declarative rule — a
+    /// [`RecipeResolver`] or a [`KeepBothRuleResolver`] — rather than a
+    /// compiled-in resolver. Coarse on purpose; [`ResolvedFile::summary`]
+    /// carries the specific rule name.
     Recipe,
 }
 
 impl ConflictClass {
     pub fn as_str(&self) -> &'static str {
         match self {
+            ConflictClass::GeneratedLock => "generated_lock",
             ConflictClass::CargoLock => "cargo_lock",
             ConflictClass::BazelModuleLock => "bazel_module_lock",
-            ConflictClass::RegistryAppendUnion => "registry_append_union",
+            ConflictClass::KeepBothUnion => "keep_both_union",
             ConflictClass::Recipe => "recipe",
         }
     }
@@ -115,6 +145,8 @@ mod tests {
         // values so a rename can't silently change the recorded label.
         assert_eq!(ConflictClass::CargoLock.as_str(), "cargo_lock");
         assert_eq!(ConflictClass::BazelModuleLock.as_str(), "bazel_module_lock");
-        assert_eq!(ConflictClass::RegistryAppendUnion.as_str(), "registry_append_union");
+        assert_eq!(ConflictClass::GeneratedLock.as_str(), "generated_lock");
+        assert_eq!(ConflictClass::KeepBothUnion.as_str(), "keep_both_union");
+        assert_eq!(ConflictClass::Recipe.as_str(), "recipe");
     }
 }

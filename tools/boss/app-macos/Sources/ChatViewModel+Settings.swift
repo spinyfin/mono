@@ -25,6 +25,11 @@ extension ChatViewModel {
         engine.sendGetSettings()
     }
 
+    /// Ask the engine for the stored off-machine backup configuration.
+    func refreshOffsiteBackup() {
+        offsiteEdit.refreshID = engine.sendGetOffsiteBackup()
+    }
+
     /// Ask the engine for a fresh engine-health snapshot. Also called
     /// on every reconnect from the `.connected` arm of `handle`; this
     /// wrapper exists so the Settings pane can re-poll on appear
@@ -38,6 +43,11 @@ extension ChatViewModel {
     /// value rather than whatever it last happened to show.
     func refreshDriverTrafficSplit() {
         engine.sendGetDriverTrafficSplit()
+        engine.sendGetCodexSolPercentage()
+    }
+
+    func setCodexSolPercentage(_ percentage: Int) {
+        engine.sendSetCodexSolPercentage(percentage)
     }
 
     /// Ask the engine for the per-driver provider quota snapshot. Called on
@@ -51,7 +61,7 @@ extension ChatViewModel {
         engine.sendGetDriverQuotaUsage(refresh: force)
     }
 
-    /// Move `driver`'s share to `value`, letting the other two absorb the
+    /// Move `driver`'s share to `value`, letting the other three absorb the
     /// difference (see `DriverTrafficSplit.adjusting(_:to:)`), and send the
     /// resulting split.
     ///

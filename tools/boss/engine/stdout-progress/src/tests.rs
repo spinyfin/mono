@@ -73,6 +73,7 @@ impl CodexShapedDriver {
                 agent_rules_filename: "AGENTS.md",
                 initial_prompt_filename: "initial-prompt.txt",
                 model_menu: ModelMenu {
+                    resolve_model_effort: None,
                     engine_default: "gpt-5.5",
                     effort_value_for_level: no_effort_value,
                     default_model_for_level: only_model,
@@ -282,6 +283,8 @@ fn kinds(events: &[WorkerEvent]) -> Vec<&'static str> {
             WorkerEvent::PostToolUse { .. } => "post_tool_use",
             WorkerEvent::Stop { .. } => "stop",
             WorkerEvent::Notification { .. } => "notification",
+            WorkerEvent::ToolPoll { .. } => "tool_poll",
+            WorkerEvent::ModelProgress { .. } => "model_progress",
             WorkerEvent::SessionEnd { .. } => "session_end",
         })
         .collect()
@@ -830,4 +833,28 @@ async fn a_rejected_resume_state_yields_no_events_at_all() {
     let stats = reader.stats();
     assert!(stats.resume_state_rejected);
     assert_eq!(stats.events_emitted, 0);
+}
+
+#[test]
+fn checkpointed_framing_matches_contiguous_reads_and_bounds_complete_lines() {
+    let config = ReaderConfig { max_line_bytes: 4 };
+    let mut partial = Vec::new();
+    let mut skipping = false;
+    assert!(frame_chunk(&mut partial, &mut skipping, b"123", false, config).is_empty());
+    // These two carried fields are sufficient to resume after a process restart.
+    assert_eq!(partial, b"123");
+    assert!(!skipping);
+    assert!(frame_chunk(&mut partial, &mut skipping, b"45", false, config).is_empty());
+    assert!(partial.is_empty());
+    assert!(skipping);
+    let frames = frame_chunk(&mut partial, &mut skipping, b"6\n{}\n[]", true, config);
+    assert!(matches!(&frames[0], RawLine::Oversized));
+    assert!(matches!(&frames[1], RawLine::Complete(bytes) if bytes == b"{}"));
+    assert!(matches!(&frames[2], RawLine::Trailing(bytes) if bytes == b"[]"));
+    assert!(partial.is_empty());
+    assert!(!skipping);
+    let frames = frame_chunk(&mut partial, &mut skipping, b"123456\n{}\n[]", true, config);
+    assert!(matches!(&frames[0], RawLine::Oversized));
+    assert!(matches!(&frames[1], RawLine::Complete(bytes) if bytes == b"{}"));
+    assert!(matches!(&frames[2], RawLine::Trailing(bytes) if bytes == b"[]"));
 }

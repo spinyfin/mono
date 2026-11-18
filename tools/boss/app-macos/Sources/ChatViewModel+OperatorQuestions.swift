@@ -1,11 +1,11 @@
 import Foundation
 
 extension ChatViewModel {
-    // MARK: Operator questions (Doing ▸ Needs Attention)
+    // MARK: Operator questions (Doing ▸ Queued)
 
     /// Answer the question a blocked worker asked on `task`'s card — the
-    /// card's Yes / No buttons. Yes re-authorizes and restarts the task, No
-    /// parks it in Backlog; either way the engine replies with
+    /// card's Yes / No buttons. Both answers record the chosen path and restart
+    /// the task; the engine replies with
     /// `work_item_updated`, which moves the card, so nothing is applied
     /// optimistically here.
     ///
@@ -14,16 +14,32 @@ extension ChatViewModel {
     /// nothing. Returns whether a request was sent.
     @discardableResult
     func answerOperatorQuestion(for task: WorkTask, answer: OperatorAnswer) -> Bool {
+        submitOperatorQuestion(for: task, answer: answer)
+    }
+
+    @discardableResult
+    func dismissOperatorQuestion(for task: WorkTask) -> Bool {
+        submitOperatorQuestion(for: task, answer: nil)
+    }
+
+    private func submitOperatorQuestion(for task: WorkTask, answer: OperatorAnswer?) -> Bool {
         guard let question = task.operatorQuestion else { return false }
         guard operatorAnswerInFlightByTaskID[task.id] == nil else { return false }
         operatorAnswerErrorByTaskID.removeValue(forKey: task.id)
         operatorAnswerErrorQuestionIDByTaskID.removeValue(forKey: task.id)
-        guard isConnected else {
-            setOperatorAnswerError("Not connected to the engine — reconnect and try again.", taskID: task.id, questionID: question.id)
-            return false
+        guard canSubmitUserActions() else { return false }
+        let requestID = if let answer {
+            engine.sendAnswerOperatorQuestion(id: question.id, answer: answer)
+        } else {
+            engine.sendDismissOperatorQuestion(id: question.id)
         }
-        guard let requestID = engine.sendAnswerOperatorQuestion(id: question.id, answer: answer) else {
-            setOperatorAnswerError("Couldn't send the answer to the engine. Try again.", taskID: task.id, questionID: question.id)
+        guard let requestID else {
+            refreshUnsentActions()
+            showDisconnectedActionNotice()
+            let message = answer == nil
+                ? "Dismissal saved. Use Retry after reconnecting to send it."
+                : "Answer saved. Use Retry after reconnecting to send it."
+            setOperatorAnswerError(message, taskID: task.id, questionID: question.id)
             return false
         }
         operatorAnswerInFlightByTaskID[task.id] = requestID
@@ -34,7 +50,7 @@ extension ChatViewModel {
     /// `validation_failed`): re-enable the buttons and say why the click did
     /// nothing. The card is left in place — if the question was answered or
     /// withdrawn elsewhere, the `work_item_updated` that moved the task is
-    /// what takes it out of Needs Attention.
+    /// what takes it out of the awaiting-answer state.
     func handleOperatorQuestionError(message: String, requestId: String?) {
         guard let taskID = taskIDForOperatorAnswer(requestId: requestId) else {
             workErrorMessage = message

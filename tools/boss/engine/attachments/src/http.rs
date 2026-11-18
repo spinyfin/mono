@@ -498,7 +498,7 @@ pub async fn serve(listener: TcpListener, catalog: Arc<dyn EvidenceCatalog>, sto
         };
         let catalog = Arc::clone(&catalog);
         let store = store.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             if let Err(err) = handle_connection(stream, catalog.as_ref(), &store).await {
                 tracing::debug!(error = %err, "evidence server: connection ended early");
             }

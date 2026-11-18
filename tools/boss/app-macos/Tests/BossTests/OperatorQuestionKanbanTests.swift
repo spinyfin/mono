@@ -1,10 +1,9 @@
 import XCTest
 @testable import Boss
 
-/// Covers Doing's "Needs Attention" section: a task a blocked worker parked
-/// with a typed question (`blocked_reason = awaiting_operator_answer` plus an
-/// engine-projected `operator_question`) routes to Doing, renders in its own
-/// section above everything else, and is answered with Yes/No from the card.
+/// A task parked with a typed operator question stays in Doing. Without a
+/// live worker it sits in the Needs Attention section above Queued, ordered
+/// oldest question first, and can still be answered with Yes/No from the card.
 @MainActor
 final class OperatorQuestionKanbanTests: XCTestCase {
 
@@ -47,26 +46,81 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertFalse(task.isAwaitingOperatorAnswer)
     }
 
-    /// The card only has Yes/No buttons, so a question of any other answer
-    /// type must not decode into a Needs Attention card nobody can answer.
+    /// The card can only answer the kinds it has buttons for, so a question it
+    /// cannot answer must not decode into a Needs Attention card nobody can
+    /// answer: an unknown kind, or a multiple-choice question whose options
+    /// are missing or cannot be rendered as two to six distinct buttons.
     func testParseTaskDropsQuestionWithUnsupportedAnswerType() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let unanswerable: [[String: Any]] = [
+            ["kind": "prompt"],
+            ["kind": "multiple_choice"],
+            ["kind": "multiple_choice", "choices": ["only one"]],
+            ["kind": "multiple_choice", "choices": ["a", "a"]],
+            ["kind": "multiple_choice", "choices": ["a", ""]],
+            ["kind": "multiple_choice", "choices": ["a", "b", "c", "d", "e", "f", "g"]],
+        ]
+        for answerType in unanswerable {
+            var payload = basePayload()
+            payload["status"] = "blocked"
+            payload["blocked_reason"] = "awaiting_operator_answer"
+            payload["operator_question"] = [
+                "id": "oq_1", "text": "Pick one", "answer_type": answerType,
+                "explanation": "", "asked_at": "1790000000", "execution_id": "exec_1",
+            ] as [String: Any]
+            let task = try XCTUnwrap(client.parseTask(payload))
+            XCTAssertNil(task.operatorQuestion, "\(answerType)")
+            XCTAssertEqual(task.boardColumn, .backlog, "an unanswerable question falls back to the plain blocked card")
+        }
+    }
+
+    func testParseTaskDecodesMultipleChoiceQuestionWithItsOptionsInOrder() throws {
         let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var payload = basePayload()
         payload["status"] = "blocked"
         payload["blocked_reason"] = "awaiting_operator_answer"
         payload["operator_question"] = [
             "id": "oq_1",
-            "text": "Pick one",
-            "answer_type": ["kind": "multiple_choice"],
-            "explanation": "",
+            "text": "Which rollout should I use?",
+            "answer_type": ["kind": "multiple_choice", "choices": ["Gradual", "All at once", "Behind a flag"]],
+            "explanation": "The brief allows each.",
             "asked_at": "1790000000",
             "execution_id": "exec_1",
         ] as [String: Any]
 
         let task = try XCTUnwrap(client.parseTask(payload))
 
-        XCTAssertNil(task.operatorQuestion)
-        XCTAssertEqual(task.boardColumn, .backlog, "an unanswerable question falls back to the plain blocked card")
+        let question = try XCTUnwrap(task.operatorQuestion)
+        XCTAssertEqual(question.answerType, .multipleChoice)
+        XCTAssertEqual(question.choices, ["Gradual", "All at once", "Behind a flag"])
+        XCTAssertTrue(task.isAwaitingOperatorAnswer)
+        XCTAssertEqual(task.boardColumn, .doing, "same Needs Attention routing as the Yes/No question")
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing))
+        XCTAssertEqual(snapshot.operatorQuestion?.choices, question.choices)
+        XCTAssertEqual(OperatorAnswer.multipleChoice("All at once").wirePayload["kind"] as? String, "multiple_choice")
+        XCTAssertEqual(OperatorAnswer.multipleChoice("All at once").wirePayload["value"] as? String, "All at once")
+    }
+
+    func testMultipleChoiceAnswerRequestEncodingMatchesTheEngineWireShape() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var sent: [[String: Any]] = []
+        client.outboundRecorder = { sent.append($0) }
+
+        client.sendAnswerOperatorQuestion(id: "oq_1", answer: .multipleChoice("All at once"))
+
+        let data = try JSONSerialization.data(withJSONObject: try XCTUnwrap(sent.first), options: [.sortedKeys])
+        XCTAssertEqual(
+            String(decoding: data, as: UTF8.self),
+            #"{"answer":{"kind":"multiple_choice","value":"All at once"},"id":"oq_1","type":"answer_operator_question"}"#
+        )
+    }
+
+    func testConflictMessageNamesTheRecordedChoice() {
+        let message = OperatorQuestionFailure.message(from: [
+            "code": "conflict", "state": "answered",
+            "answer": ["kind": "multiple_choice", "value": "Gradual"],
+        ] as [String: Any])
+        XCTAssertTrue(message.contains("Recorded answer: Gradual."), message)
     }
 
     /// A "create a prerequisite task" question reads and routes exactly like
@@ -102,6 +156,85 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(snapshot.operatorQuestion?.prerequisiteTask, question.prerequisiteTask)
         // The answer is the same Yes/No wire object.
         XCTAssertEqual(OperatorAnswer.yesNo(true).wirePayload["kind"] as? String, "yes_no")
+    }
+
+    func testParseTaskDecodesLinkPrerequisiteQuestionWithTheExistingTask() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload = basePayload()
+        payload["status"] = "blocked"
+        payload["blocked_reason"] = "awaiting_operator_answer"
+        payload["operator_question"] = [
+            "id": "oq_link",
+            "text": "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it.",
+            "answer_type": [
+                "kind": "link_prerequisite_task",
+                "existing_pr": "https://github.com/acme/widget/pull/9",
+                "work_item_id": "task_abc",
+                "name": "Land the wiring",
+                "pr_url": "https://github.com/acme/widget/pull/9",
+            ] as [String: Any],
+            "explanation": "The other change is already in review.",
+            "asked_at": "1790000000",
+            "execution_id": "exec_1",
+        ] as [String: Any]
+
+        let task = try XCTUnwrap(client.parseTask(payload))
+        let question = try XCTUnwrap(task.operatorQuestion)
+        XCTAssertEqual(question.answerType, .linkPrerequisiteTask)
+        XCTAssertEqual(question.prerequisiteTask?.name, "Land the wiring")
+        XCTAssertEqual(question.prerequisiteTask?.brief, "")
+        XCTAssertEqual(question.prerequisiteTask?.pullRequest, "https://github.com/acme/widget/pull/9")
+        XCTAssertEqual(question.prerequisiteTask?.existing, true)
+        XCTAssertTrue(task.isAwaitingOperatorAnswer)
+        XCTAssertEqual(task.boardColumn, .doing)
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing))
+        XCTAssertEqual(snapshot.operatorQuestion?.prerequisiteTask, question.prerequisiteTask)
+        XCTAssertEqual(OperatorAnswer.yesNo(true).wirePayload["kind"] as? String, "yes_no")
+    }
+
+    /// The engine names the two answers of a split-vs-bypass question; the app
+    /// carries those names to the card verbatim and attaches no meaning to them.
+    func testParseTaskCarriesTheEnginesOptionNamesToTheCard() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        func parsed(labels: Any?) throws -> WorkTask {
+            var answerType: [String: Any] = [
+                "kind": "create_prerequisite_task",
+                "name": "Extract the first capability",
+                "brief": "Land the first capability as its own PR.",
+                "file_count_bypass": ["files": 48, "limit": 30],
+            ]
+            if let labels { answerType["option_labels"] = labels }
+            var payload = basePayload()
+            payload["status"] = "blocked"
+            payload["blocked_reason"] = "awaiting_operator_answer"
+            payload["operator_question"] = [
+                "id": "oq_split",
+                "text": "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or bypass the limit and keep it in one PR?",
+                "answer_type": answerType,
+                "explanation": "Context:\nToo big.\nSplit:\nLand the first PR.\nBypass limit:\nKeep one PR.\nRecommendation:\nI recommend Bypass limit because it is one unit.",
+                "asked_at": "1790000000",
+                "execution_id": "exec_1",
+            ] as [String: Any]
+            return try XCTUnwrap(client.parseTask(payload))
+        }
+
+        let named = try XCTUnwrap(parsed(labels: ["yes": "Split", "no": "Bypass limit"]).operatorQuestion)
+        XCTAssertEqual(named.optionLabels, AnswerOptionLabels(yes: "Split", no: "Bypass limit"))
+        let snapshot = WorkCardSnapshot.build(
+            task: try parsed(labels: ["yes": "Split", "no": "Bypass limit"]),
+            context: WorkCardSnapshotContext(column: .doing)
+        )
+        XCTAssertEqual(snapshot.operatorQuestion?.optionLabels, AnswerOptionLabels(yes: "Split", no: "Bypass limit"))
+
+        // A question stored before options were named keeps Yes / No, and so
+        // does one whose names are unusable; both stay answerable.
+        for labels: Any? in [nil, ["yes": "Split"], ["yes": "Same", "no": "Same"], ["yes": "", "no": "No"], "Split"] {
+            let question = try XCTUnwrap(parsed(labels: labels).operatorQuestion)
+            XCTAssertNil(question.optionLabels, "\(String(describing: labels))")
+            XCTAssertEqual(question.answerType, .createPrerequisiteTask)
+        }
+        // Both buttons answer with the same wire object a Yes/No question uses.
+        XCTAssertEqual(OperatorAnswer.yesNo(false).wirePayload["value"] as? Bool, false)
     }
 
     /// A proposal with no name or brief cannot be displayed behind
@@ -176,13 +309,16 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertNil(ChatViewModel.needsAttentionSection(items: []))
     }
 
-    func testNeedsAttentionSectionShape() throws {
-        let section = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [awaiting(id: "task_a")]))
-        XCTAssertEqual(section.id, "doing-needs-attention")
-        XCTAssertEqual(section.title, "Needs Attention")
-        XCTAssertTrue(section.isCollapsible)
-        XCTAssertTrue(section.defaultExpanded)
-        XCTAssertEqual(section.groupKey, .needsAttention)
+    func testNeedsAttentionSectionShapeAndDecisionCount() throws {
+        let one = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [awaiting(id: "task_a")]))
+        XCTAssertEqual(one.id, "doing-needs-attention")
+        XCTAssertEqual(one.title, "Needs Attention")
+        XCTAssertTrue(one.isCollapsible)
+        XCTAssertTrue(one.defaultExpanded)
+        XCTAssertNil(one.groupKey)
+        XCTAssertEqual(one.countLabel, "1 decision waiting")
+        let two = try XCTUnwrap(ChatViewModel.needsAttentionSection(items: [awaiting(id: "task_a"), awaiting(id: "task_b")]))
+        XCTAssertEqual(two.countLabel, "2 decisions waiting")
     }
 
     func testNeedsAttentionSectionOrdersOldestQuestionFirst() throws {
@@ -218,7 +354,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
     // MARK: - workSections(in: .doing)
 
-    func testDoingFlatGroupingPutsNeedsAttentionAboveRemainingCards() {
+    func testDoingFlatGroupingSplitsQuestionsFromOtherCardsWithoutWorkers() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [
             awaiting(id: "task_q"),
@@ -227,12 +363,12 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.map(\.title), ["Needs Attention", "Doing"])
+        XCTAssertEqual(sections.map(\.title), ["Needs Attention", "Queued"])
         XCTAssertEqual(sections[0].items.map(\.id), ["task_q"])
         XCTAssertEqual(sections[1].items.map(\.id), ["task_active"])
     }
 
-    func testDoingSectionIsOmittedWhenNoTaskIsAwaitingAnAnswer() {
+    func testOrdinaryDoingCardWithoutWorkerRendersQueued() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [
             makeTask(id: "task_active", status: "active", reason: nil, question: nil),
@@ -241,11 +377,11 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertFalse(sections.contains { $0.title == "Needs Attention" })
+        XCTAssertEqual(sections.map(\.title), ["Queued"])
         XCTAssertEqual(sections.flatMap(\.items).map(\.id), ["task_active"])
     }
 
-    func testDoingWithOnlyAQuestionRendersJustTheNeedsAttentionSection() {
+    func testDoingWithOnlyAQuestionRendersOnlyNeedsAttention() {
         let model = makeModel()
         model.choresByProductID = ["prod_test": [awaiting(id: "task_q")]]
 
@@ -254,7 +390,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(sections.map(\.title), ["Needs Attention"])
     }
 
-    func testDoingProjectGroupingKeepsNeedsAttentionAboveProjectGroups() {
+    func testDoingProjectGroupingStillSplitsQuestionsFromOtherCardsWithoutWorkers() {
         let model = makeModel()
         model.workBoardGrouping = .project
         model.choresByProductID = ["prod_test": [
@@ -264,42 +400,53 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
 
-        XCTAssertEqual(sections.first?.title, "Needs Attention")
-        XCTAssertEqual(sections.first?.items.map(\.id), ["task_q"])
-        XCTAssertEqual(sections.dropFirst().map(\.title), ["No Project"])
-        XCTAssertEqual(
-            sections.dropFirst().flatMap(\.items).map(\.id), ["task_active"],
-            "the awaiting task must not also appear in a project group"
-        )
+        XCTAssertEqual(sections.map(\.title), ["Needs Attention", "Queued"])
+        XCTAssertEqual(sections.flatMap(\.items).map(\.id), ["task_q", "task_active"], "each card must appear exactly once")
     }
 
-    func testBoardGroupMapsAwaitingTaskToNeedsAttention() {
+    func testBoardGroupIsNilForDoingCards() {
         let model = makeModel()
         let task = awaiting(id: "task_q")
         let active = makeTask(id: "task_active", status: "active", reason: nil, question: nil)
         model.choresByProductID = ["prod_test": [task, active]]
 
-        XCTAssertEqual(model.boardGroup(for: task), .needsAttention)
+        XCTAssertNil(model.boardGroup(for: task))
         XCTAssertNil(model.boardGroup(for: active))
     }
 
     // MARK: - Wire
 
-    /// The engine's `BoardGroup` has no Needs Attention member, so a drop on
-    /// the section must name only the column.
-    func testMoveRequestNeverSendsTheClientOnlyNeedsAttentionGroup() {
-        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+    func testDismissQuestionSendsNoAnswerAndSettlesFromEngineUpdate() {
+        let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
+        let task = awaiting(id: "task_q")
+        model.choresByProductID = ["prod_test": [task]]
         var sent: [[String: Any]] = []
-        client.outboundRecorder = { sent.append($0) }
+        model.engine.outboundRecorder = { sent.append($0) }
+        XCTAssertTrue(model.dismissOperatorQuestion(for: task))
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent[0]["type"] as? String, "dismiss_operator_question")
+        XCTAssertEqual(sent[0]["id"] as? String, task.operatorQuestion?.id)
+        XCTAssertNil(sent[0]["answer"])
+        XCTAssertFalse(model.answerOperatorQuestion(for: task, answer: .yesNo(true)))
+        XCTAssertFalse(model.dismissOperatorQuestion(for: task))
 
-        client.sendMoveWorkItemOnBoard(id: "task_a", column: .doing, group: .needsAttention)
-        client.sendMoveWorkItemOnBoard(id: "task_a", column: .done, group: .merging)
+        var dismissed = task
+        dismissed.blockedReason = "question_dismissed"
+        dismissed.operatorQuestion = nil
+        model.applyEventForTest(.workItemUpdated(item: .chore(dismissed)))
+        XCTAssertNil(model.operatorAnswerInFlightByTaskID[task.id])
+        XCTAssertFalse(dismissed.isAwaitingOperatorAnswer)
+        XCTAssertEqual(WorkBlockedBadge.label(forReason: dismissed.blockedReason!), "Question Dismissed")
+    }
 
-        let targets = sent.compactMap { $0["target"] as? [String: Any] }
-        XCTAssertEqual(targets.count, 2)
-        XCTAssertEqual(targets[0]["column"] as? String, "doing")
-        XCTAssertNil(targets[0]["group"])
-        XCTAssertEqual(targets[1]["group"] as? String, "merging")
+    func testDismissWhileDisconnectedIsSavedForExplicitRetry() {
+        let model = makeModel()
+        let task = awaiting(id: "task_q")
+        model.isConnected = false
+        XCTAssertFalse(model.dismissOperatorQuestion(for: task))
+        XCTAssertTrue(model.engine.hasUnsentAction(kind: "dismiss_operator_question"))
+        XCTAssertEqual(model.operatorAnswerErrorByTaskID[task.id], "Dismissal saved. Use Retry after reconnecting to send it.")
     }
 
     func testAnswerOperatorQuestionRequestEncoding() throws {
@@ -375,7 +522,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertTrue(model.operatorAnswerInFlightByTaskID.isEmpty)
     }
 
-    func testAnswerWhileDisconnectedSurfacesAnErrorOnTheCard() {
+    func testAnswerWhileDisconnectedIsSavedForExplicitRetry() {
         let model = makeModel()
         let task = awaiting(id: "task_q")
         model.isConnected = false
@@ -384,8 +531,10 @@ final class OperatorQuestionKanbanTests: XCTestCase {
 
         XCTAssertEqual(
             model.operatorAnswerErrorByTaskID["task_q"],
-            "Not connected to the engine — reconnect and try again."
+            "Answer saved. Use Retry after reconnecting to send it."
         )
+        XCTAssertTrue(model.engine.hasUnsentAction(kind: "answer_operator_question"))
+        XCTAssertTrue(model.hasUnsentActions)
         XCTAssertNil(model.operatorAnswerInFlightByTaskID["task_q"])
     }
 
@@ -429,7 +578,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertNil(model.operatorAnswerInFlightByTaskID["task_q"])
         XCTAssertNil(model.operatorAnswerErrorByTaskID["task_q"])
         XCTAssertEqual(model.task(withID: "task_q")?.boardColumn, .doing)
-        XCTAssertFalse(model.workSections(in: .doing).contains { $0.title == "Needs Attention" })
+        XCTAssertEqual(model.workSections(in: .doing).map(\.title), ["Queued"])
     }
 
     func testUnrelatedUpdateKeepsAnswerPendingUntilItsRefusalArrives() {
@@ -471,7 +620,7 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         var sent: [[String: Any]] = []
         model.engine.outboundRecorder = { sent.append($0) }
 
-        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: .needsAttention))
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
         XCTAssertTrue(sent.isEmpty)
         XCTAssertNil(model.optimisticColumnByTaskID[task.id])
         XCTAssertNil(model.pendingDragAdmissionCheck)

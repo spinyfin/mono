@@ -1,10 +1,32 @@
 //! Human-readable rendering of workspace rows for the terminal.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use console::{Style, style};
 
+use crate::app::errors::Result;
 use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
+use crate::store::{CleanupStatus, Store};
+
+/// Cleanup marks (`repo`, `workspace_id`) -> status, for the workspaces that
+/// carry one. A marked workspace shows as `free` but is not leasable.
+pub(super) type CleanupMarks = HashMap<(String, String), CleanupStatus>;
+
+pub(super) fn cleanup_marks_by_workspace(store: &Store, repo: Option<&str>) -> Result<CleanupMarks> {
+    Ok(store
+        .list_workspace_cleanup_states(repo)?
+        .into_iter()
+        .filter_map(|state| state.status.map(|status| ((state.repo, state.workspace_id), status)))
+        .collect())
+}
+
+fn cleanup_mark_note(status: CleanupStatus) -> &'static str {
+    match status {
+        CleanupStatus::Running => "cleanup running",
+        CleanupStatus::Failed => "cleanup failed, retrying",
+    }
+}
 
 /// Returns the human-readable effective status string for a workspace,
 /// combining the lease state with the last-known health status. Free
@@ -57,10 +79,18 @@ pub(super) struct RetentionSummary {
     pub(super) oldest_retained_secs: i64,
     /// Free workspaces that are actually available to lease right now.
     pub(super) effective_free: usize,
+    /// Free, otherwise-healthy workspaces withheld because a repo-declared
+    /// cleanup is running or failed on them. Not counted in `effective_free`.
+    pub(super) cleanup_withheld: usize,
     pub(super) ttl_secs: i64,
 }
 
-pub(super) fn retention_summary(records: &[WorkspaceRecord], now_epoch_s: i64, ttl_secs: i64) -> RetentionSummary {
+pub(super) fn retention_summary(
+    records: &[WorkspaceRecord],
+    cleanup_marks: &CleanupMarks,
+    now_epoch_s: i64,
+    ttl_secs: i64,
+) -> RetentionSummary {
     let mut summary = RetentionSummary {
         ttl_secs,
         ..Default::default()
@@ -72,7 +102,11 @@ pub(super) fn retention_summary(records: &[WorkspaceRecord], now_epoch_s: i64, t
         match record.health_status {
             Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined) => {}
             _ => {
-                summary.effective_free += 1;
+                if cleanup_marks.contains_key(&(record.repo.clone(), record.workspace_id.clone())) {
+                    summary.cleanup_withheld += 1;
+                } else {
+                    summary.effective_free += 1;
+                }
                 continue;
             }
         }
@@ -97,10 +131,22 @@ pub(super) fn retention_summary(records: &[WorkspaceRecord], now_epoch_s: i64, t
 /// The trailing block `cube workspace list` prints under the rows. Returns
 /// `None` when nothing is being withheld — there is no condition to report.
 pub(super) fn format_retention_summary(summary: &RetentionSummary) -> Option<String> {
-    if summary.retained == 0 {
+    if summary.retained == 0 && summary.cleanup_withheld == 0 {
         return None;
     }
     let dim = Style::new().dim();
+    if summary.retained == 0 {
+        let headline = format!(
+            "Cleanup: {} workspace(s) withheld while a workspace cleanup runs or is retried; {} free to lease.",
+            summary.cleanup_withheld, summary.effective_free,
+        );
+        let headline = if summary.effective_free == 0 {
+            style(headline).red().bold().to_string()
+        } else {
+            style(headline).yellow().to_string()
+        };
+        return Some(format!("\n{headline}"));
+    }
     let mut reasons = Vec::new();
     if summary.unpushed_work_preserved > 0 {
         reasons.push(format!("{} holding unpushed work", summary.unpushed_work_preserved));
@@ -131,10 +177,25 @@ pub(super) fn format_retention_summary(summary: &RetentionSummary) -> Option<Str
     } else {
         style(headline).yellow().to_string()
     };
-    Some(format!("\n{headline}\n{}", dim.apply_to(ttl_line)))
+    let cleanup_line = if summary.cleanup_withheld > 0 {
+        format!(
+            "\n{}",
+            dim.apply_to(format!(
+                "           {} more withheld while a workspace cleanup runs or is retried.",
+                summary.cleanup_withheld,
+            )),
+        )
+    } else {
+        String::new()
+    };
+    Some(format!("\n{headline}\n{}{cleanup_line}", dim.apply_to(ttl_line)))
 }
 
-pub(super) fn format_workspace_list(records: &[WorkspaceRecord], now_epoch_s: i64) -> String {
+pub(super) fn format_workspace_list(
+    records: &[WorkspaceRecord],
+    cleanup_marks: &CleanupMarks,
+    now_epoch_s: i64,
+) -> String {
     if records.is_empty() {
         return "No workspaces match.".to_string();
     }
@@ -182,6 +243,16 @@ pub(super) fn format_workspace_list(records: &[WorkspaceRecord], now_epoch_s: i6
                 dim.apply_to(format!("{:<label_w$}", "retained")),
                 reason,
                 format_age(now_epoch_s.saturating_sub(since)),
+            ));
+        }
+
+        if record.state == WorkspaceState::Free
+            && let Some(status) = cleanup_marks.get(&(record.repo.clone(), record.workspace_id.clone()))
+        {
+            lines.push(format!(
+                "    {}  {} (not leasable; `cube workspace gc --clear-failed-cleanup` lifts a failed mark)",
+                dim.apply_to(format!("{:<label_w$}", "cleanup")),
+                cleanup_mark_note(*status),
             ));
         }
 

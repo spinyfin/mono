@@ -358,10 +358,21 @@ fn resolve_path() -> Option<PathBuf> {
 /// this lock is what keeps two such tests from interleaving their writes
 /// into that shared file while one of them is trying to read back exactly
 /// what it just wrote. Must be held for the whole test, not just around one
-/// call — see `tests::AUDIT_GLOBALS_LOCK`'s docs for the flake this prevents.
-#[cfg(test)]
-pub(crate) fn lock_audit_globals_for_tests() -> std::sync::MutexGuard<'static, ()> {
-    tests::lock_globals()
+/// call — see `AUDIT_GLOBALS_LOCK`'s docs for the flake this prevents.
+#[cfg(any(test, feature = "test-support"))]
+pub fn lock_audit_globals_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    /// Serializes the audit tests that mutate process-global state — the
+    /// `AUDIT_PATH_ENV` env var, the `AUDIT_PATH` `OnceLock`, and the
+    /// `START_EPOCH_S` / `SHUTDOWN_EMITTED` statics. These are shared
+    /// across the whole test binary, so without a lock two of these
+    /// tests running concurrently in the same shard clobber each other's
+    /// env override and atomics (observed as a flaky
+    /// "expected shutdown, got start"). The lock recovers from poisoning
+    /// so one failing test doesn't cascade into the others.
+    static AUDIT_GLOBALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    AUDIT_GLOBALS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn append_to(path: &Path, value: &Value) -> std::io::Result<()> {
@@ -419,24 +430,9 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::fs;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Serializes the audit tests that mutate process-global state — the
-    /// `AUDIT_PATH_ENV` env var, the `AUDIT_PATH` `OnceLock`, and the
-    /// `START_EPOCH_S` / `SHUTDOWN_EMITTED` statics. These are shared
-    /// across the whole test binary, so without a lock two of these
-    /// tests running concurrently in the same shard clobber each other's
-    /// env override and atomics (observed as a flaky
-    /// "expected shutdown, got start"). The lock recovers from poisoning
-    /// so one failing test doesn't cascade into the others.
-    static AUDIT_GLOBALS_LOCK: Mutex<()> = Mutex::new(());
-
-    pub(super) fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
-        AUDIT_GLOBALS_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use super::lock_audit_globals_for_tests as lock_globals;
 
     fn parse_lines(path: &Path) -> Vec<Value> {
         let raw = fs::read_to_string(path).unwrap();

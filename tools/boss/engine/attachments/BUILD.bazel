@@ -12,9 +12,13 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/bossctl:__pkg__",
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke-worker-api:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = all_crate_deps(normal = True) + [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ],
@@ -33,6 +37,7 @@ rust_test(
         normal = True,
         normal_dev = True,
     ) + [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ],

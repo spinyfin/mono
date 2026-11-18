@@ -72,8 +72,40 @@ crate::register_gauge!(
     "REST requests left in the current hourly window, as of the last response that reported it."
 );
 
+/// A GraphQL `remaining` reading older than this is treated as absent: GitHub's
+/// quota window is hourly, so a low reading from before the last reset says
+/// nothing about the budget now.
+const GRAPHQL_REMAINING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Counts the GraphQL responses that reported the remaining quota, so a reading
+/// can be told from the gauge's starting value. A gauge is registered with the
+/// value 0 stamped with the registration time, which is also what an exhausted
+/// window reads; this counter does not exist until the first reading arrives,
+/// and its update time is when the latest one did.
+const GRAPHQL_READINGS: &str = "github_api.graphql.readings";
+
+/// GraphQL points left in the current hourly window, as of the last response
+/// that reported it, or `None` if none has (or the last one is older than the
+/// window). The un-park reconciliation job reads this before spending
+/// GitHub quota on a project's worth of children; absence means "unknown", and
+/// callers must not treat it as exhausted.
+pub fn graphql_points_remaining(registry: &Registry) -> Option<i64> {
+    let readings = registry.counter_snapshot_one(GRAPHQL_READINGS)?;
+    if readings.value == 0 || readings.updated_at_ms <= 0 {
+        return None;
+    }
+    let now_ms = boss_engine_utils::epoch_time::now_epoch_secs().saturating_mul(1000);
+    let age_ms = u64::try_from(now_ms.saturating_sub(readings.updated_at_ms)).unwrap_or(0);
+    if Duration::from_millis(age_ms) > GRAPHQL_REMAINING_MAX_AGE {
+        return None;
+    }
+    registry
+        .gauge_snapshot_one(GITHUB_API_GRAPHQL_REMAINING.name())
+        .map(|gauge| gauge.value)
+}
+
 /// Register the static handles. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&GITHUB_API_CALLS_TOTAL);
     registry.register_counter(&GITHUB_API_POINTS_TOTAL);
@@ -158,6 +190,11 @@ pub(crate) fn record_metrics(registry: &Registry, sample: &GhCallSample) {
             // but not a recoverable point cost), so it updates regardless.
             if sample.api == GhApi::Graphql {
                 GITHUB_API_GRAPHQL_REMAINING.set(registry, rl.remaining);
+                registry.counter_inc_by_dynamic(
+                    GRAPHQL_READINGS,
+                    "GraphQL responses that reported the remaining quota; its update time is the latest reading.",
+                    1,
+                );
             } else if sample.api == GhApi::Rest {
                 GITHUB_API_REST_REMAINING.set(registry, rl.remaining);
             }
@@ -236,7 +273,7 @@ fn spawn_writer(
     work_db: Arc<WorkDb>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GhCallSample>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut pending: Vec<GithubApiCallRow> = Vec::with_capacity(WRITE_BATCH_MAX);
         let mut flush_tick = tokio::time::interval(WRITE_BATCH_INTERVAL);
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -331,6 +368,58 @@ mod tests {
         let registry = Registry::new();
         register_metrics(&registry);
         registry
+    }
+
+    #[test]
+    fn graphql_points_remaining_is_unknown_until_a_graphql_response_reports_it() {
+        let registry = registry();
+        assert_eq!(
+            graphql_points_remaining(&registry),
+            None,
+            "the gauge starts at 0, which must not read as an exhausted window"
+        );
+
+        record_metrics(&registry, &sample("ci_watch", GhApi::Rest, GhOutcome::Ok, rl(1, 4_900)));
+        assert_eq!(
+            graphql_points_remaining(&registry),
+            None,
+            "a REST reading is another bucket"
+        );
+
+        record_metrics(
+            &registry,
+            &sample("merge_poller.sweep", GhApi::Graphql, GhOutcome::Ok, rl(1, 4_950)),
+        );
+        assert_eq!(graphql_points_remaining(&registry), Some(4_950));
+
+        record_metrics(
+            &registry,
+            &sample("merge_poller.sweep", GhApi::Graphql, GhOutcome::Ok, rl(1, 0)),
+        );
+        assert_eq!(
+            graphql_points_remaining(&registry),
+            Some(0),
+            "a window that really is exhausted is a reading, not an absence"
+        );
+    }
+
+    #[test]
+    fn a_graphql_reading_from_before_the_current_window_is_treated_as_absent() {
+        let registry = registry();
+        record_metrics(
+            &registry,
+            &sample("merge_poller.sweep", GhApi::Graphql, GhOutcome::Ok, rl(1, 12)),
+        );
+        assert_eq!(graphql_points_remaining(&registry), Some(12));
+
+        let two_hours_ago = boss_engine_utils::epoch_time::now_epoch_ms() - 2 * 60 * 60 * 1000;
+        assert!(registry.seed_counter(GRAPHQL_READINGS, 1, i64::try_from(two_hours_ago).unwrap()));
+
+        assert_eq!(
+            graphql_points_remaining(&registry),
+            None,
+            "a low reading from before the last reset says nothing about the budget now"
+        );
     }
 
     #[test]
@@ -517,7 +606,7 @@ mod tests {
         // intact. Driven through a local channel rather than the global
         // sink, so it cannot capture (or be perturbed by) `gh` calls made
         // by other tests running concurrently in this binary.
-        let db = Arc::new(WorkDb::open_in_memory().expect("open db"));
+        let db = Arc::new(WorkDb::open(":memory:".into()).expect("open db"));
         let (tx, rx) = unbounded_channel::<GhCallSample>();
         let handle = spawn_writer(db.clone(), rx);
 
@@ -559,7 +648,7 @@ mod tests {
     async fn writer_task_commits_what_it_holds_when_the_sender_drops() {
         // A partial batch must not be lost on shutdown: when every sender
         // is gone the writer commits what it has before returning.
-        let db = Arc::new(WorkDb::open_in_memory().expect("open db"));
+        let db = Arc::new(WorkDb::open(":memory:".into()).expect("open db"));
         let (tx, rx) = unbounded_channel::<GhCallSample>();
         let handle = spawn_writer(db.clone(), rx);
 

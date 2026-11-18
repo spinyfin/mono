@@ -145,9 +145,7 @@ pub const MAX_LOOKBACK_SECS: i64 = 24 * 60 * 60;
 /// same execution before the sweep files an attention item.
 pub const ESCALATE_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
 
-/// `work_attention_items.kind` filed once a candidate's auto-create attempts
-/// have failed [`ESCALATE_AFTER_CONSECUTIVE_FAILURES`] times in a row.
-pub const ATTENTION_KIND_ABANDONED_BRANCH_NO_PR: &str = "abandoned_branch_no_pr";
+pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR;
 
 /// Outcome of one auto-create attempt for a single candidate.
 #[derive(Debug)]
@@ -434,6 +432,7 @@ pub fn spawn_loop(
     let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
     let pr_creator: Arc<dyn PrAutoCreator> = Arc::new(CommandPrAutoCreator::new());
     let failure_counts: Arc<AsyncMutex<HashMap<String, u32>>> = Arc::new(AsyncMutex::new(HashMap::new()));
+    let preserved_backoff: Arc<AsyncMutex<crate::preserved_cleanup_sweep::Backoff>> = Arc::default();
     spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
         let coordinator = Arc::clone(&coordinator);
@@ -441,10 +440,21 @@ pub fn spawn_loop(
         let pr_creator = Arc::clone(&pr_creator);
         let dispatch_events = Arc::clone(&dispatch_events);
         let failure_counts = Arc::clone(&failure_counts);
+        let preserved_backoff = Arc::clone(&preserved_backoff);
         async move {
             if let Err(err) = crate::abandoned_execution_bookmarks::run_one_pass(&work_db, &coordinator).await {
                 tracing::error!(error = %err, "abandoned execution bookmark sweep failed");
             }
+            // Forget the preserved references a published successor or a
+            // long-closed item has finished with, so the shared store's
+            // bookmark set stays bounded by live work (see that module).
+            let mut preserved_backoff = preserved_backoff.lock().await;
+            match crate::preserved_cleanup_sweep::run_one_pass(&work_db, &coordinator, &mut preserved_backoff).await {
+                Ok(report) if report.has_activity() => tracing::info!(?report, "preserved reference cleanup pass"),
+                Ok(_) => {}
+                Err(err) => tracing::error!(error = %err, "preserved reference cleanup sweep failed"),
+            }
+            drop(preserved_backoff);
             let mut failure_counts = failure_counts.lock().await;
             boss_gh_telemetry::scope(
                 boss_gh_telemetry::callers::ABANDONED_BRANCH_SWEEP,

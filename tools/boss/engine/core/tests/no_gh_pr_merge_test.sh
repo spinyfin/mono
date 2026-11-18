@@ -15,10 +15,17 @@
 # not behaviour.
 set -euo pipefail
 
-src_dir="$TEST_SRCDIR/mono/tools/boss/engine/core/src"
+engine_dir="$TEST_SRCDIR/${TEST_WORKSPACE:-_main}/tools/boss/engine"
 allowed_file="merge_when_ready.rs"
 
-matches="$(grep -rl '"pr", *"merge"' "$src_dir" --include="*.rs" || true)"
+for d in core app; do
+  if [ -z "$(find "$engine_dir/$d/src" -name '*.rs' -print -quit 2>/dev/null)" ]; then
+    echo "ERROR: no .rs files under $engine_dir/$d/src; the guard would scan nothing." >&2
+    exit 1
+  fi
+done
+
+matches="$(grep -rl '"pr", *"merge"' "$engine_dir/core/src" "$engine_dir/app/src" --include="*.rs" || true)"
 bad="$(echo "$matches" | grep -v "/${allowed_file}\$" || true)"
 
 if [ -n "$bad" ]; then

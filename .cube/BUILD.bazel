@@ -1,0 +1,11 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# The mono repo's cube cleanup step (declared in setup.yaml) and its test. The
+# only Bazel-aware part of cube's workspace cleanup.
+sh_test(
+    name = "cleanup_bazel_output_base_test",
+    size = "small",
+    srcs = ["cleanup-bazel-output-base_test.sh"],
+    args = ["$(rootpath cleanup-bazel-output-base.sh)"],
+    data = ["cleanup-bazel-output-base.sh"],
+)

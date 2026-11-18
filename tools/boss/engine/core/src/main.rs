@@ -147,8 +147,29 @@ fn open_log_file(path: &Path, max_files: usize) -> Result<RotatingState> {
         .with_context(|| format!("failed to open engine log file {}", path.display()))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Build the runtime by hand rather than via `#[tokio::main]`: its implicit
+/// drop waits for every blocking task forever, so a wedged subprocess could
+/// keep the process alive after the engine had finished shutting down. See
+/// [`boss_engine::runtime_shutdown`].
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime")?;
+    let result = runtime.block_on(run_engine());
+    boss_engine::runtime_shutdown::shutdown_engine_runtime(runtime);
+    result
+}
+
+async fn run_engine() -> Result<()> {
+    // Hand the Bazel-stamped build identity to engine_lib before anything
+    // reads it. The stamped `boss_build_provenance` crate is linked only
+    // here, in the leaf binary — never into engine_lib — so a new commit
+    // sha relinks this binary without recompiling the library or
+    // re-executing its tests (see `build_info`'s module docs and
+    // `stamped_provenance_isolation_test`).
+    install_stamped_provenance();
+
     // Handle --version before the full startup so we print our custom
     // "boss-engine 0+<sha> built <time>" format and exit cleanly
     // without initialising logging or touching the audit log.
@@ -263,6 +284,25 @@ async fn main() -> Result<()> {
     audit::record_shutdown(reason);
 
     result
+}
+
+/// Copy the constants Bazel stamped into `boss_build_provenance` into
+/// engine_lib's process-wide provenance cell. Runs first in `run_engine`,
+/// so the "already installed" branch is unreachable in practice; it is
+/// kept non-fatal because a duplicate install is a wiring bug worth a
+/// line on stderr, not a reason to refuse to start the engine.
+fn install_stamped_provenance() {
+    let stamped = build_info::Provenance {
+        version: boss_build_provenance::version(),
+        git_sha: boss_build_provenance::git_sha(),
+        git_dirty: boss_build_provenance::git_dirty(),
+        build_time: boss_build_provenance::build_time(),
+    };
+    if let Err(already_installed) = build_info::install_provenance(stamped) {
+        // Logging is not wired up yet at this point, so stderr is the
+        // only surface available.
+        eprintln!("boss-engine: build provenance was already installed ({already_installed:?}); keeping it");
+    }
 }
 
 fn build_start_context(isolation: &IsolationPaths) -> StartContext {

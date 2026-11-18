@@ -1,152 +1,115 @@
-//! Escalation-ladder harness for the in-review merge-conflict path
-//! (`docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`,
-//! Layer 1 / tasks T4 + T6).
+//! Escalation ladder for in-review merge conflicts.
 //!
-//! The ladder restructures conflict handling from "detect → full worker"
-//! into a sequence of strictly-cheaper rungs, each attempted only when the
-//! cheaper one declines. This module is invoked from
-//! [`crate::conflict_watch::on_conflict_detected`] *before*
-//! `maybe_spawn_conflict_revision`, so a mechanical resolution retires the
-//! conflict with no agent and zero tokens, and only genuinely-semantic
-//! conflicts reach the worker path (rung 2 or 3).
+//! Rung 1 leases a workspace and runs an engine-direct rebase. Cube can
+//! collapse replay-only conflicts when it proves that the final tree is
+//! unchanged. A clean pushed result retires without dispatching a worker.
+//! Recovery pointers are saved before positioning and restored afterward;
+//! baseline maintenance cannot override the published resolution outcome.
 //!
-//! ## Rungs implemented here
+//! Rung 0 applies deterministic resolvers to residual conflicts: lockfile
+//! regeneration, the per-path rules in the Boss-side
+//! `conflict-recipes.toml`, and keep-both for same-spot insertions. Every
+//! file must resolve and the result must push before the attempt retires.
+//! Otherwise a bounded residue qualifies for the small rung-2 worker;
+//! larger conflicts use the full rung-3 worker. Worker dispatch acquires
+//! and positions its own lease.
 //!
-//! - **Rung 1 — engine-direct mechanical rebase.** Lease a workspace,
-//!   position it on the PR, and run `cube workspace rebase` engine-side (no
-//!   agent). Because jj does a real 3-way structural merge, GitHub's stale
-//!   `CONFLICTING` and non-overlapping "same-file" hunks resolve for free.
-//!   On `REBASED_CLEAN` the command advances and pushes the boss bookmark
-//!   itself; the harness retires the attempt at rung 1 and the parent
-//!   returns to Review with no worker ever spawned.
+//! ## Mechanical-resolution deletion gate
 //!
-//!   **Why this rung used to almost never fire.** A rebase
-//!   replays each commit individually, while GitHub (and the
-//!   `boss_conflict_diagnosis` `git merge-tree` probe) merges the final
-//!   trees. A branch that touched a region and then rewrote or reverted it
-//!   conflicts *during replay* even though the merge is clean, so jj left
-//!   an ancestor of the branch head flagged while the head's own rebased
-//!   tree was already correct — and `jj git push` refuses a range
-//!   containing any conflicted commit. `cube workspace rebase` therefore
-//!   reported `REBASED_WITH_CONFLICTS` for a branch that needed no decision
-//!   at all, rung 1 declined, and (because the flagged commits dedupe to
-//!   one path) the residue was almost always exactly one file, which
-//!   [`rung2_eligible`] then routed to a small agent. Measured over the
-//!   `conflict_resolutions` table: 7 of 281 ladder-era attempts retired
-//!   mechanically, and 91 of the 107 attempts carrying a trustworthy
-//!   diagnosis had a *completely clean* `git merge-tree` yet still spawned
-//!   an agent. cube now collapses those replay-only conflicted ancestors
-//!   forward and proves the pushed tree byte-identical before reporting
-//!   clean ([`crate::coordinator::RebaseOutcome::linearized_commits`]); a
-//!   conflicted *head*, a bookmarked ancestor (stacked-PR boundary), or any
-//!   tree drift still declines and hands off here exactly as before —
-//!   carrying *which* guard refused
-//!   ([`crate::coordinator::RebaseOutcome::linearize_decline`]), which this
-//!   module stamps on its rung-1 fall-through trace so the guard hits can be
-//!   counted without a code change.
-//!
-//! - **Rung 2 (T6) — small focused resolution agent.** When rung 1 leaves a
-//!   *bounded* residue of conflicted files ([`rung2_eligible`],
-//!   [`RUNG2_MAX_RESIDUAL_FILES`]), [`crate::conflict_watch`] spawns the
-//!   revision through the small-agent profile instead of the default one:
-//!   `effort_level = small` (the existing effort-level → model table already
-//!   resolves `small` to the cheap/fast tier — see `effort.rs` and issue
-//!   #746 for why this deliberately never falls to Haiku), and this module
-//!   stamps `resolved_by_rung = 2` on the attempt up front (before the
-//!   revision has actually run) so the later default-to-rung-3 stamp is a
-//!   no-op `COALESCE`. The prompt is the same tight, diagnosis-inline
-//!   conflict-resolution fragment rung 3 already uses
-//!   (`compose_conflict_resolution_fragment` in `runner.rs`) — it is
-//!   already scoped to "resolve only these conflicted hunks," which is what
-//!   makes it suitable for a smaller/cheaper model. A residue above the
-//!   bound is treated as a large/architectural conflict and declines rung 2
-//!   up front, climbing straight to rung 3 (per the design's rung-3 decline
-//!   condition).
-//!
-//!   Deferred from this task: literally handing the *already-leased,
-//!   already-rebased* workspace to the rung-2 execution (so the agent never
-//!   pays a second lease/goto/rebase) is NOT wired — the coordinator's
-//!   dispatch invariant unconditionally re-runs `cube workspace goto` for
-//!   every `revision_implementation` dispatch (`coordinator.rs`, "positioning
-//!   is never skipped for revisions"), so a second lease+goto+rebase still
-//!   happens for rung 2 today. Skipping that safely needs a new explicit
-//!   "already positioned" signal threaded through that invariant, which is
-//!   a deliberate dispatch-safety change deserving its own review rather
-//!   than a silent bypass here. Rung 2 as implemented still gets the
-//!   cost/safety win of a small, cheap, bounded-scope agent — it just
-//!   doesn't yet skip the re-lease.
-//!
-//! - **Rung 0 — deterministic resolvers.** When rung 1 leaves residual
-//!   conflicts, [`attempt_rung0`] feeds the residual files to the T2
-//!   registry (`boss_deterministic_resolvers`). If every file resolves, it
-//!   lands the result — advance the workspace's branch bookmark and push
-//!   via [`CubeClient::push_resolution`] (`cube workspace push`, the "no
-//!   clean verb today" gap this closes) — and retires the attempt at rung
-//!   0. If any file declines, or the push fails, it falls through to rung
-//!   3 exactly as an all-declined rung 1 does today. Live by default — see
-//!   [`RUNG0_APPLY_LIVE`]'s doc comment for the incident that triggered
-//!   flipping it and how to kill it again if needed.
-//!
-//! ## T9 (T2562) result-gate: the deletion tripwire on rungs 0/1
-//!
-//! Before either mechanical rung auto-retires a pushed resolution, the
-//! harness now calls [`CubeClient::verify_deletion_tripwire`] — the same
-//! both-parents deletion tripwire (incident-002 P2,
-//! `merge_parent_deletion::compute_merged_parent_deletions`) the
-//! worker-driven `pr_review` pass already runs for rung 2/3's output
-//! (`completion.rs::compute_merge_parent_deletion_signoff`). A finding
-//! halts the attempt in `blocked: deletion_signoff` — the identical
-//! operator-sign-off state rung 2/3 land in on the same tripwire — via
-//! [`halt_attempt_for_deletion_signoff`], instead of auto-retiring an
-//! unvetted deletion. This closes the gap [`RUNG0_APPLY_LIVE`]'s doc
-//! comment describes: there is now a standalone check this harness calls
-//! to vet a mechanical rung's output before auto-retiring it. Flipping
-//! `RUNG0_APPLY_LIVE` itself remains a separate, deliberate follow-up
-//! decision (see that constant's doc comment) — this task only wires the
-//! gate, it does not turn rung 0 on.
-//!
-//! The "build gate" half of T9's scope is the PR's own CI: once a rung
-//! retires an attempt, the task returns to ordinary `in_review` (or, on a
-//! tripwire hit, `blocked: deletion_signoff`) — either way it is a normal
-//! task the existing `ci_watch` detection sweep already covers generically
-//! for *any* in-review PR, independent of which rung produced the push.
-//! No rung-specific build-gate machinery is needed to get that coverage;
-//! it falls out of retiring into the same lifecycle every other PR uses.
-//!
-//! ## Deferred (declared in the T4 PR, still open)
-//!
-//! - **Escalation-on-rejection → rung 3 with findings, for CI/AI-review
-//!   rejections specifically.** The design's aspirational text describes
-//!   *any* post-resolution rejection (tripwire, build gate, AI reviewer)
-//!   auto-escalating to a rung-3 worker. For the deletion tripwire this
-//!   task deliberately does NOT build that: the already-landed P1/P2
-//!   behavior for rung 2/3 (`completion.rs`) requires **explicit operator
-//!   sign-off** on a flagged deletion rather than any auto-remediation —
-//!   incident-002's own lesson is that letting an agent "fix" a flagged
-//!   deletion is the failure mode, not the safety net. Extending rungs 0/1
-//!   to the *same* human-gated halt (this task) is the correct application
-//!   of "compose with T2253, never weaken it": auto-escalating to a rung-3
-//!   agent instead would be *weaker* than what rung 2/3 already do. A CI
-//!   failure or AI-review severity-gate rejection on a rung 2/3 PR already
-//!   mints a normal revision (`ci_watch.rs` / `completion.rs`) — untouched
-//!   by this task. What the harness *does* guarantee is the ladder's other
-//!   invariant: a rung that **declines** (rebase errors, an unresolvable
-//!   residual file, or a failed push) climbs — it never retries the same
-//!   rung against the same state (the `conflict_resolutions` UNIQUE key
-//!   dedupes identical base+head states; a genuinely new state gets a
-//!   fresh attempt, bounded by the churn guard).
+//! Every pushed mechanical resolution passes the same both-parent deletion
+//! tripwire as worker resolutions. A flagged deletion halts the attempt in
+//! `blocked: deletion_signoff` until a human explicitly approves it.
+//! Neither checkpoint errors nor a clean rebase bypass this gate. CI and
+//! review failures use the ordinary revision lifecycle.
+//! Attempts deduplicate identical base/head states, and the churn guard
+//! bounds attempts across changing states.
 
-use boss_deterministic_resolvers::{ConflictedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
+use boss_deterministic_resolvers::{
+    ConflictRecipesStore, ConflictRules, ConflictedFile, DeclinedFile, FailedFile, RegistryResolution, ResolvedFile,
+    ResolverRegistry,
+};
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 
-use crate::coordinator::{CubeClient, CubeWorkspaceLease, ExecutionPublisher};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
+
 use crate::merge_poller::stored_pr_number;
 use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
+use boss_host_execution::types::CubeWorkspaceLease;
+
+/// Builds the rung-0 resolver registry for a base revision (e.g.
+/// `main@origin`). Production uses [`configured_resolvers`] over the
+/// per-path rules; tests inject a registry whose resolvers do not need a
+/// host toolchain.
+pub(crate) type ResolverFactory<'a> = &'a (dyn Fn(&str) -> ResolverRegistry + Send + Sync);
+
+/// The shipped lockfile and keep-both resolvers, seeded from `base_revision`.
+#[cfg(test)]
+pub(crate) fn builtin_resolvers(base_revision: &str) -> ResolverRegistry {
+    ResolverRegistry::with_builtins_from_base(base_revision)
+}
+
+/// The per-path conflict rules, read from
+/// `conflict-recipes.toml` beside the work database. The file is Boss-side
+/// configuration, never part of a product repository, so a PR cannot
+/// change what the engine runs on its own conflict.
+///
+/// Read once per attempt, so an edit takes effect on the next conflict
+/// without a restart. A missing file is the normal case and yields no
+/// rules. A file that does not parse yields no rules either, and says so:
+/// half of a broken rule file is not applied.
+pub(crate) fn load_conflict_rules(work_db: &WorkDb) -> ConflictRules {
+    if work_db.is_in_memory() {
+        return ConflictRules::default();
+    }
+    let Some(state_root) = work_db.path().parent() else {
+        return ConflictRules::default();
+    };
+    let store = ConflictRecipesStore::new(ConflictRecipesStore::default_path(state_root));
+    match store.load_rules() {
+        Ok(rules) => {
+            if !rules.is_empty() {
+                tracing::info!(
+                    path = %store.path().display(),
+                    recipes = rules.recipes.len(),
+                    keep_both_rules = rules.keep_both.len(),
+                    "conflict_ladder: loaded per-path conflict rules for rung 0",
+                );
+            }
+            rules
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %store.path().display(),
+                error = %format!("{err:#}"),
+                "conflict_ladder: conflict rules file is invalid; rung 0 runs with the built-in resolvers only",
+            );
+            ConflictRules::default()
+        }
+    }
+}
+
+/// The shipped resolvers plus `rules`, seeded from `base_revision`. Rules
+/// that do not compile are dropped as a set, with a warning.
+pub(crate) fn configured_resolvers(rules: &ConflictRules, base_revision: &str) -> ResolverRegistry {
+    ResolverRegistry::with_rules_from_base(base_revision, rules).unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            "conflict_ladder: a per-path conflict rule is invalid; rung 0 runs with the built-in resolvers only",
+        );
+        ResolverRegistry::with_builtins_from_base(base_revision)
+    })
+}
+
+/// A leased workspace plus the resolver registry rung 0 uses against it.
+pub(crate) struct RungWorkspace<'a> {
+    pub(crate) lease: &'a CubeWorkspaceLease,
+    pub(crate) resolvers: ResolverFactory<'a>,
+}
 
 /// The escalation-ladder rung a resolution was produced at, recorded in
-/// `conflict_resolutions.resolved_by_rung` for telemetry (T1). Rung 0
+/// `conflict_resolutions.resolved_by_rung` for telemetry. Rung 0
 /// (deterministic resolvers) and rung 1 (engine-direct rebase) are produced
-/// by this harness; rung 2 (T6, the small focused resolution agent) is
+/// by this harness; rung 2 (the small focused resolution agent) is
 /// stamped by [`rung2_eligible`]'s caller before it spawns the revision;
 /// rung 3 (full worker) is stamped by the existing retire paths.
 const RUNG_DETERMINISTIC_RESOLVER: i64 = 0;
@@ -161,31 +124,13 @@ const RUNG_ENGINE_DIRECT_REBASE: i64 = 1;
 /// a different engine install sharing the same cube pool.
 pub(crate) const RUNG1_TASK_LABEL_PREFIX: &str = "conflict-ladder rung1 ";
 
-/// Rung 0 (deterministic-resolver apply/commit/push, [`attempt_rung0`]) is
-/// fully implemented and unit-tested. T2562 (T9, "T2253 safety integration
-/// for the ladder") landed the result-gate: both rungs 0 and 1 route their
-/// pushed output through [`CubeClient::verify_deletion_tripwire`] before
-/// auto-retiring (see the module doc comment) — the safety net this
-/// constant was waiting on.
-///
-/// Flipped live by the reviewed follow-up PR that constant's prior doc
-/// comment called for, triggered by spinyfin/mono#2032 (chore T2680):
-/// with rung 0 gated off, a PR whose *re*-conflict was lockfile-only
-/// (`MODULE.bazel.lock` regenerated from a `bzlmod` dependency bump on
-/// `main`, "no source files required resolution this round" per the
-/// resolving revision's own PR comment) still spawned a full LLM
-/// "resolve merge conflict" revision instead of retiring for free —
-/// exactly the recurring case rung 0 exists to absorb cheaply. See
-/// `rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_conflict`
-/// in `conflict_ladder_tests.rs`.
-///
-/// Deliberately still a compile-time constant, not a `feature_flags`
-/// debug-pane toggle: kept as a one-line kill switch (set back to `false`)
-/// in case live rung-0 activity misbehaves, without touching runtime
-/// config.
+/// Enable deterministic resolution after rung 1 leaves residual conflicts.
+/// Both mechanical rungs vet their pushed result with the deletion tripwire.
+/// Lockfile-only residuals can therefore retire without a worker, including
+/// repeat conflicts (see spinyfin/mono#2032).
 const RUNG0_APPLY_LIVE: bool = true;
 
-/// Rung 2 (T6): the escalation-ladder rung a resolution was produced at when
+/// Rung 2: the escalation-ladder rung a resolution was produced at when
 /// a small, focused, pre-staged agent — not a cold full worker — resolved
 /// it. Recorded in `conflict_resolutions.resolved_by_rung` by
 /// [`crate::conflict_watch`] via [`crate::work::WorkDb::stamp_conflict_resolution_rung`]
@@ -209,7 +154,7 @@ pub(crate) enum LadderOutcome {
     /// parent is back in Review, and the success events are published. The
     /// caller must NOT spawn a worker revision.
     Retired,
-    /// A mechanical rung (0 or 1) pushed a resolution, but the T9/T2562
+    /// A mechanical rung (0 or 1) pushed a resolution, but the
     /// both-parents deletion tripwire rejected it
     /// ([`halt_attempt_for_deletion_signoff`]): the attempt is halted in
     /// `blocked: deletion_signoff` pending operator sign-off — the same
@@ -254,7 +199,31 @@ pub(crate) enum LadderOutcome {
     /// rung on a pure infra failure is exactly the bug this variant exists
     /// to close. The attempt stays `pending` with no `revision_task_id`, so
     /// the ladder is retried in full on the next `conflict_watch` tick.
+    ///
+    /// Only the lease failure produces this; a resolver that ran and failed
+    /// is deterministic for the PR head and is reported through
+    /// [`Self::LockfileRegenerationFailed`] instead, so it cannot retry
+    /// silently forever.
     MechanicalRungsUnavailable,
+    /// A worker is live on this PR's chain (the root or any revision, in
+    /// `claimed`, `running` or `waiting_human`; reviews excluded), so the
+    /// engine must not rewrite the PR branch's commits in the shared jj store
+    /// underneath it. Checked before any repo access or lease, so nothing was
+    /// leased, positioned or rebased. The caller spawns nothing and leaves the
+    /// attempt `pending` (retried on a later tick, like
+    /// [`Self::MechanicalRungsUnavailable`]); the live writer owns the branch
+    /// until it finishes, and a conflict it leaves behind is picked up then.
+    DeferredForLiveWriter,
+    /// Every residual conflicted file was a generated lockfile, but its
+    /// regeneration failed operationally (tool missing from `PATH`, no
+    /// network, the tool itself erroring, the lockfile absent on the base).
+    /// The attempt has been marked `failed` with the specific resolver
+    /// reason, an attention item names it, and the parent stays
+    /// `blocked: merge_conflict`. The caller must NOT spawn a worker (the
+    /// failure is environmental, not a semantic conflict) and must not
+    /// retry: the terminal attempt row is keyed on the PR head, so a new
+    /// attempt only starts once a new head is pushed (or a human retries).
+    LockfileRegenerationFailed,
 }
 
 /// Emits the single canonical decision line for a conflicted-PR
@@ -270,7 +239,7 @@ pub(crate) enum LadderOutcome {
 /// - `"generic"` — no mechanical rung applied; a full (or small-agent,
 ///   rung 2) worker revision will be spawned.
 /// - `"skip"` — the ladder was never attempted at all (e.g. the
-///   `conflict_ladder_mechanical_rebase` feature flag is off).
+///   `conflict_ladder_mechanical_rebase` feature flag was set to `false`).
 pub(crate) fn log_routing_verdict(
     work_item_id: &str,
     pr: Option<u64>,
@@ -288,7 +257,55 @@ pub(crate) fn log_routing_verdict(
     );
 }
 
-/// Rung 2 (T6) eligibility: a bounded set of residual conflicted files is
+/// Persist decisions for CLI inspection and bounded tier/outcome counters.
+/// A blank `reason` is replaced with `{tier} {outcome}` so every ladder exit
+/// writes a non-null history entry even when per-file details were empty.
+pub(crate) fn record_tier(work_db: &WorkDb, attempt: &ConflictResolution, tier: &str, outcome: &str, reason: &str) {
+    let fallback;
+    let reason = if reason.trim().is_empty() {
+        fallback = format!("{tier} {outcome}");
+        fallback.as_str()
+    } else {
+        reason
+    };
+    if let Err(err) = work_db.record_conflict_ladder_outcome(&attempt.id, tier, outcome, reason) {
+        tracing::error!(attempt_id = %attempt.id, tier, outcome, ?err, "conflict_ladder: could not persist tier decision");
+    }
+}
+
+fn format_declined_file(file: &DeclinedFile) -> String {
+    if file.matched_resolver {
+        format!("{}: resolver ran and declined: {}", file.path, file.reason)
+    } else {
+        format!("{}: no resolver applies to this file", file.path)
+    }
+}
+
+/// Record a rung-0 registry decline/failure. Empty per-file lists still
+/// persist `reason` rather than leaving `ladder_reason` NULL.
+pub(crate) fn record_rung0_registry_decline(
+    work_db: &WorkDb,
+    attempt: &ConflictResolution,
+    declined: &[DeclinedFile],
+    failed: &[FailedFile],
+    reason: &str,
+) {
+    let details = declined
+        .iter()
+        .map(format_declined_file)
+        .chain(failed.iter().map(|f| format!("{}: {}", f.path, f.reason)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    record_tier(
+        work_db,
+        attempt,
+        "deterministic",
+        if failed.is_empty() { "declined" } else { "failed" },
+        if details.is_empty() { reason } else { &details },
+    );
+}
+
+/// Rung 2 eligibility: a bounded set of residual conflicted files is
 /// "genuine semantic overlap" a small focused agent may attempt; zero files
 /// means rung 1 never actually left a residue to hand off (a lease/goto/
 /// rebase-transport failure, or a clean-but-unpushed rebase) and more than
@@ -313,6 +330,20 @@ pub(crate) async fn try_mechanical_rungs(
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
 ) -> LadderOutcome {
+    let rules = load_conflict_rules(work_db);
+    let resolvers = |base_revision: &str| configured_resolvers(&rules, base_revision);
+    try_mechanical_rungs_with(work_db, publisher, cube_client, candidate, attempt, &resolvers).await
+}
+
+/// [`try_mechanical_rungs`] with an injectable rung-0 resolver registry.
+pub(crate) async fn try_mechanical_rungs_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: &dyn CubeClient,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    resolvers: ResolverFactory<'_>,
+) -> LadderOutcome {
     let Some(pr_number) = stored_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
@@ -321,6 +352,7 @@ pub(crate) async fn try_mechanical_rungs(
         );
         let reason = "could not parse a PR number from pr_url; mechanical rungs skipped";
         log_routing_verdict(&candidate.work_item_id, None, &[], "generic", reason);
+        record_tier(work_db, attempt, "engine_rebase", "fell_through", reason);
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason,
@@ -328,10 +360,50 @@ pub(crate) async fn try_mechanical_rungs(
     };
     let pr_number = pr_number as u64;
 
+    // The engine's rebase and push rewrite the PR branch's history in the
+    // shared jj store, and a live worker on the same chain follows those
+    // rewrites from its own workspace at the same time. Concurrent operations
+    // on one branch are what produce divergence, so prevent the overlap
+    // instead of repairing it afterwards: with a live writer, do nothing now.
+    // The hold also keeps dispatch from starting a worker on this chain while
+    // the lease, rebase and push below are running, and is released when this
+    // function returns on any path.
+    let _chain_hold = match hold_chain_for_engine_rebase(work_db, &candidate.work_item_id) {
+        Ok(hold) => hold,
+        Err(writers) => {
+            tracing::info!(
+                work_item_id = %candidate.work_item_id,
+                pr = pr_number,
+                attempt_id = %attempt.id,
+                live_writers = %writers,
+                "conflict_ladder: a worker is live on this PR's chain; deferring the engine rebase",
+            );
+            log_routing_verdict(
+                &candidate.work_item_id,
+                Some(pr_number),
+                &[],
+                "skip",
+                "a worker is live on this PR's chain; engine rebase deferred until it finishes",
+            );
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "deferred",
+                if writers.trim().is_empty() {
+                    "a worker is live on this PR's chain; engine rebase deferred until it finishes"
+                } else {
+                    &writers
+                },
+            );
+            return LadderOutcome::DeferredForLiveWriter;
+        }
+    };
+
     // One INFO line at ladder entry so "was any mechanical rung invoked for
     // this conflict?" is answerable from the engine trace (mono#1398/#1764:
     // the ladder was running silently / never reached). Escalation and
-    // outcome lines follow from `run_rung1_in_lease` / `attempt_rung0`.
+    // outcome lines follow from `run_rung1_in_lease_with` / `attempt_rung0`.
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr = pr_number,
@@ -351,6 +423,7 @@ pub(crate) async fn try_mechanical_rungs(
             );
             let reason = "no repo_remote_url resolves for this work item; mechanical rungs skipped";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(work_db, attempt, "engine_rebase", "fell_through", reason);
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -364,6 +437,13 @@ pub(crate) async fn try_mechanical_rungs(
             );
             let reason = "failed to resolve repo_remote_url; mechanical rungs skipped";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "fell_through",
+                &format!("{reason}: {err:#}"),
+            );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -382,6 +462,13 @@ pub(crate) async fn try_mechanical_rungs(
             );
             let reason = "ensure_repo failed; mechanical rungs skipped";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "fell_through",
+                &format!("{reason}: {err:#}"),
+            );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -412,6 +499,13 @@ pub(crate) async fn try_mechanical_rungs(
                 "could not lease a workspace for rung 1 after one retry; mechanical rungs unavailable \
                  this attempt, ladder will retry on the next conflict_watch tick",
             );
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "unavailable",
+                &format!("workspace lease failed after retry: {err:#}"),
+            );
             return LadderOutcome::MechanicalRungsUnavailable;
         }
     };
@@ -441,7 +535,20 @@ pub(crate) async fn try_mechanical_rungs(
     // 2026-07-18 leaked-lease incident), then run the rung and release
     // unconditionally.
     crate::ladder_lease_registry::register(&lease);
-    let outcome = run_rung1_in_lease(work_db, publisher, cube_client, candidate, attempt, pr_number, &lease).await;
+    let workspace = RungWorkspace {
+        lease: &lease,
+        resolvers,
+    };
+    let outcome = run_rung1_in_lease_with(
+        work_db,
+        publisher,
+        cube_client,
+        candidate,
+        attempt,
+        pr_number,
+        &workspace,
+    )
+    .await;
 
     // The rung has concluded (retired, halted, or fell through) — clear the
     // in-flight marker (and the mechanical lease/workspace it stamped) now,
@@ -510,15 +617,16 @@ async fn lease_rung1_workspace(
 /// Position the leased workspace on the PR head, run the engine-direct
 /// rebase, and act on the outcome. Split out so the caller can release the
 /// lease unconditionally regardless of which branch this returns from.
-async fn run_rung1_in_lease(
+pub(crate) async fn run_rung1_in_lease_with(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     cube_client: &dyn CubeClient,
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
     pr_number: u64,
-    lease: &crate::coordinator::CubeWorkspaceLease,
+    workspace: &RungWorkspace<'_>,
 ) -> LadderOutcome {
+    let lease = workspace.lease;
     if let Err(err) = cube_client.goto_workspace(&lease.workspace_path, pr_number).await {
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
@@ -528,6 +636,13 @@ async fn run_rung1_in_lease(
         );
         let reason = "goto_workspace failed; mechanical rungs unavailable";
         log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+        record_tier(
+            work_db,
+            attempt,
+            "engine_rebase",
+            "fell_through",
+            &format!("{reason}: {err:#}"),
+        );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason,
@@ -545,6 +660,13 @@ async fn run_rung1_in_lease(
             );
             let reason = "engine-direct rebase (rung 1) failed; mechanical rungs unavailable";
             log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+            record_tier(
+                work_db,
+                attempt,
+                "engine_rebase",
+                "fell_through",
+                &format!("{reason}: {err:#}"),
+            );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -554,7 +676,7 @@ async fn run_rung1_in_lease(
 
     if rebase.clean {
         if rebase.pushed {
-            // T9 (T2562): vet rung 1's pushed resolution against the
+            // Vet rung 1's pushed resolution against the
             // both-parents deletion tripwire before auto-retiring.
             let deletions = verify_deletion_tripwire(work_db, cube_client, candidate, attempt, pr_number).await;
             if !deletions.is_empty() {
@@ -597,16 +719,28 @@ async fn run_rung1_in_lease(
         );
         let reason = "rung 1 rebased clean but the push was skipped upstream; mechanical resolution not landed";
         log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
+        record_tier(work_db, attempt, "engine_rebase", "fell_through", reason);
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason,
         };
     }
 
+    record_tier(
+        work_db,
+        attempt,
+        "engine_rebase",
+        "residual_conflicts",
+        &format!(
+            "residual files: {}; replay collapse: {}",
+            rebase.conflicted_files.join(", "),
+            rebase.linearize_decline.as_deref().unwrap_or("not reported")
+        ),
+    );
     // Residual conflicts after the structural rebase are genuine overlap.
-    // Try rung 0 (deterministic resolvers) first — gated off live by
+    // Try rung 0 (deterministic resolvers) first — controlled by
     // RUNG0_APPLY_LIVE (see its doc comment). `attempt_rung0` itself
-    // decides whether every residual file actually resolves, and (T9/T2562)
+    // decides whether every residual file actually resolves, and the deletion gate
     // vets any pushed result against the deletion tripwire before retiring.
     // If rung 0 is gated off, declines, or its resolution is halted for
     // sign-off, the caller uses the residual file count to decide between
@@ -637,13 +771,13 @@ async fn run_rung1_in_lease(
                 "conflict_ladder: failed to update in-flight marker to rung 0; restart recovery weakened",
             );
         }
-        let rung0_outcome = attempt_rung0(
+        let rung0_outcome = attempt_rung0_with(
             work_db,
             publisher,
             cube_client,
             candidate,
             attempt,
-            lease,
+            workspace,
             &rebase.conflicted_files,
         )
         .await;
@@ -670,6 +804,13 @@ async fn run_rung1_in_lease(
             residual_conflicts = rebase.conflicted_files.len(),
             rung0_apply_live = RUNG0_APPLY_LIVE,
             "conflict_ladder: rung 0 (deterministic resolvers) gated off; not attempted — climbing to rung 2/3",
+        );
+        record_tier(
+            work_db,
+            attempt,
+            "deterministic",
+            "skipped",
+            "deterministic resolvers disabled",
         );
         "rung 0 compile-gated off (RUNG0_APPLY_LIVE=false); falling through to rung 2/3"
     };
@@ -701,8 +842,97 @@ async fn run_rung1_in_lease(
     }
 }
 
+/// Attention kind filed when a lockfile-only conflict could not be
+/// regenerated mechanically.
+pub(crate) use boss_engine_storage_values::attention_kinds::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND;
+
+/// Lower the lockfile-regeneration attention once the condition no longer
+/// holds: a mechanical retry, a human (or engine) clearing the conflict, or
+/// a re-armed attempt. Best-effort; a miss is logged.
+pub(crate) fn clear_lockfile_regeneration_failed_attention(work_db: &WorkDb, work_item_id: &str) {
+    if let Err(err) =
+        work_db.resolve_external_tracker_attention(work_item_id, LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND)
+    {
+        tracing::warn!(work_item_id, ?err, "failed to clear lockfile-regeneration attention",);
+    }
+}
+
+/// Terminate a lockfile-only attempt whose regeneration failed operationally:
+/// stamp the attempt `failed` with the specific resolver reason (which also
+/// ends the per-tick retry, since the row owns the head key), and
+/// file an attention item. The parent stays `blocked: merge_conflict`.
+pub(crate) async fn halt_attempt_for_lockfile_failure(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    conflicted_files: &[String],
+    reason: &str,
+) {
+    tracing::warn!(
+        work_item_id = %candidate.work_item_id,
+        attempt_id = %attempt.id,
+        %reason,
+        "conflict_ladder: generated lockfile regeneration failed; attempt marked failed, no worker spawned",
+    );
+    log_routing_verdict(
+        &candidate.work_item_id,
+        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+        conflicted_files,
+        "deterministic",
+        "lockfile-only conflict: regeneration failed operationally; attempt failed, no worker spawned",
+    );
+    if let Err(err) =
+        work_db.mark_conflict_resolution_failed(&attempt.id, &format!("lockfile_regeneration_failed: {reason}"))
+    {
+        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: failed to stamp lockfile-regeneration failure");
+    }
+    let files = conflicted_files
+        .iter()
+        .map(|f| format!("- `{f}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Idempotent: a re-armed attempt that fails again refreshes the one open
+    // item instead of piling up another with a stale reason.
+    if let Err(err) = work_db.upsert_external_tracker_attention(
+        &candidate.work_item_id,
+        LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+        "Lockfile conflict could not be regenerated automatically",
+        &format!(
+            "PR {} conflicts only in generated lockfiles, but regenerating them failed:\n\n{files}\n\n\
+             Reason: {reason}\n\nThe attempt is marked failed and will not retry until a new commit \
+             is pushed to the PR head or the attempt is retried manually. Fix the resolver environment and \
+             retry the attempt, or resolve the lockfile by hand.",
+            candidate.pr_url
+        ),
+    ) {
+        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: failed to file lockfile-regeneration attention");
+    }
+    publisher
+        .publish_work_item_changed(
+            &candidate.product_id,
+            &candidate.work_item_id,
+            "conflict_lockfile_regeneration_failed",
+        )
+        .await;
+}
+
+/// Claim the PR's chain for an engine rebase, or describe what stands in the
+/// way: live writers on the chain, a failed lookup, or another engine rebase.
+/// A failed lookup also refuses: rewriting a branch a worker may be on,
+/// because the check could not run, is the unsafe direction. The returned hold
+/// is visible to the dispatch chain guard until it is dropped.
+pub(crate) fn hold_chain_for_engine_rebase(
+    work_db: &WorkDb,
+    chain_item_id: &str,
+) -> Result<crate::work::EngineRebaseHold, String> {
+    work_db
+        .try_hold_chain_for_engine_rebase(chain_item_id)
+        .map_err(|blocker| blocker.to_string())
+}
+
 /// Rung 0: feed rung-1's residual conflicted files to the deterministic-
-/// resolver registry (T2, `boss_deterministic_resolvers`). If every file
+/// resolver registry (`boss_deterministic_resolvers`). If every file
 /// resolves, land the result — advance the workspace's branch bookmark and
 /// push via [`CubeClient::push_resolution`] (`cube workspace push`) — and
 /// retire the attempt at rung 0. Returns [`LadderOutcome::FellThrough`]
@@ -710,7 +940,7 @@ async fn run_rung1_in_lease(
 /// so the caller's existing rung-3 fallback takes over exactly as it does
 /// today.
 ///
-/// A free function (rather than inlined into [`run_rung1_in_lease`]) so
+/// A free function (rather than inlined into [`run_rung1_in_lease_with`]) so
 /// this rung's actual mechanics are unit-testable in isolation from the
 /// [`RUNG0_APPLY_LIVE`] gate at its one live call site.
 ///
@@ -718,6 +948,7 @@ async fn run_rung1_in_lease(
 /// as a parameter (`try_mechanical_rungs` already validated it parses
 /// before leasing a workspace) — one fewer argument keeps this under
 /// clippy's `too_many_arguments` limit.
+#[cfg(test)]
 pub(crate) async fn attempt_rung0(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -727,6 +958,33 @@ pub(crate) async fn attempt_rung0(
     lease: &CubeWorkspaceLease,
     residual_paths: &[String],
 ) -> LadderOutcome {
+    let workspace = RungWorkspace {
+        lease,
+        resolvers: &builtin_resolvers,
+    };
+    attempt_rung0_with(
+        work_db,
+        publisher,
+        cube_client,
+        candidate,
+        attempt,
+        &workspace,
+        residual_paths,
+    )
+    .await
+}
+
+/// [`attempt_rung0`] with an injectable rung-0 resolver registry.
+pub(crate) async fn attempt_rung0_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: &dyn CubeClient,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    workspace: &RungWorkspace<'_>,
+    residual_paths: &[String],
+) -> LadderOutcome {
+    let lease = workspace.lease;
     let Some(pr_number) = stored_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
         // Unreachable via the live call site (try_mechanical_rungs already
         // parsed this successfully before leasing), but attempt_rung0 is
@@ -736,6 +994,13 @@ pub(crate) async fn attempt_rung0(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
             "conflict_ladder: rung 0 could not parse PR number; declining",
+        );
+        record_tier(
+            work_db,
+            attempt,
+            "deterministic",
+            "fell_through",
+            "could not parse PR number",
         );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
@@ -759,7 +1024,7 @@ pub(crate) async fn attempt_rung0(
         })
         .collect();
 
-    let registry = ResolverRegistry::with_builtins();
+    let registry = (workspace.resolvers)(&format!("{}@origin", attempt.base_branch));
     let resolved: Vec<ResolvedFile> = match registry.resolve_all(&lease.workspace_path, &files).await {
         RegistryResolution::AllResolved(resolved) => resolved,
         RegistryResolution::Declined {
@@ -775,16 +1040,7 @@ pub(crate) async fn attempt_rung0(
             // no-resolver-applies file means the residue is simply out of
             // rung 0's coverage. Per-file reasons make either case
             // answerable straight from this trace line.
-            let per_file: Vec<String> = declined
-                .iter()
-                .map(|d| {
-                    if d.matched_resolver {
-                        format!("{}: resolver ran and declined: {}", d.path, d.reason)
-                    } else {
-                        format!("{}: no resolver applies to this file", d.path)
-                    }
-                })
-                .collect();
+            let per_file: Vec<String> = declined.iter().map(format_declined_file).collect();
             // Tell the truth in the verdict: a resolver that *matched and
             // ran* but whose command failed operationally (e.g. `bazel mod
             // deps` erroring in a cold workspace because a gitignored
@@ -818,6 +1074,20 @@ pub(crate) async fn attempt_rung0(
                 "rung 0 attempted but a resolver failed operationally (environment/tooling issue, \
                  not a decline)"
             };
+            record_rung0_registry_decline(work_db, attempt, &declined, &failed, reason);
+            if files
+                .iter()
+                .all(|file| boss_deterministic_resolvers::is_generated_lockfile(&file.path))
+            {
+                let specific = failed
+                    .first()
+                    .map(|f| format!("{}: {}", f.path, f.reason))
+                    .or_else(|| declined.first().map(|d| format!("{}: {}", d.path, d.reason)))
+                    .unwrap_or_else(|| reason.to_owned());
+                halt_attempt_for_lockfile_failure(work_db, publisher, candidate, attempt, residual_paths, &specific)
+                    .await;
+                return LadderOutcome::LockfileRegenerationFailed;
+            }
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
                 reason,
@@ -832,13 +1102,20 @@ pub(crate) async fn attempt_rung0(
             error = %format!("{err:#}"),
             "conflict_ladder: rung 0 resolved every residual file but the push failed; climbing to worker",
         );
+        record_tier(
+            work_db,
+            attempt,
+            "deterministic",
+            "push_failed",
+            &format!("resolution push/gate failed: {err:#}"),
+        );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
             reason: "rung 0 resolved every residual file but pushing the resolution failed",
         };
     }
 
-    // T9 (T2562): vet rung 0's pushed resolution against the both-parents
+    // Vet rung 0's pushed resolution against the both-parents
     // deletion tripwire before auto-retiring.
     let deletions = verify_deletion_tripwire(work_db, cube_client, candidate, attempt, pr_number).await;
     if !deletions.is_empty() {
@@ -897,6 +1174,15 @@ async fn retire_attempt_at_rung(
         &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
     );
 
+    record_tier(
+        work_db,
+        attempt,
+        if rung == 0 { "deterministic" } else { "engine_rebase" },
+        "retired",
+        "resolution pushed and deletion tripwire passed",
+    );
+    clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
+
     // The parent was flipped to `blocked: merge_conflict` upfront by
     // `on_conflict_detected`; clear it back to `in_review`. The WHERE guard
     // only clears engine-owned rows, so a human-moved row is left alone.
@@ -917,14 +1203,16 @@ async fn retire_attempt_at_rung(
 
     // The pushed head sha is not returned by the rebase/push payload; leave
     // `head_sha_after` for a later probe to fill. The rung stamp is the point.
-    if let Err(err) = work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
-        tracing::warn!(
-            attempt_id = %attempt.id,
-            rung,
-            ?err,
-            "conflict_ladder: failed to mark attempt succeeded",
-        );
-    }
+    // A concurrent abandon/supersede/success makes the mark a no-op
+    // (`Ok(None)`); the signal clear and parent broadcast below must still
+    // run, since the parent was already flipped back to `in_review`.
+    let marked = match work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
+        Ok(updated) => updated,
+        Err(err) => {
+            tracing::warn!(%err, "conflict_ladder: failed to mark attempt succeeded");
+            None
+        }
+    };
 
     // Clear the in-flight merge_conflict signal so `maybe_clear_blocked` does
     // not re-fire on the next probe. No-op when no signal row exists.
@@ -937,17 +1225,20 @@ async fn retire_attempt_at_rung(
         );
     }
 
-    publisher
-        .publish_frontend_event_on_product(
-            &candidate.product_id,
-            FrontendEvent::ConflictResolutionSucceeded {
-                product_id: candidate.product_id.clone(),
-                work_item_id: candidate.work_item_id.clone(),
-                attempt_id: attempt.id.clone(),
-                pr_url: candidate.pr_url.clone(),
-            },
-        )
-        .await;
+    if let Some(attempt) = marked {
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::ConflictResolutionSucceeded {
+                    attempt: work_db.remediation_entry(attempt.list_entry()),
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    attempt_id: attempt.id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+    }
 
     // Broadcast the parent status change only when it actually transitioned
     // (blocked → in_review). Mirrors `on_resolved`.
@@ -962,11 +1253,10 @@ async fn retire_attempt_at_rung(
     }
 }
 
-/// T9 (T2562) result-gate: verify a mechanical rung's (0 or 1) freshly
-/// pushed resolution against the both-parents deletion tripwire
-/// (incident-002 P2) before the caller retires the attempt. Delegates to
+/// Verify a mechanical rung's pushed resolution against the both-parent
+/// deletion tripwire before retiring the attempt. Delegates to
 /// [`CubeClient::verify_deletion_tripwire`] (test doubles fail open with
-/// no network call by default; only [`crate::coordinator::CommandCubeClient`]
+/// no network call by default; only [`crate::cube_client::CommandCubeClient`]
 /// makes the real gh-backed check).
 ///
 /// Re-derives the repo slug from `work_db` rather than adding a parameter
@@ -981,12 +1271,12 @@ async fn retire_attempt_at_rung(
 /// `compute_merged_parent_deletions` check on the worker's actual PR
 /// output before it can retire. Rungs 0 and 1 retire straight to
 /// `in_review` with **no worker spawned at all**, so a transient
-/// `gh`/network error here (in [`crate::coordinator::CommandCubeClient`]'s
+/// `gh`/network error here (in [`crate::cube_client::CommandCubeClient`]'s
 /// `fetch_pr_head_sha` or the `gh compare` calls inside
 /// `compute_merged_parent_deletions`) — as opposed to a genuinely clean
 /// tripwire result — silently auto-retires a possibly-deletion-bearing
 /// mechanical resolution with nothing left to catch it. This is a known,
-/// currently-accepted gap (see the module doc's "Deferred" section), not
+/// currently-accepted gap, not
 /// an oversight.
 async fn verify_deletion_tripwire(
     work_db: &WorkDb,
@@ -1015,7 +1305,7 @@ async fn verify_deletion_tripwire(
 }
 
 /// Halt a `conflict_resolutions` attempt a mechanical rung (0 or 1) pushed
-/// but the T9/T2562 deletion tripwire rejected: stamp the attempt
+/// but the deletion tripwire rejected: stamp the attempt
 /// `succeeded` at `rung` (it did produce a mechanical resolution — the
 /// telemetry fact stands independent of the safety gate), flip the parent
 /// from `blocked: merge_conflict` to `blocked: deletion_signoff` via
@@ -1025,7 +1315,7 @@ async fn verify_deletion_tripwire(
 /// regardless of which rung produced it. Does NOT publish
 /// `ConflictResolutionSucceeded` (this is not a success) and does not spawn
 /// any worker (there is no automatic remediation for a flagged deletion —
-/// see the module doc comment's "Deferred" section for why).
+/// flagged deletions require explicit human approval).
 async fn halt_attempt_for_deletion_signoff(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -1045,6 +1335,13 @@ async fn halt_attempt_for_deletion_signoff(
         ),
     );
 
+    record_tier(
+        work_db,
+        attempt,
+        if rung == 0 { "deterministic" } else { "engine_rebase" },
+        "halted_for_signoff",
+        &format!("deletion tripwire: {}", deletions.join("; ")),
+    );
     if let Err(err) = work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
         tracing::warn!(
             attempt_id = %attempt.id,
@@ -1108,7 +1405,7 @@ async fn halt_attempt_for_deletion_signoff(
         rung,
         removed = deletions.len(),
         "conflict_ladder: merge-parent deletion tripwire fired for a mechanical rung; halted in \
-         blocked:deletion_signoff pending operator sign-off (T9/T2562)",
+         blocked:deletion_signoff pending operator sign-off",
     );
 }
 

@@ -28,7 +28,7 @@
 //!    survived the restart, so its slot claim, `WorkerRegistry` entries,
 //!    `LiveWorkerState` entry, and live-status summarizer task are rebuilt
 //!    from the DB row plus a fresh read of the session's pane pid — the same
-//!    things [`crate::app::readoption`] rebuilds for a *terminalized*
+//!    things `boss_engine::app::readoption` rebuilds for a *terminalized*
 //!    survivor, minus the DB status flip that path needs and this one
 //!    doesn't (the row was never wrong here).
 //!
@@ -99,16 +99,17 @@ use std::path::Path;
 
 use boss_tmux::{DisplayField, TMUX_SPAWN_TOKEN_ENV, Tmux};
 
-use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, ENGINE_BOOT_EXECUTION_ID, Outcome, Stage};
 use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
+use boss_execution_contracts::slot_id_from_worker_id;
 
 mod dead_pane;
 mod persist;
-pub(crate) use persist::persist_observed_pane_state;
+pub use persist::persist_observed_pane_state;
 use persist::{PaneObservation, PersistedPanePid, adoption_pid_snapshot, persist_observed_pane_pid};
 
 /// The tmux session environment variable carrying [`TMUX_SESSION_SCHEMA`].
@@ -125,17 +126,9 @@ const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 /// doc's "Two engines briefly running at once" failure mode.
 const ENGINE_OWNER_OPTION: &str = "@boss_engine_owner";
 
-/// `work_attention_items.kind` filed when [`refuse_and_reap`] reaps a
-/// version-skewed session. Registered in [`crate::attention_lifecycle`] as
-/// [`crate::attention_lifecycle::ClearedBy::WorkResumed`] — a later run
-/// starting on the same work item is direct evidence the item is moving
-/// again.
-pub const TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND: &str = "tmux_adoption_schema_skew";
+pub use boss_engine_storage_values::attention_kinds::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND;
 
-/// `work_attention_items.kind` filed when live sessions remain on the
-/// pre-move `tmux -L boss` server after the engine has switched to an
-/// explicit socket. Cleared when a later run starts on the same item.
-pub const TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND: &str = "tmux_legacy_label_server";
+pub use boss_engine_storage_values::attention_kinds::TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND;
 
 /// Trigger name recorded on the dispatch event and carried into
 /// [`LiveWorkerConvergence::converge_live_worker`] for a session whose token
@@ -242,51 +235,26 @@ pub async fn observe_tmux_identity(
             current_command: None,
         };
     }
-    let token = match session_spawn_token(tmux, session_name).await {
-        Ok(token) => token,
-        Err(err) => {
+    let (pane_dead, pane_dead_status) = match boss_tmux::probe_pane(tmux, session_name, expected_spawn_token).await {
+        boss_tmux::PaneProbe::Absent | boss_tmux::PaneProbe::ForeignToken => {
+            return TmuxIdentityObservation {
+                adoption_state: boss_protocol::TmuxAdoptionState::TokenMismatch,
+                pane_dead: None,
+                pane_dead_status: None,
+                window_activity_epoch_secs: None,
+                current_command: None,
+            };
+        }
+        boss_tmux::PaneProbe::Unreadable { stage, error } => {
             tracing::debug!(
                 session = %session_name,
-                error = %format!("{err:#}"),
-                "tmux identity probe: spawn token unreadable"
+                error = %format!("{error:#}"),
+                "tmux identity probe: {stage} unreadable"
             );
             return probe_unavailable_observation();
         }
-    };
-    if token.as_deref() != Some(expected_spawn_token) {
-        return TmuxIdentityObservation {
-            adoption_state: boss_protocol::TmuxAdoptionState::TokenMismatch,
-            pane_dead: None,
-            pane_dead_status: None,
-            window_activity_epoch_secs: None,
-            current_command: None,
-        };
-    }
-    let pane_dead = match tmux.display_message(session_name, DisplayField::PaneDead).await {
-        Ok(value) => value == "1",
-        Err(err) => {
-            tracing::debug!(
-                session = %session_name,
-                error = %format!("{err:#}"),
-                "tmux identity probe: pane_dead unreadable"
-            );
-            return probe_unavailable_observation();
-        }
-    };
-    let pane_dead_status = if pane_dead {
-        match tmux.display_message(session_name, DisplayField::PaneDeadStatus).await {
-            Ok(status) => (!status.is_empty()).then_some(status),
-            Err(err) => {
-                tracing::debug!(
-                    session = %session_name,
-                    error = %format!("{err:#}"),
-                    "tmux identity probe: pane_dead_status unreadable"
-                );
-                return probe_unavailable_observation();
-            }
-        }
-    } else {
-        None
+        boss_tmux::PaneProbe::Alive => (false, None),
+        boss_tmux::PaneProbe::Dead { status } => (true, status),
     };
     let window_activity_epoch_secs = match tmux.display_message(session_name, DisplayField::WindowActivity).await {
         Ok(value) => match value.parse::<i64>() {
@@ -345,7 +313,7 @@ pub async fn observe_tmux_identity(
 /// `#{window_activity}` and `#{pane_current_command}` for the sweep's
 /// staleness classification. A caller that only feeds
 /// `persist_observed_pane_state` (teardown's completion-path probe, and
-/// [`crate::app::pane_delivery`]'s own dead-pane check) should call this
+/// `boss_engine::app::pane_delivery`'s own dead-pane check) should call this
 /// instead, so it does not spawn and discard two extra tmux subprocesses in
 /// the narrow window between a verified token match and a reap's kill
 /// signal.
@@ -358,10 +326,7 @@ pub async fn observe_tmux_identity(
 /// `pane_delivery` must treat it as "cannot prove the pane is safe to write
 /// to" and refuse, while teardown's best-effort reap degrades it locally and
 /// proceeds regardless.
-pub(crate) async fn observe_pane_dead_state(
-    tmux: &Tmux,
-    session_name: &str,
-) -> anyhow::Result<TmuxIdentityObservation> {
+pub async fn observe_pane_dead_state(tmux: &Tmux, session_name: &str) -> anyhow::Result<TmuxIdentityObservation> {
     let pane_dead = tmux.display_message(session_name, DisplayField::PaneDead).await? == "1";
     let pane_dead_status = if pane_dead {
         let status = tmux.display_message(session_name, DisplayField::PaneDeadStatus).await?;
@@ -393,6 +358,13 @@ pub struct TmuxAdoptionOutcome {
     /// already proved them alive more directly than a cube lease snapshot
     /// can.
     pub adopted_execution_ids: HashSet<String>,
+    /// Execution ids behind [`Self::terminal_handoffs`]: terminal rows whose
+    /// live session this pass observed and handed to re-adoption. Startup
+    /// treats them as live when judging review-guide attempts, so an attempt
+    /// is not closed on the strength of a status re-adoption is about to
+    /// reverse.
+    #[builder(default)]
+    pub terminal_handoff_execution_ids: HashSet<String>,
     /// Adopted runs whose `tmux_spawn_state` was still `intended` and got
     /// durably repaired to `created` by this pass.
     pub repaired_intents: usize,
@@ -632,6 +604,7 @@ pub async fn run_adoption_pass<S>(
 where
     S: WorkerSpawner + ?Sized,
 {
+    crate::tmux_health::server_observed(tmux);
     let mut outcome = TmuxAdoptionOutcome::default();
 
     let sessions = match tmux.list_sessions().await {
@@ -818,6 +791,35 @@ where
     outcome
 }
 
+/// Register a re-adopted pane's shell pid with the tier its execution kind
+/// demands. A `progression` pane must come back confined to its captured
+/// neighbourhood: registered as an ordinary worker it would be unconfined
+/// whenever the `worker_rpc_tier` flag is off. The execution row is what says
+/// which tier applies, so when it cannot be read this fails closed: the pane
+/// is registered confined (with whatever scope can be captured, none if the
+/// row is unreadable). That is strictly narrower than the ordinary posture, so
+/// a transient read error can never leave a progression pane unconfined.
+fn register_adopted_pid<S>(spawner: &S, work_db: &WorkDb, shell_pid: libc::pid_t, execution_id: &str)
+where
+    S: WorkerSpawner + ?Sized,
+{
+    let progression = match work_db.get_execution(execution_id) {
+        Ok(execution) => execution.kind == boss_protocol::ExecutionKind::Progression,
+        Err(error) => {
+            tracing::error!(
+                execution_id,
+                %error,
+                "tmux adoption: could not read the execution kind to pick a registry tier; \
+                 registering the pane confined",
+            );
+            true
+        }
+    };
+    spawner
+        .worker_registry()
+        .register_for_run(shell_pid, execution_id, progression, Some(work_db));
+}
+
 /// Rebuild derived bookkeeping for one confirmed-live, non-terminal match.
 #[allow(clippy::too_many_arguments)]
 async fn adopt_one<S>(
@@ -896,7 +898,7 @@ async fn adopt_one<S>(
     spawner
         .worker_registry()
         .register_tmux_run_slot(execution_id.to_owned(), slot_id, session_name);
-    spawner.worker_registry().register(shell_pid, execution_id.to_owned());
+    register_adopted_pid(spawner, work_db, shell_pid, execution_id);
 
     if !coordinator.reclaim_slot(&handle.agent_id, execution_id).await {
         tracing::warn!(
@@ -921,6 +923,15 @@ async fn adopt_one<S>(
     };
 
     let driver = crate::driver_transcript::driver_for_spawned_execution(work_db, execution_id);
+    // The periodic husk sweep re-runs this routine for every live run. A run
+    // whose slot this process already holds is already observed here, so
+    // only a run adopted for the first time needs its ingress re-established.
+    let previously_live = spawner.live_worker_state_registry().is_some_and(|live_states| {
+        live_states
+            .snapshot()
+            .iter()
+            .any(|state| state.run_id == execution_id && !state.activity.is_terminal())
+    });
     crate::tmux_adoption_live_state::register_adopted_live_state(
         work_db,
         spawner,
@@ -928,9 +939,26 @@ async fn adopt_one<S>(
         execution_id,
         slot_id,
         shell_pid,
-        driver,
+        driver.clone(),
     )
     .await;
+
+    // A file-tailing driver is observed only through the tail the previous
+    // engine process held, so without re-establishing it the slot stays at
+    // its seeded activity and never sees the turn boundary. Same
+    // re-establishment the terminalized-survivor path does, from the same
+    // checkpoint.
+    let progress_ingress = if previously_live {
+        crate::spawn_flow::IngressReadoption::AlreadyObserved
+    } else {
+        spawner.reestablish_progress_ingress(&execution, driver).await
+    };
+    tracing::info!(
+        execution_id,
+        slot_id,
+        progress_ingress = progress_ingress.as_str(),
+        "tmux boot adoption: progress ingress re-establishment",
+    );
 
     outcome.adopted_execution_ids.insert(execution_id.to_owned());
 
@@ -948,6 +976,7 @@ async fn adopt_one<S>(
                     "shell_pid_write_reason": shell_pid_write_reason,
                     "tmux_session_name": session_name,
                     "repaired_intent": repaired_intent,
+                    "progress_ingress": progress_ingress.as_str(),
                 })),
         )
         .await;
@@ -1091,10 +1120,15 @@ async fn classify_untracked_session<S>(
         ) {
             return;
         }
+        // The pid was just observed live in the tmux pane, so (unlike a durable
+        // pid) it is safe to trust. Register it before convergence returns the
+        // worker to Running so its requests are attributed and confined at once.
+        register_adopted_pid(spawner, work_db, shell_pid, &execution_id);
         convergence
             .converge_live_worker(&execution_id, TERMINAL_HANDOFF_TRIGGER)
             .await;
         outcome.terminal_handoffs += 1;
+        outcome.terminal_handoff_execution_ids.insert(execution_id.clone());
         return;
     }
 
@@ -1567,6 +1601,7 @@ async fn refuse_and_reap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle_adapter::CoreCoordinatorConstructors;
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::Path;
@@ -1576,8 +1611,7 @@ mod tests {
     use boss_tmux::{CommandOutput, CommandRunner};
     use tokio::time::Duration;
 
-    use crate::app::SendToAppError;
-    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
+    use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::driver::AgentDriver;
     use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -1585,6 +1619,8 @@ mod tests {
     use crate::test_support::{NoopCube, NoopRunner, create_test_chore_manual, create_test_product_named, open_db_arc};
     use crate::worker_readoption::{LiveWorkerConvergence, NoopLiveWorkerConvergence};
     use crate::worker_registry::WorkerRegistry;
+    use boss_execution_contracts::SendToAppError;
+    use boss_execution_contracts::WorkerPool;
 
     /// A fake `boss` tmux server: scripted answers for `list-sessions`,
     /// `show-environment`, and `display-message #{pane_pid}`, keyed by
@@ -1723,9 +1759,10 @@ mod tests {
                     self.server_options.lock().unwrap().insert(option, value);
                     Ok(ok_output(String::new()))
                 }
-                Some("kill-session") => {
-                    assert_eq!(args[3], "-t");
-                    let session = args[4].clone();
+                Some("detach-client") => Ok(ok_output(String::new())),
+                Some("if-shell") => {
+                    assert_eq!(args[4], "-t");
+                    let session = args[5].trim_start_matches('=').trim_end_matches(':').to_owned();
                     self.killed_sessions.lock().unwrap().push(session.clone());
                     if self.kill_session_failures.contains(&session) {
                         // Must NOT look like an absent-session error: those
@@ -1802,6 +1839,9 @@ mod tests {
         live_states: LiveWorkerStateRegistry,
         live_status_calls: StdMutex<Vec<(u8, String)>>,
         publish_calls: StdMutex<usize>,
+        /// Execution ids whose progress ingress the pass asked to have
+        /// re-established, in call order. Answered as `Reestablished`.
+        ingress_calls: StdMutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -1831,6 +1871,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((slot_id, run_id.to_owned()));
+        }
+
+        async fn reestablish_progress_ingress(
+            &self,
+            execution: &crate::work::WorkExecution,
+            _driver: Option<Arc<dyn AgentDriver>>,
+        ) -> crate::spawn_flow::IngressReadoption {
+            self.ingress_calls.lock().unwrap().push(execution.id.clone());
+            crate::spawn_flow::IngressReadoption::Reestablished
         }
     }
 
@@ -1931,6 +1980,9 @@ mod tests {
     #[path = "tmux_adoption_persona_tests.rs"]
     mod persona_tests;
 
+    #[path = "tmux_adoption_progression_tests.rs"]
+    mod progression_tests;
+
     /// The cardinal case: engine restarts, the worker's tmux session (and its
     /// non-terminal execution row) survived. The pass must rebuild the slot
     /// claim, the `WorkerRegistry` pid/slot map, the `LiveWorkerState` entry,
@@ -1980,7 +2032,10 @@ mod tests {
         assert_eq!(outcome.terminal_handoffs, 0);
         assert_eq!(outcome.refused_schema_skew, 0);
 
-        assert_eq!(spawner.registry.lookup(4321).as_deref(), Some(execution_id.as_str()));
+        assert_eq!(
+            spawner.registry.lookup_unverified(4321).as_deref(),
+            Some(execution_id.as_str())
+        );
         assert_eq!(
             spawner.registry.pane_for_run(&execution_id),
             Some(crate::worker_registry::RegisteredWorkerPane {
@@ -2007,6 +2062,12 @@ mod tests {
             spawner.live_status_calls.lock().unwrap().as_slice(),
             &[(1u8, execution_id.clone())]
         );
+        assert_eq!(
+            spawner.ingress_calls.lock().unwrap().as_slice(),
+            std::slice::from_ref(&execution_id),
+            "a live run's progress ingress must be re-established alongside its slot: a file-tailing \
+             driver has no other way back to being observed after the restart",
+        );
 
         assert!(
             coordinator
@@ -2028,6 +2089,7 @@ mod tests {
             events[0].details["shell_pid_write_reason"],
             "refresh_created_tmux_session"
         );
+        assert_eq!(events[0].details["progress_ingress"], "reestablished");
     }
 
     /// A variant of the cardinal non-terminal-match case: the durable
@@ -2107,7 +2169,10 @@ mod tests {
         assert_eq!(outcome.terminal_handoffs, 0);
         assert_eq!(outcome.refused_schema_skew, 0);
 
-        assert_eq!(spawner.registry.lookup(4321).as_deref(), Some(execution_id.as_str()));
+        assert_eq!(
+            spawner.registry.lookup_unverified(4321).as_deref(),
+            Some(execution_id.as_str())
+        );
         assert_eq!(
             spawner.registry.pane_for_run(&execution_id),
             Some(crate::worker_registry::RegisteredWorkerPane {
@@ -2269,11 +2334,16 @@ mod tests {
         );
         assert_eq!(
             convergence.calls.lock().unwrap().as_slice(),
-            &[(execution_id, TERMINAL_HANDOFF_TRIGGER.to_owned())],
+            &[(execution_id.clone(), TERMINAL_HANDOFF_TRIGGER.to_owned())],
         );
         assert!(
             spawner.live_states.snapshot().is_empty(),
             "a terminal-status handoff must never rebuild live state directly",
+        );
+        assert_eq!(
+            spawner.registry.lookup_unverified(111),
+            Some(execution_id.clone()),
+            "terminal handoff must register the tmux-observed pane pid before the worker resumes",
         );
     }
 

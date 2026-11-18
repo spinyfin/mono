@@ -78,20 +78,20 @@ async fn assert_single_pass_fanout(first_already_dispatching: bool) {
             DispatchClaimOutcome::Won
         );
         coordinator
-            .inflight_dispatches
+            .inflight_dispatches()
             .try_reserve(&executions[0], &db)
             .unwrap()
     });
 
     // No kick or heartbeat: the slow tails keep every reservation held for
     // the entire single pass, so sequential run completion cannot mask this.
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     for execution in &executions {
         assert_eq!(
             db.get_execution(&execution.id).unwrap().status,
             ExecutionStatus::Claimed
         );
-        assert!(coordinator.inflight_dispatches.blocks_execution(execution, &db));
+        assert!(coordinator.inflight_dispatches().blocks_execution(execution, &db));
     }
 }
 
@@ -239,7 +239,7 @@ async fn spawn_guard_does_not_abandon_a_new_heads_leaf_behind_a_live_supervisor(
         .expect("worker pool slot available");
 
     let _ = coordinator
-        .schedule_execution(&leaf, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&leaf, &worker_id, DispatchAdmission::Queued)
         .await;
 
     let events = recording.events_for(&leaf.id).await;

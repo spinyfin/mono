@@ -19,9 +19,54 @@ use crate::app::gc;
 /// that reads it must hold this lock too, not just the ones that write it.
 pub(super) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// How long a test waits to take the jj maintenance gate exclusively.
+///
+/// Never try the gate with a zero wait right after this process released
+/// it. A child that another test thread is spawning holds a copy of every
+/// open descriptor from the spawn until its exec, including a gate this
+/// thread has already closed, and the kernel keeps the flock until that last
+/// copy goes away. A zero-wait try-lock in that window reports the gate
+/// busy although no holder remains; under the test binary's parallelism
+/// the window is hit regularly, and the failure then poisons `ENV_MUTEX`
+/// for every environment-dependent test. The wait is a ceiling, not a
+/// delay: the lock is retried every 25ms and taken as soon as it is free.
+pub(super) const EXCLUSIVE_GATE_WAIT: Duration = Duration::from_secs(30);
+
+/// Reader recovery tries exclusivity without waiting and may legitimately
+/// return a retryable error before calling its runner. Wait for admission,
+/// not for a successful recovery: callers still assert the actual outcome
+/// and every expected command once the recovery probe has run.
+pub(super) fn after_recovery_admission<T>(fake: &FakeRunner, mut run: impl FnMut() -> Result<T>) -> Result<T> {
+    let expected = fake.expectations.borrow().len();
+    let started = std::time::Instant::now();
+    loop {
+        let result = run();
+        if fake.expectations.borrow().len() < expected {
+            return result;
+        }
+        assert!(matches!(result, Err(CubeError::MaintenanceQuarantined(_))));
+        assert!(
+            started.elapsed() < EXCLUSIVE_GATE_WAIT,
+            "recovery never acquired the gate"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// A fresh database whose daily pool-GC pass counts as having just run.
+/// A test of leasing is a test of leasing: the periodic pass would
+/// otherwise run on the first lease of every test, against the test's
+/// fake runner, and consume expectations meant for the lease. Tests of the
+/// pass itself age `last_pool_gc_at` (or the per-repo store-gc stamp) to
+/// make it due again.
 pub(super) fn with_database_path() -> (TempDir, std::path::PathBuf) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let database_path = tempdir.path().join("state.db");
+    let store = crate::store::Store::open_at(&database_path).expect("store");
+    let now = crate::app::util::current_epoch_s().expect("clock");
+    store
+        .set_pool_metadata_i(gc::POOL_GC_LAST_AT_KEY, now)
+        .expect("stamp pool gc");
     (tempdir, database_path)
 }
 
@@ -136,34 +181,28 @@ pub(super) fn gc_exec_sweep_command(workspace_path: &std::path::Path, output: &s
 }
 
 /// Returns an expected gc-log command that reports no consumed bookmarks.
-/// Add to any release runner after `jj new main@origin` to satisfy the gc check.
+/// Used by bookmark-sweep tests.
 pub(super) fn gc_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
     gc_exec_sweep_command(workspace_path, "")
 }
 
-/// The `pr/<n>` half of the bookmark sweep, reporting `output` as the set of
-/// bookmarks no workspace is positioned on any more.
-pub(super) fn gc_pr_sweep_command(workspace_path: &std::path::Path, output: &str) -> ExpectedCommand {
+/// The check the exec sweep makes, only when something is consumed, that no
+/// unmerged side of a consumed bookmark holds unpublished non-empty work.
+/// `output` names the bookmarks that do.
+pub(super) fn gc_exec_unpublished_command(workspace_path: &std::path::Path, output: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         workspace_path.to_path_buf(),
         "jj",
         &[
             "log",
             "-r",
-            gc::UNREFERENCED_PR_BOOKMARKS_REVSET,
+            &gc::unpublished_exec_tips(),
             "--no-graph",
             "-T",
             gc::BOOKMARK_NAMES_TEMPLATE,
         ],
         output,
     )
-}
-
-/// The `pr/<n>` half reporting that every `pr/*` bookmark is still
-/// referenced, so nothing is swept. Add to any release runner after
-/// [`gc_noop_command`].
-pub(super) fn gc_pr_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
-    gc_pr_sweep_command(workspace_path, "")
 }
 
 /// The release-time reuse-guard probe that says "this working copy is
@@ -177,8 +216,7 @@ pub(super) fn release_guard_reusable_command(workspace_path: &std::path::Path) -
     )
 }
 
-/// Standard release runner: fetch, reuse-guard probe, reset, then gc-noop
-/// (exec + pr sweeps).
+/// Standard release runner: fetch, reuse-guard probe, and reset.
 pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner {
     FakeRunner::new(vec![
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
@@ -196,8 +234,6 @@ pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner
             "",
         ),
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(workspace_path),
-        gc_pr_noop_command(workspace_path),
     ])
 }
 
@@ -294,6 +330,11 @@ pub(super) fn audit_events(tempdir: &TempDir) -> Vec<serde_json::Value> {
     events
 }
 
+/// The cube executable the fake reports. It does not exist, and the fake
+/// never starts anything anyway; what matters is that it is not the running
+/// test binary.
+pub(super) const FAKE_CUBE_EXECUTABLE: &str = "/nonexistent/fake-cube";
+
 #[derive(Default)]
 pub(super) struct FakeRunner {
     pub(super) expectations: RefCell<VecDeque<ExpectedCommand>>,
@@ -302,6 +343,15 @@ pub(super) struct FakeRunner {
     /// that a caller's wall-clock budget actually reached the subprocess
     /// bound, rather than the default 120s network timeout.
     observed_timeouts: RefCell<Vec<Duration>>,
+    /// Every detached spawn the code under test requested
+    /// ([`CommandRunner::spawn_detached`]), in call order. Nothing is ever
+    /// started: the request is the whole observable.
+    detached_spawns: RefCell<Vec<CommandInvocation>>,
+    /// When set, an invocation with no queued expectation fails like a
+    /// missing program instead of panicking. For tests of passes that must
+    /// tolerate every subprocess failing (the pool-GC throttle tests), where
+    /// enumerating the pass's commands would test nothing.
+    fail_unexpected: bool,
 }
 
 impl FakeRunner {
@@ -309,7 +359,23 @@ impl FakeRunner {
         Self {
             expectations: RefCell::new(expectations.into()),
             observed_timeouts: RefCell::new(Vec::new()),
+            detached_spawns: RefCell::new(Vec::new()),
+            fail_unexpected: false,
         }
+    }
+
+    /// A runner with no expectations that fails every command it is handed
+    /// (and still records detached spawns without starting them).
+    pub(super) fn failing_every_command() -> Self {
+        Self {
+            fail_unexpected: true,
+            ..Self::new(Vec::new())
+        }
+    }
+
+    /// The detached spawns requested so far, in call order.
+    pub(super) fn detached_spawns(&self) -> Vec<CommandInvocation> {
+        self.detached_spawns.borrow().clone()
     }
 
     pub(super) fn assert_exhausted(&self) {
@@ -326,11 +392,32 @@ impl FakeRunner {
     }
 
     fn next_expectation(&self, invocation: &CommandInvocation) -> ExpectedCommand {
-        let expected = self
-            .expectations
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or_else(|| panic!("unexpected command invocation: {invocation:?}"));
+        // The collector's version probe is not part of any scripted store
+        // sequence: answer it as the oldest supported client unless the test
+        // scripted a `--version` expectation itself.
+        if invocation.args == ["--version"]
+            && !self
+                .expectations
+                .borrow()
+                .front()
+                .is_some_and(|next| next.args == invocation.args)
+        {
+            return ExpectedCommand::ok(invocation.cwd.clone(), &invocation.program, &["--version"], "jj 0.26.0");
+        }
+        let next = self.expectations.borrow_mut().pop_front();
+        let expected = match next {
+            Some(expected) => expected,
+            None if self.fail_unexpected => {
+                let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+                return ExpectedCommand::failing(
+                    invocation.cwd.clone(),
+                    &invocation.program,
+                    &args,
+                    "no such command in this test",
+                );
+            }
+            None => panic!("unexpected command invocation: {invocation:?}"),
+        };
         assert_eq!(expected.cwd, invocation.cwd);
         assert_eq!(expected.program, invocation.program);
         assert_eq!(expected.args, invocation.args);
@@ -342,8 +429,23 @@ impl FakeRunner {
 }
 
 impl CommandRunner for FakeRunner {
+    fn lock_git_remotes(&self, _cwd: &std::path::Path) -> Result<crate::lock::RepoLock> {
+        // As above: nothing contends a scripted runner's remote changes.
+        let dir = tempfile::tempdir().unwrap();
+        crate::lock::RepoLock::acquire(&dir.path().join("remotes.lock"))
+    }
+
     fn run(&self, invocation: &CommandInvocation) -> Result<String> {
         self.next_expectation(invocation).result
+    }
+
+    fn cube_executable(&self) -> Result<PathBuf> {
+        Ok(PathBuf::from(FAKE_CUBE_EXECUTABLE))
+    }
+
+    fn spawn_detached(&self, invocation: &CommandInvocation) -> Result<u32> {
+        self.detached_spawns.borrow_mut().push(invocation.clone());
+        Ok(4242)
     }
 
     /// Honours `timeout` against the expectation's simulated `duration`, so a

@@ -217,6 +217,9 @@ async fn comment_topic_invalidation_reaches_subscriber() -> Result<()> {
         TopicEventPayload::ResyncRequired => {
             panic!("unexpected resync marker on comment topic")
         }
+        TopicEventPayload::WorkerPaneCapture { .. } => {
+            panic!("unexpected pane capture on comment topic")
+        }
     }
 
     Ok(())

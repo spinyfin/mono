@@ -1,0 +1,2920 @@
+//! Per-execution scheduling: work-item resolution, host selection, workspace
+//! leasing/recovery, and pre-start failure handling. Part of the `coordinator`
+//! module split; see [`super`] for the struct and shared types.
+use crate::work::CancelExecutionOpts;
+use anyhow::bail;
+use boss_protocol::ReviewBatchPhase;
+
+use super::spoke_in_doubt::waitable_spoke_lease;
+use super::*;
+
+/// The original dispatch failure is already visible in the event stream.
+#[derive(Debug, thiserror::Error)]
+#[error("pre-start failure bookkeeping failed")]
+pub(super) struct PreStartFailureReported;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct HostSelectionFailure {
+    report: Vec<Eligibility>,
+    message: String,
+}
+
+/// Where `cube workspace goto` should position the working copy: a PR
+/// branch head, or (for a post-merge review batch member) a frozen
+/// revision such as a merge commit SHA.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GotoTarget<'a> {
+    Pr(u64),
+    Revision(&'a str),
+}
+
+/// PR number for `cube workspace goto --pr` after the lease.
+///
+/// `AnswerAgent` executions bind to a comment, not a task. When that
+/// comment's feedback target is an open implementation PR, position the
+/// lease on the PR so the read-only agent inspects current code rather
+/// than a fresh change off the default base.
+pub(crate) fn pr_number_for_workspace_goto(
+    work_db: &crate::work::WorkDb,
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+) -> Option<u64> {
+    match execution.kind {
+        ExecutionKind::RevisionImplementation => execution
+            .pr_url
+            .as_deref()
+            .and_then(boss_github::pr_url::pr_number_from_url)
+            // `execution.pr_url` is not reliably stamped on every revision dispatch
+            // path (e.g. orphan-sweep re-dispatch, user-initiated `bossctl work start`).
+            // Fall back to the chain root's PR URL — the same authoritative lookup
+            // used by completion.rs — so positioning is never skipped for revisions.
+            .or_else(|| {
+                work_db
+                    .get_revision_chain_root_pr_url(&execution.work_item_id)
+                    .as_deref()
+                    .and_then(boss_github::pr_url::pr_number_from_url)
+            }),
+        ExecutionKind::PrReview => match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task
+                .pr_url
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .and_then(boss_github::pr_url::pr_number_from_url),
+            _ => None,
+        },
+        ExecutionKind::AnswerAgent => {
+            let comment = work_db.get_comment(&execution.work_item_id).ok().flatten()?;
+            match work_db
+                .resolve_feedback_target(&comment.artifact_kind, &comment.artifact_id)
+                .ok()
+                .flatten()?
+            {
+                crate::work::FeedbackTarget::PullRequestImplementation {
+                    pr_lifecycle: boss_protocol::DocOwnerPrLifecycle::Open,
+                    pr_url,
+                    canonical_pr,
+                    ..
+                } => pr_url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                    .or(Some(canonical_pr.as_str()).filter(|url| !url.is_empty()))
+                    .and_then(boss_github::pr_url::pr_number_from_url),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+impl ExecutionCoordinator {
+    /// Reject an explicit host request before the work DB can create or
+    /// refresh an execution. This makes `bossctl ... --host` failures
+    /// transactional from the operator's point of view: an unknown,
+    /// disabled, or saturated host leaves no queued execution behind.
+    pub(crate) fn validate_requested_host(&self, work_item_id: &str, host_id: &str) -> Result<()> {
+        let hosts = self.work_db.list_hosts().context("host validation: list hosts")?;
+        let known_hosts = hosts.iter().map(|host| host.id.as_str()).collect::<Vec<_>>().join(", ");
+        let host = hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .ok_or_else(|| anyhow!("unknown host '{host_id}'; known hosts: {known_hosts}"))?;
+        if !host.enabled {
+            bail!(
+                "requested host '{host_id}' is disabled{}",
+                host.last_error_text
+                    .as_deref()
+                    .map(|text| format!(" — {text}"))
+                    .unwrap_or_default()
+            )
+        }
+        let work_item = self.work_db.get_work_item(work_item_id)?;
+        let required_driver = self.requested_host_driver(&work_item)?;
+        self.pick_host(&work_item, None, Some(host_id.to_string()), required_driver, None)
+            .map(|_| ())
+            .map_err(|err| anyhow!("requested host '{host_id}' is ineligible: {err}"))
+    }
+
+    /// Resolve the driver that a newly requested task execution will use,
+    /// before creating that execution. Requested-host admission must apply
+    /// the same driver capability constraint as later scheduling, otherwise
+    /// an operator gets a misleading successful dispatch followed by a hold.
+    fn requested_host_driver(&self, work_item: &WorkItem) -> Result<Option<String>> {
+        let (task_driver, product_id) = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => (task.driver.as_deref(), task.product_id.as_str()),
+            WorkItem::Product(_) | WorkItem::Project(_) => return Ok(None),
+        };
+        let product_driver = self
+            .work_db
+            .get_product(product_id)?
+            .and_then(|product| product.default_driver);
+        Ok(Some(boss_engine_effort::resolve_driver(
+            task_driver,
+            product_driver.as_deref(),
+        )))
+    }
+
+    /// Resolve the [`WorkItem`] an execution operates on.
+    ///
+    /// For a normal execution this is the persisted task/chore/product/
+    /// project. An `automation_triage` execution, though, binds to an
+    /// `automations.id` — there is no task row for `get_work_item` to find —
+    /// so we synthesize an in-memory `Chore` carrying the automation's
+    /// product/name/repo. The synthetic item only feeds the task-centric
+    /// spawn plumbing (cube task label, change title, product resolution);
+    /// the runner branches on `kind` to render the triage preamble and the
+    /// completion handler branches on `kind` to run the outcome detector, so
+    /// the synthetic fields never drive real task work.
+    ///
+    /// An `answer_agent` execution binds to a `work_comments.id` for
+    /// the same reason — see [`crate::work::WorkDb::create_answer_agent_execution`]
+    /// — so it gets the same synthetic-item treatment via
+    /// [`Self::synthetic_answer_agent_work_item`].
+    pub(super) fn resolve_execution_work_item(&self, execution: &WorkExecution) -> Result<WorkItem> {
+        if execution.kind == ExecutionKind::AutomationTriage
+            && let Some(item) = self.synthetic_triage_work_item(execution)
+        {
+            return Ok(item);
+        }
+        if execution.kind == ExecutionKind::AnswerAgent
+            && let Some(item) = self.synthetic_answer_agent_work_item(execution)
+        {
+            return Ok(item);
+        }
+        if execution.kind == ExecutionKind::PrReviewGuide
+            && let Some(item) = self.synthetic_review_guide_work_item(execution)
+        {
+            return Ok(item);
+        }
+        self.work_db.get_work_item(&execution.work_item_id)
+    }
+
+    /// Refresh the owning review-guide card after a pre-start failure. The
+    /// attempt row is already terminal; this is the board-invalidation the
+    /// comparison-id `work_item_id` cannot provide on its own.
+    pub(super) fn notify_review_guide_pre_start_failure(&self, execution: &WorkExecution) {
+        if execution.kind != ExecutionKind::PrReviewGuide {
+            return;
+        }
+        let work_db = self.work_db.clone();
+        let publisher = self.publisher.clone();
+        let lifecycle = self.lifecycle.clone();
+        let execution_id = execution.id.clone();
+        boss_task_scope::spawn(async move {
+            let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
+                return;
+            };
+            let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
+                return;
+            };
+            lifecycle
+                .notify_review_guide_changed(&publisher, &root_task_id, "review_guide_failed")
+                .await;
+        });
+    }
+
+    /// Pick the host this execution should run on. Durable pins bypass
+    /// capability matching; a one-dispatch requested host remains subject to it,
+    /// then ranks the survivors by branch affinity / free slots — see
+    /// `boss_engine::host_scheduling::select_host`.
+    ///
+    /// The local host is never slot-gated here: the worker pool already
+    /// bounded local concurrency before dispatch reached this point, and
+    /// `hosts.local.pool_size` defaults to 1, so double-gating on it would
+    /// throttle local dispatch to a single concurrent worker. We therefore
+    /// report the local slot as always-free (`active_runs = 0`) and let
+    /// only remote hosts be gated by their `work_runs` active count.
+    ///
+    /// The execution's resolved agent driver is a hard placement
+    /// constraint: only hosts whose auto-discovered capabilities include
+    /// `driver=<slug>` are candidates. There is no silent fall-back to a
+    /// different driver or to `local`.
+    ///
+    /// Returns the selected [`Host`] or an error describing why nothing was
+    /// eligible (consumed by the caller as a recoverable pre-start
+    /// failure).
+    fn pick_host(
+        &self,
+        work_item: &WorkItem,
+        pinned_host_id: Option<String>,
+        requested_host_id: Option<String>,
+        required_driver: Option<String>,
+        preferred_host_id: Option<String>,
+    ) -> Result<Host> {
+        // Capability requirements union over the chore + its product +
+        // its project. Empty today (no writer yet), which leaves every
+        // enabled host capability-eligible for non-driver tags.
+        let product_id = work_item.product_id().to_string();
+        let project_id = work_item_project_id(work_item);
+        let mut subject_ids: Vec<&str> = vec![work_item.primary_id(), product_id.as_str()];
+        if let Some(pid) = project_id.as_deref() {
+            subject_ids.push(pid);
+        }
+        let mut required_capabilities = self
+            .work_db
+            .required_capabilities_for_subject_ids(&subject_ids)
+            .context("host-selection: capability requirements")?;
+
+        // Resolved driver is a hard requirement, when the caller has one to
+        // enforce — see [`Self::select_host_for_execution`] for how it is
+        // resolved.
+        if let Some(ref driver) = required_driver {
+            required_capabilities.insert(driver_capability(driver));
+        }
+
+        self.work_db.ensure_work_item_not_quarantined(work_item.primary_id())?;
+        let quarantine_reason = self.work_db.local_dispatch_quarantine_reason()?;
+        let mut hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
+        if quarantine_reason.is_some() {
+            hosts.retain(|host| host.id != "local");
+        }
+        let active = self
+            .work_db
+            .active_runs_per_host()
+            .context("host-selection: active runs per host")?;
+
+        let slots: Vec<HostSlot> = hosts
+            .iter()
+            .map(|host| {
+                let capabilities = self
+                    .work_db
+                    .list_host_capabilities(&host.id)
+                    .map(|caps| caps.into_iter().map(|c| c.capability).collect::<BTreeSet<_>>())
+                    .context("host-selection: host capabilities")?;
+                let active_runs = if host.id == "local" {
+                    0
+                } else {
+                    *active.get(&host.id).unwrap_or(&0)
+                };
+                Ok(HostSlot {
+                    host: host.clone(),
+                    capabilities,
+                    active_runs,
+                    // Branch-affinity tiebreaker is deferred (PR4): the
+                    // affinity key is the PR branch, which is unset until
+                    // the first run pushes. Free-slots-first is the
+                    // design's documented v1 fallback for the first run.
+                    had_prior_run_on_branch: false,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let requirements = ChoreRequirements {
+            required_capabilities,
+            pinned_host_id,
+            requested_host_id,
+        };
+        let (picked, report) = select_host(&requirements, &slots);
+        // Prefer the host that already holds restorable work when it is
+        // eligible. An ineligible source (full, disabled, missing caps)
+        // does not wait: another eligible host is chosen and recovery
+        // archives then starts fresh.
+        let picked = preferred_host_id
+            .filter(|id| report.iter().any(|row| row.eligible && row.host_id == *id))
+            .or(picked);
+        match picked {
+            Some(host_id) => hosts
+                .into_iter()
+                .find(|h| h.id == host_id)
+                .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
+            None => Err(anyhow!(HostSelectionFailure {
+                report: report.clone(),
+                message: format!(
+                    "no eligible host for work item {}: {}{}",
+                    work_item.primary_id(),
+                    summarize_ineligibility(&report, required_driver.as_deref()),
+                    quarantine_reason
+                        .map(|reason| format!("; {reason}"))
+                        .unwrap_or_default(),
+                ),
+            })),
+        }
+    }
+
+    fn select_host_for_execution(
+        &self,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        worker_id: &str,
+    ) -> Result<Host> {
+        let pinned = self
+            .work_db
+            .execution_pinned_host(&execution.id)
+            .context("host-selection: execution pinned host")?;
+        // Non-destructive: everything after selection (adapter build,
+        // `cube repo ensure`, workspace lease) can still fail recoverably
+        // and re-enter selection on retry, so the constraint must still be
+        // there. `schedule_execution` clears it explicitly on success or
+        // on a terminal cancel — never here.
+        let requested = self.requested_host_for(&execution.id);
+        if execution.kind == ExecutionKind::PrReviewGuide {
+            for host in [pinned.as_deref(), requested.as_deref()].into_iter().flatten() {
+                anyhow::ensure!(
+                    host == "local",
+                    "review-guide submissions require a local worker; SSH proposal attribution is unsupported"
+                );
+            }
+            return self.pick_host(
+                work_item,
+                Some("local".to_owned()),
+                requested,
+                self.resolve_spawn_driver(execution, worker_id)?,
+                None,
+            );
+        }
+        let required_driver = self.resolve_spawn_driver(execution, worker_id)?;
+        let preferred = if execution.kind.never_writes_pr_branch() {
+            None
+        } else {
+            self.recovery_source_host(execution)?
+        };
+        self.pick_host(work_item, pinned, requested, required_driver, preferred)
+    }
+
+    /// Host that holds this execution's preserved work, when its recovery
+    /// source recorded a preserved tip. A bare record (an empty run) carries
+    /// nothing to restore and expresses no placement preference. Used only as a
+    /// non-blocking preference.
+    fn recovery_source_host(&self, execution: &WorkExecution) -> Result<Option<String>> {
+        let Some(source) = self.work_db.recovery_source(execution)?.filter(|s| s.has_preserved_tip) else {
+            return Ok(None);
+        };
+        Ok(self
+            .work_db
+            .preservation_source(&source.execution.id)?
+            .map(|record| record.host_id))
+    }
+
+    pub(super) fn immutable_execution_target(&self, execution: &WorkExecution) -> Result<Option<String>> {
+        Ok(if execution.kind == ExecutionKind::PrReviewGuide {
+            let capture = self
+                .work_db
+                .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
+                .ok_or_else(|| anyhow!("review-guide comparison is missing; cannot pin workspace"))?;
+            Some(capture.packet.head_sha)
+        } else if execution.kind == ExecutionKind::PrReview {
+            let member = self
+                .work_db
+                .review_batch_member_for_execution(&execution.id)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{err:#}"),
+                        "spawn: failed to resolve review batch member for post-merge target lookup; \
+                         falling back to `--pr` positioning",
+                    );
+                    None
+                });
+            member
+                .and_then(|member| {
+                    self.work_db.review_batch(&member.batch_id).unwrap_or_else(|err| {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            batch_id = %member.batch_id,
+                            error = %format!("{err:#}"),
+                            "spawn: failed to resolve review batch for post-merge target lookup; \
+                             falling back to `--pr` positioning",
+                        );
+                        None
+                    })
+                })
+                .filter(|batch| batch.phase == ReviewBatchPhase::PostMerge)
+                .map(|batch| batch.target_sha)
+        } else {
+            None
+        })
+    }
+
+    /// Resolve the driver used by both host placement and spawn-failure alerts.
+    pub(crate) fn resolve_spawn_driver(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
+        if execution.kind == ExecutionKind::PrReviewGuide {
+            return Ok(Some(boss_execution_contracts::REVIEW_GUIDE_DRIVER.to_owned()));
+        }
+        if execution.kind == ExecutionKind::PrReview
+            && let Some(member) = self.work_db.review_batch_member_for_execution(&execution.id)?
+        {
+            return Ok(Some(member.requested_driver));
+        }
+        if let Some(policy) = boss_execution_contracts::pool_dispatch_policy_for_worker_id(worker_id) {
+            return Ok(Some(policy.driver.to_owned()));
+        }
+        self.work_db.get_execution_driver_slug(&execution.id)
+    }
+
+    async fn check_predecessor_lease_hold(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str) -> Result<()> {
+        // The run this row recovers from has not released its cube lease, so
+        // its unpublished work may not be preserved yet. The drain holds such
+        // a row before claiming a slot; this is the chokepoint backstop for
+        // `force_dispatch` and for a lease that came back between that check
+        // and this call. Starting from trunk here would strand the work, so it
+        // refuses rather than guess. A pending preservation leaves the row
+        // ready; a hold that outlasts its bound terminalizes it with a retry reason.
+        self.await_predecessor_recheck(execution).await;
+        let hold = match self.predecessor_lease_hold(execution) {
+            None => return Ok(()),
+            Some(hold) => hold,
+        };
+        if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+            tracing::error!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to release dispatch claim after predecessor-lease hold"
+            );
+        }
+        let detail = match hold {
+            super::predecessor_hold::PredecessorHold::Failed(error) => {
+                self.fail_predecessor_hold(execution, &error);
+                return Err(anyhow!("execution {} failed to start: {error}", execution.id));
+            }
+            super::predecessor_hold::PredecessorHold::Waiting(detail) => detail,
+        };
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            worker_id = %worker_id,
+            reason = DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
+            detail = %detail,
+            "spawn_attempt refused: the run this execution recovers from still holds its cube lease",
+        );
+        self.work_db
+            .set_dispatch_wait_reason(&execution.id, DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION)?;
+        Err(anyhow!(
+            "execution {} is held ({DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION}): {detail}; \
+             inspect the execution's status and the predecessor's cleanup attention before retrying",
+            execution.id
+        ))
+    }
+
+    /// Take one `ready` execution all the way to a running worker: guards,
+    /// host selection, `cube repo ensure`, the workspace lease, positioning,
+    /// and the pane spawn.
+    ///
+    /// `admission` says which entry point asked, and is the reason this
+    /// function is where the dispatch pause is enforced. It is the single
+    /// chokepoint every worker spawn passes through — `drain_ready_queue`
+    /// and `force_dispatch` are its only production callers — so gating here
+    /// means a pause cannot be bypassed by a dispatch entry point that
+    /// forgot to check one, which is precisely how the 2026-08-10 incident
+    /// happened. Any future caller must name a [`DispatchAdmission`], and
+    /// the compiler will not let it avoid the question.
+    pub(crate) async fn schedule_execution(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        admission: DispatchAdmission,
+    ) -> Result<()> {
+        // Enforce the coordinator's progression spawning switch here as well as
+        // in the drain, so force_dispatch cannot bypass it. Return the claim
+        // without recording a spawn failure against the stuck item.
+        if self.execution_targets_progression_pool(execution) && !self.progression_spawn_enabled {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                "spawn_attempt refused: progression spawning is disabled in this coordinator",
+            );
+            if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "failed to release dispatch claim after progression-unavailable hold"
+                );
+            }
+            return Err(anyhow!(
+                "execution {} is a progression run and the engine cannot spawn progression agents yet; \
+                 it stays `ready`",
+                execution.id
+            ));
+        }
+        self.check_predecessor_lease_hold(execution, worker_id).await?;
+        // Global pause gate. `drain_ready_queue` short-circuits before ever
+        // claiming a slot, so in the ordinary case this is never reached
+        // while paused — but a pause can land in the window between that
+        // check and this call (the drain hands the slow tail to a detached
+        // task), and this is the check that a newly-added entry point
+        // cannot skip. Refusing here returns the claimed worker to its pool
+        // via the caller's error path, before any cube lease is taken.
+        if let Some(hold) = self.dispatch_hold_for(execution, admission) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                admission = admission.as_str(),
+                origin = hold.pause.origin.as_metadata_str(),
+                "spawn_attempt refused: dispatch is paused",
+            );
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::DispatchHeldByPause, DispatchOutcome::Skipped, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_details(serde_json::json!({
+                            "origin": hold.pause.origin.as_metadata_str(),
+                            "admission": hold.admission.as_str(),
+                            "reviews_held": hold.pause.reviews_held(),
+                            "targets_review_pool": hold.targets_review_pool,
+                            "paused_since_epoch_s": hold.pause.since_epoch_s,
+                            "reason": hold.pause.reason,
+                            "detail": hold.detail,
+                        })),
+                )
+                .await;
+            // Drain may already have CAS'd this row to `claimed`. A pause is
+            // not a spawn failure — revert so the next kick can pick it up.
+            if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "failed to release dispatch claim after pause hold"
+                );
+            }
+            return Err(anyhow!("{hold}"));
+        }
+        // Durable spawn-window claim. The drain loop usually already won
+        // this CAS; `AlreadyHeld` is that case. `force_dispatch` and any
+        // path that skipped the drain pickup claim it here. Rejected means
+        // the reconciler (or another writer) moved the row off `ready`
+        // before we took the window — fail closed rather than leasing a
+        // workspace we cannot start.
+        match self.work_db.claim_execution_for_dispatch(&execution.id) {
+            Ok(DispatchClaimOutcome::Won | DispatchClaimOutcome::AlreadyHeld) => {}
+            Ok(DispatchClaimOutcome::Rejected) => {
+                let status = self
+                    .work_db
+                    .get_execution(&execution.id)
+                    .map(|e| e.status.to_string())
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                return Err(anyhow!(
+                    "execution {} is not ready and cannot be dispatched from status `{status}`",
+                    execution.id
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+        // Double-spawn guard (Bug A): if another execution for this
+        // work_item is already live (running or waiting_human), this
+        // execution is a redundant duplicate created by the orphan sweep
+        // racing with a still-active pane. Abandon it without spawning
+        // so "execution run completed" doesn't fire prematurely.
+        match self
+            .work_db
+            .get_live_execution_for_work_item(&execution.work_item_id, &execution.id)
+        {
+            Ok(Some(live)) => {
+                if self
+                    .work_db
+                    .are_admissible_concurrent_review_batch_pair(&execution.id, &live.id)?
+                {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        live_execution_id = %live.id,
+                        work_item_id = %execution.work_item_id,
+                        "spawn_attempt: permitting concurrent read-only review-batch members on one cycle root",
+                    );
+                    // Review-batch members have no workspace-writing role and
+                    // each reviews its own batch's frozen target in its own
+                    // lease; their proposals are independently scoped to their
+                    // persisted member rows. That holds across batches too: a
+                    // new head's leaves must not be abandoned as "redundant"
+                    // because the previous head's supervisor is still running
+                    // (the shape that left mono PR #3110's latest head
+                    // unreviewed). Continue to ordinary host selection.
+                } else {
+                    // Liveness gate (waiting_human-zombie fix, 2026-06-14 incident):
+                    // `get_live_execution_for_work_item` returns any row in
+                    // `status IN ('running','waiting_human')`, but that is a *paper*
+                    // liveness signal. A row can sit `waiting_human` forever after
+                    // its worker died without a `Stop` hook — e.g. the cube
+                    // workspace-root migration relocated the pool out from under
+                    // three running triage panes, so their rows stayed `waiting_human`
+                    // and every subsequent fire died right here with `redundant_spawn`.
+                    // Before treating this execution as a redundant duplicate, verify
+                    // the blocker is *actually* live: a local execution whose worker
+                    // pane is provably gone (workspace dir vanished, recorded pane pid
+                    // dead, or a pane that never attached) is a zombie — reconcile it
+                    // to a terminal status and proceed with this spawn instead of
+                    // blocking. This is the restart-robust check that keeps the guard
+                    // from deferring forever to a corpse (the recurring 2026-07-03
+                    // redundant_spawn spam).
+                    let reconciled_lost_workspace = self
+                        .lifecycle
+                        .reconcile_if_execution_dead(&live, self.dispatch_events.as_ref())
+                        .await;
+                    let reconciled_dead_pane = !reconciled_lost_workspace
+                        && self
+                            .lifecycle
+                            .reconcile_if_pane_dead(
+                                &live,
+                                self.dispatch_events.as_ref(),
+                                boss_engine_utils::epoch_time::now_epoch_secs(),
+                                self.live_worker_states.as_deref(),
+                            )
+                            .await;
+                    if reconciled_lost_workspace || reconciled_dead_pane {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            reconciled_execution_id = %live.id,
+                            work_item_id = %execution.work_item_id,
+                            reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
+                            "spawn_attempt: prior 'live' execution's worker pane was gone; \
+                             reconciled it and proceeding with this spawn",
+                        );
+                        self.release_lease_after_reconcile(&live, reconciled_dead_pane).await;
+                        // Reconciliation can make a previously live run the
+                        // recovery predecessor while its release gates keep
+                        // the lease. Recheck before leasing a successor.
+                        self.check_predecessor_lease_hold(execution, worker_id).await?;
+                        // Not redundant after all — fall through to the rest of dispatch.
+                    } else {
+                        // The blocker survived every death check the reconciler
+                        // applies, so it is genuinely live: this fire is redundant
+                        // *normal* scheduler behaviour (the work is already running),
+                        // NOT a failure. Annotate the blocker's liveness verdict +
+                        // age-in-status so the next recurrence is attributable in one
+                        // read.
+                        let live_age_secs = live
+                            .started_at
+                            .as_deref()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .map(|s| boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(s));
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            live_execution_id = %live.id,
+                            work_item_id = %execution.work_item_id,
+                            live_execution_age_secs = ?live_age_secs,
+                            "spawn_attempt: work already running in a live execution; skipping this fire (not an error)",
+                        );
+                        if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
+                            tracing::error!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "spawn_attempt: failed to mark redundant execution abandoned",
+                            );
+                        }
+                        // Neutral automation bookkeeping: an `automation_triage` fire
+                        // superseded by a genuinely-live execution records
+                        // `triage_running` — the automation IS being triaged, just by
+                        // the live execution, not this one. This overwrites the
+                        // pessimistic "dispatched; awaiting triage worker decision"
+                        // placeholder with a *neutral* outcome so the automation UI
+                        // renders "Running" (blue), NOT "Failed (retrying)" (which is
+                        // reserved for dispatch failures that will not self-heal — a
+                        // redundant fire self-heals when the live execution finishes).
+                        if execution.kind == ExecutionKind::AutomationTriage
+                            && let Err(err) = self.work_db.finalize_automation_triage_run(
+                                &execution.id,
+                                boss_protocol::AUTOMATION_OUTCOME_TRIAGE_RUNNING,
+                                None,
+                                Some(&format!(
+                                    "skipped: work already running in live execution {} (this fire was redundant, \
+                                 not a failure)",
+                                    live.id
+                                )),
+                            )
+                        {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "spawn_attempt: failed to record already-running outcome on automation_runs row",
+                            );
+                        }
+                        // Emit a terminal event so the dispatch timeline doesn't
+                        // silently stall at `worker_claimed/ok` for 30s until the
+                        // watchdog fires. The execution is already marked redundant
+                        // (terminal DB state); `host_selected:error` remains the
+                        // timeline closer (`is_terminal_event` keys off `error`), but
+                        // its details carry `live_execution_liveness: "alive"` +
+                        // `live_execution_age_secs` so the diagnostic stream shows the
+                        // block was against a genuinely-live execution, not a corpse.
+                        self.dispatch_events
+                            .emit(
+                                DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                                    .with_work_item(&execution.work_item_id)
+                                    .with_worker(worker_id)
+                                    .with_details(serde_json::json!({
+                                        "reason": "redundant_spawn",
+                                        "live_execution_id": live.id,
+                                        "live_execution_liveness": "alive",
+                                        "live_execution_age_secs": live_age_secs,
+                                    })),
+                            )
+                            .await;
+                        return Err(anyhow::anyhow!(
+                            "redundant spawn: execution {} for work_item {} superseded by live execution {}",
+                            execution.id,
+                            execution.work_item_id,
+                            live.id,
+                        ));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // Non-fatal: if the DB check fails, proceed with the
+                // spawn rather than blocking all dispatches. The worst
+                // case is the double-spawn race we're trying to prevent,
+                // which is the pre-existing behaviour.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: live-execution check failed — proceeding without dedup guard",
+                );
+            }
+        }
+
+        // Per-PR single-writer guard (guards against the two-concurrent-writers-to-one-PR incident). The
+        // double-spawn guard above only sees executions on this exact
+        // work_item; it cannot see a *sibling* execution that targets the
+        // SAME PR. A revision (conflict-resolution, ci-fix, review-findings,
+        // operator) is a distinct work item whose chain root owns the PR,
+        // and cube co-locates every same-PR worker on ONE shared jj backing
+        // store — so a second live execution anywhere in the chain rebases
+        // and rewrites the first's commits. Every dispatch entry point
+        // funnels through here, so this one check serializes ALL of them:
+        // the conflict-resolution and ci-fix auto-spawn paths included.
+        //
+        // The auto-dispatcher (`drain_ready_queue`) applies this same guard
+        // BEFORE claiming a worker (so it never wastes a slot or emits a
+        // misleading `worker_claimed` timeline for a deferred row); this
+        // copy is the backstop for `force_dispatch` (`bossctl agents
+        // launch`) and any future direct caller, closing the chokepoint.
+        //
+        // Unlike the redundant-duplicate guard above, a chain sibling is NOT
+        // redundant — it has its own real work — so we DEFER rather than
+        // abandon: the execution stays `ready` and is re-attempted on the
+        // next scheduler kick (which fires when the live sibling reaps), so
+        // it runs strictly after the live one finishes.
+        //
+        // Goes through `resolve_chain_hold` (not the raw `WorkDb` query) so
+        // this backstop shares the pre-claim guard's zombie reconciliation —
+        // see that method's docs — and its review-yields-to-revision
+        // carve-out, so a revision the pre-claim check in
+        // `drain_ready_queue` just bypassed isn't immediately re-deferred
+        // here (which would otherwise wedge it in a defer loop instead of
+        // ever actually dispatching).
+        match self.resolve_chain_hold(execution).await {
+            Ok(ChainHold::Blocked {
+                sibling, review_held, ..
+            }) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    live_sibling_execution_id = %sibling.id,
+                    live_sibling_work_item_id = %sibling.work_item_id,
+                    review_held,
+                    "spawn_attempt: deferred — another execution on the same PR/chain is live; \
+                     serializing behind it rather than co-dispatching onto the shared jj store",
+                );
+                // Leave the execution `ready` (do NOT abandon). Revert a
+                // drain-loop `claimed` CAS so the next kick can see the row.
+                // The caller releases the claimed worker on this `Err`.
+                //
+                // Emit a terminal event so the dispatch timeline advances
+                // past `worker_claimed/ok` immediately — otherwise the
+                // stall watchdog fires ~30s later, masking the real reason
+                // (chain serialization) in the timeline. The execution is
+                // not actually failed; on the next kick it will re-attempt
+                // and may succeed. The `error` outcome is necessary here
+                // because `is_terminal_event` only recognises `outcome ==
+                // "error"` (besides `pane_spawned/ok`) as closing the stage.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "reason": "chain_serialized_backstop",
+                                "review_held": review_held,
+                                "live_sibling_execution_id": sibling.id,
+                                "live_sibling_work_item_id": sibling.work_item_id,
+                            })),
+                    )
+                    .await;
+                if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to release dispatch claim after chain-serialization backstop"
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "serialized: execution {} for work_item {} deferred behind live chain sibling {} (work_item {})",
+                    execution.id,
+                    execution.work_item_id,
+                    sibling.id,
+                    sibling.work_item_id,
+                ));
+            }
+            Ok(ChainHold::ReviewBypassed(sibling)) => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    live_sibling_execution_id = %sibling.id,
+                    live_sibling_work_item_id = %sibling.work_item_id,
+                    "spawn_attempt: proceeding — live sibling is a read-only review, \
+                     bypassed for this revision",
+                );
+            }
+            Ok(ChainHold::Clear) => {}
+            Err(err) => {
+                // Non-fatal: proceed rather than blocking all dispatches.
+                // The post-lease assertion below is the defense-in-depth
+                // backstop for the single-writer invariant.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: chain single-writer check failed — proceeding without serialization guard",
+                );
+            }
+        }
+
+        // A kind that holds no cube lease (`progression`) takes the checkout-free
+        // spawn path. It deliberately skips the gating-prerequisite check
+        // below: a progression run on a `blocked: dependency` item is the whole
+        // point, and downgrading its row to `waiting_dependency` would hold it
+        // forever.
+        if !execution.kind.holds_cube_lease() {
+            return self.schedule_progression_execution(execution, worker_id).await;
+        }
+
+        // At-dispatch gate check: if the work item is still gated by an
+        // unmet prerequisite, the execution must not be dispatched. This
+        // closes the timing window where a `ready` row was created before
+        // a `blocks` dep edge committed (or before the gate check in
+        // `reconcile_work_item_execution` ran). Downgrade to
+        // `waiting_dependency` so the execution leaves the ready queue
+        // and gets re-promoted when the gate clears.
+        match self.work_db.gating_prereqs_for(&execution.work_item_id) {
+            Ok(prereqs) if !prereqs.is_empty() => {
+                let names = prereqs.join(", ");
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    gating_prereqs = %names,
+                    "spawn_attempt: execution for gated work item — downgrading to waiting_dependency and skipping dispatch",
+                );
+                if let Err(err) = self.work_db.downgrade_ready_to_waiting_dependency(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "spawn_attempt: failed to downgrade gated execution",
+                    );
+                }
+                // Emit a terminal event so the dispatch timeline advances
+                // past `worker_claimed/ok` immediately and the stall
+                // watchdog doesn't misattribute the hold to worker claim.
+                // The execution is downgraded to `waiting_dependency` (not
+                // failed); on gate clearance `dep_unblock_sweep` re-promotes
+                // it to `ready` and the next kick re-dispatches.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "reason": "gating_prereqs_blocked",
+                                "gating_prereqs": prereqs,
+                            })),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "gated: execution {} for {} blocked by [{}]",
+                    execution.id,
+                    execution.work_item_id,
+                    names,
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // Non-fatal: proceed rather than blocking all dispatches.
+                // The work item's gating state is re-evaluated on the next
+                // kick, so a transient DB error here at most allows one
+                // erroneous dispatch.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: gate check failed — proceeding without gating guard",
+                );
+            }
+        }
+
+        let work_item = match self
+            .resolve_execution_work_item(execution)
+            .with_context(|| format!("failed to resolve work item {}", execution.work_item_id))
+        {
+            Ok(work_item) => work_item,
+            Err(err) => {
+                // Previously a bare `?`: the execution returned to the
+                // drain loop with no dispatch event and no start-failure
+                // record, so it sat at `worker_claimed` until the stall
+                // watchdog reaped it ~30s later. Emit a terminal
+                // `host_selected:error` so the timeline names the blocker
+                // and the watchdog stops re-flagging it, then record the
+                // start failure so the row flips out of `worker_claimed`
+                // immediately.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({ "reason": "work_item_unresolved" })),
+                    )
+                    .await;
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    ("work_item_unresolved", "Could not resolve work item for execution"),
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+        let task = execution_task_summary(execution, &work_item);
+
+        // Merge-conflict revision already-resolved guard: a revision
+        // spawned to fix a merge conflict can sit `ready` for a while
+        // (worker-pool contention) before a slot frees up. In that window
+        // the periodic merge-poller sweep may independently notice the
+        // bound PR is mergeable again and retire the linked
+        // `conflict_resolutions` ledger row to `succeeded`
+        // (`conflict_watch::on_resolved`) without ever touching this
+        // now-unnecessary revision task/execution. Dispatching a worker
+        // here would just have it discover "nothing to do" and become the
+        // produce-a-PR nudge loop described in the `nudge_breaker` module
+        // doc. Check the ledger (already kept fresh by that sweep) before
+        // ever leasing a workspace.
+        if execution.kind == ExecutionKind::RevisionImplementation
+            && let WorkItem::Task(ref revision_task) = work_item
+            && revision_task.kind == TaskKind::Revision
+            && let Some(crz_id) = revision_task
+                .created_via
+                .strip_prefix(boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        {
+            match self.work_db.get_conflict_resolution(crz_id) {
+                Ok(Some(ref attempt)) if attempt.status == "succeeded" => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        attempt_id = %attempt.id,
+                        "spawn_attempt: merge-conflict revision's bound PR was already resolved \
+                         before dispatch — retiring without spawning a worker",
+                    );
+                    match self
+                        .work_db
+                        .retire_stale_revision_before_dispatch(&execution.id, &revision_task.id)
+                    {
+                        Ok(task_transitioned) => {
+                            if task_transitioned {
+                                self.publisher
+                                    .publish_work_item_changed(
+                                        &revision_task.product_id,
+                                        &revision_task.id,
+                                        "merge_conflict_already_resolved",
+                                    )
+                                    .await;
+                            }
+                            self.dispatch_events
+                                .emit(
+                                    DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                                        .with_work_item(&execution.work_item_id)
+                                        .with_worker(worker_id)
+                                        .with_details(serde_json::json!({
+                                            "reason": "merge_conflict_already_resolved",
+                                            "attempt_id": attempt.id,
+                                        })),
+                                )
+                                .await;
+                            return Err(anyhow::anyhow!(
+                                "skipped: execution {} for work_item {} not spawned — merge conflict \
+                                 already resolved before dispatch (attempt {})",
+                                execution.id,
+                                execution.work_item_id,
+                                attempt.id,
+                            ));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "spawn_attempt: failed to retire stale already-resolved revision; \
+                                 proceeding with dispatch",
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        crz_id,
+                        ?err,
+                        "spawn_attempt: failed to look up linked conflict_resolution; proceeding with dispatch",
+                    );
+                }
+            }
+        }
+
+        // Host selection (distributed-execution PR3): pick the host this
+        // execution should run on, then build the matching adapter (local
+        // vs SSH-remote) and route the whole dispatch through it. A
+        // no-eligible-host result is a recoverable pre-start failure — it
+        // backs off and raises an attention item rather than hot-looping,
+        // and a later kick retries once a host comes online / tags change.
+        let had_requested_host = self.requested_host_ids.lock().unwrap().contains_key(&execution.id);
+        // An assignment that may already have leased a workspace or started a
+        // worker can only be reconciled on its own host: placement is not
+        // reconsidered, and nothing below that fails to reach the host is a
+        // failed start. Those outcomes park the attempt instead.
+        let held_spoke_host = match self.work_db.spoke_host_holding_execution(&execution.id) {
+            Ok(host) => host,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "could not read the execution's spoke assignment; selecting a host normally",
+                );
+                None
+            }
+        };
+        let selection = match held_spoke_host.as_deref() {
+            Some(host_id) => self
+                .work_db
+                .get_host(host_id)
+                .and_then(|host| host.ok_or_else(|| anyhow!("host '{host_id}' is missing from the registry"))),
+            None => self.select_host_for_execution(execution, &work_item, worker_id),
+        };
+        let selected_host = match selection {
+            Ok(host) => host,
+            Err(err) if held_spoke_host.is_some() => {
+                return Err(self.park_held_spoke_attempt(execution, err).await);
+            }
+            Err(err) => {
+                if had_requested_host {
+                    match self.work_db.cancel_execution_with(
+                        &execution.id,
+                        CancelExecutionOpts {
+                            reason: Some(format!("requested host became ineligible: {err:#}")),
+                            queued_only: true,
+                            record_failure_reason: true,
+                        },
+                    ) {
+                        Ok(cancelled) => {
+                            // Terminal for this execution: drop the constraint so it
+                            // cannot leak (selection no longer takes it itself).
+                            self.take_requested_host(&execution.id);
+                            self.notify_review_guide_pre_start_failure(&cancelled);
+                        }
+                        Err(cancel_err) => {
+                            // The cancel is what makes this row terminal. If it
+                            // failed, the row is still `ready` and will be
+                            // drained again — keep the constraint in place so
+                            // the retry is refused for the same requested host
+                            // instead of landing unpinned on an arbitrary one.
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                error = %format!("{cancel_err:#}"),
+                                "failed to cancel execution whose requested host became ineligible; \
+                                 leaving the --host constraint in place so a retry cannot land unpinned",
+                            );
+                        }
+                    }
+                }
+                // No event was emitted here before, so a `no_eligible_host`
+                // failure was invisible in the per-execution timeline — the
+                // watchdog reaped it as a `worker_claimed` stall. Emit a
+                // terminal `host_selected:error` so the blocker is named in
+                // dispatch.jsonl before recording the start failure.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({ "reason": "no_eligible_host" })),
+                    )
+                    .await;
+                if had_requested_host {
+                    return Err(err);
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    ("no_eligible_host", "No eligible host for execution"),
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+        // Resolved per execution so a transport that records which host owns an
+        // execution does so before any command for it can be sent.
+        let adapter = match self
+            .host_adapter_provider
+            .adapter_for_execution(&selected_host, &execution.id)
+            .await
+        {
+            Ok(adapter) => adapter,
+            Err(err) if held_spoke_host.is_some() => {
+                return Err(self.park_held_spoke_attempt(execution, err).await);
+            }
+            Err(err) => {
+                // Same silent-gap fix as the host-selection branch above:
+                // a host was chosen but its adapter could not be built
+                // (e.g. SSH unreachable). Make it observable + terminal.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "reason": "host_adapter_unavailable",
+                                "host_id": selected_host.id.clone(),
+                            })),
+                    )
+                    .await;
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "host adapter build", &err)
+                        .await;
+                    return Err(err);
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    ("host_adapter_unavailable", "Could not build host adapter"),
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+        // Host chosen and adapter ready: emit the success milestone so the
+        // claimed -> repo-ensure handoff is no longer a blind spot in the
+        // timeline (closes the gap that hid the automation-pool stall).
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_details(serde_json::json!({ "host_id": selected_host.id.clone() })),
+            )
+            .await;
+        tracing::info!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            host_id = %selected_host.id,
+            "host-selection: routing execution to host",
+        );
+
+        // Mirror the argv `ensure_repo` actually drives so the dispatch-event
+        // `cube_command` is reproducible from a terminal: a bare resolver
+        // slug goes positionally (`repo ensure <name>`), a URL via `--origin`.
+        let ensure_args = boss_host_execution::cube::repo_ensure_args(&execution.repo_remote_url);
+        // Record the attempt *before* the subprocess, mirroring
+        // `cube_workspace_lease_attempted`. `cube repo ensure` on a cold
+        // repo can outrun the `worker_claimed` stall threshold; with this
+        // marker the watchdog attributes such a stall to the ensure
+        // subprocess instead of the (already-completed) worker claim.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeRepoEnsureAttempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_invocation(adapter.command_repr(&ensure_args))
+                    .with_details(serde_json::json!({
+                        "repo_remote_url": execution.repo_remote_url,
+                        "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                    })),
+            )
+            .await;
+        let repo = match tokio::time::timeout(
+            CUBE_REPO_ENSURE_TIMEOUT,
+            adapter.ensure_repo(&execution.repo_remote_url),
+        )
+        .await
+        {
+            Ok(Ok(repo)) => repo,
+            Ok(Err(err)) => {
+                self.emit_ensure_failed(
+                    execution,
+                    worker_id,
+                    adapter.command_repr(&ensure_args),
+                    &err,
+                    serde_json::json!({ "host_id": selected_host.id.clone() }),
+                )
+                .await;
+                if held_spoke_host.is_some() {
+                    return Err(self.park_held_spoke_attempt(execution, err).await);
+                }
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
+                        .await;
+                    return Err(err);
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+            Err(_elapsed) => {
+                let err = anyhow!(
+                    "cube `repo ensure` timed out after {}s",
+                    CUBE_REPO_ENSURE_TIMEOUT.as_secs()
+                );
+                self.emit_ensure_failed(
+                    execution,
+                    worker_id,
+                    adapter.command_repr(&ensure_args),
+                    &err,
+                    serde_json::json!({
+                        "reason": "timeout",
+                        "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                        "host_id": selected_host.id.clone(),
+                    }),
+                )
+                .await;
+                if held_spoke_host.is_some() {
+                    return Err(self.park_held_spoke_attempt(execution, err).await);
+                }
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err)
+                        .await;
+                    return Err(err);
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+        self.maybe_probe_cold_repo(execution, &adapter).await;
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_invocation(adapter.command_repr(&ensure_args)),
+            )
+            .await;
+
+        // A `PrReview` execution that is a member of a PostMerge review batch
+        // must position on the frozen merge commit rather than the PR head:
+        // the PR is MERGED by construction (the batch only exists because it
+        // merged), and `cube workspace goto --pr` hard-errors on a non-open
+        // PR. Resolved once here so both `pr_for_goto` below and the
+        // post-lease positioning step special-case it via
+        // `goto_workspace_revision` instead of `goto_workspace`.
+        let immutable_target_sha = self.immutable_execution_target(execution)?;
+
+        // PR number to pass to `cube workspace goto` after the lease.
+        // Set for pr_review, revision_implementation, and answer_agent
+        // executions whose comment targets an open implementation PR.
+        let pr_for_goto: Option<u64> = if immutable_target_sha.is_some() {
+            None
+        } else {
+            pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
+        };
+
+        let lease_result = self
+            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
+            .await;
+        // A spoke host that has not said whether it granted the lease is not a
+        // failed start. Hand back every claim this attempt holds (the per-repo
+        // permit, the dispatch slot and the pool slot are all released when
+        // this returns) and come back to the same stored lease command later.
+        let lease_result = match lease_result {
+            Err(err) if waitable_spoke_lease(&err).is_some() => {
+                if self.repo_lease_limiter.release(&execution.id) {
+                    self.kick();
+                }
+                return Err(self.park_in_doubt_spoke_lease(execution, err).await);
+            }
+            other => other,
+        };
+        // The per-repo permit bounds concurrent lease calls, which contend on
+        // cube's per-repo lock. Once the call has returned that contention is
+        // over, so free the permit now rather than holding it through the
+        // rest of the spawn pipeline.
+        if lease_result.is_ok() {
+            self.pool_for_worker_id(worker_id).mark_working(worker_id).await;
+        }
+        if self.repo_lease_limiter.release(&execution.id) {
+            self.kick();
+        }
+        let lease = match lease_result {
+            Ok(lease) => lease,
+            Err(err) => {
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "cube workspace lease", &err)
+                        .await;
+                    return Err(err);
+                }
+                // The lease helper has already emitted attempt /
+                // failure events for every try; convert the final
+                // failure into the start-failure record so the
+                // execution row flips to `failed` cleanly instead of
+                // wedging in `worker_claimed`.
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    Some(repo.repo_id.as_str()),
+                    ("cube_workspace_lease_failed", "Cube `workspace lease` failed"),
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+
+        // Record the lease before any fallible work so a later cube-release
+        // failure still leaves columns the leftover-lease sweep can retry.
+        self.persist_acquired_lease(execution, &lease);
+        self.resolve_spoke_in_doubt_attention(&execution.id);
+
+        // The answer-agent run is already bound to this execution before it
+        // can reach the dispatcher. Stamp the lease immediately so comment
+        // inspection has the same workspace pivot as dispatch diagnostics.
+        if execution.kind == ExecutionKind::AnswerAgent {
+            match self
+                .work_db
+                .set_answer_agent_execution_lease(&execution.id, &lease.lease_id)
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    workspace_lease_id = %lease.lease_id,
+                    "answer-agent lease acquired but no bound run exists for the execution",
+                ),
+                Err(err) => tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    workspace_lease_id = %lease.lease_id,
+                    err = %err,
+                    "answer-agent lease acquired but failed to persist the run lease pivot",
+                ),
+            }
+        }
+
+        // Lease-time occupancy guard (defect 3). Cube should never hand us
+        // a workspace that is still the cwd of a live worker — but the
+        // duplicate-dispatch incident proved it can when an upstream bug
+        // frees a lease while the worker's process is still alive. Before
+        // we commit this run to the workspace, refuse (and loudly log) if
+        // the engine's own live-worker registry still tracks a live
+        // process there. A refused lease retries via the normal pre-start
+        // backoff; an interleaved working copy silently corrupts two
+        // workers' edits. Only runs when the registry is wired
+        // (production); fails open otherwise. The probe is keyed by
+        // run_id/execution_id, so it never trips on our own (not-yet-
+        // spawned) execution.
+        if let Some(live_states) = self.live_worker_states.as_ref() {
+            let snapshot = live_states.snapshot();
+            let occupant = occupying_live_worker(
+                &lease.workspace_id,
+                &execution.id,
+                &snapshot,
+                |eid| self.work_db.get_execution(eid).ok().and_then(|e| e.cube_workspace_id),
+                |pid| !matches!(self.lifecycle.probe_pid(pid), PidStatus::Dead),
+            );
+            if let Some(occupant_run_id) = occupant {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    workspace_path = %lease.workspace_path.display(),
+                    occupied_by = %occupant_run_id,
+                    "REFUSING lease: cube returned a workspace still occupied by a live tracked worker \
+                     — refusing rather than interleaving two workers in one working copy (defect 3)",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "reason": "workspace_occupied_by_live_worker",
+                                "occupied_by_execution_id": occupant_run_id,
+                                "workspace_path": lease.workspace_path.display().to_string(),
+                            })),
+                    )
+                    .await;
+                // Record this workspace as refused so the next lease call
+                // passes --exclude and skips it, breaking the livelock where
+                // cube's deterministic ordering re-offers the same occupied
+                // workspace on every retry attempt.
+                self.refused_workspaces
+                    .lock()
+                    .await
+                    .entry(execution.id.clone())
+                    .or_default()
+                    .push(lease.workspace_id.clone());
+
+                // Drop only the refused registry lease, never reset the live
+                // occupant's checkout. This execution has not positioned it.
+                self.lifecycle
+                    .release_refused_workspace(execution, &lease.lease_id, adapter.as_ref())
+                    .await;
+                let err = anyhow!(
+                    "leased workspace {} is occupied by live worker {}",
+                    lease.workspace_id,
+                    occupant_run_id
+                );
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    Some(repo.repo_id.as_str()),
+                    (
+                        "cube_workspace_occupied",
+                        "Cube leased a workspace occupied by a live worker",
+                    ),
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+        }
+
+        // Per-PR single-writer assertion (defense in depth). The pre-claim
+        // chain guard at the top of `schedule_execution` already deferred
+        // any execution whose PR/chain has a live sibling, but there is a
+        // TOCTOU window between that check and committing this run to the
+        // leased workspace: a sibling could have gone live in between. We
+        // re-assert the invariant HERE, immediately before spawning onto the
+        // shared jj backing store — the irreversible step. The occupancy
+        // guard above only catches a sibling in the SAME workspace; two
+        // same-PR workers in DIFFERENT cube workspaces still share one
+        // backing store and corrupt each other, which this catches. On a
+        // violation we release the lease and refuse rather than interleave.
+        //
+        // Goes through `resolve_chain_hold` for the same reason as the other
+        // two call sites: a `waiting_human` "sibling" that is actually a
+        // dead worker must not refuse this spawn forever, and a live
+        // read-only review sibling must not refuse a revision the
+        // earlier checkpoints already bypassed for it (see
+        // `resolve_chain_hold`'s docs) — otherwise this defense-in-depth
+        // assertion would defeat the bypass right before the irreversible
+        // spawn step.
+        match self.resolve_chain_hold(execution).await {
+            Ok(ChainHold::Blocked {
+                sibling, review_held, ..
+            }) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    live_sibling_execution_id = %sibling.id,
+                    live_sibling_work_item_id = %sibling.work_item_id,
+                    review_held,
+                    "REFUSING spawn: another execution on the same PR/chain went live after the \
+                     pre-claim guard — refusing rather than handing two same-PR workers the shared \
+                     jj backing store (single-writer invariant)",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "reason": "chain_sibling_went_live",
+                                "review_held": review_held,
+                                "live_sibling_execution_id": sibling.id,
+                                "live_sibling_work_item_id": sibling.work_item_id,
+                            })),
+                    )
+                    .await;
+                // Hand the workspace back so it isn't stranded, then unclaim
+                // so the row returns to `ready` (the deferral path) and
+                // `recover_failed_dispatch` does not count this serialization
+                // as a spawn failure.
+                self.release_pre_start_workspace(execution, &lease, &adapter).await;
+                if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to release dispatch claim after post-lease chain-sibling refusal"
+                    );
+                }
+                return Err(anyhow!(
+                    "serialized: execution {} for work_item {} refused after lease — chain sibling {} (work_item {}) went live",
+                    execution.id,
+                    execution.work_item_id,
+                    sibling.id,
+                    sibling.work_item_id,
+                ));
+            }
+            Ok(ChainHold::ReviewBypassed(_)) | Ok(ChainHold::Clear) => {}
+            Err(err) => {
+                // Fail open: a DB error here must not wedge dispatch. The
+                // pre-claim guard already covered the common case.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: post-lease chain single-writer assertion failed to query — proceeding",
+                );
+            }
+        }
+        {
+            let lease_args = vec![
+                "--json",
+                "workspace",
+                "lease",
+                repo.repo_id.as_str(),
+                "--task",
+                task.as_str(),
+                // Mirror the flag the actual lease call passes (see
+                // `cube_commands::lease_workspace`) so this diagnostic repr
+                // reproduces exactly what ran.
+                "--release-on-setup-failure",
+            ];
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::CubeWorkspaceLeased, DispatchOutcome::Ok, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_cube_lease(&lease.lease_id)
+                        .with_cube_workspace(&lease.workspace_id)
+                        .with_cube_invocation(adapter.command_repr(&lease_args)),
+                )
+                .await;
+        }
+        let change_title = execution_change_title(execution, &work_item);
+
+        // For PR-targeting executions, run `cube workspace goto --workspace <path>
+        // --pr <n>` AFTER the lease to position the working copy on the PR branch
+        // head; for a post-merge review batch member, position on the frozen
+        // merge commit via `--revision <sha>` instead (see `immutable_target_sha`
+        // above — the PR is MERGED by construction, which `--pr` refuses
+        // outright). Both must happen before handing the workspace to the
+        // worker. If positioning fails, abort dispatch with a diagnosable stage.
+        let pr_for_reconcile = pr_for_goto.or_else(|| match &work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task
+                .pr_url
+                .as_deref()
+                .filter(|url| !url.is_empty())
+                .and_then(boss_github::pr_url::pr_number_from_url),
+            _ => None,
+        });
+        let recovered = match self
+            .recover_execution_bookmark(
+                execution,
+                &lease,
+                &adapter,
+                &repo.repo_id,
+                pr_for_goto,
+                pr_for_reconcile,
+            )
+            .await
+        {
+            Ok(recovered) => recovered,
+            Err(err) => {
+                self.release_pre_start_workspace(execution, &lease, &adapter).await;
+                // Report the failed recovery operation without guessing its cause.
+                let attention = (
+                    "cube_workspace_positioning_failed",
+                    "Could not prepare workspace recovery",
+                );
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    Some(&repo.repo_id),
+                    attention,
+                    &err,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+        let recovered_blocked = !execution.kind.never_writes_pr_branch()
+            && (recovered.as_ref().is_some_and(|recovered| recovered.has_work)
+                || self.work_db.execution_restore_report(&execution.id)?.is_some());
+        let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
+            _ if recovered_blocked => None,
+            (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
+            (Some(pr), None) => Some(GotoTarget::Pr(pr)),
+            (None, None) => None,
+        };
+        // Set only on the AnswerAgent fallback below: a goto failure there
+        // is non-fatal, so `keep_change` further down must not treat the
+        // workspace as PR-positioned when it demonstrably isn't.
+        let mut answer_agent_goto_failed = false;
+        if let Some(target) = goto_target {
+            let workspace_path_str = lease.workspace_path.display().to_string();
+            let goto_repr = match target {
+                GotoTarget::Pr(pr) => adapter.command_repr(&[
+                    "--json",
+                    "workspace",
+                    "goto",
+                    "--workspace",
+                    &workspace_path_str,
+                    "--pr",
+                    &pr.to_string(),
+                ]),
+                GotoTarget::Revision(sha) => adapter.command_repr(&[
+                    "--json",
+                    "workspace",
+                    "goto",
+                    "--workspace",
+                    &workspace_path_str,
+                    "--revision",
+                    sha,
+                ]),
+            };
+            let goto_result = match target {
+                GotoTarget::Pr(pr) => adapter.goto_workspace(&lease.workspace_path, pr).await,
+                GotoTarget::Revision(sha) => adapter.goto_workspace_revision(&lease.workspace_path, sha).await,
+            };
+            match goto_result {
+                Ok(()) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        kind = execution.kind.as_str(),
+                        workspace_path = %lease.workspace_path.display(),
+                        target = ?target,
+                        "workspace positioned via cube workspace goto",
+                    );
+                    let details = match target {
+                        GotoTarget::Pr(pr) => serde_json::json!({
+                            "pr": pr,
+                            "kind": execution.kind.as_str(),
+                        }),
+                        GotoTarget::Revision(sha) => serde_json::json!({
+                            "target_sha": sha,
+                            "kind": execution.kind.as_str(),
+                            "post_merge": execution.kind == ExecutionKind::PrReview,
+                        }),
+                    };
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::CubeWorkspacePositioned, DispatchOutcome::Ok, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_cube_repo(&repo.repo_id)
+                                .with_cube_lease(&lease.lease_id)
+                                .with_cube_workspace(&lease.workspace_id)
+                                .with_cube_invocation(goto_repr)
+                                .with_details(details),
+                        )
+                        .await;
+                    if execution.kind == ExecutionKind::AnswerAgent
+                        && let Err(err) = self.work_db.set_answer_agent_run_positioning(&execution.id, true)
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "failed to stamp answer-agent run positioning=true after a successful goto",
+                        );
+                    }
+                }
+                Err(err) => {
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeWorkspacePositioningFailed,
+                                DispatchOutcome::Error,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_cube_invocation(goto_repr),
+                        )
+                        .await;
+
+                    // `AnswerAgent` is read-only positioning-as-convenience,
+                    // not positioning-as-correctness: the DB-derived
+                    // `pr_lifecycle == Open` this decision is based on can
+                    // be stale (merged-on-GitHub-but-not-yet-polled, or
+                    // closed-unmerged), and `cube workspace goto --pr` hard-
+                    // errors on a non-open PR. A failed goto is therefore
+                    // non-fatal for AnswerAgent: it continues from a fresh
+                    // `cube change create` checkout, and the prompt/CLAUDE.md
+                    // state that the checkout is not the PR head. Every
+                    // other execution kind only reaches `goto` when its own
+                    // PR is genuinely open (revision/PR-review target their
+                    // own task's PR, not a DB snapshot of someone else's
+                    // comment target), so they keep the hard-fail path.
+                    if execution.kind == ExecutionKind::AnswerAgent {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "answer_agent: cube workspace goto --pr failed (stale/closed PR lifecycle); \
+                             falling back to a fresh checkout instead of failing the run",
+                        );
+                        answer_agent_goto_failed = true;
+                        if let Err(err) = self.work_db.set_answer_agent_run_positioning(&execution.id, false) {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "failed to stamp answer-agent run positioning=false after a failed goto",
+                            );
+                        }
+                    } else {
+                        self.release_pre_start_workspace(execution, &lease, &adapter).await;
+                        let failure_label = match target {
+                            GotoTarget::Pr(_) => "Cube `workspace goto` positioning failed",
+                            GotoTarget::Revision(_) => "Cube `workspace goto --revision` positioning failed",
+                        };
+                        self.record_start_failure(
+                            Arc::clone(self),
+                            execution,
+                            worker_id,
+                            Some(repo.repo_id.as_str()),
+                            ("cube_workspace_positioning_failed", failure_label),
+                            &err,
+                        )
+                        .await?;
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        // For PR-targeting executions the workspace is now positioned on the PR
+        // head (or, for a post-merge review, on the merge commit) — skip
+        // create_change (there is nothing to create; the worker edits or
+        // reviews the branch/commit directly). For all other executions
+        // create a fresh jj change via `cube change create`. An AnswerAgent
+        // whose goto fell back (see above) was never positioned, so it needs
+        // the fresh change like any other non-PR-targeting execution.
+        let keep_change =
+            recovered_blocked || (pr_for_goto.is_some() && !answer_agent_goto_failed) || immutable_target_sha.is_some();
+        let change: Option<CubeChangeHandle> = if keep_change {
+            None
+        } else {
+            // Normal path (pr_review without a PR URL, and all non-review/
+            // non-revision executions): create a fresh jj change via `cube
+            // change create`.
+            let workspace_path_str = lease.workspace_path.display().to_string();
+            let change_repr: Option<(String, String)> = adapter.command_repr(&[
+                "--json",
+                "change",
+                "create",
+                "--workspace",
+                &workspace_path_str,
+                "--title",
+                &change_title,
+            ]);
+            match adapter.create_change(&lease.workspace_path, &change_title).await {
+                Ok(change) => {
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Ok, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_cube_repo(&repo.repo_id)
+                                .with_cube_lease(&lease.lease_id)
+                                .with_cube_workspace(&lease.workspace_id)
+                                .with_cube_invocation(change_repr)
+                                .with_details(serde_json::json!({
+                                    "change_id": change.change_id,
+                                    "change_title": change_title,
+                                })),
+                        )
+                        .await;
+                    Some(change)
+                }
+                Err(err) => {
+                    self.release_pre_start_workspace(execution, &lease, &adapter).await;
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Error, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_cube_repo(&repo.repo_id)
+                                .with_cube_lease(&lease.lease_id)
+                                .with_cube_workspace(&lease.workspace_id)
+                                .with_error(&err)
+                                .with_cube_invocation(change_repr.clone()),
+                        )
+                        .await;
+                    if had_requested_host {
+                        self.cancel_requested_host_pre_start_failure(execution, "cube change create", &err)
+                            .await;
+                        return Err(err);
+                    }
+                    self.record_start_failure(
+                        Arc::clone(self),
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        ("cube_change_create_failed", "Cube `change create` failed"),
+                        &err,
+                    )
+                    .await?;
+                    return Err(err);
+                }
+            }
+        };
+
+        // The commit cube positioned this workspace on (a fresh change's
+        // parent, or the PR head / target commit a goto landed on) is the
+        // pointer floor for a fresh start; only a recovered workspace, which
+        // was not positioned at all, has none. Capture it now so a trunk that advances before the
+        // pointer exists cannot move the floor onto unrelated upstream work.
+        // A failed capture is a pre-start positioning failure: retry rather
+        // than creating a pointer whose floor is a later re-resolution of
+        // trunk().
+        let positioned_base = if !recovered_blocked {
+            match adapter.positioned_parent(&lease.workspace_path).await {
+                Ok(commit) => Some(commit),
+                Err(err) => {
+                    self.release_pre_start_workspace(execution, &lease, &adapter).await;
+                    if had_requested_host {
+                        self.cancel_requested_host_pre_start_failure(execution, "positioned commit capture", &err)
+                            .await;
+                        return Err(err);
+                    }
+                    self.record_start_failure(
+                        Arc::clone(self),
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        (
+                            "positioned_commit_capture_failed",
+                            "Could not capture the positioned commit",
+                        ),
+                        &err,
+                    )
+                    .await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+        let bookmark_result = async {
+            // Refresh the contribution snapshot on every pre-start attempt,
+            // including a retry that already has a pointer row. The recovery
+            // floor stays on that row; pr_head_before is this attempt's
+            // SHA-delta baseline.
+            if let Err(err) = self.execution_started_hook.snapshot_pr_head_before(&execution.id).await {
+                let spent = usize::try_from(execution.pre_start_failure_count.max(0))
+                    .is_ok_and(|failures| failures >= self.pre_start_retry_delays.len());
+                if !spent {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "pr_head_before snapshot failed on the final attempt; continuing without it"
+                );
+            }
+            if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
+                let execution_for_pointer = self.work_db.get_execution(&execution.id)?;
+                let report = if execution.kind.never_writes_pr_branch() {
+                    None
+                } else {
+                    self.work_db.execution_restore_report(&execution.id)?
+                };
+                let baseline = report
+                    .as_ref()
+                    .and_then(|r| r.inherited_base.as_deref())
+                    .or(execution_for_pointer.pr_head_before.as_deref())
+                    .or(positioned_base.as_deref());
+                let record = adapter
+                    .create_execution_bookmark(&lease.workspace_path, &execution.id, None, baseline)
+                    .await?;
+                self.work_db.record_execution_bookmark(&record)?;
+            }
+            if let Some(recovered) = recovered
+                .as_ref()
+                .filter(|recovered| recovered.predecessor != execution.id)
+            {
+                self.work_db
+                    .record_bookmark_recovery(&execution.id, &recovered.predecessor, recovered.has_work)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = bookmark_result {
+            self.lifecycle.report_bookmark_failure(execution, &format!("{err:#}"));
+            self.release_pre_start_workspace(execution, &lease, &adapter).await;
+            self.record_start_failure(
+                Arc::clone(self),
+                execution,
+                worker_id,
+                Some(&repo.repo_id),
+                (CREATE_FAILED, "Execution bookmark creation failed"),
+                &err,
+            )
+            .await?;
+            return Err(err);
+        }
+        // This attempt recorded its recovery metadata in a freshly leased workspace.
+        // Creation or backup failures filed by an earlier attempt describe a
+        // lease that is no longer this execution's (a retained one was
+        // released or detached before this lease), so this attempt's success
+        // supersedes them. Failures raised from here on belong to this lease.
+        for kind in [CREATE_FAILED, RECOVERY_FAILED] {
+            if let Err(err) = self.work_db.resolve_attention_kind_for_execution(&execution.id, kind) {
+                tracing::warn!(execution_id = %execution.id, kind, ?err, "could not resolve superseded bookmark failure");
+            }
+        }
+
+        let tmux_hosted = selected_host.id == "local";
+        match self.work_db.start_execution_run_on_host_with_tmux_hosting(
+            &execution.id,
+            worker_id,
+            &repo.repo_id,
+            &lease.lease_id,
+            &lease.workspace_id,
+            &lease.workspace_path.display().to_string(),
+            &selected_host.id,
+            tmux_hosted,
+        ) {
+            Ok((execution, run)) => {
+                // Dispatch succeeded: the request-scoped `--host` constraint
+                // (if any) has done its job. Clear it here — the same point
+                // the durable pin used to be cleared before request-scoped
+                // routing got its own lifetime — so it can never leak.
+                self.take_requested_host(&execution.id);
+                let worker_id_owned = worker_id.to_owned();
+                let queue_wait_ms = execution
+                    .started_epoch()
+                    .zip(execution.created_epoch())
+                    .map(|(started, created)| (started.saturating_sub(created).max(0) as u64).saturating_mul(1_000))
+                    .unwrap_or(0);
+                if execution.kind == ExecutionKind::AnswerAgent {
+                    self.lifecycle.record_answer_agent_started(&self.metrics, queue_wait_ms);
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        queue_wait_ms,
+                        "answer-agent execution started after queue wait",
+                    );
+                }
+                tracing::info!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id,
+                    cube_repo_id = %repo.repo_id,
+                    cube_lease_id = %lease.lease_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    cube_change_id = ?change.as_ref().map(|c| &c.change_id),
+                    workspace_path = %lease.workspace_path.display(),
+                    "started execution run"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::RunStarted, DispatchOutcome::Ok, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "execution_kind": execution.kind.as_str(),
+                                "queue_wait_ms": queue_wait_ms,
+                            })),
+                    )
+                    .await;
+                self.publisher
+                    .publish(
+                        &execution.id,
+                        &execution.work_item_id,
+                        execution.status.as_str(),
+                        "execution_started",
+                    )
+                    .await;
+                // Auto-advance bumped `tasks.status` to `'active'`
+                // inside the same transaction. Broadcast a work-tree
+                // invalidation so kanban subscribers re-fetch and
+                // move the card to the Doing column.
+                if let Ok(work_item) = self.resolve_execution_work_item(&execution) {
+                    self.publisher
+                        .publish_work_item_changed(
+                            work_item.product_id(),
+                            &execution.work_item_id,
+                            "execution_started_auto_advance",
+                        )
+                        .await;
+                }
+                // For automation triage executions, advance the
+                // automation_runs row from its queued/pessimistic state
+                // (`pool_throttled` or `failed_will_retry`) to
+                // `triage_running` now that a pool slot is held and the
+                // agent is about to start. The completion handler will
+                // overwrite this with the terminal outcome.
+                if execution.kind == ExecutionKind::AutomationTriage
+                    && let Err(err) = self.work_db.mark_automation_run_triage_started(&execution.id)
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to mark automation run triage_running on start",
+                    );
+                }
+                // Resume-bounce SHA-delta gate: capture the bound
+                // chore PR's head SHA into the execution row BEFORE
+                // the worker spawns and starts pushing. The Stop
+                // boundary uses this snapshot to decide whether the
+                // run contributed to the bound PR. Best-effort: the
+                // hook logs and swallows every failure mode (no
+                // bound PR, slug/number parse failure, GitHub fetch
+                // failure), and the gate treats a missing snapshot
+                // as "inapplicable" — never noisier than the
+                // pre-change behaviour.
+                self.execution_started_hook.on_execution_started(&execution.id).await;
+                self.spawn_run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter);
+                Ok(())
+            }
+            Err(err) => {
+                self.release_pre_start_workspace(execution, &lease, &adapter).await;
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::RunStarted, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err),
+                    )
+                    .await;
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "start_execution_run", &err)
+                        .await;
+                    return Err(err);
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    Some(repo.repo_id.as_str()),
+                    ("execution_run_start_failed", "`start_execution_run` failed"),
+                    &err,
+                )
+                .await?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Cold-repo probe (design doc Q6, Follow-up chore #8). The first
+    /// time a given repo URL flows through `ensure_repo` in this
+    /// engine's lifetime, ask cube `repo list --json` once and check
+    /// whether the entry for this URL is sitting on cube's
+    /// auto-provisioned defaults — i.e. nothing was customised with
+    /// `cube repo add` / `cube repo configure`. If so, raise an
+    /// advisory `repo_cold_pool` `WorkAttentionItem` against the
+    /// execution naming the exact override command.
+    ///
+    /// Best-effort by design: never blocks dispatch, never returns an
+    /// error to the caller. A failed `list_repos` round-trip is logged
+    /// at WARN and the URL is still marked seen so we don't retry the
+    /// probe every dispatch — engine restart re-probes per R4.
+    async fn maybe_probe_cold_repo(self: &Arc<Self>, execution: &WorkExecution, adapter: &Arc<dyn HostAdapter>) {
+        let origin = execution.repo_remote_url.clone();
+        {
+            let mut seen = self.repo_cold_probe_seen.lock().await;
+            if !seen.insert(origin.clone()) {
+                return;
+            }
+        }
+
+        let repos = match adapter.list_repos().await {
+            Ok(repos) => repos,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    execution_id = %execution.id,
+                    repo_remote_url = %origin,
+                    "cold-repo probe: `cube repo list` failed — skipping advisory check"
+                );
+                return;
+            }
+        };
+
+        let Some(repo) = repos.iter().find(|r| r.origin == origin) else {
+            tracing::debug!(
+                execution_id = %execution.id,
+                repo_remote_url = %origin,
+                "cold-repo probe: ensured repo not present in `cube repo list` snapshot"
+            );
+            return;
+        };
+
+        if !repo_has_default_pool_config(repo) {
+            return;
+        }
+
+        let title = format!(
+            "Cold cube pool for `{repo_id}` — using auto-provisioned defaults",
+            repo_id = repo.repo_id,
+        );
+        let body = cold_repo_attention_body(repo);
+        let input = CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: "repo_cold_pool".to_owned(),
+            status: None,
+            title,
+            body_markdown: body,
+            resolved_at: None,
+        };
+        match self.work_db.create_attention_item(input) {
+            Ok(item) => {
+                tracing::info!(
+                    attention_id = %item.id,
+                    execution_id = %execution.id,
+                    repo_id = %repo.repo_id,
+                    repo_remote_url = %origin,
+                    "cold-repo probe: raised advisory attention item"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    execution_id = %execution.id,
+                    repo_id = %repo.repo_id,
+                    repo_remote_url = %origin,
+                    "cold-repo probe: failed to persist attention item — dispatch continues"
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn lease_workspace_with_fallback(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        repo: &CubeRepoHandle,
+        task: &str,
+        adapter: &Arc<dyn HostAdapter>,
+    ) -> Result<CubeWorkspaceLease> {
+        // A previous pre-start attempt may still hold a lease (its cube
+        // release failed). Try to free it. A never-started release has no
+        // pane or occupancy gate, so it either releases or cube's own call
+        // fails; on failure the lease stays recorded and this attempt fails so
+        // the sweep and the next retry keep trying to return it.
+        if let Some(existing_lease) = execution.cube_lease_id.as_deref() {
+            let outcome = self
+                .lifecycle
+                .release_lease_after_proven_never_started(execution, existing_lease, adapter.as_ref())
+                .await;
+            match outcome {
+                LeaseReleaseOutcome::Released | LeaseReleaseOutcome::NoLease => {}
+                // Cube itself failed. The lease stays recorded on this
+                // execution so the leftover-lease sweep keeps retrying it;
+                // leasing a fresh workspace would overwrite it.
+                LeaseReleaseOutcome::CubeFailed { error } => {
+                    return Err(anyhow!(
+                        "previous cube workspace lease {existing_lease} could not be released yet: {error}"
+                    ));
+                }
+                // A never-started release has no gate that can keep the lease,
+                // so this is unexpected; treat it like a failed release.
+                LeaseReleaseOutcome::Kept { reason } => {
+                    return Err(anyhow!(
+                        "previous cube workspace lease {existing_lease} was unexpectedly kept ({})",
+                        reason.label()
+                    ));
+                }
+            }
+        }
+        // Lease clean scratch space. Recovery follows the engine-created
+        // reference in the shared store, never the old workspace's identity.
+        let prefer: Option<&str> = None;
+        let allow_dirty = false;
+        let fallback_policy = "any_free";
+
+        // Look up any workspaces that were refused for this execution by the
+        // occupancy guard on a previous dispatch attempt. Passing them as
+        // `--exclude` to cube breaks the livelock where cube's deterministic
+        // candidate ordering keeps re-offering the same occupied workspace.
+        let refused: Vec<String> = self
+            .refused_workspaces
+            .lock()
+            .await
+            .get(&execution.id)
+            .cloned()
+            .unwrap_or_default();
+        let refused_refs: Vec<&str> = refused.iter().map(|s| s.as_str()).collect();
+
+        // Build the lease args for attempt 1 so we can attach the
+        // exact command to both the attempted and failed events.
+        let mut attempt1_args = vec![
+            "--json",
+            "workspace",
+            "lease",
+            repo.repo_id.as_str(),
+            "--task",
+            task,
+            "--release-on-setup-failure",
+        ];
+        for excluded in &refused_refs {
+            attempt1_args.extend_from_slice(&["--exclude", excluded]);
+        }
+        let attempt1_repr = adapter.command_repr(&attempt1_args);
+
+        // Emit the attempt before leasing clean scratch so the timeline
+        // retains the invocation even if cube fails to return.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_invocation(attempt1_repr.clone())
+                    .with_details(serde_json::json!({
+                        "attempt": 1,
+                        "prefer_workspace_id": prefer,
+                        "fallback_policy": fallback_policy,
+                        "allow_dirty": allow_dirty,
+                        "timeout_ms": self.cube_lease_timeout.as_millis() as u64,
+                        "excluded_workspace_ids": refused,
+                    })),
+            )
+            .await;
+
+        CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
+        match self
+            .invoke_lease(
+                repo,
+                task,
+                (prefer, allow_dirty),
+                self.cube_lease_timeout,
+                adapter,
+                &refused_refs,
+            )
+            .await
+        {
+            Ok(lease) => {
+                CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
+                return Ok(lease);
+            }
+            Err((reason, err)) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_repo_id = %repo.repo_id,
+                    prefer = ?prefer,
+                    allow_dirty,
+                    reason,
+                    error = format!("{err:#}"),
+                    "cube workspace lease attempt failed"
+                );
+                let mut details = serde_json::json!({
+                    "attempt": 1,
+                    "prefer_workspace_id": prefer,
+                    "reason": reason,
+                    "fallback_policy": fallback_policy,
+                    "allow_dirty": allow_dirty,
+                    "excluded_workspace_ids": refused,
+                });
+                augment_details_with_cube_cli_error(&mut details, &err);
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_error(&err)
+                            .with_cube_invocation(attempt1_repr)
+                            .with_details(details),
+                    )
+                    .await;
+                if reason == "timeout" || waitable_spoke_lease(&err).is_some() {
+                    // A timed-out lease must not immediately re-attempt
+                    // inside this dispatch (the fallback is for a refused
+                    // `--prefer`, not for a hang). Backoff lives on
+                    // `record_start_failure` / `dispatch_not_before`.
+                    CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
+                    return Err(err);
+                }
+            }
+        };
+
+        let mut attempt2_args = vec![
+            "--json",
+            "workspace",
+            "lease",
+            repo.repo_id.as_str(),
+            "--task",
+            task,
+            "--release-on-setup-failure",
+        ];
+        for excluded in &refused_refs {
+            attempt2_args.extend_from_slice(&["--exclude", excluded]);
+        }
+        let attempt2_repr = adapter.command_repr(&attempt2_args);
+
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_invocation(attempt2_repr.clone())
+                    .with_details(serde_json::json!({
+                        "attempt": 2,
+                        "prefer_workspace_id": serde_json::Value::Null,
+                        "fallback_policy": "none",
+                        "timeout_ms": self.cube_lease_timeout.as_millis() as u64,
+                        "fallback_from_prefer": prefer,
+                        "excluded_workspace_ids": refused,
+                    })),
+            )
+            .await;
+
+        CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
+        match self
+            .invoke_lease(
+                repo,
+                task,
+                (None, false),
+                self.cube_lease_timeout,
+                adapter,
+                &refused_refs,
+            )
+            .await
+        {
+            Ok(lease) => {
+                CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
+                Ok(lease)
+            }
+            Err((reason, err)) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_repo_id = %repo.repo_id,
+                    reason,
+                    error = format!("{err:#}"),
+                    "cube workspace lease fallback also failed"
+                );
+                let mut details = serde_json::json!({
+                    "attempt": 2,
+                    "prefer_workspace_id": serde_json::Value::Null,
+                    "reason": reason,
+                    "fallback_policy": "none",
+                    "fallback_from_prefer": prefer,
+                    "excluded_workspace_ids": refused,
+                });
+                augment_details_with_cube_cli_error(&mut details, &err);
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_error(&err)
+                            .with_cube_invocation(attempt2_repr)
+                            .with_details(details),
+                    )
+                    .await;
+                CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
+                Err(err)
+            }
+        }
+    }
+
+    /// Run one `cube workspace lease` invocation under
+    /// [`CUBE_LEASE_TIMEOUT`]. Returns `(reason, error)` so the caller
+    /// can label the dispatch event with `"timeout"` vs `"cube_error"`
+    /// without re-parsing the message.
+    async fn invoke_lease(
+        &self,
+        repo: &CubeRepoHandle,
+        task: &str,
+        // (prefer_workspace_id, allow_dirty) — bundled to keep the
+        // parameter count under clippy::too_many_arguments.
+        lease_opts: (Option<&str>, bool),
+        timeout: Duration,
+        adapter: &Arc<dyn HostAdapter>,
+        exclude_workspace_ids: &[&str],
+    ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
+        let (prefer_workspace_id, allow_dirty) = lease_opts;
+        match tokio::time::timeout(
+            timeout,
+            adapter.lease_workspace(
+                &repo.repo_id,
+                task,
+                prefer_workspace_id,
+                allow_dirty,
+                exclude_workspace_ids,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(lease)) => Ok(lease),
+            // A transport that bounds itself (the SSH adapter's inner lease
+            // budget) reports its own elapsed deadline through the error
+            // chain; that is a timeout just as much as the outer backstop.
+            Ok(Err(err)) if err.chain().any(|cause| cause.is::<tokio::time::error::Elapsed>()) => Err(("timeout", err)),
+            Ok(Err(err)) => Err(("cube_error", err)),
+            Err(_elapsed) => Err((
+                "timeout",
+                anyhow!("cube workspace lease timed out after {}s", timeout.as_secs()),
+            )),
+        }
+    }
+
+    /// Emits the `CubeRepoEnsureFailed` dispatch event only. Callers decide
+    /// what happens next: [`Self::record_start_failure`]'s ordinary retry
+    /// for an unconstrained execution, or
+    /// [`Self::cancel_requested_host_pre_start_failure`] for one with a
+    /// `--host` constraint still in effect (retrying would silently drop
+    /// the constraint — see that method's doc comment).
+    async fn emit_ensure_failed(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        ensure_repr: Option<(String, String)>,
+        error: &anyhow::Error,
+        details: serde_json::Value,
+    ) {
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeRepoEnsureFailed, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_error(error)
+                    .with_cube_invocation(ensure_repr)
+                    .with_details(details),
+            )
+            .await;
+    }
+
+    pub(super) fn persist_acquired_lease(&self, execution: &WorkExecution, lease: &CubeWorkspaceLease) {
+        if let Err(err) = self.work_db.restore_execution_workspace(
+            &execution.id,
+            &lease.lease_id,
+            Some(lease.workspace_id.as_str()),
+            Some(&lease.workspace_path.display().to_string()),
+        ) {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id = %lease.lease_id,
+                error = %format!("{err:#}"),
+                "failed to persist cube lease after acquire",
+            );
+        }
+    }
+
+    async fn release_pre_start_workspace(
+        &self,
+        execution: &WorkExecution,
+        lease: &CubeWorkspaceLease,
+        adapter: &Arc<dyn HostAdapter>,
+    ) {
+        self.lifecycle
+            .release_lease_after_proven_never_started(execution, &lease.lease_id, adapter.as_ref())
+            .await;
+    }
+
+    /// Record a pre-start failure and either schedule an automatic retry
+    /// or surface a permanent failure to the operator.
+    ///
+    /// Safe-to-retry stages (no worker side effects yet):
+    /// `cube_repo_ensure`, `workspace_lease`, `change_create`,
+    /// `run_start` (DB-only failure, transaction rolled back).
+    ///
+    /// Do NOT call this for post-`run_started` failures — those require
+    /// `finish_execution_run`.
+    pub(crate) async fn record_start_failure(
+        &self,
+        coordinator: Arc<ExecutionCoordinator>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        cube_repo_id: Option<&str>,
+        // (attention_kind, attention_title) — bundled to keep the
+        // parameter count under clippy::too_many_arguments.
+        attention: (&str, &str),
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let positioning_refused = attention.0 == "cube_workspace_positioning_failed"
+            && error
+                .downcast_ref::<boss_host_execution::cube::CubeCliError>()
+                .is_some_and(|error| error.positioning_refused());
+        let (attention_kind, attention_title) = if positioning_refused {
+            (
+                crate::work::WORKSPACE_POSITIONING_REFUSED,
+                "Workspace blocked: positioning refused",
+            )
+        } else {
+            attention
+        };
+        let error_text = format!("{error:#}");
+        // Cube's own message, without its JSON envelope, for the label and the attention body.
+        let refusal_message = error
+            .downcast_ref::<boss_host_execution::cube::CubeCliError>()
+            .and_then(|error| error.refusal_message())
+            .unwrap_or_else(|| error_text.clone());
+        let retry_delays: &[std::time::Duration] = if positioning_refused {
+            &[]
+        } else {
+            &self.pre_start_retry_delays
+        };
+        let transition = if positioning_refused {
+            self.work_db.record_workspace_positioning_refusal(
+                &execution.id,
+                worker_id,
+                cube_repo_id,
+                &error_text,
+                &refusal_message,
+            )
+        } else {
+            self.work_db
+                .record_pre_start_failure(&execution.id, worker_id, cube_repo_id, &error_text, retry_delays)
+        };
+        let (execution, run, outcome) = match transition {
+            Ok(recorded) => recorded,
+            Err(bookkeeping_error) => {
+                let mut event = DispatchEvent::new(Stage::PreStartFailure, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_error(error)
+                    .with_details(serde_json::json!({
+                        "reason": attention_kind,
+                        "will_retry": false,
+                        "bookkeeping_error": format!("{bookkeeping_error:#}"),
+                    }));
+                if let Some(repo_id) = cube_repo_id {
+                    event = event.with_cube_repo(repo_id);
+                }
+                self.dispatch_events.emit(event).await;
+                return Err(bookkeeping_error.context(PreStartFailureReported));
+            }
+        };
+
+        // The tracing log alone is not enough: `bossctl dispatch diagnose`
+        // and the stage-stalled detector read the dispatch event stream, and
+        // without an `error` record here a failed pre-start stage looks like
+        // a timeline that simply stopped (and then trips `stage_stalled`).
+        // Emitted for every failure, retried or not; the error outcome is
+        // what makes the stage terminal on the timeline.
+        let will_retry = matches!(outcome, PreStartFailureOutcome::Retry { .. });
+        let mut failure_event = DispatchEvent::new(Stage::PreStartFailure, DispatchOutcome::Error, &execution.id)
+            .with_work_item(&execution.work_item_id)
+            .with_worker(worker_id)
+            .with_error(error);
+        if let Some(repo_id) = cube_repo_id {
+            failure_event = failure_event.with_cube_repo(repo_id);
+        }
+        let retry_delay_secs = match &outcome {
+            PreStartFailureOutcome::Retry { delay } => Some(delay.as_secs()),
+            PreStartFailureOutcome::PermanentFail => None,
+        };
+        self.dispatch_events
+            .emit(failure_event.with_details(serde_json::json!({
+                "reason": attention_kind,
+                "pre_start_failure_count": execution.pre_start_failure_count,
+                "will_retry": will_retry,
+                "decision": if positioning_refused { "blocked" } else if will_retry { "retry" } else { "permanent" },
+                "attempt": execution.pre_start_failure_count,
+                "max_attempts": retry_delays.len() + 1,
+                "attention_kind": attention_kind,
+                "retry_delay_secs": retry_delay_secs,
+            })))
+            .await;
+
+        match outcome {
+            PreStartFailureOutcome::Retry { delay } => {
+                // Intermediate retries do not insert a work_runs row — retry
+                // state lives on the execution (`pre_start_failure_count` /
+                // `dispatch_not_before`). See `record_pre_start_failure`.
+                tracing::info!(
+                    execution_id = %execution.id,
+                    worker_id,
+                    pre_start_failure_count = execution.pre_start_failure_count,
+                    max_retries = self.pre_start_retry_delays.len(),
+                    delay_secs = delay.as_secs(),
+                    "pre-start failure will retry after backoff"
+                );
+                // After the backoff window expires, promote the execution
+                // back into the ready queue and wake the scheduler. Until
+                // then `dispatch_not_before` keeps it invisible to
+                // `list_ready_executions`.
+                boss_task_scope::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    coordinator.kick();
+                });
+            }
+            PreStartFailureOutcome::PermanentFail => {
+                let run_id = run.as_ref().map(|r| r.id.as_str()).unwrap_or("(none)");
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    run_id,
+                    worker_id,
+                    pre_start_failure_count = execution.pre_start_failure_count,
+                    error = %error,
+                    "recorded execution start failure"
+                );
+
+                // Maint task 6 — transient-retry wiring on `dispatch_not_before`:
+                // an `automation_triage` execution that exhausts its pre-start
+                // retries is the design's `failed_gave_up` terminal state.
+                // Finalise the matching `automation_runs` row so the Automations
+                // tab shows the occurrence was abandoned (the schedule already
+                // advanced past it when the scheduler fired the triage). Until
+                // this point the run sat at the pessimistic `failed_will_retry`.
+                if execution.kind == ExecutionKind::AutomationTriage
+                    && let Err(err) = self.work_db.finalize_automation_triage_run(
+                        &execution.id,
+                        boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                        None,
+                        Some(&format!(
+                            "triage pre-start failed permanently after {} attempt(s): {error}",
+                            execution.pre_start_failure_count
+                        )),
+                    )
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to mark automation run failed_gave_up after permanent triage pre-start failure",
+                    );
+                }
+
+                // Surface every permanent pre-start failure as a
+                // `WorkAttentionItem` so the failure is diagnosable in one
+                // bossctl call instead of needing a tracing-log tail.
+                let attention_body = format!(
+                    "Execution `{execution_id}` could not start on worker `{worker_id}` \
+                     after {attempts} attempt(s).\n\n\
+                     **Error:** {shown_error}\n\n\
+                     Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
+                     for the full stage timeline.",
+                    shown_error = if positioning_refused {
+                        &refusal_message
+                    } else {
+                        &error_text
+                    },
+                    execution_id = execution.id,
+                    attempts = execution.pre_start_failure_count,
+                );
+                let attention_result = if positioning_refused && execution.work_item_id.starts_with("task_") {
+                    // The durable hold and deduplicated attention were committed together.
+                    Ok(())
+                } else {
+                    self.work_db
+                        .create_attention_item(CreateAttentionItemInput {
+                            execution_id: Some(execution.id.clone()),
+                            work_item_id: None,
+                            kind: attention_kind.to_owned(),
+                            status: None,
+                            title: attention_title.to_owned(),
+                            body_markdown: attention_body,
+                            resolved_at: None,
+                        })
+                        .map(|_| ())
+                };
+                if let Err(attention_err) = attention_result {
+                    tracing::error!(
+                        ?attention_err,
+                        execution_id = %execution.id,
+                        "failed to record attention item for execution start failure",
+                    );
+                }
+
+                self.notify_review_guide_pre_start_failure(&execution);
+
+                // Stop the silent claim → fail → release → re-queue loop
+                // (the "waiting for a slot" vs. "failing to start"
+                // ambiguity): bounce the work item to Backlog with
+                // `autostart` cleared and the failure reason/error stamped
+                // directly on the row so the kanban card renders it
+                // inline. Guarded on `status IN ('todo', 'active')`, so
+                // this is a no-op for review-phase dispatch kinds
+                // (`pr_review`, `ci_remediation`, `conflict_resolution`)
+                // whose work item sits in `in_review`/`blocked` — bouncing
+                // those would erase review context.
+                //
+                // A `progression` run is never the reason its item failed to
+                // dispatch: it only reads the item, so its own start failure
+                // must not move or stamp that item.
+                let bounced_result = if !positioning_refused && execution.kind.holds_cube_lease() {
+                    self.work_db
+                        .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &error_text)
+                } else {
+                    Ok(false)
+                };
+                let bounced = match bounced_result {
+                    Ok(true) => {
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            reason = attention_kind,
+                            "bounced work item to backlog after permanent pre-start dispatch failure",
+                        );
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(bounce_err) => {
+                        tracing::error!(
+                            ?bounce_err,
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            "failed to bounce work item to backlog after permanent pre-start dispatch failure",
+                        );
+                        false
+                    }
+                };
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PreStartRetriesExhausted, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(error)
+                            .with_details(serde_json::json!({
+                                "reason": attention_kind,
+                                "pre_start_failure_count": execution.pre_start_failure_count,
+                                "bounced_to_backlog": bounced,
+                            })),
+                    )
+                    .await;
+
+                let publisher = self.publisher.clone();
+                let execution_id = execution.id.clone();
+                let work_item_id = execution.work_item_id.clone();
+                let status_str = execution.status.as_str();
+                // Route through `resolve_execution_work_item` rather than a
+                // direct `get_work_item` call: `PrReviewGuide` (and
+                // `AutomationTriage`/`AnswerAgent`) bind to a non-task id
+                // that `get_work_item` can never resolve, so a direct call
+                // here would log a spurious warning on every one of these
+                // execution starts.
+                let product_id = match self.resolve_execution_work_item(&execution) {
+                    Ok(item) => Some(item.product_id().to_string()),
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            %work_item_id,
+                            "failed to resolve product for runtime broadcast"
+                        );
+                        None
+                    }
+                };
+                boss_task_scope::spawn(async move {
+                    publisher
+                        .publish(&execution_id, &work_item_id, status_str, "execution_start_failed")
+                        .await;
+                    if let Some(product_id) = product_id {
+                        publisher
+                            .publish_work_item_changed(&product_id, &work_item_id, "execution_start_failed")
+                            .await;
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A recoverable pre-start failure (host adapter build, `cube repo
+    /// ensure`, workspace lease, cube change create, ...) on an execution
+    /// with a request-scoped `--host` constraint must not fall through to
+    /// [`Self::record_start_failure`]'s ordinary retry: a retry re-enters
+    /// host selection, and by then this constraint may already be the
+    /// last thing standing between "runs on the explicitly requested host"
+    /// and "runs on any eligible host with no notice" — exactly the
+    /// silent-misplacement class `--host` exists to eliminate. Cancel the
+    /// execution instead (leaving no residue queued behind an unpinned
+    /// retry) and drop the constraint, matching how the ineligible-host
+    /// case in [`Self::schedule_execution`] already behaves.
+    async fn cancel_requested_host_pre_start_failure(
+        &self,
+        execution: &WorkExecution,
+        stage: &str,
+        err: &anyhow::Error,
+    ) {
+        // Not retried, but must still be reported: a `--host` pre-start
+        // failure never reaches `record_start_failure`'s permanent-failure
+        // path, so without this a requested-host dispatch can
+        // silently disappear as a `cancelled` row with no attention item —
+        // exactly the case an SSH-unreachable remote host hits. The dispatch
+        // event stream gets the same record as an ordinary pre-start failure,
+        // so the failed stage is terminal on the timeline.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::PreStartFailure, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_error(err)
+                    .with_details(serde_json::json!({
+                        "reason": "requested_host_dispatch_failed",
+                        "failed_step": stage,
+                        "will_retry": false,
+                    })),
+            )
+            .await;
+        let attention_body = format!(
+            "Execution `{execution_id}` (requested host) failed during `{stage}` and was \
+             cancelled rather than retried, so the `--host` constraint is not silently \
+             dropped.\n\n\
+             **Error:** {err:#}\n\n\
+             Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
+             for the full stage timeline.",
+            execution_id = execution.id,
+        );
+        if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: "requested_host_dispatch_failed".to_owned(),
+            status: None,
+            title: "Requested-host dispatch failed".to_owned(),
+            body_markdown: attention_body,
+            resolved_at: None,
+        }) {
+            tracing::error!(
+                ?attention_err,
+                execution_id = %execution.id,
+                "failed to record attention item for requested-host pre-start failure",
+            );
+        }
+
+        match self.work_db.cancel_execution_with(
+            &execution.id,
+            CancelExecutionOpts {
+                reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
+                queued_only: true,
+                record_failure_reason: true,
+            },
+        ) {
+            Ok(cancelled) => {
+                self.take_requested_host(&execution.id);
+                self.notify_review_guide_pre_start_failure(&cancelled);
+            }
+            Err(cancel_err) => {
+                // The cancel is what makes this row terminal. If it failed,
+                // the row is still `ready` and will be drained again — keep
+                // the constraint in place so the retry is refused for the
+                // same requested host instead of landing unpinned.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    stage,
+                    error = %format!("{cancel_err:#}"),
+                    "failed to cancel requested-host execution after a pre-start failure; \
+                     leaving the --host constraint in place so a retry cannot land unpinned",
+                );
+            }
+        }
+    }
+}
+
+mod synthetic_work_items;
+
+#[cfg(test)]
+mod tests;

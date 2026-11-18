@@ -86,7 +86,7 @@ struct Attention: Identifiable, Codable, Hashable {
     /// `"yes_no"` | `"multiple_choice"` | `"prompt"`.
     var questionType: String?
     var promptText: String?
-    /// JSON array of strings (`multiple_choice` only).
+    /// JSON string array for multiple choice, or engine-owned Yes/No labels.
     var choiceOptions: String?
     /// Captured answer: `"yes"`/`"no"`, the chosen value, or free text.
     var answer: String?
@@ -232,6 +232,13 @@ struct ProducedArtifactRef: Hashable {
 }
 
 extension Attention {
+    /// Engine-owned names for canonical Yes/No answers; older questions omit them.
+    var optionLabels: AnswerOptionLabels? {
+        guard questionType == "yes_no", let choiceOptions,
+              let data = choiceOptions.data(using: .utf8) else { return nil }
+        return AnswerOptionLabels.parse(try? JSONSerialization.jsonObject(with: data))
+    }
+
     /// Decoded `choice_options` JSON array. Empty when absent or unparseable.
     var choices: [String] {
         guard let choiceOptions,

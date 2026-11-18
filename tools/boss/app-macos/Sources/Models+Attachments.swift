@@ -65,6 +65,53 @@ struct AttachmentVM: Identifiable, Hashable, RevisionChainItem {
     }
 }
 
+/// Keep explicitly captioned comparisons together, before then after. Only
+/// matching captions containing one phase word participate; unrelated evidence
+/// retains the engine's order. Match across revisions as well as within a run.
+enum ReviewGuideAttachmentOrdering {
+    private struct Phase {
+        let subject: String
+        let isAfter: Bool
+    }
+
+    private static func phase(_ attachment: AttachmentVM) -> Phase? {
+        let words = attachment.caption.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        let phases = words.filter { $0 == "before" || $0 == "after" }
+        guard phases.count == 1 else { return nil }
+        return Phase(subject: words.filter { $0 != "before" && $0 != "after" }.joined(separator: " "),
+                     isAfter: phases[0] == "after")
+    }
+
+    static func arrange(_ attachments: [AttachmentVM]) -> [AttachmentVM] {
+        let phases = attachments.map(phase)
+        var groups: [String: [Int]] = [:]
+        for (index, phase) in phases.enumerated() {
+            if let phase { groups[phase.subject, default: []].append(index) }
+        }
+        var emitted = Set<String>()
+        var result: [AttachmentVM] = []
+        for (index, attachment) in attachments.enumerated() {
+            guard let phase = phases[index], let group = groups[phase.subject],
+                  group.contains(where: { phases[$0]?.isAfter == true }),
+                  group.contains(where: { phases[$0]?.isAfter == false }) else {
+                result.append(attachment)
+                continue
+            }
+            guard emitted.insert(phase.subject).inserted else { continue }
+            let before = group.filter { phases[$0]?.isAfter == false }
+            let after = group.filter { phases[$0]?.isAfter == true }
+            // Repeated captions still form adjacent pairs, preserving each
+            // phase's input order and retaining any unmatched extra images.
+            for offset in 0..<max(before.count, after.count) {
+                if offset < before.count { result.append(attachments[before[offset]]) }
+                if offset < after.count { result.append(attachments[after[offset]]) }
+            }
+        }
+        return result
+    }
+}
+
 // MARK: - Blob path resolution
 
 /// Resolves an [[AttachmentVM]] to its on-disk blob path under the engine's

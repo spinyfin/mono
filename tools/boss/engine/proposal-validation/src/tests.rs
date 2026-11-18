@@ -84,6 +84,15 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
         }),
         ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "opened the PR"}),
         ProposalKind::Wait => json!({"reason": "bazel test still compiling", "duration_secs": 1800}),
+        ProposalKind::Revise => json!({"brief": "Fix the flaky retention fixture"}),
+        ProposalKind::Precursor => {
+            json!({"name": "Fix the retention fixture on main", "brief": "A stand-alone brief."})
+        }
+        ProposalKind::Depend | ProposalKind::Undepend => json!({"on": "task_abc123"}),
+        ProposalKind::Redispatch => json!({}),
+        ProposalKind::ClearSignal => json!({"reason": "merge_conflict"}),
+        ProposalKind::ArchiveRevision => json!({"revision": "task_abc123", "reason": "dead; parent PR is green"}),
+        ProposalKind::Unblock => json!({}),
     }
 }
 
@@ -712,4 +721,114 @@ fn wait_accepts_optional_waiting_on() {
     let parsed: WaitProposalPayload = serde_json::from_str(&canonical).unwrap();
     assert_eq!(parsed.waiting_on.as_deref(), Some("pid:12"));
     assert_eq!(parsed.duration_secs, 1800);
+}
+
+// ── Progression verbs ───────────────────────────────────────────────────────
+
+#[test]
+fn progression_verbs_report_missing_malformed_and_unknown_fields() {
+    let revise = errs(ProposalKind::Revise, json!({"briefing": "x"}));
+    assert!(
+        revise
+            .iter()
+            .any(|e| e.field == "brief" && e.message.contains("missing"))
+    );
+    assert!(
+        revise
+            .iter()
+            .any(|e| e.field == "briefing" && e.message.contains("unknown field"))
+    );
+
+    let two_lines = errs(ProposalKind::Precursor, json!({"name": "one\ntwo", "brief": "b"}));
+    assert!(
+        two_lines
+            .iter()
+            .any(|e| e.field == "name" && e.message.contains("single line"))
+    );
+    let long = errs(
+        ProposalKind::Precursor,
+        json!({"name": "n".repeat(MAX_PREREQUISITE_NAME_CHARS + 1), "brief": "b"}),
+    );
+    assert!(long.iter().any(|e| e.field == "name"));
+
+    for kind in [ProposalKind::Depend, ProposalKind::Undepend] {
+        for bad in ["", "   ", "not an id", "42", "T", "Tx1", "task_a b"] {
+            assert!(!errs(kind, json!({"on": bad})).is_empty(), "{kind} accepted `{bad}`");
+        }
+        for good in ["task_abc", "task_123", "T7"] {
+            ok(kind, json!({"on": good}));
+        }
+    }
+
+    let reason = errs(ProposalKind::ClearSignal, json!({"reason": "worker_failed"}));
+    assert!(
+        reason
+            .iter()
+            .any(|e| e.field == "reason" && e.message.contains("merge_conflict"))
+    );
+    for good in ["merge_conflict", "ci_failure", "ci_failure_exhausted"] {
+        ok(ProposalKind::ClearSignal, json!({"reason": good}));
+    }
+
+    assert!(
+        errs(ProposalKind::ArchiveRevision, json!({"revision": "task_x"}))
+            .iter()
+            .any(|e| e.field == "reason")
+    );
+    assert!(
+        errs(ProposalKind::Unblock, json!({"why": "x"}))
+            .iter()
+            .any(|e| e.field == "why")
+    );
+    assert!(
+        errs(ProposalKind::Redispatch, json!({"brief_addendum": "  "}))
+            .iter()
+            .any(|e| e.field == "brief_addendum")
+    );
+    assert!(
+        ok(
+            ProposalKind::Redispatch,
+            json!({"brief_addendum": "  The blocker is stale.  "})
+        )
+        .contains("The blocker is stale.")
+    );
+}
+
+#[test]
+fn done_criterion_accompanies_only_a_question_and_is_canonicalized() {
+    let question =
+        json!({"text": "Merge it?", "answer_type": {"kind": "yes_no"}, "explanation": "Merging is human-only."});
+    let with = |criterion: serde_json::Value| json!({"outcome": "blocked", "summary": "Needs the owner", "question": question, "criterion": criterion});
+    // The brief teaches numbers; the stored form is the name.
+    let canonical = ok(ProposalKind::RunDone, with(json!("1")));
+    let named = ok(ProposalKind::RunDone, with(json!("human_only_action")));
+    assert_eq!(canonical, named);
+    assert_eq!(
+        boss_protocol::run_done_question_criterion(&canonical),
+        Some(boss_protocol::ProgressionQuestionCriterion::HumanOnlyAction)
+    );
+    // Still decodes as the typed payload, so readers that predate it are unaffected.
+    assert!(
+        serde_json::from_str::<RunDoneProposalPayload>(&canonical)
+            .unwrap()
+            .question
+            .is_some()
+    );
+
+    assert!(!errs(ProposalKind::RunDone, with(json!("5"))).is_empty());
+    let no_question = errs(
+        ProposalKind::RunDone,
+        json!({"outcome": "blocked", "summary": "stuck", "criterion": "3"}),
+    );
+    assert!(no_question.iter().any(|e| e.field == "criterion"));
+    // No criterion, no key.
+    assert_eq!(
+        boss_protocol::run_done_question_criterion(&ok(
+            ProposalKind::RunDone,
+            valid_payload_for(ProposalKind::RunDone)
+        )),
+        None
+    );
+    // A different criterion is a different submission.
+    assert_ne!(ok(ProposalKind::RunDone, with(json!("2"))), canonical);
 }

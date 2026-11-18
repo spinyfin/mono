@@ -3,15 +3,19 @@
 //!
 //! Pure CLI + wire-protocol glue: every verb here translates flags into a
 //! [`FrontendRequest::SubmitProposal`] / [`FrontendRequest::ListProposals`]
-//! call and renders the typed reply. All validation (payload schema, rate
+//! call and renders the typed reply. Payload validation (schema, rate
 //! caps, attribution) happens engine-side — see
-//! `boss_engine_proposal_validation` and `engine/core/src/app/proposals.rs`
+//! `boss_engine_proposal_validation` and `engine/app/src/app/proposals.rs`
 //! — so a malformed submission comes back as a
 //! [`FrontendEvent::ProposalRejected`] the worker can act on immediately,
 //! rather than a client-side guess at what the engine would have accepted.
+//! The CLI additionally enforces the labelled explanation writing contract
+//! for newly filed questions before sending the payload.
 //!
 //! Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
 //! §"CLI surface".
+
+mod explanation;
 
 use std::path::PathBuf;
 
@@ -162,6 +166,146 @@ pub(crate) enum ProposeCommand {
     /// Example: `boss propose wait --reason "bazel test //tools/boss/engine/...
     /// still compiling" --duration 30m --waiting-on task_abc`
     Wait(WaitArgs),
+    /// Progression agents only: create a revision on this item's own open PR,
+    /// with a diagnosis-bearing brief. Counts against the item's create budget;
+    /// at most one open progression revision per PR; refused if the PR is closed.
+    ///
+    /// Example: `boss propose revise --brief "Fix the diagnosed failure"`
+    Revise(ReviseArgs),
+    /// Progression agents only: create a chore and make this item depend on it
+    /// (a red check that belongs on `main`, a missing prerequisite). Counts
+    /// against the create budget; at most one open precursor per item.
+    ///
+    /// Example: `boss propose precursor --name "Fix the flaky fixture on main"
+    /// --brief "Repair the fixture that also fails on main"`
+    Precursor(PrecursorArgs),
+    /// Progression agents only: add a dependency edge from this item to another
+    /// item in its neighbourhood.
+    ///
+    /// Example: `boss propose depend --on task_0123abcd`
+    Depend(DependencyEdgeArgs),
+    /// Progression agents only: drop the edge from this item to a prerequisite
+    /// that is finished, archived, missing, or a dead revision of a green PR.
+    ///
+    /// Example: `boss propose undepend --on task_0123abcd`
+    Undepend(DependencyEdgeArgs),
+    /// Progression agents only: explicitly restart this item. Clears the churn
+    /// guard, a worker's deliberate park and its attention, and a non-refusal
+    /// `worker_failed` block. At most once per stuck kind until a work run
+    /// completes. The addendum is appended to the item's brief.
+    ///
+    /// Example: `boss propose redispatch --brief-addendum-file note.md`
+    Redispatch(RedispatchArgs),
+    /// Progression agents only: clear a `blocked_reason` whose probe is already
+    /// clear (`merge_conflict` while the PR is MERGEABLE, `ci_failure` while
+    /// required checks pass). Refused when the stored probe disagrees.
+    ///
+    /// Example: `boss propose clear-signal --reason merge_conflict`
+    ClearSignal(ClearSignalArgs),
+    /// Progression agents only: archive a dead revision of this item's PR chain
+    /// that has no live execution, when the parent PR is green. Never the item
+    /// itself.
+    ///
+    /// Example: `boss propose archive-revision task_0123abcd --reason "dead; parent is green"`
+    ArchiveRevision(ArchiveRevisionArgs),
+    /// Progression agents only: move this item `blocked -> todo` (or
+    /// `in_review` when it already owns a bound PR) once its block reason is
+    /// cleared.
+    ///
+    /// Example: `boss propose unblock`
+    Unblock(UnblockArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReviseArgs {
+    /// The brief of the revision, inline. Exactly one of `--brief` /
+    /// `--brief-file` is required; progression agents use `--brief` because they cannot write files.
+    #[arg(long, conflicts_with = "brief_file")]
+    brief: Option<String>,
+
+    /// Path to a file containing the revision's brief.
+    #[arg(long = "brief-file", value_name = "PATH", conflicts_with = "brief")]
+    brief_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PrecursorArgs {
+    /// One-line name of the precursor chore.
+    #[arg(long)]
+    name: String,
+
+    /// The precursor's brief, inline. Exactly one of `--brief` / `--brief-file`
+    /// is required; the precursor's worker sees nothing else, so make it stand
+    /// alone. Progression agents use `--brief` because they cannot write files.
+    #[arg(long, conflicts_with = "brief_file")]
+    brief: Option<String>,
+
+    /// Path to a file containing the precursor's brief.
+    #[arg(long = "brief-file", value_name = "PATH", conflicts_with = "brief")]
+    brief_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct DependencyEdgeArgs {
+    /// The other end of the edge: a `task_…` id or a short `T<n>` id inside this
+    /// run's neighbourhood.
+    #[arg(long)]
+    on: String,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RedispatchArgs {
+    /// A note for the next worker, inline: quote a declared blocker and the
+    /// evidence it is stale so it is not re-declared.
+    #[arg(long = "brief-addendum", conflicts_with = "brief_addendum_file")]
+    brief_addendum: Option<String>,
+
+    /// Path to a file containing the note.
+    #[arg(long = "brief-addendum-file", value_name = "PATH", conflicts_with = "brief_addendum")]
+    brief_addendum_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ClearSignalArgs {
+    /// The `blocked_reason` to clear: `merge_conflict`, `ci_failure` or
+    /// `ci_failure_exhausted`.
+    #[arg(long, value_parser = boss_protocol::CLEARABLE_BLOCK_REASONS.to_vec())]
+    reason: String,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ArchiveRevisionArgs {
+    /// The revision to archive: a `task_…` id or a short `T<n>` id.
+    #[arg(value_name = "REVISION")]
+    revision: String,
+
+    /// Why it is dead.
+    #[arg(long)]
+    reason: String,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct UnblockArgs {
+    #[command(flatten)]
+    common: IdempotencyArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -360,6 +504,9 @@ pub(crate) struct ReviewVerdictArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RunDoneArgs {
+    /// JSON evidence required to finish a merge-queue CI-fix revision.
+    #[arg(long)]
+    queue_ci_evidence_file: Option<PathBuf>,
     /// How the run ended. `delivered` = the deliverable exists;
     /// `no-changes-needed` = you verified there was nothing to produce;
     /// `blocked` = you are stopping without delivering. Explain the
@@ -373,22 +520,69 @@ pub(crate) struct RunDoneArgs {
     #[arg(long)]
     summary: String,
 
-    /// One specific Yes/No decision preventing delivery. Required with
-    /// `--answer-type yes-no`; not accepted with `create-prerequisite-task`,
-    /// whose question the engine words from `--prerequisite-name`.
-    #[arg(long, requires_all = ["answer_type", "explanation"], required_if_eq("answer_type", "yes-no"))]
+    /// One specific decision in everyday words, without internal symbols,
+    /// types, file names, API names, or review jargon. Required with
+    /// `--answer-type yes-no` and `multiple-choice`; not accepted with
+    /// `create-prerequisite-task` or `link-prerequisite-task`, whose question
+    /// the engine words from the named or resolved task.
+    #[arg(
+        long,
+        requires_all = ["answer_type", "explanation"],
+        required_if_eq_any([("answer_type", "yes-no"), ("answer_type", "multiple-choice")])
+    )]
     question: Option<String>,
 
-    /// `yes-no` for a plain approval. `create-prerequisite-task` when this
-    /// task cannot proceed until some other, unrelated piece of work lands
-    /// first: also pass `--prerequisite-name` and `--prerequisite-brief`, and
-    /// make `--explanation` the one line saying why this task cannot unblock
-    /// without it.
-    #[arg(long, value_parser = ["yes-no", "create-prerequisite-task"], requires = "explanation")]
+    /// `yes-no` for a plain approval. `multiple-choice` when the decision is
+    /// a pick among alternatives: also pass `--choices`. `create-prerequisite-task`
+    /// when this task cannot proceed until some other, unrelated piece of work
+    /// lands first: also pass `--prerequisite-name` and `--prerequisite-brief`,
+    /// and explain the dependency and both answers in `--explanation`. For an
+    /// over-limit file-count change, also pass `--file-count` and
+    /// `--file-count-limit` so No authorizes a file-count exception for this PR.
+    /// `link-prerequisite-task` when that work already belongs to an existing
+    /// open task: pass `--prerequisite-id` and/or `--prerequisite-pr` (a GitHub
+    /// URL, `owner/repo#n`, or PR number). The engine resolves the task from
+    /// that id or PR, never by name.
+    #[arg(
+        long,
+        value_parser = ["yes-no", "multiple-choice", "create-prerequisite-task", "link-prerequisite-task"],
+        requires = "explanation"
+    )]
     answer_type: Option<String>,
 
-    /// Why the decision is needed and what Yes authorizes.
-    #[arg(long, requires = "answer_type")]
+    /// The options of a `multiple-choice` question, each a short single-line
+    /// button label: two to six distinct, non-empty values, e.g.
+    /// `--choices "Merge now" "Wait for review"`. The kanban card shows one
+    /// button per option and the chosen option reaches the next run verbatim.
+    #[arg(
+        long,
+        num_args = 1..,
+        value_name = "CHOICE",
+        requires = "answer_type",
+        required_if_eq("answer_type", "multiple-choice")
+    )]
+    choices: Vec<String>,
+
+    /// Progression agents only, and required there: which of the four numbered
+    /// reasons for asking the owner this question meets (1 the action is
+    /// human-only, 2 every direct verb is spent or refused, 3 a decision only the
+    /// owner can make, 4 the evidence contradicts itself). Recorded with the
+    /// question so asking can be audited.
+    #[arg(long, value_parser = ["1", "2", "3", "4"], requires = "question")]
+    criterion: Option<String>,
+
+    /// Self-contained decision explanation with these labels on their own lines,
+    /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
+    /// For `multiple-choice` use only Context:, Recommendation:, and optional
+    /// Details: (there are no Yes/No buttons); say in Context what each option
+    /// leads to.
+    /// Context opens with 1–2 plain-language sentences about the work and blocker.
+    /// Yes and No each name an actionable path the engine or the next worker
+    /// will take, with the user-visible result and rough work size. "No = remain
+    /// blocked" is rejected. Recommend an answer with a one-line reason. Keep
+    /// symbols, types, file/API names and links in Details only; preserve all
+    /// technical evidence there.
+    #[arg(long, requires = "answer_type", value_parser = explanation::validate)]
     explanation: Option<String>,
 
     /// Name of the proposed prerequisite task (`create-prerequisite-task`).
@@ -399,6 +593,17 @@ pub(crate) struct RunDoneArgs {
     )]
     prerequisite_name: Option<String>,
 
+    /// Canonical or friendly id of an existing task to wait for
+    /// (`link-prerequisite-task`, optional on `create-prerequisite-task`).
+    #[arg(long, requires = "answer_type", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    prerequisite_id: Option<String>,
+
+    /// GitHub pull request that already belongs to the work to wait for:
+    /// a URL, `owner/repo#n`, or a PR number (`link-prerequisite-task`,
+    /// optional on `create-prerequisite-task`).
+    #[arg(long, requires = "answer_type")]
+    prerequisite_pr: Option<String>,
+
     /// Self-contained brief for the proposed prerequisite task: the card
     /// shows it and the task's worker sees nothing else.
     #[arg(
@@ -407,6 +612,20 @@ pub(crate) struct RunDoneArgs {
         required_if_eq("answer_type", "create-prerequisite-task")
     )]
     prerequisite_brief: Option<String>,
+
+    /// Projected upper-bound non-deleted file count of the single-PR change.
+    /// With `--file-count-limit`, this is a split-vs-bypass question: Yes
+    /// creates the prerequisite; No authorizes a `change/file-count` exception
+    /// for this PR only. Checkleft does not enforce the approved count: before
+    /// pushing, compare the non-deleted count from `jj diff --stat` against
+    /// the PR base with this bound, and ask again if it is over.
+    #[arg(long, requires_all = ["answer_type", "file_count_limit"])]
+    file_count: Option<u32>,
+
+    /// The repository `change/file-count` `max_files` limit. Must travel with
+    /// `--file-count`; both apply only to `create-prerequisite-task`.
+    #[arg(long, requires_all = ["answer_type", "file_count"])]
+    file_count_limit: Option<u32>,
 
     #[command(flatten)]
     common: IdempotencyArgs,
@@ -472,6 +691,14 @@ pub(crate) enum ProposalKindArg {
     ReviewVerdict,
     RunDone,
     Wait,
+    Revise,
+    Precursor,
+    Depend,
+    Undepend,
+    Redispatch,
+    ClearSignal,
+    ArchiveRevision,
+    Unblock,
 }
 
 impl From<ProposalKindArg> for ProposalKind {
@@ -489,6 +716,14 @@ impl From<ProposalKindArg> for ProposalKind {
             ProposalKindArg::ReviewVerdict => ProposalKind::ReviewVerdict,
             ProposalKindArg::RunDone => ProposalKind::RunDone,
             ProposalKindArg::Wait => ProposalKind::Wait,
+            ProposalKindArg::Revise => ProposalKind::Revise,
+            ProposalKindArg::Precursor => ProposalKind::Precursor,
+            ProposalKindArg::Depend => ProposalKind::Depend,
+            ProposalKindArg::Undepend => ProposalKind::Undepend,
+            ProposalKindArg::Redispatch => ProposalKind::Redispatch,
+            ProposalKindArg::ClearSignal => ProposalKind::ClearSignal,
+            ProposalKindArg::ArchiveRevision => ProposalKind::ArchiveRevision,
+            ProposalKindArg::Unblock => ProposalKind::Unblock,
         }
     }
 }
@@ -719,20 +954,80 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
-        ProposeCommand::Done(args) => (
-            ProposalKind::RunDone,
-            serde_json::to_value(RunDoneProposalPayload {
+        ProposeCommand::Done(args) => {
+            let criterion = args.criterion.clone();
+            let question = operator_question_from_flags(&args)?;
+            let mut payload = serde_json::to_value(RunDoneProposalPayload {
+                queue_ci_evidence: read_queue_ci_evidence(args.queue_ci_evidence_file)?,
                 outcome: RunDoneOutcome::from(args.outcome),
                 summary: args.summary,
-                question: operator_question_from_flags(
-                    args.question,
-                    args.answer_type.as_deref(),
-                    args.explanation,
-                    args.prerequisite_name,
-                    args.prerequisite_brief,
-                )?,
+                question,
+            })
+            .map_err(CliError::internal)?;
+            // The criterion rides beside the typed payload; see
+            // `boss_protocol::run_done_question_criterion`.
+            if let (Some(criterion), Some(object)) = (criterion, payload.as_object_mut()) {
+                object.insert("criterion".to_owned(), serde_json::Value::String(criterion));
+            }
+            (ProposalKind::RunDone, payload, args.common.idempotency_key)
+        }
+        ProposeCommand::Revise(args) => {
+            let brief = resolve_text_or_file("brief", args.brief, args.brief_file)?;
+            (
+                ProposalKind::Revise,
+                serde_json::to_value(boss_protocol::ReviseProposalPayload { brief }).map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
+        }
+        ProposeCommand::Precursor(args) => {
+            let brief = resolve_text_or_file("brief", args.brief, args.brief_file)?;
+            (
+                ProposalKind::Precursor,
+                serde_json::to_value(boss_protocol::PrecursorProposalPayload { name: args.name, brief })
+                    .map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
+        }
+        ProposeCommand::Depend(args) => (
+            ProposalKind::Depend,
+            serde_json::to_value(boss_protocol::DependProposalPayload { on: args.on }).map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::Undepend(args) => (
+            ProposalKind::Undepend,
+            serde_json::to_value(boss_protocol::UndependProposalPayload { on: args.on }).map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::Redispatch(args) => {
+            let brief_addendum = match (args.brief_addendum, args.brief_addendum_file) {
+                (None, None) => None,
+                (text, file) => Some(resolve_text_or_file("brief-addendum", text, file)?),
+            };
+            (
+                ProposalKind::Redispatch,
+                serde_json::to_value(boss_protocol::RedispatchProposalPayload { brief_addendum })
+                    .map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
+        }
+        ProposeCommand::ClearSignal(args) => (
+            ProposalKind::ClearSignal,
+            serde_json::to_value(boss_protocol::ClearSignalProposalPayload { reason: args.reason })
+                .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::ArchiveRevision(args) => (
+            ProposalKind::ArchiveRevision,
+            serde_json::to_value(boss_protocol::ArchiveRevisionProposalPayload {
+                revision: args.revision,
+                reason: args.reason,
             })
             .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::Unblock(args) => (
+            ProposalKind::Unblock,
+            serde_json::to_value(boss_protocol::UnblockProposalPayload {}).map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
         ProposeCommand::Wait(args) => {
@@ -751,31 +1046,86 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
     })
 }
 
+pub(crate) fn read_queue_ci_evidence(
+    path: Option<PathBuf>,
+) -> Result<Option<boss_protocol::QueueCiEvidence>, CliError> {
+    path.map(|path| {
+        let value = read_json_object_file("queue CI evidence", path)?;
+        serde_json::from_value(value).map_err(|err| CliError::usage(format!("invalid queue CI evidence: {err}")))
+    })
+    .transpose()
+}
+
 /// Assemble the blocked declaration's question from its flags. clap has
 /// already enforced which flags must travel together; what it cannot express
 /// is that the two question shapes exclude each other's flags.
-fn operator_question_from_flags(
-    question: Option<String>,
-    answer_type: Option<&str>,
-    explanation: Option<String>,
-    prerequisite_name: Option<String>,
-    prerequisite_brief: Option<String>,
-) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
-    let explanation = explanation.unwrap_or_default();
+fn operator_question_from_flags(args: &RunDoneArgs) -> Result<Option<boss_protocol::OperatorQuestion>, CliError> {
+    let question = args.question.clone();
+    let answer_type = args.answer_type.as_deref();
+    let choices = args.choices.clone();
+    let explanation = args.explanation.clone();
+    let prerequisite_name = args.prerequisite_name.clone();
+    let prerequisite_brief = args.prerequisite_brief.clone();
+    let prerequisite_id = args.prerequisite_id.clone();
+    let prerequisite_pr = args.prerequisite_pr.clone();
+    let file_count_bypass = match (args.file_count, args.file_count_limit) {
+        (Some(files), Some(limit)) => Some(boss_protocol::FileCountBypassSpec { files, limit }),
+        _ => None,
+    };
+    // A split-vs-bypass question names its two actions, so its explanation
+    // sections and the card's buttons say Split / Bypass limit, not Yes / No.
+    let option_labels = (answer_type == Some("create-prerequisite-task") && file_count_bypass.is_some())
+        .then(boss_protocol::AnswerOptionLabels::split_or_bypass);
+    let explanation = match answer_type {
+        None => explanation.unwrap_or_default(),
+        Some(kind) => {
+            let shape = match (kind, &option_labels) {
+                ("multiple-choice", _) => explanation::Shape::MultipleChoice,
+                (_, Some(labels)) => explanation::Shape::Labelled(labels),
+                _ => explanation::Shape::YesNo,
+            };
+            explanation::validate_for(&explanation.unwrap_or_default(), shape).map_err(CliError::usage)?
+        }
+    };
+    if answer_type != Some("multiple-choice") && !choices.is_empty() {
+        return Err(CliError::usage(
+            "--choices only applies to --answer-type multiple-choice",
+        ));
+    }
+    if answer_type != Some("create-prerequisite-task") && file_count_bypass.is_some() {
+        return Err(CliError::usage(
+            "--file-count and --file-count-limit only apply to --answer-type create-prerequisite-task",
+        ));
+    }
+    let existing_id = nonempty_flag(prerequisite_id);
+    let existing_pr = nonempty_flag(prerequisite_pr);
     match answer_type {
         None => Ok(None),
-        Some("yes-no") => {
-            if prerequisite_name.is_some() || prerequisite_brief.is_some() {
-                return Err(CliError::usage(
-                    "--prerequisite-name and --prerequisite-brief only apply to --answer-type create-prerequisite-task",
-                ));
-            }
+        Some("yes-no" | "multiple-choice")
+            if prerequisite_name.is_some()
+                || prerequisite_brief.is_some()
+                || existing_id.is_some()
+                || existing_pr.is_some() =>
+        {
+            Err(CliError::usage(
+                "--prerequisite-name, --prerequisite-brief, --prerequisite-id, and --prerequisite-pr only apply to create-prerequisite-task or link-prerequisite-task",
+            ))
+        }
+        Some("multiple-choice") => {
+            let choices: Vec<String> = choices.into_iter().map(|choice| choice.trim().to_owned()).collect();
+            boss_protocol::OperatorAnswerType::validate_choices(&choices)
+                .map_err(|message| CliError::usage(format!("--choices: {message}")))?;
             Ok(question.map(|text| boss_protocol::OperatorQuestion {
                 text,
-                answer_type: boss_protocol::OperatorAnswerType::YesNo,
+                answer_type: boss_protocol::OperatorAnswerType::MultipleChoice { choices },
                 explanation,
             }))
         }
+        Some("yes-no") => Ok(question.map(|text| boss_protocol::OperatorQuestion {
+            text,
+            answer_type: boss_protocol::OperatorAnswerType::YesNo,
+            explanation,
+        })),
         Some("create-prerequisite-task") => {
             if question.is_some() {
                 return Err(CliError::usage(
@@ -783,18 +1133,65 @@ fn operator_question_from_flags(
                      the engine words the question from --prerequisite-name",
                 ));
             }
+            if let Some(spec) = file_count_bypass {
+                spec.validate().map_err(CliError::usage)?;
+            }
             let name = prerequisite_name.unwrap_or_default();
+            let text = match file_count_bypass {
+                Some(spec) => boss_protocol::OperatorAnswerType::file_count_split_question_text(name.trim(), spec),
+                None => boss_protocol::OperatorAnswerType::prerequisite_question_text(name.trim()),
+            };
             Ok(Some(boss_protocol::OperatorQuestion {
-                text: boss_protocol::OperatorAnswerType::prerequisite_question_text(name.trim()),
+                text,
                 answer_type: boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
                     name,
                     brief: prerequisite_brief.unwrap_or_default(),
+                    file_count_bypass,
+                    option_labels,
+                    existing_id,
+                    existing_pr,
+                },
+                explanation,
+            }))
+        }
+        Some("link-prerequisite-task") => {
+            if question.is_some() {
+                return Err(CliError::usage(
+                    "--question does not apply to --answer-type link-prerequisite-task; \
+                     the engine words the question from the existing task it resolves",
+                ));
+            }
+            if prerequisite_name.is_some() || prerequisite_brief.is_some() {
+                return Err(CliError::usage(
+                    "--prerequisite-name and --prerequisite-brief only apply to --answer-type create-prerequisite-task",
+                ));
+            }
+            if existing_id.is_none() && existing_pr.is_none() {
+                return Err(CliError::usage(
+                    "--answer-type link-prerequisite-task requires --prerequisite-id and/or --prerequisite-pr",
+                ));
+            }
+            Ok(Some(boss_protocol::OperatorQuestion {
+                text: boss_protocol::OperatorAnswerType::link_prerequisite_unresolved_question_text(),
+                answer_type: boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+                    existing_id,
+                    existing_pr,
+                    work_item_id: String::new(),
+                    name: String::new(),
+                    pr_url: None,
                 },
                 explanation,
             }))
         }
         Some(other) => Err(CliError::usage(format!("unsupported --answer-type `{other}`"))),
     }
+}
+
+fn nonempty_flag(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 /// Parse `--duration` into seconds. Accepts a bare integer or a compact
@@ -812,6 +1209,34 @@ fn parse_wait_duration_secs(raw: &str) -> Result<u64, String> {
         return Err("duration must be at least 1 second".to_owned());
     }
     Ok(secs)
+}
+
+pub(crate) fn print_gateway_result(ctx: &RunContext, status: &str, value: &serde_json::Value) -> Result<(), CliError> {
+    if status == "hub_decision" && value["receipt"]["decision"]["code"].as_i64() != Some(1) {
+        return Err(CliError::application(format!(
+            "Hub rejected proposal: {}",
+            value["receipt"]["decision"]["reason"]
+        )));
+    }
+    print_entity(ctx, &serde_json::json!({"status": status, "value": value}), || {
+        println!("Spoke worker API: {status}");
+        if status == "queued" {
+            // Only a proposal receipt lets the worker park. An attachment or a
+            // guide outcome is queued evidence for the hub, not a finish line.
+            if value.get("artifact").is_some() {
+                println!("Registered for streaming to the hub; keep working.");
+            } else if value["receipt"]["kind"] == "guide_outcome" {
+                println!("Guide outcome durably queued for the hub; keep working.");
+            } else if !matches!(value["receipt"]["kind"].as_str(), Some("run_done" | "wait")) {
+                println!("Durably queued for hub validation; keep working.");
+            } else {
+                println!(
+                    "Durably queued for hub validation. You may finish this turn and park; the run and workspace remain assigned."
+                );
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+    })
 }
 
 async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result<(), CliError> {
@@ -832,13 +1257,17 @@ async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result
         })?;
 
     match response {
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::ProposalSubmitted { proposal, .. }
-            if kind == ProposalKind::ReviewGuide && proposal.state == ProposalState::Rejected =>
+            if matches!(kind, ProposalKind::ReviewGuide | ProposalKind::RunDone)
+                && proposal.state == ProposalState::Rejected =>
         {
             Err(CliError::application(
                 proposal
                     .decision_reason
-                    .unwrap_or_else(|| "review-guide submission was rejected".to_owned()),
+                    .unwrap_or_else(|| format!("{kind} submission was rejected")),
             ))
         }
         FrontendEvent::ProposalSubmitted {
@@ -883,6 +1312,9 @@ async fn run_propose_list(
         })?;
 
     match response {
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::ProposalsList {
             work_item_id,
             proposals,
@@ -960,12 +1392,27 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::RunDone, "summary") => Some("--summary"),
         (ProposalKind::RunDone, "question" | "question.text") => Some("--question"),
         (ProposalKind::RunDone, "question.answer_type.kind") => Some("--answer-type"),
+        (ProposalKind::RunDone, "question.answer_type.choices") => Some("--choices"),
         (ProposalKind::RunDone, "question.explanation") => Some("--explanation"),
         (ProposalKind::RunDone, "question.answer_type.name") => Some("--prerequisite-name"),
         (ProposalKind::RunDone, "question.answer_type.brief") => Some("--prerequisite-brief"),
+        (ProposalKind::RunDone, "question.answer_type.file_count_bypass") => Some("--file-count / --file-count-limit"),
+        (ProposalKind::RunDone, "question.answer_type.existing_id" | "question.answer_type.work_item_id") => {
+            Some("--prerequisite-id")
+        }
+        (ProposalKind::RunDone, "question.answer_type.existing_pr") => Some("--prerequisite-pr"),
         (ProposalKind::Wait, "reason") => Some("--reason"),
         (ProposalKind::Wait, "duration_secs") => Some("--duration"),
         (ProposalKind::Wait, "waiting_on") => Some("--waiting-on"),
+        (ProposalKind::RunDone, "criterion") => Some("--criterion"),
+        (ProposalKind::Revise, "brief") => Some("--brief / --brief-file"),
+        (ProposalKind::Precursor, "name") => Some("--name"),
+        (ProposalKind::Precursor, "brief") => Some("--brief / --brief-file"),
+        (ProposalKind::Depend | ProposalKind::Undepend, "on") => Some("--on"),
+        (ProposalKind::Redispatch, "brief_addendum") => Some("--brief-addendum / --brief-addendum-file"),
+        (ProposalKind::ClearSignal, "reason") => Some("--reason"),
+        (ProposalKind::ArchiveRevision, "revision") => Some("<REVISION>"),
+        (ProposalKind::ArchiveRevision, "reason") => Some("--reason"),
 
         _ => None,
     }
@@ -977,7 +1424,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
 /// `None` for `--list` rejections, which never carry field errors.
 ///
 /// `pub(crate)`: `boss context` reuses `ProposalRejected` for its own
-/// attribution failures (see `engine/core/src/app/context.rs`'s doc
+/// attribution failures (see `engine/app/src/app/context.rs`'s doc
 /// comment), so `context::run_context_command` renders them the same way
 /// with `kind = None`.
 pub(crate) fn render_proposal_rejection(kind: Option<ProposalKind>, error: ProposalSubmissionError) -> CliError {
@@ -989,7 +1436,10 @@ pub(crate) fn render_proposal_rejection(kind: Option<ProposalKind>, error: Propo
     }
     match error.code {
         ProposalErrorCode::ValidationFailed => CliError::usage(error.message),
-        ProposalErrorCode::RateLimited => CliError::application(error.message),
+        // Nothing was stored, so the worker's next attempt is a fresh
+        // submission. Same exit as a stored `rejected` review-guide /
+        // run-done row, so a worker that keyed off exit 6 sees no change.
+        ProposalErrorCode::RateLimited | ProposalErrorCode::NotAccepted => CliError::application(error.message),
         ProposalErrorCode::NoLocalPeer
         | ProposalErrorCode::AttributionUnresolved
         | ProposalErrorCode::AttributionMismatch
@@ -1003,7 +1453,7 @@ mod tests {
     use clap::Parser;
 
     use super::*;
-    use crate::{Cli, Commands};
+    use crate::{Cli, Commands, commands::TaskCommand};
 
     #[test]
     fn operator_question_flags_require_a_complete_question_and_typed_answer() {
@@ -1019,14 +1469,14 @@ mod tests {
         for flags in [
             vec!["--question", "Approve?"],
             vec!["--answer-type", "yes-no"],
-            vec!["--explanation", "Why"],
+            vec!["--explanation", explanation::tests::VALID],
             vec![
                 "--question",
                 "Approve?",
                 "--answer-type",
                 "prompt",
                 "--explanation",
-                "Why",
+                explanation::tests::VALID,
             ],
         ] {
             assert!(Cli::try_parse_from(base.iter().copied().chain(flags)).is_err());
@@ -1037,7 +1487,7 @@ mod tests {
             "--answer-type",
             "yes-no",
             "--explanation",
-            "Why",
+            explanation::tests::VALID,
         ];
         let cli = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap();
         let Commands::Propose(args) = cli.command else {
@@ -1046,13 +1496,108 @@ mod tests {
         let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
         assert_eq!(payload["question"]["answer_type"]["kind"], "yes_no");
         assert_eq!(payload["question"]["text"], "Approve?");
-        assert_eq!(payload["question"]["explanation"], "Why");
+        assert_eq!(payload["question"]["explanation"], explanation::tests::VALID);
         for flags in [vec![], vec!["--yes", "--no"]] {
             assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example"].into_iter().chain(flags)).is_err());
         }
         for flag in ["--yes", "--no"] {
             assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example", flag]).is_ok());
         }
+    }
+
+    #[test]
+    fn multiple_choice_flags_build_the_typed_question_and_enforce_the_choice_rules() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need a decision",
+            "--question",
+            "Which rollout should I use?",
+            "--answer-type",
+            "multiple-choice",
+            "--explanation",
+            explanation::tests::VALID_CHOICE,
+        ];
+        let payload = |extra: &[&str]| {
+            let Commands::Propose(args) = Cli::try_parse_from(base.iter().chain(extra)).ok()?.command else {
+                panic!("expected propose")
+            };
+            payload_for(args.command.unwrap()).ok().map(|(_, payload, _)| payload)
+        };
+        // The options are required with the multiple-choice type.
+        assert!(Cli::try_parse_from(base).is_err());
+        // A multiple-choice explanation has no Yes/No sections.
+        let mut with_yes_no = base;
+        *with_yes_no.last_mut().unwrap() = explanation::tests::VALID;
+        let Commands::Propose(args) = Cli::try_parse_from(with_yes_no.iter().chain(&["--choices", "a", "b"]))
+            .unwrap()
+            .command
+        else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+        let built = payload(&["--choices", " Gradual ", "All at once"]).unwrap();
+        assert_eq!(
+            built["question"]["answer_type"],
+            serde_json::json!({"kind": "multiple_choice", "choices": ["Gradual", "All at once"]})
+        );
+        assert_eq!(built["question"]["text"], "Which rollout should I use?");
+        // Repeating the flag accumulates, like listing the values after one flag.
+        let repeated = payload(&["--choices", "a", "--choices", "b"]).unwrap();
+        assert_eq!(
+            repeated["question"]["answer_type"]["choices"],
+            serde_json::json!(["a", "b"])
+        );
+        for bad in [
+            vec!["--choices", "only one"],
+            vec!["--choices", "a", "a"],
+            vec!["--choices", "a", " "],
+            vec!["--choices", "a", "b", "c", "d", "e", "f", "g"],
+        ] {
+            assert!(payload(&bad).is_none(), "{bad:?}");
+        }
+        // The options belong to the multiple-choice type only.
+        let yes_no_with_choices = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "s",
+            "--question",
+            "Approve?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            explanation::tests::VALID,
+            "--choices",
+            "a",
+            "b",
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(yes_no_with_choices).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+        for flag in [vec!["--yes"], vec!["--choice", "Gradual"]] {
+            assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example"].into_iter().chain(flag)).is_ok());
+        }
+        assert!(Cli::try_parse_from(["boss", "task", "answer", "oq_example", "--yes", "--choice", "a"]).is_err());
+        // A named option answers a question whose answers are named actions.
+        let Commands::Task {
+            command: TaskCommand::Answer(args),
+        } = Cli::try_parse_from(["boss", "task", "answer", "oq_example", "--choice", "Bypass limit"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected task answer")
+        };
+        assert_eq!(args.choice.as_deref(), Some("Bypass limit"));
+        assert!(!args.yes && !args.no);
     }
 
     #[test]
@@ -1068,7 +1613,7 @@ mod tests {
             "--answer-type",
             "create-prerequisite-task",
             "--explanation",
-            "CI cannot go green until the fixture is fixed",
+            explanation::tests::VALID,
         ];
         // Name and brief are both required with the prerequisite type.
         assert!(Cli::try_parse_from(base).is_err());
@@ -1111,7 +1656,7 @@ mod tests {
             "--answer-type",
             "yes-no",
             "--explanation",
-            "Why",
+            explanation::tests::VALID,
             "--prerequisite-name",
             "x",
             "--prerequisite-brief",
@@ -1121,6 +1666,176 @@ mod tests {
             panic!("expected propose")
         };
         assert!(payload_for(args.command.unwrap()).is_err());
+    }
+
+    #[test]
+    fn link_prerequisite_flags_require_an_id_or_pr_and_build_the_typed_question() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need the other PR first",
+            "--answer-type",
+            "link-prerequisite-task",
+            "--explanation",
+            explanation::tests::VALID,
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        let Commands::Propose(args) = Cli::try_parse_from(base).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+        let flags = ["--prerequisite-pr", " https://github.com/acme/widget/pull/9 "];
+        let Commands::Propose(args) = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap().command else {
+            panic!("expected propose")
+        };
+        let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        let answer_type = &payload["question"]["answer_type"];
+        assert_eq!(answer_type["kind"], "link_prerequisite_task");
+        assert_eq!(answer_type["existing_pr"], "https://github.com/acme/widget/pull/9");
+        assert_eq!(
+            payload["question"]["text"],
+            "Wait for the existing work this request names? This task will wait for it."
+        );
+        let with_name =
+            base.iter()
+                .copied()
+                .chain(flags)
+                .chain(["--prerequisite-name", "x", "--prerequisite-brief", "y"]);
+        let Commands::Propose(args) = Cli::try_parse_from(with_name).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+    }
+
+    #[test]
+    fn file_count_flags_mark_a_split_vs_bypass_prerequisite_question() {
+        let base = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "The change is over the file-count limit",
+            "--answer-type",
+            "create-prerequisite-task",
+            "--explanation",
+            explanation::tests::VALID_SPLIT,
+            "--prerequisite-name",
+            "Extract the first PR",
+            "--prerequisite-brief",
+            "Land the first capability as its own PR.",
+        ];
+        assert!(Cli::try_parse_from(base.iter().copied().chain(["--file-count", "48"])).is_err());
+        let flags = ["--file-count", "48", "--file-count-limit", "30"];
+        let Commands::Propose(args) = Cli::try_parse_from(base.iter().copied().chain(flags)).unwrap().command else {
+            panic!("expected propose")
+        };
+        let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        let answer_type = &payload["question"]["answer_type"];
+        assert_eq!(answer_type["kind"], "create_prerequisite_task");
+        assert_eq!(answer_type["file_count_bypass"]["files"], 48);
+        assert_eq!(answer_type["file_count_bypass"]["limit"], 30);
+        assert_eq!(
+            payload["question"]["text"],
+            "Split this 48-file change (limit 30) by landing 'Extract the first PR' first, or bypass the limit and keep it in one PR?"
+        );
+        // The question names its two actions; the engine and the card render these.
+        assert_eq!(
+            answer_type["option_labels"],
+            serde_json::json!({"yes": "Split", "no": "Bypass limit"})
+        );
+        // A split question is explained in terms of its options, never Yes/No.
+        let explained_as = |text: &'static str| -> Vec<&'static str> {
+            base.iter()
+                .map(|arg| {
+                    if *arg == explanation::tests::VALID_SPLIT {
+                        text
+                    } else {
+                        *arg
+                    }
+                })
+                .collect()
+        };
+        let Commands::Propose(args) =
+            Cli::try_parse_from(explained_as(explanation::tests::VALID).into_iter().chain(flags))
+                .unwrap()
+                .command
+        else {
+            panic!("expected propose")
+        };
+        let error = payload_for(args.command.unwrap()).unwrap_err().to_string();
+        assert!(error.contains("Split:") && error.contains("Bypass limit:"), "{error}");
+        // An ordinary prerequisite stays a Yes/No question with no option names.
+        let Commands::Propose(args) = Cli::try_parse_from(explained_as(explanation::tests::VALID))
+            .unwrap()
+            .command
+        else {
+            panic!("expected propose")
+        };
+        let (_, ordinary, _) = payload_for(args.command.unwrap()).unwrap();
+        assert!(ordinary["question"]["answer_type"].get("option_labels").is_none());
+        for bad in [
+            ["--file-count", "30", "--file-count-limit", "30"],
+            ["--file-count", "0", "--file-count-limit", "30"],
+            ["--file-count", "48", "--file-count-limit", "0"],
+        ] {
+            let Commands::Propose(args) = Cli::try_parse_from(base.iter().copied().chain(bad)).unwrap().command else {
+                panic!("expected propose")
+            };
+            assert!(payload_for(args.command.unwrap()).is_err(), "{bad:?}");
+        }
+        let yes_no_with_file_count = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "s",
+            "--question",
+            "Approve?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            explanation::tests::VALID,
+            "--file-count",
+            "48",
+            "--file-count-limit",
+            "30",
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(yes_no_with_file_count).unwrap().command else {
+            panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+    }
+
+    #[test]
+    fn blocked_question_rejects_a_remain_blocked_no() {
+        let args = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "The scope needs authorization",
+            "--question",
+            "Approve the extra files?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            explanation::tests::REMAIN_BLOCKED,
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(args).unwrap().command else {
+            panic!("expected propose")
+        };
+        let err = payload_for(args.command.unwrap()).unwrap_err();
+        assert!(err.to_string().contains("remain blocked"), "{err}");
     }
 
     fn parse_propose(args: &[&str]) -> ProposeArgs {
@@ -1213,6 +1928,31 @@ mod tests {
             }
             other => panic!("expected FollowupTask, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn followup_task_catalogue_shape_parses_and_brief_is_not_a_flag() {
+        // The progression verb catalogue teaches this invocation; clap must
+        // accept it so a progression agent following its brief does not get a
+        // usage error.
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "propose",
+                "followup-task",
+                "--name",
+                "n",
+                "--description",
+                "d",
+                "--rationale",
+                "r",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["boss", "propose", "followup-task", "--name", "n", "--brief", "d"]).is_err(),
+            "followup-task takes --description, not --brief"
+        );
     }
 
     #[test]
@@ -1373,6 +2113,131 @@ mod tests {
 
     fn command_for(args: &[&str]) -> ProposeCommand {
         parse_propose(args).command.expect("expected a subcommand")
+    }
+
+    #[test]
+    fn progression_verbs_pin_their_wire_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "Fix the fixture.\n").unwrap();
+        let brief = brief.to_str().unwrap();
+        let shape = |args: &[&str]| {
+            let (kind, payload, key) = payload_for(command_for(args)).unwrap();
+            assert!(key.is_none());
+            (kind, payload)
+        };
+        assert_eq!(
+            shape(&["revise", "--brief-file", brief]),
+            (ProposalKind::Revise, serde_json::json!({"brief": "Fix the fixture.\n"}))
+        );
+        assert_eq!(
+            shape(&["precursor", "--name", "Fix it on main", "--brief", "Standalone."]),
+            (
+                ProposalKind::Precursor,
+                serde_json::json!({"name": "Fix it on main", "brief": "Standalone."})
+            )
+        );
+        assert_eq!(
+            shape(&["depend", "--on", "task_12"]),
+            (ProposalKind::Depend, serde_json::json!({"on": "task_12"}))
+        );
+        assert_eq!(
+            shape(&["undepend", "--on", "task_x"]),
+            (ProposalKind::Undepend, serde_json::json!({"on": "task_x"}))
+        );
+        assert_eq!(
+            shape(&["redispatch"]),
+            (ProposalKind::Redispatch, serde_json::json!({}))
+        );
+        assert_eq!(
+            shape(&["redispatch", "--brief-addendum", "The blocker is stale."]),
+            (
+                ProposalKind::Redispatch,
+                serde_json::json!({"brief_addendum": "The blocker is stale."})
+            )
+        );
+        assert_eq!(
+            shape(&["clear-signal", "--reason", "merge_conflict"]),
+            (
+                ProposalKind::ClearSignal,
+                serde_json::json!({"reason": "merge_conflict"})
+            )
+        );
+        assert_eq!(
+            shape(&["archive-revision", "T9", "--reason", "dead; parent is green"]),
+            (
+                ProposalKind::ArchiveRevision,
+                serde_json::json!({"revision": "T9", "reason": "dead; parent is green"})
+            )
+        );
+        assert_eq!(shape(&["unblock"]), (ProposalKind::Unblock, serde_json::json!({})));
+    }
+
+    #[test]
+    fn progression_verbs_reject_malformed_invocations() {
+        for args in [
+            vec!["revise", "--brief", "a", "--brief-file", "b.md"],
+            vec!["precursor", "--brief", "no name"],
+            vec!["depend"],
+            vec!["clear-signal", "--reason", "worker_failed"],
+            vec!["archive-revision", "T1"],
+            vec!["redispatch", "--brief-addendum", "a", "--brief-addendum-file", "b.md"],
+        ] {
+            let mut full = vec!["boss", "propose"];
+            full.extend(&args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?} should not parse");
+        }
+        // A brief is required, as text or as a readable file.
+        assert!(payload_for(command_for(&["revise"])).is_err());
+        assert!(payload_for(command_for(&["revise", "--brief-file", "/nonexistent/brief.md"])).is_err());
+    }
+
+    #[test]
+    fn done_criterion_is_carried_beside_the_typed_payload_and_needs_a_question() {
+        let base = [
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Needs the owner",
+            "--question",
+            "Merge it?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+        ];
+        let explanation = "Context:\nThe PR is ready.\nYes:\nMerge it.\nNo:\nLeave it.\nRecommendation:\nI recommend Yes because CI is green.";
+        let mut args = base.to_vec();
+        args.extend([explanation, "--criterion", "1"]);
+        let (kind, payload, _) = payload_for(command_for(&args)).unwrap();
+        assert_eq!(kind, ProposalKind::RunDone);
+        assert_eq!(payload["criterion"], "1");
+        assert_eq!(payload["question"]["text"], "Merge it?");
+        // Without the flag the payload is unchanged.
+        let mut plain = base.to_vec();
+        plain.push(explanation);
+        let (_, payload, _) = payload_for(command_for(&plain)).unwrap();
+        assert!(payload.get("criterion").is_none());
+        // The criterion only accompanies a question, and only 1 to 4 are meaningful.
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "propose",
+                "done",
+                "--outcome",
+                "delivered",
+                "--summary",
+                "s",
+                "--criterion",
+                "1"
+            ])
+            .is_err()
+        );
+        let mut out_of_range = base.to_vec();
+        out_of_range.extend([explanation, "--criterion", "5"]);
+        let mut full = vec!["boss", "propose"];
+        full.extend(&out_of_range);
+        assert!(Cli::try_parse_from(full).is_err());
     }
 
     #[test]

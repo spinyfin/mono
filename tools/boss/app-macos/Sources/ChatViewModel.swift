@@ -1,10 +1,17 @@
 import Foundation
+import os.log
 #if canImport(AppKit)
 import AppKit
 #endif
 
+/// Every `workErrorMessage` is also written here, so a failure the user
+/// dismissed (or never noticed on the passive banner) stays recoverable
+/// from the unified log.
+private let workNoticeLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "work-notice")
+
 @MainActor
 final class ChatViewModel: ObservableObject {
+    @Published var criticalPriorityRequests: [CriticalPriorityRequest] = []
     @Published var navigationMode: NavigationMode = .agents
     @Published var isConnected: Bool = false
     /// Full product list as reported by the engine, including archived
@@ -64,13 +71,57 @@ final class ChatViewModel: ObservableObject {
     /// product ever viewed this session, not just the product being
     /// refreshed (see `ChatViewModel+WorkItemEvents.applyWorkTree`).
     var trackedProjectIDsByProductID: [String: Set<String>] = [:]
-    /// Debounce handles for [[scheduleWorkTreeRefetch]], keyed by product
+    /// The one timer per product behind [[scheduleRefetch]], keyed by product
     /// id. A burst of invalidation-style events for the same product
-    /// (bulk deletes, reorders, planner actions) collapses into one
-    /// `GetWorkTree` request — and one full-tree apply — instead of one
-    /// per event; see the "refetch storm" evidence in
+    /// (bulk deletes, reorders, planner actions, `work_invalidated`)
+    /// collapses into one `GetWorkTree` request — and one full-tree apply —
+    /// plus one set of side-fetches, instead of one per event; see the
+    /// "refetch storm" evidence in
     /// docs/investigations/task-population-latency-on-start-and-product-switch.md §10.2.
     var pendingWorkTreeRefetchTasks: [String: Task<Void, Never>] = [:]
+    /// What each pending timer in [[pendingWorkTreeRefetchTasks]] will send
+    /// when it fires, keyed by the same product id.
+    var pendingRefetchBursts: [String: PendingRefetchBurst] = [:]
+    var refetchCoalescingPolicy = RefetchCoalescingPolicy.standard
+    /// The clock the per-product timers above and the resync timer below read
+    /// and sleep on. Tests replace it with one they advance by hand.
+    var refetchClock = RefetchClock.continuous
+    /// Coalescing and backoff of `resync_required`, and the timer for the one
+    /// refetch it has pending; see `ChatViewModel+ResyncRefetch.swift`.
+    var resyncRefetchGate = ResyncRefetchGate()
+    var pendingResyncRefetchTask: Task<Void, Never>?
+    /// A resync was dropped by a disconnect or connect before it fired; the
+    /// next connect owes the reads its burst doesn't cover.
+    var resyncOnlyReadsOwed = false
+    /// Part of `resyncOnlyReadsOwed`: a quota snapshot or refresh was awaited
+    /// when the resync was dropped, so the cached quota read is owed too.
+    var resyncQuotaReadOwed = false
+    /// Outstanding whole-board and runtime-patch reads per product; see
+    /// [[BoardReadFence]].
+    var boardReadFences: [String: BoardReadFence] = [:]
+    /// Which products have their first board snapshot, and how far the engine
+    /// says the others have got. Published: the board shows a loading state
+    /// instead of empty columns until the product is loaded. See
+    /// [[BoardLoadTracker]].
+    @Published var boardLoad = BoardLoadTracker()
+    /// Views currently showing a task's execution history (card popover,
+    /// transcript viewer), by task id, each identified by a per-view token.
+    /// A task with no entry has no consumer: its history is not cached and
+    /// is not refetched on invalidation.
+    var executionsConsumerTokensByTaskID: [String: Set<UUID>] = [:]
+
+    /// Projects whose navigator "Archive" gesture has been sent to the
+    /// engine and not yet answered. This is the gesture's immediate
+    /// feedback (the row dims and reads "Archiving…" the instant the menu
+    /// item is clicked) — it is *not* an optimistic status: the project
+    /// stays `active` in the store until the engine's `work_item_updated`
+    /// reply lands, and a `work_error` / disconnect clears the pending
+    /// state and surfaces the failure instead of leaving a ghost row.
+    @Published var archivingProjectIDs: Set<String> = []
+
+    /// Envelope request id of each in-flight archive → its project id, so
+    /// a `work_error` carrying that id settles onto the right row.
+    var archiveRequestProjectIDs: [String: String] = [:]
     /// Dependency edges keyed by product. Refreshed whenever the engine
     /// pushes a fresh `WorkTree` for that product. The kanban joins
     /// these against the task/chore/project name maps to render
@@ -90,7 +141,7 @@ final class ChatViewModel: ObservableObject {
     /// `create_task_from_deferred_scope_attention` has been sent but neither
     /// the success push (`attentionItemUpdated`/`attentionItemConverted`) nor
     /// `work_error` has arrived yet. Drives the popover row's disabled
-    /// "acting" state — published (unlike `mergingWhenReadyIDs`) because the
+    /// "acting" state — published because the
     /// row reads it directly to know when to re-enable. Cleared wholesale on
     /// any `work_error` and on `.disconnected` (see
     /// `ChatViewModel+EventHandling.swift`) so a failed request or a dropped
@@ -144,11 +195,26 @@ final class ChatViewModel: ObservableObject {
     /// fetched on demand for the merge-provenance affordance (score badge
     /// detail). Absent key means "not yet fetched", not "no merges".
     @Published var attentionMergesByAttentionID: [String: [AttentionMerge]] = [:]
+    /// Inline refusal for a group whose generation no longer matches the
+    /// body that submitted, keyed by group id. Cleared by the next attempt
+    /// or when the group snapshot is replaced.
+    @Published var attentionAnswerErrorByGroupID: [String: String] = [:]
+    /// In-flight `answer_attention` / `action_attention_group` request ids
+    /// mapped to the group they were for, so an engine refusal lands inline
+    /// beside that group instead of the generic work error banner.
+    var attentionRequestGroupByRequestID: [String: AttentionRequestGroup] = [:]
     /// Planner audit rows (`planner_runs`) keyed by project id, newest
-    /// first — as returned by `list_planner_runs`. Backs the Planner
+    /// first — as returned by `list_planner_runs`. Fetched on demand by the
+    /// popover and the inspector only; the kanban affordance itself renders
+    /// from [[plannerRunSummaryByProjectID]]. Backs the Planner
     /// review/release/undo surface (design auto-populate-project-tasks-on-
     /// design-pr-merge.md task 10).
     @Published var plannerRunsByProjectID: [String: [PlannerRun]] = [:]
+    /// Each project's latest settled planner run, blob-free, seeded from every
+    /// `work_tree` snapshot and delta. This — not `list_planner_runs` — is what
+    /// the kanban planner affordance renders from, so a board refresh costs no
+    /// extra planner request.
+    @Published var plannerRunSummaryByProjectID: [String: PlannerRunSummary] = [:]
     /// Project ids with an in-flight `release_project` or
     /// `unpopulate_project` request — disables the action buttons until
     /// the engine replies (or `workError` clears it on failure).
@@ -177,6 +243,8 @@ final class ChatViewModel: ObservableObject {
     /// Cleared per-task before each fresh fetch, mirroring
     /// [[executionsByTaskID]].
     @Published var attachmentsByTaskID: [String: [AttachmentVM]] = [:]
+    /// Shared selection lets guide thumbnails select an image in an already-open viewer.
+    @Published var selectedAttachmentIDByTaskID: [String: String] = [:]
     /// Task ids with an in-flight `list_attachments_for_work_item` request.
     /// Mirrors [[executionsInFlightTaskIDs]] for the same reason.
     var attachmentsInFlightTaskIDs: Set<String> = []
@@ -200,8 +268,11 @@ final class ChatViewModel: ObservableObject {
     @Published var automationsFetchStateByProductID: [String: AutomationsFetchState] = [:]
     /// Open-task counts keyed by automation id. Refreshed alongside the list.
     @Published var openTaskCountByAutomationID: [String: Int] = [:]
-    /// Run history keyed by automation id. Fetched on selection and refreshed
-    /// when the automation's state changes (outcome updated, etc.).
+    /// Row summaries never replace the complete, collapsed run history.
+    @Published var latestRunByAutomationID: [String: AppAutomationRun] = [:]
+    var automationsIsVisible = false
+    var visibleAutomationHistoryID: String?
+    /// Run history is fetched only for the mounted detail row.
     @Published var automationRunsByID: [String: [AppAutomationRun]] = [:]
     /// The automation currently selected in the Automations tab detail pane.
     @Published var selectedAutomationID: String?
@@ -221,6 +292,7 @@ final class ChatViewModel: ObservableObject {
             // fallback — so reporting here is what keeps the engine's copy
             // from drifting, rather than having each call site remember.
             if oldValue != selectedWorkProductID {
+                if !isRestoringWorkSelection, let id = selectedWorkProductID { selectionHistory.useProduct(id) }
                 reportSelectedProductToEngine()
             }
         }
@@ -258,7 +330,12 @@ final class ChatViewModel: ObservableObject {
         body()
     }
     @Published var selectedProjectFilterIDs: Set<String> = [] {
-        didSet { notePublishedWorkInputChanged() }
+        didSet {
+            if !isRestoringWorkSelection, let productID = selectedWorkProductID {
+                selectionHistory.useProjects(selectedProjectFilterIDs.subtracting(oldValue), productID: productID)
+            }
+            notePublishedWorkInputChanged()
+        }
     }
     /// When true, the board shows all project-less work items (chores,
     /// investigation tasks, etc.) and their revisions. Mutually exclusive
@@ -275,15 +352,26 @@ final class ChatViewModel: ObservableObject {
     @Published var showArchivedProjects: Bool = false {
         didSet { notePublishedWorkInputChanged() }
     }
-    /// When true, the Review column shows only `readyForReview` cards —
-    /// waiting on the user and nothing else: no block, no in-progress
-    /// revision, CI green, no merge conflict. Sticky across app restarts
-    /// (persisted like the other board filters below), scoped to the
-    /// Review column only.
-    @Published var reviewReadyOnly: Bool = false {
+    /// When false (the default) parked tasks, chores and projects' tasks are
+    /// left off the board. When true they are added back in their lifecycle
+    /// columns, each carrying a "Parked" chip; un-parked rows are never hidden
+    /// by it.
+    @Published var showParked: Bool = false {
         didSet { notePublishedWorkInputChanged() }
     }
-    @Published var selectedWorkCardID: String?
+    /// The park confirmation sheet's target, presented from `ContentView`.
+    @Published var pendingParkRequest: ParkRequest?
+    var navigatorRevealRootID: String?
+    @Published var navigator = WorkNavigatorState()
+    @Published var selectedWorkCardID: String? {
+        didSet {
+            // A retained Navigator root can outlive the task store after a
+            // deletion event. Re-resolving that id would wipe retainedTask
+            // and the removal notice.
+            guard let id = selectedWorkCardID, task(withID: id) != nil else { return }
+            selectNavigatorRoot(id)
+        }
+    }
     /// Task id that the reveal animation is currently highlighting.
     /// Set after viewport confirmation; cleared after 1.5 s. Views observe
     /// this to apply a transient border-glow overlay on the matching
@@ -316,20 +404,64 @@ final class ChatViewModel: ObservableObject {
     var revealCompletion: ((EngineRevealResult) -> Void)?
     var revealProductID: String?
     var revealDeadlineToken = UUID()
+    /// How long a reveal waits for the target's product tree, and then
+    /// again for the card to confirm it is visible, before it fails.
+    static let revealDeadline: TimeInterval = 3
+    /// Schedules the work that fails a reveal once `revealDeadline` has
+    /// elapsed. Production arms a main-queue timer. Tests replace this
+    /// with a scheduler that captures the work and fires it on demand,
+    /// so a deadline can be shown to fire — or to be a stale no-op —
+    /// without sleeping the real interval out.
+    var revealDeadlineScheduler: (@escaping @MainActor () -> Void) -> Void = { work in
+        DispatchQueue.main.asyncAfter(deadline: .now() + ChatViewModel.revealDeadline) {
+            work()
+        }
+    }
     weak var revealBoardViewport: NSView?
     /// Task id whose card should be scrolled to once its product's
     /// work tree arrives. Used when a reveal crosses a product
     /// boundary — `revealWorkCard` sets this and the `workTree`
     /// event handler resolves it against the newly loaded board.
     var pendingRevealScrollID: String?
+    /// Whether a project filter was active when the deferred reveal began,
+    /// so the filter is reconciled against the target once its tree loads.
+    var pendingRevealReconcilesProjectFilter = false
     @Published var workBoardGrouping: WorkBoardGrouping = .none {
         didSet { notePublishedWorkInputChanged() }
     }
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
-    @Published var workErrorMessage: String?
+    /// Failure report for the passive `WorkNoticeBanner` in the window's
+    /// titlebar chrome (`ContentView.chromeBanners`): engine `work_error`
+    /// replies, failed reveals, broken doc pointers, and so on. Setting a
+    /// non-nil value shows (or replaces) the banner; `nil` hides it. This
+    /// is never presented modally — a modal would steal focus from
+    /// whatever the user is doing and block the window for a message
+    /// they often cannot act on. Every value is also logged, so a
+    /// dismissed message is still recoverable from the unified log.
+    @Published var workErrorMessage: String? {
+        didSet {
+            guard let workErrorMessage, workErrorMessage != oldValue else { return }
+            workNoticeLog.error("\(workErrorMessage, privacy: .public)")
+        }
+    }
+
+    /// Explicit dismissal from the banner's close control; the same
+    /// clearing many flows already do before starting a fresh action.
+    func dismissWorkErrorMessage() {
+        workErrorMessage = nil
+    }
     @Published var disconnectedActionNotice: String?
+    var uncertainActionNotice: String?
+    /// One entry per drop that left actions unconfirmed; cleared only by
+    /// `acknowledgeUncertainActions`.
+    var uncertainActionMessages: [String] = []
+    var unsavedActionNotice: String?
+    var retryingDisconnectedActions = false
+    /// Mirror of `engine.hasUnsentActions`, refreshed on connection and
+    /// action events so the banner never queries the engine from a view body.
+    @Published var hasUnsentActions = false
     /// Current state of an in-flight `evaluate_editorial_rules` RPC.
     @Published var editorialEvaluationState: EditorialEvaluationState = .idle
     @Published var workSearchText: String = "" {
@@ -401,19 +533,28 @@ final class ChatViewModel: ObservableObject {
     /// panel, ContentView root). Only the views that actually read
     /// live state subscribe to the store.
     let liveWorkerStates = LiveWorkerStateStore()
-
-    /// Slot ids whose live-status summarizer has been manually
-    /// disabled by the human via the Agents-tab toggle. Sourced from
-    /// `list_live_status_disabled_slots` at session start and kept
-    /// in sync via `live_status_enabled_set` echoes. Persisted on
-    /// the engine side so this is purely a UI mirror.
-    @Published var liveStatusDisabledSlotIDs: Set<Int> = []
+    /// Read-only views of workers on other hosts. Its own `ObservableObject`
+    /// for the same reason as `liveWorkerStates`: snapshots arrive every few
+    /// seconds and must not invalidate views that observe `ChatViewModel`.
+    let remotePaneViewer = RemotePaneViewerModel()
+    /// Engine-owned membership; publish only when a card changes section,
+    /// not for every tool/activity event in the high-rate live worker feed.
+    @Published var doingSectionsByID: [String: DoingSection] = [:]
+    /// Engine-owned dispatch order for queued cards; same publish discipline
+    /// as `doingSectionsByID`.
+    @Published var queuedDispatchByID: [String: QueuedDispatch] = [:]
 
     /// Per-installation settings snapshot, sourced from `get_settings`
     /// on Settings window open and kept in sync via `setting_set`
     /// echoes after every toggle. Empty until the Settings window is
     /// first opened in this session.
     @Published var engineSettings: [EngineSetting] = []
+
+    /// Persisted off-machine backup configuration, from `get_offsite_backup`
+    /// on Settings open and `offsite_backup_settings` after each save. `nil`
+    /// until the engine first answers.
+    @Published var offsiteBackup: OffsiteBackupSettings?
+    @Published var offsiteEdit = OffsiteBackupEdit()
 
     /// All registered hosts, populated by `list_hosts` on Settings-pane
     /// appear and updated in-place by `host_result`, `host_updated`, and
@@ -437,11 +578,12 @@ final class ChatViewModel: ObservableObject {
     @Published var engineAnthropicApiKeyPresent: Bool = true
 
     /// Current driver traffic split: how eligible, `standard`-reasoning
-    /// implementation work is allocated between the `grok`, `claude`, and
-    /// `codex` drivers. Sourced from `driver_traffic_split_result`, fetched
+    /// implementation work is allocated between the `grok`, `claude`, `codex`,
+    /// and `agy` drivers. Sourced from `driver_traffic_split_result`, fetched
     /// on Settings-pane appear and confirmed after every
     /// `setDriverTrafficShare` call.
     @Published var driverTrafficSplit: DriverTrafficSplit = .engineDefault
+    @Published var codexSolPercentage: Int = 100
 
     /// Per-driver provider quota usage, sourced from
     /// `driver_quota_usage_result`. Starts empty (`neverChecked`), which the
@@ -493,14 +635,9 @@ final class ChatViewModel: ObservableObject {
     /// Defaults to `.disconnected` until the engine's first reply lands.
     @Published var gitHubAuthState: GitHubAuthState = .disconnected
 
-    /// Resolved design-doc pointer state per project. Populated lazily
-    /// when a project surface (kanban project header, future detail
-    /// view) calls `resolveProjectDesignDoc(_:)`; refreshed whenever
-    /// the engine pushes a fresh `WorkTree` so a re-pointing or unset
-    /// from another session lands in the icon without a manual reload.
-    /// A missing entry means "we haven't asked yet" — the affordance
-    /// stays hidden until the engine replies.
+    /// Last click's resolve result; never used to refresh or decide icon visibility.
     @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
+    var pendingProjectDesignDocOpen: WorkProject?
     /// Designs-tab markdown listings, keyed by product id. A missing
     /// entry means "not asked yet"; the value is the engine's classified
     /// outcome (loaded / no repo / unreachable / rate-limited / empty).
@@ -516,38 +653,26 @@ final class ChatViewModel: ObservableObject {
     @Published var designDocContentByRef: [DesignDocRef: DesignDocContent] = [:]
     /// The document the Designs tab reader pane is showing, if any.
     @Published var selectedDesignDocRef: DesignDocRef?
-    /// In-flight resolve-RPC batch. The engine resolves design-doc
-    /// pointers in lock-step (responses arrive back-to-back regardless of
-    /// per-project work), so stamping each project with its own
-    /// start-to-response delta produces N near-identical numbers and
-    /// destroys per-project attribution. Instead we track one batch per
-    /// `refreshDesignDocStates` call and emit a single
-    /// `phase=resolve project=batch count=<n>` summary when the last
-    /// pending response arrives. Stray responses for projects outside the
-    /// current batch (a refresh that landed mid-flight) still update
-    /// state — they just don't drive timing.
-    struct DesignDocResolveBatch {
-        var startDate: Date
-        var pendingProjectIDs: Set<String>
-        let initialCount: Int
-    }
-    var currentDesignDocResolveBatch: DesignDocResolveBatch?
-
-    /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
-    /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
-    /// button taps. Phase 5 #14 of the merge-conflict design.
-    @Published var conflictResolutions: [WorkConflictResolution] = [] {
+    /// Compact conflict rows, updated by pushes and open-PR recovery.
+    @Published var conflictResolutions: [EngineAttemptListEntry] = [] {
         didSet { notePublishedWorkInputChanged() }
     }
 
-    /// Engine-tab CI-remediation attempt list, freshest first.
-    /// Mirror of [[conflictResolutions]]; refreshed on Engine-tab
-    /// entry, on `ci_remediation_*` topic pushes, and on `Refresh`
-    /// button taps. Phase 11 #37 of the merge-conflict design.
-    @Published var ciRemediations: [WorkCiRemediation] = [] {
+    /// Compact CI rows, updated by pushes and open-PR recovery.
+    @Published var ciRemediations: [EngineAttemptListEntry] = [] {
         didSet { notePublishedWorkInputChanged() }
     }
 
+    /// True while buffered pushes are being replayed through `handle`, so the
+    /// replay is not itself buffered again.
+    var replayingRemediationEvents = false
+    /// Whether the Activity tab is on screen; history reads are issued only then.
+    var activityIsVisible = false
+    /// Request id of the outstanding open-PR snapshot read, if any.
+    var remediationStateRequestID: String?
+    /// Lifecycle pushes received while a read (history or open-PR snapshot)
+    /// was outstanding, keyed by request id and replayed when it returns.
+    var remediationEventsDuringRead: [String: [EngineEvent]] = [:]
     /// The authoritative, merged attempt feed for Activity. Unlike the
     /// source-specific arrays above, these entries deliberately contain only
     /// shared list fields; a selected row loads its detailed record on demand.
@@ -676,6 +801,7 @@ final class ChatViewModel: ObservableObject {
     /// loaded/failed without needing to pass content through the
     /// `openWindow` value type.
     let asyncMarkdownViewerVM = AsyncMarkdownViewerViewModel()
+    let navigatorReviewGuides = NavigatorReviewGuideStore()
 
     /// In-flight engine fetch for the async markdown viewer (project /
     /// investigation doc icon). `applyProductDesignDocContent` updates
@@ -734,7 +860,8 @@ final class ChatViewModel: ObservableObject {
     /// Work item IDs for which `merge_when_ready` has been sent but
     /// `merge_when_ready_accepted` (or `work_error`) has not yet arrived.
     /// Guards against a duplicate tap while the engine is running the merge.
-    var mergingWhenReadyIDs: Set<String> = []
+    @Published var mergingWhenReadyIDs: Set<String> = []
+    var mergeRequestStartedAt: [String: ContinuousClock.Instant] = [:]
 
     /// Which surface initiated each in-flight merge, keyed by work item id.
     /// Copied onto `MergeRevisionConfirmation.origin` when the engine asks
@@ -768,7 +895,12 @@ final class ChatViewModel: ObservableObject {
     static let connectionLostBannerDelay: TimeInterval = 2.0 // grace period before a disconnect may raise the banner
     var connectionGeneration = 0 // bumped on connect/disconnect; supersedes a stale banner-reveal
     var subscribedWorkTopics: Set<String> = []
-    let defaults = BossDefaults.store
+    lazy var selectionHistory = WorkSelectionHistory(defaults: defaults)
+    var isRestoringWorkSelection = true
+    @Published var isWorkSidebarHidden = false {
+        didSet { defaults.set(isWorkSidebarHidden, forKey: "boss.work.sidebarHidden") }
+    }
+    let defaults: UserDefaults
 
     /// Notification manager for Review-lane transitions. Fires a system
     /// banner when a task reaches `in_review` while the app is backgrounded.
@@ -792,12 +924,14 @@ final class ChatViewModel: ObservableObject {
     let includeChoresDefaultsKey = "boss.work.includeChores"
     let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     let showArchivedProjectsDefaultsKey = "boss.work.showArchivedProjects"
-    let reviewReadyOnlyDefaultsKey = "boss.work.reviewReadyOnly"
+    let showParkedDefaultsKey = "boss.work.showParked"
     let workBoardGroupingDefaultsKey = "boss.work.grouping"
+    let legacyReviewReadyOnlyDefaultsKey = "boss.work.reviewReadyOnly"
     let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
     let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
 
-    init(paths: BossEnginePaths) {
+    init(paths: BossEnginePaths, defaults: UserDefaults = BossDefaults.store) {
+        self.defaults = defaults
         self.paths = paths
         self.socketPath = paths.socketPath
         self.processController = EngineProcessController(paths: paths)
@@ -821,16 +955,29 @@ final class ChatViewModel: ObservableObject {
     /// `BossEnginePaths.forTest(...)` so the test-context refusal in
     /// `BossEnginePaths.production*()` still applies to anything that
     /// reaches for the canonical paths.
-    convenience init(socketPath: String) {
+    convenience init(socketPath: String, defaults: UserDefaults = BossDefaults.store) {
         let paths = BossEnginePaths.forTest(
             socketPath: socketPath,
             pidPath: "\(socketPath).pid",
             controlTokenPath: "\(socketPath).token"
         )
-        self.init(paths: paths)
+        self.init(paths: paths, defaults: defaults)
     }
 
     private func commonInit() {
+        defer { isRestoringWorkSelection = false }
+        isWorkSidebarHidden = defaults.bool(forKey: "boss.work.sidebarHidden")
+        navigator.mode = defaults.string(forKey: "boss.work.viewMode").flatMap(WorkViewMode.init(rawValue:)) ?? .kanban
+        bindBoardReadObserver()
+        bindRemotePaneViewer()
+        commentBridge.onSubmissionRejected = { [weak self] action in
+            self?.showActionNotSaved(requestKind: action)
+        }
+        commentBridge.onSubmissionAccepted = { [weak self] in
+            guard let self, self.unsavedActionNotice != nil else { return }
+            self.unsavedActionNotice = nil
+            self.showDisconnectedActionNotice()
+        }
 
         if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
            let persistedMode = NavigationMode(rawValue: rawMode) {
@@ -846,7 +993,9 @@ final class ChatViewModel: ObservableObject {
         }
         showBlockedOnly = defaults.bool(forKey: showBlockedOnlyDefaultsKey)
         showArchivedProjects = defaults.bool(forKey: showArchivedProjectsDefaultsKey)
-        reviewReadyOnly = defaults.bool(forKey: reviewReadyOnlyDefaultsKey)
+        showParked = defaults.bool(forKey: showParkedDefaultsKey)
+        // Remove the unused preference left by earlier builds.
+        defaults.removeObject(forKey: legacyReviewReadyOnlyDefaultsKey)
         if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),
            let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
             workBoardGrouping = grouping
@@ -859,6 +1008,10 @@ final class ChatViewModel: ObservableObject {
 
         processController.onOutputLine = { [weak self] line in
             self?.appendSystemMessage(line)
+            // Engine handoff decisions (`[engine version-check …]`, `[engine upgrade]`,
+            // `[engine launch]`) join the durable update trail for the launch that
+            // completed or rolled back an update. No-op outside that context.
+            UpdateLifecycle.recordEngineLine(line)
         }
         processController.onSupervisionStateChange = { [weak self] state in
             guard let self, self.engineSupervisionState != state else { return }
@@ -867,6 +1020,9 @@ final class ChatViewModel: ObservableObject {
 
         bindEngineEventStream()
 
+        reviewNotifier.onSelectDecision = { [weak self] taskID, productID in
+            self?.revealWorkCard(taskID, productID: productID) { _ in }
+        }
         reviewNotifier.configure()
         reviewNotifier.onSelectWorkItem = { [weak self] taskID in
             self?.setNavigationMode(.work)
@@ -935,6 +1091,7 @@ final class ChatViewModel: ObservableObject {
             exit(0)
         }
 
+        UpdateLifecycle.recordStartup("engine-handoff-begin")
         didStart = true
 
         // UI tests drive explicit fixture clients and events directly. The
@@ -950,6 +1107,7 @@ final class ChatViewModel: ObservableObject {
                 do {
                     try processController.start()
                     DispatchQueue.main.async {
+                        UpdateLifecycle.recordStartup("engine-handoff-complete")
                         self?.startEngineIfNeeded()
                     }
                 } catch {
@@ -1024,8 +1182,8 @@ final class ChatViewModel: ObservableObject {
     /// leaves them `nil` and those arms answer with a failure.
     var paneAttachHandler: ((EngineAttachRequest) -> EngineAttachResult)?
     var coordinatorPaneAttachHandler: ((EngineCoordinatorAttachRequest) -> EngineCoordinatorAttachResult)?
-    var paneDetachHandler: ((Int) -> EngineReleaseResult)?
-    var paneFocusHandler: ((Int) -> EngineFocusResult)?
+    var paneDetachHandler: ((String) -> EngineReleaseResult)?
+    var paneFocusHandler: ((String) -> EngineFocusResult)?
     /// Enumerates every slot the app currently hosts a session in,
     /// regardless of whether the engine has a live-tracked run for it.
     /// Backs `bossctl agents list --all`. `nil` build (Bazel without
@@ -1036,6 +1194,10 @@ final class ChatViewModel: ObservableObject {
     /// `WorkersWorkspaceModel` and records the engine's desired coordinator model.
     /// Parameters: workerSlots, automationSlots, reviewSlots, coordinatorModel.
     var panePoolConfigHandler: ((Int, Int, Int, String) -> Void)?
+    /// Refresh finished labels after session registration or work-item changes.
+    var executionLabelsInvalidatedHandler: (() -> Void)?
+    /// Receives the engine's resolved labels for finished panes.
+    var executionLabelsHandler: (([ExecutionWorkLabel]) -> Void)?
 
     /// The model the engine would use for the next coordinator creation.
     /// Paired with `attachedCoordinatorModel` to make a replacement explicitly
@@ -1045,6 +1207,14 @@ final class ChatViewModel: ObservableObject {
     var attachedCoordinatorSpawnToken: String?
     var declinedCoordinatorRecreateToken: String?
     @Published var coordinatorModelRecreateConfirmation: CoordinatorModelRecreateConfirmation?
+    @Published var coordinatorResetWaiting = false
+    @Published var coordinatorResetDeliveryFailed = false
+    /// Why the engine could not deliver the handoff request, as the engine
+    /// stated it (which step failed and its reason). Shown verbatim under the
+    /// delivery-failure banner; `nil` while no failure is being shown.
+    @Published var coordinatorResetDeliveryFailureReason: String?
+    @Published var coordinatorResetForced = false
+    var pendingCoordinatorReset: (token: String, reason: CoordinatorRecreateReason)?
 
     /// The installed `claude` version, set only while the engine reports it
     /// as newer than what the running coordinator session actually launched
@@ -1077,6 +1247,8 @@ final class ChatViewModel: ObservableObject {
     /// `nil` whenever a published input changes (see `invalidateWorkCache`).
     /// Keeps engine pushes that don't touch the work tree (e.g.
     /// `worker.live_states`) from re-walking the projects/tasks/chores trees.
+    var cachedNavigatorSections: [NavigatorSectionRows]?
+    var cachedNavigatorCompatibility: (message: String?, computed: Bool)?
     var cachedVisibleItems: [WorkTask]?
     var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
     var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
@@ -1151,6 +1323,8 @@ final class ChatViewModel: ObservableObject {
     /// the full id index when bucket membership is unchanged.
     func invalidateWorkCache(_ keys: WorkCacheInvalidation) {
         if keys.contains(.boardLayout) {
+            cachedNavigatorSections = nil
+            cachedNavigatorCompatibility = nil
             cachedVisibleItems = nil
             cachedItemsByColumn.removeAll(keepingCapacity: true)
             cachedSectionsByColumn.removeAll(keepingCapacity: true)
@@ -1200,11 +1374,15 @@ final class ChatViewModel: ObservableObject {
     /// previous notice is replaced when a new refusal fires.
     @Published var dragRefusalNotice: DragRefusalNotice?
 
-    /// A drag-to-Doing whose `EvaluateDispatchAdmission` reply is still
-    /// in flight. Single-slot, like `dragRefusalNotice` — a second drag
-    /// landing before the first's reply arrives simply supersedes it; the
-    /// stale reply is dropped by `taskID` mismatch in the event handler.
-    var pendingDragAdmissionCheck: PendingDragAdmissionCheck?
+    /// Drag-to-Doing gestures whose `EvaluateDispatchAdmission` reply is
+    /// still in flight, keyed by task id so several drags queued during a
+    /// connection gap each keep their own continuation through Retry. A
+    /// newer drag of the same task supersedes its earlier entry.
+    var pendingDragAdmissionChecks: [String: PendingDragAdmissionCheck] = [:]
+    /// Any in-flight admission check (nil when none).
+    var pendingDragAdmissionCheck: PendingDragAdmissionCheck? { pendingDragAdmissionChecks.values.first }
+    /// Confirmations that arrived while another pause-override alert was up.
+    var queuedPauseOverrideConfirmations: [PauseOverrideConfirmation] = []
 
     /// Set once `EvaluateDispatchAdmission` reports an active, overridable
     /// pause and no other blocker — the confirmation dialog binds to this.
@@ -1252,8 +1430,8 @@ final class ChatViewModel: ObservableObject {
     /// (the generic reply carries no request id to disambiguate further —
     /// same limitation `mergeFeedbackNotice`'s doc comment describes for
     /// success). Read by the review-guide viewer header, which — unlike the
-    /// board card — has no other surface for `workErrorMessage`'s modal
-    /// alert. Cleared on a fresh `mergeWhenReady(for:)` attempt, on
+    /// board card — has no other surface for `workErrorMessage`'s chrome
+    /// banner. Cleared on a fresh `mergeWhenReady(for:)` attempt, on
     /// `.mergeWhenReadyAccepted`, and via `clearMergeError(for:)`.
     @Published var mergeErrorNoticesByTaskID: [String: String] = [:]
 

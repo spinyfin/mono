@@ -180,13 +180,24 @@ struct WorkTask: Identifiable, Hashable {
     /// the kanban — the purple wand icon distinguishes them from human-filed
     /// work so the user can still review and merge their PRs.
     var sourceAutomationId: String? = nil
-    /// `true` while an independent `pr_review` reviewer execution is running
-    /// for this task. The task is held in the Doing column until the reviewer
-    /// finalises (or a timeout forces the advance). Surfaces as a
-    /// "Reviewing (AI)" badge on the card so the user can see the hold is
-    /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
-    /// absent (older engines / tasks not undergoing an AI review pass).
+    /// Parking provenance. `parkedAt` (epoch seconds, decimal string) is the
+    /// single load-bearing fact: non-`nil` means the owner parked this row.
+    /// `parkedVia` is `"direct"` or `"project:<id>"` (stamped by the project's
+    /// park cascade). Mirror `Task.parked_*` on the wire; see `isParked`.
+    var parkedAt: String? = nil
+    var parkedBy: String? = nil
+    var parkedReason: String? = nil
+    var parkedVia: String? = nil
+    /// Engine-resolved review activity, including a held revision's started
+    /// batch across reviewer re-admission, consolidation and verdict apply.
+    /// First admission to the review pool remains queued.
     var aiReviewing: Bool = false
+    /// Engine-reported stage of the AI review cycle (`"reviewers"`,
+    /// `"consolidation"` or `"applying"`). Mirrors `Task.ai_review_stage`; only set while
+    /// `aiReviewing` is true.
+    var aiReviewStage: String? = nil
+    /// Engine-resolved parent-card rollup, including review-phase blocked revisions.
+    var boardFoldedRevision: Bool = false
     /// Engine-resolved review for the current PR head. `not_reviewed`
     /// explicitly marks missing review evidence; `reviewed_clean_pending`
     /// means AI passed but CI, mergeability, or revisions prevent readiness.
@@ -207,6 +218,25 @@ struct WorkTask: Identifiable, Hashable {
     /// CLI and any future surface agree with the board. Mirrors
     /// `Task.ready_for_review` on the wire; `false` when absent.
     var readyForReview: Bool = false
+    /// The labelled Review-column section the engine grouped this card
+    /// under, or `nil` for a row that is not a Review-lane card (and for an
+    /// engine that predates the field). Engine-computed — the board renders
+    /// the key it is given and never re-derives it from the badge fields
+    /// above. Mirrors `Task.review_section` on the wire.
+    var reviewSection: ReviewSection? = nil
+    /// Whether the engine's payload carried the `review_section` key at all
+    /// — as a section or as `null`. A section-aware engine always writes the
+    /// key (null for a row that is not a Review-lane card), so a payload
+    /// without it came from an engine that predates the field: the one case
+    /// where a Review card with `reviewSection == nil` is not a defect (see
+    /// `ChatViewModel.missingReviewSectionIsExpected(for:)`). Rows built
+    /// in-app rather than parsed off the wire default to `false` for the
+    /// same reason — no engine vouched for them.
+    var reviewSectionReported: Bool = false
+    /// GitHub's `updatedAt` for the bound PR (RFC 3339), engine-supplied.
+    /// Together with `updatedAt` it keys the Review column's Pending-section
+    /// order. Mirrors `Task.pr_updated_at` on the wire.
+    var prUpdatedAt: String? = nil
     /// Resolved doc-link state for this work item. Independent of `kind`
     /// — any task may carry a per-task pointer. Mirrors `Task.doc_link_state`
     /// on the wire: the engine resolves the task's own `doc_*` columns
@@ -301,6 +331,7 @@ struct WorkTask: Identifiable, Hashable {
     /// there is none (never asked, answered, withdrawn, or of an answer type
     /// this build cannot render). Mirrors `Task.operator_question`.
     var operatorQuestion: OperatorQuestion? = nil
+    var navigator: NavigatorProjection? = nil
 
     var isChore: Bool {
         kind == "chore" || (kind == "followup" && projectID == nil)
@@ -383,6 +414,7 @@ enum WorkBlockedBadge {
         case "ci_failure_exhausted": return "CI Failed"
         case "review_feedback": return "Review"
         case "awaiting_operator_answer": return "Needs Answer"
+        case "spawning_attempt_retired_unsuccessfully": return "Fix Attempt Ended"
         default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
@@ -395,7 +427,7 @@ enum WorkBlockedBadge {
     /// exactly the case that can be truncated prose).
     private static let knownReasons: Set<String> = [
         "dependency", "merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback",
-        "awaiting_operator_answer",
+        "awaiting_operator_answer", "spawning_attempt_retired_unsuccessfully",
     ]
 
     /// Whether the blocked pill has meaningfully more to say than its
@@ -437,6 +469,13 @@ enum WorkPriority: String, CaseIterable, Identifiable {
     case low
     case medium
     case high
+    /// The human owner's escape hatch above `high`. The engine accepts
+    /// it only from a human session (never from the coordinator's CLI
+    /// tier or a worker), so it is offered here, in the app, and
+    /// refused with a "Work Error" alert for anything else. A critical
+    /// item dispatches ahead of everything, past the interactive
+    /// concurrency cap, and through an operator dispatch pause.
+    case critical
 
     var id: String { rawValue }
 
@@ -456,6 +495,7 @@ enum WorkPriority: String, CaseIterable, Identifiable {
         case .low: return "Low"
         case .medium: return "Medium"
         case .high: return "High"
+        case .critical: return "Critical"
         }
     }
 }
@@ -487,8 +527,8 @@ extension WorkTask {
     ///     has an open PR; the block is transient and in-flight. The card
     ///     shows the reason badge so the state is legible.
     ///   • `awaiting_operator_answer` with an open question
-    ///     (`isAwaitingOperatorAnswer`) → Doing's "Needs Attention"
-    ///     section: the task is work in progress waiting on an answer.
+    ///     (`isAwaitingOperatorAnswer`) → Doing's Queued
+    ///     section (no worker is live on it): the task is work in progress waiting on an answer.
     ///   • Everything else (dependency, nil, unknown) → Backlog: the item
     ///     can't start yet, so from the user's perspective it sits with
     ///     the not-yet-active pile.
@@ -540,6 +580,12 @@ extension WorkTask {
         }
     }
 
+    /// The engine resolves whether this revision is represented on its parent.
+    /// Board membership consumes the projection without inferring it from status.
+    var isFoldedRevision: Bool {
+        boardFoldedRevision
+    }
+
     /// `true` when this task is blocked for a review-phase reason —
     /// it has an open PR and the block is transient (conflict resolution
     /// or CI fix in progress). These tasks render in Review, not Backlog.
@@ -555,7 +601,7 @@ extension WorkTask {
     /// `true` when a worker ended its run by asking the user a question
     /// and nobody has answered yet: the task is `blocked` for
     /// `awaiting_operator_answer` *and* the engine projected an open question
-    /// onto it. Routes the card into Doing's "Needs Attention" section
+    /// onto it. Routes the card into Doing's Queued section
     /// (`boardColumn`).
     ///
     /// Gated on `status`, for the same stale-scalar reason `WorkBlockedBadge`
@@ -563,7 +609,7 @@ extension WorkTask {
     /// route a card. Gated on the question too: a parked task with the
     /// reason but nothing to answer (an answer type this build cannot render,
     /// or a payload racing the question's withdrawal) stays a plain blocked
-    /// card in Backlog rather than a Needs Attention card with no buttons.
+    /// card in Backlog rather than a Queued card with no buttons.
     var isAwaitingOperatorAnswer: Bool {
         status == "blocked"
             && blockedReason == "awaiting_operator_answer"
@@ -605,6 +651,20 @@ extension WorkTask {
             && mergeQueueState == nil
     }
 
+    /// Mirrors `Task::is_parked`: the row carries its own park stamp and is
+    /// still open. A merged or archived row keeps its stamp as history but is
+    /// finished work and must not hide behind the parked filter. This reads
+    /// only the row's own stamp; `ChatViewModel.isParked(_:)` adds the
+    /// parked-project backstop.
+    var hasOwnParkStamp: Bool {
+        parkedAt != nil && status != "done" && status != "archived"
+    }
+
+    /// `true` when the stamp came from the project's park cascade, so only
+    /// un-parking the project (not this row) can clear it.
+    var isParkedViaProject: Bool {
+        parkedVia?.hasPrefix("project:") == true
+    }
 }
 
 struct WorkTaskRuntime: Hashable {
@@ -619,15 +679,24 @@ struct WorkTaskRuntime: Hashable {
     /// backoff after a pre-spawn dispatch failure, `nil` for a genuine
     /// capacity wait. Mirrors `TaskRuntime.dispatch_retry_at` on the wire.
     var dispatchRetryAt: String?
-    /// The dispatcher's current defer reason for this `ready` execution
-    /// (e.g. `chain_serialized`, `pool_exhausted`), `nil` when it isn't
-    /// currently deferred. Mirrors `TaskRuntime.dispatch_wait_reason`.
+    /// Why the item is waiting rather than running, as the engine's wait
+    /// classifier reports it: a wait code (e.g. `pool_exhausted`,
+    /// `project_order`) or the scheduler's own sentence for one hold. `nil`
+    /// when the item is not waiting on dispatch. `unclassified` marks a wait
+    /// the engine could not name. Mirrors `TaskRuntime.dispatch_wait_reason`.
     let dispatchWaitReason: String?
     /// Unix epoch seconds (decimal string) since `dispatchWaitReason` took
     /// its current value. Mirrors `TaskRuntime.dispatch_wait_since`.
     let dispatchWaitSince: String?
     var dispatchNotBefore: String? = nil
     var dispatchWaitBlocker: DispatchWaitBlocker? = nil
+    /// The engine's phrase for `dispatchWaitReason`, rendered as given. The
+    /// app never maps a wait code to text itself. Mirrors
+    /// `TaskRuntime.dispatch_wait_label`.
+    var dispatchWaitLabel: String? = nil
+    /// Failed attempts that produced a `failure_backoff` wait. Empty for
+    /// every other reason. Newest last. Mirrors `TaskRuntime.dispatch_failures`.
+    var dispatchFailures: [DispatchFailureAttempt] = []
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by
@@ -663,6 +732,11 @@ struct ExecutionVM: Identifiable, Hashable, RevisionChainItem {
     let runId: String?
     let startedAt: String?
     let endedAt: String?
+    /// `startedAt` / `endedAt` parsed once at decode time. The engine stamps
+    /// epoch-seconds strings (ISO-8601 is also accepted); `nil` means absent
+    /// or unparseable, in which case consumers fall back to the raw string.
+    let startedDate: Date?
+    let endedDate: Date?
 }
 
 /// Resolved dependency row used by the card detail Dependencies

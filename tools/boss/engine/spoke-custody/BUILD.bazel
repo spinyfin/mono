@@ -1,0 +1,67 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Hub custody of the transcript and artifact bytes spokes journal: exact-offset,
+# digest-checked files plus the ledger that says what is held and why anything
+# is missing. Consumers reach it through spoke-hub's re-export or, for the
+# structured-output and transcript readers, the spoke host adapter.
+rust_library(
+    name = "spoke-custody",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_custody",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/spoke-hub:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+# Same sources against the work-db test fixture, so crates whose tests swap
+# their WorkDb (engine_lib_test, app_test) get one WorkDb type throughout.
+rust_library(
+    name = "spoke_custody_test_support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//tools/boss/engine/work-db:work_db_test_support": "boss_work_db",
+    },
+    crate_name = "boss_spoke_custody",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/spoke-hub:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/work-db:work_db_test_support",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    size = "small",
+    crate = ":spoke-custody",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

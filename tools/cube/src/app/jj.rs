@@ -5,6 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
+use git_utils::pr_bookmark;
+
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::{audit, paths};
 
@@ -41,6 +43,12 @@ pub(super) fn network_cmd_timeout() -> Duration {
         .filter(|s| *s >= 5)
         .unwrap_or(DEFAULT_NETWORK_CMD_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// Longest a [`run_jj_network_within`] call can legitimately run without a
+/// caller deadline: every attempt, including retries, at the full timeout.
+pub(super) fn network_cmd_total_bound() -> Duration {
+    network_cmd_timeout() * (NETWORK_CMD_RETRIES + 1)
 }
 
 /// Default wall-clock bound for a single `jj git push` attempt. Larger than
@@ -285,6 +293,45 @@ pub(super) fn run_jj(
     invocation: &CommandInvocation,
 ) -> Result<String> {
     run_jj_within(runner, database_path, invocation, None)
+}
+
+/// Engine-owned pointer namespaces: per-execution recovery and base
+/// bookmarks, teardown-preserved tips, and archived unpublished heads. They
+/// are never the branch a PR is published from, nor stacked-PR boundaries.
+pub(super) const ENGINE_POINTER_BOOKMARK_PREFIXES: [&str; 4] =
+    ["boss-recovery/", "boss-base/", "preserved/", "preserved-archive/"];
+
+/// Bookmarks that are local bookkeeping, not a published PR branch or a
+/// stacked-PR boundary: obsolete `pr/<n>` aliases and the engine pointer
+/// namespaces. Branch inference and the replay-only collapse guard must
+/// share this so a new pointer prefix cannot drift between the two.
+pub(super) fn is_bookkeeping_bookmark(name: &str) -> bool {
+    pr_bookmark::is_pr_bookmark(name)
+        || ENGINE_POINTER_BOOKMARK_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// Rebase `branch` and its descendants onto `destination`. `-b` rewrites the
+/// whole descendant closure; branch bookmarks follow their commits, and no
+/// other pointer is saved or restored around it. Legacy `pr/<n>` bookmarks
+/// in the rewritten range also follow their commits, including into conflicts.
+pub(super) fn rebase_branch_onto(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    branch: &str,
+    destination: &str,
+) -> Result<String> {
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["rebase", "-b", branch, "-d", destination, "--ignore-immutable"],
+        ),
+    )
 }
 
 /// [`run_jj`] under a caller's wall-clock `deadline`. Every subprocess this

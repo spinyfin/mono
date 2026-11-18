@@ -75,7 +75,9 @@ pub struct CiBudgetSnapshot {
 /// merge-queue rebounce this is the PR head attributed to the dequeue event;
 /// `before_commit_sha` separately stores the synthetic merged-result commit.
 /// `head_sha_after` brackets the worker's push (`None` on failure
-/// or for re-trigger-only attempts).
+/// or for re-trigger-only attempts); on an attempt abandoned because a newer
+/// head superseded it, it instead records that superseding head (which may be
+/// a human push or rebase).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CiRemediation {
@@ -103,6 +105,9 @@ pub struct CiRemediation {
     /// attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_commit_sha: Option<String>,
+    /// Historical base of the failed queue construction, even if checks were not captured.
+    #[serde(default)]
+    pub queue_base_sha: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cube_lease_id: Option<String>,
@@ -163,7 +168,11 @@ pub struct CiRemediation {
 /// `succeeded` (push landed, PR back to mergeable), `superseded`
 /// (a newer attempt — or a human push — replaced this one),
 /// `failed` (worker gave up / errored), `abandoned` (engine
-/// declined to spawn, e.g. churn-threshold or product opt-out).
+/// declined to spawn, e.g. churn-threshold or product opt-out),
+/// `deferred` (the conflict is recorded but its resolution waits until a
+/// merge is requested for the PR or a human asks; no attempt has been
+/// made). A `deferred` row ends as `superseded`, with
+/// `deferral_end_reason` saying what ended it.
 ///
 /// `pr_url` / `pr_number` / `head_branch` / `base_branch` are
 /// snapshots of the parent's PR state at trigger time so the row
@@ -267,6 +276,53 @@ pub struct ConflictResolution {
     /// halt, or fall-through). `None` for every non-mechanical row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mechanical_rung_in_flight: Option<i64>,
+
+    /// `true` once the repo owner has answered the architectural-mismatch
+    /// question for this attempt (rewrite or force a merge). From then on
+    /// `architectural_mismatch` is no longer an allowed exit: the engine
+    /// refuses `mark-failed` with that reason and the worker prompt does not
+    /// offer it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[builder(default)]
+    pub mismatch_exit_barred: bool,
+
+    /// Which arm of the just-in-time resolution rollout this row was
+    /// assigned at detection: `"deferred"` (resolution waits for a merge
+    /// request) or `"control"` (resolved on detection). `None` for rows
+    /// written while deferral was off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral_arm: Option<String>,
+
+    /// Set on a row that recorded a deferred conflict once the deferral is
+    /// over: `merge_requested`, `human_request`, `deferral_disabled` or
+    /// `resolution_started` when the conflict was handed to the resolver,
+    /// `conflict_cleared` when the PR stopped conflicting on its own, and
+    /// `pr_merged` / `pr_closed` when the PR ended first. `None` on every
+    /// row that is not an ended deferral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral_end_reason: Option<String>,
+
+    /// Ordered tier decisions, including retries. Stored as a JSON TEXT
+    /// column and decoded by the work-db mapper. `conflicts list --json`
+    /// emits this as an array of objects, not a nested JSON string.
+    /// Absent on historical attempts whose routing was only logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_outcomes: Option<Vec<LadderDecision>>,
+
+    /// Latest mechanical outcome or fall-through reason, preserved when an
+    /// agent is scheduled. For direct worker routing, the scheduling reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_reason: Option<String>,
+}
+
+/// One completed conflict-ladder tier decision. `recorded_at` is the
+/// engine clock string written at persist time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LadderDecision {
+    pub outcome: String,
+    pub reason: String,
+    pub recorded_at: String,
+    pub tier: String,
 }
 
 fn default_review_watch_event_source() -> String {
@@ -274,7 +330,7 @@ fn default_review_watch_event_source() -> String {
 }
 
 /// Aggregated hotspot report over `conflict_resolutions.conflict_diagnosis`
-/// for one product (Layer 0 telemetry, T5 — see `tools/boss/docs/designs/
+/// for one product (Layer 0 telemetry — see `tools/boss/docs/designs/
 /// merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
 /// Exposed as `boss engine conflicts hotspots`. Always scoped to a single
 /// `product_id` — hotspot data is only meaningful within one repo, so the
@@ -282,7 +338,9 @@ fn default_review_watch_event_source() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConflictHotspotReport {
     pub product_id: String,
-    /// Number of `conflict_resolutions` rows scanned for this product.
+    /// Number of successful fetched-base diagnoses included for this product.
+    /// Historical diagnoses without a fetched base tip, and probes that
+    /// recorded an error, are excluded.
     pub total_events: u64,
     /// Per-file conflict frequency, most-frequent first, capped to the
     /// requested top-N.
@@ -314,4 +372,89 @@ pub struct ConflictFilePairFrequency {
 pub struct ConflictClassCount {
     pub class: String,
     pub count: u64,
+}
+/// Worker-reported verification of the tree rebased onto current origin/main.
+/// Each failed queue job must be covered by successful Bazel invocations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct QueueCiEvidence {
+    pub main_sha: String,
+    pub verified_head_sha: String,
+    pub queue_sha: String,
+    pub queue_base_sha: String,
+    pub runs: Vec<QueueCiRun>,
+    /// GitHub enqueuePullRequest receipt, required for an unchanged-head delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_entry_id: Option<String>,
+    /// RFC 3339 `mergeQueueEntry.enqueuedAt` from the same receipt. Anchors
+    /// the dedup boundary: queue failures at or before it are superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_entry_enqueued_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct QueueCiRun {
+    pub check_name: String,
+    /// The captured failing check's target_url (including job fragment, if present).
+    pub source_url: String,
+    /// Complete Bazel command, including every failed target, or the whole job.
+    pub command: String,
+    pub exit_code: i32,
+    pub output: String,
+    /// Explains target coverage; whole-job failures must reproduce the full invocation.
+    pub coverage: String,
+}
+
+impl ConflictResolution {
+    /// Compact projection shared by lifecycle pushes and Activity lists.
+    pub fn list_entry(&self) -> super::EngineAttemptListEntry {
+        let mut extra = std::collections::BTreeMap::new();
+        if let Some(id) = &self.revision_task_id {
+            extra.insert("revision_task_id".into(), id.clone());
+        }
+        if let Some(arm) = &self.deferral_arm {
+            extra.insert("deferral_arm".into(), arm.clone());
+        }
+        if let Some(reason) = &self.deferral_end_reason {
+            extra.insert("deferral_end_reason".into(), reason.clone());
+        }
+        super::EngineAttemptListEntry {
+            id: self.id.clone(),
+            product_id: self.product_id.clone(),
+            kind: "conflict".into(),
+            work_item_id: Some(self.work_item_id.clone()),
+            pr_url: self.pr_url.clone(),
+            status: self.status.clone(),
+            failure_reason: self.failure_reason.clone(),
+            created_at: self.created_at.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            extra,
+        }
+    }
+}
+
+impl CiRemediation {
+    /// Compact projection shared by lifecycle pushes and Activity lists.
+    pub fn list_entry(&self) -> super::EngineAttemptListEntry {
+        let mut extra = std::collections::BTreeMap::new();
+        if let Some(id) = &self.revision_task_id {
+            extra.insert("revision_task_id".into(), id.clone());
+        }
+        extra.insert("attempt_kind".into(), self.attempt_kind.clone());
+        super::EngineAttemptListEntry {
+            id: self.id.clone(),
+            product_id: self.product_id.clone(),
+            kind: "ci".into(),
+            work_item_id: Some(self.work_item_id.clone()),
+            pr_url: self.pr_url.clone(),
+            status: self.status.clone(),
+            failure_reason: self.failure_reason.clone(),
+            created_at: self.created_at.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            extra,
+        }
+    }
 }

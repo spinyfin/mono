@@ -25,14 +25,23 @@ struct ContentView: View {
     @StateObject private var bossPane = BossPaneModel()
     #endif
     @StateObject private var updateQuitRequest = UpdateQuitRequest()
-    @State private var isSearchExpanded: Bool = false
-    @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
+    private var workColumnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(get: { model.isWorkSidebarHidden ? .detailOnly : .all },
+                set: { model.isWorkSidebarHidden = $0 == .detailOnly })
+    }
+    @FocusState private var workSearchFocused: Bool
+    // The hidden Work tree still contributes to the shared window toolbar.
+    private var workSearchBinding: Binding<String> {
+        Binding(
+            get: { model.navigationMode == .work ? model.workSearchText : "" },
+            set: { if model.navigationMode == .work { model.workSearchText = $0 } }
+        )
+    }
     @State private var showCoordinatorResetConfirmFromBanner = false
     @Environment(\.openWindow) private var openWindow
-    @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var useStandardSearch: Bool = false
     @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .productDefault
 
-    var body: some View {
+    private var navigationContent: some View {
         // Work and Agents stay mounted via opacity + hit-testing. Switching
         // either tree to `if navigationMode ==` would call
         // `GhosttyTerminalView.dismantleNSView` → `ghostty_surface_free` on
@@ -50,9 +59,8 @@ struct ContentView: View {
         // Hidden-tab layout cost is cut without unmounting: `WorkersDetailView`
         // is Equatable over workspace / live-state identity, visibility, and
         // the two live-status flags, so an unrelated `ChatViewModel` publish
-        // (the kanban's usual invalidation) skips the Agents body. While the
-        // tab is hidden, its snapshot cache also prevents live-state ticks
-        // from invalidating a grid or slot while preserving all surfaces.
+        // (the kanban's usual invalidation) skips the Agents body. Off-page
+        // and unplaced attached surfaces stay mounted at zero opacity.
         //
         // This ZStack must stay the root of the window's content: SwiftUI only
         // promotes a NavigationSplitView to the window's content view
@@ -61,39 +69,35 @@ struct ContentView: View {
         // needs to sit above it goes in the titlebar accessory slot
         // (`windowTitlebarAccessory` below), never in a wrapping VStack.
         ZStack {
-            // boss.ui.standardSearch OFF (default): custom WorkSearchToolbarItem below.
-            // boss.ui.standardSearch ON: SwiftUI .searchable() owns placement/focus/clear.
-            // Both branches keep the same opacity/hitTesting treatment so navigation-mode
-            // switching never tears down NSViews in agentsView (see comment above).
-            if useStandardSearch {
-                NavigationSplitView(columnVisibility: $workColumnVisibility) {
-                    sidebar
-                } detail: {
-                    detail
-                }
-                // Remove the system sidebarToggle only on non-Work tabs. On the Work
-                // tab, the system-provided toggle handles both expanded and collapsed
-                // states natively, giving exactly one toggle button in either state
-                // without a state-conditional custom button (suppressing one button
-                // in one collapse state always left the other button visible in the
-                // opposite state).
-                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
-                .opacity(model.navigationMode == .work ? 1 : 0)
-                .allowsHitTesting(model.navigationMode == .work)
-                .searchable(
-                    text: $model.workSearchText,
-                    placement: .toolbar,
-                    prompt: "Search tasks…"
-                )
-            } else {
-                NavigationSplitView(columnVisibility: $workColumnVisibility) {
-                    sidebar
-                } detail: {
-                    detail
-                }
-                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
-                .opacity(model.navigationMode == .work ? 1 : 0)
-                .allowsHitTesting(model.navigationMode == .work)
+            NavigationSplitView(columnVisibility: workColumnVisibility) {
+                sidebar
+            } detail: {
+                detail
+            }
+            // Remove the system sidebarToggle only on non-Work tabs. On the Work
+            // tab, the system-provided toggle handles both expanded and collapsed
+            // states natively, giving exactly one toggle button in either state
+            // without a state-conditional custom button (suppressing one button
+            // in one collapse state always left the other button visible in the
+            // opposite state).
+            .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
+            .opacity(model.navigationMode == .work ? 1 : 0)
+            .allowsHitTesting(model.navigationMode == .work)
+            .searchable(
+                text: workSearchBinding,
+                placement: .toolbar,
+                prompt: "Search tasks…"
+            )
+            .searchFocused($workSearchFocused)
+            .disabled(model.navigationMode != .work)
+            .background {
+                Button("Find tasks") { workSearchFocused = true }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .hidden()
+                    .disabled(model.navigationMode != .work)
+            }
+            .onChange(of: model.navigationMode) { _, mode in
+                if mode != .work { workSearchFocused = false }
             }
 
             agentsView
@@ -113,6 +117,10 @@ struct ContentView: View {
                 IdeasView(chat: model)
             }
         }
+    }
+
+    private var configuredContent: some View {
+        navigationContent
         // Chrome banners live in the window's titlebar-accessory slot: below
         // the toolbar, above the content, with AppKit shrinking
         // `contentLayoutRect` by the bar's own measured height. That reserves
@@ -120,6 +128,14 @@ struct ContentView: View {
         // kanban top edge are no longer painted under the bar — without
         // demoting the NavigationSplitView out of the window root, which is
         // what made the sidebar render as a floating inset panel (#2459).
+        .task(id: model.isConnected) {
+            guard model.isConnected else { return }
+            while !Task.isCancelled {
+                model.criticalPriorityRequests.removeAll { $0.expiresAt <= Date() }
+                model.engine.sendLine(["type": "list_critical_priority_requests"], reportIfDisconnected: false)
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            }
+        }
         .windowTitlebarAccessory(isPresented: hasChromeBanners) {
             chromeBanners
         }
@@ -141,7 +157,7 @@ struct ContentView: View {
             }
         } message: {
             if let confirmation = model.coordinatorModelRecreateConfirmation {
-                Text("Picard is running \(confirmation.currentModel). Restarting replaces its tmux session and permanently discards the current conversation.")
+                Text("Picard is running \(confirmation.currentModel). Boss will request a fresh handoff first, then replace its session. The full conversation is permanently discarded.")
             }
         }
         // Same confirmed flow as the "Reset Coordinator Session…" control in
@@ -159,6 +175,7 @@ struct ContentView: View {
         } message: {
             Text(CoordinatorResetCopy.message)
         }
+        .modifier(CoordinatorResetStatus(model: model))
         #if canImport(GhosttyKit)
         .task {
             // Wire the SwiftPM-only pane allocator into ChatViewModel
@@ -182,14 +199,31 @@ struct ContentView: View {
                 hostView.submitText(text)
                 return true
             }
-            model.paneDetachHandler = { [workspace = workersWorkspace] slotId in
-                workspace.detachWorkerPane(slotId: slotId)
+            model.paneDetachHandler = { [workspace = workersWorkspace] runId in
+                workspace.detachWorkerPane(runId: runId)
             }
-            model.paneFocusHandler = { [workspace = workersWorkspace] slotId in
-                workspace.focusWorkerPane(slotId: slotId)
+            model.paneFocusHandler = { [workspace = workersWorkspace] runId in
+                workspace.revealAgent(runId: runId)
             }
             model.paneListHostedHandler = { [workspace = workersWorkspace] in
                 workspace.listHostedPanes()
+            }
+            // Agents view → engine: a live worker on a visible page has no
+            // viewer; ask for `AttachWorkerPane` again (see
+            // `WorkersWorkspaceModel.requestViewerAttach(forRuns:)`).
+            workersWorkspace.onViewerAttachRequested = { [model] runId in
+                model.requestWorkerPaneAttach(runId: runId)
+            }
+            // Finished Agents panes name their work item from the engine's
+            // durable execution → work item → PR binding, not live state.
+            workersWorkspace.onExecutionLabelsRequested = { [model] runIds in
+                model.requestExecutionLabels(runIds: runIds)
+            }
+            model.executionLabelsInvalidatedHandler = { [workspace = workersWorkspace] in
+                workspace.invalidateExecutionLabels()
+            }
+            model.executionLabelsHandler = { [workspace = workersWorkspace] labels in
+                workspace.applyExecutionLabels(labels)
             }
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
@@ -223,12 +257,13 @@ struct ContentView: View {
             model.reviewTerminalOpener = { [openWindow] in
                 openWindow(id: "review-terminal")
             }
-            // Register capabilities compiled into this build so the engine can
-            // detect flag ↔ capability mismatches and surface a warning badge.
-            CapabilityRegistry.shared.register("toolbar_search_standard")
             model.startIfNeeded()
         }
         .toolbar {
+            if WorkSwitcherToolbar.isVisible(model: model) {
+                ToolbarItem(placement: .navigation) { WorkSwitcherToolbar(model: model) }
+                    .separatedFromNeighborGlass()
+            }
             ToolbarItem(placement: .navigation) {
                 NativeSegmentedPicker(
                     "Mode",
@@ -295,14 +330,8 @@ struct ContentView: View {
 
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.navigationMode == .work {
-                    WorkProjectFilterToolbarButton(model: model)
-                    WorkGroupToolbarMenu(model: model)
-                    if !useStandardSearch {
-                        WorkSearchToolbarItem(
-                            model: model,
-                            isExpanded: $isSearchExpanded
-                        )
-                    }
+                    WorkViewModePicker(model: model)
+                    if model.navigator.mode == .kanban { WorkGroupToolbarMenu(model: model) }
                 }
             }
 
@@ -322,29 +351,14 @@ struct ContentView: View {
                 UpdateBadgeToolbarButton(updateModel: updateModel, quitRequest: updateQuitRequest)
             }
         }
-        .onChange(of: model.navigationMode) { _, newMode in
-            isSearchExpanded = false
-            if useStandardSearch && newMode != .work {
-                model.workSearchText = ""
-            }
-        }
-        .alert(
-            "Work Error",
-            isPresented: Binding(
-                get: { model.workErrorMessage != nil },
-                set: { newValue in
-                    if !newValue {
-                        model.workErrorMessage = nil
-                    }
-                }
-            ),
-            actions: {
-                Button("OK", role: .cancel) {}
-            },
-            message: {
-                Text(model.workErrorMessage ?? "")
-            }
-        )
+    }
+
+    var body: some View {
+        configuredContent
+        // `model.workErrorMessage` is deliberately NOT an `.alert` here: it
+        // renders as the passive `WorkNoticeBanner` in `chromeBanners`
+        // below. The two alerts that remain are decisions about an action
+        // the user just took (pause override, merge with open revisions).
         .alert(
             "Dispatch is paused",
             isPresented: Binding(
@@ -381,6 +395,13 @@ struct ContentView: View {
                         setAsProductDefault: setAsDefault
                     )
                 }
+            )
+        }
+        .sheet(item: $model.pendingParkRequest) { request in
+            ParkWorkItemSheet(
+                request: request,
+                onCancel: { model.dismissParkRequest() },
+                onPark: { reason in model.submitPark(request, reason: reason) }
             )
         }
         .sheet(isPresented: Binding(
@@ -491,13 +512,15 @@ struct ContentView: View {
     /// healthy window's titlebar is untouched. The coordinator-update
     /// banner is not chrome: it lives in the coordinator pane column.
     private var hasChromeBanners: Bool {
-        shouldShowEngineUnreachableBanner(
+        (model.isConnected && !model.criticalPriorityRequests.isEmpty) || chromeBannersPresent(
             isConnected: model.isConnected,
             showConnectionLostBanner: model.showConnectionLostBanner,
-            supervisionState: model.engineSupervisionState
+            supervisionState: model.engineSupervisionState,
+            hasHealthIssues: !model.bannerHealthIssues.isEmpty,
+            hasDisconnectedActionNotice: model.disconnectedActionNotice != nil,
+            hasWorkErrorMessage: model.workErrorMessage != nil,
+            hasRollbackNotice: updateModel.rollbackNotice != nil
         )
-            || (model.isConnected && !model.bannerHealthIssues.isEmpty)
-            || model.disconnectedActionNotice != nil
     }
 
     /// Insertion-only: a banner slides down into the gap AppKit has just
@@ -517,22 +540,54 @@ struct ContentView: View {
     @ViewBuilder
     private var chromeBanners: some View {
         VStack(spacing: 0) {
+            if model.isConnected {
+                CriticalPriorityBanner(model: model)
+            }
+            // A self-update whose first launch failed and was rolled back by the
+            // relaunch watchdog. Persistent until dismissed or retried so a silent
+            // "came back on the old version" can never happen again.
+            if let rollback = updateModel.rollbackNotice {
+                UpdateRollbackBanner(
+                    record: rollback,
+                    onRetry: {
+                        if let version = VersionTuple.parse(rollback.version) {
+                            updateModel.retryBlockedUpdate(version)
+                        }
+                    },
+                    onDismiss: { updateModel.dismissRollbackNotice() }
+                )
+                .transition(bannerTransition)
+            }
             if let notice = model.disconnectedActionNotice {
                 HStack {
                     Label(notice, systemImage: "exclamationmark.triangle")
                     Spacer()
-                    Button("Dismiss") { model.disconnectedActionNotice = nil }
+                    Button("Retry") { model.retryDisconnectedActions() }
+                        .disabled(!model.isConnected || !model.hasUnsentActions)
+                    if model.uncertainActionNotice != nil {
+                        Button("Checked") { model.acknowledgeUncertainActions() }
+                    }
+                    Button("Discard") { model.dismissDisconnectedActions() }
                 }
                 .padding(8)
                 .background(Color.orange.opacity(0.12))
             }
+            // Failure reports with no more specific surface (engine
+            // `work_error` replies, failed reveals, broken doc pointers).
+            // Passive, dismissable banner that never takes focus.
+            // See `WorkNoticeBanner`.
+            if let notice = model.workErrorMessage {
+                WorkNoticeBanner(
+                    message: notice,
+                    onDismiss: { model.dismissWorkErrorMessage() }
+                )
+                .transition(bannerTransition)
+            }
             // Persistent chrome-level signal that the engine socket is
             // down. Only shown after we've connected at least once so
             // the banner doesn't flash on launch during the normal
-            // initial-connect window. Replaces the previous behavior
-            // where every reconnect attempt re-popped a "Work Error"
-            // modal (#698) — transport errors are now routed away from
-            // `workErrorMessage` in `ChatViewModel.handle`. Also gated on
+            // initial-connect window. Transport errors are routed away
+            // from `workErrorMessage` in `ChatViewModel.handle`. Also gated on
             // `showConnectionLostBanner` rather than the raw `isConnected`
             // flag: a drop that self-heals within `connectionLostBannerDelay`
             // (reconnect backoff starts at 0.5s) never surfaces this at
@@ -568,6 +623,8 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
         .animation(.easeInOut(duration: 0.15), value: model.engineSupervisionState)
         .animation(.easeInOut(duration: 0.15), value: model.bannerHealthIssues)
+        .animation(.easeInOut(duration: 0.15), value: model.workErrorMessage)
+        .animation(.easeInOut(duration: 0.15), value: updateModel.rollbackNotice)
     }
 
     private var sidebar: some View {
@@ -625,10 +682,10 @@ struct ContentView: View {
         WorkersDetailView(
             workspace: workersWorkspace,
             liveStates: model.liveWorkerStates,
+            remotePanes: model.remotePaneViewer,
             isVisible: model.navigationMode == .agents,
-            liveStatusDisabledSlotIDs: model.liveStatusDisabledSlotIDs,
-            onToggleLiveStatus: { slotId, enabled in
-                model.setLiveStatusEnabled(slotId: slotId, enabled: enabled)
+            onRevealWorkItem: { workItemId, productId in
+                model.revealWorkCard(workItemId, productID: productId)
             }
         )
             .equatable()
@@ -741,20 +798,23 @@ struct ContentView: View {
                     ForEach(model.projectsForSelectedProduct) { project in
                         let isOn = model.selectedProjectFilterIDs.contains(project.id)
                         let isArchived = project.status == "archived"
+                        let isArchiving = model.archivingProjectIDs.contains(project.id)
+                        let isParked = project.isParked
+                        let parkedCount = model.parkedTaskCount(forProjectID: project.id)
                         let unblocked = model.unblockedTaskCount(forProjectID: project.id)
                         let blocked = model.blockedTaskCount(forProjectID: project.id)
                         let docPresentation = ProjectDesignDocAffordancePresentation.from(
-                            state: model.designDocStateByProjectID[project.id] ?? .notSet
+                            project: project
                         )
                         WorkSidebarFilterRow(
                             title: project.name,
-                            subtitle: project.sidebarSubtitle,
+                            subtitle: isArchiving ? "Archiving…" : project.sidebarSubtitle(parkedItemCount: parkedCount),
                             systemImage: project.sidebarSystemImage,
                             isSelected: isOn,
                             trailing: nil,
                             showsCheckbox: true,
                             isCheckboxOn: isOn,
-                            dimmed: isArchived,
+                            dimmed: isArchived || isArchiving || isParked,
                             unblockedCount: unblocked > 0 ? unblocked : nil,
                             blockedCount: blocked > 0 ? blocked : nil,
                             designDocPresentation: docPresentation,
@@ -767,10 +827,20 @@ struct ContentView: View {
                             model.toggleProjectFilter(project.id)
                         }
                         .contextMenu {
+                            if isParked {
+                                Button("Unpark") {
+                                    model.unpark(id: project.id)
+                                }
+                            } else if !isArchived && project.status != "done" {
+                                Button("Park…") {
+                                    model.requestPark(project: project)
+                                }
+                            }
                             if !isArchived {
                                 Button("Archive") {
                                     model.archiveProject(id: project.id)
                                 }
+                                .disabled(isArchiving)
                             }
                         }
                     }
@@ -790,6 +860,14 @@ struct ContentView: View {
                         get: { model.showBlockedOnly },
                         set: { model.setShowBlockedOnly($0) }
                     ))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
+                    .listRowBackground(Color.clear)
+
+                    Toggle("Show parked", isOn: Binding(
+                        get: { model.showParked },
+                        set: { model.setShowParked($0) }
+                    ))
+                    .help("Add parked tasks and projects' tasks back to the board. Un-parked work is never hidden by this.")
                     .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
                     .listRowBackground(Color.clear)
 
@@ -859,15 +937,47 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .padding(24)
-            } else if model.selectedProduct != nil {
+            } else if let product = model.selectedProduct {
                 VStack(spacing: 0) {
                     if let query = model.activeWorkSearchQuery {
                         WorkFilterBanner(query: query) {
                             model.workSearchText = ""
-                            isSearchExpanded = false
                         }
                     }
-                    workBoard()
+                    switch boardMainPresentation(isBoardLoaded: model.isBoardLoaded(product.id)) {
+                    case .loaded:
+                        DelayedBoardRefreshBanner(
+                            isRefreshing: model.boardLoad.isRefreshing(product.id),
+                            since: model.boardLoad.waitingSince(product.id),
+                            progress: model.boardLoad.progress(for: product.id),
+                            failed: model.boardLoad.hasFailed(product.id),
+                            isConnected: model.isConnected,
+                            retry: { model.refetchBoard(productID: product.id) }
+                        )
+                        .id(product.id)
+                        ZStack {
+                            workBoard()
+                                .opacity(model.navigator.mode == .kanban ? 1 : 0)
+                                .allowsHitTesting(model.navigator.mode == .kanban)
+                                .disabled(model.navigator.mode != .kanban)
+                                .accessibilityHidden(model.navigator.mode != .kanban)
+                            if model.navigator.mode == .navigator {
+                                #if canImport(GhosttyKit)
+                                WorkNavigatorView(model: model, workspace: workersWorkspace)
+                                #else
+                                WorkNavigatorView(model: model)
+                                #endif
+                            }
+                        }
+                    case .loading:
+                        BoardLoadingView(
+                            isConnected: model.isConnected,
+                            since: model.boardLoad.waitingSince(product.id),
+                            progress: model.boardLoad.progress(for: product.id),
+                            failed: model.boardLoad.hasFailed(product.id),
+                            retry: { model.refetchBoard(productID: product.id) }
+                        )
+                    }
                 }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
@@ -894,7 +1004,10 @@ struct ContentView: View {
             if model.isConnected, let installedVersion = model.coordinatorUpdateAvailable {
                 CoordinatorUpdateBanner(
                     installedVersion: installedVersion,
-                    onReset: { showCoordinatorResetConfirmFromBanner = true },
+                    onReset: {
+                        model.logCoordinatorReset("gesture", source: "update_banner")
+                        showCoordinatorResetConfirmFromBanner = true
+                    },
                     isCollapsed: isCollapsed
                 )
             }
@@ -999,12 +1112,12 @@ struct ContentView: View {
     @ViewBuilder
     private func bossAgentHeader(isCollapsed: Bool) -> some View {
         HStack(alignment: .center, spacing: 10) {
-            if let portrait = TrekIconAssets.image(.picard, size: .small) {
+            if let portrait = TrekIconAssets.coordinatorPortrait() {
                 Image(nsImage: portrait)
                     .resizable()
-                    .interpolation(.high)
+                    .interpolation(.none)
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 22, height: 28)
+                    .frame(width: 28, height: 28)
                     .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
             } else {
                 Image(systemName: "person.crop.circle.badge.checkmark")
@@ -1086,9 +1199,6 @@ struct ContentView: View {
             HStack {
                 Text(column.title)
                     .font(.headline)
-                if column == .review {
-                    reviewReadyOnlyToggle
-                }
                 Spacer()
                 Text("\(itemCount)")
                     .font(.caption.weight(.semibold))
@@ -1110,28 +1220,16 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
                 Spacer(minLength: 0)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView(.vertical) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(sections) { section in
-                                workSectionView(section, column: column)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                    }
-                    .frame(maxHeight: .infinity)
-                    .task(id: model.revealScrollTarget.map { "\(model.revealGeneration)-\($0)" }) {
-                        guard let target = model.revealScrollTarget else { return }
-                        let columnIDs = sections.flatMap { $0.items.map(\.id) }
-                        guard columnIDs.contains(target) else { return }
-                        // Wait for disclosure expansion and lazy card layout. Retry
-                        // until the card's viewport probe acknowledges this request.
-                        for _ in 0..<40 {
-                            guard !Task.isCancelled, model.revealScrollTarget == target else { return }
-                            boardProxy.scrollTo(column, anchor: .center)
-                            proxy.scrollTo(target, anchor: .center)
-                            do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
-                        }
+                WorkBoardColumnScrollView(
+                    column: column,
+                    cardIDs: sections.flatMap { $0.items.map(\.id) },
+                    revealTarget: model.revealScrollTarget,
+                    revealGeneration: model.revealGeneration,
+                    boardProxy: boardProxy,
+                    isRevealStillPending: { [model] target in model.revealScrollTarget == target }
+                ) {
+                    ForEach(sections) { section in
+                        workSectionView(section, column: column)
                     }
                 }
             }
@@ -1156,26 +1254,6 @@ struct ContentView: View {
             guard let taskID = items.first else { return false }
             return model.attemptDrop(taskID, onColumn: column, group: nil)
         }
-    }
-
-    /// Review-column-only affordance: narrows the column to cards that are
-    /// waiting on the operator and nothing else (no blocked pill, no `in
-    /// revision` badge, CI green, no merge conflict). Sticky across app
-    /// restarts (persisted via `ChatViewModel.setReviewReadyOnly`).
-    private var reviewReadyOnlyToggle: some View {
-        Button {
-            model.setReviewReadyOnly(!model.reviewReadyOnly)
-        } label: {
-            Label("Ready", systemImage: model.reviewReadyOnly ? "checkmark.circle.fill" : "checkmark.circle")
-                .font(.caption.weight(.semibold))
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(model.reviewReadyOnly ? Color.accentColor : .secondary)
-        .help(
-            "Show only Review cards ready for you to act on now: no blocked pill, "
-                + "no in-progress revision, CI checks green, and no merge conflict."
-        )
-        .accessibilityIdentifier("review-ready-only-toggle")
     }
 
     private var columnBackground: Color {
@@ -1208,6 +1286,7 @@ struct ContentView: View {
                     title: section.title,
                     count: section.items.count,
                     defaultExpanded: section.defaultExpanded,
+                    countLabel: section.countLabel,
                     shortIDLabel: sectionProject?.shortID.map { "P" + String($0) },
                     banner: section.queueBannerText,
                     revealGeneration: section.items.contains { $0.id == model.revealScrollTarget }

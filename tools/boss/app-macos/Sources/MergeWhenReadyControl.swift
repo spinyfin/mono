@@ -13,6 +13,7 @@ import SwiftUI
 /// source of truth for the actual merge request and its eligibility/error
 /// handling.
 struct MergeWhenReadyControl: View {
+    var isRequesting = false
     var onConfirm: () -> Void
 
     @State private var showConfirmation = false
@@ -21,11 +22,19 @@ struct MergeWhenReadyControl: View {
         Button {
             showConfirmation = true
         } label: {
-            Image(systemName: "arrow.triangle.merge")
-                .font(.caption)
-                .foregroundStyle(Color.secondary)
-                .accessibilityLabel("Merge when ready")
+            if isRequesting {
+                HStack(spacing: 4) {
+                    ProgressView().controlSize(.small)
+                    Text("Requesting merge…").font(.caption)
+                }
+            } else {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.caption)
+                    .foregroundStyle(Color.secondary)
+                    .accessibilityLabel("Merge when ready")
+            }
         }
+        .disabled(isRequesting)
         .buttonStyle(.plain)
         .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
         // Always-attached: confirmationDialog needs false→true while

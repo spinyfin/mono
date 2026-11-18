@@ -1,6 +1,6 @@
-//! Per-event conflict classification (Layer 0 telemetry,
-//! `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
-//! T1). Coarse, repo-agnostic pattern matching over conflicted file
+//! Per-event conflict classification (Layer 0 telemetry, see
+//! `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+//! Coarse, repo-agnostic pattern matching over conflicted file
 //! paths — the engine core stays ignorant of any particular repo's
 //! tooling; this is a heuristic for telemetry grouping, not the
 //! rung-0 deterministic-resolver framework (a separate, later task).

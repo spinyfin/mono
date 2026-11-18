@@ -1,0 +1,22 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Will a macOS notification with sound plus the kanban's Needs Attention card be enough for you to see and act on a forced decision, so no out-of-app channel (Slack, email) is needed in v1?",
+    "anchor": "27-how-a-forced-question-reaches-the-human"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "May progression agents create revisions on an item's PR and precursor tasks directly, bounded by a per-item budget and the no-repeat fingerprint rule, rather than asking you to approve each one?",
+    "anchor": "f-approval-gated-creation-of-revisions-and-precursors"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Should the existing `deferred` flag stay separate from parking, or be folded into parking as a reason?",
+    "choices": [
+      "Keep deferred separate (v1 as written)",
+      "Fold deferred into parking in v1",
+      "Fold it later, after parking ships"
+    ],
+    "anchor": "risks--open-questions"
+  }
+]

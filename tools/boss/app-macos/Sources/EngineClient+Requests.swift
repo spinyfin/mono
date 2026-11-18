@@ -12,24 +12,6 @@ extension EngineClient {
         sendLine(["type": "list_worker_live_states"], queueIfDisconnected: true)
     }
 
-    /// Ask the engine for the current set of slot ids that have the
-    /// live-status summarizer disabled. Used at session start so the
-    /// Agents-tab toggle reflects the persisted state.
-    func sendListLiveStatusDisabledSlots() {
-        sendLine(["type": "list_live_status_disabled_slots"], queueIfDisconnected: true)
-    }
-
-    /// Toggle the live-status summarizer for one slot. The engine
-    /// persists the choice in its metadata KV so it survives an
-    /// engine restart.
-    func sendSetLiveStatusEnabled(slotId: Int, enabled: Bool) {
-        sendLine([
-            "type": "set_live_status_enabled",
-            "slot_id": slotId,
-            "enabled": enabled,
-        ])
-    }
-
     /// Report which product the work board's chooser is now set to, so
     /// the engine — not app-local view state — is the system of record
     /// for the current selection. `productId` is nil when nothing is
@@ -63,13 +45,21 @@ extension EngineClient {
 
     /// Ask the engine for the current driver traffic split — how eligible,
     /// `standard`-reasoning implementation work is allocated between the
-    /// `grok`, `claude`, and `codex` drivers. Replies with
+    /// `grok`, `claude`, `codex`, and `agy` drivers. Replies with
     /// `driver_traffic_split_result`.
     func sendGetDriverTrafficSplit() {
         sendLine(["type": "get_driver_traffic_split"], queueIfDisconnected: true)
     }
 
-    /// Set the driver traffic split. The three shares must sum to exactly
+    func sendGetCodexSolPercentage() {
+        sendLine(["type": "get_codex_sol_percentage"], queueIfDisconnected: true)
+    }
+
+    func sendSetCodexSolPercentage(_ percentage: Int) {
+        sendLine(["type": "set_codex_sol_percentage", "percentage": percentage])
+    }
+
+    /// Set the driver traffic split. The four shares must sum to exactly
     /// 100; the engine rejects anything else with a `work_error` rather
     /// than repairing it, so callers must send a split built by
     /// `DriverTrafficSplit.adjusting(_:to:)`, which preserves that
@@ -84,6 +74,7 @@ extension EngineClient {
                 "grok": split.grok,
                 "claude": split.claude,
                 "codex": split.codex,
+                "agy": split.agy,
             ],
         ])
     }
@@ -110,6 +101,14 @@ extension EngineClient {
     /// key; no IO.
     func sendGetEngineHealth() {
         sendLine(["type": "get_engine_health"], queueIfDisconnected: true)
+    }
+
+    /// Ask the engine for its pool sizes and coordinator model. Replies with
+    /// `engine_pool_config`, the same event it pushes at session
+    /// registration; used on `resync_required` because that push is
+    /// uncorrelated and can be evicted.
+    func sendGetEnginePoolConfig() {
+        sendLine(["type": "get_engine_pool_config"], queueIfDisconnected: true)
     }
 
     /// Pause or resume global dispatch — the same `SetDispatchPaused`
@@ -146,6 +145,28 @@ extension EngineClient {
             "key": key,
             "enabled": enabled,
         ])
+    }
+
+    /// Fetch the persisted off-machine backup configuration.
+    @discardableResult
+    func sendGetOffsiteBackup() -> String? {
+        sendLine(["type": "get_offsite_backup"], queueIfDisconnected: true)
+    }
+
+    /// Replace the off-machine backup configuration. The engine validates,
+    /// persists to `settings.toml`, and replies with
+    /// `offsite_backup_settings`; each finished snapshot uses the current settings.
+    func sendSetOffsiteBackup(_ settings: OffsiteBackupSettings) -> String? {
+        var line: [String: Any] = [
+            "type": "set_offsite_backup",
+            "enabled": settings.enabled,
+            "keep_hourly": settings.keepHourly,
+            "keep_daily": settings.keepDaily,
+        ]
+        if let destination = settings.destination {
+            line["destination"] = destination
+        }
+        return sendLine(line)
     }
 
     /// Fetch the full host registry (including `local`).
@@ -249,6 +270,23 @@ extension EngineClient {
         ])
     }
 
+    /// Queue `text` for a worker as an explicit probe. Not an interrupt: it is
+    /// delivered at the worker's next boundary, so a probe from the read-only
+    /// pane viewer never cuts a turn short (the Interrupt button does that).
+    func sendProbeRun(runId: String, text: String) {
+        sendLine(["type": "probe_run", "run_id": runId, "text": text, "interrupt": false])
+    }
+
+    /// Press Esc in the worker's pane — the engine's explicit interrupt.
+    func sendInterruptWorkerPane(runId: String) {
+        sendLine(["type": "interrupt_worker_pane", "run_id": runId])
+    }
+
+    /// Tear down the worker's session and release its workspace.
+    func sendStopRun(runId: String) {
+        sendLine(["type": "stop_run", "run_id": runId])
+    }
+
     func sendUnsubscribe(topics: [String]) {
         sendLine([
             "type": "unsubscribe",
@@ -260,24 +298,31 @@ extension EngineClient {
     /// product-switch breakdowns can be grepped apart, and lets
     /// [[PopulationTiming]] record the send timestamp for the
     /// request→reply segment plus the per-product session issue count
-    /// (which surfaces the cold-start double-fetch).
-    func sendGetWorkTree(productId: String, flow: PopulationFlow) {
+    /// (which surfaces duplicate fetches).
+    func sendGetWorkTree(productId: String, flow: PopulationFlow, delta: Bool = true) {
         // Propagate the app-side `fetch_seq` on the wire so the engine can
         // stamp it on its `engine-population-timing-*.jsonl` segments and the
         // two sides join on `(product_id, fetch_seq)`.
         let fetchSeq = PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
+        let requestId = UUID().uuidString
+        onWorkTreeRequested?(productId, requestId)
         sendLine([
             "type": "get_work_tree",
+            "delta": delta,
             "product_id": productId,
             "fetch_seq": fetchSeq,
-        ], queueIfDisconnected: true)
+        ], queueIfDisconnected: true, envelopeRequestId: requestId)
     }
 
-    func sendListAttentionItemsForWorkItem(workItemID: String) {
+    /// Re-read a few cards of `productId` (and their revision chains) without
+    /// the engine assembling the board: the answer to a runtime-class
+    /// `work_invalidated` push. Replies with `work_runtime_patch`.
+    func sendGetWorkRuntimePatch(productId: String, itemIds: [String]) -> String? {
         sendLine([
-            "type": "list_attention_items_for_work_item",
-            "work_item_id": workItemID,
-        ], queueIfDisconnected: true)
+            "type": "get_work_runtime_patch",
+            "product_id": productId,
+            "item_ids": itemIds,
+        ])
     }
 
     /// Accept an open `deferred_scope` attention item without filing a
@@ -345,27 +390,6 @@ extension EngineClient {
 
     // MARK: Attention groups (attentions.md — Notifications toolbar + window)
 
-    /// List attention groups for a product. Omitting `state` lets the engine
-    /// default to open + partially_answered — the actionable set the
-    /// Notifications window renders. Replies with `attention_groups_list`.
-    func sendListAttentionGroups(
-        productId: String,
-        projectId: String? = nil,
-        taskId: String? = nil,
-        kind: String? = nil,
-        state: String? = nil
-    ) {
-        var payload: [String: Any] = [
-            "type": "list_attention_groups",
-            "product_id": productId,
-        ]
-        if let projectId { payload["project_id"] = projectId }
-        if let taskId { payload["task_id"] = taskId }
-        if let kind { payload["kind"] = kind }
-        if let state { payload["state"] = state }
-        sendLine(payload, queueIfDisconnected: true)
-    }
-
     /// Fetch one group (`atg_…` or `A<n>`) plus its members. Replies with
     /// `attention_group_result`.
     func sendGetAttentionGroup(id: String) {
@@ -375,7 +399,9 @@ extension EngineClient {
     /// Record the human's resolution of one member (`atn_…`): an `answer`
     /// (value for questions, omitted to "accept" a followup), `skip`, or
     /// `dismiss`. Replies with `attention_group_updated`.
-    func sendAnswerAttention(id: String, answer: String?, skip: Bool, dismiss: Bool) {
+    /// Returns the envelope id so a refusal can be matched to its group.
+    @discardableResult
+    func sendAnswerAttention(id: String, answer: String?, skip: Bool, dismiss: Bool) -> String? {
         var payload: [String: Any] = [
             "type": "answer_attention",
             "id": id,
@@ -383,14 +409,16 @@ extension EngineClient {
             "dismiss": dismiss,
         ]
         if let answer { payload["answer"] = answer }
-        sendLine(payload)
+        return sendLine(payload)
     }
 
     /// Action a group (`atg_…` or `A<n>`) — produce the downstream artifact
     /// and transition it to `actioned`. `skipUnanswered` marks every open
     /// member skipped first so the human needn't touch every row. Replies
     /// with `attention_group_actioned`.
-    func sendActionAttentionGroup(id: String, skipUnanswered: Bool) {
+    /// Returns the envelope id so a refusal can be matched to its group.
+    @discardableResult
+    func sendActionAttentionGroup(id: String, skipUnanswered: Bool) -> String? {
         sendLine([
             "type": "action_attention_group",
             "id": id,
@@ -575,12 +603,33 @@ extension EngineClient {
         sendLine(payload)
     }
 
-    func sendUpdateWorkItem(id: String, patch: [String: Any]) {
+    /// Returns the envelope request id so a caller can correlate a
+    /// `work_error` reply back to this patch (the engine echoes the id on
+    /// its reply envelope). `nil` means the line was not sent at all.
+    @discardableResult
+    func sendUpdateWorkItem(id: String, patch: [String: Any]) -> String? {
         sendLine([
             "type": "update_work_item",
             "id": id,
             "patch": patch,
         ])
+    }
+
+    /// Park (`parked == true`) or un-park a task, chore or project. Its own
+    /// request rather than an `update_work_item` patch so the engine applies
+    /// the parking-only rules (a park never rides along with another edit).
+    /// Returns the request id of the line, or `nil` when it was not sent.
+    @discardableResult
+    func sendParkWorkItem(id: String, parked: Bool, reason: String? = nil) -> String? {
+        var payload: [String: Any] = [
+            "type": "park_work_item",
+            "id": id,
+            "parked": parked,
+        ]
+        if let reason, !reason.isEmpty {
+            payload["reason"] = reason
+        }
+        return sendLine(payload)
     }
 
     /// Report where a kanban drag ended and let the engine decide what the
@@ -609,7 +658,7 @@ extension EngineClient {
         observedPauseSinceEpochS: UInt64? = nil
     ) {
         var target: [String: Any] = ["column": column.rawValue]
-        if let group, group.isEngineBoardGroup {
+        if let group {
             target["group"] = group.rawValue
         }
         var payload: [String: Any] = [
@@ -630,11 +679,11 @@ extension EngineClient {
     /// request execution, so the app can show a pause-only confirmation (or
     /// bounce the card back) instead of reproducing engine admission rules
     /// client-side. Reply arrives as `.dispatchAdmissionEvaluated`.
-    func sendEvaluateDispatchAdmission(workItemId: String) {
+    func sendEvaluateDispatchAdmission(workItemId: String, requestId: String = UUID().uuidString) {
         sendLine([
             "type": "evaluate_dispatch_admission",
             "work_item_id": workItemId,
-        ])
+        ], envelopeRequestId: requestId)
     }
 
     /// Ask the engine to schedule an execution for `workItemId`.
@@ -665,6 +714,13 @@ extension EngineClient {
             "answer": answer.wirePayload,
         ])
     }
+
+    /// Dismiss without answering; the engine keeps the work item blocked.
+    @discardableResult
+    func sendDismissOperatorQuestion(id: String) -> String? {
+        sendLine(["type": "dismiss_operator_question", "id": id])
+    }
+
 
     func sendDeleteWorkItem(id: String) {
         sendLine([
@@ -725,11 +781,12 @@ extension EngineClient {
     /// destroying a newer session after recovery. `reason` distinguishes an
     /// operator-initiated reset from the automatic model-mismatch prompt in
     /// the engine's audit log — both paths call the same engine-owned recreate.
-    func sendRecreateCoordinator(expectedSpawnToken: String, reason: CoordinatorRecreateReason) {
+    func sendRecreateCoordinator(expectedSpawnToken: String, reason: CoordinatorRecreateReason, forceWithoutHandoff: Bool = false) {
         sendLine([
             "type": "recreate_coordinator",
             "expected_spawn_token": expectedSpawnToken,
             "reason": reason.rawValue,
+            "force_without_handoff": forceWithoutHandoff,
         ])
     }
 
@@ -742,6 +799,18 @@ extension EngineClient {
     func sendSpawnCapabilityRestored() {
         sendLine([
             "type": "spawn_capability_restored",
+        ])
+    }
+
+    /// Ask the engine to send `AttachWorkerPane` for `runId` again: the
+    /// Agents view is showing that live worker without a terminal. Sent
+    /// when the pane comes into view, never on a timer. Fire-and-forget;
+    /// the outcome arrives as the attach request itself or as
+    /// `viewer_attach_error` on the worker live-state topic.
+    func sendRequestWorkerPaneAttach(runId: String) {
+        sendLine([
+            "type": "request_worker_pane_attach",
+            "run_id": runId,
         ])
     }
 
@@ -847,12 +916,6 @@ extension EngineClient {
         sendLine(["type": "update_automation", "id": id, "patch": patch])
     }
 
-    /// Get the count of open tasks produced by an automation. Engine replies
-    /// with `automation_open_task_count`.
-    func sendGetAutomationOpenTaskCount(automationId: String) {
-        sendLine(["type": "get_automation_open_task_count", "automation_id": automationId], queueIfDisconnected: true)
-    }
-
     /// List the run history for an automation (newest first). Engine replies
     /// with `automation_runs_list`.
     func sendListAutomationRuns(automationId: String) {
@@ -940,7 +1003,7 @@ extension EngineClient {
 
     // MARK: - Comments in the markdown viewer
     //
-    // Adapts the engine comment RPCs (`engine/core/src/app/comments.rs`).
+    // Adapts the engine comment RPCs (`engine/app/src/app/comments.rs`).
     // Requests are `FrontendRequest` variants
     // tagged by a snake_case `type`; `comments_create` / `comments_revise_doc`
     // flatten their input struct, so those fields sit at the top level. The
@@ -1106,6 +1169,17 @@ extension EngineClient {
         ], queueIfDisconnected: true)
     }
 
+    /// Resolve the work-item label (short id, title, PR, what the run was for)
+    /// of each execution from the engine's durable bindings. The Agents view
+    /// sends the ids of runs the engine has released, whose live state is
+    /// gone. Engine replies with `execution_labels_resolved`. Read-only.
+    func sendResolveExecutionLabels(executionIds: [String]) {
+        sendLine([
+            "type": "resolve_execution_labels",
+            "execution_ids": executionIds,
+        ], queueIfDisconnected: true)
+    }
+
     /// Fetch one immutable review-guide version's full Markdown. Engine
     /// replies with `review_guide_content` carrying a
     /// `ReviewGuideVersionContent` (`content: nil` when the version id is
@@ -1170,55 +1244,6 @@ extension EngineClient {
         ], queueIfDisconnected: true)
     }
 
-    /// Engine-tab listing fetch (Phase 5 #14). `productID = nil`
-    /// returns every product's attempts; `statuses` is AND-ed on the
-    /// server, `limit` caps the response.
-    func sendListConflictResolutions(
-        productID: String? = nil,
-        statuses: [String] = [],
-        workItemID: String? = nil,
-        limit: Int? = nil
-    ) {
-        var payload: [String: Any] = ["type": "list_conflict_resolutions"]
-        if let productID {
-            payload["product_id"] = productID
-        }
-        if !statuses.isEmpty {
-            payload["status"] = statuses
-        }
-        if let workItemID {
-            payload["work_item_id"] = workItemID
-        }
-        if let limit {
-            payload["limit"] = limit
-        }
-        sendLine(payload, queueIfDisconnected: true)
-    }
-
-    /// Engine-tab listing fetch for CI remediations (design Phase 11
-    /// #37). Mirror of `sendListConflictResolutions`.
-    func sendListCiRemediations(
-        productID: String? = nil,
-        statuses: [String] = [],
-        workItemID: String? = nil,
-        limit: Int? = nil
-    ) {
-        var payload: [String: Any] = ["type": "list_ci_remediations"]
-        if let productID {
-            payload["product_id"] = productID
-        }
-        if !statuses.isEmpty {
-            payload["status"] = statuses
-        }
-        if let workItemID {
-            payload["work_item_id"] = workItemID
-        }
-        if let limit {
-            payload["limit"] = limit
-        }
-        sendLine(payload, queueIfDisconnected: true)
-    }
-
     /// Fetch the merged, shallow engine-attempt feed. Detailed records remain
     /// behind their source-specific get requests so list refreshes stay small.
     /// `limit: 0` is the background-only polling form: `attempts` comes back
@@ -1226,8 +1251,9 @@ extension EngineClient {
     /// Returns the envelope `request_id` so the model can drop out-of-order
     /// snapshot replies, or `nil` when the line was not written.
     @discardableResult
-    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) -> String? {
+    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false, openPRsOnly: Bool = false) -> String? {
         var payload: [String: Any] = ["type": "list_engine_attempts"]
+        if openPRsOnly { payload["open_prs_only"] = true }
         if let limit {
             payload["limit"] = limit
         }

@@ -1,8 +1,8 @@
 //! `cube repo` — registering repositories, materialising their shared object
 //! store on demand, and resolving origin URLs to a stable repo id.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 use console::{Style, style};
 use git_utils::repo_slug::{
@@ -22,6 +22,7 @@ use crate::app::errors::{
     CubeError, JJ_NO_REMOTE_BOOKMARK_SIGNATURE, JJ_REVISION_DOESNT_EXIST_SIGNATURE, Result, RunResult,
 };
 use crate::app::jj::network_cmd_timeout;
+use crate::app::store_gc::store_gc_lock_path;
 use crate::app::util::repo_lock_path;
 
 #[derive(Debug, Clone)]
@@ -79,6 +80,9 @@ pub(super) fn run_repo(
                 }),
             )
         }
+        RepoCommand::Reclone { repo, discard_dirty } => {
+            super::repo_reclone::reclone(&store, runner, database_path, &repo, discard_dirty)
+        }
         RepoCommand::List => {
             let repos = store.list_repos()?;
             let message = format_repo_list(&repos);
@@ -100,6 +104,89 @@ pub(super) fn run_repo(
                 }),
             )
         }
+        RepoCommand::DeclareOldestJj { repo, version } => {
+            use crate::app::store_gc_integrity::{
+                decode_major_minor, encode_major_minor, oldest_client_key, parse_declared_version,
+            };
+            let record = store
+                .get_repo(&repo)?
+                .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
+            let not_a_version =
+                || CubeError::InvalidArgument(format!("`{version}` is not a `major.minor` jj version (e.g. 0.34)"));
+            let oldest = parse_declared_version(version.trim()).ok_or_else(not_a_version)?;
+            let encoded = encode_major_minor(oldest).ok_or_else(not_a_version)?;
+            let previous = store
+                .get_pool_metadata_i(&oldest_client_key(&record.repo))?
+                .and_then(decode_major_minor)
+                .map(|(major, minor)| format!("{major}.{minor}"));
+            store.set_pool_metadata_i(&oldest_client_key(&record.repo), encoded)?;
+            audit!(
+                database_path,
+                "repo.oldest_jj_declared",
+                repo = record.repo,
+                oldest_jj = format!("{}.{}", oldest.0, oldest.1),
+                previous_oldest_jj = previous,
+            );
+            RunResult::new(
+                format!(
+                    "Recorded jj {}.{} as the oldest client sharing `{repo}`'s store; store upkeep may now collect with jj up to that version.",
+                    oldest.0, oldest.1
+                ),
+                json!({ "repo": record.repo, "oldest_jj": format!("{}.{}", oldest.0, oldest.1) }),
+            )
+        }
+        RepoCommand::Gc {
+            repo,
+            keep_hours,
+            dry_run,
+        } => {
+            let record = store
+                .get_repo(&repo)?
+                .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
+            let keep = keep_hours
+                .map(|hours| std::time::Duration::from_secs(hours * 60 * 60))
+                .unwrap_or(crate::app::store_gc::DEFAULT_KEEP);
+            // One upkeep run per repo at a time, on its own lock: the
+            // per-repo lease lock is deliberately not taken, because a
+            // collection runs for minutes and every `cube workspace lease`
+            // waits on that lock. jj itself tolerates the workspaces'
+            // concurrent commands (see store_gc).
+            let _lock = RepoLock::try_acquire(&store_gc_lock_path(&repo, database_path)?)?.ok_or_else(|| {
+                CubeError::InvalidArgument(format!(
+                    "shared-store upkeep for `{repo}` is already running; one run per repo at a time"
+                ))
+            })?;
+            let result = crate::app::store_gc::gc_repo_store(
+                runner,
+                database_path,
+                &record,
+                keep,
+                crate::app::store_gc::QUIESCENCE_WAIT,
+                dry_run,
+            );
+            if !dry_run {
+                // The detached daily child's stderr goes nowhere, so the
+                // outcome is persisted for `cube workspace list` to surface.
+                use crate::app::store_gc::{Collection, StoreGcOutcome, record_store_gc_outcome};
+                let outcome = match &result {
+                    Ok(report) if report.collection == Collection::Skipped => StoreGcOutcome::Skipped,
+                    Ok(report) if report.collection == Collection::Concurrent => StoreGcOutcome::Concurrent,
+                    Ok(_) => StoreGcOutcome::Maintained,
+                    Err(_) => StoreGcOutcome::Failed,
+                };
+                if let Err(err) = record_store_gc_outcome(&store, &repo, outcome) {
+                    eprintln!("cube: store gc: cannot record the outcome for {repo}: {err}");
+                }
+            }
+            let report = result?;
+            if !dry_run {
+                store.set_pool_metadata_i(
+                    &crate::app::store_gc::store_gc_last_at_key(&repo),
+                    crate::app::util::current_epoch_s()?,
+                )?;
+            }
+            RunResult::new(report.summary(), json!({ "store_gc": report }))
+        }
         RepoCommand::Remove {
             repo,
             force,
@@ -114,6 +201,11 @@ pub(super) fn run_repo(
             };
 
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
+            let _upkeep = RepoLock::try_acquire(&store_gc_lock_path(&repo, database_path)?)?.ok_or_else(|| {
+                CubeError::InvalidArgument(format!(
+                    "repo `{repo}` upkeep is running; retry removal after it finishes"
+                ))
+            })?;
 
             // Collect workspace info before deletion (needed for lease check + purge).
             let workspaces = store.list_workspaces(&repo)?;
@@ -137,23 +229,21 @@ pub(super) fn run_repo(
             let workspace_paths: Vec<PathBuf> = workspaces.iter().map(|w| w.workspace_path.clone()).collect();
             let workspace_count = workspaces.len();
 
-            // Delete the repo row; FK cascades remove workspaces, workspace_setup,
-            // and changes rows automatically.
-            store.delete_repo(&repo)?;
-
-            // Optionally remove on-disk workspace directories.
+            // Preserve the registration on cleanup failure so a retry can finish.
             let mut purged_dirs: Vec<String> = Vec::new();
             if purge_workspaces {
-                for path in &workspace_paths {
-                    match fs::remove_dir_all(path) {
-                        Ok(()) => purged_dirs.push(path.display().to_string()),
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                        Err(err) => {
-                            eprintln!("warning: failed to remove workspace dir {}: {err}", path.display());
-                        }
+                let mut paths = workspace_paths;
+                for candidate in super::provision::discover_workspaces(&record)? {
+                    if !paths.contains(&candidate.workspace_path) {
+                        paths.push(candidate.workspace_path);
                     }
                 }
+                for path in &paths {
+                    super::fs_util::remove_workspace_tree(path)?;
+                    purged_dirs.push(path.display().to_string());
+                }
             }
+            store.delete_repo(&repo)?;
 
             audit!(
                 database_path,
@@ -366,6 +456,7 @@ fn ensure_repo_core(
         }
         record.main_branch = branch;
     }
+    super::registration::stamp_registration(&record)?;
     store.upsert_repo(&record)
 }
 
@@ -506,6 +597,7 @@ pub(super) fn materialize_repo_source_if_missing(
         // The colocated clone already exposes the remote's branches as local
         // jj bookmarks, so there is nothing to promote here; we only need the
         // remote's default branch to record as the repo's `main_branch`.
+        super::registration::stamp_registration(record)?;
         Ok(detect_remote_default_branch(runner, source, &record.origin))
     } else {
         eprintln!("cube: using `jj git clone --colocate` for repo `{}`", record.repo);
@@ -524,6 +616,7 @@ pub(super) fn materialize_repo_source_if_missing(
             ],
             env: vec![],
         })?;
+        super::registration::stamp_registration(record)?;
         track_remote_bookmarks(runner, source, default_branch.as_deref())?;
         Ok(default_branch)
     }

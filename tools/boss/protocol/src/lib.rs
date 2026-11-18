@@ -4,7 +4,10 @@
 //! request/response envelope and the data shapes those carry — lives in this
 //! crate so that engine and clients link against the same types.
 
+mod board_population;
 mod boothby;
+mod dispatch_focus;
+mod doing_section;
 mod engine_app;
 mod health_wire;
 mod host_registry_wire;
@@ -13,14 +16,20 @@ mod live_status_debug;
 mod live_worker_state;
 mod metrics_wire;
 pub mod planner;
+mod queued_dispatch;
+mod request_contract;
 mod tmux_worker_status;
 mod types;
 mod wire;
 mod work_item_id;
+pub mod work_tree_delta;
 mod worker_event;
 mod worker_names;
 
+pub use board_population::*;
 pub use boothby::*;
+pub use dispatch_focus::*;
+pub use doing_section::*;
 pub use engine_app::*;
 pub use health_wire::*;
 pub use host_registry_wire::*;
@@ -31,6 +40,10 @@ pub use metrics_wire::*;
 pub use planner::{
     ApplyResult, Confidence, DocRef, PlannerInput, PlannerOutput, ProductContext, ProjectContext, ProposedEdge,
     ProposedMergeOrderHint, ProposedTask, TaskBrief, planner_output_schema,
+};
+pub use queued_dispatch::*;
+pub use request_contract::{
+    AdmissionLane, ProgressionAccess, ReplayContract, RequestContract, WorkerAccess, WorkerRedirect, request_contract,
 };
 pub use tmux_worker_status::*;
 pub use types::*;

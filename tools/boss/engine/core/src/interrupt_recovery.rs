@@ -115,10 +115,7 @@ async fn poll_for_turn_end(driver: &dyn AgentDriver, snapshot: &InterruptRecover
         let (lines, new_offset) = read_new_complete_lines(&snapshot.events_path, offset).await;
         offset = new_offset;
         for line in &lines {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if driver.is_interrupt_recovery_turn_end(&value) {
+            if driver.is_interrupt_recovery_line(line, snapshot) {
                 return true;
             }
         }
@@ -181,6 +178,7 @@ mod tests {
         agent_rules_filename: "AGENTS.md",
         initial_prompt_filename: "initial-prompt.txt",
         model_menu: ModelMenu {
+            resolve_model_effort: None,
             engine_default: "test-model",
             effort_value_for_level: |_| None,
             default_model_for_level: |_| "test-model",
@@ -401,5 +399,39 @@ mod tests {
         // the matcher does not false-positive on unrelated event shapes.
         assert_eq!(outcome, InterruptRecoveryOutcome::Fallback);
         assert_eq!(sink.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agy_text_log_observer_ignores_old_child_and_partial_lines() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agy.log");
+        let parent = "9476903e-615e-4a03-b5b5-ea82733cc97b";
+        let child = "30dedab2-dc3a-4990-8b2c-53e481e66031";
+        let cancel = |id| {
+            format!(
+                "I1111 04:17:39.400 conversation_manager.go:123] Cancelling in-progress response for conversation {id}\n"
+            )
+        };
+        std::fs::write(&path, cancel(parent)).unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "Interrupted · What should Antigravity CLI do instead?").unwrap();
+        write!(file, "{}", cancel(child)).unwrap();
+        // The parent message is not evidence until the writer completes its line.
+        write!(file, "{}", cancel(parent).trim_end()).unwrap();
+        let driver = Arc::new(crate::driver::AgyDriver::default());
+        let mut snap = snapshot(path.clone(), offset, Duration::ZERO);
+        snap.session_id = parent.into();
+        assert!(!poll_for_turn_end(driver.as_ref(), &snap).await);
+        writeln!(file).unwrap();
+        let sink = RecordingSink::default();
+        assert_eq!(
+            run_interrupt_recovery(driver, "run-agy".into(), snap, sink.clone()).await,
+            InterruptRecoveryOutcome::Observed
+        );
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_turn_boundary());
     }
 }

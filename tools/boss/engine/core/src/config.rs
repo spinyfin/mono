@@ -2,11 +2,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
+use boss_engine_storage_values::progression::ProgressionSettings;
 use boss_engine_utility_model::{self as utility_model, UtilityModel};
 
-use crate::coordinator::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
+use boss_execution_contracts::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
 
 /// Environment override for the SQLite state database path.
 pub const DB_PATH_ENV: &str = "BOSS_DB_PATH";
@@ -35,15 +36,9 @@ pub const FRONTEND_SOCKET_ENV: &str = "BOSS_SOCKET_PATH";
 /// Environment override for the engine pid-file path.
 pub const PID_PATH_ENV: &str = "BOSS_ENGINE_PID_PATH";
 
-/// Default value for [`WorkConfig::max_review_cycles`]. Matches the
-/// "~3 cycles at worst" mental model from the review-cycle-cap design, §7.
-pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
-
-/// Default threshold for the no-op / trivial-diff skip gate (review-cycle-cap
-/// design, §8).
-/// Zero means "skip only when the effective diff is literally empty (0 changed
-/// lines)"; operators can raise this to also skip small cosmetic-only pushes.
-pub const DEFAULT_MIN_REVIEW_CHANGED_LINES: u64 = 0;
+/// Default value for [`WorkConfig::max_review_cycles`] and the review-cycle
+/// threshold; shared with the completion service, so defined below both.
+pub use boss_engine_storage_values::pool_policy::{DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES};
 
 /// Default line threshold for embedding `gh pr diff` output directly in the
 /// reviewer's initial prompt. PRs whose diff is at or below this many lines
@@ -123,11 +118,6 @@ pub const DEFAULT_ENABLE_DISPATCH_READY_BUS: bool = false;
 /// higher tier — no code change required.
 pub const DEFAULT_COORDINATOR_MODEL: &str = "opus";
 
-// Bare name used as the PATH fallback. In installed Boss.app the engine
-// resolves cube from the bundle first (see resolve_cube_command); this
-// constant is only reached in dev mode or when the bundle copy is absent.
-const DEFAULT_CUBE_COMMAND: &str = "cube";
-
 #[derive(Debug, Clone)]
 pub struct CubeConfig {
     pub command: String,
@@ -146,7 +136,7 @@ pub struct WorkConfig {
     ///
     /// Resolved once (from `BOSS_EVENTS_SOCKET`, else the production default)
     /// and, for a test fixture, overwritten by the isolation guard in
-    /// [`crate::app::run`] before the config is frozen — exactly the way
+    /// `boss_engine::app::run` before the config is frozen — exactly the way
     /// `db_path` is handled. Everything downstream that needs to know where
     /// the engine is listening reads it from here rather than re-deriving it
     /// from the environment: a fixture that isolated its own socket but
@@ -161,7 +151,7 @@ pub struct WorkConfig {
     /// `pr status`, …) dial *this* engine.
     ///
     /// Resolved once (from `BOSS_SOCKET_PATH`, else the production default)
-    /// and overwritten in [`crate::app::run`] / [`crate::app::serve`] with
+    /// and overwritten in `boss_engine::app::run` / `boss_engine::app::serve` with
     /// the socket this process actually binds. Everything downstream that
     /// hands workers a control-socket path reads it from here rather than
     /// re-deriving it from `$HOME` or `$BOSS_SOCKET_PATH`: a Grok worker's
@@ -177,7 +167,7 @@ pub struct WorkConfig {
     /// from a pane still find the token after `BOSS_SOCKET_PATH` has
     /// switched CLI discovery into its sibling-derivation branch.
     ///
-    /// Stamped in [`crate::app::serve`] from the path `resolve_engine_paths`
+    /// Stamped in `boss_engine::app::serve` from the path `resolve_engine_paths`
     /// resolved (isolation-derived, else `$BOSS_ENGINE_CONTROL_TOKEN_PATH`,
     /// else the production default). Never re-derived from the socket stem:
     /// production writes `engine-control.token`, while sibling derivation
@@ -264,6 +254,13 @@ pub struct WorkConfig {
     /// `BOSS_ENABLE_DISPATCH_READY_BUS`.
     #[builder(default = DEFAULT_ENABLE_DISPATCH_READY_BUS)]
     pub enable_dispatch_ready_bus: bool,
+    /// The limits that bound progression agents (design section 2.6): pool size,
+    /// sweep interval, stuck-after grace, cooldown, create budget, run timeout.
+    /// Each is configured via a `BOSS_PROGRESSION_*` variable and defaults to the
+    /// design's placeholder; they are not yet tuned from measured traffic. See
+    /// [`ProgressionSettings`].
+    #[builder(default)]
+    pub progression: ProgressionSettings,
     /// Model slug the Boss coordinator session launches with, pushed to the
     /// macOS app as `EnginePoolConfig.coordinator_model` on every
     /// `RegisterAppSession`. Configured via `BOSS_COORDINATOR_MODEL`;
@@ -272,6 +269,12 @@ pub struct WorkConfig {
     /// higher tier without a code change.
     #[builder(default = DEFAULT_COORDINATOR_MODEL.to_owned())]
     pub coordinator_model: String,
+    /// Hub listener, host credentials and server TLS identity. Inert until
+    /// listen, credentials directory and TLS cert/key are all set. Test
+    /// fixtures isolate this via [`crate::hub::HubConfig::isolate_for_fixture`]
+    /// before startup binds a socket.
+    #[builder(default)]
+    pub hub: crate::hub::HubConfig,
 }
 
 impl WorkConfig {
@@ -322,6 +325,7 @@ impl WorkConfig {
             .unwrap_or(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
         let enable_dispatch_ready_bus =
             lookup_bool(&lookup, "BOSS_ENABLE_DISPATCH_READY_BUS")?.unwrap_or(DEFAULT_ENABLE_DISPATCH_READY_BUS);
+        let progression = load_progression_settings(&lookup)?;
         let coordinator_model = lookup_string(&lookup, "BOSS_COORDINATOR_MODEL")
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
@@ -342,7 +346,9 @@ impl WorkConfig {
             .merge_order_stagger_secs(merge_order_stagger_secs)
             .enable_spawn_capability_breaker(enable_spawn_capability_breaker)
             .enable_dispatch_ready_bus(enable_dispatch_ready_bus)
+            .progression(progression)
             .coordinator_model(coordinator_model)
+            .hub(crate::hub::HubConfig::load_from(&lookup)?)
             .build())
     }
 
@@ -381,6 +387,60 @@ pub fn tmux_socket_path_beside_db(db_path: &Path) -> Result<PathBuf> {
              relying on this fallback."
         ),
     }
+}
+
+/// Read the progression limits from `BOSS_PROGRESSION_*`. Absent variables keep
+/// the design's placeholders; a zero or unparsable value is an error, since a
+/// zero grace, cooldown or interval would make the sweep fire on every item at
+/// once. Runtime calibration derives the sweep cadence from the effective
+/// stuck grace; an explicit sweep interval still takes precedence.
+fn load_progression_settings(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ProgressionSettings> {
+    let defaults = ProgressionSettings::default();
+    let positive = |name: &str| -> Result<Option<u64>> {
+        match lookup_u64(lookup, name)? {
+            Some(0) => bail!("{name} must be greater than zero"),
+            other => Ok(other),
+        }
+    };
+    let secs = |name: &str, default: i64| -> Result<i64> {
+        positive(name)?.map_or(Ok(default), |value| {
+            i64::try_from(value).map_err(|_| anyhow!("{name} is too large: {value}"))
+        })
+    };
+    let pool_size = lookup_usize(lookup, "BOSS_PROGRESSION_POOL_SIZE")?.unwrap_or(defaults.pool_size);
+    if pool_size == 0 {
+        bail!("BOSS_PROGRESSION_POOL_SIZE must be greater than zero");
+    }
+    let mut overrides = 0;
+    for setting in boss_engine_storage_values::progression::CALIBRATED_SETTINGS {
+        if lookup(&format!("BOSS_PROGRESSION_{}", setting.key.to_uppercase())).is_some() {
+            overrides |= setting.override_bit;
+        }
+    }
+    Ok(ProgressionSettings::builder()
+        .explicit_overrides(overrides)
+        .remind_after_secs(positive("BOSS_PROGRESSION_REMIND_AFTER_SECS")?.unwrap_or(defaults.remind_after_secs))
+        .maybe_expected_questions_per_week(
+            lookup_u64(lookup, "BOSS_PROGRESSION_EXPECTED_QUESTIONS_PER_WEEK")?
+                .map(u32::try_from)
+                .transpose()?,
+        )
+        .pool_size(pool_size)
+        .sweep_interval_secs(positive("BOSS_PROGRESSION_SWEEP_INTERVAL_SECS")?.unwrap_or(defaults.sweep_interval_secs))
+        .stuck_after_secs(secs("BOSS_PROGRESSION_STUCK_AFTER_SECS", defaults.stuck_after_secs)?)
+        .cooldown_secs(secs("BOSS_PROGRESSION_COOLDOWN_SECS", defaults.cooldown_secs)?)
+        .max_creates_per_item_window(positive("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW")?.map_or(
+            Ok(defaults.max_creates_per_item_window),
+            |value| {
+                u32::try_from(value).map_err(|_| anyhow!("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW is too large"))
+            },
+        )?)
+        .max_creates_window_secs(secs(
+            "BOSS_PROGRESSION_MAX_CREATES_WINDOW_SECS",
+            defaults.max_creates_window_secs,
+        )?)
+        .run_timeout_secs(positive("BOSS_PROGRESSION_RUN_TIMEOUT_SECS")?.unwrap_or(defaults.run_timeout_secs))
+        .build())
 }
 
 fn lookup_usize(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<Option<usize>> {
@@ -425,6 +485,12 @@ fn lookup_bool(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<
     }
 }
 
+/// The `ANTHROPIC_API_KEY` the engine was launched with. Read independently of
+/// [`AgentConfig`] so a cube-resolution failure cannot hide an exported key.
+fn anthropic_api_key_from_env() -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY").ok()
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub anthropic_api_key: Option<String>,
@@ -434,14 +500,23 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn load_from_env(work: &WorkConfig) -> Result<Self> {
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        Self::load_for_engine(work, &std::env::current_exe()?)
+    }
 
-        let (cube_command, cube_args) = parse_command_line(
-            "BOSS_CUBE_CMD",
-            std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| resolve_cube_command()),
-        )?;
+    fn load_for_engine(work: &WorkConfig, engine_path: &Path) -> Result<Self> {
+        let anthropic_api_key = anthropic_api_key_from_env();
 
-        log_cube_resolution(&cube_command);
+        let (cube_command, cube_args) = match std::env::var("BOSS_CUBE_CMD") {
+            Ok(command) => parse_command_line("BOSS_CUBE_CMD", command)?,
+            Err(_) => (
+                boss_engine_worker_bin::resolve_cube_cli_for_engine(engine_path)
+                    .context("no bundled cube found; set BOSS_CUBE_CMD or CUBE_CLI_BIN to an executable path")?
+                    .to_string_lossy()
+                    .into_owned(),
+                Vec::new(),
+            ),
+        };
+        tracing::info!(command = cube_command, "cube command configured");
 
         Ok(Self {
             anthropic_api_key,
@@ -525,6 +600,16 @@ impl RuntimeConfig {
         }
     }
 
+    /// The Anthropic API key, independent of cube resolution: a missing
+    /// bundled cube makes [`Self::agent`] fail but must not make an exported
+    /// key look unset.
+    pub fn anthropic_api_key(&self) -> Option<String> {
+        match self.agent_cell.get() {
+            Some(agent) => agent.anthropic_api_key.clone(),
+            None => anthropic_api_key_from_env(),
+        }
+    }
+
     /// The [`UtilityModel`] provider for the engine's own inference calls.
     ///
     /// Infallible on purpose — provider selection never fails, it falls back
@@ -546,7 +631,7 @@ impl RuntimeConfig {
         if let Some(provider) = self.utility_cell.get() {
             return provider.clone();
         }
-        let base_api_key = self.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        let base_api_key = self.anthropic_api_key();
         let selection = utility_model::select(base_api_key);
         selection.log();
         let provider = selection.provider;
@@ -567,49 +652,6 @@ impl RuntimeConfig {
     /// process environment. No-op if a provider is already installed.
     pub fn set_utility_model(&self, provider: Arc<dyn UtilityModel>) {
         let _ = self.utility_cell.set(provider);
-    }
-}
-
-/// Returns the cube command to use, preferring a bundle-relative binary when
-/// the engine itself was launched from a bundle (installed Boss.app).
-///
-/// Resolution order:
-///   1. `<engine_exe_dir>/cube` — present in the bundle; used by installed
-///      Boss.app so the engine never depends on the GUI launchd PATH.
-///   2. `"cube"` — bare name resolved from PATH at exec time; used in dev
-///      mode where the engine runs via `bazel run` outside a bundle.
-///
-/// Workers run inside Ghostty terminal panes which inherit the user's shell
-/// PATH, so they continue to resolve cube (and jj, gh, claude, etc.) from
-/// PATH naturally. This bundle-relative lookup is engine-only.
-fn resolve_cube_command() -> String {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join(DEFAULT_CUBE_COMMAND);
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-    DEFAULT_CUBE_COMMAND.to_owned()
-}
-
-/// Logs how cube was resolved and warns if the bare name cannot be found on PATH.
-fn log_cube_resolution(command: &str) {
-    if command.contains('/') {
-        tracing::info!(command, "cube resolved from bundle");
-        return;
-    }
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let found = std::env::split_paths(&path_env).any(|dir| dir.join(command).is_file());
-    if found {
-        tracing::info!(command, "cube resolved from PATH");
-    } else {
-        tracing::warn!(
-            command,
-            "cube executable not found on PATH; worker dispatch will fail — \
-             install cube or set BOSS_CUBE_CMD to its full path"
-        );
     }
 }
 
@@ -653,6 +695,66 @@ mod tests {
     };
     use std::ffi::OsString;
     use std::path::Path;
+
+    #[test]
+    fn missing_bundled_cube_rejects_config_without_running_path_decoy() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::driver::grok::GROK_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("decoy-ran");
+        let decoy = dir.path().join("cube");
+        std::fs::write(&decoy, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let keys = [
+            "PATH",
+            "BOSS_CUBE_CMD",
+            "CUBE_CLI_BIN",
+            "BOSS_BIN_DIR",
+            "BUILD_WORKSPACE_DIRECTORY",
+            "ANTHROPIC_API_KEY",
+        ];
+        let _restore = Restore(keys.iter().map(|&key| (key, std::env::var_os(key))).collect());
+        for key in keys {
+            unsafe { std::env::remove_var(key) };
+        }
+        let inherited_path = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf())
+                .chain(_restore.0[0].1.as_ref().into_iter().flat_map(std::env::split_paths)),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PATH", inherited_path);
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-test-independent");
+        };
+        let work = WorkConfig::load_from(|key| match key {
+            "BOSS_DB_PATH" => Some(dir.path().join("state.db").into_os_string()),
+            _ => None,
+        })
+        .unwrap();
+        // A synthetic engine path has neither runfiles nor sibling binaries.
+        let engine = dir.path().join("missing/engine");
+        let error = super::AgentConfig::load_for_engine(&work, &engine).unwrap_err();
+        assert!(error.to_string().contains("no bundled cube found"), "{error:#}");
+        assert!(!marker.exists(), "PATH cube must never be invoked");
+        // The cube failure must not null out the unrelated API key.
+        let runtime = super::RuntimeConfig::from_parts(work, None);
+        assert_eq!(runtime.anthropic_api_key().as_deref(), Some("sk-test-independent"));
+    }
 
     #[test]
     fn prefers_bazel_workspace_directory_when_present() {
@@ -1036,5 +1138,104 @@ mod tests {
     fn tmux_socket_path_beside_db_resolves_next_to_the_db_file() {
         let socket = tmux_socket_path_beside_db(Path::new("/tmp/x/state.db")).unwrap();
         assert_eq!(socket, Path::new("/tmp/x/tmux.sock"));
+    }
+
+    #[test]
+    fn work_config_hub_is_inert_by_default_and_loads_from_env() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path)),
+            _ => None,
+        })
+        .unwrap();
+        assert!(config.hub.listener_plan().unwrap().is_none());
+
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path)),
+            crate::hub::LISTEN_ENV => Some(OsString::from("127.0.0.1:8443")),
+            crate::hub::CREDENTIALS_DIR_ENV => Some(OsString::from("/tmp/hub-credentials")),
+            crate::hub::TLS_CERT_ENV => Some(OsString::from("/tmp/hub.crt")),
+            crate::hub::TLS_KEY_ENV => Some(OsString::from("/tmp/hub.key")),
+            _ => None,
+        })
+        .unwrap();
+        let plan = config.hub.listener_plan().unwrap().unwrap();
+        assert_eq!(plan.listen, "127.0.0.1:8443".parse().unwrap());
+    }
+
+    fn progression_with(
+        vars: &[(&str, &str)],
+    ) -> anyhow::Result<boss_engine_storage_values::progression::ProgressionSettings> {
+        let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        super::load_progression_settings(&|name: &str| {
+            vars.iter().find(|(k, _)| k == name).map(|(_, v)| OsString::from(v))
+        })
+    }
+
+    #[test]
+    fn progression_settings_default_to_the_placeholders_and_accept_each_override() {
+        use boss_engine_storage_values::progression::ProgressionSettings;
+        assert_eq!(progression_with(&[]).unwrap(), ProgressionSettings::default());
+
+        let settings = progression_with(&[
+            ("BOSS_PROGRESSION_POOL_SIZE", "2"),
+            ("BOSS_PROGRESSION_SWEEP_INTERVAL_SECS", "11"),
+            ("BOSS_PROGRESSION_STUCK_AFTER_SECS", "22"),
+            ("BOSS_PROGRESSION_COOLDOWN_SECS", "33"),
+            ("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW", "4"),
+            ("BOSS_PROGRESSION_MAX_CREATES_WINDOW_SECS", "55"),
+            ("BOSS_PROGRESSION_RUN_TIMEOUT_SECS", "66"),
+        ])
+        .unwrap();
+        assert_eq!(settings.pool_size, 2);
+        assert_eq!(settings.sweep_interval_secs, 11);
+        assert_eq!(settings.stuck_after_secs, 22);
+        assert_eq!(settings.cooldown_secs, 33);
+        assert_eq!(settings.max_creates_per_item_window, 4);
+        assert_eq!(settings.max_creates_window_secs, 55);
+        assert_eq!(settings.run_timeout_secs, 66);
+    }
+
+    #[test]
+    fn progression_records_explicit_defaults_and_question_alarm_zero() {
+        let settings = progression_with(&[
+            ("BOSS_PROGRESSION_POOL_SIZE", "1"),
+            ("BOSS_PROGRESSION_REMIND_AFTER_SECS", "259200"),
+            ("BOSS_PROGRESSION_EXPECTED_QUESTIONS_PER_WEEK", "0"),
+        ])
+        .unwrap();
+        assert_eq!(settings.explicit_overrides, 1 | (1 << 6) | (1 << 7));
+        assert_eq!(settings.expected_questions_per_week, Some(0));
+        assert_eq!(settings.remind_after_secs, 259200);
+    }
+
+    #[test]
+    fn progression_settings_reject_zero_unparsable_and_out_of_range_values() {
+        for name in [
+            "BOSS_PROGRESSION_POOL_SIZE",
+            "BOSS_PROGRESSION_SWEEP_INTERVAL_SECS",
+            "BOSS_PROGRESSION_STUCK_AFTER_SECS",
+            "BOSS_PROGRESSION_COOLDOWN_SECS",
+            "BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW",
+            "BOSS_PROGRESSION_MAX_CREATES_WINDOW_SECS",
+            "BOSS_PROGRESSION_RUN_TIMEOUT_SECS",
+        ] {
+            let zero = progression_with(&[(name, "0")]).unwrap_err().to_string();
+            assert!(zero.contains(name) && zero.contains("greater than zero"), "{zero}");
+            let junk = progression_with(&[(name, "soon")]).unwrap_err().to_string();
+            assert!(junk.contains(name), "{junk}");
+        }
+        let too_big = progression_with(&[("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW", "4294967296")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            too_big.contains("BOSS_PROGRESSION_MAX_CREATES_PER_ITEM_WINDOW"),
+            "{too_big}"
+        );
+        let huge_secs = progression_with(&[("BOSS_PROGRESSION_COOLDOWN_SECS", "18446744073709551615")])
+            .unwrap_err()
+            .to_string();
+        assert!(huge_secs.contains("BOSS_PROGRESSION_COOLDOWN_SECS"), "{huge_secs}");
     }
 }

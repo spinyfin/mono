@@ -169,7 +169,7 @@ fn reviewer_claude_md_omits_reuse_before_you_build_guardrail() {
         "lease-1",
         "/tmp/ws",
         crate::prompt_fragments::absolute_paths_fragment(),
-        crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        crate::prompt_fragments::boundaries_and_probes_fragment(),
     );
     assert!(
         !rendered.contains("Reuse before you build"),
@@ -215,6 +215,26 @@ fn claude_md_pr_section_is_front_and_centre() {
         rendered.contains("jj diff -r @"),
         "CLAUDE.md must remind workers to verify the diff before pushing",
     );
+}
+
+#[test]
+fn claude_md_requires_concrete_pr_evidence_or_specific_limitations() {
+    let rendered = claude_md_for(&sample_input());
+    for rule in [
+        "Every PR body must contain an evidence section.",
+        "commands run and their results",
+        "repeated-run counts for flake fixes",
+        "measurements, before/after behavior",
+        "screenshots registered via `\"$BOSS_BIN\" attach`",
+        "A bare \"tests pass\" is not enough",
+        "state the specific limitation and what would be",
+        "needed to gather it",
+        "Summarize registered screenshots by caption in the evidence",
+        "Do not put an attachment URL",
+    ] {
+        assert!(rendered.contains(rule), "missing evidence rule: {rule}");
+    }
+    assert!(!rendered.contains("describe\nthe screenshot in prose"));
 }
 
 #[test]
@@ -404,5 +424,140 @@ fn every_worker_kind_claude_md_carries_the_absolute_paths_instruction() {
             rendered.contains(crate::prompt_fragments::absolute_paths_fragment()),
             "{label} CLAUDE.md must embed the shared fragment verbatim, not a paraphrase",
         );
+    }
+}
+
+#[test]
+fn claude_md_routes_revision_blocking_prs_to_prerequisite_and_later_work_to_followup() {
+    let mut input = sample_input();
+    let disabled = claude_md_for(&input);
+    assert!(!disabled.contains("--answer-type create-prerequisite-task"));
+    assert!(disabled.contains("report the dependency using the blocker channel"));
+    input.run_done_proposals_seam_enabled = true;
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("## Revisions"),
+        "worker rules must carry a Revisions section; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("A revision never opens a new PR"),
+        "worker rules must state a revision never opens a new PR; got:\n{rendered}",
+    );
+    assert!(
+        rendered
+            .contains("propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task")
+            && rendered.contains("--prerequisite-name")
+            && rendered.contains("--prerequisite-brief"),
+        "worker rules must route a PR that must land first to create-prerequisite-task; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("propose followup-task --name")
+            && rendered.contains("only for non-blocking work that can happen later"),
+        "worker rules must keep followup-task as the non-blocking path; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("[blocked] reason=\"<specific question>\""),
+        "worker rules, seam off: must steer a blocked guard/policy/decision to the marker; got:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("propose blocked --reason"),
+        "worker rules, seam off: must not teach propose blocked; got:\n{rendered}",
+    );
+}
+
+#[test]
+fn claude_md_steers_blocked_progress_to_propose_blocked_when_seam_is_on() {
+    let mut input = sample_input();
+    input.worker_signal_proposals_seam_enabled = true;
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("propose blocked --reason"),
+        "worker rules, seam on: must steer a blocked guard/policy/decision to propose blocked; got:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("[blocked] reason=\"<specific question>\""),
+        "worker rules, seam on: must not teach the marker as the primary channel; got:\n{rendered}",
+    );
+}
+
+/// The generated rules file is read by every standard worker, so it must not
+/// teach the engine's internal vocabulary any more than the prompt does (see
+/// `crate::prose_vocabulary`).
+#[test]
+fn claude_md_avoids_internal_vocabulary() {
+    for draft_pr_mode in [false, true] {
+        let mut input = sample_input();
+        input.draft_pr_mode = draft_pr_mode;
+        let rendered = claude_md_for(&input);
+        crate::prose_vocabulary::assert_no_forbidden_prose(
+            &format!("worker rules (draft_pr_mode={draft_pr_mode})"),
+            &rendered,
+        );
+    }
+}
+
+#[test]
+fn static_question_contract_lives_in_generated_rules() {
+    let mut input = sample_input();
+    input.run_done_proposals_seam_enabled = true;
+    let rendered = claude_md_for(&input);
+    for rule in [
+        "## Write questions for someone arriving cold",
+        "Context:\n",
+        "Yes:\n",
+        "No:\n",
+        "Replace the `Yes:` and `No:` sections with `Split:` and `Bypass limit:`",
+        "Recommendation:\n",
+        "Details:\n",
+        "no internal symbols",
+        "buttons named **Split** and **Bypass limit**",
+        "rough size",
+        "\"No = remain blocked\" is not a real choice",
+        "Never truncate evidence",
+        "Before submitting",
+        "This writing contract does not change when a question is warranted",
+    ] {
+        assert!(rendered.contains(rule), "missing question rule: {rule}");
+    }
+    assert!(!rendered.contains("Worked example"));
+    assert!(!rendered.contains("## Running Boss itself"));
+    assert!(!rendered.contains("bazel run //tools/boss/"));
+}
+
+#[test]
+fn question_contract_requires_standard_worker_and_enabled_channel() {
+    for kind in [
+        WorkerKind::Standard,
+        WorkerKind::Reviewer,
+        WorkerKind::Triage,
+        WorkerKind::AnswerAgent,
+        WorkerKind::ReviewGuide,
+    ] {
+        for enabled in [false, true] {
+            let mut input = sample_input();
+            input.worker_kind = kind.clone();
+            input.run_done_proposals_seam_enabled = enabled;
+            let rendered = claude_md_for(&input);
+            assert_eq!(
+                rendered.contains("## Write questions for someone arriving cold"),
+                kind == WorkerKind::Standard && enabled
+            );
+            assert!(!rendered.contains("### Write questions"));
+        }
+    }
+}
+
+#[test]
+fn shared_publication_and_ci_policy_lives_in_worker_rules() {
+    let rendered = claude_md_for(&sample_input());
+    for rule in [
+        "Do not babysit CI",
+        "SUCCESS, NEUTRAL, or SKIPPED",
+        "CI-fix revision is no substitute",
+        "jj diff -r @",
+        "Print the PR URL on its own line as the last thing in your final response",
+        "check must be classified using the CI failure classification below",
+    ] {
+        assert!(rendered.contains(rule), "missing shared policy: {rule}");
     }
 }

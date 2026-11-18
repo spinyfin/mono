@@ -22,9 +22,12 @@ use std::process::{Command, Stdio};
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
+#[cfg(test)]
 use boss_protocol::WorkItemBinding;
 use boss_tmux::TMUX_SPAWN_TOKEN_ENV;
-use boss_tmux::{DisplayField, NewSession, Tmux};
+#[cfg(test)]
+use boss_tmux::Tmux;
+use boss_tmux::{DisplayField, NewSession};
 use thiserror::Error;
 use tokio::time::Duration;
 
@@ -33,9 +36,8 @@ use std::sync::Arc;
 use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar};
-use crate::work::WorkDb;
 use crate::worker_registry::WorkerRegistry;
-use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
+use crate::worker_setup::{WorkerKind, WorkerSetupInput, write_workspace_files};
 
 /// Sanitized PATH for worker panes. Excludes `~/bin` (where the
 /// `bossctl` symlink lives in this user's setup) and any other
@@ -46,6 +48,13 @@ use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_work
 /// system bins. `/usr/local/bin` is included for legacy x86 brew
 /// installs but Apple-silicon machines ignore it.
 pub(crate) const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+
+/// Serialises a test that sets `BOSS_BIN_DIR` in the process environment
+/// against a test that asserts on the exact `PATH` a spawn derives from it.
+/// Tests in one binary share that environment, so whenever two such tests
+/// land in the same shard they interleave without this.
+#[cfg(test)]
+pub(crate) static BOSS_BIN_DIR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The shell and PATH seed shared by a worker pane and local capability
 /// discovery.
@@ -184,9 +193,50 @@ fn set_env_var(env: &mut Vec<EnvVar>, key: &str, value: String) {
 ///   exported as its own env var, and `BOSS_LAUNCH_GUARD_COMMAND` blocks it
 ///   by basename regardless of where PATH resolution finds it.
 ///
-/// Empty / missing is a no-op: dev / `bazel run` mode relies on the
-/// per-workspace `boss` launcher instead, and never falls back to a
-/// user `PATH` copy for `boss`.
+/// The per-workspace launchers take priority in both installed and dev mode;
+/// their absolute paths are exported for driver tool shells as well.
+pub(crate) fn apply_worker_tool_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<&str>) {
+    apply_boss_bin_dir_to_worker_env(env, boss_bin_dir);
+
+    // The per-workspace launcher dir goes ahead of everything, including
+    // BOSS_BIN_DIR: it holds a `boss` pinned to an absolute path, so it
+    // is the one entry that stays correct in dev mode (no bundle) as
+    // well as installed mode. Applied after the BOSS_BIN_DIR prepend
+    // above so it lands in front of it, mirroring the ordering of the
+    // pane's first shell line in `pane_spawn`.
+    let worker_bin_dir = env
+        .iter()
+        .find(|e| e.key == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
+        .map(|e| e.value.clone());
+    if let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty()) {
+        if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
+            path_entry.value = format!("{worker_bin_dir}:{}", path_entry.value);
+        }
+        // Name the binaries, not a PATH entry. A driver shell snapshot can
+        // demote the launcher dir (Codex does this today); `"$BOSS_BIN"` /
+        // `"$CUBE_BIN"` still exec the launchers. Overwrites the bundle
+        // `BOSS_BIN`/`CUBE_BIN` set above (if any) rather than pushing a
+        // duplicate key: a duplicate is last-wins for the shell env prefix a
+        // worker pane runs under, but any `.find(|e| e.key == ..)` consumer
+        // — including this crate's own tests — sees the FIRST match, which
+        // would silently be the bundle path instead of the launcher.
+        set_env_var(
+            env,
+            boss_engine_worker_bin::BOSS_BIN_ENV,
+            boss_engine_worker_bin::boss_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        );
+        set_env_var(
+            env,
+            boss_engine_worker_bin::CUBE_BIN_ENV,
+            boss_engine_worker_bin::cube_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        );
+    }
+}
+
 fn apply_boss_bin_dir_to_worker_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<&str>) {
     let Some(boss_bin_dir) = boss_bin_dir.filter(|d| !d.is_empty()) else {
         return;
@@ -239,7 +289,7 @@ const WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH: &str = "xai-boss-worker-no-interac
 /// here is automatically enforced there with no second edit to keep in
 /// sync. That module rejects adopting a session whose schema is missing,
 /// unparseable, or newer than this value.
-pub(crate) const TMUX_SESSION_SCHEMA: &str = "1";
+pub const TMUX_SESSION_SCHEMA: &str = "1";
 /// Name of the environment variable [`TMUX_SESSION_SCHEMA`] is carried in.
 /// Adoption reads this name from a different process generation's live
 /// session, so it remains local to that compatibility boundary.
@@ -248,90 +298,8 @@ const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
 /// Durable writes surrounding a tmux session creation. Kept as a narrow
 /// seam so the spawn-ordering test can exercise the real tmux command shape
-/// without requiring a SQLite fixture; [`WorkDb`] is the production store.
-pub trait TmuxSpawnStore: Send + Sync {
-    /// Persist the session identity before tmux receives any command.
-    fn record_tmux_spawn_intent(
-        &self,
-        execution_id: &str,
-        server_label: &str,
-        session_name: &str,
-        spawn_token: &str,
-    ) -> anyhow::Result<bool>;
-
-    /// Mark the pre-recorded session as created after its pane pid is known.
-    /// `session_name` / `server_label` are already known to the caller at
-    /// this point (the intent write above recorded them), so this passes
-    /// them straight through to [`WorkDb::persist_tmux_identity_after_observation`]
-    /// rather than going through the test-only None/None wrapper.
-    fn record_tmux_session_created(
-        &self,
-        execution_id: &str,
-        spawn_token: &str,
-        pane_pid: i64,
-        session_name: &str,
-        server_label: &str,
-    ) -> anyhow::Result<bool>;
-}
-
-impl TmuxSpawnStore for WorkDb {
-    fn record_tmux_spawn_intent(
-        &self,
-        execution_id: &str,
-        server_label: &str,
-        session_name: &str,
-        spawn_token: &str,
-    ) -> anyhow::Result<bool> {
-        self.record_tmux_spawn_intent_for_execution(execution_id, server_label, session_name, spawn_token)
-    }
-
-    fn record_tmux_session_created(
-        &self,
-        execution_id: &str,
-        spawn_token: &str,
-        pane_pid: i64,
-        session_name: &str,
-        server_label: &str,
-    ) -> anyhow::Result<bool> {
-        self.persist_tmux_identity_after_observation(
-            execution_id,
-            spawn_token,
-            pane_pid,
-            Some(session_name),
-            Some(server_label),
-        )
-    }
-}
-
-/// Required collaborators for a local worker spawn.
-#[derive(Clone)]
-pub struct TmuxWorkerHost {
-    tmux: Tmux,
-    spawn_store: Arc<dyn TmuxSpawnStore>,
-    session_name: String,
-}
-
-impl TmuxWorkerHost {
-    pub fn new(tmux: Tmux, spawn_store: Arc<dyn TmuxSpawnStore>, session_name: String) -> Self {
-        Self {
-            tmux,
-            spawn_store,
-            session_name,
-        }
-    }
-
-    pub(crate) fn tmux(&self) -> &boss_tmux::Tmux {
-        &self.tmux
-    }
-
-    pub(crate) fn session_name(&self) -> &str {
-        &self.session_name
-    }
-
-    fn socket_path(&self) -> Option<&Path> {
-        self.tmux.socket_path()
-    }
-}
+/// without requiring a SQLite fixture; [`crate::work::WorkDb`] is the production store.
+pub use boss_execution_runner::host::{TmuxSpawnStore, TmuxWorkerHost};
 
 /// Create one detached tmux session using the durable write ordering required
 /// for restart adoption. Once the intent write succeeds, every later failure
@@ -352,8 +320,8 @@ async fn start_tmux_worker(
         .spawn_store
         .record_tmux_spawn_intent(
             execution_id,
-            &host.tmux.server_identity(),
-            &host.session_name,
+            &host.tmux().server_identity(),
+            host.session_name(),
             &spawn_token,
         )
         .context("recording tmux spawn intent")
@@ -376,13 +344,13 @@ async fn start_tmux_worker(
     environment.insert("BOSS_RUN_ID".to_owned(), execution_id.to_owned());
     crate::tmux_session_options::insert_color_environment(&mut environment);
 
-    crate::tmux_session_options::prepare_server(&host.tmux)
+    crate::tmux_session_options::prepare_server(host.tmux())
         .await
         .context("preparing Boss tmux server before creating worker session")
         .map_err(StartWorkerError::Tmux)?;
-    host.tmux
+    host.tmux()
         .new_session(&NewSession {
-            name: host.session_name.clone(),
+            name: host.session_name().to_owned(),
             environment,
             working_directory: workspace_path.to_path_buf(),
             command: pane_launch.tmux_command(command),
@@ -390,7 +358,7 @@ async fn start_tmux_worker(
         .await
         .context("creating detached tmux session")
         .map_err(StartWorkerError::Tmux)?;
-    crate::tmux_session_options::apply(&host.tmux, &host.session_name)
+    crate::tmux_session_options::apply(host.tmux(), host.session_name())
         .await
         .context("applying Boss worker tmux session options")
         .map_err(StartWorkerError::Tmux)?;
@@ -402,15 +370,13 @@ async fn start_tmux_worker(
     // sending it — an older server rejects the flag outright, which would
     // otherwise fail the whole spawn over a cosmetic scrollback fix.
     if let Some(config) = crate::driver::tmux_session_config_for(driver_name) {
-        match host.tmux.version().await {
-            Ok(version) if version.supports_source_file_target() => {
-                host.tmux
-                    .source_file(&host.session_name, config)
-                    .await
-                    .with_context(|| format!("sourcing {driver_name} tmux session config"))
-                    .map_err(StartWorkerError::Tmux)?;
-            }
-            Ok(version) => {
+        match boss_tmux::session_options::source_driver_session_config(host.tmux(), host.session_name(), config)
+            .await
+            .with_context(|| format!("sourcing {driver_name} tmux session config"))
+            .map_err(StartWorkerError::Tmux)?
+        {
+            boss_tmux::session_options::SessionConfigOutcome::Sourced => {}
+            boss_tmux::session_options::SessionConfigOutcome::UnsupportedTmux(version) => {
                 tracing::warn!(
                     execution_id = %execution_id,
                     driver_name = %driver_name,
@@ -419,7 +385,7 @@ async fn start_tmux_worker(
                     "tmux predates 3.4's `source-file -t`; skipping session-scoped tmux config for this driver",
                 );
             }
-            Err(error) => {
+            boss_tmux::session_options::SessionConfigOutcome::VersionUnreadable(error) => {
                 tracing::warn!(
                     execution_id = %execution_id,
                     driver_name = %driver_name,
@@ -429,14 +395,14 @@ async fn start_tmux_worker(
             }
         }
     }
-    host.tmux
-        .set_option(&host.session_name, TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
+    host.tmux()
+        .set_option(host.session_name(), TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
         .await
         .context("mirroring tmux spawn token in session option")
         .map_err(StartWorkerError::Tmux)?;
     let pane_pid = host
-        .tmux
-        .display_message(&host.session_name, DisplayField::PanePid)
+        .tmux()
+        .display_message(host.session_name(), DisplayField::PanePid)
         .await
         .context("reading tmux pane pid")
         .map_err(StartWorkerError::Tmux)?
@@ -450,8 +416,8 @@ async fn start_tmux_worker(
             execution_id,
             &spawn_token,
             i64::from(pane_pid),
-            &host.session_name,
-            &host.tmux.server_identity(),
+            host.session_name(),
+            &host.tmux().server_identity(),
         )
         .context("recording tmux session creation")
         .map_err(StartWorkerError::Tmux)?;
@@ -463,116 +429,7 @@ async fn start_tmux_worker(
     Ok(pane_pid)
 }
 
-// No `Debug` derive: `Arc<dyn AgentDriver>` is not `Debug`, and nothing
-// logs or asserts on a full `StartWorkerInput` dump.
-#[derive(Clone, bon::Builder)]
-#[builder(on(String, into))]
-pub struct StartWorkerInput {
-    pub run_id: String,
-    pub lease_id: String,
-    /// Slot the engine has already claimed for this worker (1-indexed,
-    /// matches the app's WorkersWorkspaceModel slot numbering). The
-    /// engine is the source of truth for slot allocation; an optional app
-    /// viewer attaches to the tmux worker in this slot.
-    pub slot_id: u8,
-    pub workspace_path: PathBuf,
-    pub events_socket_path: PathBuf,
-    /// Frontend (control) socket this engine bound. Exported as
-    /// `BOSS_SOCKET_PATH` so `boss` CLI verbs reach this engine even when a
-    /// driver has scoped `$HOME` (Grok's process-home sandbox). `None` skips
-    /// the export — tests that don't exercise CLI reachability. Must be the
-    /// bound path, never re-derived from `$BOSS_SOCKET_PATH` / `$HOME`.
-    pub frontend_socket_path: Option<PathBuf>,
-    /// Control-token file this engine wrote. Exported as
-    /// `BOSS_ENGINE_CONTROL_TOKEN_PATH` alongside [`Self::frontend_socket_path`]
-    /// so CLI discovery does not derive `<socket-stem>.control-token` (a
-    /// filename the engine never writes). Must be the bound path from
-    /// `resolve_engine_paths`, never re-derived from the socket stem.
-    /// `None` skips the export.
-    pub control_token_path: Option<PathBuf>,
-    pub boss_event_path: PathBuf,
-    pub initial_input: String,
-    /// Extra env vars to thread to the worker on top of the ones the
-    /// worker settings template injects (`BOSS_EVENTS_SOCKET`,
-    /// `BOSS_SOCKET_PATH`, `BOSS_ENGINE_CONTROL_TOKEN_PATH`,
-    /// `BOSS_LEASE_ID`).
-    #[builder(default)]
-    pub extra_env: Vec<(String, String)>,
-    /// Optional 2–4 word gerund summary to display in the pane
-    /// titlebar (e.g. `"fixing the fencer scraper"`). Set only when
-    /// the engine successfully called Claude to generate the phrase.
-    /// When absent, `task_title` is used for the fallback display.
-    pub title_summary: Option<String>,
-    /// Raw work-item title passed alongside `title_summary` so the
-    /// app can render `"<AgentName>: <task_title>"` when no gerund
-    /// summary is available (no API key or generation failed).
-    pub task_title: Option<String>,
-    /// Work-item linkage stamped onto the resulting `LiveWorkerState`
-    /// so `bossctl agents list` / `agents status` can resolve "the
-    /// worker on chore X" without prompting for a slot. `None` from
-    /// callers that don't have a work item (tests).
-    pub work_item_binding: Option<WorkItemBinding>,
-    /// The model that was actually passed to the claude CLI via `--model`.
-    /// Stamped onto `LiveWorkerState` at spawn so `bossctl agents list`
-    /// reports the real dispatched model instead of a hardcoded default.
-    pub model: String,
-    /// When `true`, the engine-injected CLAUDE.md includes a directive
-    /// to pass `--draft` to `gh pr create` by default. Sourced from
-    /// the `default_pr_draft_mode` per-installation setting.
-    #[builder(default)]
-    pub draft_pr_mode: bool,
-    /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
-    /// Forwarded to `WorkerSetupInput` so the worker settings file can
-    /// install kind-specific hook guards. Also stamped onto
-    /// `LiveWorkerState.kind` at registration so `bossctl agents list`
-    /// can render it without joining the execution table.
-    pub execution_kind: String,
-    /// Attributed worker pool for this run (`"main"`, `"automation"`, or
-    /// `"review"`). Stamped onto `LiveWorkerState.pool` at registration.
-    /// Production dispatch always sets this; tests may leave it `None`.
-    pub pool: Option<String>,
-    /// Task kind from the underlying work item (e.g. `"revision"`, `"chore"`).
-    /// `None` for non-task work items (products, projects).
-    /// Forwarded to `WorkerSetupInput` for defense-in-depth guard checks.
-    pub task_kind: Option<String>,
-    /// Worker kind — forwarded to `WorkerSetupInput` to select the per-kind
-    /// tool denylist. Defaults to [`WorkerKind::Standard`] for all
-    /// current callers; set to [`WorkerKind::Reviewer`] when spawning a
-    /// reviewer worker.
-    #[builder(default = WorkerKind::Standard)]
-    pub worker_kind: WorkerKind,
-    /// Resolved agent driver for this worker. Production callers look the
-    /// slug up once via [`crate::driver::DriverRegistry::require`] and pass
-    /// the same `Arc` into provision, spawn, and this struct so every trait
-    /// method on the run goes through one object. Tests may pass any
-    /// registered (or stub) driver.
-    pub driver: Arc<dyn AgentDriver>,
-    /// Required tmux owner for this local worker.
-    pub tmux_host: TmuxWorkerHost,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::Triage`].
-    #[builder(default)]
-    pub automation_outcome_proposals_seam_enabled: bool,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::Reviewer`].
-    #[builder(default)]
-    pub is_review_supervisor: bool,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::Reviewer`].
-    #[builder(default)]
-    pub is_post_merge_reviewer: bool,
-    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
-    /// unless `worker_kind` is [`WorkerKind::AnswerAgent`].
-    #[builder(default)]
-    pub checkout_positioned_on_pr_head: bool,
-}
-
-#[derive(Debug)]
-pub struct StartedWorker {
-    pub slot_id: u8,
-    pub shell_pid: i32,
-    pub written_files: WrittenFiles,
-}
+pub use boss_execution_runner::host::{StartWorkerInput, StartedWorker};
 
 #[derive(Debug, Error)]
 pub enum StartWorkerError {
@@ -594,9 +451,38 @@ pub enum StartWorkerError {
     ProgressFidelity(ProgressFidelity),
 }
 
+/// What re-establishing a re-adopted run's progress ingress did, for the
+/// dispatch trace. Produced by [`WorkerSpawner::reestablish_progress_ingress`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressReadoption {
+    /// The run's driver observes progress some other way (hook callbacks).
+    NotFileIngress,
+    /// The tail is back, reading from the recorded resume point.
+    Reestablished,
+    /// The run recorded no checkpoint, so whether it needed one is unknown.
+    Unknown,
+    /// It needed one and could not be re-established; an attention item says so.
+    Failed,
+    /// This process already holds the run's slot, so its tail (if any) is
+    /// already in place and nothing was re-established.
+    AlreadyObserved,
+}
+
+impl IngressReadoption {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFileIngress => "not_file_ingress",
+            Self::Reestablished => "reestablished",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
+            Self::AlreadyObserved => "already_observed",
+        }
+    }
+}
+
 /// Public API for callers that want to wire pane-spawning into the
 /// coordinator (or a test). The trait is implemented by
-/// [`crate::app::ServerState`]; users should typically call through
+/// `boss_engine::app::ServerState`; users should typically call through
 /// `ServerState` directly, but the trait makes the dependency
 /// explicit and lets stub implementations stand in for unit tests.
 #[async_trait::async_trait]
@@ -605,7 +491,7 @@ pub trait WorkerSpawner: Send + Sync {
         &self,
         request: EngineToAppRequest,
         timeout: Duration,
-    ) -> Result<EngineToAppResponse, crate::app::SendToAppError>;
+    ) -> Result<EngineToAppResponse, boss_execution_contracts::SendToAppError>;
 
     /// Abort our newly started process without detaching another run's viewer.
     async fn abort_worker_spawn(&self, _run_id: &str) -> Result<(), String> {
@@ -613,6 +499,21 @@ pub trait WorkerSpawner: Send + Sync {
     }
 
     fn worker_registry(&self) -> &WorkerRegistry;
+
+    /// The work database, used to capture a progression pane's neighbourhood
+    /// when its pid is registered ([`WorkerRegistry::register_for_run`]).
+    /// `None` in tests that never spawn a progression run; a progression
+    /// spawn without it is registered confined with no scope.
+    fn work_db(&self) -> Option<&crate::work::WorkDb> {
+        None
+    }
+
+    /// The GitHub-backed design-docs service, which also reads a repo's
+    /// `BOSS.md` for coding workers' prompts. `None` in tests that never
+    /// compose a worker prompt; those prompts simply carry no such block.
+    fn design_docs(&self) -> Option<Arc<boss_engine_design_docs::DesignDocsService>> {
+        None
+    }
 
     /// Engine's live per-slot state registry. Implementations return
     /// `None` from in-process tests that don't care about the live
@@ -626,6 +527,15 @@ pub trait WorkerSpawner: Send + Sync {
     /// caller can broadcast the snapshot on the worker live-state
     /// topic. Default no-op for tests.
     async fn publish_live_worker_states(&self) {}
+
+    /// Hook called when the spawn-time `AttachWorkerPane` did not
+    /// produce a viewer even though the worker itself started (the app
+    /// answered with an error other than `SlotBusy`, or the request
+    /// failed outright). The worker keeps running headless; production
+    /// `ServerState` schedules its bounded viewer re-attach so the pane
+    /// is retried without waiting for an app relaunch. Default no-op
+    /// for tests.
+    async fn note_worker_viewer_attach_failed(&self, _run_id: &str) {}
 
     /// Hook called after a slot has been registered so the engine can
     /// spawn the per-slot live-status summarizer task. Default no-op
@@ -652,6 +562,23 @@ pub trait WorkerSpawner: Send + Sync {
     /// Cancel a prepared or active source after spawn failure/teardown.
     fn stop_progress_ingress(&self, _run_id: &str) {}
 
+    /// Re-establish a *re-adopted* run's progress ingress from the durable
+    /// record of where it got to, after an engine restart rebuilt the run's
+    /// slot. A hook-callback driver needs nothing here — its shim reconnects
+    /// to the events socket on its own — but a file-tailing driver (Codex)
+    /// is observed only through the tail this engine process holds, and a
+    /// rebuilt slot with no tail stays frozen at whatever activity it was
+    /// seeded with and never sees the turn boundary that completes the run.
+    /// Production `ServerState` resumes the tail at the recorded byte or
+    /// files an attention item; the default is for tests.
+    async fn reestablish_progress_ingress(
+        &self,
+        _execution: &crate::work::WorkExecution,
+        _driver: Option<Arc<dyn AgentDriver>>,
+    ) -> IngressReadoption {
+        IngressReadoption::Unknown
+    }
+
     /// Whether the `default_pr_draft_mode` setting is enabled. When
     /// `true`, the worker's CLAUDE.md gets a directive to pass
     /// `--draft` to `gh pr create`. Default `false` for tests.
@@ -676,7 +603,7 @@ pub trait WorkerSpawner: Send + Sync {
     /// kill the just-spawned worker before the coordinator releases the
     /// deferred lease. Default no-op for test spawners that don't host
     /// real panes; production `ServerState` delegates to
-    /// [`crate::app::ServerState::release_worker_pane`].
+    /// `boss_engine::app::ServerState::release_worker_pane`.
     async fn reap_worker_pane(&self, _run_id: &str) {}
 }
 
@@ -753,6 +680,8 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .maybe_task_kind(input.task_kind.clone())
         .worker_kind(input.worker_kind.clone())
         .automation_outcome_proposals_seam_enabled(input.automation_outcome_proposals_seam_enabled)
+        .run_done_proposals_seam_enabled(input.run_done_proposals_seam_enabled)
+        .worker_signal_proposals_seam_enabled(input.worker_signal_proposals_seam_enabled)
         .is_review_supervisor(input.is_review_supervisor)
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
@@ -769,7 +698,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     //    CLI verbs survive a driver that scopes `$HOME`),
     //    `BOSS_ENGINE_CONTROL_TOKEN_PATH` (the bound token, so
     //    `boss engine stop` does not derive a sibling of the socket),
-    //    `BOSS_LEASE_ID`, and any caller-provided `extra_env` keys
+    //    `BOSS_LEASE_ID` for leased workers, and caller-provided `extra_env` keys
     //    that survive the allowlist filter. Anything else is dropped.
     //
     //    Editor env vars are forced to `false` so a worker that runs
@@ -823,11 +752,16 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
              worker `boss` verbs will fall back to HOME-relative discovery",
         );
     }
-    env.extend([
-        EnvVar {
+    // Progression runs use a scratch directory without a cube lease. Omit
+    // only their lease export; an empty value for a leased worker must still
+    // reach tmux validation and fail as an invalid spawn context.
+    if input.worker_kind != WorkerKind::Progression {
+        env.push(EnvVar {
             key: "BOSS_LEASE_ID".into(),
             value: input.lease_id.clone(),
-        },
+        });
+    }
+    env.extend([
         EnvVar {
             // Read by `boss-event` and embedded in every hook payload
             // as `_boss_run_id`. The engine uses this to correlate
@@ -882,45 +816,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     // Unset in dev mode (no bundle bin/ directory); the per-workspace
     // `boss` launcher (BOSS_WORKER_BIN_DIR) still pins bare `boss` to the
     // engine's own CLI without searching PATH.
-    apply_boss_bin_dir_to_worker_env(&mut env, std::env::var("BOSS_BIN_DIR").ok().as_deref());
-
-    // The per-workspace launcher dir goes ahead of everything, including
-    // BOSS_BIN_DIR: it holds a `boss` pinned to an absolute path, so it
-    // is the one entry that stays correct in dev mode (no bundle) as
-    // well as installed mode. Applied after the BOSS_BIN_DIR prepend
-    // above so it lands in front of it, mirroring the ordering of the
-    // pane's first shell line in `pane_spawn`.
-    let worker_bin_dir = env
-        .iter()
-        .find(|e| e.key == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
-        .map(|e| e.value.clone());
-    if let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty()) {
-        if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
-            path_entry.value = format!("{worker_bin_dir}:{}", path_entry.value);
-        }
-        // Name the binaries, not a PATH entry. A driver shell snapshot can
-        // demote the launcher dir (Codex does this today); `"$BOSS_BIN"` /
-        // `"$CUBE_BIN"` still exec the launchers. Overwrites the bundle
-        // `BOSS_BIN`/`CUBE_BIN` set above (if any) rather than pushing a
-        // duplicate key: a duplicate is last-wins for the shell env prefix a
-        // worker pane runs under, but any `.find(|e| e.key == ..)` consumer
-        // — including this crate's own tests — sees the FIRST match, which
-        // would silently be the bundle path instead of the launcher.
-        set_env_var(
-            &mut env,
-            boss_engine_worker_bin::BOSS_BIN_ENV,
-            boss_engine_worker_bin::boss_bin_in(Path::new(&worker_bin_dir))
-                .display()
-                .to_string(),
-        );
-        set_env_var(
-            &mut env,
-            boss_engine_worker_bin::CUBE_BIN_ENV,
-            boss_engine_worker_bin::cube_bin_in(Path::new(&worker_bin_dir))
-                .display()
-                .to_string(),
-        );
-    }
+    apply_worker_tool_env(&mut env, std::env::var("BOSS_BIN_DIR").ok().as_deref());
 
     let slot_id = input.slot_id;
     let tmux_host = &input.tmux_host;
@@ -955,8 +851,10 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     // only means it runs without a viewer until the app reconnects. A
     // SlotBusy rejection is different: reconciliation has already tried to
     // clear stale occupancy, so the failure is propagated and the spawned
-    // worker is reaped.
-    match spawner
+    // worker is reaped. Other failures are stamped onto the live state so
+    // the card says "Couldn't attach the terminal: <reason>" instead of
+    // reading as still connecting. A successful attach clears the error.
+    let viewer_attach_error: Option<String> = match spawner
         .send_to_app_request(
             EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
                 run_id: input.run_id.clone(),
@@ -977,6 +875,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
                 session_name = tmux_host.session_name(),
                 "attached tmux-hosted worker pane",
             );
+            None
         }
         Ok(EngineToAppResponse::AttachWorkerPane {
             result: Err(err @ EngineToAppError::SlotBusy { .. }),
@@ -996,6 +895,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
                 ?response,
                 "tmux worker started but app did not attach its viewer surface",
             );
+            Some(viewer_attach_failure_reason(&response))
         }
         Err(err) => {
             tracing::debug!(
@@ -1004,13 +904,25 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
                 ?err,
                 "tmux worker started without an app viewer surface",
             );
+            // `NotRegistered` is the one expected case: the app is not
+            // running, so there is nobody to show a card. Registration
+            // re-attaches every live worker and no failure is recorded.
+            match err {
+                boss_execution_contracts::SendToAppError::NotRegistered => None,
+                other => Some(format!("request to the app failed: {other}")),
+            }
         }
-    }
+    };
 
     spawner
         .worker_registry()
         .register_tmux_run_slot(input.run_id.clone(), slot_id, tmux_host.session_name());
-    spawner.worker_registry().register(shell_pid, input.run_id.clone());
+    spawner.worker_registry().register_for_run(
+        shell_pid,
+        &input.run_id,
+        input.worker_kind == crate::worker_setup::WorkerKind::Progression,
+        spawner.work_db(),
+    );
 
     // 4. Stamp the initial LiveWorkerState so bossctl/UI immediately
     //    see "Spawning" with the launch-default model — no more
@@ -1032,13 +944,17 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
             // non-empty snake_case kind, tests that leave the field at a
             // placeholder still surface it on the wire. Pool may be
             // `None` for tests that never set `StartWorkerInput.pool`.
-            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, true),
+            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, true)
+                .with_metadata(input.live_metadata),
         );
         // Declare this slot's driver-reported progress fidelity so
         // `stale_worker_sweep` judges cadence-based staleness against the
         // driver that is actually running, not an assumed Claude rhythm
         // (see `ProgressFidelity::stale_threshold_secs`).
         live_states.set_progress_fidelity(slot_id, input.driver.progress_fidelity());
+        if let Some(reason) = viewer_attach_error.clone() {
+            live_states.set_viewer_attach_error(&input.run_id, Some(reason));
+        }
         spawner.publish_live_worker_states().await;
         // 5. Spin up the live-status summarizer for this slot. The
         //    manager owns the task lifecycle and will be torn down
@@ -1046,6 +962,9 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         spawner.start_live_status_slot(slot_id, &input.run_id, input.driver.clone());
     }
     spawner.activate_progress_ingress(&input.run_id);
+    if viewer_attach_error.is_some() {
+        spawner.note_worker_viewer_attach_failed(&input.run_id).await;
+    }
 
     Ok(StartedWorker {
         slot_id,
@@ -1054,12 +973,26 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     })
 }
 
+/// Human-readable reason for an `AttachWorkerPane` response that is not a
+/// success, for [`boss_protocol::LiveWorkerState::viewer_attach_error`].
+/// The typed app error is spelled out (not `Debug`-formatted) because the
+/// text is rendered verbatim on the worker's pane card.
+pub fn viewer_attach_failure_reason(response: &EngineToAppResponse) -> String {
+    match response {
+        EngineToAppResponse::AttachWorkerPane { result: Err(err) } => format!("the app refused the viewer: {err}"),
+        EngineToAppResponse::AttachWorkerPane { result: Ok(_) } => {
+            unreachable!("a successful attach has no failure reason")
+        }
+        other => format!("the app answered the viewer attach with an unexpected response: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::SendToAppError;
     use crate::driver::test_support::{codex_homes_override, transcript_store_override};
     use crate::protocol::{AttachWorkerPaneResult, EngineToAppError};
+    use boss_execution_contracts::SendToAppError;
     use boss_tmux::{CommandOutput, CommandRunner};
     use std::ffi::OsString;
     use std::path::Path;
@@ -1146,9 +1079,12 @@ mod tests {
                 "boss-3-run-test".into(),
             ),
             automation_outcome_proposals_seam_enabled: false,
+            run_done_proposals_seam_enabled: false,
+            worker_signal_proposals_seam_enabled: false,
             is_review_supervisor: false,
             is_post_merge_reviewer: false,
             checkout_positioned_on_pr_head: false,
+            live_metadata: Default::default(),
         }
     }
 
@@ -1342,7 +1278,7 @@ mod tests {
         let started = start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
 
         assert_eq!(started.shell_pid, 4242);
-        assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
+        assert_eq!(registry.lookup_unverified(4242).as_deref(), Some("run-test"));
         assert_eq!(
             spawner.spawn_calls.load(Ordering::SeqCst),
             1,
@@ -1654,7 +1590,7 @@ mod tests {
         assert!(started.written_files.claude_md_path.exists());
         assert!(started.written_files.settings_path.exists());
         assert!(started.written_files.gitignore_path.exists());
-        assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
+        assert_eq!(registry.lookup_unverified(4242).as_deref(), Some("run-test"));
     }
 
     /// Call-site cutover acceptance: `start_worker` must use the driver Arc
@@ -1761,7 +1697,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(started.shell_pid, 4242);
-        assert_eq!(spawner.registry.lookup(4242).as_deref(), Some("run-test"));
+        assert_eq!(spawner.registry.lookup_unverified(4242).as_deref(), Some("run-test"));
     }
 
     /// Engine-owns-slots invariant: the slot the runner claimed for
@@ -1927,6 +1863,10 @@ mod tests {
         /// `activate_progress_ingress`, tagged with whether the slot's
         /// live-state entry was already registered when it fired.
         Activated { registered: bool },
+        /// `note_worker_viewer_attach_failed`: the worker started but the
+        /// app did not give it a viewer, so production schedules the
+        /// bounded re-attach.
+        ViewerAttachFailedNoted,
     }
 
     /// Spawner that wires the two production collaborators `StubSpawner`
@@ -1947,6 +1887,9 @@ mod tests {
         slot_id: u8,
         spawn_calls: Arc<AtomicUsize>,
         steps: std::sync::Mutex<Vec<SpawnStep>>,
+        /// When set, the fake app answers `AttachWorkerPane` with this
+        /// error instead of a viewer (the worker itself still starts).
+        viewer_refusal: Option<EngineToAppError>,
     }
 
     impl LiveStateSpawner {
@@ -1959,6 +1902,7 @@ mod tests {
                 slot_id,
                 spawn_calls: Arc::new(AtomicUsize::new(0)),
                 steps: std::sync::Mutex::new(Vec::new()),
+                viewer_refusal: None,
             }
         }
 
@@ -1982,7 +1926,10 @@ mod tests {
             self.spawn_calls.fetch_add(1, Ordering::SeqCst);
             self.record(SpawnStep::PaneRequested);
             Ok(EngineToAppResponse::AttachWorkerPane {
-                result: Ok(AttachWorkerPaneResult {}),
+                result: match &self.viewer_refusal {
+                    Some(err) => Err(err.clone()),
+                    None => Ok(AttachWorkerPaneResult {}),
+                },
             })
         }
 
@@ -1992,6 +1939,10 @@ mod tests {
 
         fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
             Some(&self.live_states)
+        }
+
+        async fn note_worker_viewer_attach_failed(&self, _run_id: &str) {
+            self.record(SpawnStep::ViewerAttachFailedNoted);
         }
 
         fn prepare_progress_ingress(
@@ -2151,6 +2102,44 @@ mod tests {
         assert_eq!(state.work_item_id.as_deref(), Some("task-codex-1"));
     }
 
+    /// A non-`SlotBusy` viewer refusal at spawn must not fail the worker
+    /// (the tmux session owns it), but it must not be silent either: the
+    /// reason is stamped on the live state the app renders, and the
+    /// spawner is told so production can schedule the bounded re-attach.
+    #[tokio::test]
+    async fn refused_spawn_time_viewer_attach_is_stamped_on_the_live_state_and_noted() {
+        let workspace = TempDir::new().unwrap();
+        let mut spawner = LiveStateSpawner::new(3);
+        spawner.viewer_refusal = Some(EngineToAppError::Internal {
+            message: "pane allocator not ready".into(),
+        });
+
+        let started = start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .expect("a refused viewer must not fail the spawn");
+        assert_eq!(started.slot_id, 3);
+
+        assert_eq!(
+            spawner.steps(),
+            vec![
+                SpawnStep::Prepared("HookCallback"),
+                SpawnStep::PaneRequested,
+                SpawnStep::Activated { registered: true },
+                SpawnStep::ViewerAttachFailedNoted,
+            ],
+            "the failure is noted only after the live state exists, so the retry can find the run",
+        );
+        let state = spawner.live_states.get(3).expect("the worker is registered headless");
+        assert_eq!(
+            state.viewer_attach_error.as_deref(),
+            Some("the app refused the viewer: app internal error: pane allocator not ready"),
+        );
+    }
+
     /// The same spawn against the Claude driver, so the assertion above is
     /// pinned as a *parity* claim rather than a Codex-only snapshot: if a
     /// future change makes registration conditional on the ingress kind,
@@ -2184,6 +2173,10 @@ mod tests {
             .get(3)
             .expect("a Claude spawn registers a LiveWorkerState");
         assert_eq!(state.run_id, "run-test");
+        assert_eq!(
+            state.viewer_attach_error, None,
+            "a spawn whose viewer attached must not carry a failure reason"
+        );
         assert_eq!(state.pool.as_deref(), Some("main"));
     }
 
@@ -2204,6 +2197,9 @@ mod tests {
 
     #[tokio::test]
     async fn env_includes_sanitized_path_and_engine_keys() {
+        // The exact-PATH assertion below holds only while no other test has
+        // `BOSS_BIN_DIR` set.
+        let _ambient = BOSS_BIN_DIR_TEST_LOCK.lock().await;
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
@@ -2658,6 +2654,134 @@ mod tests {
         assert!(keys.contains(&"BOSS_TASK_ID"));
     }
 
+    /// Delegates to [`StubSpawner`] but also exposes a work database, the way
+    /// the production spawner does.
+    struct DbSpawner {
+        inner: StubSpawner,
+        db: Arc<crate::work::WorkDb>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerSpawner for DbSpawner {
+        async fn send_to_app_request(
+            &self,
+            request: EngineToAppRequest,
+            timeout: Duration,
+        ) -> Result<EngineToAppResponse, SendToAppError> {
+            self.inner.send_to_app_request(request, timeout).await
+        }
+
+        fn worker_registry(&self) -> &WorkerRegistry {
+            self.inner.worker_registry()
+        }
+
+        fn work_db(&self) -> Option<&crate::work::WorkDb> {
+            Some(&self.db)
+        }
+    }
+
+    /// A freshly spawned progression pane is registered at the confined tier and
+    /// its neighbourhood is captured before the registration; an ordinary worker
+    /// is not.
+    async fn assert_progression_spawn(driver_name: &str) {
+        use crate::test_support::{create_test_chore_manual, create_test_product_named, open_db_arc};
+        let (_dir, db) = open_db_arc();
+        let product = create_test_product_named(&db, "p");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "stuck");
+        let execution = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(boss_protocol::ExecutionKind::Progression)
+                    .status(boss_protocol::ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        for (kind, expected_tier) in [(WorkerKind::Progression, true), (WorkerKind::Standard, false)] {
+            let workspace = TempDir::new().unwrap();
+            let spawner = DbSpawner {
+                inner: ok_spawner_capturing(),
+                db: db.clone(),
+            };
+            let mut input = sample_input(&workspace, spawner.inner.tmux_runner.clone());
+            if driver_name == "codex" {
+                input = codex_input(&workspace, &execution.id, 3, spawner.inner.tmux_runner.clone());
+            }
+            input.driver = crate::driver::DriverRegistry::default().require(driver_name).unwrap();
+            input.run_id = execution.id.clone();
+            if kind == WorkerKind::Progression {
+                assert!(execution.cube_lease_id.is_none());
+                input.execution_kind = execution.kind.as_str().to_owned();
+                input.lease_id.clear();
+            }
+            input.worker_kind = kind;
+            start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+            assert_eq!(spawner.inner.registry.registered_tier(4242), Some(expected_tier));
+            let env = spawner.inner.last_spawn_env();
+            assert!(env.iter().all(|(_, value)| !value.is_empty()), "{driver_name}: {env:?}");
+            assert_eq!(
+                env.iter()
+                    .find(|(key, _)| key == "BOSS_LEASE_ID")
+                    .map(|(_, v)| v.as_str()),
+                if expected_tier { None } else { Some("lease-test") },
+            );
+            assert!(
+                env.iter()
+                    .any(|(key, value)| key == "BOSS_RUN_ID" && value == &execution.id)
+            );
+            let calls = spawner.inner.tmux_runner.calls();
+            let create = calls
+                .iter()
+                .find(|args| args.get(2).map(String::as_str) == Some("new-session"))
+                .unwrap();
+            assert!(
+                create
+                    .windows(2)
+                    .any(|pair| pair[0] == "-c" && Path::new(&pair[1]) == workspace.path())
+            );
+        }
+        db.check_progression_scope(&execution.id, &chore.id)
+            .expect("the progression spawn captured its neighbourhood");
+    }
+
+    #[tokio::test]
+    async fn claude_progression_spawn_without_a_cube_lease() {
+        assert_progression_spawn("claude").await;
+    }
+
+    #[test]
+    fn codex_progression_spawn_without_a_cube_lease() {
+        let homes = TempDir::new().unwrap();
+        let _homes_env = codex_homes_override(homes.path());
+        let transcripts = TempDir::new().unwrap();
+        let _transcripts_env = transcript_store_override(transcripts.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_progression_spawn("codex"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_lease_on_a_standard_worker_still_fails_spawn() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
+        input.lease_id.clear();
+        let error = start_worker(&spawner, input, StdDuration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("tmux environment value cannot be empty"));
+        assert!(
+            !spawner
+                .tmux_runner
+                .calls()
+                .iter()
+                .any(|args| args.get(2).map(String::as_str) == Some("new-session"))
+        );
+        assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn absent_or_unresponsive_viewer_keeps_the_worker_registered() {
         for response in [SendToAppError::Timeout, SendToAppError::NotRegistered] {
@@ -2672,7 +2796,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(started.shell_pid, 4242);
-            assert_eq!(spawner.registry.lookup(4242).as_deref(), Some("run-test"));
+            assert_eq!(spawner.registry.lookup_unverified(4242).as_deref(), Some("run-test"));
             assert_eq!(spawner.registry.slot_for_run("run-test"), Some(3));
         }
     }

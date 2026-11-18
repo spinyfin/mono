@@ -15,6 +15,14 @@ use super::*;
 
 use boss_engine::work::dispatch_halt_headline;
 
+/// `println!` into a `String`, so a report can be built and asserted on.
+macro_rules! outln {
+    ($out:expr, $($arg:tt)*) => {{
+        use std::fmt::Write as _;
+        let _ = writeln!($out, $($arg)*);
+    }};
+}
+
 /// Resolve a positional `agent` argument to a live worker entry.
 ///
 /// Tries, in order: (a) exact match on `run_id`, (b) exact match on
@@ -225,7 +233,7 @@ pub(crate) async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<Liv
         .await
         .context("sending ListWorkerLiveStates")?
     {
-        FrontendEvent::WorkerLiveStatesList { states } => Ok(states),
+        FrontendEvent::WorkerLiveStatesList { states, .. } => Ok(states),
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected list: {message}")
         }
@@ -254,7 +262,7 @@ pub(crate) async fn fetch_tmux_worker_statuses(client: &mut BossClient) -> Resul
 /// durable-occupant-no-registry / OccupancyInconclusive / husk) — see
 /// [`HostedPaneState`]. This is the durable-state fallback
 /// every `agents` verb consults once a plain live-registry lookup misses,
-/// so a crew name or slot id the operator can see in the app still
+/// so a crew name or slot id shown in the app still
 /// resolves after the engine drops the live registry entry.
 pub(crate) async fn fetch_hosted_pane_statuses(client: &mut BossClient) -> Result<Vec<HostedPaneStatus>> {
     match client
@@ -340,7 +348,7 @@ fn pane_state_label(state: &HostedPaneState) -> &'static str {
 
 /// Build the "no worker matches" error for a reference that resolved in
 /// neither the live registry nor the durable/hosted-pane roster, listing
-/// both so the operator can see what was actually searched — not just the
+/// both so the caller can see what was actually searched — not just the
 /// live crew (mirrors what `live_candidates_summary` alone used to show).
 fn no_worker_matches_error(reference: &str, states: &[LiveWorkerState], hosted: &[HostedPaneStatus]) -> anyhow::Error {
     let live = live_candidates_summary(states);
@@ -379,44 +387,9 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
 
-    match resolve_agent_ref(&agent, &states) {
-        Ok(state) => {
-            print_live_state(json, state);
-            return Ok(());
-        }
-        Err(_) => {
-            // Durable-state fallback: a crew name or slot id the operator can
-            // see in the app must resolve even after the engine has dropped
-            // the live registry entry (crash, terminal-fail path, spawn-ack
-            // timeout).
-            let hosted = fetch_hosted_pane_statuses(&mut client).await?;
-            if let Some(pane) = resolve_hosted_pane_ref(&agent, &hosted)? {
-                print_hosted_pane_status(json, pane);
-                return Ok(());
-            }
-            if looks_like_name_or_slot(&agent) {
-                return Err(no_worker_matches_error(&agent, &states, &hosted));
-            }
-        }
-    }
-
-    // Not a live worker. If the reference resolves to a work item (a typed
-    // short id or a primary task_/proj_/prod_ id), report on it directly. This
-    // is the only path available for a work item the engine has *parked*
-    // rather than dispatched — e.g. the orphan-sweep / pr_review-recovery
-    // churn guard: there is no live worker and (if it never got far enough
-    // to spawn one) no `work_runs` row either, so the `GetRun` fallback
-    // below would just error with "no such run".
-    if let Some(work_item) = resolve_work_item_ref(&mut client, &agent).await? {
-        let primary_id = work_item.primary_id().to_owned();
-        if let Some(state) = states
-            .iter()
-            .find(|s| s.work_item_id.as_deref() == Some(primary_id.as_str()))
-        {
-            print_live_state(json, state);
-            return Ok(());
-        }
-        return print_parked_work_item_status(&mut client, json, &work_item).await;
+    if let Some(text) = status_report_for_reference(&mut client, json, &agent, &states).await? {
+        print!("{text}");
+        return Ok(());
     }
 
     // No live entry and the reference doesn't look like a name or
@@ -464,6 +437,68 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
     Ok(())
 }
 
+/// Render the status of a live worker, a durably tracked hosted pane, or a
+/// work item with no worker, each with the stored run and execution failure
+/// text. `None` means the reference matches none of them, so the caller falls
+/// back to a historical run lookup.
+async fn status_report_for_reference(
+    client: &mut BossClient,
+    json: bool,
+    agent: &str,
+    states: &[LiveWorkerState],
+) -> Result<Option<String>> {
+    match resolve_agent_ref(agent, states) {
+        Ok(state) => return Ok(Some(live_state_report(client, json, state).await)),
+        Err(_) => {
+            // Durable-state fallback: a crew name or slot id shown in the
+            // app must resolve even after the engine has dropped
+            // the live registry entry (crash, terminal-fail path, spawn-ack
+            // timeout).
+            let hosted = fetch_hosted_pane_statuses(client).await?;
+            if let Some(pane) = resolve_hosted_pane_ref(agent, &hosted)? {
+                let (run, execution) = fetch_pane_stored_records(client, &pane.run_id).await;
+                return Ok(Some(hosted_pane_status_text(
+                    json,
+                    pane,
+                    run.as_ref(),
+                    execution.as_ref(),
+                )));
+            }
+            if looks_like_name_or_slot(agent) {
+                return Err(no_worker_matches_error(agent, states, &hosted));
+            }
+        }
+    }
+
+    // Not a live worker. If the reference resolves to a work item (a typed
+    // short id or a primary task_/proj_/prod_ id), report on it directly. This
+    // is the only path available for a work item the engine has *parked*
+    // rather than dispatched — e.g. the orphan-sweep / pr_review-recovery
+    // churn guard: there is no live worker and (if it never got far enough
+    // to spawn one) no `work_runs` row either, so the `GetRun` fallback
+    // would just error with "no such run".
+    if let Some(work_item) = resolve_work_item_ref(client, agent).await? {
+        let primary_id = work_item.primary_id().to_owned();
+        if let Some(state) = states
+            .iter()
+            .find(|s| s.work_item_id.as_deref() == Some(primary_id.as_str()))
+        {
+            return Ok(Some(live_state_report(client, json, state).await));
+        }
+        return Ok(Some(parked_work_item_status(client, json, &work_item).await?));
+    }
+    Ok(None)
+}
+
+/// A live worker's report with the stored errors of its latest run and
+/// execution. The registry entry can outlive a failed start, and the failure
+/// text is recorded only on those rows.
+async fn live_state_report(client: &mut BossClient, json: bool, state: &LiveWorkerState) -> String {
+    let execution_id = state.execution_id.as_deref().unwrap_or(&state.run_id);
+    let (run, execution) = fetch_pane_stored_records(client, execution_id).await;
+    live_state_text(json, state, run.as_ref(), execution.as_ref())
+}
+
 /// Report on a work item that resolved from `bossctl agents status`'s
 /// argument but has no live worker backing it — the case a bare `GetRun`
 /// lookup can't handle because the item may never have gotten far enough
@@ -482,7 +517,8 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
 /// `cli/src/output.rs`. Without the latter, a churn-parked task/chore would
 /// print `status: todo` followed by "(no open attention items)" with no clue
 /// why — the same read-surface gap `boss task/chore show` already closed.
-async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work_item: &WorkItem) -> Result<()> {
+async fn parked_work_item_status(client: &mut BossClient, json: bool, work_item: &WorkItem) -> Result<String> {
+    let mut out = String::new();
     let primary_id = work_item.primary_id().to_owned();
 
     let runtime = match client
@@ -494,6 +530,21 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
     {
         FrontendEvent::TaskRuntimeResult { runtime } => Some(runtime),
         _ => None,
+    };
+    let execution = match runtime.as_ref().and_then(|runtime| runtime.execution_id.clone()) {
+        Some(id) => match client
+            .send_request(&FrontendRequest::GetExecution { id })
+            .await
+            .context("sending GetExecution")?
+        {
+            FrontendEvent::ExecutionResult { execution } => Some(execution),
+            _ => None,
+        },
+        None => None,
+    };
+    let latest_run = match execution.as_ref() {
+        Some(execution) => fetch_latest_run(client, &execution.id).await,
+        None => None,
     };
     let attention_items = match client
         .send_request(&FrontendRequest::ListAttentionItemsForWorkItem {
@@ -511,16 +562,19 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
         .collect();
 
     if json {
-        println!(
+        outln!(
+            out,
             "{}",
             serde_json::json!({
                 "work_item": work_item,
                 "live_worker_state": serde_json::Value::Null,
                 "task_runtime": runtime,
+                "execution": execution,
+                "errors": stored_errors_json(latest_run.as_ref(), execution.as_ref()),
                 "open_attention_items": open_attention_items,
             })
         );
-        return Ok(());
+        return Ok(out);
     }
 
     let (status, name) = match work_item {
@@ -528,18 +582,19 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
         WorkItem::Project(p) => (p.status.as_str().to_owned(), p.name.as_str()),
         WorkItem::Product(p) => (p.status.clone(), p.name.as_str()),
     };
-    println!("{primary_id} \"{name}\" — no live worker");
-    println!("  status: {status}");
+    outln!(out, "{primary_id} \"{name}\" — no live worker");
+    outln!(out, "  status: {status}");
     if let WorkItem::Task(t) | WorkItem::Chore(t) = work_item
         && let Some(reason) = t.dispatch_failed_reason.as_deref()
     {
-        println!("  {}", dispatch_halt_headline(reason));
+        outln!(out, "  {}", dispatch_halt_headline(reason));
         if let Some(error) = t.dispatch_failed_error.as_deref() {
-            println!("    {error}");
+            outln!(out, "    {error}");
         }
     }
     if let Some(runtime) = &runtime {
-        println!(
+        outln!(
+            out,
             "  current_execution: {} [{}]",
             runtime.execution_id.as_deref().unwrap_or("-"),
             runtime
@@ -549,15 +604,73 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
                 .unwrap_or_else(|| "-".to_owned())
         );
     }
+    for line in stored_error_lines(latest_run.as_ref(), execution.as_ref()) {
+        outln!(out, "{line}");
+    }
     if open_attention_items.is_empty() {
-        println!("  (no open attention items)");
+        outln!(out, "  (no open attention items)");
     } else {
-        println!("  open attention items:");
+        outln!(out, "  open attention items:");
         for item in &open_attention_items {
-            println!("    [{}] {} (since {})", item.kind, item.title, item.created_at);
+            outln!(out, "    [{}] {} (since {})", item.kind, item.title, item.created_at);
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// The most recent run of an execution; best-effort, so a missing run never
+/// fails a status read.
+async fn fetch_latest_run(client: &mut BossClient, execution_id: &str) -> Option<WorkRun> {
+    match client
+        .send_request(&FrontendRequest::ListRuns {
+            execution_id: execution_id.to_owned(),
+        })
+        .await
+    {
+        Ok(FrontendEvent::RunsList { runs, .. }) => runs.into_iter().max_by(|a, b| a.created_at.cmp(&b.created_at)),
+        _ => None,
+    }
+}
+
+/// The stored latest run and execution behind a hosted pane; its `run_id` is
+/// the execution id. Best-effort, like [`fetch_latest_run`].
+async fn fetch_pane_stored_records(
+    client: &mut BossClient,
+    execution_id: &str,
+) -> (Option<WorkRun>, Option<WorkExecution>) {
+    let request = FrontendRequest::GetExecution {
+        id: execution_id.to_owned(),
+    };
+    let execution = match client.send_request(&request).await {
+        Ok(FrontendEvent::ExecutionResult { execution }) => Some(execution),
+        _ => None,
+    };
+    (fetch_latest_run(client, execution_id).await, execution)
+}
+
+/// Failure text stored for a run (`work_runs.error_text`) and its execution
+/// (`work_executions.last_error`). A pre-start failure is recorded only here,
+/// so it may be present even when no worker process ever started.
+fn stored_errors_json(run: Option<&WorkRun>, execution: Option<&WorkExecution>) -> serde_json::Value {
+    serde_json::json!({
+        "run_error_text": run.and_then(|run| run.error_text.as_deref()),
+        "execution_last_error": execution.and_then(|execution| execution.last_error.as_deref()),
+    })
+}
+
+/// Text-mode lines for the stored failure text; empty when neither is set.
+fn stored_error_lines(run: Option<&WorkRun>, execution: Option<&WorkExecution>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(error) = run.and_then(|run| run.error_text.as_deref()).filter(|e| !e.is_empty()) {
+        lines.push(format!("  run error:     {error}"));
+    }
+    if let Some(error) = execution
+        .and_then(|execution| execution.last_error.as_deref())
+        .filter(|e| !e.is_empty())
+    {
+        lines.push(format!("  last error:    {error}"));
+    }
+    lines
 }
 
 /// Renders a historical `GetRun` lookup alongside the worker's actual
@@ -581,6 +694,7 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
                          lifecycle. Use live_worker_state (if present) or execution for that.",
                 "live_worker_state": live,
                 "execution": execution,
+                "errors": stored_errors_json(Some(run), execution),
             })
         );
         return;
@@ -594,6 +708,9 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
     }
     if let Some(f) = &run.finished_at {
         println!("  spawn finished:{f}");
+    }
+    for line in stored_error_lines(Some(run), None) {
+        println!("{line}");
     }
 
     match live {
@@ -612,6 +729,9 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
                 }
                 if let Some(f) = &exec.finished_at {
                     println!("  finished: {f}");
+                }
+                for line in stored_error_lines(None, Some(exec)) {
+                    println!("{line}");
                 }
             }
             None => {
@@ -1094,15 +1214,9 @@ pub(crate) async fn open_document(socket_path: &Option<String>, json: bool, path
     }
 }
 
-/// Inject `text` into the worker pane referenced by `agent`, as if
-/// the user had typed it and pressed Return. The submit step is the
-/// app-side writer's responsibility: after pasting the body via
-/// libghostty's text path it synthesises a Return keystroke, which
-/// is what makes the prompt land. Earlier revisions of this CLI
-/// appended a trailing `\n` here in the hope that the paste path
-/// would treat it as Enter; it does not (the `\n` lands as a literal
-/// newline character in the input field), so the writer owns
-/// submission now and the CLI ships the text verbatim.
+/// Send a nudge through the engine's pane delivery path. Busy interactive
+/// workers are interrupted before submission; parked workers receive the
+/// text directly. The engine owns the submit keystroke.
 pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent: String, text: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -1118,18 +1232,14 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
         FrontendEvent::WorkerInputSent {
             run_id: returned,
             slot_id,
+            probe_id,
         } => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "sent",
-                        "run_id": returned,
-                        "slot_id": slot_id,
-                    })
-                );
+                println!("{}", worker_input_sent_json(&returned, slot_id, probe_id.as_deref()));
             } else {
-                println!("sent input to slot {slot_id} (run {returned})");
+                for line in worker_input_sent_lines(&returned, slot_id, probe_id.as_deref()) {
+                    println!("{line}");
+                }
             }
             Ok(())
         }
@@ -1138,6 +1248,26 @@ pub(crate) async fn agents_send(socket_path: &Option<String>, json: bool, agent:
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }
+}
+
+/// `--json` body of a successful `agents send`. `probe_id` is the receipt for
+/// a busy-worker (interrupting) send and `null` otherwise.
+fn worker_input_sent_json(run_id: &str, slot_id: u8, probe_id: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "sent",
+        "run_id": run_id,
+        "slot_id": slot_id,
+        "probe_id": probe_id,
+    })
+}
+
+/// Human output of a successful `agents send`, one entry per line.
+fn worker_input_sent_lines(run_id: &str, slot_id: u8, probe_id: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("sent input to slot {slot_id} (run {run_id})")];
+    if let Some(probe_id) = probe_id {
+        lines.push(format!("check delivery with: bossctl probe-status {probe_id}"));
+    }
+    lines
 }
 
 /// Interrupt the worker referenced by `agent` — equivalent to the
@@ -1738,53 +1868,129 @@ pub(crate) async fn agents_pools(socket_path: &Option<String>, json: bool) -> Re
 }
 
 fn print_live_state(json: bool, state: &LiveWorkerState) {
+    print!("{}", live_state_text(json, state, None, None));
+}
+
+/// The live-state report, followed by the stored failure text of the
+/// worker's latest run and execution. In JSON the live fields stay at the top
+/// level and an `errors` object is added next to them.
+fn live_state_text(
+    json: bool,
+    state: &LiveWorkerState,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) -> String {
+    let mut out = String::new();
     if json {
-        println!("{}", serde_json::to_string(state).expect("LiveWorkerState serializes"));
-        return;
+        let mut value = serde_json::to_value(state).expect("LiveWorkerState serializes");
+        if let Some(object) = value.as_object_mut() {
+            object.insert("errors".to_owned(), stored_errors_json(run, execution));
+        }
+        outln!(out, "{value}");
+        return out;
     }
-    println!("slot {} ({})", state.slot_id, state.name);
-    println!("  run:           {}", state.run_id);
-    println!("  model:         {}", state.model);
-    println!("  activity:      {}", state.activity.as_str());
-    println!("  shell_pid:     {}", state.shell_pid);
+    outln!(out, "slot {} ({})", state.slot_id, state.name);
+    outln!(out, "  run:           {}", state.run_id);
+    outln!(out, "  model:         {}", state.model);
+    outln!(out, "  activity:      {}", state.activity.as_str());
+    outln!(out, "  shell_pid:     {}", state.shell_pid);
     if state.held {
-        println!("  held:          true (exempt from idle-park/auto-reap sweeps)");
+        outln!(out, "  held:          true (exempt from idle-park/auto-reap sweeps)");
     }
     if let Some(reason) = &state.wait_reason {
         let expiry = state.wait_expires_at.as_deref().unwrap_or("unknown");
-        println!("  wait:          {reason} (expires {expiry})");
+        outln!(out, "  wait:          {reason} (expires {expiry})");
     }
     if let Some(recovery) = &state.recovery_status {
-        println!("  recovery:      {recovery}");
+        outln!(out, "  recovery:      {recovery}");
     }
-    if let Some(id) = &state.work_item_id {
-        println!("  work_item:     {id}");
+    if let Some(id) = state.owning_work_item_id.as_ref().or(state.work_item_id.as_ref()) {
+        outln!(out, "  work_item:     {id}");
     }
-    if let Some(name) = &state.work_item_name {
-        println!("  work_item_name:{name}");
+    if let Some(name) = state.owning_work_item_title.as_ref().or(state.work_item_name.as_ref()) {
+        outln!(out, "  work_item_name:{name}");
+    }
+    if let Some(product) = &state.product_name {
+        outln!(out, "  product:       {product}");
+    }
+    if let Some(task) = task_short_label(state) {
+        outln!(out, "  task:          {task}");
+    }
+    if let Some(pr) = state.pr_url.as_deref().and_then(pr_compact_label) {
+        outln!(out, "  pr:            {pr}");
     }
     if let Some(id) = &state.execution_id {
-        println!("  execution:     {id}");
+        outln!(out, "  execution:     {id}");
     }
     // Attributed pool + execution kind (stamped at spawn). Shown so
     // `agents status`/`list` can diagnose pool routing without joining
     // the execution table — independent of physical slot occupancy
     // (spilled automation still reports pool=automation).
     if let Some(pool) = &state.pool {
-        println!("  pool:          {pool}");
+        outln!(out, "  pool:          {pool}");
     }
     if let Some(kind) = &state.kind {
-        println!("  kind:          {kind}");
+        outln!(out, "  kind:          {kind}");
+    }
+    if let Some(agent_type) = &state.agent_type {
+        outln!(out, "  type:          {agent_type}");
+    }
+    if let Some(project) = project_status_label(state) {
+        outln!(out, "  project:       {project}");
+    }
+    if let Some(host) = &state.host_id {
+        outln!(out, "  host:          {host}");
+    }
+    if let Some(ts) = &state.started_at {
+        outln!(out, "  started_at:    {ts}");
     }
     if let Some(tool) = &state.current_tool {
-        println!("  current_tool:  {tool}");
+        outln!(out, "  current_tool:  {tool}");
     }
     if let Some(ts) = &state.last_event_at {
-        println!("  last_event_at: {ts}");
+        outln!(out, "  last_event_at: {ts}");
     }
     if let Some(ts) = &state.last_tool_ended_at {
-        println!("  last_tool_end: {ts}");
+        outln!(out, "  last_tool_end: {ts}");
     }
+    for line in stored_error_lines(run, execution) {
+        outln!(out, "{line}");
+    }
+    out
+}
+
+/// `agents status` project line. An absent project means the work is
+/// Unfiled, but only once the engine reports metadata at all (it stamps
+/// `host_id` on every dispatched worker); an older engine reports neither,
+/// and claiming "Unfiled" for it would be a guess.
+fn project_status_label(state: &LiveWorkerState) -> Option<String> {
+    match (&state.project_name, &state.project_id) {
+        (Some(name), Some(id)) => Some(format!("{name} ({id})")),
+        (None, Some(id)) => Some(id.clone()),
+        (_, None) if state.host_id.is_some() => Some("Unfiled".to_owned()),
+        (_, None) => None,
+    }
+}
+
+/// `T<n>` for tasks and chores, `P<n>` for projects; `None` without a short id.
+fn task_short_label(state: &LiveWorkerState) -> Option<String> {
+    let short_id = state.work_item_short_id?;
+    let prefix = if state
+        .owning_work_item_id
+        .as_deref()
+        .or(state.work_item_id.as_deref())
+        .is_some_and(|id| id.starts_with("proj_"))
+    {
+        'P'
+    } else {
+        'T'
+    };
+    Some(format!("{prefix}{short_id}"))
+}
+
+/// `repo#n` from a GitHub `/pull/<n>` URL, dropping the owner.
+fn pr_compact_label(url: &str) -> Option<String> {
+    boss_github::pr_url::parse_pr_url_parts(url).map(|(_, repo, n)| format!("{repo}#{n}"))
 }
 
 fn print_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) {
@@ -1831,67 +2037,104 @@ fn durable_occupant_detail_lines(pane: &HostedPaneStatus, status: &str) -> Strin
 /// (see [`agents_status`]), so this covers exactly the case the live
 /// `LiveWorkerState` detail (model, activity, current tool) isn't
 /// available for.
-fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
+fn hosted_pane_status_text(
+    json: bool,
+    pane: &HostedPaneStatus,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) -> String {
+    let mut out = String::new();
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "slot_id": pane.slot_id,
-                "run_id": pane.run_id,
-                "crew_name": pane.crew_name,
-                "state": pane.state,
-                "summary": pane.summary,
-                "task_title": pane.task_title,
-            })
-        );
-        return;
+        outln!(out, "{}", hosted_pane_status_json(pane, run, execution));
+        return out;
     }
-    println!("slot {} ({}) — run {}", pane.slot_id, pane.crew_name, pane.run_id);
+    outln!(out, "slot {} ({}) — run {}", pane.slot_id, pane.crew_name, pane.run_id);
     match &pane.state {
         HostedPaneState::Live => {
             // Reachable only if the worker went live in the gap between the
             // `ListWorkerLiveStates` and `ListHostedPaneStatuses` round
             // trips — vanishingly rare, and harmless: the caller just
             // re-runs the command a moment later for full live detail.
-            println!("  state: live (just resolved via durable state; re-run for full live detail)");
+            outln!(
+                out,
+                "  state: live (just resolved via durable state; re-run for full live detail)"
+            );
         }
         HostedPaneState::LiveProcessNoRegistry { evidence } => {
-            println!("  state: terminal entry, live process ({evidence})");
-            println!("  the engine has no live run tracked for this worker, but its process is still running.");
-            println!(
+            outln!(out, "  state: terminal entry, live process ({evidence})");
+            outln!(
+                out,
+                "  the engine has no live run tracked for this worker, but its process is still running."
+            );
+            outln!(
+                out,
                 "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
-                pane.run_id, pane.slot_id
+                pane.run_id,
+                pane.slot_id
             );
         }
         HostedPaneState::DurableOccupantNoRegistry { status } => {
-            println!("{}", durable_occupant_detail_lines(pane, status));
+            outln!(out, "{}", durable_occupant_detail_lines(pane, status));
         }
         HostedPaneState::OccupancyInconclusive { evidence } => {
-            println!("  state: occupancy inconclusive ({evidence})");
-            println!(
+            outln!(out, "  state: occupancy inconclusive ({evidence})");
+            outln!(
+                out,
                 "  resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`.",
-                pane.run_id, pane.slot_id
+                pane.run_id,
+                pane.slot_id
             );
         }
         HostedPaneState::Husk => {
-            println!("  state: husk (app viewer only, no engine-tracked run, no live process)");
-            println!("  retire with `bossctl agents retire-pane {}`", pane.slot_id);
+            outln!(
+                out,
+                "  state: husk (app viewer only, no engine-tracked run, no live process)"
+            );
+            outln!(out, "  retire with `bossctl agents retire-pane {}`", pane.slot_id);
         }
     }
     if let Some(title) = &pane.task_title {
-        println!("  work_item:     {title}");
+        outln!(out, "  work_item:     {title}");
     }
     if let Some(summary) = &pane.summary {
-        println!("  summary:       {summary}");
+        outln!(out, "  summary:       {summary}");
     }
+    for line in stored_error_lines(run, execution) {
+        outln!(out, "{line}");
+    }
+    out
+}
+
+fn hosted_pane_status_json(
+    pane: &HostedPaneStatus,
+    run: Option<&WorkRun>,
+    execution: Option<&WorkExecution>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "slot_id": pane.slot_id,
+        "run_id": pane.run_id,
+        "crew_name": pane.crew_name,
+        "state": pane.state,
+        "summary": pane.summary,
+        "task_title": pane.task_title,
+        "errors": stored_errors_json(run, execution),
+    })
 }
 
 /// One-line `agents list` row for a live worker. Pure so tests can pin
 /// the pool + exec-kind columns without capturing stdout.
 fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) -> String {
     let tool = state.current_tool.as_deref().unwrap_or("-");
-    let work_item = state.work_item_id.as_deref().unwrap_or("-");
-    let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
+    let work_item = state
+        .owning_work_item_id
+        .as_deref()
+        .or(state.work_item_id.as_deref())
+        .unwrap_or("-");
+    let work_item_name = state
+        .owning_work_item_title
+        .as_deref()
+        .or(state.work_item_name.as_deref())
+        .unwrap_or("-");
     // `pool` / `kind` always print (as `-` when unset) so a glance at
     // `agents list` shows attributed routing even for test / direct-
     // launch spawns that never stamped them. Values match
@@ -1899,8 +2142,14 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
     // and e.g. `"task_implementation"` / `"pr_review"`.
     let pool = state.pool.as_deref().unwrap_or("-");
     let kind = state.kind.as_deref().unwrap_or("-");
+    let agent_type = state.agent_type.as_deref().unwrap_or("-");
+    let host = state.host_id.as_deref().unwrap_or("-");
+    // Unfiled (no project) prints as `-`; the id, not the free-text name,
+    // keeps the column single-token and unambiguous.
+    let project = state.project_id.as_deref().unwrap_or("-");
+    let started_at = state.started_at.as_deref().unwrap_or("-");
     let mut line = format!(
-        "slot {}  name={}  run={}  model={}  activity={}  pool={}  kind={}  tool={}  work_item={}  work_item_name=\"{}\"",
+        "slot {}  name={}  run={}  model={}  activity={}  pool={}  kind={}  type={}  project={}  host={}  started_at={}  tool={}  work_item={}  work_item_name=\"{}\"",
         state.slot_id,
         state.name,
         state.run_id,
@@ -1908,10 +2157,26 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
         state.activity.as_str(),
         pool,
         kind,
+        agent_type,
+        project,
+        host,
+        started_at,
         tool,
         work_item,
         work_item_name,
     );
+    // The same product / task / PR the app's pane header shows, as resolved by
+    // the engine (a review-guide run resolves to its root task and PR).
+    line.push_str(&format!(
+        "  product=\"{}\"  task={}  pr={}",
+        state.product_name.as_deref().unwrap_or("-"),
+        task_short_label(state).unwrap_or_else(|| "-".to_owned()),
+        state
+            .pr_url
+            .as_deref()
+            .and_then(pr_compact_label)
+            .unwrap_or_else(|| "-".to_owned()),
+    ));
     // Surfaced whenever the transient-recovery sweep is actively nudging
     // this slot — without this an auto-recovering worker prints as plain
     // `activity=idle`, indistinguishable from a normally-finished turn.
@@ -1959,743 +2224,5 @@ fn tmux_adoption_state_label(state: TmuxAdoptionState) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use boss_protocol::{Product, Project, ProjectStatus, Task, TaskKind, TaskStatus};
-
-    #[test]
-    fn tmux_adoption_state_label_marks_not_tmux_hosted_as_remote_detached() {
-        assert_eq!(
-            tmux_adoption_state_label(TmuxAdoptionState::NotTmuxHosted),
-            "remote_detached"
-        );
-        assert_eq!(tmux_adoption_state_label(TmuxAdoptionState::Adopted), "adopted");
-    }
-
-    /// Build a live-worker fixture with a caller-chosen slot id, run id, and
-    /// crew name. Setting `name` explicitly (rather than deriving it from
-    /// `slot_id` the way production does) lets the resolver tests target each
-    /// match tier — and the ambiguous-slot / ambiguous-name paths —
-    /// independently of the roster's slot→name mapping.
-    fn worker(slot_id: u8, run_id: &str, name: &str) -> LiveWorkerState {
-        let mut state = LiveWorkerState::new_spawning(slot_id, run_id, "opus", 0, None);
-        state.name = name.to_owned();
-        state
-    }
-
-    #[test]
-    fn format_live_state_short_shows_pool_and_kind_dashes_when_unset() {
-        let state = worker(3, "run_a", "Riker");
-        let line = format_live_state_short(&state, TmuxListEvidence::Missing);
-        assert!(
-            line.contains("pool=-") && line.contains("kind=-"),
-            "expected pool=- and kind=- placeholders when unset: {line}"
-        );
-        assert!(
-            line.starts_with("slot 3  name=Riker  run=run_a  model=opus  activity=spawning  pool=-  kind=-"),
-            "unexpected column order: {line}"
-        );
-    }
-
-    #[test]
-    fn format_live_state_short_renders_declared_wait() {
-        let mut state = worker(3, "run_a", "Riker");
-        let plain = format_live_state_short(&state, TmuxListEvidence::Missing);
-        assert!(!plain.contains("wait_reason"), "{plain}");
-        state.wait_reason = Some("bazel test".to_owned());
-        state.wait_expires_at = Some("2026-10-09T12:00:00Z".to_owned());
-        let line = format_live_state_short(&state, TmuxListEvidence::Missing);
-        assert!(
-            line.contains("wait_reason=\"bazel test\"  wait_expires_at=2026-10-09T12:00:00Z"),
-            "{line}"
-        );
-    }
-
-    #[test]
-    fn format_live_state_short_renders_stamped_pool_and_kind() {
-        let mut state = worker(5, "run_b", "Data");
-        state.pool = Some("automation".to_owned());
-        state.kind = Some("automation_triage".to_owned());
-        state.held = true;
-        let line = format_live_state_short(&state, TmuxListEvidence::FetchFailed);
-        assert!(
-            line.contains("pool=automation") && line.contains("kind=automation_triage"),
-            "expected stamped pool+kind: {line}"
-        );
-        assert!(
-            line.contains("held=true  tmux_session=-  adoption_state=probe_unavailable"),
-            "held and fetch-failed tmux evidence should trail the row: {line}"
-        );
-    }
-
-    #[test]
-    fn format_live_state_short_renders_tmux_observability_fields() {
-        let state = worker(5, "exec_tmux", "Data");
-        let status = TmuxWorkerStatus::builder()
-            .execution_id("exec_tmux")
-            .session_name("boss-worker-5")
-            .adoption_state(TmuxAdoptionState::Adopted)
-            .pane_dead(false)
-            .last_output_at("2026-08-19T12:00:00Z")
-            .attach_command("/opt/homebrew/bin/tmux -L boss attach-session -t boss-worker-5")
-            .build();
-        let line = format_live_state_short(&state, TmuxListEvidence::Present(&status));
-        assert!(line.contains("tmux_session=boss-worker-5"), "missing session: {line}");
-        assert!(
-            line.contains("adoption_state=adopted"),
-            "missing adoption state: {line}"
-        );
-        assert!(line.contains("pane_dead=false"), "missing pane state: {line}");
-        assert!(
-            line.contains("window_activity_at=2026-08-19T12:00:00Z"),
-            "missing output time: {line}"
-        );
-    }
-
-    #[test]
-    fn format_live_state_short_distinguishes_missing_row_from_fetch_failure() {
-        let state = worker(1, "run_c", "Geordi");
-        let missing = format_live_state_short(&state, TmuxListEvidence::Missing);
-        let failed = format_live_state_short(&state, TmuxListEvidence::FetchFailed);
-        assert!(
-            missing.contains("adoption_state=no_status"),
-            "engine answered with no row: {missing}"
-        );
-        assert!(
-            failed.contains("adoption_state=probe_unavailable"),
-            "engine could not answer: {failed}"
-        );
-    }
-
-    fn adopted_status(session_name: Option<&str>, attach_command: Option<&str>) -> TmuxWorkerStatus {
-        TmuxWorkerStatus::builder()
-            .execution_id("exec_attach")
-            .maybe_session_name(session_name)
-            .adoption_state(TmuxAdoptionState::Adopted)
-            .pane_dead(false)
-            .maybe_attach_command(attach_command)
-            .build()
-    }
-
-    #[test]
-    fn attach_command_from_status_refuses_non_adopted() {
-        let status = TmuxWorkerStatus::builder()
-            .execution_id("exec_attach")
-            .session_name("boss-worker-1")
-            .adoption_state(TmuxAdoptionState::TokenMismatch)
-            .pane_dead(false)
-            .attach_command("tmux -L boss attach-session -t boss-worker-1")
-            .build();
-        let err = attach_command_from_status("exec_attach", &status).unwrap_err();
-        assert!(
-            err.to_string().contains("adoption_state=token_mismatch"),
-            "unexpected refusal: {err}"
-        );
-    }
-
-    #[test]
-    fn attach_command_from_status_refuses_adopted_without_session_name() {
-        let status = adopted_status(None, Some("/usr/bin/tmux -L boss attach-session -t missing"));
-        let err = attach_command_from_status("exec_attach", &status).unwrap_err();
-        assert!(
-            err.to_string().contains("has no tmux session name"),
-            "unexpected refusal: {err}"
-        );
-    }
-
-    #[test]
-    fn attach_command_from_status_prints_engine_command_without_exec() {
-        let command = "/opt/homebrew/bin/tmux -L boss attach-session -t boss-worker-5";
-        let status = adopted_status(Some("boss-worker-5"), Some(command));
-        let attach = attach_command_from_status("exec_attach", &status).expect("adopted status is attachable");
-        assert_eq!(attach.session_name, "boss-worker-5");
-        assert_eq!(attach.command, command);
-        assert!(
-            !attach.command.starts_with("exec "),
-            "operator paste must not exec the shell: {}",
-            attach.command
-        );
-    }
-
-    fn task(id: &str, kind: TaskKind) -> Task {
-        Task::builder()
-            .id(id)
-            .product_id("prod_1")
-            .kind(kind)
-            .name("n")
-            .description("")
-            .status(TaskStatus::Todo)
-            .created_at("")
-            .updated_at("")
-            .build()
-    }
-
-    fn product(id: &str) -> Product {
-        Product::builder()
-            .id(id)
-            .name("n")
-            .slug("n")
-            .description("")
-            .status("active")
-            .created_at("")
-            .updated_at("")
-            .build()
-    }
-
-    fn project(id: &str) -> Project {
-        Project::builder()
-            .id(id)
-            .product_id("prod_1")
-            .name("n")
-            .slug("n")
-            .description("")
-            .goal("")
-            .status(ProjectStatus::Planned)
-            .created_at("")
-            .updated_at("")
-            .build()
-    }
-
-    // ---- resolve_document_path ---------------------------------------------
-
-    #[test]
-    fn resolve_document_path_leaves_absolute_path_untouched() {
-        let cwd = Path::new("/some/other/dir");
-        assert_eq!(resolve_document_path(cwd, "/abs/path/notes.md"), "/abs/path/notes.md");
-    }
-
-    #[test]
-    fn resolve_document_path_joins_relative_path_against_cwd() {
-        let cwd = Path::new("/home/user/project");
-        assert_eq!(
-            resolve_document_path(cwd, "docs/notes.md"),
-            "/home/user/project/docs/notes.md"
-        );
-    }
-
-    // ---- resolve_agent_ref -------------------------------------------------
-
-    #[test]
-    fn resolves_by_exact_run_id() {
-        let states = [worker(1, "exec_abc", "Riker"), worker(2, "exec_def", "Data")];
-        let resolved = resolve_agent_ref("exec_def", &states).expect("run id should resolve");
-        assert_eq!(resolved.run_id, "exec_def");
-        assert_eq!(resolved.slot_id, 2);
-    }
-
-    #[test]
-    fn resolves_by_numeric_slot_id() {
-        let states = [worker(1, "exec_abc", "Riker"), worker(7, "exec_def", "Yar")];
-        let resolved = resolve_agent_ref("7", &states).expect("slot id should resolve");
-        assert_eq!(resolved.slot_id, 7);
-        assert_eq!(resolved.run_id, "exec_def");
-    }
-
-    #[test]
-    fn resolves_by_name_case_insensitive() {
-        let states = [worker(1, "exec_abc", "Riker"), worker(2, "exec_def", "Data")];
-        let resolved = resolve_agent_ref("dATa", &states).expect("crew name should resolve");
-        assert_eq!(resolved.slot_id, 2);
-        assert_eq!(resolved.run_id, "exec_def");
-    }
-
-    #[test]
-    fn resolves_durable_personas_independently_of_slots_including_overflow() {
-        let states = [worker(27, "local", "Riker"), worker(241, "remote", "Ensign 1 (Remote)")];
-        assert_eq!(resolve_agent_ref("riker", &states).unwrap().run_id, "local");
-        assert_eq!(
-            resolve_agent_ref("ENSIGN 1 (REMOTE)", &states).unwrap().run_id,
-            "remote"
-        );
-        assert_eq!(resolve_agent_ref("241", &states).unwrap().run_id, "remote");
-        let panes = [hosted_pane(9, "historical", "Ensign 2", HostedPaneState::Husk)];
-        assert_eq!(
-            resolve_hosted_pane_ref("ensign 2", &panes).unwrap().unwrap().run_id,
-            "historical"
-        );
-    }
-
-    #[test]
-    fn missing_overflow_and_remote_names_never_become_work_item_selectors() {
-        for name in ["Ensign 1", "ensign 56", "Ensign 3 (Remote)", "riker (REMOTE)"] {
-            assert!(looks_like_name_or_slot(name), "{name}");
-            assert!(!work_item_fallback_eligible(name), "{name}");
-        }
-        assert!(!looks_like_name_or_slot("Ensign engineering"));
-    }
-
-    /// Slot 4's crew name is "La Forge" — the space is part of the name,
-    /// and the case-insensitive *exact* match honours it.
-    #[test]
-    fn resolves_multiword_name_with_space() {
-        let states = [worker(4, "exec_d", "La Forge")];
-        let resolved = resolve_agent_ref("la forge", &states).expect("multi-word name should resolve");
-        assert_eq!(resolved.slot_id, 4);
-    }
-
-    /// A numeric reference that matches one worker's run id and *also*
-    /// another worker's slot resolves to the run-id match — a defensive
-    /// case, since real run ids are never bare numbers, but it pins the
-    /// tier order (run id before slot).
-    #[test]
-    fn run_id_match_takes_precedence_over_slot() {
-        let states = [worker(2, "1", "Data"), worker(1, "exec_a", "Riker")];
-        let resolved = resolve_agent_ref("1", &states).expect("run id tier should win");
-        assert_eq!(resolved.run_id, "1");
-        assert_eq!(resolved.slot_id, 2, "run-id match must win over the slot match");
-    }
-
-    /// A reference that matches one worker's run id and *also* another
-    /// worker's name resolves to the run-id match — the run-id tier is
-    /// consulted first and short-circuits.
-    #[test]
-    fn run_id_match_takes_precedence_over_name() {
-        let states = [worker(1, "shared", "Riker"), worker(2, "exec_def", "shared")];
-        let resolved = resolve_agent_ref("shared", &states).expect("run id tier should win");
-        assert_eq!(resolved.slot_id, 1, "run-id match must win over the name match");
-        assert_eq!(resolved.run_id, "shared");
-    }
-
-    /// A numeric reference that matches one worker's slot and *also*
-    /// another worker's (numeric) name resolves to the slot match — the
-    /// slot tier is consulted before the name tier.
-    #[test]
-    fn slot_match_takes_precedence_over_name() {
-        let states = [worker(5, "exec_abc", "Data"), worker(2, "exec_def", "5")];
-        let resolved = resolve_agent_ref("5", &states).expect("slot tier should win");
-        assert_eq!(resolved.slot_id, 5, "slot match must win over the name match");
-        assert_eq!(resolved.run_id, "exec_abc");
-    }
-
-    #[test]
-    fn ambiguous_name_reports_all_candidates() {
-        let states = [worker(1, "exec_abc", "Data"), worker(2, "exec_def", "Data")];
-        let err = resolve_agent_ref("data", &states).expect_err("two workers share a name");
-        let msg = err.to_string();
-        assert!(msg.contains("matches multiple live workers"), "message was: {msg}");
-        assert!(msg.contains("slot 1 (Data) run exec_abc"), "message was: {msg}");
-        assert!(msg.contains("slot 2 (Data) run exec_def"), "message was: {msg}");
-    }
-
-    #[test]
-    fn ambiguous_slot_reports_all_candidates() {
-        let states = [worker(3, "exec_abc", "Worf"), worker(3, "exec_def", "Riker")];
-        let err = resolve_agent_ref("3", &states).expect_err("two workers share a slot");
-        let msg = err.to_string();
-        assert!(msg.contains("matches multiple live workers"), "message was: {msg}");
-        assert!(msg.contains("slot 3 (Worf) run exec_abc"), "message was: {msg}");
-        assert!(msg.contains("slot 3 (Riker) run exec_def"), "message was: {msg}");
-    }
-
-    #[test]
-    fn no_match_errors_with_live_candidates() {
-        let states = [worker(2, "exec_def", "Data"), worker(1, "exec_abc", "Riker")];
-        let err = resolve_agent_ref("nonesuch", &states).expect_err("no worker matches");
-        let msg = err.to_string();
-        assert!(msg.contains("no live worker matches `nonesuch`"), "message was: {msg}");
-        // The candidate summary is appended and sorted by slot id.
-        assert!(
-            msg.contains("Live: slot 1 (Riker), slot 2 (Data)"),
-            "message was: {msg}"
-        );
-    }
-
-    #[test]
-    fn no_match_with_no_live_workers() {
-        let err = resolve_agent_ref("anything", &[]).expect_err("no workers at all");
-        let msg = err.to_string();
-        assert!(msg.contains("no live worker matches `anything`"), "message was: {msg}");
-        assert!(msg.contains("no live workers"), "message was: {msg}");
-    }
-
-    // ---- agents stop fallback ---------------------------------------------
-
-    /// `agents stop` must remain usable for a worker the engine has lost track
-    /// of — the shape whose `LiveWorkerState` was cleared while its process
-    /// kept running. An `exec_…` selector that misses the live list is the
-    /// signal that lets `agents_stop` forward it to the engine anyway rather
-    /// than reporting `no live worker matches` and leaving the operator to
-    /// `kill` by pid.
-    #[test]
-    fn execution_ids_are_recognised_for_the_untracked_stop_fallback() {
-        assert!(looks_like_execution_id("exec_18c6a6add38b5fe0_97"));
-        assert!(looks_like_execution_id("exec_"));
-    }
-
-    /// The fallback must stay narrow. A crew name or slot number that misses
-    /// is far more likely a typo than a stranded worker, and forwarding it to
-    /// the engine as a run id would turn a clear error into a silent no-op.
-    #[test]
-    fn names_and_slots_do_not_get_the_untracked_stop_fallback() {
-        assert!(!looks_like_execution_id("Worf"));
-        assert!(!looks_like_execution_id("3"));
-        assert!(!looks_like_execution_id("markdown-striping"));
-        assert!(!looks_like_execution_id("task_abc"));
-    }
-
-    // ---- pick_unique -------------------------------------------------------
-
-    #[test]
-    fn pick_unique_returns_sole_match() {
-        let states = [worker(4, "exec_abc", "La Forge")];
-        let resolved = pick_unique("La Forge", vec![&states[0]], &states).expect("exactly one match");
-        assert_eq!(resolved.slot_id, 4);
-        assert_eq!(resolved.run_id, "exec_abc");
-    }
-
-    #[test]
-    fn pick_unique_bails_on_multiple_matches() {
-        let states = [worker(1, "exec_abc", "Riker"), worker(2, "exec_def", "Data")];
-        let err = pick_unique("x", vec![&states[0], &states[1]], &states).expect_err("two matches");
-        let msg = err.to_string();
-        assert!(msg.contains("`x` matches multiple live workers"), "message was: {msg}");
-        assert!(msg.contains("slot 1 (Riker) run exec_abc"), "message was: {msg}");
-        assert!(msg.contains("slot 2 (Data) run exec_def"), "message was: {msg}");
-    }
-
-    // ---- live_candidates_summary ------------------------------------------
-
-    #[test]
-    fn summary_reports_no_live_workers_when_empty() {
-        assert_eq!(live_candidates_summary(&[]), "no live workers");
-    }
-
-    #[test]
-    fn summary_lists_workers_sorted_by_slot_id() {
-        // Deliberately out of slot order on input to prove the sort.
-        let states = [worker(2, "exec_def", "Data"), worker(1, "exec_abc", "Riker")];
-        assert_eq!(live_candidates_summary(&states), "Live: slot 1 (Riker), slot 2 (Data)");
-    }
-
-    // ---- resolve_hosted_pane_ref / no_worker_matches_error -----------------
-
-    fn hosted_pane(slot_id: u8, run_id: &str, crew_name: &str, state: HostedPaneState) -> HostedPaneStatus {
-        HostedPaneStatus {
-            slot_id,
-            run_id: run_id.to_owned(),
-            crew_name: crew_name.to_owned(),
-            summary: None,
-            task_title: None,
-            state,
-        }
-    }
-
-    /// The exact incident shape: a crew name the operator can see in the
-    /// app, backing a run the live registry has dropped entirely, must
-    /// still resolve — by name, by slot, and by run id.
-    #[test]
-    fn resolves_terminal_entry_live_process_pane_by_name_slot_and_run_id() {
-        let panes = [hosted_pane(
-            1,
-            "exec_riker",
-            "Riker",
-            HostedPaneState::LiveProcessNoRegistry {
-                evidence: "durably-recorded shell pid 33112 is alive".to_owned(),
-            },
-        )];
-        let by_name = resolve_hosted_pane_ref("riker", &panes)
-            .expect("no ambiguity")
-            .expect("name should resolve");
-        assert_eq!(by_name.run_id, "exec_riker");
-        let by_slot = resolve_hosted_pane_ref("1", &panes)
-            .expect("no ambiguity")
-            .expect("slot should resolve");
-        assert_eq!(by_slot.crew_name, "Riker");
-        let by_run = resolve_hosted_pane_ref("exec_riker", &panes)
-            .expect("no ambiguity")
-            .expect("run id should resolve");
-        assert_eq!(by_run.slot_id, 1);
-    }
-
-    #[test]
-    fn durable_occupant_renderings_name_agents_stop_and_omit_retire_pane() {
-        let pane = hosted_pane(
-            1,
-            "exec_riker",
-            "Riker",
-            HostedPaneState::DurableOccupantNoRegistry {
-                status: "running".to_owned(),
-            },
-        );
-        for out in [
-            durable_occupant_list_line(&pane, "running"),
-            durable_occupant_detail_lines(&pane, "running"),
-        ] {
-            assert!(out.contains("agents stop exec_riker"), "output was: {out}");
-            assert!(!out.contains("retire-pane"), "output was: {out}");
-        }
-    }
-
-    #[test]
-    fn resolve_hosted_pane_ref_misses_return_none_not_error() {
-        let panes = [hosted_pane(1, "exec_riker", "Riker", HostedPaneState::Husk)];
-        assert!(
-            resolve_hosted_pane_ref("nonesuch", &panes)
-                .expect("a miss is not an error")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn resolve_hosted_pane_ref_bails_on_ambiguous_name() {
-        let panes = [
-            hosted_pane(1, "exec_a", "Data", HostedPaneState::Husk),
-            hosted_pane(2, "exec_b", "Data", HostedPaneState::Husk),
-        ];
-        let err = resolve_hosted_pane_ref("data", &panes).expect_err("two panes share a name");
-        let msg = err.to_string();
-        assert!(msg.contains("matches multiple tracked panes"), "message was: {msg}");
-    }
-
-    #[test]
-    fn resolve_hosted_pane_ref_prefers_live_pane_over_husk_with_reused_name() {
-        let panes = [
-            hosted_pane(1, "exec_old", "Data", HostedPaneState::Husk),
-            hosted_pane(2, "exec_new", "Data", HostedPaneState::Live),
-        ];
-        let pane = resolve_hosted_pane_ref("data", &panes)
-            .expect("a live pane disambiguates")
-            .expect("name matches");
-        assert_eq!(pane.run_id, "exec_new");
-    }
-
-    /// Requirement: a total miss must list what was searched, including
-    /// the non-live candidates — not only the live crew.
-    #[test]
-    fn no_worker_matches_error_lists_non_live_candidates_too() {
-        let states = [worker(2, "exec_data", "Data")];
-        let hosted = [
-            hosted_pane(2, "exec_data", "Data", HostedPaneState::Live),
-            hosted_pane(
-                1,
-                "exec_riker",
-                "Riker",
-                HostedPaneState::LiveProcessNoRegistry {
-                    evidence: "durably-recorded shell pid 33112 is alive".to_owned(),
-                },
-            ),
-            hosted_pane(3, "exec_worf", "Worf", HostedPaneState::Husk),
-        ];
-        let err = no_worker_matches_error("nonesuch", &states, &hosted);
-        let msg = err.to_string();
-        assert!(msg.contains("Live: slot 2 (Data)"), "message was: {msg}");
-        assert!(msg.contains("Also tracked (not live)"), "message was: {msg}");
-        assert!(
-            msg.contains("slot 1 (Riker) run exec_riker [terminal entry, live process]"),
-            "message was: {msg}"
-        );
-        assert!(msg.contains("slot 3 (Worf) run exec_worf [husk]"), "message was: {msg}");
-        // The Live-classified pane is not double-listed in the "not live" tail.
-        assert!(!msg.contains("slot 2 (Data) run exec_data ["), "message was: {msg}");
-    }
-
-    #[test]
-    fn no_worker_matches_error_omits_tail_when_nothing_non_live() {
-        let err = no_worker_matches_error("nonesuch", &[], &[]);
-        assert_eq!(err.to_string(), "no worker matches `nonesuch`. no live workers");
-    }
-
-    // ---- looks_like_name_or_slot ------------------------------------------
-
-    #[test]
-    fn numeric_slot_looks_like_name_or_slot() {
-        assert!(looks_like_name_or_slot("5"));
-        assert!(looks_like_name_or_slot("0"));
-        assert!(looks_like_name_or_slot("300"));
-    }
-
-    #[test]
-    fn roster_name_looks_like_name_or_slot_case_insensitive() {
-        assert!(looks_like_name_or_slot("Riker"));
-        assert!(looks_like_name_or_slot("riker"));
-        assert!(looks_like_name_or_slot("LA FORGE"));
-    }
-
-    #[test]
-    fn non_slot_references_do_not_look_like_name_or_slot() {
-        assert!(!looks_like_name_or_slot("exec_18ad9f"));
-        assert!(!looks_like_name_or_slot("Picard"));
-    }
-
-    // ---- work_item_fallback_eligible --------------------------------------
-
-    #[test]
-    fn work_item_fallback_excludes_slot_shaped_references_and_crew_names() {
-        assert!(!work_item_fallback_eligible("1"));
-        assert!(!work_item_fallback_eligible("300"));
-        assert!(!work_item_fallback_eligible("riker"));
-    }
-
-    #[test]
-    fn work_item_fallback_allows_work_item_and_execution_references() {
-        assert!(work_item_fallback_eligible("exec_18ad9f"));
-        assert!(work_item_fallback_eligible("T1"));
-        assert!(work_item_fallback_eligible("task_123"));
-    }
-
-    // ---- WorkItem::primary_id ---------------------------------------------
-
-    #[test]
-    fn primary_id_for_each_work_item_variant() {
-        assert_eq!(WorkItem::Product(product("prod_9")).primary_id(), "prod_9");
-        assert_eq!(WorkItem::Project(project("proj_9")).primary_id(), "proj_9");
-        assert_eq!(WorkItem::Task(task("task_9", TaskKind::Task)).primary_id(), "task_9");
-        assert_eq!(
-            WorkItem::Chore(task("chore_9", TaskKind::Chore)).primary_id(),
-            "chore_9"
-        );
-    }
-
-    // ---- parse_transcript_tail_events --------------------------------------
-
-    use boss_engine::transcript_markdown::TranscriptEventKind;
-
-    fn assistant_texts(events: &[boss_engine::transcript_markdown::TranscriptEvent]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match &event.kind {
-                TranscriptEventKind::AssistantText(text) => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn parse_transcript_tail_events_reads_claude_dialect_without_a_driver() {
-        let jsonl = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
-        let events = parse_transcript_tail_events(jsonl, None, "/tmp/t.jsonl").expect("claude dialect must parse");
-        assert_eq!(assistant_texts(&events), vec!["hi".to_owned()]);
-    }
-
-    #[test]
-    fn parse_transcript_tail_events_falls_back_to_the_grok_driver_for_acp_records() {
-        // Grok's raw ACP `session/update` envelope carries no top-level
-        // `type` field, so the direct schema check must fail before the
-        // driver fallback kicks in — this is the exact shape
-        // `bossctl agents transcript` received for a Grok run and rendered
-        // nothing for.
-        let jsonl = concat!(
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
-            r#""sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"[blocked] reason=\"needs a decision\""}}}}"#,
-        );
-        assert!(
-            boss_engine::transcript_markdown::parse_transcript_checked(jsonl).is_err(),
-            "raw ACP content must not match the Claude/Codex schema directly"
-        );
-        let events =
-            parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl").expect("grok driver must normalize");
-        assert!(
-            assistant_texts(&events)
-                .iter()
-                .any(|text| text.contains("[blocked] reason=\"needs a decision\"")),
-            "grok ACP prose must survive the driver-aware fallback parse; got {events:?}",
-        );
-    }
-
-    #[test]
-    fn parse_transcript_tail_events_errors_when_driver_resolves_but_cannot_normalize_content() {
-        // A resolvable driver slug that still can't make sense of the tail
-        // content (e.g. a Grok tail window landing entirely on a
-        // `session_update` variant `parse_acp_envelope` maps to `Unknown`,
-        // or any other non-empty content the driver silently drops) must
-        // not swallow the original schema error into an empty transcript —
-        // the doc comment on `parse_transcript_tail_events` promises the
-        // opposite, and this is the exact "renders nothing" symptom this
-        // module set out to fix.
-        let jsonl = concat!(
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
-            r#""sessionUpdate":"totally_unknown_variant","foo":"bar"}}}"#,
-        );
-        assert!(
-            boss_engine::transcript_markdown::parse_transcript_checked(jsonl).is_err(),
-            "raw ACP content must not match the Claude/Codex schema directly"
-        );
-        let err = parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl")
-            .expect_err("a resolvable driver that normalizes to nothing must still surface the schema error");
-        assert!(err.to_string().contains("rendering transcript"), "got: {err}");
-    }
-
-    #[test]
-    fn parse_transcript_tail_events_errors_when_no_driver_can_normalize_unknown_content() {
-        let jsonl = r#"{"totally":"unrecognised"}"#;
-        let err = parse_transcript_tail_events(jsonl, None, "/tmp/t.jsonl")
-            .expect_err("unrecognised content with no driver to fall back on must still error");
-        assert!(err.to_string().contains("rendering transcript"));
-    }
-
-    #[test]
-    fn parse_transcript_tail_events_grok_joins_tool_call_and_surfaces_hook_events() {
-        // A `tool_call` / `tool_call_update` pair only joins into one
-        // `ToolUse` (no spurious filler for the update line) because
-        // `parse_transcript_with_driver` builds a stateful
-        // `GrokTranscriptSession` for the whole tail — an isolated
-        // per-line normalize (a regression back to
-        // `normalize_transcript_entry`) would instead see the update in
-        // isolation, fail the `toolCallId` correlation, and emit an
-        // extra `{"type":"system"}` filler event with no subtype. A
-        // `hook_execution` record must also surface as a system event,
-        // per the brief's requirement that hook events render alongside
-        // assistant text and tool calls/results.
-        let jsonl = concat!(
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
-            r#""sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"echo hi"}}}}"#,
-            "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
-            r#""sessionUpdate":"tool_call_update","toolCallId":"call-1","rawOutput":{"exit_code":0,"output":"hi"}}}}"#,
-            "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
-            r#""sessionUpdate":"hook_execution","event_name":"Stop"}}}"#,
-        );
-        let events =
-            parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl").expect("grok driver must normalize");
-
-        let tool_uses: Vec<_> = events
-            .iter()
-            .filter_map(|event| match &event.kind {
-                TranscriptEventKind::ToolUse { name, input } => Some((name.as_str(), input)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            tool_uses.len(),
-            1,
-            "expected exactly one joined tool call; got {events:?}"
-        );
-        assert_eq!(tool_uses[0].0, "Bash");
-        assert_eq!(tool_uses[0].1, &serde_json::json!({"command": "echo hi"}));
-
-        let system_events: Vec<_> = events
-            .iter()
-            .filter_map(|event| match &event.kind {
-                TranscriptEventKind::System { subtype, .. } => Some(subtype.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            system_events,
-            vec![Some("hook_execution".to_owned())],
-            "the tool_call_update must join silently (no unmatched filler) and the hook \
-             execution must be the only system event; got {events:?}",
-        );
-
-        let render_opts = boss_engine::transcript_markdown::RenderOpts {
-            hide_tools: true,
-            ..Default::default()
-        };
-        let segments = boss_engine::transcript_markdown::events_to_segments(&events, &render_opts);
-        assert!(
-            segments
-                .iter()
-                .all(|segment| segment.role != boss_engine::transcript_markdown::SegmentRole::Tool),
-            "--no-tools must drop the Grok tool segment exactly as it does for Claude; got {segments:?}",
-        );
-    }
-
-    #[test]
-    fn parse_transcript_tail_events_errors_when_driver_slug_is_unknown() {
-        let jsonl = r#"{"totally":"unrecognised"}"#;
-        let err = parse_transcript_tail_events(jsonl, Some("not-a-real-driver"), "/tmp/t.jsonl")
-            .expect_err("an unresolvable driver slug must not swallow the schema error");
-        assert!(err.to_string().contains("rendering transcript"));
-    }
-}
+#[path = "agents_tests.rs"]
+mod tests;

@@ -54,10 +54,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use boss_protocol::FrontendEvent;
 
-use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{sanitize_metric_name_component, stored_pr_number};
 use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, WorkDb};
+use boss_execution_contracts::ExecutionPublisher;
 
 /// Minimum wall-clock between full stacking passes. The per-pair re-offer
 /// interval already prevents spamming the same offer, but this bounds how
@@ -92,7 +92,7 @@ crate::register_counter!(
 );
 
 /// Register this module's counter handles. Called from
-/// [`crate::metrics_init::init_all`] at engine startup.
+/// `boss_engine::metrics_init::init_all` at engine startup.
 pub fn init(registry: &Registry) {
     registry.register_counter(&STACK_PROPOSAL_OFFERED);
 }

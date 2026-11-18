@@ -77,9 +77,11 @@ extension ChatViewModel {
         ref: DesignDocRef,
         title: String,
         artifact: CommentArtifactRef?,
-        projectShortID: String
+        projectShortID: String,
+        fragment: String? = nil
     ) {
         pendingAsyncViewerRef = ref
+        asyncMarkdownViewerVM.initialFragment = fragment
         pendingAsyncViewerTitle = title
         pendingAsyncViewerArtifact = artifact
         pendingReviewGuideVersionId = nil
@@ -93,7 +95,7 @@ extension ChatViewModel {
         if let existing = designDocContentByRef[ref] {
             applyContentToAsyncViewerIfPending(ref: ref, content: existing)
         } else {
-            asyncMarkdownViewerVM.state = .loading
+            asyncMarkdownViewerVM.state = .loading(title: title)
             asyncMarkdownViewerVM.staleReason = nil
             asyncMarkdownViewerVM.canRetry = false
         }
@@ -134,24 +136,12 @@ extension ChatViewModel {
         designDocsLoadingProductIDs.contains(productID)
     }
 
-    /// Ask the engine to resolve the design-doc pointer for every
-    /// project whose row carries a non-nil `designDocPath`. Projects
-    /// with no pointer set are skipped so the engine doesn't burn an
-    /// RPC just to be told `not_set` — the affordance is hidden in
-    /// that case anyway. Re-issued on every `WorkTree` so a re-point
-    /// landed in another session flows through to the icon.
-    func refreshDesignDocStates(for projects: [WorkProject]) {
-        guard isConnected else { return }
-        let pending = projects.filter { $0.designDocPath != nil }
-        guard !pending.isEmpty else { return }
-        currentDesignDocResolveBatch = DesignDocResolveBatch(
-            startDate: Date(),
-            pendingProjectIDs: Set(pending.map(\.id)),
-            initialCount: pending.count
-        )
-        for project in pending {
-            engine.sendResolveProjectDesignDoc(projectID: project.id)
-        }
+    /// Resolve only after a click. Keep the latest selection so a late reply
+    /// for another project cannot open a document the user has moved away from.
+    func openProjectDesignDoc(_ project: WorkProject) {
+        guard project.designDocPath != nil else { return }
+        pendingProjectDesignDocOpen = project
+        engine.sendResolveProjectDesignDoc(projectID: project.id)
     }
 
     /// Open the design-doc pointer for `project`. Dispatch follows
@@ -175,9 +165,8 @@ extension ChatViewModel {
     ///      render via [[designRendererOpener]] (in-app renderer) when wired,
     ///      otherwise hand the `file://` URL to [[urlOpener]].
     ///   3. Fall through to [[urlOpener]] with the web URL.
-    func openProjectDesignDoc(_ project: WorkProject) {
+    private func openResolvedProjectDesignDoc(_ project: WorkProject, state: ProjectDesignDocState) {
         let shortID = project.shortID.map { "\($0)" } ?? project.id
-        let state = designDocStateByProjectID[project.id] ?? .notSet
         switch state {
         case .notSet:
             return
@@ -195,7 +184,7 @@ extension ChatViewModel {
                     // Open the window immediately, then resolve through
                     // the engine (cache + revalidate). App-side `gh api`
                     // is no longer on this path.
-                    asyncMarkdownViewerVM.state = .loading
+                    asyncMarkdownViewerVM.state = .loading(title: projectName)
                     asyncMarkdownViewerVM.clickStartTime = clickStart
                     let openWindowStart = Date()
                     opener()
@@ -341,17 +330,18 @@ extension ChatViewModel {
         // Engine-minted review-findings briefs carry the standing "HARD
         // RULE: no punting" boilerplate ahead of their findings
         // (`render_revision_instructions` in
-        // `tools/boss/engine/pr-review/src/render.rs`) — collapse it by
-        // default so the findings are immediately visible. Detection keys
-        // on that heading being present in the description, not on
-        // `task.kind`: a pre-merge brief is a `revision`, but the post-merge
-        // follow-up the engine mints after a PR has merged is a `followup`
-        // carrying the same rendering behind a provenance preamble, and it
-        // must collapse identically. This is purely presentational: the
-        // heading text matched here never changes what `task.description`
-        // itself contains, which is what the worker actually reads (see
-        // that Rust function's doc comment for the cross-language contract
-        // this string must stay in sync with).
+        // `tools/boss/engine/pr-review/src/render.rs`). Collapse that
+        // boilerplate by default so the findings that follow stay on
+        // screen. Detection keys on that heading being present in the
+        // description, not on `task.kind`: a pre-merge brief is a
+        // `revision`, but the post-merge follow-up the engine mints after
+        // a PR has merged is a `followup` carrying the same rendering
+        // behind a provenance preamble, and it must collapse identically.
+        // This is purely presentational: the heading text matched here
+        // never changes what `task.description` itself contains, which is
+        // what the worker actually reads (see that Rust function's doc
+        // comment for the cross-language contract this string must stay
+        // in sync with).
         asyncMarkdownViewerVM.collapsedByDefaultHeadings =
             RevisionBriefCollapsibleHeadings.collapsedByDefault(in: markdown)
         asyncMarkdownViewerVM.state = .loaded(
@@ -362,23 +352,13 @@ extension ChatViewModel {
         asyncMarkdownViewerOpener?()
     }
 
-    /// Apply a resolve response and close out the in-flight batch's timing
-    /// summary once its last project reports. Stray responses for projects
-    /// outside the current batch (a refresh that landed mid-flight) still
-    /// update state — they just don't drive timing. Called from the
-    /// `.projectDesignDocResolved` arm in [[ChatViewModel+EventHandling.swift]].
+    /// Only a reply to the latest clicked project may open a document.
     func applyResolvedProjectDesignDoc(_ output: ResolveProjectDesignDocOutput) {
-        if var batch = currentDesignDocResolveBatch,
-           batch.pendingProjectIDs.remove(output.projectID) != nil {
-            if batch.pendingProjectIDs.isEmpty {
-                let ms = Int(Date().timeIntervalSince(batch.startDate) * 1000)
-                designDocTimingLog.info("phase=resolve project=batch count=\(batch.initialCount, privacy: .public) duration_ms=\(ms, privacy: .public)")
-                currentDesignDocResolveBatch = nil
-            } else {
-                currentDesignDocResolveBatch = batch
-            }
-        }
         designDocStateByProjectID[output.projectID] = output.state
+        guard let project = pendingProjectDesignDocOpen,
+              project.id == output.projectID else { return }
+        pendingProjectDesignDocOpen = nil
+        openResolvedProjectDesignDoc(project, state: output.state)
     }
 
     /// Kanban open-affordance fast-path predicate: a `ResolvedDesignDocKind`

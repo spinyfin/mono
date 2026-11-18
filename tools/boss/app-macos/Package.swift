@@ -15,8 +15,10 @@ let package = Package(
             name: "GhosttyKit",
             path: "ThirdParty/GhosttyKit.xcframework"
         ),
+        .target(name: "DiagnosticIO", path: "Sources/DiagnosticIO"),
         .target(
             name: "UpdateCore",
+            dependencies: ["DiagnosticIO"],
             path: "Sources/UpdateCore"
         ),
         .target(
@@ -33,10 +35,14 @@ let package = Package(
                 .product(name: "Textual", package: "textual"),
                 "GhosttyKit",
                 "UpdateCore",
+                "DiagnosticIO",
                 "CrashWatchdog",
+                "PaneLayout",
             ],
             path: "Sources",
-            exclude: ["UpdateCore", "CrashWatchdog", "PaneLayout"],
+            // RelaunchHelper holds a C source (exit-observer.c) built by Bazel; SwiftPM
+            // rejects mixed-language targets, so keep it out of the Boss target.
+            exclude: ["DiagnosticIO", "UpdateCore", "CrashWatchdog", "PaneLayout", "Resources/RelaunchHelper"],
             resources: [
                 .copy("Resources/TrekIcons"),
             ],
@@ -53,7 +59,7 @@ let package = Package(
         ),
         .testTarget(
             name: "BossTests",
-            dependencies: ["Boss"],
+            dependencies: ["Boss", "PaneLayout"],
             path: "Tests/BossTests"
         ),
         .testTarget(

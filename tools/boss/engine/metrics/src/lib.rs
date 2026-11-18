@@ -22,9 +22,9 @@
 //! metric doesn't rebuild `boss-engine`, the largest Rust target in
 //! the repo. This crate re-exports that vocabulary and adds the flush
 //! / rehydrate machinery on top. The persistence layer talks to
-//! storage through the [`MetricsStore`] trait, which `boss_engine`'s
+//! storage through the [`MetricsStore`] trait, which `boss_work_db`'s
 //! `WorkDb` implements. That keeps the dependency edge one-directional
-//! (`boss_engine` -> `boss_metrics` -> `boss_engine_metrics_registry`).
+//! (`boss_engine` -> `boss_work_db` -> `boss_metrics` -> `boss_engine_metrics_registry`).
 //!
 //! Registering the engine's own handles is the engine's job: see
 //! `boss_engine::metrics_init::init_all`, which must name every
@@ -32,9 +32,41 @@
 
 pub mod persistence;
 pub mod store;
+pub mod sweep;
 
 pub use boss_engine_metrics_registry::{
     CounterHandle, CounterSnapshot, GaugeHandle, GaugeSnapshot, Registry, now_ms, register_counter, register_gauge,
 };
 pub use persistence::{FLUSH_INTERVAL, flush_all, seed_from_db, spawn_flush_task};
 pub use store::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};
+
+pub mod population_progress;
+pub mod population_timing;
+
+/// Lowercase and replace any character outside the registry's
+/// allowed charset (`a-z 0-9 . _`) with `_`, so an arbitrary
+/// `product_id` or `conflict_class` can't produce an invalid dynamic
+/// metric name or let two distinct products collide on one counter.
+///
+/// Shared by every per-product dynamic-counter call site (the merge poller,
+/// speculative conflict prediction, stacked-PR structuring, answer-agent
+/// observability) so they sanitize identically.
+pub fn sanitize_metric_name_component(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_owned()
+    } else {
+        sanitized
+    }
+}

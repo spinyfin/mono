@@ -1,7 +1,7 @@
 use super::support::{
-    ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_noop_command, gc_pr_noop_command,
-    gc_pr_sweep_command, head_status_command, head_status_output, lease_runner_for, release_guard_reusable_command,
-    release_runner_for, seed_mono_repo, unpushed_probe_command, with_database_path,
+    ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_exec_unpublished_command, gc_noop_command,
+    head_status_command, head_status_output, lease_runner_for, release_guard_reusable_command, release_runner_for,
+    seed_mono_repo, unpushed_probe_command, with_database_path,
 };
 use clap::Parser;
 use tempfile::TempDir;
@@ -19,6 +19,41 @@ use crate::app::salvage::{
     salvage_dir, salvage_log_limit_arg, salvage_revset,
 };
 use crate::app::util::current_epoch_s;
+
+fn trunk_cleanup_revision(root: &std::path::Path) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        root.join("source/mono"),
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "main@origin",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+        "abc1234",
+    )
+}
+
+fn trunk_cleanup_files(root: &std::path::Path) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        root.join("source/mono"),
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "file",
+            "list",
+            "-r",
+            "abc1234",
+            ".cube",
+            "-T",
+            "file_type ++ \"\\t\" ++ executable ++ \"\\t\" ++ path ++ \"\\n\"",
+        ],
+        "",
+    )
+}
 
 #[test]
 fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
@@ -46,9 +81,12 @@ fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
     // gc: ws1 is leased → skipped; ws2 is free → fetch + forget.
     let gc_runner = FakeRunner::new(vec![
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(ws2_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_exec_sweep_command(&ws2_path, "boss/exec_dead_01"),
-        gc_pr_noop_command(&ws2_path),
+        gc_exec_unpublished_command(&ws2_path, ""),
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["bookmark", "forget", "boss/exec_dead_01"], ""),
+        trunk_cleanup_revision(tempdir.path()),
+        trunk_cleanup_files(tempdir.path()),
     ]);
     let gc_result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "gc"]),
@@ -107,7 +145,9 @@ fn workspace_gc_dry_run_lists_without_forgetting() {
     let gc_runner = FakeRunner::new(vec![
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
         gc_exec_sweep_command(&workspace_path, "boss/exec_dry_01"),
-        gc_pr_noop_command(&workspace_path),
+        gc_exec_unpublished_command(&workspace_path, ""),
+        trunk_cleanup_revision(tempdir.path()),
+        trunk_cleanup_files(tempdir.path()),
     ]);
     let gc_result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "gc", "--dry-run"]),
@@ -163,25 +203,24 @@ fn lease_mono_agent_001(workspace_path: &std::path::Path, database_path: &std::p
         .to_string()
 }
 
+/// The release-time sweep touches only the `boss/exec_*` namespace. A
+/// scripted runner is a strict FIFO of exact-match invocations, so any
+/// command about `pr/<n>` aliases (an import, a retention revset, a delete
+/// or an export) would panic as unexpected.
 #[test]
-fn gc_forgets_pr_bookmark_no_workspace_is_positioned_on() {
-    // The reset above has just moved `@` off whatever branch this lease was
-    // working on, so pr/42 is no longer in any workspace's ancestry and the
-    // revset returns it. That is the whole eligibility test — no GitHub call
-    // decides it.
+fn release_sweep_issues_no_pr_alias_commands() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
     std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
     seed_mono_repo(&workspace_root, &database_path);
-    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc test");
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "no alias sweep");
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_noop_command(&workspace_path),
-        gc_pr_sweep_command(&workspace_path, "pr/42\n"),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/42"], ""),
     ]);
     let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
@@ -190,70 +229,34 @@ fn gc_forgets_pr_bookmark_no_workspace_is_positioned_on() {
         &release_runner,
     )
     .expect("release");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 }
 
-/// A `pr/<n>` bookmark some workspace is still positioned on is excluded by
-/// the revset itself, so an empty result must produce no `jj bookmark forget`
-/// call at all. `FakeRunner` is a strict FIFO of exact-match invocations, so
-/// a regression that forgot bookmarks the revset did not name would panic on
-/// "unexpected command invocation".
+/// A consumed `boss/exec_*` bookmark is forgotten only after the sweep has
+/// checked that no side of it holds unpublished work; a bookmark the check
+/// names is kept, and nothing is forgotten at all.
 #[test]
-fn gc_retains_pr_bookmark_a_workspace_is_still_positioned_on() {
+fn release_sweep_keeps_a_consumed_exec_bookmark_that_still_holds_unpublished_work() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
     std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
     seed_mono_repo(&workspace_root, &database_path);
-    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc referenced");
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "conflicted exec bookmark");
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
-        gc_noop_command(&workspace_path),
-        // The revset excludes anything reachable from a working copy, so a
-        // still-referenced pr/7 simply never appears here.
-        gc_pr_noop_command(&workspace_path),
-    ]);
-    let release_runner = FakeRunner::new(commands);
-    run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
-        Some(&database_path),
-        &release_runner,
-    )
-    .expect("release");
-    release_runner.assert_exhausted();
-}
-
-/// The growth defect this change exists to fix. A repo's shared object store
-/// accumulates one `pr/<n>` bookmark per PR *any* of its workspaces has ever
-/// touched — sixty of them in the live `mono` store, spanning PR 1586 to
-/// 2609 — and the sweep used to size a GitHub round trip by that backlog.
-///
-/// The whole backlog must now resolve in one local `jj log` and **zero**
-/// network commands. `FakeRunner` is a strict FIFO of exact-match
-/// invocations, so a regression that reintroduced any `gh` call — batched or
-/// per-bookmark — would panic on "unexpected command invocation" rather than
-/// silently pass.
-#[test]
-fn gc_sweeps_an_accumulated_backlog_with_one_local_command_and_no_network() {
-    let (tempdir, database_path) = with_database_path();
-    let workspace_root = tempdir.path().join("workspaces");
-    let workspace_path = workspace_root.join("mono-agent-001");
-    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
-
-    seed_mono_repo(&workspace_root, &database_path);
-    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc backlog");
-
-    // Far apart in PR number, the way a long-lived pool accumulates them.
-    let mut commands = release_prefix_commands(&workspace_path);
-    commands.extend([
-        gc_noop_command(&workspace_path),
-        gc_pr_sweep_command(&workspace_path, "pr/1579\npr/2201\npr/2332\n"),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
+        gc_exec_sweep_command(&workspace_path, "boss/exec_split_01\nboss/exec_done_02\n"),
+        gc_exec_unpublished_command(&workspace_path, "boss/exec_split_01\n"),
+        // Only the bookmark with no unpublished side is forgotten.
         ExpectedCommand::ok(
             workspace_path.clone(),
             "jj",
-            &["bookmark", "forget", "pr/1579", "pr/2201", "pr/2332"],
+            &["bookmark", "forget", "boss/exec_done_02"],
             "",
         ),
     ]);
@@ -264,80 +267,14 @@ fn gc_sweeps_an_accumulated_backlog_with_one_local_command_and_no_network() {
         &release_runner,
     )
     .expect("release");
-    release_runner.assert_exhausted();
-}
-
-/// The sweep is purely local, so it works with no GitHub remote and no
-/// network at all. Previously an unresolvable remote skipped the `pr/*`
-/// sweep entirely — an offline pool pruned nothing and grew unboundedly.
-/// Here the release issues no `jj git remote list` for the sweep and no `gh`
-/// call, and still forgets the unreferenced bookmark.
-#[test]
-fn gc_pr_sweep_runs_offline() {
-    let (tempdir, database_path) = with_database_path();
-    let workspace_root = tempdir.path().join("workspaces");
-    let workspace_path = workspace_root.join("mono-agent-001");
-    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
-
-    seed_mono_repo(&workspace_root, &database_path);
-    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "offline gc");
-
-    let mut commands = release_prefix_commands(&workspace_path);
-    commands.extend([
-        gc_noop_command(&workspace_path),
-        gc_pr_sweep_command(&workspace_path, "pr/1586\n"),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/1586"], ""),
-    ]);
-    let release_runner = FakeRunner::new(commands);
-    run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
-        Some(&database_path),
-        &release_runner,
-    )
-    .expect("release");
-    release_runner.assert_exhausted();
-}
-
-/// A commit can carry bookmarks in more than one namespace — a `pr/<n>` and
-/// the `boss/exec_*` head it was created from, which is the normal shape
-/// after `cube pr create`. The `pr/*` half of the sweep must take only the
-/// `pr/*` names from its revset: the `boss/exec_*` namespace has its own,
-/// stricter "reachable from main" test, and forgetting an exec bookmark
-/// merely because it shares a commit with a dead `pr/<n>` would drop a
-/// branch that has not landed yet.
-#[test]
-fn gc_pr_sweep_ignores_co_located_bookmarks_in_other_namespaces() {
-    let (tempdir, database_path) = with_database_path();
-    let workspace_root = tempdir.path().join("workspaces");
-    let workspace_path = workspace_root.join("mono-agent-001");
-    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
-
-    seed_mono_repo(&workspace_root, &database_path);
-    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc namespaces");
-
-    let mut commands = release_prefix_commands(&workspace_path);
-    commands.extend([
-        // The exec half finds nothing consumed: this branch has not landed.
-        gc_noop_command(&workspace_path),
-        gc_pr_sweep_command(&workspace_path, "boss/exec_still_open_01\npr/2609\nmain\n"),
-        // Only pr/2609 is forgotten.
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/2609"], ""),
-    ]);
-    let release_runner = FakeRunner::new(commands);
-    run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
-        Some(&database_path),
-        &release_runner,
-    )
-    .expect("release");
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 }
 
 /// Failure must not look like "there was nothing to prune". This sweep is
-/// the only thing that bounds either bookmark namespace, so a sweep that
+/// the only thing that bounds the exec bookmark namespace, so a sweep that
 /// silently returns an empty set on error is unbounded growth with no
-/// signal — the exact feedback loop that let the live `mono` store reach
-/// sixty `pr/*` bookmarks. The release still succeeds (the lease has to come
+/// signal. The release still succeeds (the lease has to come
 /// back either way), but it forgets nothing and records the failure in the
 /// audit log.
 #[test]
@@ -352,14 +289,14 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
 
     let mut commands = release_prefix_commands(&workspace_path);
     commands.extend([
-        gc_noop_command(&workspace_path),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], ""),
         ExpectedCommand {
             cwd: workspace_path.clone(),
             program: "jj".to_string(),
             args: [
                 "log",
                 "-r",
-                crate::app::gc::UNREFERENCED_PR_BOOKMARKS_REVSET,
+                "bookmarks(glob:\"boss/exec_*\") & ::main",
                 "--no-graph",
                 "-T",
                 crate::app::gc::BOOKMARK_NAMES_TEMPLATE,
@@ -371,7 +308,7 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
                 program: "jj".to_string(),
                 args: vec!["log".to_string()],
                 status: Some(1),
-                stderr: "Revision `working_copies()` doesn't exist".to_string(),
+                stderr: "Revision `main` doesn't exist".to_string(),
             }),
             creates_dir: None,
             duration: std::time::Duration::ZERO,
@@ -386,6 +323,8 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
         &release_runner,
     )
     .expect("release still succeeds — a failed sweep must not strand the lease");
+    // Execute the detached worker's sweep separately, after release returned.
+    crate::app::release_bookmark_gc::sweep(&release_runner, Some(&database_path), "mono", &workspace_path);
     release_runner.assert_exhausted();
 
     let events = audit_events(&tempdir);
@@ -393,10 +332,10 @@ fn gc_release_records_an_audit_event_when_the_sweep_fails() {
         .iter()
         .find(|e| e["event"] == "workspace.release_bookmark_gc_failed")
         .expect("a failed sweep is recorded, not swallowed");
-    assert_eq!(failure["workspace_id"], "mono-agent-001");
+    assert!(events.iter().any(|event| event["event"] == "lease.released"));
     assert_eq!(failure["repo"], "mono");
     assert!(
-        failure["error"].as_str().unwrap().contains("working_copies()"),
+        failure["error"].as_str().unwrap().contains("Revision `main`"),
         "the audit event carries the underlying failure: {failure}"
     );
 }
@@ -623,7 +562,13 @@ fn pool_gc_backlog_retriggers_before_24h_elapsed() {
         "an aged dirty workspace should be reported as backlog"
     );
 
-    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut store,
+        Some(&database_path),
+        now,
+    )
+    .expect("trigger gc");
 
     let started_ts = store
         .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)
@@ -657,7 +602,13 @@ fn pool_gc_skips_before_24h_when_no_backlog() {
         "a pool with no unhealthy workspaces should report no backlog"
     );
 
-    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut store,
+        Some(&database_path),
+        now,
+    )
+    .expect("trigger gc");
 
     assert!(
         store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY).unwrap().is_none(),
@@ -689,14 +640,14 @@ fn workspace_gc_verb_runs_unhealthy_recycler() {
     drop(store);
 
     // FakeRunner sequence:
-    // 1. gc_workspace_bookmarks: fetch, exec sweep (nothing consumed), pr sweep
+    // 1. gc_workspace_bookmarks: fetch, exec sweep (nothing consumed)
     // 2. gc_aged_unhealthy_workspaces → probe (fetch + head status), then
     //    remote list, bookmark set, jj new
     let gc_runner = FakeRunner::new(vec![
         // gc_workspace_bookmarks
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], ""),
         gc_noop_command(&ws_path),
-        gc_pr_noop_command(&ws_path),
         // gc_aged_unhealthy_workspaces → probe (fetch + head status), then reset
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
         head_status_command(&ws_path, &head_status_output("abcd1234", true, "main", "main", "main")),
@@ -1594,7 +1545,13 @@ fn aged_quarantined_rows_count_as_backlog_so_gc_retries_in_minutes() {
     // POOL_GC_BACKLOG_RETRY_SECS (5m) and nowhere near AUTO_GC_INTERVAL_SECS
     // (24h), so the next lease retriggers.
     store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now - (10 * 60)).unwrap();
-    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut store,
+        Some(&database_path),
+        now,
+    )
+    .expect("trigger gc");
     assert_eq!(
         store
             .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)

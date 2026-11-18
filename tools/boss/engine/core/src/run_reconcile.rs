@@ -43,23 +43,10 @@ use boss_protocol::WorkExecution;
 #[cfg(test)]
 use boss_protocol::{ExecutionKind, ExecutionStatus};
 
-use crate::coordinator::{CubeClient, CubeWorkspaceStatus};
+use boss_execution_contracts::CubeClient;
+use boss_host_execution::types::CubeWorkspaceStatus;
 
-/// Per-execution outcome of the startup probe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunReconcileVerdict {
-    /// Worker is presumed still attached; dispatch should not
-    /// redispatch the work item.
-    Live,
-    /// Worker is presumed gone; the execution row is stale and the
-    /// work item should be redispatched after the row is marked
-    /// abandoned by the existing reconcile transaction.
-    Dead,
-    /// Insufficient signal to decide. Conservatively treated as Live
-    /// at dispatch time so we don't risk a duplicate, but surfaced via
-    /// `tracing::warn!` so an operator can resolve manually.
-    Unknown,
-}
+pub use boss_engine_storage_values::RunReconcileVerdict;
 
 /// Output of [`probe_in_flight_runs`].
 #[derive(Debug, Clone, Default)]
@@ -262,7 +249,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use crate::coordinator::CubeWorkspaceStatus;
+    use boss_host_execution::types::CubeWorkspaceStatus;
 
     struct StubCube {
         list_response: Mutex<Result<Vec<CubeWorkspaceStatus>>>,

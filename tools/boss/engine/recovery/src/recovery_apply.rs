@@ -1,33 +1,8 @@
-//! Reading back the recovery patches [`crate::recovery_backup`] writes.
+//! Legacy patch-reading utilities retained for explicit callers and tests.
 //!
-//! ## Why this module exists
-//!
-//! Before it, the recovery pipeline was write-only. Six sweep sites called
-//! [`crate::recovery_backup::backup_execution_patch`], 86 patches accumulated
-//! on disk going back to 2026-06-03, `boothby.md` even scheduled a GC pass
-//! for them — and nothing anywhere read one. A crashed worker's uncommitted
-//! work was captured to a file that no code path ever opened.
-//!
-//! ## Recovery order: cube first, patch second
-//!
-//! The patch is the *fallback*, not the primary. When a resume dispatch can
-//! re-lease the exact cube workspace the dead worker was using, and that
-//! workspace still holds the dirty working copy, the work is already live and
-//! in place with its jj operation log intact — that is strictly better than
-//! replaying a diff, and applying a patch on top of it would be actively
-//! harmful (duplicate hunks, or a conflict against work that was already
-//! there).
-//!
-//! So the caller's order is:
-//!
-//! 1. Lease `--prefer <workspace> --allow-dirty`. Cube reports
-//!    `dirty_verified` on the lease payload: `true` means the working copy
-//!    still held work that exists on no remote, i.e. cube recovered it in
-//!    place. Nothing else to do.
-//! 2. Only when cube could **not** recover — the lease failed outright, or it
-//!    succeeded with `dirty_verified: false` because the tree had already
-//!    been reset — apply the patch into whatever workspace the resuming
-//!    worker actually got.
+//! The engine no longer exports or automatically replays crash patches.
+//! Recovery restages the teardown-preserved jj tip instead. These helpers can
+//! read patches written by older engines from an explicitly supplied directory.
 //!
 //! ## Bookkeeping is filtered out
 //!
@@ -193,7 +168,7 @@ impl FilteredPatch {
 /// Locate the recovery patch for `execution_id`, if one was captured and has
 /// not already been consumed.
 ///
-/// Mirrors [`crate::recovery_backup`]'s naming exactly (including the
+/// Matches the retired patch export's naming (including the
 /// defensive id sanitisation), so a patch written by the backup path is the
 /// one found here.
 pub fn find_patch(recovery_dir: &Path, execution_id: &str) -> Option<PathBuf> {
@@ -207,9 +182,7 @@ pub fn find_patch(recovery_dir: &Path, execution_id: &str) -> Option<PathBuf> {
 /// replace anything outside `[A-Za-z0-9_-]` with `_` so a hostile or
 /// malformed id can never escape the recovery directory via `/` or `..`.
 ///
-/// This is the single canonical home for the naming; the backup path
-/// ([`crate::recovery_backup`]) calls it so a patch it writes is the one
-/// [`find_patch`] locates here.
+/// This preserves the retired export format so [`find_patch`] can locate old patches.
 pub(crate) fn patch_file_name(execution_id: &str) -> String {
     let stem: String = execution_id
         .chars()

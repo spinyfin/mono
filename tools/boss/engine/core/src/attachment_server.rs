@@ -126,7 +126,7 @@ pub async fn spawn(
     );
 
     let catalog: Arc<dyn EvidenceCatalog> = Arc::new(WorkDbEvidenceCatalog::new(work_db));
-    Some(tokio::spawn(http::serve(listener, catalog, store)))
+    Some(boss_task_scope::spawn(http::serve(listener, catalog, store)))
 }
 
 #[cfg(test)]

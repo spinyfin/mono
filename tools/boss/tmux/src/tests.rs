@@ -1,3 +1,8 @@
+mod absence;
+mod blocking_dialog;
+mod probe;
+mod teardown;
+
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -542,7 +547,7 @@ async fn set_option_capture_and_display_use_the_private_server() {
 
 #[tokio::test]
 async fn kill_session_verified_kills_only_on_an_exact_token_match() {
-    let (tmux, runner) = tmux([success("BOSS_SPAWN_TOKEN=secret\n"), success("")]);
+    let (tmux, runner) = tmux([success("BOSS_SPAWN_TOKEN=secret\n"), success(""), success("")]);
     let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
     assert_eq!(outcome, KillSessionOutcome::Killed);
     assert_eq!(
@@ -556,7 +561,18 @@ async fn kill_session_verified_kills_only_on_an_exact_token_match() {
                 "boss-1",
                 "BOSS_SPAWN_TOKEN"
             ],
-            vec!["-S", TEST_SOCKET_PATH, "kill-session", "-t", "boss-1"],
+            vec!["-S", TEST_SOCKET_PATH, "detach-client", "-s", "=boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "if-shell",
+                "-F",
+                "-t",
+                "=boss-1:",
+                "#{==:#{session_attached_list},}",
+                "kill-session -t '=boss-1'",
+                "display-message -p boss-viewers-attached"
+            ],
         ]
     );
 }
@@ -570,6 +586,7 @@ async fn kill_session_verified_treats_a_session_destroyed_just_before_the_kill_a
     // to Absent, not surface as a hard Tmux error.
     let (tmux, runner) = tmux([
         success("BOSS_SPAWN_TOKEN=secret\n"),
+        success(""),
         failure("can't find session: boss-1"),
     ]);
     let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
@@ -585,7 +602,18 @@ async fn kill_session_verified_treats_a_session_destroyed_just_before_the_kill_a
                 "boss-1",
                 "BOSS_SPAWN_TOKEN"
             ],
-            vec!["-S", TEST_SOCKET_PATH, "kill-session", "-t", "boss-1"],
+            vec!["-S", TEST_SOCKET_PATH, "detach-client", "-s", "=boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "if-shell",
+                "-F",
+                "-t",
+                "=boss-1:",
+                "#{==:#{session_attached_list},}",
+                "kill-session -t '=boss-1'",
+                "display-message -p boss-viewers-attached"
+            ],
         ],
     );
 }
@@ -773,7 +801,7 @@ async fn send_keys_chunks_utf8_then_submits_in_a_separate_command() {
                 "x".repeat(DEFAULT_SEND_CHUNK_BYTES).as_str()
             ],
             vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "-l", "--", "é"],
-            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"],
         ]
     );
 }
@@ -795,7 +823,7 @@ async fn send_keys_marks_dash_prefixed_literal_input_as_an_argument() {
                 "--",
                 "-R dashdash"
             ],
-            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"],
         ]
     );
 }
@@ -830,9 +858,63 @@ async fn send_keys_pastes_multiline_text_then_submits_once() {
     );
     assert_eq!(
         calls[2],
-        vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"]
+        vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"]
     );
     assert_eq!(runner.stdin(), vec![b"first\nsecond".to_vec()]);
+}
+
+/// The settle sits between the text and the Return, and nowhere else: an
+/// application that reads a Return arriving right behind typed text as part
+/// of a paste needs the gap there.
+#[tokio::test(start_paused = true)]
+async fn send_keys_with_submit_settle_waits_before_the_return_only() {
+    let (tmux, runner) = tmux([success(""), success("")]);
+    let settle = std::time::Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    tmux.send_keys_with_submit_settle("boss-1", "hello", settle)
+        .await
+        .unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "-l", "--", "hello"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"],
+        ]
+    );
+    assert_eq!(started.elapsed(), DEFAULT_SEND_CHUNK_DELAY + settle);
+}
+
+/// A pane in a mode has its keys consumed by tmux, so the mode is left
+/// before anything is sent; a pane outside one costs a single read.
+#[tokio::test]
+async fn leave_pane_modes_cancels_only_a_pane_that_is_in_a_mode() {
+    let (tmux, runner) = tmux([success("1\n"), success(""), success("0\n")]);
+    assert!(tmux.leave_pane_modes("boss-1").await.unwrap());
+    assert!(!tmux.leave_pane_modes("boss-1").await.unwrap());
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1",
+                "#{pane_in_mode}"
+            ],
+            vec!["-S", TEST_SOCKET_PATH, "copy-mode", "-q", "-t", "boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1",
+                "#{pane_in_mode}"
+            ],
+        ]
+    );
 }
 
 #[tokio::test]
@@ -855,7 +937,7 @@ async fn send_keys_strips_trailing_newlines_on_single_line_path() {
         runner.calls(),
         vec![
             vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "-l", "--", "hello"],
-            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"],
         ]
     );
 }
@@ -937,6 +1019,15 @@ async fn new_session_validation_rejections_do_not_run_tmux() {
             },
             "environment name cannot contain '='",
         ),
+        (
+            NewSession {
+                name: "boss-1".to_owned(),
+                environment: [("BOSS_LEASE_ID".to_owned(), String::new())].into(),
+                working_directory: PathBuf::from("/workspace"),
+                command: "exec codex".to_owned(),
+            },
+            "environment value cannot be empty",
+        ),
     ];
     for (session, expected_error) in cases {
         let (tmux, runner) = tmux([]);
@@ -961,6 +1052,7 @@ async fn kill_session_verified_surfaces_a_kill_session_failure_after_a_matched_t
     // a hard error rather than being swallowed as Absent.
     let (tmux, _) = tmux([
         success("BOSS_SPAWN_TOKEN=secret\n"),
+        success(""),
         failure("server exited unexpectedly"),
     ]);
     let error = tmux.kill_session_verified("boss-1", "secret").await.unwrap_err();
@@ -1070,4 +1162,48 @@ async fn readiness_capture_includes_bounded_scrollback() {
             "boss-1"
         ]]
     );
+}
+
+#[tokio::test]
+async fn send_submit_presses_enter_never_c_m() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.send_submit("boss-1").await.unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Enter"]]
+    );
+    assert_eq!(SUBMIT_KEY, "Enter");
+}
+
+#[tokio::test]
+async fn send_submit_if_evaluates_the_predicate_after_the_dialog_capture() {
+    let (tmux, runner) = tmux([success("composer idle")]);
+    let tmux = tmux.with_blocking_dialog_markers(vec!["Allow this command?".to_owned()]);
+    let calls_at_decision = std::sync::Mutex::new(0usize);
+    let sent = tmux
+        .send_submit_if("boss-1", || {
+            *calls_at_decision.lock().unwrap() = runner.calls().len();
+            false
+        })
+        .await
+        .unwrap();
+    assert!(!sent);
+    assert_eq!(
+        *calls_at_decision.lock().unwrap(),
+        1,
+        "the capture ran before the decision"
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![vec!["-S", TEST_SOCKET_PATH, "capture-pane", "-p", "-t", "boss-1"]],
+        "no Return when the predicate declines",
+    );
+}
+
+#[tokio::test]
+async fn send_submit_if_sends_return_when_permitted() {
+    let (tmux, runner) = tmux([success("composer idle"), success("")]);
+    let tmux = tmux.with_blocking_dialog_markers(vec!["Allow this command?".to_owned()]);
+    assert!(tmux.send_submit_if("boss-1", || true).await.unwrap());
+    assert_eq!(runner.calls().last().unwrap().last().unwrap(), "Enter");
 }

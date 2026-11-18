@@ -116,7 +116,7 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         ..FakeExecutionRunner::default()
@@ -242,6 +242,99 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     assert_eq!(demote.details["reason"], "pane_spawn_failure");
 }
 
+/// A local spawn refused because a blocking dialog was on screen must be
+/// terminalized by the dispatcher, not the runner. The runner returns the
+/// typed error while the execution is still live; this arm files the
+/// attention item, stamps last_error, records the failure basis, and must
+/// not fall into the double-fault "failed to record execution run failure"
+/// path.
+#[tokio::test]
+async fn blocking_dialog_spawn_refusal_is_terminalized_by_the_dispatcher() {
+    let buffer = log_capture::install();
+    let starting_offset = buffer.lock().len();
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
+    let runner = Arc::new(FakeExecutionRunner {
+        fail_blocking_dialog: true,
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+    let failed = db.get_execution(&execution_id).unwrap();
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("BlockingDialogOnScreen")),
+        "dialog refusal must persist last_error; got {:?}",
+        failed.last_error,
+    );
+    assert_eq!(failed.pre_start_failure_count, 1);
+
+    let attention_items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        attention_items.iter().any(|item| item.kind == "pane_spawn_failed"),
+        "dialog refusal must file pane_spawn_failed; got {attention_items:#?}",
+    );
+
+    let basis: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT basis FROM task_status_audit
+             WHERE work_item_id = ?1 AND property = 'blocked_reason'
+             ORDER BY id DESC LIMIT 1",
+            [&chore.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(basis, "blocking_dialog_on_screen");
+
+    let item = db.get_work_item(&chore.id).unwrap();
+    match &item {
+        WorkItem::Chore(task) | WorkItem::Task(task) => {
+            assert_eq!(&task.status, &TaskStatus::Blocked);
+            assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+
+    wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "pane_spawned" && event.outcome == "error",
+        "pane_spawned:error",
+    )
+    .await;
+    let events = recording.events_for(&execution_id).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.stage == "status_transition" && event.details["to_status"] == "todo"),
+        "a dialog refusal parks the task; it must not bounce to todo; got {events:#?}",
+    );
+
+    let captured = captured_lines_for(&buffer, starting_offset, &execution_id);
+    assert!(
+        !captured.contains("failed to record execution run failure"),
+        "dispatcher must finish the live run instead of double-faulting; logs:\n{captured}"
+    );
+}
+
 /// Coordinator persistence for a spawn that the runner refused because
 /// no turn-start evidence arrived: the execution is `failed`, the
 /// attention item is `pane_spawn_failed`, and the recorded reason names
@@ -255,16 +348,15 @@ async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reaso
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let fail_message = crate::runner::spawn_confirmation::turn_did_not_start_error(
-        "claude",
-        "exec-silent-turn",
-        std::time::Duration::from_secs(45),
-    )
-    .to_string();
-    let cube = Arc::new(FakeCubeClient::default());
+    let fail_source = crate::runner::spawn_confirmation::SpawnConfirmationError::TurnDidNotStart {
+        driver_name: "claude".to_owned(),
+        run_id: "exec-silent-turn".to_owned(),
+        timeout_secs: 45,
+    };
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
-        fail_message: Some(fail_message.clone()),
+        fail_source: Some(fail_source),
         ..FakeExecutionRunner::default()
     });
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
@@ -290,6 +382,11 @@ async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reaso
         "attention body must carry the turn-start reason; got {:?}",
         first.body_markdown,
     );
+    assert!(
+        first.body_markdown.contains("the driver started") && first.body_markdown.contains("the pane was reaped"),
+        "confirmation failure must not claim the pane never came up; got {:?}",
+        first.body_markdown,
+    );
 
     let events = recording.events_for(&execution_id).await;
     let pane_event = events
@@ -306,6 +403,132 @@ async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reaso
     );
 }
 
+/// Coordinator persistence for a spawn that the runner refused because
+/// the composer never became ready: the attention item is still
+/// `pane_spawn_failed`, but the body must not claim the driver started.
+#[tokio::test]
+async fn composer_never_ready_persists_pane_spawn_failed_without_claiming_the_driver_started() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let fail_source = crate::runner::spawn_confirmation::SpawnConfirmationError::ComposerNotReady {
+        driver_name: "claude".to_owned(),
+        run_id: "exec-missing-composer".to_owned(),
+        timeout_secs: 20,
+    };
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
+    let runner = Arc::new(FakeExecutionRunner {
+        fail: true,
+        fail_source: Some(fail_source),
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+    let attention_items = db.list_attention_items(&execution_id).unwrap();
+    let first = attention_items
+        .first()
+        .expect("composer-not-ready must raise pane_spawn_failed");
+    assert_eq!(first.kind, "pane_spawn_failed");
+    assert!(
+        first.body_markdown.contains("composer never became ready"),
+        "attention body must carry the composer-not-ready reason; got {:?}",
+        first.body_markdown,
+    );
+    assert!(
+        first
+            .body_markdown
+            .contains("spawn confirmation failed and the pane was reaped"),
+        "composer timeout must use the neutral confirmation wording; got {:?}",
+        first.body_markdown,
+    );
+    assert!(
+        !first.body_markdown.contains("the driver started"),
+        "composer timeout must not claim the driver started; got {:?}",
+        first.body_markdown,
+    );
+    assert!(
+        !first.body_markdown.contains("never came up"),
+        "confirmation failure must not claim the pane never came up; got {:?}",
+        first.body_markdown,
+    );
+}
+
+/// Every pre-start failure, including stages without a stage-specific error
+/// event, carries the error, attempt number and retry/permanent decision
+/// in a `pre_start_failure` dispatch record.
+#[tokio::test]
+async fn pre_start_failure_is_recorded_in_the_dispatch_stream_with_its_decision() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let cube = Arc::new(FakeCubeClient {
+        fail_create: true,
+        ..FakeCubeClient::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![Duration::ZERO])
+        .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+    wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "pre_start_failure" && event.details["decision"] == "permanent",
+        "permanent pre_start_failure",
+    )
+    .await;
+
+    let events = recording.events_for(&execution_id).await;
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|event| event.stage == "pre_start_failure")
+        .collect();
+    assert_eq!(failures.len(), 2, "{events:?}");
+    for (event, attempt, decision) in [(failures[0], 1, "retry"), (failures[1], 2, "permanent")] {
+        assert_eq!(event.outcome, "error");
+        assert_eq!(event.work_item_id.as_deref(), Some(chore.id.as_str()));
+        assert!(event.worker_id.is_some());
+        assert!(
+            event
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("cube change create failed")),
+            "{event:?}"
+        );
+        assert_eq!(event.details["attention_kind"], "cube_change_create_failed");
+        assert_eq!(event.details["attempt"], attempt);
+        assert_eq!(event.details["max_attempts"], 2);
+        assert_eq!(event.details["decision"], decision);
+    }
+    assert_eq!(failures[0].details["retry_delay_secs"], 0);
+    assert!(failures[1].details["retry_delay_secs"].is_null());
+    assert_eq!(db.get_execution(&execution_id).unwrap().pre_start_failure_count, 2);
+}
+
 /// Poll `recording` until an event for `execution_id` matches `predicate`,
 /// returning it. Used by the spawn-abort tests below, which have to assert on
 /// what is visible at a specific instant *while the cube release is still
@@ -318,7 +541,8 @@ async fn wait_for_dispatch_event(
     predicate: impl Fn(&crate::dispatch_events::DispatchEvent) -> bool,
     what: &str,
 ) -> crate::dispatch_events::DispatchEvent {
-    for _ in 0..200 {
+    // Real recovery setup precedes spawn; allow its jj subprocesses to finish.
+    for _ in 0..3000 {
         let events = recording.events_for(execution_id).await;
         if let Some(found) = events.iter().find(|event| predicate(event)) {
             return found.clone();
@@ -335,7 +559,8 @@ async fn wait_for_dispatch_event(
 /// records the call before parking on its gate, so this returning means the
 /// release is in flight and being held open.
 async fn wait_for_release_entered(cube: &FakeCubeClient, lease_id: &str) {
-    for _ in 0..200 {
+    // Release now verifies the recovery pointers through real jj.
+    for _ in 0..3000 {
         if cube.release_calls.lock().await.iter().any(|id| id == lease_id) {
             return;
         }
@@ -380,10 +605,13 @@ async fn spawn_abort_is_reported_before_the_cube_release_completes() {
     db.reconcile_product_executions(&product.id).unwrap();
 
     let gate = Arc::new(tokio::sync::Notify::new());
-    let cube = Arc::new(FakeCubeClient {
-        release_gate: Some(gate.clone()),
-        ..FakeCubeClient::default()
-    });
+    let cube = Arc::new(
+        FakeCubeClient {
+            release_gate: Some(gate.clone()),
+            ..FakeCubeClient::default()
+        }
+        .with_real_workspace(dir.path()),
+    );
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         ..FakeExecutionRunner::default()
@@ -480,10 +708,13 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
     db.reconcile_product_executions(&product.id).unwrap();
 
     let gate = Arc::new(tokio::sync::Notify::new());
-    let cube = Arc::new(FakeCubeClient {
-        release_gate: Some(gate.clone()),
-        ..FakeCubeClient::default()
-    });
+    let cube = Arc::new(
+        FakeCubeClient {
+            release_gate: Some(gate.clone()),
+            ..FakeCubeClient::default()
+        }
+        .with_real_workspace(dir.path()),
+    );
     let runner = Arc::new(FakeExecutionRunner {
         fail: true,
         ..FakeExecutionRunner::default()
@@ -2308,7 +2539,7 @@ async fn requested_host_became_ineligible_fails_review_guide_card() {
         )
         .with_pre_start_retry_delays(vec![]),
     );
-    coordinator.mark_requested_host(&fixture.execution_id, "local".to_owned());
+    coordinator.mark_requested_host_for_test(&fixture.execution_id, "local".to_owned());
     db.set_host_enabled("local", false).unwrap();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &fixture.execution_id, ExecutionStatus::Cancelled).await;

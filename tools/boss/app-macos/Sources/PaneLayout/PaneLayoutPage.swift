@@ -4,7 +4,7 @@ import Foundation
 public enum PaneCellContent: Equatable, Sendable {
     /// Unassigned: a hole, or a spare rectangle past the page's logical capacity.
     case empty
-    /// A live engine member. Draw its terminal, or a "Viewer not attached"
+    /// A live engine member. Draw its terminal, or a viewer-missing
     /// card when `hasViewer` is false.
     case occupied(PaneMember)
     /// A released run's retained cell ("<persona> finished"). Never counts as

@@ -90,7 +90,7 @@ pub(crate) mod testing {
     /// the same upsert-by-name semantics as the engine's sqlite
     /// implementation. The sqlite behaviour itself (including the
     /// `u64`-as-`i64` bit round-trip) is covered against the real
-    /// `WorkDb` over in `boss_engine::metrics_store`.
+    /// `WorkDb` over in `boss_work_db` (`metrics_db.rs`).
     #[derive(Default)]
     pub(crate) struct FakeStore {
         counters: Mutex<HashMap<String, MetricsCounterRow>>,

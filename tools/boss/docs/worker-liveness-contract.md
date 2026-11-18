@@ -40,6 +40,17 @@ The two statuses now mean what they say, and both are `is_live()`:
 
 `waiting_human` has exactly one writer and exactly one clearer, both in `engine/core/src/awaiting_input_status.rs`, driven off the `WorkerActivity::WaitingForInput` transition on the ordinary hook-dispatch path. That signal is the driver's own notification (Claude's `Notification` hook), honoured only for a driver declaring `Capability::AwaitingInputSignal` — never inferred from tool timing or elapsed silence. The write is guarded in SQL to the `running` ⇄ `waiting_human` pair, so a late hook can never drag a settled row (terminal, `waiting_review`, `waiting_merge`) back into a live status.
 
+### A worker is busy for the whole turn, including while it waits on its own background command
+
+`activity` is `Working` from the first turn activity the driver reports (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`) until the driver reports the turn boundary (`Stop`). Nothing in between lowers it: not a balanced tool call, not a long think, not minutes of silence. `Idle` means one thing — the driver said the turn ended — and the only honest way to get there is a `Stop` the driver actually emitted.
+
+Two driver facts make this matter more than it sounds:
+
+- **A Codex background-terminal wait is silent by design.** The rollout translator (`engine/driver/src/codex/progress.rs`) announces a command once, when its cell starts (`PreToolUse`), and treats every `wait`/`write_stdin` poll of that cell as a continuation of the announced command: no `PreToolUse` for the poll, no `PostToolUse` while the command is still running. `• Waiting for background terminal (12m 49s • esc to interrupt)` on the TUI is a chain of 30-second polls inside one turn, and the engine sees no event for any of them. The command's own `PreToolUse` is the last tool-boundary event, so the slot stays `Working` with `current_tool` set — correctly — until the command's real output or the turn's `task_complete` arrives. A Claude worker's equivalent is a long foreground `Bash` call (one `PreToolUse`, then nothing); a Claude worker that backgrounds a command _ends its turn_ (`Stop`) and is woken by Claude Code when the command finishes, so `Idle` there is the truth, not this bug.
+- **The durable checkpoint carries the turn, not just the tool.** `work_runs.semantic_tool_condition` (`in_flight` / `idle` / `unknown`) answers only "is a tool call unbalanced right now?", which is `idle` for most of a live turn — between tools, during a think, and for the whole of a background wait whose polls emit nothing after an earlier command completed. `work_runs.semantic_turn_condition` (`in_turn` / `ended` / `unknown`, schema 50) mirrors the reducer's turn gate: set to `in_turn` by the main session's turn-activity events, to `ended` by `Stop`, and left alone by everything else. Both columns are persisted from the reducer's latest post-apply state, captured under a dedicated persistence lock (the registry mutex is released before the database write, so the registry and database locks are never nested) (`WorkDb::record_semantic_checkpoint`, `tools/boss/engine/work-db/src/semantic_progress.rs`), so an event the reducer refuses as stale (a `Stop` that arrives after the next turn's tool hook) or does not count (a subagent's tool hooks) never changes them. Both are restored to the slot by `LiveWorkerStateRegistry::seed_semantic_progress` on re-adoption, where the turn condition decides busy-vs-idle: `in_turn` seeds `Working`; `ended` seeds `Idle`; a row from before the column (`unknown`) seeds `Working` only when a tool was in flight and otherwise leaves the slot unknown (`Spawning`) until the next driver event. A balanced last tool call is not evidence that the turn ended, so no `Idle` is inferred from it. This is a one-time gap at upgrade: a worker that was mid-turn in a silent background wait remains unknown (`Spawning`) until its next driver event, for either driver. Checkpoint-seeded slots are exempt from startup-stall promotion, so the 30-second timer cannot turn this uncertainty into `Idle` or `WaitingForInput`.
+
+A re-adopted slot seeded from the tool condition alone reads `Idle` over a worker that is mid-turn in a background wait: the last tool boundary was an earlier command completing, and the polls since emit nothing. Seeding from the turn condition, and re-establishing the rollout tail on adoption (below), is what keeps the pane header at `Working` for such a worker.
+
 A pane going `Terminated`/`Errored` is deliberately NOT mirrored. That is a death signal, and death detection has its own owners with their own corroboration rules — see Convergence below.
 
 ### `live_status` is not the indicator's input
@@ -102,8 +113,24 @@ closes that gap, once at boot and periodically thereafter, before
 `boss` tmux server, exact-matches each live session's authoritative
 `BOSS_SPAWN_TOKEN` (`show-environment`, never the `@boss_spawn_token` option
 mirror) against the non-terminal tmux-tracked `work_runs` rows, and rebuilds
-the pool slot claim, `WorkerRegistry` entry, `LiveWorkerState` entry, and
-live-status summarizer for every match. A matching session whose worker pane
+the pool slot claim, `WorkerRegistry` entry, `LiveWorkerState` entry
+(seeded from the durable semantic-progress checkpoint, turn condition
+first — see "busy for the whole turn" above), live-status summarizer, and
+**progress ingress** for every match. The last of those is what keeps the
+rebuilt slot from freezing at its seeded activity: a hook-callback driver's
+shim reconnects to the events socket on its own, but a file-tailing driver
+(Codex) is observed only through the rollout tail the previous engine
+process held, and that tail died with it. Adoption therefore calls the same
+`readopt_progress_ingress` the terminalized-survivor path uses
+(`WorkerSpawner::reestablish_progress_ingress`), resuming the tail at the
+recorded byte or filing the "Re-adopted worker has no progress ingress"
+attention item when it cannot; the `tmux_adopt` dispatch event records the
+outcome as `details.progress_ingress`. Without this step every engine restart
+would leave every live Codex worker unobserved for the rest of its run. The
+periodic sweep re-runs adoption for every live session, so a run whose slot
+this process already holds is skipped (`details.progress_ingress =
+already_observed`): its tail is already in place, and re-establishing it
+would only repeat failures. A matching session whose worker pane
 is dead (`#{pane_dead}=1`) is not a live worker: `remain-on-exit` keeps the
 session listed after the command has exited, and that is terminal evidence.
 The sweep records the pane exit status (and a pane-capture snippet when
@@ -119,6 +146,35 @@ being handled here.
 
 ### Retained worker exits
 
+Confirmed session loss is reconciled independently of the last transcript
+event and the activity it left behind: idle and waiting workers can die too.
+The engine marks the pane terminated before asynchronous teardown, preserving
+the final driver timestamp and summary. A surviving recorded PID still blocks
+destructive cleanup for an absent session or mismatched token; it does not
+make that missing pane display as working.
+
+The `observed_dead` fence drops buffered hooks until same-run re-adoption or
+a later `Alive` inspection restores the activity saved before termination,
+falling back to semantic evidence only when no activity was saved. Without
+either, activity is unchanged.
+Ordinary buffered hooks never clear it. Inferred death that still has a live
+PID skips the live-status refresh without fencing hooks or stopping the
+status loop; the stale-worker sweep still uses a reversible terminated
+display. Confirmed death (an observed pane exit, or inferred absence
+whose PID is gone) sets the fence, parks the live-status loop, and stays
+eligible for the ordinary death and pool-claim sweeps so the registry entry
+and pool claim are released even when the refresh guard noticed first. A
+later Alive inspection or same-run re-adoption un-parks the loop on its next wake.
+Only engine-inferred or observed-dead terminations can be revived this way;
+a driver SessionEnd remains under the authority of the hook stream.
+
+The live-status timer and the stale-worker sweep share one confirmed-death
+predicate. The timer checks process/session liveness before using a cached
+transcript and again before publishing a model response. Confirmed death
+stops the loop, and the registry rejects summary writes after termination.
+The app renders that activity in the header and the exited body; it does not
+infer death from summary age or viewer attachment.
+
 Before Boss creates its first private-server window, it starts the server and
 sets the global `history-limit=2000` and `remain-on-exit=on` defaults. The
 former makes scrollback a bounded diagnostic convenience; driver JSONL remains
@@ -128,6 +184,116 @@ enough for the real tmux wrapper to read `#{pane_dead}` and
 status, and the ordinary release path removes the retained session only after
 its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 
+## Hook events are applied in the worker's emission order
+
+`LiveWorkerState.activity` is reduced from the hook stream by
+`LiveWorkerStateRegistry::apply_sequenced_event`
+(`engine/live-worker-state/src/lib.rs`), and the reducer is simple:
+`UserPromptSubmit` / `PreToolUse` / `PostToolUse` → `Working` (with the
+tool on `PreToolUse`), `Stop` → `Idle` (or `WaitingForInput` when a
+`Notification` preceded it), `SessionEnd` → `Terminated`. There is no
+"turn gate": a `PreToolUse` after a `Stop` is a new turn, whether or not a
+`UserPromptSubmit` came first. It must be, because Claude Code wakes a
+stopped session **on its own** when a background command finishes, and
+that resumed turn opens with tool hooks and no prompt.
+
+What can go wrong is ordering. The events-socket accept loop
+(`engine/app/src/app/events_accept.rs`) dispatches every connection on its
+own task, so two hooks the worker emitted in order can reach the reducer in
+either order — and the race is not symmetric. A turn boundary persists the
+transcript path and folds the transcript into the run's cost snapshot (a
+bounded settle loop with sleeps, plus transcript reads and DB writes whose
+latency is not bounded by those sleeps) on its way to the reducer; a
+`PreToolUse` goes almost straight there. When a `Stop` is slow and the
+re-woken turn's first `PreToolUse` is fast, the `Stop` lands second and
+rewinds the slot to `Idle` with no tool — and it stays that way until the
+next hook, which for a multi-minute `checkleft run` is the whole run.
+
+The 2026-10-15 "Idle while visibly running `checkleft`" incident is
+**consistent with** that race but the race is not proven to be its cause:
+the engine log lines for the incident window (`hook event received`, `hook
+payload arrived at dispatcher`, `dropping hook fan-out`) were not available
+when the fix was written. The settle loop's sleeps alone (~200ms) are far
+shorter than the minutes the pane stayed Idle, so a delay that long would
+have to come from elsewhere in the `Stop`'s ingress (transcript read, DB
+lock contention). Another unruled-out cause is the shim's resilience path:
+after its roughly ten-second connection retry budget, it appends the hook
+to `.boss/events-pending.jsonl`, exits successfully, and retries delivery
+on the next hook. A concurrent drain waits for the buffer lock instead of
+stranding the current hook, and a non-empty buffer still uses the same
+connect-retry ride-through so an engine restart does not skip the head
+record. A buffered `PreToolUse` may therefore arrive with `PostToolUse`
+after the entire long command. Check shim stderr for
+`buffering event for later delivery` and the pending file for that payload.
+An engine `hook event received` followed by `dropping hook fan-out`
+distinguishes a slot-less drop from shim buffering; `hook payload arrived
+at dispatcher` confirms dispatch. Missing receipt alone cannot distinguish
+buffering from a hook that never fired. Every `Stale` refusal logs
+`ingress_seq` and `last_applied_seq`, proving reducer reordering, but not
+by itself proving the cause of the historical incident. The incident's
+engine logs and original pending buffer require coordinator investigation;
+neither delivery failure nor slot-less dropping is repaired by ordering.
+
+Three things close the ordering hole:
+
+- **Accept order is emission order, and the reducer honours it.** The
+  `boss-event` shim connects synchronously from inside the driver's hook,
+  so the order the accept loop sees connections is the order the worker
+  emitted them. The loop stamps that order as `ingress_seq` before spawning
+  the task; the registry remembers the newest sequence it applied per slot
+  (`LiveWorkerStateRegistry::apply_hook_event`) and treats an older event as
+  late (`ApplyEventOutcome::Stale`). A late event does not touch `activity`,
+  `current_tool` or the display timestamps, and does not trigger the
+  live-status loop's `Stop`/`PostToolUse` refresh. Hook events are
+  incremental, though, so late events still contribute: a late
+  `Notification` repairs only an Idle slot whose newest `Stop` was its
+  first clearing event. An earlier `PreToolUse` or `Stop` consumes it;
+  Errored and Terminated slots are never repaired to waiting. A late
+  `Stop` reports the turn boundary it opened (below), and stale main-session
+  activity can consume an older boundary without changing the display.
+  Liveness bookkeeping (`record_driver_signal`) already happened at ingress.
+  Unsequenced callers (the Codex stdout reader, engine-synthesized events,
+  tests) keep the always-apply `apply_event`.
+- **The live-state transition and its durable projection run before the
+  slow half of ingress.** `dispatch_live_worker_state`
+  (`engine/app/src/app/worker_events.rs`) applies the event, broadcasts,
+  and mirrors the awaiting-input state onto the execution row, and only then
+  persists the transcript path and captures cost. The row write is decided
+  from the pane's activity at write time, inside a gate that serializes the
+  writes, so an older handler that stalls can never leave `waiting_human`
+  over a pane that has since moved on.
+- **A declared wait survives turns until its bounded deadline.** A wait
+  (`boss propose wait`) reserves time for a background job. A human asking
+  for status, a coordinator prompt, or an autonomous wakeup does not prove
+  that job finished. Main-session hooks, including late or reordered hooks,
+  therefore neither revoke nor extend the grant. The live snapshot hides
+  its wait caption during an active turn (and keeps permission prompts
+  visible); after Stop the unexpired wait is visible again. The declaration
+  still records hook order so a Stop before the declaration cannot turn a
+  current permission prompt into a job wait.
+
+  Completion checks the active wait before recording a nudge: status replies
+  consume no consecutive or total breaker strikes, and do not clear earlier
+  legitimate strikes. A renewal replaces the deadline and charges its full
+  duration against the existing per-execution cap. The two-hour declaration
+  limit, cumulative cap, expiry, teardown cleanup, and other safety checks
+  are unchanged. Workers need to renew only when the job needs more time.
+
+  Expiry does not itself run a timer callback or fail the execution. The
+  merge poller retains a `WorkerWait` nudge intent and calls
+  `recheck_background_nudge` on subsequent sweeps. Once activity, mid-turn,
+  live-child and build-wait guards permit it, that path re-enters
+  `nudge_or_park`. Three identical nudges are allowed; the next eligible
+  attempt trips the breaker and calls `fail_for_unproductive_nudges`, without
+  sending a fourth nudge or requiring a new Stop. This explains how the
+  2026-11-07 status-question incident could fail at 03:25:24 UTC after its
+  last Stop at 01:49 and wait expiry at 02:19:17: the retained sweep used the
+  three earlier strikes. It was the same nudge breaker, not a separate wait
+  timeout. There is no fixed 66-minute post-expiry delay in this path. The
+  exact sweep timing and suppression observations require the incident
+  engine logs; the historical transcript alone cannot establish which guard
+  or sweep delay accounted for that interval.
+
 ## Rules of thumb for future work here
 
 - **A dead pane is terminal evidence.** `remain-on-exit` keeps a tmux session listed after its worker command has exited. `#{pane_dead}=1` must not be treated as a live worker, and it must not disprove an inferred death.
@@ -135,4 +301,53 @@ its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 - **`Unknown` is not `Gone`.** A worker with no recorded pid is mid-spawn, not dead. `WorkerProcess::Unknown` and `PaneReleaseOutcome::NoLiveWorker` both exist to keep that case from being read as death — treating it as death reaps live-but-slow spawns and releases cube leases out from under workspaces a worker is about to occupy.
 - **`EPERM` means alive.** `kill(pid, 0)` returning `EPERM` proves the process exists.
 - **A pid is a durable number, not a durable handle.** Once the OS recycles it — macOS wraps at ~99999 — the same integer names an unrelated process, and the reap signals its whole process _group_. Anything that signals a process or restores state from the pid must use a bounded probe (`probe_execution_worker_within`, `probe_work_item_worker`), which declines to answer once the run row ages past `REDISPATCH_PID_TRUST_SECS`. The unbounded `probe_execution_worker` is only for callers whose failure direction is to decline to act, where a stale pid costs a missed reconciliation rather than a killed bystander.
+- **Never infer activity from pane output or timers.** `activity` is reduced from the hook stream, in emission order (`ingress_seq`). If a pane looks busy while the slot says `Idle`, the bug is in ingress ordering, the reducer, or — after an engine restart — the re-adoption seed or a tail that was never re-established; fix that, not the symptom.
+- **A balanced tool call is not a turn boundary.** `semantic_tool_condition = idle` says no tool is unbalanced; only `semantic_turn_condition = ended` (a driver `Stop`) says the worker is parked. Anything that restores or classifies a slot's activity from durable state must read the turn column, and a Codex worker polling its own background command — silent on both columns for as long as the wait lasts — is `Working`, not idle and not stuck.
 - **Don't lengthen a timeout to fix a contradiction.** A longer spawn-ack window narrows the race without closing it, and leaves the system with no answer for the times it still loses.
+
+## Suspected hung drivers
+
+The engine publishes a separate `hung_since` diagnostic and a “Worker hung”
+attention. It does not change the hook-derived activity, execution status, or
+the two-hour idle reap. The app shows “Hung” on the Doing card and worker pane,
+so an operator can inspect, interrupt, or restart the session without treating
+silence as a confirmed failure. The ten-second activity sweep reconciles the
+warning; resumed progress, a running tool, a declared wait, an operator hold,
+or release of the worker clears it.
+
+Only a Rich driver with a confirmed open turn and an idle or yielded tool state is
+eligible. Unknown state, ended turns, permission waits, and blocking tool calls
+are exempt. Codex poll results persist a yielded checkpoint: the command is still
+running, but the model must respond within 900 seconds. Starting the next poll
+restores the blocking exemption until its result returns. Yielded commands remain
+protected from the destructive stale-worker sweep.
+Codex model-message/reasoning events advance progress, but `token_count`
+records do not, including unchanged usage during retries. Notifications, including
+Grok background task completions, do not advance the semantic deadline. Hook-only drivers
+provide tool/turn boundaries rather than token-level output, so their warning
+is necessarily a suspicion based on that coarser evidence.
+
+The thresholds are 600 seconds before any tool has completed and 900 seconds
+after a tool completes within the current prompt; prompt submission resets the
+in-memory tool-completion marker. This threshold is approximate after restart:
+completed-tool history is not restored, so an idle checkpoint uses 600 seconds
+until another tool completes. A persisted yielded checkpoint always uses 900
+seconds. These are warning thresholds, not termination deadlines.
+They use the 2026-10-27 transcript measurement: 3,454 completed, never-reaped
+Codex sessions (September 10–October 27), 1,500 sampled Claude sessions out of
+3,829 (September 27–October 27), and 647 Grok sessions (September 10–October 27).
+Observed prompt/tool-result gaps were at most 268 seconds for Codex (128 for
+first response), 608 seconds per Claude request (984 for the worst
+single-request gap), and 413 for Grok; p99.9 was 75–165 seconds. The 600-second
+initial warning exceeds the observed Codex first-response maximum; 900 seconds
+after a tool leaves additional room for the slower Claude sample. Neither is
+a guarantee: the 984-second Claude outlier exceeds the latter threshold.
+
+At 600 seconds, recovered stalls affected 3.9% of Codex, 5.3% of Claude, and
+6.8% of Grok sessions. Long gaps involved retries/errors; a Grok stream could
+stall for 3.4 hours. Those observations justify an inspect/restart warning
+rather than killing a worker at the new threshold. Tool duration is not model
+latency: Claude Bash reached 2,991 seconds and Grok tools 900 seconds, so tools
+are exempt regardless of elapsed time. These measurements come from
+the local transcript survey; the detector's boundary tests use synthetic clocks
+and do not claim to repeat that survey.

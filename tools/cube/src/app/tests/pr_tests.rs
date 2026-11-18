@@ -82,7 +82,6 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
             ],
             "https://github.com/spinyfin/mono/pull/99",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/99", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from([
@@ -167,7 +166,6 @@ fn ensure_pr_created_json_has_action_url_number() {
             ],
             "https://github.com/spinyfin/mono/pull/42",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
@@ -180,7 +178,11 @@ fn ensure_pr_created_json_has_action_url_number() {
     assert_eq!(result.payload["action"], "created");
     assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/42");
     assert_eq!(result.payload["number"], 42);
-    assert_eq!(result.payload["pr_bookmark"], "pr/42");
+    assert!(
+        result.payload.get("pr_bookmark").is_none(),
+        "publication writes no pr/<n> alias: {}",
+        result.payload
+    );
 }
 
 #[test]
@@ -226,7 +228,6 @@ fn ensure_pr_exists_json_has_action_url_number() {
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from([
@@ -247,7 +248,11 @@ fn ensure_pr_exists_json_has_action_url_number() {
     assert_eq!(result.payload["action"], "exists");
     assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/7");
     assert_eq!(result.payload["number"], 7);
-    assert_eq!(result.payload["pr_bookmark"], "pr/7");
+    assert!(
+        result.payload.get("pr_bookmark").is_none(),
+        "publication writes no pr/<n> alias: {}",
+        result.payload
+    );
 }
 
 #[test]
@@ -316,7 +321,6 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
             ],
             "https://github.com/spinyfin/mono/pull/77",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/77", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
@@ -407,9 +411,9 @@ fn ensure_pr_guard_rejects_pr_bookmark_branch_arg() {
 }
 
 #[test]
-fn ensure_pr_sets_pr_bookmark_on_create() {
-    // After a new PR is created, `jj bookmark set pr/<n> -r <branch>` must
-    // be called so the workspace has a local pointer from number to head.
+fn ensure_pr_creates_no_pr_bookmark_on_create() {
+    // After a new PR is created, no `pr/<n>` bookmark is written: the scripted
+    // runner is a strict FIFO, so any jj bookmark command would panic.
     let cwd = std::env::current_dir().expect("cwd");
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(
@@ -468,8 +472,6 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
             ],
             "https://github.com/spinyfin/mono/pull/55",
         ),
-        // Must call `jj bookmark set pr/55 -r my-feature` after creation.
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/55", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from([
@@ -486,13 +488,17 @@ fn ensure_pr_sets_pr_bookmark_on_create() {
     let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr create+bookmark");
     runner.assert_exhausted();
 
-    assert_eq!(result.payload["pr_bookmark"], "pr/55");
+    assert!(
+        result.payload.get("pr_bookmark").is_none(),
+        "publication writes no pr/<n> alias: {}",
+        result.payload
+    );
 }
 
 #[test]
-fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
-    // When a PR already exists (backfill path), `jj bookmark set pr/<n> -r
-    // <branch>` must still be called so the local bookmark is up to date.
+fn ensure_pr_creates_no_pr_bookmark_on_existing_pr() {
+    // When a PR already exists (backfill path), no `pr/<n>` bookmark is
+    // written either.
     let cwd = std::env::current_dir().expect("cwd");
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(
@@ -535,7 +541,6 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/33"}]"#,
         ),
         // Bookmark set must happen even on the reuse/backfill path.
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/33", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from([
@@ -551,7 +556,11 @@ fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
     runner.assert_exhausted();
 
     assert_eq!(result.payload["action"], "exists");
-    assert_eq!(result.payload["pr_bookmark"], "pr/33");
+    assert!(
+        result.payload.get("pr_bookmark").is_none(),
+        "publication writes no pr/<n> alias: {}",
+        result.payload
+    );
 }
 
 #[test]
@@ -687,7 +696,6 @@ fn pr_create_opens_pr_when_none_exists() {
             ],
             "https://github.com/spinyfin/mono/pull/42",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "New PR"]);
@@ -697,7 +705,11 @@ fn pr_create_opens_pr_when_none_exists() {
     assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/42");
     assert_eq!(result.payload["action"], "created");
     assert_eq!(result.payload["number"], 42);
-    assert_eq!(result.payload["pr_bookmark"], "pr/42");
+    assert!(
+        result.payload.get("pr_bookmark").is_none(),
+        "publication writes no pr/<n> alias: {}",
+        result.payload
+    );
 }
 
 #[test]
@@ -721,8 +733,19 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
             r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
-        // No push, no `gh pr create` — only the local pr/<n> bookmark is set.
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        // No push, no `gh pr create`: the local branch is only compared with GitHub.
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+            "published",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+            "published",
+        ),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "Dup"]);
@@ -732,7 +755,47 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
     assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/7");
     assert_eq!(result.payload["action"], "already_exists");
     assert_eq!(result.payload["number"], 7);
-    assert_eq!(result.payload["pr_bookmark"], "pr/7");
+    assert!(
+        result.payload.get("pr_bookmark").is_none(),
+        "publication writes no pr/<n> alias: {}",
+        result.payload
+    );
+}
+
+#[test]
+fn pr_create_existing_pr_with_new_local_commits_recommends_update() {
+    let cwd = std::env::current_dir().unwrap();
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+            "local",
+        ),
+        ExpectedCommand::ok(
+            cwd,
+            "gh",
+            &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+            "published",
+        ),
+    ]);
+    let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "Update"]);
+    let error = run_with_dependencies(cli, None, &runner).unwrap_err().to_string();
+    runner.assert_exhausted();
+    assert!(error.contains("cube pr update --branch my-feature"), "{error}");
+    assert!(!error.contains("push did not reach"), "{error}");
 }
 
 #[test]
@@ -792,7 +855,6 @@ fn pr_update_pushes_when_pr_exists() {
             &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
             "abc123\n",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "my-feature"]);
@@ -802,7 +864,11 @@ fn pr_update_pushes_when_pr_exists() {
     assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/7");
     assert_eq!(result.payload["action"], "updated");
     assert_eq!(result.payload["number"], 7);
-    assert_eq!(result.payload["pr_bookmark"], "pr/7");
+    assert!(
+        result.payload.get("pr_bookmark").is_none(),
+        "publication writes no pr/<n> alias: {}",
+        result.payload
+    );
 }
 
 #[test]
@@ -850,7 +916,7 @@ fn pr_update_errors_when_no_pr_exists() {
 
 #[test]
 fn pr_update_refuses_when_working_copy_is_stale() {
-    // T2764 postmortem: a worker rebased the bookmark onto main but never
+    // Regression: a worker rebased the bookmark onto main but never
     // `jj edit`ed into it, so `@` stayed on the old tree while the
     // bookmark advanced. `cube pr update` must refuse before pushing —
     // and before even checking whether a PR exists — rather than ship a
@@ -968,7 +1034,6 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
             &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
             "abc123\n",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "my-feature"]);
@@ -1025,7 +1090,6 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
             &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
             "abc123\n",
         ),
-        ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
     ]);
 
     let cli = Cli::parse_from([

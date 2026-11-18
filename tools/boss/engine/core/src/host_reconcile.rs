@@ -34,7 +34,7 @@
 //! Runs every [`DEFAULT_INTERVAL`] and fires immediately on boot, so a host
 //! disabled while the engine was down is drained at startup without waiting
 //! for the first interval. It also subscribes to [`Event::HostDisabled`] —
-//! published by [`crate::host_registry::WorkDb::set_host_enabled`] and
+//! published by [`crate::work::WorkDb::set_host_enabled`] and
 //! [`crate::work::WorkDb::record_host_dispatch_failure`] on a genuine
 //! enabled → disabled transition — so a disable is drained immediately
 //! instead of waiting up to [`DEFAULT_INTERVAL`] for the next sweep tick.
@@ -50,10 +50,11 @@ use std::time::Duration;
 use boss_event_bus::{Event, Subscription};
 use boss_protocol::ExecutionKind;
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::sweep_loop::SweepOutcome;
 use crate::work::{HostBoundExecution, WorkDb};
+use boss_execution_contracts::CubeClient;
 
 /// How often the host-reconcile sweep runs. Matches the other steady-state
 /// reconcilers (orphan / pool-claim / lost-workspace, all 60s) so a host
@@ -100,7 +101,7 @@ pub fn spawn_loop(
     interval: Duration,
     host_disabled: Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut host_disabled = host_disabled;
         // Once the bus itself is dropped (engine shutdown path in tests /
         // process teardown) `recv` resolves to `None` forever; stop polling
@@ -324,6 +325,7 @@ async fn drain_execution(
 
 #[cfg(test)]
 mod tests {
+    use crate::lifecycle_adapter::CoreCoordinatorConstructors;
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -333,12 +335,14 @@ mod tests {
     use boss_protocol::{CreateExecutionInput, ExecutionStatus, RequestExecutionInput, WorkExecution};
 
     use super::*;
-    use crate::coordinator::{CubeRepoSummary, ExecutionCoordinator, WorkerPool};
+    use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::{create_test_chore, create_test_product_with_repo, open_db};
     use crate::work::WorkDb;
+    use boss_execution_contracts::WorkerPool;
+    use boss_execution_contracts::{ExecutionRunner, RunOutcome};
+    use boss_host_execution::types::CubeRepoSummary;
 
     /// No-op execution runner: the real re-route tests only need
     /// `orphan_sweep::run_one_pass` to produce a fresh `ready` execution;

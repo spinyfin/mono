@@ -140,6 +140,23 @@ final class GhosttyRuntime: @unchecked Sendable {
     /// instead of waiting for the engine's periodic sweeps.
     var onDisplaysDidWake: (() -> Void)?
 
+    /// Last libghostty cell size in points at the worker font, when any
+    /// worker surface has reported one. The Agents layout model uses this with
+    /// the pane area to compute per-page capacity.
+    private(set) var lastCellSize: (width: Double, height: Double)?
+    /// Native worker first-responder changes, keyed by session identity.
+    var onWorkerFocus: ((String) -> Void)?
+    /// Invoked on the main actor when a worker reports its cell size in points.
+    var onCellSizeChanged: ((Double, Double) -> Void)?
+
+    @MainActor
+    static func workerCellSize(role: PaneRole, host: NSView, pixels: NSSize) -> NSSize? {
+        let points = host.convertFromBacking(pixels)
+        guard case .worker = role, points.width > 0, points.height > 0,
+              points.width.isFinite, points.height.isFinite else { return nil }
+        return points
+    }
+
     private init() {
         GhosttyBootstrap.ensureInitialized()
 
@@ -422,6 +439,14 @@ final class GhosttyRuntime: @unchecked Sendable {
 
         case .cellSize(let size):
             resolved.host?.setCellSize(size)
+            guard let host = resolved.host else { return }
+            let pixels = NSSize(width: Double(size.width), height: Double(size.height))
+            guard let cell = Self.workerCellSize(role: host.session.role, host: host, pixels: pixels) else { return }
+            let width = Double(cell.width)
+            let height = Double(cell.height)
+            let runtime = GhosttyRuntime.shared
+            runtime.lastCellSize = (width, height)
+            runtime.onCellSizeChanged?(width, height)
 
         case .colorChange(let change):
             resolved.host?.applyColorChange(change)

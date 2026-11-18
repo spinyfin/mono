@@ -180,6 +180,23 @@ pub enum Stage {
     /// occupant). Readers keying off `pane_spawned` — `bossctl doctor`'s
     /// SIG-B/SIG-F/SIG-H signatures — are unaffected.
     SpawnFailed,
+    /// A dispatch attempt failed before the run started and the engine
+    /// recorded it (`record_start_failure`): cube repo ensure, workspace
+    /// lease, change create, execution-bookmark creation or run start.
+    /// Emitted once per failure — including every failure that is about to
+    /// be retried — always with outcome `error`, so the failed stage is
+    /// terminal on the timeline and `stage_stalled` never fires for it.
+    /// `error_message` carries the full error chain; `details` carries
+    /// `reason` (the failure kind, e.g. `execution_bookmark_create_failed`),
+    /// `pre_start_failure_count`, `will_retry` and, when retrying,
+    /// `retry_delay_secs`.
+    PreStartFailure,
+    /// Pre-start retries are exhausted (or the failure kind is never
+    /// retried): the attempt failed for good. `details.reason` is the
+    /// failure kind, `details.pre_start_failure_count` the attempts spent
+    /// and `details.bounced_to_backlog` whether the work item was returned
+    /// to the backlog with autostart cleared. Always outcome `error`.
+    PreStartRetriesExhausted,
     /// The completion handler finished tearing down an execution it had
     /// just terminalized — pane released, driver state torn down, cube
     /// lease released (or its release timed out and was abandoned to cube's
@@ -260,9 +277,12 @@ pub enum Stage {
     DispatchDecision,
     /// The transient-recovery sweep detected a worker that stalled or
     /// died with a *transient* Claude API error as the last entry in
-    /// its transcript and auto-resumed it on the same workspace. The
+    /// its transcript and auto-resumed it in a new execution (on any free
+    /// workspace, carrying over the stalled run's preserved work). The
     /// `details` object carries `attempt`, `max_attempts`, the error
-    /// `class`, and a clipped `error` string so `bossctl dispatch tail`
+    /// `class`, a clipped `error` string, and `predecessor_lease` (what
+    /// became of the stalled run's cube lease: `released`, `kept`,
+    /// `cube_failed`, `not_attempted` or `none`) so `bossctl dispatch tail`
     /// shows "recovering, attempt 2/3" without a log dive.
     TransientRecovery,
     /// The transient-recovery sweep stopped retrying a worker and
@@ -824,6 +844,18 @@ pub enum Stage {
     /// this one run (`details.reason`). The run stays live but unobserved
     /// until it is reaped or re-adopted; readoption re-arms discovery.
     FileIngressDiscoveryFailed,
+    /// One step of the un-park reconciliation sequence ran for a work item the
+    /// owner just un-parked (`engine/core/src/unpark_reconcile.rs`). Keyed by
+    /// the work item id rather than an execution id, like `dispatch_decision`:
+    /// the sequence concerns the item, not any one run, so it is a timeline
+    /// observation that never re-opens a dispatched execution's timeline.
+    /// `details.step` names the step (`clear_halt_stamps`, `refresh_pr`,
+    /// `conflict_probe`, `ci_probe`, `ai_review`, `reconcile_execution`,
+    /// `revisions`, `progression_grace`, `rate_limit`, `progress`),
+    /// `details.outcome` what it did, and `outcome` is `ok` when the step
+    /// acted or found nothing to do, `skipped` when its precondition did not
+    /// hold, and `error` when it failed (the sequence continues past it).
+    UnparkReconcile,
 }
 
 /// How a dispatch record participates in an execution timeline.
@@ -839,7 +871,7 @@ pub enum TimelineStageClass {
 
 impl Stage {
     /// Every stable stage name, for exhaustive schema-contract tests.
-    pub const ALL: [Stage; 65] = [
+    pub const ALL: [Stage; 68] = [
         Stage::StatusTransition,
         Stage::RequestRecorded,
         Stage::WorkerClaimed,
@@ -857,6 +889,8 @@ impl Stage {
         Stage::PaneSpawned,
         Stage::ExecutionCancelled,
         Stage::SpawnFailed,
+        Stage::PreStartFailure,
+        Stage::PreStartRetriesExhausted,
         Stage::ExecutionFinalized,
         Stage::StageStalled,
         Stage::OrphanActiveRedispatch,
@@ -905,6 +939,7 @@ impl Stage {
         Stage::FileIngressAttached,
         Stage::FileIngressDiscoveryOverdue,
         Stage::FileIngressDiscoveryFailed,
+        Stage::UnparkReconcile,
     ];
 
     /// Classify this stage's effect on an execution timeline.
@@ -914,9 +949,10 @@ impl Stage {
             // its dispatch pipeline. In particular, a heartbeat must not
             // hide a dispatch that is stuck before pane spawn, and the
             // victim-side preemption record must not reopen a finished run.
-            Stage::DispatchDecision | Stage::AutomationPreempted | Stage::CubeLeaseHeartbeat => {
-                TimelineStageClass::Observation
-            }
+            Stage::DispatchDecision
+            | Stage::AutomationPreempted
+            | Stage::CubeLeaseHeartbeat
+            | Stage::UnparkReconcile => TimelineStageClass::Observation,
             stage if stage.is_post_dispatch() => TimelineStageClass::PostDispatch,
             _ => TimelineStageClass::Pipeline,
         }
@@ -941,6 +977,8 @@ impl Stage {
             Stage::PaneSpawned => "pane_spawned",
             Stage::ExecutionCancelled => "execution_cancelled",
             Stage::SpawnFailed => "spawn_failed",
+            Stage::PreStartFailure => "pre_start_failure",
+            Stage::PreStartRetriesExhausted => "pre_start_retries_exhausted",
             Stage::ExecutionFinalized => "execution_finalized",
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
@@ -989,6 +1027,7 @@ impl Stage {
             Stage::FileIngressAttached => "file_ingress_attached",
             Stage::FileIngressDiscoveryOverdue => "file_ingress_discovery_overdue",
             Stage::FileIngressDiscoveryFailed => "file_ingress_discovery_failed",
+            Stage::UnparkReconcile => "unpark_reconcile",
         }
     }
 
@@ -1045,6 +1084,8 @@ impl Stage {
             | Stage::RunStarted
             | Stage::PaneSpawned
             | Stage::SpawnFailed
+            | Stage::PreStartFailure
+            | Stage::PreStartRetriesExhausted
             // Re-entry points: a fresh dispatch starts (or is re-driven)
             // from these, so what follows is pipeline progress.
             | Stage::OrphanActiveRedispatch
@@ -1068,6 +1109,7 @@ impl Stage {
             | Stage::DispatchDecision
             | Stage::AutomationPreempted
             | Stage::CubeLeaseHeartbeat
+            | Stage::UnparkReconcile
             // Not a stage at all — the detector's own flag, folded
             // separately by every reader before terminality is asked.
             | Stage::StageStalled => false,
@@ -1841,6 +1883,8 @@ mod tests {
         assert_eq!(Stage::PaneSpawned.as_str(), "pane_spawned");
         assert_eq!(Stage::ExecutionCancelled.as_str(), "execution_cancelled");
         assert_eq!(Stage::SpawnFailed.as_str(), "spawn_failed");
+        assert_eq!(Stage::PreStartFailure.as_str(), "pre_start_failure");
+        assert_eq!(Stage::PreStartRetriesExhausted.as_str(), "pre_start_retries_exhausted");
         assert_eq!(Stage::StageStalled.as_str(), "stage_stalled");
         assert_eq!(Stage::OrphanActiveRedispatch.as_str(), "orphan_active_redispatch");
         assert_eq!(Stage::PrReviewDeadRecovery.as_str(), "pr_review_dead_recovery");
@@ -1903,6 +1947,7 @@ mod tests {
             Stage::FileIngressDiscoveryFailed.as_str(),
             "file_ingress_discovery_failed"
         );
+        assert_eq!(Stage::UnparkReconcile.as_str(), "unpark_reconcile");
         assert_eq!(Stage::ExecutionFinalized.as_str(), "execution_finalized");
     }
 
@@ -1933,6 +1978,7 @@ mod tests {
             Stage::DispatchDecision,
             Stage::AutomationPreempted,
             Stage::CubeLeaseHeartbeat,
+            Stage::UnparkReconcile,
         ] {
             assert_eq!(
                 stage.timeline_class(),

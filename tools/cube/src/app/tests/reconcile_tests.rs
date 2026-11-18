@@ -493,6 +493,8 @@ fn workspace_list_reconciler_respects_repo_filter() {
 
 #[test]
 fn workspace_lease_reconciles_expired_missing_row_before_claiming() {
+    // Provisioning reads CUBE_CONFIG_DIR, which reclamation tests temporarily replace.
+    let _env = super::support::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // A previously leased workspace's directory was wiped while the
     // lease aged out. Lease must reconcile the dangling row before
     // claiming so it doesn't hand out the stale slot.

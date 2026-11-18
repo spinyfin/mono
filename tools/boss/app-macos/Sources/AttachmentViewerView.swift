@@ -160,19 +160,32 @@ enum AttachmentImageCache {
 struct AttachmentRow: View {
     let attachment: AttachmentVM
 
+    static let thumbnailSlot: CGFloat = 48
+    /// Generous cap; normal captions wrap fully, only pathological ones
+    /// truncate (and then the full text is in the row tooltip).
+    static let captionLineLimit = 8
+
     var body: some View {
-        HStack(spacing: 8) {
-            AttachmentThumbnail(attachment: attachment)
-                .frame(width: 40, height: 40)
+        HStack(alignment: .top, spacing: 8) {
+            // The slot is a fixed-size layout box and the image is `.fit`
+            // inside it, so the thumbnail can never report a larger size
+            // than the slot and spill over the text column.
+            AttachmentThumbnail(attachment: attachment, contentMode: .fit)
+                .frame(width: Self.thumbnailSlot, height: Self.thumbnailSlot)
+                .fixedSize()
             VStack(alignment: .leading, spacing: 2) {
                 Text(attachment.displayTitle)
                     .font(.callout)
-                    .lineLimit(1)
+                    .lineLimit(Self.captionLineLimit)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(AttachmentDateFormatting.format(attachment.createdAt))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .help(attachment.displayTitle)
         .padding(.vertical, 2)
     }
 }
@@ -182,6 +195,8 @@ struct AttachmentRow: View {
 /// engine's content-addressed store — never through the loopback gallery.
 struct AttachmentThumbnail: View {
     let attachment: AttachmentVM
+    var maxPixelSize: Int = 80
+    var contentMode: ContentMode = .fill
 
     var body: some View {
         Group {
@@ -189,9 +204,15 @@ struct AttachmentThumbnail: View {
                 Image(systemName: "trash")
                     .foregroundStyle(.secondary)
             } else if let image = loadedImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
+                // Overlay on a clear box: a `.fill` image's own layout size
+                // exceeds the proposal, which would otherwise inflate the
+                // thumbnail past its slot.
+                Color.clear.overlay(
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: contentMode)
+                )
+                .clipped()
             } else {
                 Image(systemName: "photo.badge.exclamationmark")
                     .foregroundStyle(.secondary)
@@ -203,7 +224,7 @@ struct AttachmentThumbnail: View {
     }
 
     private var loadedImage: NSImage? {
-        AttachmentImageCache.thumbnail(for: attachment)
+        AttachmentImageCache.thumbnail(for: attachment, maxPixelSize: maxPixelSize)
     }
 }
 
@@ -213,16 +234,20 @@ struct AttachmentThumbnail: View {
 enum AttachmentDateFormatting {
     static func format(_ epochSecondsString: String, style: DateFormatter.Style = .short) -> String {
         guard let epoch = TimeInterval(epochSecondsString) else { return epochSecondsString }
+        return format(Date(timeIntervalSince1970: epoch), style: style)
+    }
+
+    static func format(_ date: Date, style: DateFormatter.Style = .short) -> String {
         let display = DateFormatter()
         display.dateStyle = style
         display.timeStyle = style
-        return display.string(from: Date(timeIntervalSince1970: epoch))
+        return display.string(from: date)
     }
 }
 
 // MARK: - AttachmentDetailView
 
-/// Right-pane detail: the full-size image (or an explanatory placeholder
+/// Right-pane detail: the fitted image (or an explanatory placeholder
 /// when the bytes are gone) plus caption and metadata.
 struct AttachmentDetailView: View {
     let attachment: AttachmentVM
@@ -232,18 +257,22 @@ struct AttachmentDetailView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                imageArea
-                if !attachment.caption.isEmpty {
+        VStack(alignment: .leading, spacing: 12) {
+            imageArea
+            if !attachment.caption.isEmpty {
+                ScrollView {
                     Text(attachment.caption)
                         .font(.body)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                metadataRow
+                .frame(maxHeight: 96)
+                .fixedSize(horizontal: false, vertical: true)
             }
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .leading)
+            metadataRow
         }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .navigationTitle(attachment.displayTitle)
     }
 
@@ -255,12 +284,11 @@ struct AttachmentDetailView: View {
             } description: {
                 Text(reclaimedDescription)
             }
-            .frame(maxWidth: .infinity, minHeight: 240)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let image = loadedImage {
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: .infinity)
+            AttachmentZoomView(image: image)
+                .id(attachment.id)
+                .frame(minHeight: 120)
                 .background(Color.black.opacity(0.05))
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
@@ -269,7 +297,7 @@ struct AttachmentDetailView: View {
             } description: {
                 Text("The image bytes could not be found on disk.")
             }
-            .frame(maxWidth: .infinity, minHeight: 240)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -301,7 +329,12 @@ struct AttachmentViewerView: View {
     let ref: AttachmentViewerRef
 
     @EnvironmentObject private var chatModel: ChatViewModel
-    @State private var selectedAttachmentId: String?
+    private var selectedAttachmentId: Binding<String?> {
+        Binding(
+            get: { chatModel.selectedAttachmentIDByTaskID[ref.taskId] },
+            set: { chatModel.selectedAttachmentIDByTaskID[ref.taskId] = $0 }
+        )
+    }
 
     private var attachments: [AttachmentVM] {
         chatModel.attachmentsByTaskID[ref.taskId] ?? []
@@ -368,7 +401,7 @@ struct AttachmentViewerView: View {
                     description: Text("No evidence has been attached to this task yet.")
                 )
             } else {
-                List(selection: $selectedAttachmentId) {
+                List(selection: selectedAttachmentId) {
                     ForEach(attachmentGroups) { group in
                         if group.label.isEmpty {
                             ForEach(group.items) { attachment in
@@ -392,7 +425,7 @@ struct AttachmentViewerView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if let id = selectedAttachmentId, let attachment = attachments.first(where: { $0.id == id }) {
+        if let id = selectedAttachmentId.wrappedValue, let attachment = attachments.first(where: { $0.id == id }) {
             AttachmentDetailView(attachment: attachment)
         } else {
             ContentUnavailableView(

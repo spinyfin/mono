@@ -1,0 +1,163 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Isolated mTLS hub used by daemon session tests and by the packaged-daemon
+# upgrade suite, which must exercise a real management handshake.
+rust_library(
+    name = "test_hub",
+    testonly = True,
+    srcs = ["tests/hub.rs"],
+    crate_name = "boss_spoke_test_hub",
+    crate_root = "tests/hub.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    visibility = ["//tools/boss/spoke-package:__pkg__"],
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_binary(
+    name = "boss-spoke",
+    srcs = ["src/main.rs"],
+    crate_name = "boss_spoke",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    # The package builder bundles this binary and the packaging test installs it.
+    visibility = ["//tools/boss/spoke-package:__pkg__"],
+    deps = [
+        ":ingress",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/engine/spoke-preflight",
+        "//tools/boss/engine/spoke-worker-api",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "spoke_test",
+    size = "medium",
+    srcs = glob(
+        ["tests/**/*.rs"],
+        exclude = [
+            "tests/supervisor.rs",
+        ],
+    ),
+    crate_root = "tests/session.rs",
+    data = [":boss-spoke"],
+    edition = "2024",
+    env = {"SPOKE_BIN": "$(rootpath :boss-spoke)"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "spoke_supervisor_tmux_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = [
+        "tests/hub.rs",
+        "tests/supervisor.rs",
+    ],
+    crate_root = "tests/supervisor.rs",
+    data = [
+        ":boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "HOME": "/tmp",
+        "SPOKE_BIN": "$(rootpath :boss-spoke)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    tags = ["manual"],
+    deps = [
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/protocol-spoke",
+        "//tools/boss/tmux",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_library(
+    name = "ingress",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "boss_spoke_ingress",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/engine/spoke-worker-api",
+        "//tools/boss/engine/stdout-progress",
+        "//tools/boss/engine/transcript-tail",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "ingestion_test",
+    size = "small",
+    crate = ":ingress",
+    data = ["//tools/boss/event-shim:boss-event"],
+    edition = "2024",
+    env = {"SHIM_BIN": "$(rootpath //tools/boss/event-shim:boss-event)"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":ingress",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/spoke-journal",
+        "//tools/boss/engine/spoke-outbound",
+        "//tools/boss/engine/spoke-worker-api",
+        "//tools/boss/engine/stdout-progress",
+        "//tools/boss/engine/transcript-tail",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

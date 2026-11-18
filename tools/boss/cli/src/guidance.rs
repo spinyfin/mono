@@ -8,7 +8,7 @@
 //! sha the rules in context came from. Coordinator-only. Design:
 //! `tools/boss/docs/coordinator-product-guidance.md`.
 
-use boss_protocol::{CoordinatorGuidanceState, CoordinatorGuidanceView, FrontendEvent, FrontendRequest};
+use boss_protocol::{CoordinatorGuidanceView, FrontendEvent, FrontendRequest};
 use clap::{Args, Subcommand};
 
 use crate::data::resolve_product;
@@ -20,7 +20,9 @@ pub(crate) enum GuidanceCommand {
     /// default branch's current HEAD and print it with the commit sha it
     /// was read at. Every product gets one entry whatever happened: loaded,
     /// missing (repo reachable, no file), over the engine's size cap (text
-    /// withheld), fetch failed (nothing known — not "no guidance"), no
+    /// withheld), cached (GitHub unreachable, so the last successful read is
+    /// shown, labelled with its sha, read time and the fetch error), fetch
+    /// failed with nothing cached (nothing known — not "no guidance"), no
     /// repo, or a non-GitHub remote.
     Show(GuidanceShowArgs),
 }
@@ -66,12 +68,13 @@ async fn run_show(ctx: &RunContext, args: GuidanceShowArgs) -> Result<(), CliErr
 
 /// Human rendering: a header per product, the one-line state (shared with
 /// the session-start brief via `CoordinatorGuidanceView::describe_state`),
-/// and the full text when there is one.
+/// and the full text when there is one — loaded, or the cached last-known-good
+/// copy the state line labels as such.
 fn print_view_human(view: &CoordinatorGuidanceView) {
     println!("== {} ({}) ==", view.product_name, view.product_id);
     println!("{}", view.describe_state());
     println!("read at: {}", view.fetched_at);
-    if let CoordinatorGuidanceState::Loaded { markdown, .. } = &view.state {
+    if let Some(markdown) = view.body() {
         println!("--- {} begins ---", view.path);
         println!("{}", markdown.trim_end());
         println!("--- {} ends ---", view.path);

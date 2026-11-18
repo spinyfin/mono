@@ -39,13 +39,6 @@ use tokio::io::AsyncRead;
 
 use crate::events_socket::IncomingHookEvent;
 
-impl crate::driver::ProgressIdentityStore for crate::work::WorkDb {
-    fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String> {
-        self.claim_run_progress_session_identity(run_id, session_id)
-            .map_err(|err| format!("{err:#}"))
-    }
-}
-
 /// Where decoded progress events go.
 ///
 /// A seam rather than a direct `ServerState` call so the ingress loop below
@@ -679,6 +672,7 @@ mod tests {
                     agent_rules_filename: "AGENTS.md",
                     initial_prompt_filename: "initial-prompt.txt",
                     model_menu: crate::driver::ModelMenu {
+                        resolve_model_effort: None,
                         engine_default: "stub-model",
                         effort_value_for_level: no_effort_value,
                         default_model_for_level: only_model,

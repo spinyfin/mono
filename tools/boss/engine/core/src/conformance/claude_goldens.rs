@@ -31,6 +31,8 @@ fn golden_input() -> WorkerSetupInput {
         task_kind: Some("chore".into()),
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
+        run_done_proposals_seam_enabled: false,
+        worker_signal_proposals_seam_enabled: false,
         is_review_supervisor: false,
         is_post_merge_reviewer: false,
         checkout_positioned_on_pr_head: false,
@@ -72,7 +74,10 @@ fn normalize_host_paths(rendered: &str) -> String {
 /// content-addressed guard path compares equal across builds while still
 /// asserting that the hashed directory component is present.
 fn replace_content_addressed_guard_dirs(s: &str) -> String {
-    replace_kind_hash_dir(&replace_kind_hash_dir(s, "path-guard-"), "checkleft-push-guard-")
+    replace_kind_hash_dir(
+        &replace_kind_hash_dir(&replace_kind_hash_dir(s, "path-guard-"), "checkleft-push-guard-"),
+        "git-store-guard-",
+    )
 }
 
 fn replace_kind_hash_dir(s: &str, prefix: &str) -> String {
@@ -116,7 +121,7 @@ fn golden_spawn_line_opus_with_settings() {
     );
     assert_eq!(
         plan.command,
-        "claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json' \"$(cat .claude/initial-prompt.txt)\"\n",
+        "python3 -I .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json'\n",
         "Opus + settings spawn line must match the pre-refactor contract byte-for-byte",
     );
 }
@@ -133,7 +138,7 @@ fn golden_spawn_line_sonnet_skip_permissions() {
     });
     assert_eq!(
         plan.command,
-        "claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+        "python3 -I .claude/initial-prompt.py claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions\n",
     );
 }
 
@@ -149,7 +154,7 @@ fn golden_spawn_line_sonnet_corp_auto_mode() {
     });
     assert_eq!(
         plan.command,
-        "claude --model sonnet --effort high --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+        "python3 -I .claude/initial-prompt.py claude --model sonnet --effort high --disallowedTools=AskUserQuestion --permission-mode auto\n",
     );
 }
 
@@ -165,7 +170,7 @@ fn golden_spawn_line_dont_ask_override() {
     });
     assert_eq!(
         plan.command,
-        "claude --model sonnet --disallowedTools=AskUserQuestion --permission-mode dontAsk \"$(cat .claude/initial-prompt.txt)\"\n",
+        "python3 -I .claude/initial-prompt.py claude --model sonnet --disallowedTools=AskUserQuestion --permission-mode dontAsk\n",
     );
 }
 
@@ -195,6 +200,7 @@ fn golden_deny_rules_standard_worker() {
         format!("Edit({boss_dir}/**)"),
         "Bash(bossctl)".to_owned(),
         "Bash(bossctl:*)".to_owned(),
+        "Bash(boss handoff:*)".to_owned(),
         "Bash(boss engine start)".to_owned(),
         "Bash(boss engine start:*)".to_owned(),
         "Bash(boss engine stop)".to_owned(),

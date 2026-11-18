@@ -17,31 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::transcript_tail::TranscriptTail;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
-pub(crate) struct RunCostSnapshot {
-    /// Assign every persisted cost field verbatim, including NULL. Set when a
-    /// transcript generation is replaced so values absent from the replay do
-    /// not survive from the obsolete generation.
-    #[builder(default)]
-    pub full_replacement: bool,
-    pub model: Option<String>,
-    pub output_tokens: Option<i64>,
-    pub input_tokens: Option<i64>,
-    pub cache_creation_tokens: Option<i64>,
-    pub cache_read_tokens: Option<i64>,
-    pub cache_creation_5m_tokens: Option<i64>,
-    pub cache_creation_1h_tokens: Option<i64>,
-    /// `None`: no usage observation in this snapshot. `Some(false)`: usage
-    /// was observed but at least one non-zero cache write lacked a TTL split,
-    /// so persisted split columns must be explicitly cleared to NULL.
-    pub cache_creation_ttl_split_known: Option<bool>,
-    pub rounds: Option<i64>,
-    pub agent_active_ms: Option<i64>,
-    /// Provider usage objects, keyed by provider and transcript/message identity.
-    /// Preserve missing fields and provider-specific categories verbatim.
-    pub provider_usage_json: Option<String>,
-}
+pub(crate) use boss_engine_storage_values::RunCostSnapshot;
 
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[builder(on(String, into))]
@@ -334,6 +310,7 @@ impl RunCostTail {
         transcript_path: &Path,
         containment_root: Option<&Path>,
         capture_provider_usage: bool,
+        limit: u64,
     ) -> Result<bool, String> {
         let replace = match self.tails.get(transcript_path) {
             Some(state)
@@ -355,7 +332,11 @@ impl RunCostTail {
             .tails
             .get_mut(transcript_path)
             .expect("transcript cost tail was just inserted");
-        let values = state.tail.poll().await.map_err(|error| error.to_string())?;
+        let values = state
+            .tail
+            .poll_through(limit)
+            .await
+            .map_err(|error| error.to_string())?;
         let mut full_replacement = replace;
         if state.tail.generation() != state.accumulator_generation {
             state.accumulator = CostAccumulator::default();
@@ -381,22 +362,32 @@ impl RunCostTail {
 
 /// Process-lifetime incremental tails keyed by execution id.
 #[derive(Default)]
-pub(crate) struct RunCostCapture {
+pub struct RunCostCapture {
     inner: StdMutex<HashMap<String, Arc<Mutex<RunCostTail>>>>,
 }
 
+/// Check a hub transcript against custody before opening it. Local paths have
+/// no custody row and retain their ordinary filesystem semantics.
+pub fn transcript_read_limit(db: &crate::work::WorkDb, path: &Path) -> Result<Option<u64>, String> {
+    let root = boss_engine_driver::transcript_store::transcript_store_root().map_err(|e| e.to_string())?;
+    crate::hub::projection::Custody::new(db.clone(), root)
+        .read_limit_at(path)
+        .map_err(|e| e.to_string())
+}
+
 impl RunCostCapture {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) async fn capture_and_persist(
+    pub async fn capture_and_persist(
         &self,
         work_db: &crate::work::WorkDb,
         execution_id: &str,
         transcript_path: &Path,
         containment_root: Option<&Path>,
     ) -> Result<bool, String> {
+        let limit = transcript_read_limit(work_db, transcript_path)?.unwrap_or(u64::MAX);
         let state = {
             let mut guard = self.inner.lock().expect("run cost capture mutex poisoned");
             guard
@@ -412,7 +403,7 @@ impl RunCostCapture {
                 .is_some_and(|execution| execution.kind == boss_protocol::ExecutionKind::PrReviewGuide)
         });
         let full_replacement = state
-            .poll(transcript_path, containment_root, capture_provider_usage)
+            .poll(transcript_path, containment_root, capture_provider_usage, limit)
             .await?;
         let mut snapshot = match state.snapshot() {
             Some(snapshot) => snapshot,
@@ -427,7 +418,7 @@ impl RunCostCapture {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn forget(&self, execution_id: &str) {
+    pub fn forget(&self, execution_id: &str) {
         self.inner
             .lock()
             .expect("run cost capture mutex poisoned")
@@ -572,7 +563,7 @@ mod tests {
         )
         .unwrap();
         let mut tail = RunCostTail::default();
-        assert!(!tail.poll(&path, None, false).await.unwrap());
+        assert!(!tail.poll(&path, None, false, u64::MAX).await.unwrap());
         let before = tail.snapshot().unwrap();
         assert_eq!(before.input_tokens, Some(150));
         assert_eq!(before.rounds, Some(2));
@@ -588,7 +579,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(tail.poll(&path, None, false).await.unwrap());
+        assert!(tail.poll(&path, None, false, u64::MAX).await.unwrap());
         let after = tail.snapshot().unwrap();
         assert_eq!(after.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(after.input_tokens, Some(7));
@@ -625,8 +616,8 @@ mod tests {
         .unwrap();
 
         let mut tail = RunCostTail::default();
-        tail.poll(&path, Some(&root), false).await.unwrap();
-        let downgrade_error = tail.poll(&path, None, false).await.unwrap_err();
+        tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap();
+        let downgrade_error = tail.poll(&path, None, false, u64::MAX).await.unwrap_err();
         assert!(
             downgrade_error.contains("containment downgrade"),
             "a contained cost tail must never become unrestricted: {downgrade_error}",
@@ -634,7 +625,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         symlink(&outside, &path).unwrap();
 
-        let error = tail.poll(&path, Some(&root), false).await.unwrap_err();
+        let error = tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap_err();
         assert!(
             error.contains("transcript"),
             "contained run-cost tail must reject path replacement: {error}",

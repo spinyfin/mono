@@ -905,7 +905,13 @@ fn a_surplus_the_last_trim_could_not_act_on_does_not_pin_the_gc_at_five_minutes(
         "the surplus is still there — it is just not actionable",
     );
 
-    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("throttle");
+    maybe_trigger_pool_gc(
+        &FakeRunner::failing_every_command(),
+        &mut store,
+        Some(&database_path),
+        now,
+    )
+    .expect("throttle");
 
     assert!(
         store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY).unwrap().is_none(),

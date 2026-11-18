@@ -2,34 +2,28 @@
 //! working-tree dirty flag, and build wall-clock time, stamped at Bazel
 //! build time.
 //!
-//! Kept as its own crate — rather than a module inside `engine/core`,
-//! where `boss_engine::build_info` lives — for a normal crate-boundary
-//! reason: it isolates the per-commit/per-build stamped values (and the
-//! `include!(env!(...))` machinery that reads them) from `engine/core`'s
-//! own source, so a rebuild of this crate never touches `engine/core`'s
-//! compilation unit directly. `build_info_rs`'s own doc comment
-//! (`tools/boss/installer/pkg.bzl`) explains why `BOSS_GIT_SHA` /
-//! `BOSS_BUILD_TIME` are deliberately left as the literal `"unknown"`
-//! in that shared, `include!`d-into-every-binary stamp.
+//! **This crate is a leaf, and must stay one.** Its generated source
+//! (`//tools/boss/installer:build_provenance_rs`, read from Bazel's
+//! stable-status.txt) embeds the full commit sha, so the crate's source —
+//! and therefore its compiled `.rlib` — changes on every commit. Anything
+//! that links it recompiles on every commit too, and any test binary that
+//! links it re-executes on every commit (the binary's digest, an input of
+//! the test action, changes). That is why only the `engine` rust_binary
+//! targets in `//tools/boss/engine/core` depend on it: they hand the four
+//! values to `boss_engine::build_info::install_provenance` at startup, and
+//! `engine_lib` (which `boss`, `bossctl` and every
+//! `rust_test(crate = ":engine_lib")` share) never sees this crate.
+//! `//tools/boss/engine/core:stamped_provenance_isolation_test` guards
+//! that edge; the history is in
+//! `tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md`.
 //!
-//! **This crate boundary does NOT protect `engine_lib`'s Bazel action
-//! cache.** The functions below are trivial getters over `&'static str`
-//! / `bool` constants, so rustc's `.rmeta` for this crate embeds those
-//! constant values (they're cross-crate inlining candidates) — with
-//! `pipelined_compilation` on or off, a changed `GIT_SHA` changes this
-//! crate's `.rmeta`, and `engine_lib` (which depends on that `.rmeta`/
-//! `.rlib`) still recompiles on every commit — verified empirically by
-//! building twice with only the commit sha changed and observing
-//! `engine_lib` recompile both times, with `pipelined_compilation`
-//! enabled. The crate split buys logical separation and a much smaller,
-//! near-instant *compile* of the changed value, but not cache isolation
-//! for `engine_lib` itself — that would require reading these values
-//! from a runtime resource instead of a compiled-in Rust constant —
-//! not done here.
+//! `build_info_rs`'s own doc comment (`tools/boss/installer/pkg.bzl`)
+//! explains why `BOSS_GIT_SHA` / `BOSS_BUILD_TIME` are deliberately left as
+//! the literal `"unknown"` in the shared, `include!`d-into-every-binary
+//! stamp that `engine_lib` does compile in.
 //!
 //! Exposed as plain functions (not `pub const`s) as a style preference
-//! matching the rest of this crate's API — it does not change the cache
-//! behavior described above.
+//! matching the rest of the Boss crates' API.
 
 mod stamp {
     include!(env!("BOSS_BUILD_PROVENANCE_RS"));

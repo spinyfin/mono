@@ -6,6 +6,11 @@ import Foundation
 /// itself; the visible tmux client is only a viewer and cannot be its
 /// trust root.
 extension ChatViewModel {
+    func logCoordinatorReset(_ stage: String, source: String) {
+        IpcLog.shared.log(requestId: attachedCoordinatorSpawnToken ?? "unattached",
+                          direction: "app", kind: "coordinator_reset_\(stage)",
+                          body: ["source": source])
+    }
     func coordinatorModelConfigured(_ model: String) {
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else { return }
@@ -14,6 +19,9 @@ extension ChatViewModel {
     }
 
     func coordinatorPaneAttached(_ request: EngineCoordinatorAttachRequest) {
+        if request.spawnToken != pendingCoordinatorReset?.token {
+            clearCoordinatorReset()
+        }
         attachedCoordinatorModel = request.model
         attachedCoordinatorSpawnToken = request.spawnToken
         coordinatorUpdateAvailable = request.newerInstalledClaudeVersion
@@ -22,8 +30,9 @@ extension ChatViewModel {
 
     func confirmCoordinatorModelRecreate() {
         guard let confirmation = coordinatorModelRecreateConfirmation else { return }
+        logCoordinatorReset("confirmed", source: "model_change")
         coordinatorModelRecreateConfirmation = nil
-        engine.sendRecreateCoordinator(expectedSpawnToken: confirmation.expectedSpawnToken, reason: .modelMismatch)
+        beginCoordinatorReset(token: confirmation.expectedSpawnToken, reason: .modelMismatch)
     }
 
     func cancelCoordinatorModelRecreate() {
@@ -33,14 +42,81 @@ extension ChatViewModel {
 
     /// Perform an operator-confirmed coordinator reset: destroys the current
     /// tmux session and starts a fresh one through the normal creation path
-    /// (current binary, current instructions, no carried-over context). The
+    /// (current binary, current instructions, freshly requested handoff). The
     /// UI-side confirmation dialog (Settings ▸ Workers, or the update-available
     /// banner) must call this only after the operator has explicitly confirmed
     /// — this method itself does not prompt. A no-op when no coordinator is
     /// currently attached (nothing to reset).
     func resetCoordinator() {
         guard let token = attachedCoordinatorSpawnToken else { return }
-        engine.sendRecreateCoordinator(expectedSpawnToken: token, reason: .operatorReset)
+        logCoordinatorReset("confirmed", source: "operator_reset")
+        beginCoordinatorReset(token: token, reason: .operatorReset)
+    }
+
+    private func beginCoordinatorReset(token: String, reason: CoordinatorRecreateReason) {
+        guard !coordinatorResetWaiting else { return }
+        guard !engine.hasUnsentAction(kind: "recreate_coordinator"), canSubmitUserActions() else { return }
+        pendingCoordinatorReset = (token, reason)
+        coordinatorResetForced = false
+        coordinatorResetDeliveryFailed = false
+        coordinatorResetDeliveryFailureReason = nil
+        coordinatorResetWaiting = true
+        engine.sendRecreateCoordinator(expectedSpawnToken: token, reason: reason)
+    }
+
+    func forceCoordinatorReset() {
+        guard coordinatorResetDeliveryFailed, let pending = pendingCoordinatorReset else { return }
+        guard canSubmitUserActions() else { return }
+        coordinatorResetForced = true
+        coordinatorResetDeliveryFailed = false
+        coordinatorResetDeliveryFailureReason = nil
+        coordinatorResetWaiting = true
+        engine.sendRecreateCoordinator(
+            expectedSpawnToken: pending.token, reason: pending.reason, forceWithoutHandoff: true
+        )
+    }
+
+    func clearCoordinatorReset() {
+        coordinatorResetForced = false
+        coordinatorResetWaiting = false
+        coordinatorResetDeliveryFailed = false
+        coordinatorResetDeliveryFailureReason = nil
+        pendingCoordinatorReset = nil
+    }
+
+    /// Leads the engine's delivery-failure error; what follows it names the
+    /// failing step and its reason (see `DELIVERY_FAILED_PREFIX` in the
+    /// engine's `reset_handoff.rs`).
+    static let coordinatorHandoffDeliveryFailedPrefix = "coordinator did not receive the handoff request"
+
+    /// Returns true only when the reset UI owns the delivery failure.
+    func handleCoordinatorResetError(_ message: String) -> Bool {
+        guard message.hasPrefix("recreate_coordinator:"), pendingCoordinatorReset != nil else { return false }
+        coordinatorResetWaiting = false
+        if message.contains(Self.coordinatorHandoffDeliveryFailedPrefix) {
+            coordinatorResetDeliveryFailed = true
+            coordinatorResetDeliveryFailureReason = Self.coordinatorHandoffDeliveryFailureReason(from: message)
+            return true
+        }
+        clearCoordinatorReset()
+        return false
+    }
+
+    /// The engine's reason for a delivery failure, stripped of the RPC label,
+    /// the shared prefix and the trailing "session is still running" note the
+    /// banner already states. `nil` when the message carries no reason.
+    static func coordinatorHandoffDeliveryFailureReason(from message: String) -> String? {
+        guard let range = message.range(of: coordinatorHandoffDeliveryFailedPrefix) else { return nil }
+        var reason = String(message[range.upperBound...])
+        if reason.hasPrefix(":") { reason.removeFirst() }
+        let trailer = "The coordinator session is still running."
+        if let trailerRange = reason.range(of: trailer, options: .backwards) {
+            reason = String(reason[..<trailerRange.lowerBound])
+        }
+        reason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        while reason.hasSuffix(".") { reason.removeLast() }
+        reason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty ? nil : reason
     }
 
     private func refreshCoordinatorModelRecreateConfirmation() {
@@ -68,5 +144,23 @@ extension ChatViewModel {
     func spawnCapabilityRestored() {
         guard isAppSessionRegistered else { return }
         engine.sendSpawnCapabilityRestored()
+    }
+
+    /// Called by the Agents view for runs the engine has released: asks the
+    /// engine for each run's work-item label (title, PR, purpose). The run id
+    /// is the execution id. Queued while disconnected, answered by
+    /// `executionLabelsHandler`.
+    func requestExecutionLabels(runIds: [String]) {
+        guard !runIds.isEmpty else { return }
+        engine.sendResolveExecutionLabels(executionIds: runIds)
+    }
+
+    /// Called by the Agents view when a live local worker on a visible
+    /// page has no viewer. Asks the engine to send `AttachWorkerPane` for
+    /// that run again. Dropped while no app session is registered: the
+    /// engine re-attaches every live worker as part of registration.
+    func requestWorkerPaneAttach(runId: String) {
+        guard isAppSessionRegistered else { return }
+        engine.sendRequestWorkerPaneAttach(runId: runId)
     }
 }

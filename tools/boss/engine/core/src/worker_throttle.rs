@@ -4,7 +4,7 @@
 use crate::work::WorkDb;
 use anyhow::Result;
 
-pub(crate) const SETTING_KEY: &str = "workers.background_throttle";
+pub const SETTING_KEY: &str = "workers.background_throttle";
 
 pub(crate) fn enabled(db: &WorkDb) -> Result<bool> {
     match db.get_metadata(SETTING_KEY)?.as_deref() {
@@ -17,11 +17,11 @@ pub(crate) fn enabled(db: &WorkDb) -> Result<bool> {
     }
 }
 
-pub(crate) fn set(db: &WorkDb, enabled: bool) -> Result<()> {
+pub fn set(db: &WorkDb, enabled: bool) -> Result<()> {
     db.set_metadata(SETTING_KEY, if enabled { "background" } else { "off" })
 }
 
-pub(crate) fn snapshot(db: &WorkDb) -> Result<boss_protocol::SettingSnapshot> {
+pub fn snapshot(db: &WorkDb) -> Result<boss_protocol::SettingSnapshot> {
     Ok(boss_protocol::SettingSnapshot {
         key: SETTING_KEY.into(),
         description: "Background lowers CPU and I/O priority for all local macOS worker pools, including reviews and automation. Builds may run much slower.".into(),
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn unknown_stored_level_defaults_off() {
-        let db = WorkDb::open_in_memory().unwrap();
+        let db = WorkDb::open(":memory:".into()).unwrap();
         db.set_metadata(SETTING_KEY, "unknown").unwrap();
         assert!(!enabled(&db).unwrap());
         assert!(!snapshot(&db).unwrap().enabled);

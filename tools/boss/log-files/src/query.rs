@@ -29,7 +29,7 @@ pub struct LogFilter {
     /// Raw case-sensitive substring match against the whole line.
     pub grep: Option<String>,
     /// Match the top-level JSON `target` field exactly, or as a module
-    /// prefix (`boss_engine::app` matches `boss_engine::app::server`).
+    /// prefix (`boss_engine_app::app` matches `boss_engine_app::app::server`).
     pub target: Option<String>,
     /// Match the top-level JSON `level` field case-insensitively
     /// (`info` matches `INFO`).

@@ -19,6 +19,9 @@ struct BossCaptureArgs: Equatable, Sendable {
     var captureTo: String?
     /// Delay before capture, in seconds.
     var captureAfter: TimeInterval
+    /// Markdown file for `--capture-reveal-state=revision-brief`. Quiet
+    /// capture reads this path instead of compiling a sample into the app.
+    var captureBriefMarkdown: String?
 
     static let defaultCaptureAfter: TimeInterval = 0.6
 
@@ -27,6 +30,7 @@ struct BossCaptureArgs: Equatable, Sendable {
     static func parse(_ arguments: [String]) -> BossCaptureArgs {
         var captureTo: String?
         var captureAfter = defaultCaptureAfter
+        var captureBriefMarkdown: String?
         var i = 1 // skip argv[0]
         while i < arguments.count {
             let arg = arguments[i]
@@ -54,9 +58,23 @@ struct BossCaptureArgs: Equatable, Sendable {
                 i += 1
                 continue
             }
+            if arg == "--capture-brief-markdown", i + 1 < arguments.count {
+                captureBriefMarkdown = arguments[i + 1]
+                i += 2
+                continue
+            }
+            if arg.hasPrefix("--capture-brief-markdown=") {
+                captureBriefMarkdown = String(arg.dropFirst("--capture-brief-markdown=".count))
+                i += 1
+                continue
+            }
             i += 1
         }
-        return BossCaptureArgs(captureTo: captureTo, captureAfter: captureAfter)
+        return BossCaptureArgs(
+            captureTo: captureTo,
+            captureAfter: captureAfter,
+            captureBriefMarkdown: captureBriefMarkdown
+        )
     }
 
     var isCaptureMode: Bool { captureTo != nil }
@@ -98,6 +116,24 @@ enum BossWindowCapture {
         }
     }
 
+    /// With `--capture-dump-scroll`, print every NSScrollView's visible rect
+    /// and document size before the grab so a capture can be compared
+    /// numerically, not just by eye.
+    @MainActor
+    static func dumpScrollOffsets(in view: NSView?, label: String) {
+        guard CommandLine.arguments.contains("--capture-dump-scroll"), let view else { return }
+        func walk(_ view: NSView) {
+            if let scroll = view as? NSScrollView {
+                let r = scroll.documentVisibleRect
+                let d = scroll.documentView?.frame.size ?? .zero
+                print("\(label) scrollview visible=\(Int(r.origin.x)),\(Int(r.origin.y)) size=\(Int(r.width))x\(Int(r.height)) doc=\(Int(d.width))x\(Int(d.height))")
+            }
+            for sub in view.subviews { walk(sub) }
+        }
+        walk(view)
+        fflush(stdout)
+    }
+
     /// Capture the primary window's chrome + content to `path` as PNG.
     ///
     /// The window need not be ordered front or key — measured: a never-ordered
@@ -127,6 +163,7 @@ enum BossWindowCapture {
             throw CaptureError.noFrameView
         }
         frameView.layoutSubtreeIfNeeded()
+        dumpScrollOffsets(in: frameView, label: "capture")
         let bounds = frameView.bounds
         guard bounds.width > 1, bounds.height > 1 else {
             throw CaptureError.emptyBounds

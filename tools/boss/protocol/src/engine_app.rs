@@ -25,8 +25,14 @@ pub struct EnvVar {
 /// driver crate (not currently carried on any engine↔app wire message).
 ///
 /// All marker lists are OR-semantics: any hit means the condition is true.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[builder(on(String, into))]
 pub struct PaneMonitorSpec {
+    /// Question or option text identifying a blocking dialog. Input transports
+    /// also require the active dialog's choice rows and cancellation footer.
+    #[serde(default)]
+    #[builder(default)]
+    pub blocking_dialog_markers: Vec<String>,
     /// Substrings whose presence means "the agent is running in this pane".
     pub agent_markers: Vec<String>,
     /// Substrings meaning "a turn is in flight" (Claude: `"esc to interrupt"`).
@@ -47,8 +53,9 @@ pub struct PaneMonitorSpec {
 /// The engine is the source of truth for which slot a worker lands
 /// in: it picks the slot via [`crate::WorkerPool::claim_worker`] and
 /// passes the result here as `slot_id`. The app's job is to honor
-/// that slot — no fallback / re-allocation. If the slot is already
-/// occupied (engine and app disagree), the app returns
+/// that slot on first attach — no fallback / re-allocation. Reattaching
+/// the same run preserves its existing surface and original slot metadata
+/// and returns success. If the slot is occupied by a different run, the app returns
 /// [`EngineToAppError::SlotBusy`] rather than silently picking a
 /// different slot, which would re-introduce the dual-allocator bug
 /// the engine-owns-slots refactor exists to fix.
@@ -107,6 +114,8 @@ pub struct AttachCoordinatorPaneResult {}
 /// worker. This must not signal or otherwise stop the tmux session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DetachWorkerPaneInput {
+    /// Viewer identity. Slot metadata must never select the target.
+    pub run_id: String,
     pub slot_id: u8,
 }
 
@@ -151,6 +160,8 @@ pub struct ListHostedPanesResult {
 /// window-server stack. Used by `bossctl agents focus`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FocusWorkerPaneInput {
+    /// Viewer identity. Slot metadata must never select the target.
+    pub run_id: String,
     pub slot_id: u8,
 }
 
@@ -254,9 +265,9 @@ pub enum EngineToAppError {
     /// the engine claim path, not this RPC.
     #[error("no free worker slot (legacy app signal; engine-side claim already enforces concurrency)")]
     NoAvailableSlot,
-    /// `DetachWorkerPane` / `FocusWorkerPane` referred to a slot the
-    /// app does not recognise — already released, never allocated, or
-    /// stale after an app restart.
+    /// `DetachWorkerPane` / `FocusWorkerPane` referred to a run whose viewer
+    /// is absent — already released, never attached, or stale after restart.
+    /// The variant retains its wire name; slot metadata is not a lookup key.
     #[error("unknown worker slot")]
     UnknownSlot,
     /// Engine↔app **slot occupancy desync** — not capacity exhaustion.
@@ -398,7 +409,15 @@ mod tests {
             task_title: Some("attach panes".into()),
         });
         let attach_json = serde_json::to_string(&attach).unwrap();
-        assert!(attach_json.contains("attach_worker_pane"));
+        // Exact wire fields: layout page/cell coordinates are app-local.
+        assert_eq!(
+            serde_json::to_value(&attach).unwrap(),
+            serde_json::json!({
+                "kind": "attach_worker_pane", "run_id": "run-tmux", "slot_id": 3,
+                "session_name": "boss-3-run-tmux", "tmux_socket_path": "/state/boss/tmux.sock",
+                "summary": "implementing attach mode", "task_title": "attach panes"
+            })
+        );
         assert_eq!(
             serde_json::from_str::<EngineToAppRequest>(&attach_json).unwrap(),
             attach
@@ -481,11 +500,25 @@ mod tests {
 
     #[test]
     fn focus_request_round_trips() {
-        let original = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 4 });
+        let original = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput {
+            run_id: "run-focus".into(),
+            slot_id: 4,
+        });
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("focus_worker_pane"));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn viewer_actions_require_run_identity_without_slot_only_fallback() {
+        for kind in ["detach_worker_pane", "focus_worker_pane"] {
+            let legacy = serde_json::json!({"kind": kind, "slot_id": 4});
+            assert!(serde_json::from_value::<EngineToAppRequest>(legacy).is_err());
+            let wire = serde_json::json!({"kind": kind, "run_id": "old-run", "slot_id": 4});
+            let parsed: EngineToAppRequest = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+        }
     }
 
     #[test]

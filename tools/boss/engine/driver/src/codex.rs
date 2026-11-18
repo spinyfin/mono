@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 
 mod decision;
 mod guard_chain;
-mod guard_python;
+use crate::guard_python;
+
 pub mod guard_trace;
 mod pane_monitor;
 mod progress;
@@ -47,17 +48,17 @@ use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trac
 pub(crate) use review_guide_guard::codex_review_guide_guard_script;
 #[cfg(test)]
 pub(crate) use review_guide_guard::with_review_guide_command as codex_review_guide_guard_script_for_test;
-use reviewer_publish_guard::codex_reviewer_publish_guard_script;
-use tool_surface_guard::codex_tool_surface_guard_script;
+pub(crate) use reviewer_publish_guard::codex_reviewer_publish_guard_script;
+pub(crate) use tool_surface_guard::codex_tool_surface_guard_script;
 
 use crate::transcript_store::{
-    durable_sessions_dir, provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir,
+    durable_sessions_dir, durable_transcript_containment_root, provision_durable_sessions, transcript_store_root,
 };
 use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{
-    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND,
-    REVISION_PR_GUARD_COMMAND,
+    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, PR_REDIRECT_REVISION_ENV,
+    REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
 };
 use super::{
     AgentDriver, AgentJsonlFileIngress, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective,
@@ -80,7 +81,7 @@ use super::{
 ///
 /// The engine's `codex_unobserved_command` module matches on this literal
 /// prefix to stage the signal for `WorkerCompletionHandler`, which files an
-/// attention item and refuses the worker's `NO_CHANGES_NEEDED` claim for the
+/// attention item and refuses the worker's `no-changes-needed` claim for the
 /// rest of the run.
 pub const UNOBSERVED_COMMAND_MARKER: &str = "[codex-unobserved-command]";
 
@@ -179,8 +180,8 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // Re-captured on codex-cli 0.160.1 (2026-10-06): every slug above is still
 // listed with the same `tool_mode` (`code_mode_only` for the selected
 // `gpt-6-astra`); the catalog gained `gpt-6.1-sol` (priority 1), `gpt-6-sol`
-// and `gpt-6-luna` above/around astra, which stays at priority 2. None of
-// them is dispatched by this table.
+// and `gpt-6-luna` above/around astra, which stays at priority 2. The engine
+// effort policy selects Sol automatically for eligible work, per the configured share.
 //
 // `ModelMenu` is static function pointers today, so this is a baked snapshot
 // rather than a live `codex debug models` parse. Per-model effort filtering
@@ -188,6 +189,80 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // the ModelAndEffortMenu gap — Boss's five [`EffortLevel`]s already fit
 // inside every listed model's ladder, and `ultra` has no [`EffortLevel`] to
 // map from (see [`ModelMenu::effort_value_for_level`]).
+
+mod sol_preflight {
+    //! Verify the installed CLI advertises Sol before selecting it. Never fall back.
+    use anyhow::{Context, Result};
+    pub const SOL_MODEL: &str = "gpt-6.1-sol";
+
+    pub async fn validate_sol_available() -> Result<()> {
+        tokio::task::spawn_blocking(|| {
+            let output = boss_command_runner::output_blocking_timeout(
+                std::process::Command::new(super::resolve_codex_bin()).args(["debug", "models", "--bundled"]),
+                std::time::Duration::from_secs(10),
+            )
+            .context("Cannot select gpt-6.1-sol: unable to read the installed Codex model catalog")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Cannot select gpt-6.1-sol: Codex model catalog failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            validate_catalog(&output.stdout)
+        })
+        .await
+        .context("Codex Sol capability check failed")?
+    }
+
+    fn validate_catalog(bytes: &[u8]) -> Result<()> {
+        let catalog: serde_json::Value =
+            serde_json::from_slice(bytes).context("Cannot select gpt-6.1-sol: invalid Codex model catalog")?;
+        let supported = catalog["models"].as_array().is_some_and(|models| {
+            models.iter().any(|model| {
+                model["slug"] == SOL_MODEL
+                    && ["low", "medium", "high", "xhigh", "max"].iter().all(|level| {
+                        model["supported_reasoning_levels"]
+                            .as_array()
+                            .is_some_and(|levels| levels.iter().any(|entry| entry["effort"] == *level))
+                    })
+            })
+        });
+        anyhow::ensure!(
+            supported,
+            "Cannot select gpt-6.1-sol: the installed Codex CLI does not advertise Sol with the required effort levels; update Codex or set the Sol share to 0% (launches not yet started will then fall back to Astra)"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn pinned_codex_catalog_advertises_the_exact_sol_model() {
+            let binary =
+                std::path::PathBuf::from(std::env::var_os("BOSS_TEST_CODEX").expect("Bazel provides pinned Codex"))
+                    .canonicalize()
+                    .unwrap();
+            let output = boss_command_runner::output_blocking_timeout(
+                std::process::Command::new(binary).args(["debug", "models", "--bundled"]),
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            validate_catalog(&output.stdout).unwrap();
+        }
+
+        #[test]
+        fn requires_exact_slug_and_supported_efforts() {
+            assert!(validate_catalog(br#"{"models":[{"slug":"gpt-6-astra"}]}"#).is_err());
+            assert!(validate_catalog(br#"{"models":[{"slug":"gpt-6.1-sol"}]}"#).is_err());
+            let catalog = serde_json::json!({"models":[{"slug":"gpt-6.1-sol", "supported_reasoning_levels":
+            (["low", "medium", "high", "xhigh", "max"].map(|effort| serde_json::json!({"effort":effort})))}]});
+            validate_catalog(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+            assert!(validate_catalog(b"broken").is_err());
+        }
+    }
+}
+pub use sol_preflight::{SOL_MODEL, validate_sol_available};
 
 /// Map a Boss effort level onto Codex's reasoning-effort vocabulary.
 ///
@@ -204,26 +279,29 @@ fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     })
 }
 
-/// One Codex model is selected for all worker sessions: both `Standard`
-/// and `Investigation` resolve to `gpt-6-astra`. Terra remains a known
+/// The Codex base model every automatic selection starts from.
+pub const ASTRA_MODEL: &str = "gpt-6-astra";
+
+/// Base model before the engine automatically selects Sol for eligible work:
+/// both reasoning modes resolve to `gpt-6-astra`. Terra remains a known
 /// catalog SKU (`codex debug models`) but is not selected as a lower
 /// tier or fallback.
 fn codex_model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 /// One Codex model is selected for all review tiers: Fast, Balanced, and
 /// Strong all resolve to `gpt-6-astra`. This table does not infer anything
 /// from task effort or reasoning.
 fn codex_review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 /// Legacy size-derived table. Consulted only for rows with no
 /// [`ReasoningMode`]. Keeps untagged rows on the frontier default rather than
 /// inventing a size→model progression Codex has not validated.
 fn codex_default_model_for_level(_level: EffortLevel) -> &'static str {
-    "gpt-6-astra"
+    ASTRA_MODEL
 }
 
 fn codex_prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> {
@@ -265,18 +343,19 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
+        resolve_model_effort: None,
         // Highest-priority model in `codex debug models` on 0.153.4: frontier
         // agentic coding. 0.159.1 added `gpt-6.1-sol` above it (priority 1
         // on 0.160.1); astra is retained deliberately — swapping the
         // dispatched model is a product decision, not part of a CLI
         // qualification. Step-5 fall-through only — classified rows resolve
         // through `model_for_reasoning`.
-        engine_default: "gpt-6-astra",
+        engine_default: ASTRA_MODEL,
         effort_value_for_level: codex_effort_value_for_level,
         default_model_for_level: codex_default_model_for_level,
         model_for_reasoning: codex_model_for_reasoning,
         review_model_for_tier: codex_review_model_for_tier,
-        design_investigation_model: Some(|| "gpt-6-astra"),
+        design_investigation_model: Some(|| ASTRA_MODEL),
         prompt_addendum_for_level: codex_prompt_addendum_for_level,
         model_requires_auto_permissions: codex_model_requires_auto_permissions,
         model_belongs_to_driver: codex_model_belongs_to_driver,
@@ -293,23 +372,38 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// cannot observe, so a worker that reaches for them gets a hard block. Saying
 /// so up front turns a wasted turn into a known constraint.
 ///
-/// The long-command rule is also Codex-specific. `exec_command`'s initial
-/// yield is capped at 30 seconds by codex-cli 0.145.0 and has no config/env/CLI
-/// override (`--strict-config` rejects the corresponding candidate keys).
-/// Unified exec does, however, return a session id and supports empty
-/// `write_stdin` polls up to 300 seconds. The injected example keeps those
-/// polls inside the originating JavaScript cell: the rollout correlator
-/// observes that cell through its `wait` continuations and ultimately receives
-/// the command's real `exit_code`; a separate polling cell has no attributable
-/// command.
-const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
-     spawned you in a leased cube workspace and observes this session\n\
-     via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
+/// The long-command rule is also Codex-specific, and it exists for one reason:
+/// the rollout correlator needs the command's real `exit_code`. `exec_command`'s
+/// initial yield is capped at 30 seconds by codex-cli 0.145.0 and has no
+/// config/env/CLI override (`--strict-config` rejects the corresponding
+/// candidate keys). Unified exec does, however, return a session id and
+/// supports empty `write_stdin` polls up to 300 seconds.
+///
+/// The rule deliberately does **not** require the polls to stay in the
+/// originating JavaScript cell. The correlator uses the shell session, not the
+/// cell, as its durable unit (`driver/src/codex/rollout_calls.rs` module docs,
+/// L21-26): the chunk's `session_id` binds every later polling cell to the
+/// originating command (`RolloutCallTracker::observe_output`, covered by
+/// `multi_cell_session_is_observed_when_a_later_poll_reports_an_exit_code` in
+/// `rollout_calls.rs` and
+/// `multi_cell_session_is_not_flagged_after_a_later_poll_reports_its_exit_code`
+/// in `progress.rs`). What does need the worker's cooperation is getting a
+/// structured `exit_code` onto some chunk of that session: `text(r.output)`
+/// discards the `session_id`, so the call stays open, drains as abandoned at
+/// the turn boundary (`RolloutCallTracker::drain_open_calls`), surfaces as an
+/// `UNOBSERVED_COMMAND_MARKER`, and the engine refuses the run's
+/// `no-changes-needed` declaration (`refuse_no_op_declaration` in
+/// `core/src/completion/no_op.rs`). The injected example polls in one cell
+/// only because that is the simplest loop to write.
+///
+/// The block says nothing to discourage backgrounding: a job deliberately left
+/// running is covered by the engine-wide `propose wait` rule, which the block
+/// points at in one sentence.
+const CODEX_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!(
+    "via the Codex rollout JSONL file in this run's isolated CODEX_HOME.",
+    "\n\
      \n\
-     Two tool routes are blocked in this session, because Boss's command\n\
+     Two tool routes are blocked in this session, because the command\n\
      guardrails cannot see them:\n\
      \n\
      - **Do not use `mcp__*` app tools** (the Codex GitHub/Gmail/Drive\n\
@@ -326,10 +420,12 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      never infer ownership or blockage from global process-name matches.\n\
      \n\
      For any ordinary command expected to exceed roughly ten seconds, keep its\n\
-     session handle and poll it to completion in the same JavaScript cell.\n\
+     session handle and poll it with `write_stdin` until the result carries\n\
+     `exit_code`.\n\
      `exec_command` yields after at most 30 seconds; a result containing\n\
      `session_id` means the command is still running — never that it passed or\n\
-     failed. `text(r.output)` discards that handle, so use this pattern instead:\n\
+     failed. `text(r.output)` discards that handle, so use this pattern instead\n\
+     (a later cell may keep polling the same `session_id`):\n\
      \n\
      ```js\n\
      let r = await tools.exec_command({cmd: \"bazel test //backend/blob:blob_test //backend/admintasks:admintasks_test\",\n\
@@ -341,13 +437,18 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      text(JSON.stringify(r));\n\
      ```\n\
      \n\
-     Empty `write_stdin(session_id, chars: \"\")` polling is explicitly\n\
-     allowed for a session started by an ordinary command; repeat the poll in\n\
-     that same cell with its returned `session_id` until the terminal result\n\
-     carries `exit_code`. Writing commands through stdin is not. Do not end the\n\
-     turn or claim a gate result without the real `exit_code`. Give a command\n\
-     that might hang its own foreground timeout so expiry returns a nonzero\n\
-     status instead of polling forever.\n\
+     Empty `write_stdin(session_id, chars: \"\")` polling is allowed for a\n\
+     session started by an ordinary command; writing commands through stdin\n\
+     is not. Do not claim a gate result without the real `exit_code`. Do not\n\
+     wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a\n\
+     shell `timeout`; poll those commands until they return a real\n\
+     `exit_code`. A build that is still compiling is making progress. If a\n\
+     hard cap is ever unavoidable for some other hanging command, it must be\n\
+     at least two hours, and a timeout must never be treated as a reason to\n\
+     rerun the same command under the same cap. A job you deliberately leave\n\
+     running rather than polling it to completion must be declared with\n\
+     `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>`\n\
+     before you end the turn.\n\
      \n\
      **Do not invent a budget.** Nothing in this session meters your runtime,\n\
      your turns, or your tokens, and you are not the accountant for any of\n\
@@ -360,7 +461,8 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      is still a failed run. A blocker is reportable only when something\n\
      external forced it: a command that ran and failed, a missing credential,\n\
      a genuinely conflicting instruction. Say so plainly and show the\n\
-     evidence when that happens — and complete the work when it has not.";
+     evidence when that happens — and complete the work when it has not."
+);
 
 /// Single-pattern gitignore for the workspace-local `.codex/` config dir
 /// (prompt + agent-rules copies). Engine-injected files must not appear in
@@ -512,6 +614,14 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: 
         // (render_review_guide_config), not a CLI override — see
         // codex_sandbox_extra_args's doc comment for why.
         WorkerKind::ReviewGuide => None,
+        // The progression agent holds no checkout and never writes files, so it
+        // gets a read-only profile regardless of the enforcement flag — never
+        // the Standard `workspace-write` / `danger-full-access` posture. A bare
+        // `--sandbox read-only` would also cut it off from the engine socket and
+        // GitHub, which it needs to read the state it diagnoses, so the profile
+        // (`render_progression_config`) is selected in the rendered config file
+        // like ReviewGuide's.
+        WorkerKind::Progression => None,
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
                 Some("workspace-write")
@@ -653,8 +763,9 @@ impl CodexRuntimeState {
 
 /// Render the non-hook portion of the per-run user `config.toml`.
 ///
-/// - Stamps the cube workspace as trusted so the first-run trust dialog never
-///   blocks a headless worker.
+/// - Stamps the workspace as trusted, under every spelling Codex may resolve
+///   it to ([`crate::scoped_home::trust_path_variants`]), so the first-run
+///   trust dialog never blocks a headless worker.
 /// - Suppresses the external-agent (Claude Code) config-migration notice for
 ///   this home and this project, and pins the underlying memory-import
 ///   feature off, so a co-located `.claude/` from a prior Claude worker is
@@ -716,6 +827,20 @@ fn codex_hook_context(workspace: &Path) -> (String, PathBuf) {
 /// domains the proxy rejects all IP destinations; Seatbelt also blocks direct
 /// IP connections. Never replace this with unrestricted network_access.
 fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
+    render_read_only_socket_profile(workspace, socket, "review-guide", &[])
+}
+
+/// The progression agent's profile: the same read-only filesystem and single
+/// attributed engine-socket exception as the review guide, plus network access
+/// to exactly the GitHub hosts `gh pr view` / `gh pr checks` read from, so the
+/// agent can inspect the state it diagnoses. Nothing else is reachable.
+const PROGRESSION_ALLOWED_DOMAINS: &[&str] = &["api.github.com", "github.com"];
+
+fn render_progression_config(workspace: &Path, socket: &Path) -> String {
+    render_read_only_socket_profile(workspace, socket, "progression", PROGRESSION_ALLOWED_DOMAINS)
+}
+
+fn render_read_only_socket_profile(workspace: &Path, socket: &Path, profile: &str, allowed_domains: &[&str]) -> String {
     // Codex 0.153.4 requires a default whenever named permissions exist:
     // https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/core/src/config/mod.rs#L3404-L3413
     // Unchanged on 0.160.1 ("config defines `[permissions]` profiles but does
@@ -724,21 +849,62 @@ fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
     // The hook-trust app-server loads this file before the worker's CLI
     // overrides exist, so selecting the profile only on the command line
     // makes hooks/list reject the config and return no hooks.
-    let mut config = String::from("default_permissions = \"review-guide\"\nweb_search = \"disabled\"\n");
+    let domains = format!(
+        "{{ {} }}",
+        allowed_domains
+            .iter()
+            .map(|domain| format!("{} = \"allow\"", toml_basic_string(domain)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let domains = if allowed_domains.is_empty() {
+        "{}".to_owned()
+    } else {
+        domains
+    };
+    let mut config = format!("default_permissions = \"{profile}\"\nweb_search = \"disabled\"\n");
     config.push_str(&render_config_toml(workspace, String::new()).replace(
         "[features]\n",
-        "[features]\nnetwork_proxy = { enabled = true, domains = {}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }\n",
+        &format!("[features]\nnetwork_proxy = {{ enabled = true, domains = {domains}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }}\n"),
     ));
     config.push_str(&format!(
-        "\n[permissions.review-guide]\nextends = \":read-only\"\n[permissions.review-guide.network]\nenabled = true\ndomains = {{}}\nunix_sockets = {{ {} = \"allow\" }}\n",
+        "\n[permissions.{profile}]\nextends = \":read-only\"\n[permissions.{profile}.network]\nenabled = true\ndomains = {domains}\nunix_sockets = {{ {} = \"allow\" }}\n",
         toml_basic_string(&socket.display().to_string()),
     ));
     config
 }
 
+/// The question Codex's folder-trust dialog asks, as rendered by codex-cli
+/// 0.160.1 and 0.169.0 (`Trust this folder? Codex can read, edit, and run
+/// files here, …`). The rest of the dialog differs between those releases
+/// (`2. Quit` became `2. Back to Agent Command Center`), so only the question
+/// is matched.
+const CODEX_FOLDER_TRUST_DIALOG_MARKER: &str = "Trust this folder?";
+
 fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> String {
+    // Every spelling Codex may look the workspace up under, not only the
+    // engine's. Codex keys `[projects]` by the working directory it resolves
+    // for itself, which is the physical path, and the two differ whenever the
+    // engine's path crosses a symlink. A cube workspace never does, but a
+    // progression run works in engine scratch under the system temp directory,
+    // and on macOS that is `/var/folders/…`, a symlink to
+    // `/private/var/folders/…`. Stamping only the engine's spelling left Codex
+    // with no trust entry for the directory it was in, so it opened its
+    // "Trust this folder?" dialog instead of the composer and the brief was
+    // pasted into the dialog and lost (measured on codex-cli 0.160.1 and
+    // 0.169.0; see
+    // `docs/investigations/codex-progression-spawn-never-attaches-2026-11-17.md`).
+    //
     // TOML basic-string escape for paths that may contain backslashes or quotes.
-    let workspace_key = toml_basic_string(&workspace.display().to_string());
+    let trust_keys: Vec<String> = crate::scoped_home::trust_path_variants(workspace)
+        .iter()
+        .map(|key| toml_basic_string(key))
+        .collect();
+    let migration_notice_projects: String = trust_keys.iter().map(|key| format!("{key} = true\n")).collect();
+    let trusted_projects: String = trust_keys
+        .iter()
+        .map(|key| format!("[projects.{key}]\ntrust_level = \"trusted\"\n\n"))
+        .collect();
     let config = format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
@@ -762,7 +928,7 @@ fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> Stri
          home = true\n\
          \n\
          [notice.external_config_migration_prompts.projects]\n\
-         {workspace_key} = true\n\
+         {migration_notice_projects}\
          \n\
          [features]\n\
          external_agent_memory_import = false\n\
@@ -780,9 +946,7 @@ fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> Stri
          experimental_use_profile = false\n\
          \n\
          {sandbox_workspace_write}\
-         [projects.{workspace_key}]\n\
-         trust_level = \"trusted\"\n\
-         \n"
+         {trusted_projects}"
     );
     config
 }
@@ -1066,11 +1230,6 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
         run_id: _,
     } = request;
 
-    let prompt_cat = format!(
-        "\"$(cat {}/{})\"",
-        CODEX_DESCRIPTOR.config_dir, CODEX_DESCRIPTOR.initial_prompt_filename,
-    );
-
     // Sandbox policy is fully supplied by PermissionArtifacts::extra_args.
     // In particular, reviewers intentionally receive no `--sandbox` flag: the
     // sandbox required a `--cd` into engine scratch to permit its one report
@@ -1090,10 +1249,8 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
         cmd.push_str(" -c model_reasoning_effort=");
         cmd.push_str(&shell_quote(e));
     }
-    cmd.push(' ');
-    cmd.push_str(&prompt_cat);
     cmd.push('\n');
-    cmd
+    super::initial_prompt::launcher_command(CODEX_DESCRIPTOR.config_dir, &cmd)
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,11 +1273,159 @@ pub struct MaterializedGuard {
     /// Matcher for PreToolUse (`".*"` covers all tools; Bash-only where the
     /// Claude path used a Bash matcher).
     pub matcher: Option<&'static str>,
+    /// Codex command-hook timeout in seconds. `None` uses Codex's 600s default.
+    /// The checkleft push guard sets this above its own 7200s subprocess
+    /// budget so the inner fail-open wins rather than Codex cutting the gate
+    /// short at 600s.
+    pub timeout_sec: Option<u64>,
 }
+
+/// Deny-by-default `PreToolUse` guard for the Codex progression agent.
+///
+/// Codex has no declarative `permissions.deny`, and the progression profile
+/// opens `github.com` / `api.github.com` (so `gh pr view` works) — a network
+/// allowlist cannot tell a GitHub read from an authenticated write. This guard
+/// is the command-level layer: it admits only the progression inspection and
+/// declaration surface (the same set as `progression_allow_rules`) plus a few
+/// read-only file commands, and rejects everything else, including mutating
+/// `gh`, `jj`, `git`, `cube`, redirections, substitutions and chaining.
+fn codex_progression_guard_script() -> String {
+    guard_python::with_command_tokenizer(PROGRESSION_SCRIPT_TEMPLATE)
+}
+
+const PROGRESSION_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import sys
+
+# COMMAND_TOKENIZER_FRAGMENT
+
+BOSS_BINS = ('boss', '$BOSS_BIN', '${BOSS_BIN}')
+BOSS_VERBS = (('propose',), ('task', 'show'), ('task', 'list'), ('pr', 'status'))
+GH_VERBS = (('pr', 'view'), ('pr', 'checks'))
+READ_COMMANDS = ('cat', 'ls', 'head', 'tail', 'nl', 'wc', 'rg')
+SECRET_MARKERS = ('.codex', '.ssh', '.aws', '.gnupg', 'auth.json')
+# Characters the shell expands or reinterprets. shlex does no expansion, so a
+# token it returns is not the argument the shell will pass; admit only text with
+# none of these outside single quotes (after the leading `$BOSS_BIN`).
+UNSAFE_CHARS = ('$', '<', '>', '{', '}', '~', '!', '*', '?', '[', ']', '\n', '\r', '\x00')
+RG_SAFE_FLAGS = frozenset((
+    '-n', '-i', '-S', '-s', '-l', '-c', '-w', '-F', '-v', '-H', '-N', '-o', '-q',
+    '-e', '-g', '-t', '-T', '-m', '-A', '-B', '-C', '-U', '--',
+    '--files', '--line-number', '--ignore-case', '--smart-case', '--case-sensitive',
+    '--files-with-matches', '--count', '--word-regexp', '--fixed-strings',
+    '--invert-match', '--with-filename', '--no-line-number', '--only-matching',
+    '--quiet', '--glob', '--type', '--max-count', '--after-context',
+    '--before-context', '--context', '--no-heading', '--heading',
+))
+
+def literal_only(command, head):
+    rest = command.lstrip()
+    if head.startswith('$'):
+        for form in ('"' + head + '"', head):
+            if rest.startswith(form):
+                rest = rest[len(form):]
+                break
+    quote = None
+    escaped = False
+    for ch in rest:
+        if ch in ('\n', '\r', '\x00'):
+            return False
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            continue
+        if ch in UNSAFE_CHARS:
+            return False
+        if escaped:
+            escaped = False
+        elif ch == '\\':
+            escaped = True
+        elif ch == quote:
+            quote = None
+        elif quote is None and ch in ("'", '"'):
+            quote = ch
+    return quote is None and not escaped
+
+def rg_safe(rest):
+    options_done = False
+    for t in rest:
+        if options_done or not t.startswith('-') or t == '-':
+            continue
+        if t == '--':
+            options_done = True
+            continue
+        if t.split('=', 1)[0] not in RG_SAFE_FLAGS:
+            return False
+    return True
+
+def starts_with(tokens, verbs):
+    return any(tuple(tokens[:len(verb)]) == verb for verb in verbs)
+
+def allowed_bash(command):
+    if not isinstance(command, str):
+        return False
+    if any(marker in command for marker in ('`', '$(', '<(', '>(')):
+        return False
+    groups = command_groups(command)
+    if len(groups) != 1:
+        return False
+    tokens = list(groups[0])
+    if not tokens or any(re.match(r'^[0-9]*[<>]', token) for token in tokens):
+        return False
+    head, rest = tokens[0], tokens[1:]
+    if not literal_only(command, head):
+        return False
+    if head in BOSS_BINS:
+        return starts_with(rest, BOSS_VERBS)
+    if head == 'gh':
+        return starts_with(rest, GH_VERBS)
+    if head in READ_COMMANDS:
+        if head == 'rg' and not rg_safe(rest):
+            return False
+        return not any(marker in token for token in rest for marker in SECRET_MARKERS)
+    return False
+
+def allowed(payload):
+    if not isinstance(payload, dict):
+        return False
+    tool = payload.get('tool_name')
+    if tool in ('Read', 'Grep', 'Glob'):
+        return True
+    if tool != 'Bash':
+        return False
+    tool_input = payload.get('tool_input')
+    return isinstance(tool_input, dict) and allowed_bash(tool_input.get('command'))
+
+try:
+    payload = json.load(sys.stdin)
+    approved = allowed(payload)
+except Exception:
+    payload = None
+    approved = False
+if approved:
+    print(json.dumps({"decision": "approve"}))
+else:
+    tool = payload.get("tool_name", "(unreadable payload)") if isinstance(payload, dict) else "(unreadable payload)"
+    print(json.dumps({"decision": "block", "reason": "Blocked: the progression agent may only inspect state (boss task show/list, boss pr status, gh pr view/checks, read-only file commands) and declare through boss propose; edits, writes, jj/git/cube and mutating gh are forbidden (matched tool: " + str(tool) + ")."}))
+"#;
 
 /// Materialise Boss guard scripts under `codex_home/guards/` and return the
 /// absolute paths Codex will invoke.
+#[cfg(test)]
 fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> anyhow::Result<Vec<MaterializedGuard>> {
+    materialize_guards_for(codex_home, config, false)
+}
+
+/// [`materialize_guards`] with the worker-kind posture the interception config
+/// does not carry: `progression` arms the deny-by-default progression guard.
+fn materialize_guards_for(
+    codex_home: &Path,
+    config: &ToolUseInterceptionConfig,
+    progression: bool,
+) -> anyhow::Result<Vec<MaterializedGuard>> {
     let guards_dir = codex_home.join("guards");
     fs::create_dir_all(&guards_dir).with_context(|| format!("creating {}", guards_dir.display()))?;
 
@@ -1169,6 +1474,26 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         });
     }
 
+    // 1b. Shared-source-store write gate — local workers of every kind. The
+    //     engine materialises the script outside CODEX_HOME (it is not
+    //     Codex-specific); the wrapper hands it the workspace so it can derive
+    //     cube's repos root. `Bash` only: it judges shell commands.
+    if let Some(guard_script) = &config.git_store_guard_script {
+        let mut extra_env = Vec::new();
+        if let Some(workspace) = &config.workspace_path {
+            extra_env.push((
+                crate::git_store_guard::GIT_STORE_GUARD_WORKSPACE_ENV,
+                workspace.display().to_string(),
+            ));
+        }
+        planned.push(Planned {
+            name: "git_store_guard",
+            source: GuardSource::Existing(guard_script.clone()),
+            matcher: "Bash",
+            extra_env,
+        });
+    }
+
     // 2. Boss-launch guard — always on. Materialise the Claude inline
     //    `python3 -c` body as a real .py so the trust gate can path-check it.
     planned.push(Planned {
@@ -1192,11 +1517,16 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
 
     // 4. PR redirect — Standard workers only.
     if config.is_standard_worker {
+        let extra_env = if config.is_revision {
+            vec![(PR_REDIRECT_REVISION_ENV, "1".to_owned())]
+        } else {
+            Vec::new()
+        };
         planned.push(Planned {
             name: "pr_redirect_guard",
             source: GuardSource::Inline(python_c_to_script(PR_REDIRECT_GUARD_COMMAND)?),
             matcher: "Bash",
-            extra_env: Vec::new(),
+            extra_env,
         });
     }
 
@@ -1208,7 +1538,13 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
             name: "checkleft_push_guard",
             source: GuardSource::Existing(checkleft_script.clone()),
             matcher: "Bash",
-            extra_env: Vec::new(),
+            // Covers the guard script's sequential probe + run budgets so a
+            // contended Bazel compile is not fail-closed by the shim
+            // (default 420s) or Codex's 600s command-hook default.
+            extra_env: vec![(
+                "BOSS_GUARD_TIMEOUT_SECONDS",
+                crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS.to_string(),
+            )],
         });
     }
 
@@ -1240,6 +1576,18 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         planned.push(Planned {
             name: "review_guide_guard",
             source: GuardSource::Inline(codex_review_guide_guard_script()),
+            matcher: ".*",
+            extra_env: Vec::new(),
+        });
+    }
+
+    // The progression agent holds no checkout and may only inspect and declare.
+    // Its profile opens GitHub hosts, which a network allowlist alone cannot
+    // split into reads and writes, so every tool call goes through this guard.
+    if progression {
+        planned.push(Planned {
+            name: "progression_guard",
+            source: GuardSource::Inline(codex_progression_guard_script()),
             matcher: ".*",
             extra_env: Vec::new(),
         });
@@ -1287,6 +1635,8 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         out.push(MaterializedGuard {
             command_path: fs::canonicalize(&wrapper).unwrap_or(wrapper),
             matcher: Some(guard.matcher),
+            timeout_sec: (guard.name == "checkleft_push_guard")
+                .then_some(crate::CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS),
         });
     }
 
@@ -1350,6 +1700,9 @@ pub fn append_hooks_toml(base: &str, guards: &[MaterializedGuard]) -> String {
         }
         out.push_str("[[hooks.PreToolUse.hooks]]\n");
         out.push_str("type = \"command\"\n");
+        if let Some(timeout) = guard.timeout_sec {
+            out.push_str(&format!("timeout = {timeout}\n"));
+        }
         out.push_str(&format!(
             "command = {}\n\n",
             toml_basic_string(&guard.command_path.display().to_string())
@@ -1370,11 +1723,12 @@ pub fn write_hooks_and_attest(
     hook_cwd: &Path,
     base_config: &str,
     config: &ToolUseInterceptionConfig,
+    progression: bool,
     codex_bin: &Path,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(codex_home).with_context(|| format!("creating CODEX_HOME {}", codex_home.display()))?;
 
-    let guards = materialize_guards(codex_home, config)?;
+    let guards = materialize_guards_for(codex_home, config, progression)?;
     let full = append_hooks_toml(base_config, &guards);
     let config_path = codex_home.join("config.toml");
     fs::write(&config_path, full).with_context(|| format!("writing {}", config_path.display()))?;
@@ -1393,6 +1747,7 @@ pub fn write_hooks_and_attest(
                 .event(HookEvent::PreToolUse)
                 .maybe_matcher(guard.matcher.map(str::to_owned))
                 .command(guard.command_path.clone())
+                .maybe_timeout_sec(guard.timeout_sec)
                 .group_index(group_index)
                 .handler_index(0usize)
                 .require_guard_executable(true)
@@ -1577,6 +1932,32 @@ impl AgentDriver for CodexDriver {
         ])
     }
 
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        // Recorded from the isolated Codex 0.161.0 onboarding picker.
+        //
+        // `Trust this folder?` is the folder-trust dialog, measured on
+        // 0.160.1 and 0.169.0. Its selected row is `› 1. Trust and continue`,
+        // and `›` is an agent marker, so without this entry the launcher
+        // takes the dialog for the composer: it pastes the brief into the
+        // dialog, which discards it, and its Return then accepts the dialog.
+        //
+        // This holds delivery only once the dialog is on screen. Codex draws
+        // a provisional composer first and replaces it with the dialog, and a
+        // brief delivered into that composer is lost all the same. What keeps
+        // the dialog away is the trust the engine pre-stamps
+        // (`render_config_toml`).
+        [
+            "Sign in with ChatGPT",
+            "Sign in with Device Code",
+            "Provide your own API key",
+            "Sign in from another device",
+            "Complete sign-in in your browser",
+            CODEX_FOLDER_TRUST_DIALOG_MARKER,
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Measured Codex TUI chrome; see `codex/pane_monitor.rs` for the
         // literals, their stability evidence, and why the startup banner
@@ -1649,9 +2030,8 @@ impl AgentDriver for CodexDriver {
         // with the Claude path's shared template.
         let config_dir = workspace.join(CODEX_DESCRIPTOR.config_dir);
         fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
-        let prompt_path = config_dir.join(CODEX_DESCRIPTOR.initial_prompt_filename);
-        fs::write(&prompt_path, prompt_text)
-            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        super::initial_prompt::warm_preflight().await?;
+        super::initial_prompt::provision(&config_dir, &codex_home, prompt_text, self)?;
         let gitignore_path = config_dir.join(".gitignore");
         fs::write(&gitignore_path, CODEX_DIR_GITIGNORE)
             .with_context(|| format!("writing gitignore to {}", gitignore_path.display()))?;
@@ -1744,43 +2124,37 @@ impl AgentDriver for CodexDriver {
             );
         }
 
-        let interception = ToolUseInterceptionConfig {
-            data_dir: if input.is_remote {
-                None
-            } else {
-                input.events_socket_path.parent().map(|p| p.to_path_buf())
-            },
-            path_guard_script: if input.is_remote {
-                None
-            } else {
-                input.path_guard_script.clone()
-            },
-            checkleft_guard_script: if input.is_remote {
-                None
-            } else {
-                input.checkleft_guard_script.clone()
-            },
-            is_revision: input.execution_kind == "revision_implementation"
-                || input.task_kind.as_deref() == Some("revision"),
-            is_standard_worker: input.worker_kind == WorkerKind::Standard,
-            is_reviewer: input.worker_kind == WorkerKind::Reviewer,
-            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
-            run_id: Some(input.run_id.clone()),
-            workspace_path: Some(input.workspace_path.clone()),
-        };
+        let interception = ToolUseInterceptionConfig::from_permission_input(input);
 
         // When path/checkleft scripts are supplied via PermissionInput they
         // win; otherwise leave those guards off (remote / early unit tests).
         let (mut base_config, hook_cwd) = codex_hook_context(&input.workspace_path);
-        if input.worker_kind == WorkerKind::ReviewGuide {
-            let socket = input
-                .frontend_socket_path
-                .as_deref()
-                .context("review-guide requires a bound frontend socket")?;
-            base_config = render_review_guide_config(&input.workspace_path, socket);
+        if matches!(input.worker_kind, WorkerKind::ReviewGuide | WorkerKind::Progression) {
+            let socket = input.frontend_socket_path.as_deref().with_context(|| {
+                format!(
+                    "{} requires a bound frontend socket",
+                    if input.worker_kind == WorkerKind::Progression {
+                        "progression"
+                    } else {
+                        "review-guide"
+                    }
+                )
+            })?;
+            base_config = if input.worker_kind == WorkerKind::Progression {
+                render_progression_config(&input.workspace_path, socket)
+            } else {
+                render_review_guide_config(&input.workspace_path, socket)
+            };
         }
         let codex_bin = resolve_codex_bin();
-        write_hooks_and_attest(&codex_home, &hook_cwd, &base_config, &interception, &codex_bin)?;
+        write_hooks_and_attest(
+            &codex_home,
+            &hook_cwd,
+            &base_config,
+            &interception,
+            input.worker_kind == WorkerKind::Progression,
+            &codex_bin,
+        )?;
 
         let extra_args = codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced);
 
@@ -1981,31 +2355,8 @@ impl AgentDriver for CodexDriver {
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let (homes_root, codex_home) = codex_homes_root_and_home_for_run(run_id)?;
         let sessions_path = codex_home.join("sessions");
-        match fs::symlink_metadata(&sessions_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let store_root = transcript_store_root()?;
-                return Ok(Some(verified_durable_sessions_dir(
-                    &codex_home,
-                    &store_root,
-                    "codex",
-                    run_id,
-                )?));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let store_root = transcript_store_root()?;
-                let durable = durable_sessions_dir(&store_root, "codex", run_id)?;
-                if let Ok(canonical) = fs::canonicalize(&durable)
-                    && canonical.is_dir()
-                {
-                    return Ok(Some(canonical));
-                }
-            }
-            Err(err) => tracing::debug!(
-                ?err,
-                path = %sessions_path.display(),
-                "stat of temporary sessions path failed; falling back to legacy containment"
-            ),
-            _ => {}
+        if let Some(root) = durable_transcript_containment_root(&sessions_path, "codex", run_id)? {
+            return Ok(Some(root));
         }
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
             anyhow!(
@@ -2129,6 +2480,20 @@ impl AgentDriver for CodexDriver {
     /// ever arrive for the folded prompt.
     fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
         MidTurnPaneInput::Buffers
+    }
+
+    /// One second, **measured**: the TUI treats keys that arrive in a burst
+    /// as a paste, and a Return landing right behind them as a newline in it.
+    ///
+    /// `docs/investigations/codex-0.160.1-qualification-2026-10-06.md`
+    /// ("Harness notes") records `tmux send-keys -l -- <text>` followed
+    /// immediately by Return leaving the prompt in the composer with a
+    /// newline inserted instead of submitting, on both 0.153.4 and 0.160.1,
+    /// and a 1 s gap before Return submitting reliably. Without the gap a
+    /// single-line probe typed into a parked pane sits in the composer and
+    /// starts no turn, while the write itself succeeds.
+    fn pane_submit_settle(&self) -> Duration {
+        Duration::from_secs(1)
     }
 
     /// The bare TUI is a long-lived, multi-turn session — the retired

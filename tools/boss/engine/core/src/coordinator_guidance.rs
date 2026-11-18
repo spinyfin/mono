@@ -16,18 +16,54 @@
 //! Every product gets exactly one entry whatever happened. A GitHub
 //! failure, a missing file, an over-cap file, and a product with no repo
 //! are four different states and each is rendered as itself; none of
-//! them is dropped or passed off as "no guidance". See
-//! `tools/boss/docs/coordinator-product-guidance.md`.
+//! them is dropped or passed off as "no guidance".
+//!
+//! Every successful read (loaded, or missing) is persisted per product as
+//! the last-known-good result. When a later read fails, that entry is
+//! served instead, as an explicitly labelled
+//! [`CoordinatorGuidanceState::Cached`] carrying the sha, the read time and
+//! the fetch error — never as a fresh load. With no entry the failure is
+//! reported unchanged. See `tools/boss/docs/coordinator-product-guidance.md`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use boss_engine_design_docs::DesignDocsService;
 use boss_engine_utils::iso8601::format_epoch_iso8601;
-use boss_protocol::{COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState, CoordinatorGuidanceView, Product};
+use boss_protocol::{
+    COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState, CoordinatorGuidanceView, Product, REPO_BOSS_GUIDANCE_PATH,
+};
 use serde_json::json;
 
-use crate::work::WorkDb;
+use crate::work::{COORDINATOR_GUIDANCE_CACHE_NAMESPACE, CachedGuidance, REPO_BOSS_GUIDANCE_CACHE_NAMESPACE, WorkDb};
+
+/// One guidance file the engine reads from a product's repo, with the
+/// last-known-good cache namespace that belongs to it. Every read, size cap,
+/// state and cache rule in this module is identical for the files; this is
+/// the only thing that differs, so adding a third file is one constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuidanceFile {
+    /// Repo-relative path read from the default branch.
+    pub path: &'static str,
+    /// Metadata-key namespace of this file's last-known-good entries.
+    cache_namespace: &'static str,
+    /// On-demand command for this file, if one exists (takes `--product`).
+    retry_command: Option<&'static str>,
+}
+
+/// `BOSS_COORDINATOR.md`: coordinator-only rules.
+pub const COORDINATOR_FILE: GuidanceFile = GuidanceFile {
+    path: COORDINATOR_GUIDANCE_PATH,
+    cache_namespace: COORDINATOR_GUIDANCE_CACHE_NAMESPACE,
+    retry_command: Some("boss guidance show"),
+};
+
+/// `BOSS.md`: rules injected into Boss-dispatched coding workers.
+pub const REPO_BOSS_FILE: GuidanceFile = GuidanceFile {
+    path: REPO_BOSS_GUIDANCE_PATH,
+    cache_namespace: REPO_BOSS_GUIDANCE_CACHE_NAMESPACE,
+    retry_command: None,
+};
 
 /// Per-product bound on one guidance read at coordinator session start.
 /// Reads run concurrently, so this is also (roughly) the most the
@@ -39,13 +75,13 @@ pub(crate) const SESSION_START_FETCH_BUDGET: Duration = Duration::from_secs(3);
 
 /// Per-product bound for an on-demand `boss guidance show`. More generous
 /// than the launch budget: a CLI caller is waiting for exactly this.
-pub(crate) const ON_DEMAND_FETCH_BUDGET: Duration = Duration::from_secs(45);
+pub const ON_DEMAND_FETCH_BUDGET: Duration = Duration::from_secs(45);
 
 /// Products whose guidance the coordinator is bound by: every product
 /// that is not archived. Products without a repo are included — their
 /// `NoRepoConfigured` state is reported rather than them being omitted,
 /// so the coordinator can see the list is complete.
-pub(crate) fn guidance_products(work_db: &WorkDb) -> anyhow::Result<Vec<Product>> {
+pub fn guidance_products(work_db: &WorkDb) -> anyhow::Result<Vec<Product>> {
     Ok(work_db
         .list_products()?
         .into_iter()
@@ -55,8 +91,21 @@ pub(crate) fn guidance_products(work_db: &WorkDb) -> anyhow::Result<Vec<Product>
 
 /// Read every product's guidance concurrently, each bounded by `budget`.
 /// Always returns one view per input product, in input order.
-pub(crate) async fn load_product_guidance(
+pub async fn load_product_guidance(
     design_docs: &Arc<DesignDocsService>,
+    work_db: &WorkDb,
+    products: &[Product],
+    budget: Duration,
+    now_epoch_secs: i64,
+) -> Vec<CoordinatorGuidanceView> {
+    load_product_guidance_file(COORDINATOR_FILE, design_docs, work_db, products, budget, now_epoch_secs).await
+}
+
+/// [`load_product_guidance`] for any [`GuidanceFile`].
+pub async fn load_product_guidance_file(
+    file: GuidanceFile,
+    design_docs: &Arc<DesignDocsService>,
+    work_db: &WorkDb,
     products: &[Product],
     budget: Duration,
     now_epoch_secs: i64,
@@ -65,9 +114,19 @@ pub(crate) async fn load_product_guidance(
     let mut reads = tokio::task::JoinSet::new();
     for (index, product) in products.iter().cloned().enumerate() {
         let design_docs = design_docs.clone();
+        let work_db = work_db.clone();
         let fetched_at = fetched_at.clone();
-        reads.spawn(async move {
-            let view = load_one(&design_docs, &product, budget, fetched_at).await;
+        boss_task_scope::spawn_into(&mut reads, async move {
+            let view = load_one(
+                file,
+                &design_docs,
+                &work_db,
+                &product,
+                budget,
+                fetched_at,
+                now_epoch_secs,
+            )
+            .await;
             (index, view)
         });
     }
@@ -77,7 +136,7 @@ pub(crate) async fn load_product_guidance(
             Ok(entry) => views.push(entry),
             // A panicked read must still leave its product accounted for.
             Err(join_error) => {
-                tracing::error!(error = %join_error, "coordinator guidance: a product read panicked");
+                tracing::error!(path = file.path, error = %join_error, "guidance: a product read panicked");
             }
         }
     }
@@ -90,60 +149,191 @@ pub(crate) async fn load_product_guidance(
         .into_iter()
         .zip(products)
         .map(|(view, product)| {
-            view.unwrap_or_else(|| {
-                failed_view(
-                    product,
-                    fetched_at.clone(),
-                    format!("the engine's read of `{COORDINATOR_GUIDANCE_PATH}` panicked; see the engine log"),
-                )
-            })
+            view.unwrap_or_else(|| panicked_view(file, work_db, product, fetched_at.clone(), now_epoch_secs))
         })
         .collect()
 }
 
-async fn load_one(
-    design_docs: &DesignDocsService,
+/// The view for a product whose read task panicked. It is a `Failed` read
+/// like any other, so the last-known-good cache still answers for it.
+fn panicked_view(
+    file: GuidanceFile,
+    work_db: &WorkDb,
     product: &Product,
-    budget: Duration,
     fetched_at: String,
+    now_epoch_secs: i64,
 ) -> CoordinatorGuidanceView {
-    let fetch = tokio::time::timeout(
-        budget,
-        design_docs.fetch_coordinator_guidance(product.repo_remote_url.as_deref()),
-    )
-    .await;
-    match fetch {
-        Ok(fetch) => CoordinatorGuidanceView::builder()
-            .product_id(product.id.clone())
-            .fetched_at(fetched_at)
-            .path(COORDINATOR_GUIDANCE_PATH)
-            .product_name(product.name.clone())
-            .state(fetch.state)
-            .maybe_owner_repo(fetch.owner_repo)
-            .maybe_repo_remote_url(product.repo_remote_url.clone())
-            .build(),
-        Err(_elapsed) => failed_view(
-            product,
-            fetched_at,
-            format!(
-                "reading `{COORDINATOR_GUIDANCE_PATH}` from GitHub did not finish within {}s; run `boss guidance show \
-                 --product {}` to retry",
-                budget.as_secs(),
-                product.id
-            ),
-        ),
-    }
-}
-
-fn failed_view(product: &Product, fetched_at: String, reason: String) -> CoordinatorGuidanceView {
+    let owner_repo = owner_repo_of(product);
+    let state = settle_with_cache(
+        file,
+        work_db,
+        product,
+        owner_repo.as_deref(),
+        CoordinatorGuidanceState::Failed {
+            reason: format!("the engine's read of `{}` panicked; see the engine log", file.path),
+        },
+        now_epoch_secs,
+    );
     CoordinatorGuidanceView::builder()
         .product_id(product.id.clone())
         .fetched_at(fetched_at)
-        .path(COORDINATOR_GUIDANCE_PATH)
+        .path(file.path)
         .product_name(product.name.clone())
-        .state(CoordinatorGuidanceState::Failed { reason })
+        .state(state)
+        .maybe_owner_repo(owner_repo)
         .maybe_repo_remote_url(product.repo_remote_url.clone())
         .build()
+}
+
+async fn load_one(
+    file: GuidanceFile,
+    design_docs: &DesignDocsService,
+    work_db: &WorkDb,
+    product: &Product,
+    budget: Duration,
+    fetched_at: String,
+    now_epoch_secs: i64,
+) -> CoordinatorGuidanceView {
+    let fetch = tokio::time::timeout(
+        budget,
+        design_docs.fetch_guidance_file(product.repo_remote_url.as_deref(), file.path),
+    )
+    .await;
+    let (state, owner_repo) = match fetch {
+        Ok(fetch) => (fetch.state, fetch.owner_repo),
+        // The read never finished, so it cannot say which repo it was for.
+        Err(_elapsed) => (
+            CoordinatorGuidanceState::Failed {
+                reason: format!(
+                    "reading `{}` from GitHub did not finish within {}s{}",
+                    file.path,
+                    budget.as_secs(),
+                    file.retry_command
+                        .map(|command| format!("; run `{command} --product {}` to retry", product.id))
+                        .unwrap_or_default()
+                ),
+            },
+            None,
+        ),
+    };
+    let owner_repo = owner_repo.or_else(|| owner_repo_of(product));
+    let state = settle_with_cache(file, work_db, product, owner_repo.as_deref(), state, now_epoch_secs);
+    CoordinatorGuidanceView::builder()
+        .product_id(product.id.clone())
+        .fetched_at(fetched_at)
+        .path(file.path)
+        .product_name(product.name.clone())
+        .state(state)
+        .maybe_owner_repo(owner_repo)
+        .maybe_repo_remote_url(product.repo_remote_url.clone())
+        .build()
+}
+
+fn owner_repo_of(product: &Product) -> Option<String> {
+    let url = product.repo_remote_url.as_deref()?;
+    let (owner, repo) = git_utils::repo_slug::parse_github_owner_repo(url).ok()?;
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Keep the last-known-good cache in step with a fresh read, and use it
+/// when the read failed.
+///
+/// * `Loaded` / `Missing` — the repo answered, so the result is saved as the
+///   product's new last-known-good, replacing any older entry.
+/// * `Failed` — if a saved entry exists for this repo it is served as
+///   [`CoordinatorGuidanceState::Cached`], with the fetch error kept in it;
+///   otherwise the failure is returned unchanged.
+/// * Everything else (over cap, no repo, not GitHub) is passed through. An
+///   over-cap read neither replaces nor clears the cache.
+///
+/// Cache I/O problems are logged and never turn a result into something
+/// else: a failed save still returns the fresh state, a failed load still
+/// returns the original `Failed`.
+fn settle_with_cache(
+    file: GuidanceFile,
+    work_db: &WorkDb,
+    product: &Product,
+    owner_repo: Option<&str>,
+    state: CoordinatorGuidanceState,
+    now_epoch_secs: i64,
+) -> CoordinatorGuidanceState {
+    let Some(owner_repo) = owner_repo else {
+        return state;
+    };
+    match state {
+        CoordinatorGuidanceState::Loaded {
+            ref git_ref,
+            ref markdown,
+            ..
+        } => save_cache(
+            file,
+            work_db,
+            product,
+            owner_repo,
+            git_ref,
+            Some(markdown),
+            now_epoch_secs,
+        ),
+        CoordinatorGuidanceState::Missing { ref git_ref } => {
+            save_cache(file, work_db, product, owner_repo, git_ref, None, now_epoch_secs)
+        }
+        CoordinatorGuidanceState::Failed { reason } => {
+            match work_db.load_guidance_cache(file.cache_namespace, &product.id) {
+                Ok(Some(cached)) if cached.owner_repo == owner_repo => {
+                    tracing::warn!(
+                        path = file.path,
+                        product_id = %product.id,
+                        git_ref = %cached.git_ref,
+                        fetch_error = %reason,
+                        "guidance: GitHub read failed; returning the cached last successful read result"
+                    );
+                    return CoordinatorGuidanceState::Cached {
+                        git_ref: cached.git_ref,
+                        read_at: format_epoch_iso8601(cached.read_at),
+                        fetch_error: reason,
+                        markdown: cached.markdown,
+                    };
+                }
+                Ok(_) => return CoordinatorGuidanceState::Failed { reason },
+                Err(error) => {
+                    tracing::error!(
+                        path = file.path,
+                        product_id = %product.id,
+                        error = %format!("{error:#}"),
+                        "guidance: could not read the last-known-good cache"
+                    );
+                    return CoordinatorGuidanceState::Failed { reason };
+                }
+            }
+        }
+        _ => {}
+    }
+    state
+}
+
+fn save_cache(
+    file: GuidanceFile,
+    work_db: &WorkDb,
+    product: &Product,
+    owner_repo: &str,
+    git_ref: &str,
+    markdown: Option<&str>,
+    now_epoch_secs: i64,
+) {
+    let entry = CachedGuidance {
+        owner_repo: owner_repo.to_owned(),
+        git_ref: git_ref.to_owned(),
+        markdown: markdown.map(str::to_owned),
+        read_at: now_epoch_secs,
+    };
+    if let Err(error) = work_db.save_guidance_cache(file.cache_namespace, &product.id, &entry) {
+        tracing::error!(
+            path = file.path,
+            product_id = %product.id,
+            error = %format!("{error:#}"),
+            "guidance: could not save the last-known-good cache"
+        );
+    }
 }
 
 /// Compact per-product summary for the `coordinator_guidance_brief` audit
@@ -156,6 +346,9 @@ pub(crate) fn audit_summary(guidance: &[CoordinatorGuidanceView]) -> serde_json:
                 let bytes = match &view.state {
                     CoordinatorGuidanceState::Loaded { bytes, .. }
                     | CoordinatorGuidanceState::OverCap { bytes, .. } => Some(*bytes),
+                    CoordinatorGuidanceState::Cached { markdown, .. } => {
+                        markdown.as_ref().map(|text| text.len() as u64)
+                    }
                     _ => None,
                 };
                 json!({
@@ -179,8 +372,11 @@ pub(crate) fn render_brief_section(guidance: &[CoordinatorGuidanceView], error: 
     out.push_str(
         "Each product repo may carry a `BOSS_COORDINATOR.md` at its root with coordinator-only rules for that \
          product. The engine read each one from GitHub at the default branch's HEAD just now; the commit sha shown \
-         is the version you are acting on. These rules bind you for work on that product, alongside your generic \
-         instructions. `boss guidance show [--product <id>]` re-reads at the current HEAD at any time.\n",
+         is the version you are acting on. If GitHub could not be reached for a product, the engine falls back to \
+         the last copy it read successfully and labels it CACHED with its sha, read time and the fetch error: that \
+         copy still binds you, but it may be stale, so retry it. These rules bind you for work on that product, \
+         alongside your generic instructions. `boss guidance show [--product <id>]` re-reads at the current HEAD at \
+         any time.\n",
     );
     if let Some(error) = error {
         out.push_str(&format!(
@@ -196,7 +392,7 @@ pub(crate) fn render_brief_section(guidance: &[CoordinatorGuidanceView], error: 
         out.push_str(&format!("\n### {} ({})\n", view.product_name, view.product_id));
         out.push_str(&view.describe_state());
         out.push('\n');
-        if let CoordinatorGuidanceState::Loaded { markdown, .. } = &view.state {
+        if let Some(markdown) = view.body() {
             out.push_str(&format!("--- {} for {} begins ---\n", view.path, view.product_name));
             out.push_str(markdown.trim_end());
             out.push_str(&format!("\n--- {} for {} ends ---\n", view.path, view.product_name));
@@ -275,6 +471,267 @@ mod tests {
         }
     }
 
+    /// Source whose HEAD probe and blob read are scripted per test.
+    struct ScriptedSource {
+        sha: std::sync::Mutex<Result<String, TreeApiError>>,
+        blob: std::sync::Mutex<Result<String, TreeApiError>>,
+    }
+
+    impl ScriptedSource {
+        fn serving(sha: &str, body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                sha: std::sync::Mutex::new(Ok(sha.to_owned())),
+                blob: std::sync::Mutex::new(Ok(body.to_owned())),
+            })
+        }
+
+        fn serve(&self, sha: &str, body: &str) {
+            *self.sha.lock().unwrap() = Ok(sha.to_owned());
+            *self.blob.lock().unwrap() = Ok(body.to_owned());
+        }
+
+        fn go_offline(&self) {
+            *self.sha.lock().unwrap() = Err(TreeApiError {
+                kind: TreeApiErrorKind::Unreachable,
+                message: "error connecting to api.github.com".to_owned(),
+            });
+        }
+    }
+
+    #[async_trait]
+    impl boss_engine_design_docs::GitHubTreeSource for ScriptedSource {
+        async fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String, TreeApiError> {
+            Ok("main".to_owned())
+        }
+        async fn head_sha(&self, _owner: &str, _repo: &str, _git_ref: &str) -> Result<String, TreeApiError> {
+            self.sha.lock().unwrap().clone()
+        }
+        async fn markdown_tree(&self, _owner: &str, _repo: &str, _sha: &str) -> Result<RepoTree, TreeApiError> {
+            unreachable!()
+        }
+        async fn fetch_blob(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _path: &str,
+            _git_ref: &str,
+            _etag: Option<&str>,
+        ) -> Result<BlobFetch, TreeApiError> {
+            self.blob.lock().unwrap().clone().map(|text| BlobFetch::Content {
+                text,
+                etag: None,
+                rate_limit_remaining: None,
+            })
+        }
+    }
+
+    const MONO: &str = "git@github.com:spinyfin/mono.git";
+    const SHA_OLD: &str = "1111111111111111111111111111111111111111";
+    const SHA_NEW: &str = "2222222222222222222222222222222222222222";
+
+    /// One read of the single product `prod_boss` at `now`.
+    async fn read_at(
+        service: &Arc<DesignDocsService>,
+        db: &WorkDb,
+        now: i64,
+        budget: Duration,
+    ) -> CoordinatorGuidanceView {
+        let boss = product("prod_boss", "Boss", Some(MONO));
+        load_product_guidance(service, db, &[boss], budget, now).await.remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_successful_read_populates_the_cache() {
+        let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
+        let service = Arc::new(DesignDocsService::with_source(source));
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        assert_eq!(db.load_coordinator_guidance_cache("prod_boss").unwrap(), None);
+
+        let view = read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+        assert!(
+            matches!(view.state, CoordinatorGuidanceState::Loaded { .. }),
+            "{:?}",
+            view.state
+        );
+
+        assert_eq!(
+            db.load_coordinator_guidance_cache("prod_boss").unwrap(),
+            Some(CachedGuidance {
+                owner_repo: "spinyfin/mono".to_owned(),
+                git_ref: SHA_OLD.to_owned(),
+                markdown: Some("# rules v1\n".to_owned()),
+                read_at: NOW,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_with_a_cache_serves_it_labelled_with_the_error() {
+        let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
+        let service = Arc::new(DesignDocsService::with_source(source.clone()));
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+
+        source.go_offline();
+        let later = NOW + 3600;
+        let view = read_at(&service, &db, later, Duration::from_secs(5)).await;
+
+        let CoordinatorGuidanceState::Cached {
+            git_ref,
+            read_at: cached_read_at,
+            fetch_error,
+            markdown,
+        } = &view.state
+        else {
+            panic!("expected Cached, got {:?}", view.state);
+        };
+        assert_eq!(git_ref, SHA_OLD);
+        assert_eq!(
+            cached_read_at,
+            &format_epoch_iso8601(NOW),
+            "the label carries the original read time"
+        );
+        assert!(
+            fetch_error.contains("error connecting to api.github.com"),
+            "{fetch_error}"
+        );
+        assert_eq!(markdown.as_deref(), Some("# rules v1\n"));
+        assert_eq!(view.fetched_at, format_epoch_iso8601(later));
+
+        let text = render_brief_section(&[view], None);
+        assert!(text.contains("CACHED (NOT freshly loaded)"), "{text}");
+        assert!(text.contains(SHA_OLD), "{text}");
+        assert!(text.contains(&format_epoch_iso8601(NOW)), "{text}");
+        assert!(text.contains("error connecting to api.github.com"), "{text}");
+        assert!(text.contains("may be newer upstream"), "{text}");
+        assert!(text.contains("boss guidance show --product prod_boss"), "{text}");
+        assert!(
+            text.contains(
+                "--- BOSS_COORDINATOR.md for Boss begins ---\n# rules v1\n--- BOSS_COORDINATOR.md for Boss ends ---"
+            ),
+            "the cached body is still delivered: {text}"
+        );
+        assert!(
+            !text.contains("LOADED from"),
+            "never presented as freshly loaded: {text}"
+        );
+        assert!(!text.contains("FETCH FAILED"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_without_a_cache_still_reports_fetch_failed() {
+        let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
+        source.go_offline();
+        let service = Arc::new(DesignDocsService::with_source(source));
+        let db = WorkDb::open(":memory:".into()).unwrap();
+
+        let view = read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+
+        assert!(
+            matches!(&view.state, CoordinatorGuidanceState::Failed { reason } if reason.contains("error connecting to api.github.com")),
+            "{:?}",
+            view.state
+        );
+        assert!(
+            view.describe_state().starts_with("FETCH FAILED"),
+            "{}",
+            view.describe_state()
+        );
+        assert_eq!(db.load_coordinator_guidance_cache("prod_boss").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_newer_successful_read_replaces_the_cache_entry() {
+        let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
+        let service = Arc::new(DesignDocsService::with_source(source.clone()));
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+
+        source.serve(SHA_NEW, "# rules v2\n");
+        read_at(&service, &db, NOW + 60, Duration::from_secs(5)).await;
+        let cached = db.load_coordinator_guidance_cache("prod_boss").unwrap().unwrap();
+        assert_eq!(cached.git_ref, SHA_NEW);
+        assert_eq!(cached.markdown.as_deref(), Some("# rules v2\n"));
+        assert_eq!(cached.read_at, NOW + 60);
+
+        source.go_offline();
+        let view = read_at(&service, &db, NOW + 120, Duration::from_secs(5)).await;
+        assert!(
+            matches!(&view.state, CoordinatorGuidanceState::Cached { git_ref, markdown, .. } if git_ref == SHA_NEW && markdown.as_deref() == Some("# rules v2\n")),
+            "the fallback serves the newest read, not the first: {:?}",
+            view.state
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_missing_result_falls_back_labelled_as_cached() {
+        let source = ScriptedSource::serving(SHA_OLD, "");
+        *source.blob.lock().unwrap() = Err(TreeApiError {
+            kind: TreeApiErrorKind::NotFound,
+            message: "HTTP 404".to_owned(),
+        });
+        let service = Arc::new(DesignDocsService::with_source(source.clone()));
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        let first = read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+        assert!(
+            matches!(first.state, CoordinatorGuidanceState::Missing { .. }),
+            "{:?}",
+            first.state
+        );
+
+        source.go_offline();
+        let view = read_at(&service, &db, NOW + 60, Duration::from_secs(5)).await;
+        assert!(
+            matches!(&view.state, CoordinatorGuidanceState::Cached { git_ref, markdown: None, .. } if git_ref == SHA_OLD),
+            "{:?}",
+            view.state
+        );
+        let line = view.describe_state();
+        assert!(line.starts_with("CACHED"), "{line}");
+        assert!(line.contains("had no `BOSS_COORDINATOR.md`"), "{line}");
+        assert_eq!(view.body(), None);
+    }
+
+    #[tokio::test]
+    async fn a_budget_overrun_falls_back_to_the_cache_and_names_the_overrun() {
+        let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
+        let service = Arc::new(DesignDocsService::with_source(source));
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+
+        // A different service whose blob read hangs: nothing fresh arrives
+        // within the budget, and the cache answers.
+        let hanging = Arc::new(DesignDocsService::with_source(Arc::new(HangingSource {
+            head_calls: AtomicUsize::new(0),
+        })));
+        let view = read_at(&hanging, &db, NOW + 60, Duration::from_millis(50)).await;
+        assert!(
+            matches!(&view.state, CoordinatorGuidanceState::Cached { fetch_error, .. } if fetch_error.contains("did not finish within")),
+            "{:?}",
+            view.state
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_from_another_repo_is_never_served() {
+        let source = ScriptedSource::serving(SHA_OLD, "# rules v1\n");
+        let service = Arc::new(DesignDocsService::with_source(source.clone()));
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+
+        // The product is repointed at a different repo, which is unreachable.
+        source.go_offline();
+        let moved = product("prod_boss", "Boss", Some("git@github.com:acme/elsewhere.git"));
+        let view = load_product_guidance(&service, &db, &[moved], Duration::from_secs(5), NOW + 60)
+            .await
+            .remove(0);
+        assert!(
+            matches!(view.state, CoordinatorGuidanceState::Failed { .. }),
+            "{:?}",
+            view.state
+        );
+    }
+
     #[tokio::test]
     async fn every_product_gets_an_entry_and_a_budget_overrun_is_a_named_failure() {
         let source = Arc::new(HangingSource {
@@ -286,7 +743,8 @@ mod tests {
             product("prod_b", "Beta", None),
             product("prod_c", "Gamma", Some("https://gitlab.com/acme/gamma.git")),
         ];
-        let views = load_product_guidance(&service, &products, Duration::from_millis(50), NOW).await;
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        let views = load_product_guidance(&service, &db, &products, Duration::from_millis(50), NOW).await;
         assert_eq!(views.len(), 3, "one entry per product, no omissions");
         assert_eq!(views[0].product_id, "prod_a");
         assert!(
@@ -382,6 +840,25 @@ mod tests {
     }
 
     #[test]
+    fn audit_summary_reports_a_cached_entry_with_its_sha_and_size() {
+        let boss = product("prod_boss", "Boss", Some(MONO));
+        let summary = audit_summary(&[view(
+            &boss,
+            CoordinatorGuidanceState::Cached {
+                git_ref: SHA.to_owned(),
+                read_at: "2026-10-09T00:00:00Z".to_owned(),
+                fetch_error: "could not reach GitHub".to_owned(),
+                markdown: Some("# SECRET-SHAPED BODY".to_owned()),
+            },
+        )]);
+        let rendered = summary.to_string();
+        assert!(rendered.contains("\"state\":\"cached\""), "{rendered}");
+        assert!(rendered.contains(SHA), "{rendered}");
+        assert!(rendered.contains("\"bytes\":20"), "{rendered}");
+        assert!(!rendered.contains("SECRET-SHAPED"), "{rendered}");
+    }
+
+    #[test]
     fn brief_section_with_no_products_says_so() {
         let text = render_brief_section(&[], None);
         assert!(text.contains("No products are registered"), "{text}");
@@ -452,5 +929,214 @@ mod tests {
         .unwrap();
         let ids: Vec<String> = guidance_products(&db).unwrap().into_iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![with_repo.id, without_repo.id]);
+    }
+
+    // ── The per-repo worker file (`BOSS.md`) ─────────────────────────────
+
+    mod worker_file {
+        use boss_execution_runner::repo_guidance::{RepoGuidanceSource, render_block};
+
+        use super::*;
+        use crate::repo_boss_guidance::RepoBossGuidanceLoader;
+
+        fn loader(source: Arc<ScriptedSource>, db: &Arc<WorkDb>) -> RepoBossGuidanceLoader {
+            RepoBossGuidanceLoader::new(Arc::new(DesignDocsService::with_source(source)), db.clone())
+        }
+
+        fn boss_product() -> Product {
+            product("prod_boss", "Boss", Some(MONO))
+        }
+
+        fn open_db() -> Arc<WorkDb> {
+            Arc::new(WorkDb::open(":memory:".into()).unwrap())
+        }
+
+        #[tokio::test]
+        async fn a_present_file_is_loaded_and_the_marker_names_the_sha() {
+            let db = open_db();
+            let loader = loader(ScriptedSource::serving(SHA_OLD, "- attach screenshots\n"), &db);
+            let view = loader.read(&boss_product()).await;
+            assert_eq!(view.path, "BOSS.md");
+            assert!(
+                matches!(view.state, CoordinatorGuidanceState::Loaded { .. }),
+                "{:?}",
+                view.state
+            );
+            let block = render_block(&view).unwrap();
+            assert!(
+                block.starts_with(&format!("[repo-boss-guidance repo=spinyfin/mono sha={SHA_OLD}]")),
+                "{block}"
+            );
+            assert!(block.contains("- attach screenshots"), "{block}");
+        }
+
+        #[tokio::test]
+        async fn a_repo_without_the_file_gets_nothing_not_even_a_note() {
+            let db = open_db();
+            let source = ScriptedSource::serving(SHA_OLD, "ignored");
+            *source.blob.lock().unwrap() = Err(TreeApiError {
+                kind: TreeApiErrorKind::NotFound,
+                message: "HTTP 404".to_owned(),
+            });
+            let view = loader(source, &db).read(&boss_product()).await;
+            assert!(
+                matches!(view.state, CoordinatorGuidanceState::Missing { .. }),
+                "{:?}",
+                view.state
+            );
+            assert_eq!(render_block(&view), None);
+        }
+
+        #[tokio::test]
+        async fn an_over_cap_file_injects_no_text_and_leaves_a_note() {
+            let db = open_db();
+            let big = "x".repeat(boss_engine_design_docs::MAX_REPO_GUIDANCE_BYTES as usize + 1);
+            let view = loader(ScriptedSource::serving(SHA_OLD, &big), &db)
+                .read(&boss_product())
+                .await;
+            assert!(
+                matches!(view.state, CoordinatorGuidanceState::OverCap { .. }),
+                "{:?}",
+                view.state
+            );
+            let block = render_block(&view).unwrap();
+            assert!(!block.contains("xxxx"), "the oversized text must not be injected");
+            assert!(block.contains("over the 32768-byte cap"), "{block}");
+            assert!(block.contains(&format!("sha={SHA_OLD}")), "{block}");
+        }
+
+        #[tokio::test]
+        async fn a_fetch_failure_serves_the_cached_copy_labelled_with_sha_and_read_time() {
+            let db = open_db();
+            let source = ScriptedSource::serving(SHA_OLD, "- the rule\n");
+            let loader = loader(source.clone(), &db);
+            loader.read(&boss_product()).await;
+            let saved = db
+                .load_guidance_cache(boss_work_db_namespace(), "prod_boss")
+                .unwrap()
+                .expect("a successful read is saved as last-known-good");
+            assert_eq!(saved.git_ref, SHA_OLD);
+
+            source.go_offline();
+            let view = loader.read(&boss_product()).await;
+            let CoordinatorGuidanceState::Cached { git_ref, .. } = &view.state else {
+                panic!("expected Cached, got {:?}", view.state);
+            };
+            assert_eq!(git_ref, SHA_OLD);
+            let block = render_block(&view).unwrap();
+            assert!(
+                block.starts_with(&format!(
+                    "[repo-boss-guidance repo=spinyfin/mono sha={SHA_OLD} cached read_at="
+                )),
+                "{block}"
+            );
+            assert!(block.contains("error connecting to api.github.com"), "{block}");
+            assert!(block.contains("- the rule"), "{block}");
+        }
+
+        #[tokio::test]
+        async fn a_fetch_failure_with_no_cached_copy_leaves_a_visible_note() {
+            let db = open_db();
+            let source = ScriptedSource::serving(SHA_OLD, "- the rule\n");
+            source.go_offline();
+            let view = loader(source, &db).read(&boss_product()).await;
+            assert!(
+                matches!(view.state, CoordinatorGuidanceState::Failed { .. }),
+                "{:?}",
+                view.state
+            );
+            let block = render_block(&view).unwrap();
+            assert!(block.contains("could not be loaded"), "{block}");
+            assert!(block.contains("error connecting to api.github.com"), "{block}");
+        }
+
+        #[tokio::test]
+        async fn a_cached_missing_result_leaves_a_visible_note_during_an_outage() {
+            let db = open_db();
+            let source = ScriptedSource::serving(SHA_OLD, "ignored");
+            *source.blob.lock().unwrap() = Err(TreeApiError {
+                kind: TreeApiErrorKind::NotFound,
+                message: "HTTP 404".to_owned(),
+            });
+            let loader = loader(source.clone(), &db);
+            loader.read(&boss_product()).await;
+            source.go_offline();
+            let view = loader.read(&boss_product()).await;
+            assert!(
+                matches!(view.state, CoordinatorGuidanceState::Cached { markdown: None, .. }),
+                "{:?}",
+                view.state
+            );
+            let block = render_block(&view).unwrap();
+            assert!(block.contains("could not be loaded"), "{block}");
+            assert!(block.contains("error connecting to api.github.com"), "{block}");
+            assert!(block.contains("found no file"), "{block}");
+        }
+
+        #[tokio::test]
+        async fn a_worker_timeout_note_does_not_suggest_the_coordinator_command() {
+            let db = open_db();
+            let service = Arc::new(DesignDocsService::with_source(Arc::new(HangingSource {
+                head_calls: AtomicUsize::new(0),
+            })));
+            for cached in [false, true] {
+                if cached {
+                    loader(ScriptedSource::serving(SHA_OLD, "- rule"), &db)
+                        .read(&boss_product())
+                        .await;
+                }
+                let view =
+                    load_product_guidance_file(REPO_BOSS_FILE, &service, &db, &[boss_product()], Duration::ZERO, NOW)
+                        .await
+                        .remove(0);
+                assert_eq!(matches!(&view.state, CoordinatorGuidanceState::Cached { .. }), cached);
+                let block = render_block(&view).unwrap();
+                assert!(
+                    block.contains("reading `BOSS.md` from GitHub did not finish within 0s"),
+                    "{block}"
+                );
+                assert!(!block.contains("boss guidance show"), "{block}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_coordinator_cache_never_answers_for_the_worker_file() {
+            let db = open_db();
+            // A coordinator read succeeds and is cached...
+            let coordinator_source = ScriptedSource::serving(SHA_OLD, "# coordinator rules\n");
+            let service = Arc::new(DesignDocsService::with_source(coordinator_source));
+            read_at(&service, &db, NOW, Duration::from_secs(5)).await;
+            // ...then the worker file's read fails with no worker entry of its own.
+            let worker_source = ScriptedSource::serving(SHA_OLD, "x");
+            worker_source.go_offline();
+            let view = loader(worker_source, &db).read(&boss_product()).await;
+            assert!(
+                matches!(view.state, CoordinatorGuidanceState::Failed { .. }),
+                "{:?}",
+                view.state
+            );
+        }
+
+        #[tokio::test]
+        async fn a_new_head_sha_is_what_the_next_dispatch_carries() {
+            let db = open_db();
+            let source = ScriptedSource::serving(SHA_OLD, "- v1\n");
+            let loader = loader(source.clone(), &db);
+            let first = render_block(&loader.read(&boss_product()).await).unwrap();
+            source.serve(SHA_NEW, "- v2\n");
+            let second = render_block(&loader.read(&boss_product()).await).unwrap();
+            assert!(
+                first.contains(&format!("sha={SHA_OLD}")) && first.contains("- v1"),
+                "{first}"
+            );
+            assert!(
+                second.contains(&format!("sha={SHA_NEW}")) && second.contains("- v2"),
+                "{second}"
+            );
+        }
+
+        fn boss_work_db_namespace() -> &'static str {
+            crate::work::REPO_BOSS_GUIDANCE_CACHE_NAMESPACE
+        }
     }
 }

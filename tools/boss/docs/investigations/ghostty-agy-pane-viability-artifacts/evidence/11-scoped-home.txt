@@ -1,0 +1,209 @@
+Scoped HOME in a pane
+=====================
+
+Where agy keeps its sign-in
+  Neither binary contains the strings oauth_creds, google_accounts or trustedFolders (strings | grep: 0 hits each);
+  both link zalando/go-keyring and name /usr/bin/security. ~/.gemini/oauth_creds.json, google_accounts.json,
+  trustedFolders.json and ~/.gemini/settings.json (security.auth.selectedType) are not agy's files.
+
+  /usr/bin/security under the real HOME:
+         "<home>/Library/Keychains/login.keychain-db"
+         "/Library/Keychains/System.keychain"
+  /usr/bin/security under an empty scoped HOME (env -i HOME=<scoped> ...):
+         "/Library/Keychains/System.keychain"
+      security: SecKeychainCopyDefault: A default keychain could not be found.
+  /usr/bin/security under a scoped HOME holding one symlink, Library/Keychains/login.keychain-db -> the host's:
+         "<home>/Library/Keychains/login.keychain-db"
+         "/Library/Keychains/System.keychain"
+
+  agy 1.1.12, `agy models`, empty scoped HOME: exit 1
+      Fetching available models...
+      Error: Please sign in to view available models. Launch the CLI without arguments to sign in.
+  agy 1.1.12, `agy models`, scoped HOME with the keychain symlink: exit 0, 10 models listed; from its log:
+      keyring.go:81] keyringAuth: loaded token, expiry=2026-11-11 04:15:19.416234 -0600 CST expired=false
+      auth.go:147] ChainedAuth: authenticated via keyring (effective: keyring)
+      server_oauth.go:194] OAuth: authenticated successfully as <account-email>
+  agy 1.5.5, `agy models`, empty scoped HOME: exit 1
+      Fetching available models...
+      Error: Please sign in to view available models. Launch the CLI without arguments to sign in.
+  agy 1.5.5, `agy models`, scoped HOME with the keychain symlink: exit 0, 16 models listed; from its log:
+      keyring.go:64] keyringAuth: loaded token, expiry=2026-11-11 04:15:19.416234 -0600 CST expired=false
+      auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)
+      server_oauth.go:226] OAuth: authenticated successfully as <account-email>
+
+  State tree created by one `agy models` under an empty scoped HOME (agy 1.5.5; depth 3):
+      .
+      ./.gemini
+      ./.gemini/antigravity-cli
+      ./.gemini/antigravity-cli/brain
+      ./.gemini/antigravity-cli/builtin
+      ./.gemini/antigravity-cli/cache
+      ./.gemini/antigravity-cli/cache/default_project_id.txt
+      ./.gemini/antigravity-cli/cli.log
+      ./.gemini/antigravity-cli/conversation_summaries.db
+      ./.gemini/antigravity-cli/conversation_summaries.db-shm
+      ./.gemini/antigravity-cli/conversation_summaries.db-wal
+      ./.gemini/antigravity-cli/conversations
+      ./.gemini/antigravity-cli/crashes
+      ./.gemini/antigravity-cli/installation_id
+      ./.gemini/antigravity-cli/jetski_state.pbtxt
+      ./.gemini/antigravity-cli/last_check.timestamp
+      ./.gemini/antigravity-cli/log
+      ./.gemini/antigravity-cli/log/cli-20261111_033844.log
+      ./.gemini/antigravity-cli/updater
+      ./.gemini/antigravity-cli/updater/update_status.json
+      ./.gemini/antigravity-cli/updater/update.lock
+      ./.gemini/config
+      ./.gemini/config/.migrated
+      ./.gemini/config/config.json
+      ./.gemini/config/mcp_config.json
+      ./.gemini/config/projects
+      ./.gemini/config/projects/default-cli-project.json
+  agy 1.1.12 additionally created Library/Caches/ms-playwright-go/ under the scoped HOME.
+
+  Token refresh through the bridge. The keychain token was due to expire at 04:15:19. Two processes refreshed it,
+  about 100 seconds apart, and each wrote the result back to the same keychain item:
+      04:14:07  a scoped-HOME 1.5.5 session of this study (scenario hideaccount):
+                browser.go:265] token refreshed, new expiry=2026-11-11 05:14:06.645874 -0600 CST
+      04:15:50  the agy session already running in the real home directory, outside this study (its own log holds
+                one "token refreshed" line; the new expiry it wrote is what later sessions loaded)
+  What scoped sessions of both versions loaded from the keychain, by time of start:
+      03:49:46 onward  keyringAuth: loaded token, expiry=2026-11-11 04:15:19
+      04:14:23 onward  keyringAuth: loaded token, expiry=2026-11-11 05:14:06
+      04:15:53 onward  keyringAuth: loaded token, expiry=2026-11-11 05:15:50
+  No session on either side failed to authenticate before, between or after the two refreshes.
+
+
+agy 1.1.12: what a tool child process sees (scenario home; the brief runs one shell command that writes this file)
+  pane shell exported: HOME=<scoped home>, AGY_CLI_DISABLE_AUTO_UPDATE=true, SPIKE_CANARY=set-in-pane-shell
+
+    HOME=<run:home-1.1.12>/home
+    USER=<user>
+    PWD=<run:home-1.1.12>/ws/repo
+    SPIKE_CANARY=set-in-pane-shell
+    TERM=dumb
+    git_user=none
+    keychain="<home>/Library/Keychains/login.keychain-db"
+    env_count=32
+    _ __CF_USER_TEXT_ENCODING AGY_CLI_DISABLE_AUTO_UPDATE ANTIGRAVITY_AGENT ANTIGRAVITY_AGENTAPI_EXE ANTIGRAVITY_CONVERSATION_ID ANTIGRAVITY_CSRF_TOKEN ANTIGRAVITY_LS_ADDRESS ANTIGRAVITY_LS_VERSION ANTIGRAVITY_PROJECT_ID ANTIGRAVITY_SOURCE_METADATA ANTIGRAVITY_TRAJECTORY_ID COLORTERM GIT_PAGER HOME LANG LOGNAME OLDPWD PAGER PATH PWD SHELL SHLVL SPIKE_CANARY SSH_AUTH_SOCK TERM TERM_PROGRAM TERM_PROGRAM_VERSION TMPDIR TMUX TMUX_PANE USER 
+
+  what a hook process sees:
+    event=Stop
+    pwd=<run:home-1.1.12>/home/.gemini/config
+    HOME=<run:home-1.1.12>/home
+    AGY_CLI_DISABLE_AUTO_UPDATE=true
+    ANTIGRAVITY_CONVERSATION_ID=fe3e4849-fd3e-4df3-a9aa-568f1b2b3641
+    PWD=<run:home-1.1.12>/home/.gemini/config
+    TERM=tmux-256color
+    TMUX_PANE=%52
+    TMUX=s,57779,52
+
+  resize of the GhosttyKit surface while idle:
+    520x330 pt  -> dead=0 status= pid=7538 size=64x19 cmd=Python alt=0 cursor=2,16
+    1200x760 pt -> dead=0 status= pid=7538 size=149x44 cmd=Python alt=0 cursor=2,25
+    hooks: SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop  (the last turn is a probe typed after the resize)
+
+  files under the scoped HOME after the session (builtin/ and cache/marketplaces/ omitted):
+    ./.gemini/antigravity-cli/bin/agentapi
+    ./.gemini/antigravity-cli/bin/webm_encoder
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/chunks/transcript_full/00000000.jsonl
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/chunks/transcript/00000000.jsonl
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/transcript_full.jsonl
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/transcript.jsonl
+    ./.gemini/antigravity-cli/cache/default_project_id.txt
+    ./.gemini/antigravity-cli/cache/last_conversations.json
+    ./.gemini/antigravity-cli/cache/onboarding.json
+    ./.gemini/antigravity-cli/conversation_summaries.db
+    ./.gemini/antigravity-cli/conversations/<cid>.db
+    ./.gemini/antigravity-cli/history.jsonl
+    ./.gemini/antigravity-cli/implicit/<cid>.pb
+    ./.gemini/antigravity-cli/installation_id
+    ./.gemini/antigravity-cli/jetski_state.pbtxt
+    ./.gemini/antigravity-cli/knowledge/knowledge.lock
+    ./.gemini/antigravity-cli/presence/<cid>.lock
+    ./.gemini/antigravity-cli/settings.json
+    ./.gemini/config/.migrated
+    ./.gemini/config/config.json
+    ./.gemini/config/hooks.json
+    ./.gemini/config/mcp_config.json
+    ./.gemini/config/projects/default-cli-project.json
+    ./Library/Keychains/login.keychain-db
+
+agy 1.5.5: what a tool child process sees (scenario home; the brief runs one shell command that writes this file)
+  pane shell exported: HOME=<scoped home>, AGY_CLI_DISABLE_AUTO_UPDATE=true, SPIKE_CANARY=set-in-pane-shell
+
+    HOME=<run:home-1.5.5>/home
+    USER=<user>
+    PWD=<run:home-1.5.5>/ws/repo
+    SPIKE_CANARY=set-in-pane-shell
+    TERM=dumb
+    git_user=none
+    keychain="<home>/Library/Keychains/login.keychain-db"
+    env_count=37
+    _ __CF_USER_TEXT_ENCODING AGY_CLI_DISABLE_AUTO_UPDATE ANTIGRAVITY_AGENT ANTIGRAVITY_AGENTAPI_EXE ANTIGRAVITY_APP_DATA_DIR ANTIGRAVITY_CONVERSATION_ID ANTIGRAVITY_CSRF_TOKEN ANTIGRAVITY_LS_ADDRESS ANTIGRAVITY_LS_VERSION ANTIGRAVITY_PROJECT_ID ANTIGRAVITY_SOURCE_METADATA ANTIGRAVITY_TRAJECTORY_ID COLORTERM GIT_EDITOR GIT_PAGER HGEDITOR HOME JJ_EDITOR JJ_PAGER LANG LOGNAME OLDPWD PAGER PATH PWD SHELL SHLVL SPIKE_CANARY SSH_AUTH_SOCK TERM TERM_PROGRAM TERM_PROGRAM_VERSION TMPDIR TMUX TMUX_PANE USER 
+
+  what a hook process sees:
+    event=Stop
+    pwd=<run:home-1.5.5>/home/.gemini/config
+    HOME=<run:home-1.5.5>/home
+    AGY_CLI_DISABLE_AUTO_UPDATE=true
+    ANTIGRAVITY_CONVERSATION_ID=ee51fade-a19c-42d1-bf36-e96a9c531813
+    PWD=<run:home-1.5.5>/home/.gemini/config
+    TERM=tmux-256color
+    TMUX_PANE=%25
+    TMUX=s,57779,25
+
+  resize of the GhosttyKit surface while idle:
+    520x330 pt  -> dead=0 status= pid=95132 size=64x19 cmd=Python alt=0 cursor=2,16
+    1200x760 pt -> dead=0 status= pid=95132 size=149x44 cmd=Python alt=0 cursor=2,24
+    hooks: SessionStart PreInvocation PreToolUse PostToolUse PostInvocation PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop  (the last turn is a probe typed after the resize)
+
+  files under the scoped HOME after the session (builtin/ and cache/marketplaces/ omitted):
+    ./.gemini/antigravity-cli/annotations/<cid>.pbtxt
+    ./.gemini/antigravity-cli/bin/agentapi
+    ./.gemini/antigravity-cli/bin/webm_encoder
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/chunks/transcript_full/00000000.jsonl
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/chunks/transcript/00000000.jsonl
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/transcript_full.jsonl
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/transcript.jsonl
+    ./.gemini/antigravity-cli/brain/<cid>/.system_generated/steps/2/output.txt
+    ./.gemini/antigravity-cli/cache/default_project_id.txt
+    ./.gemini/antigravity-cli/cache/last_conversations.json
+    ./.gemini/antigravity-cli/cache/onboarding.json
+    ./.gemini/antigravity-cli/conversation_summaries.db
+    ./.gemini/antigravity-cli/conversations/<cid>.db
+    ./.gemini/antigravity-cli/history.jsonl
+    ./.gemini/antigravity-cli/implicit/<cid>.pb
+    ./.gemini/antigravity-cli/installation_id
+    ./.gemini/antigravity-cli/jetbox_summaries_proto.pb
+    ./.gemini/antigravity-cli/jetski_state.pbtxt
+    ./.gemini/antigravity-cli/presence/<cid>.lock
+    ./.gemini/antigravity-cli/settings.json
+    ./.gemini/config/.migrated
+    ./.gemini/config/config.json
+    ./.gemini/config/hooks.json
+    ./.gemini/config/mcp_config.json
+    ./.gemini/config/projects/default-cli-project.json
+    ./Library/Keychains/login.keychain-db
+
+The operator's own ~/.gemini, before and after
+  Inventory (path, mtime, size; builtin/ and marketplaces/ omitted) taken at 03:36 before the first scoped run and
+  again after the last one: 117 entries before, 115 after. Differences:
+      53,55c53
+      < <home>/.gemini/antigravity-cli/conversation_summaries.db mtime=1794388887 size=69632
+      < <home>/.gemini/antigravity-cli/conversation_summaries.db-shm mtime=1794388991 size=32768
+      < <home>/.gemini/antigravity-cli/conversation_summaries.db-wal mtime=1794388991 size=115392
+      ---
+      > <home>/.gemini/antigravity-cli/conversation_summaries.db mtime=1794390681 size=69632
+      81c79
+      < <home>/.gemini/antigravity-cli/log/cli-20261111_032051.log mtime=1794389571 size=18094
+      ---
+      > <home>/.gemini/antigravity-cli/log/cli-20261111_032051.log mtime=1794392811 size=20977
+  Both changed files belong to an agy session that was already running in the operator's home directory, outside
+  this study (pid 95480, started 03:20:50): it holds that log open for writing, and the summaries database is its
+  own. No scoped run names either path; every scoped run's log shows appDataDir under its own HOME.
+      lsof -p 95480: fd 1w <home>/.gemini/antigravity-cli/log/cli-20261111_032051.log
+      lsof -p 95480: fd 2w <home>/.gemini/antigravity-cli/log/cli-20261111_032051.log
+
+  What the scoped runs did share with the operator: the login keychain item (read on every start; rewritten once,
+  by the token refresh shown above).

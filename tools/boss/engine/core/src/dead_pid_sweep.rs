@@ -120,10 +120,11 @@ use std::time::Duration;
 
 use boss_protocol::{LiveWorkerState, WorkExecution};
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
+use boss_execution_contracts::{CubeClient, worker_id_for_slot};
 
 /// Grace period after `started_at` (epoch seconds) during which we
 /// skip PID probing. Guards against racing a fresh dispatch whose pane
@@ -236,8 +237,11 @@ pub async fn run_one_pass(
             continue;
         }
 
-        // Skip terminal slots — the completion path handles these.
-        if state.activity.is_terminal() {
+        // Skip terminal slots the completion path already owns. Confirmed
+        // death that only froze display (`observed_dead`) still needs this
+        // pass: the live-status refresh guard marks Terminated without
+        // releasing the registry entry or pool claim.
+        if state.activity.is_terminal() && !live_states.is_observed_dead(&state.run_id) {
             continue;
         }
 
@@ -253,8 +257,14 @@ pub async fn run_one_pass(
         };
 
         // Skip executions already in a terminal DB state (completion
-        // path may have raced the sweep).
+        // path may have raced the sweep), except observed-dead slots
+        // whose process is also gone: drop the retained registry entry
+        // so pool_claim_sweep can release the claim.
         if execution.status.is_terminal() {
+            if live_states.is_observed_dead(execution_id) && matches!(probe_pid(state.shell_pid), PidStatus::Dead) {
+                release_reaped_execution(live_states, &coordinator, &state).await;
+                outcome.reaped += 1;
+            }
             continue;
         }
 
@@ -435,7 +445,7 @@ async fn reap_live_nonterminal_worker(
         return false;
     };
 
-    if state.activity.is_terminal() {
+    if state.activity.is_terminal() && !matches!(evidence, DeathEvidence::TmuxObservation) {
         // Already finalized via the normal completion path; nothing to do.
         return false;
     }
@@ -644,11 +654,14 @@ async fn reap_dead_execution(
         return false;
     }
 
+    // Freeze status before slow teardown/backup work yields to the summarizer.
+    live_states.mark_terminated(execution_id);
+
     // Every dead-worker reap removes this slot from the live-state registry.
     // Resolve the work item's stale-worker attention before that happens so
     // the periodic sweep, the pane-input path, and tmux-observed death path
     // cannot strand an attention item after the slot is gone.
-    crate::stale_worker_sweep::resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+    crate::stale_worker_sweep::resolve_stale_worker_attention_for_execution(work_db, execution);
 
     // Reap termination path (dead-pid reconcile): tear down any
     // driver-owned state outside the workspace. `mark_execution_orphaned`
@@ -662,15 +675,11 @@ async fn reap_dead_execution(
     )
     .await;
 
-    // Export supplementary patch evidence from the recorded shared-store ref.
-    // Inspection failures raise attention; they never read the old workspace.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
     // Append [engine-reconcile] audit line to the task description
-    // so a human inspecting the chore can see why it was reset (and
-    // where to find the recovery patch, if one was captured).
+    // so a human inspecting the chore can see why it was reset.
     let detection_source = evidence.audit_source();
-    if let Some(work_item_id) = &state.work_item_id
+    if execution.kind.holds_cube_lease()
+        && let Some(work_item_id) = &state.work_item_id
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
             work_item_id,
@@ -678,7 +687,6 @@ async fn reap_dead_execution(
             &format!(
                 "dead worker (exec {execution_id}) detected via {detection_source}; chore reset to todo for redispatch"
             ),
-            recovery_patch.as_deref(),
         )
     {
         tracing::warn!(
@@ -692,11 +700,17 @@ async fn reap_dead_execution(
     // but THIS reap's redispatch path is the plain orphan-active sweep, which
     // creates an entirely fresh execution with no memory of the old lease — so
     // release here or the workspace stays leased to a terminal row forever.
-    if let Some(lease_id) = execution.cube_lease_id.as_deref() {
-        crate::execution_liveness::force_release_lease_best_effort(
-            execution_id,
-            lease_id,
-            cube_client.force_release_lease(lease_id, Some("dead-pid reconcile: worker process gone")),
+    if execution.cube_lease_id.is_some() {
+        crate::workspace_lease_release::release_lease_after_inferred_death(
+            work_db,
+            execution,
+            crate::workspace_lease_release::PaneStatus::Gone,
+            None,
+            Some(cube_client),
+            cube_client.force_release_lease(
+                execution.cube_lease_id.as_deref().expect("lease checked"),
+                Some("dead-pid reconcile: worker process gone"),
+            ),
         )
         .await;
     }
@@ -725,9 +739,6 @@ async fn reap_dead_execution(
         "dead_pid": state.shell_pid,
         "slot_id": state.slot_id,
         "detection_source": evidence.as_str(),
-        "recovery_patch": recovery_patch
-            .as_deref()
-            .map(|p| p.display().to_string()),
     });
     if let Some(observation) = probe_observation
         && let Some(obj) = details.as_object_mut()
@@ -746,23 +757,25 @@ async fn reap_dead_execution(
     true
 }
 
-/// Remove a reaped run's live-state entry and release its pool claim only
-/// while that claim still belongs to the reaped execution. Reapers that own
-/// pane teardown may already have done both operations; the execution-id
-/// guard makes the second call harmless if dispatch has re-claimed the slot.
+/// Remove a reaped run's live-state entry and release its pool claim, each
+/// keyed by the reaped run rather than by slot. Reapers that own pane teardown
+/// may already have done both operations, and their awaited release can have
+/// handed the slot to a new run that has since registered live state. Both
+/// halves are therefore no-ops unless the entry or claim still belongs to the
+/// reaped run, so a replacement keeps its live state, driver evidence and claim.
 pub(crate) async fn release_reaped_execution(
     live_states: &LiveWorkerStateRegistry,
     coordinator: &Arc<ExecutionCoordinator>,
     state: &LiveWorkerState,
 ) {
-    live_states.release_slot(state.slot_id);
+    live_states.release_slot_for_run(&state.run_id);
     let worker_id = worker_id_for_slot(state.slot_id);
     coordinator
         .release_pool_claim_if_execution(&worker_id, &state.run_id)
         .await;
 }
 
-pub(crate) enum PidStatus {
+pub enum PidStatus {
     Alive,
     Dead,
     PermissionDenied,
@@ -774,7 +787,7 @@ pub(crate) enum PidStatus {
 /// - Returns `Dead` when `ESRCH` (no such process).
 /// - Returns `PermissionDenied` when `EPERM` (process exists, not ours).
 /// - Returns `Unknown` on any other error; caller skips conservatively.
-pub(crate) fn probe_pid(pid: i32) -> PidStatus {
+pub fn probe_pid(pid: i32) -> PidStatus {
     // SAFETY: kill(pid, 0) sends no signal; it only checks whether
     // the process exists and we have permission to signal it. The
     // `pid` value comes from the OS-reported shell_pid at spawn time.
@@ -793,8 +806,9 @@ pub(crate) fn probe_pid(pid: i32) -> PidStatus {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
-    use boss_protocol::WorkItemBinding;
+    use boss_protocol::{WorkItemBinding, WorkerActivity};
 
     use super::*;
     use crate::dispatch_events::RecordingDispatchEventSink;
@@ -885,6 +899,45 @@ mod tests {
     }
 
     // ─── tests ───────────────────────────────────────────────────────────────
+
+    /// A replacement admitted into the slot between the reaper's release and
+    /// the shared cleanup keeps its live-state entry and its pool claim.
+    #[tokio::test]
+    async fn reaped_cleanup_leaves_a_replacement_run_in_the_same_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let coordinator = Arc::new(crate::coordinator::ExecutionCoordinator::new(
+            db,
+            boss_execution_contracts::WorkerPool::new(1),
+            Arc::new(NoopCube),
+            Arc::new(NoopRunner),
+        ));
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot_with_binding(&live_states, 1, "old-run", 1, "item-old");
+        let reaped = live_states.snapshot().pop().unwrap();
+        let worker = coordinator.worker_pool().claim_worker("old-run", None).await.unwrap();
+
+        // The reaper's release already freed the slot and admitted a new run.
+        live_states.release_slot_for_run("old-run");
+        coordinator.release_worker_and_kick(&worker, "old-run", None).await;
+        coordinator
+            .worker_pool()
+            .claim_worker("replacement", None)
+            .await
+            .unwrap();
+        register_slot_with_binding(&live_states, 1, "replacement", 1, "item-new");
+
+        coordinator.scheduling_active().store(true, Ordering::Release);
+        coordinator.scheduling_pending().store(false, Ordering::Release);
+        release_reaped_execution(&live_states, &coordinator, &reaped).await;
+
+        assert_eq!(coordinator.claim_holder(&worker).await.as_deref(), Some("replacement"));
+        assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+        assert!(
+            !coordinator.scheduling_pending().load(Ordering::Acquire),
+            "a no-op ownership miss must not kick dispatch or rescan active work"
+        );
+    }
 
     /// A slot backed by the live test process PID is never reaped, even
     /// when the grace period has passed.
@@ -1170,6 +1223,67 @@ mod tests {
         assert_eq!(
             events[0].details["detection_source"],
             DeathEvidence::DriverExitAtPaneInput.as_str(),
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_progression_preserves_the_stuck_item_snapshot() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "stuck chore");
+        let db = Arc::new(db);
+        let execution_id = create_execution_started_now(&db, &work_item_id);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET kind = 'progression' WHERE id = ?1",
+                [&execution_id],
+            )
+            .unwrap();
+        let snapshot = || -> Vec<Option<String>> {
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT status, CAST(autostart AS TEXT), dispatch_failed_reason, dispatch_failed_error,
+                        dispatch_failed_at, updated_at, description FROM tasks WHERE id = ?1",
+                    [&work_item_id],
+                    |row| (0..7).map(|i| row.get(i)).collect(),
+                )
+                .unwrap()
+        };
+        let before = snapshot();
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, std::process::id() as i32, &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let sink = RecordingDispatchEventSink::new();
+        assert!(
+            reap_driver_exit_at_pane_input(
+                db.as_ref(),
+                &live_states,
+                coordinator.clone(),
+                &sink,
+                &NoopCube,
+                &execution_id,
+            )
+            .await
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "progression cleanup must not rewrite the stuck item"
+        );
+        assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id)
         );
     }
 
@@ -1892,6 +2006,157 @@ mod tests {
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
+        );
+    }
+
+    /// Refresh-guard PID death marks the slot Terminated without releasing
+    /// it; the death sweep and pool-claim sweep must still clean up.
+    #[tokio::test]
+    async fn refresh_guard_pid_death_is_released_by_subsequent_sweeps() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "refresh-first");
+        let pid = dead_pid();
+        let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(pid));
+        let db = Arc::new(db);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, pid, &work_item_id);
+        drive_working_idle(&live_states, 1);
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        live_states.set_last_event_at_for_test(1, iso8601_utc(now - 200));
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        assert!(live_states.get(1).is_some());
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id)
+        );
+
+        let outcome = crate::worker_refresh_liveness::evaluate(&db, &live_states, None, &execution_id, now).await;
+        assert_eq!(
+            outcome.permit,
+            crate::worker_refresh_liveness::WorkerRefreshPermit::Stop
+        );
+        assert_eq!(live_states.get(1).unwrap().activity, WorkerActivity::Terminated);
+        assert!(live_states.is_observed_dead(&execution_id));
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the refresh guard must not release the pool claim"
+        );
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let death = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &AlwaysSucceedsCube,
+        )
+        .await;
+        assert_eq!(death.reaped, 1);
+
+        struct AllowTeardown;
+        #[async_trait::async_trait]
+        impl crate::pool_claim_sweep::WorkerViewerDetach for AllowTeardown {
+            async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
+                run_ids.iter().map(|_| Ok(())).collect()
+            }
+        }
+        let _pool = crate::pool_claim_sweep::run_one_pass(
+            db.as_ref(),
+            live_states.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &AllowTeardown,
+            &mut crate::pool_claim_sweep::TeardownRetries::default(),
+        )
+        .await;
+
+        assert!(live_states.get(1).is_none(), "registry entry must be released");
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "pool claim must be released"
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+    }
+
+    /// The durable reap can win the race: the execution row is already
+    /// terminal while the fenced slot and pool claim are still held. The
+    /// death sweep must still drop the retained entry so the pool-claim
+    /// sweep can release the claim.
+    #[tokio::test]
+    async fn terminal_row_with_fenced_dead_pid_slot_is_released_by_subsequent_sweeps() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "terminal-row");
+        let pid = dead_pid();
+        let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(pid));
+        let db = Arc::new(db);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, pid, &work_item_id);
+        drive_working_idle(&live_states, 1);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        assert!(live_states.mark_terminated(&execution_id));
+        db.force_execution_status_for_test(&work_item_id, ExecutionStatus::Completed)
+            .unwrap();
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let death = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &AlwaysSucceedsCube,
+        )
+        .await;
+        assert_eq!(death.reaped, 1);
+
+        struct AllowTeardown;
+        #[async_trait::async_trait]
+        impl crate::pool_claim_sweep::WorkerViewerDetach for AllowTeardown {
+            async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
+                run_ids.iter().map(|_| Ok(())).collect()
+            }
+        }
+        let _pool = crate::pool_claim_sweep::run_one_pass(
+            db.as_ref(),
+            live_states.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &AllowTeardown,
+            &mut crate::pool_claim_sweep::TeardownRetries::default(),
+        )
+        .await;
+
+        assert!(live_states.get(1).is_none(), "registry entry must be released");
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "pool claim must be released"
         );
     }
 }

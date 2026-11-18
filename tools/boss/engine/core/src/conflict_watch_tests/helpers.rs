@@ -204,6 +204,19 @@ pub(super) fn rewind_attempt_created_at(db_path: &std::path::Path, attempt_id: &
     .unwrap();
 }
 
+/// Back-date a task's `created_at` so the undispatched-revision grace window
+/// can be exercised without waiting.
+pub(super) fn rewind_task_created_at(db_path: &std::path::Path, task_id: &str, secs_ago: i64) {
+    let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+    let new_ts = (now_secs - secs_ago).to_string();
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "UPDATE tasks SET created_at = ?2 WHERE id = ?1",
+        rusqlite::params![task_id, new_ts],
+    )
+    .unwrap();
+}
+
 // Helper: build a probe with an explicit head SHA (all other fields match
 // the default `probe()` helper).
 pub(super) fn probe_with_head(pr_url: &str, state: PrLifecycleState, head_sha: &str) -> PrLifecycleProbe {

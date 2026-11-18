@@ -370,9 +370,16 @@ move it out — in particular:
 A revision's own row moves through its own statuses independently of its
 parent — the parent surfaces in-flight revisions to the operator through
 `has_in_progress_revision` and the Review-lane rollup (`inReviewRevisions`),
-never by leaving Review itself. Per
-[`revision-tasks.md`](revision-tasks.md): "On success the revision row
-flips to `in_review`; the parent's status is untouched."
+never by leaving Review itself. A successful revision push leaves the
+parent's status untouched and holds the revision for automated review, as
+described in [`revision-tasks.md`](revision-tasks.md).
+
+A revision whose implementation run has finished is held `active` in Doing
+while the automated review of its pushed commit runs (see
+[`revision-tasks.md`](revision-tasks.md) § Doing while the PR's AI review
+runs). The engine groups it as Reviewing, not Queued, for as long as that
+review is running; it never gets a Review card. Once the review is
+consolidated it is `in_review` and folds into the parent's card.
 
 A `kind = revision` row is not a cycle root and is outside this contract:
 `start_execution_run` still advances it from `in_review` to `active` on its

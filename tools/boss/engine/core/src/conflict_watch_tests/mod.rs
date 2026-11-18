@@ -2,6 +2,7 @@
 //! the concern each module exercises. Shared fixtures live in [`helpers`].
 
 mod churn;
+mod deferral;
 mod detection;
 mod escalation;
 mod foreign_bucket;
@@ -11,5 +12,7 @@ mod rearm;
 mod resolution;
 mod retire;
 mod revision;
+mod stale_attempt;
+mod stale_revision;
 mod supersession;
 mod trunk_coordination;

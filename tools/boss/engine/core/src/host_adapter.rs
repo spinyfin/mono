@@ -25,28 +25,27 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, Jj, LocalJj};
-use boss_protocol::ExecutionKind;
+use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, Jj, LocalJj, WorkspaceTipSource};
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
-use crate::coordinator::{
-    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-};
-use crate::cube_commands::CubeJsonTransport;
 use crate::host_registry::Host;
+use crate::hub_spawn::REMOTE_BOSS_EVENT_BIN;
 use crate::remote_wrapper::remote_wrapper_path;
-use crate::runner::{
-    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, WorkerSpawnOpts, bazel_prepush_gate_text,
-    compose_worker_spawn, work_item_name, work_item_task_kind,
-};
+use crate::runner::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn, work_item_name};
 use crate::ssh_spawn::{
-    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
+    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, SshExec, perform_remote_launch, reap_failed_remote_turn,
+    remote_events_socket_path,
 };
-use crate::ssh_transport::SshTransport;
+use crate::ssh_transport::{SshOutput, SshTransport};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
-use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
+use crate::worker_setup::WorkerSetupInput;
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
+use boss_execution_contracts::CubeClient;
+use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 
 /// Remote dir (under `$HOME`) that holds rendered worker `--settings`
 /// files. Outside any workspace tree so the worker's `jj`/`git` never
@@ -54,13 +53,88 @@ use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_w
 /// settings under the system temp dir.
 const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 
-/// Remote shim binary name. Cube's standard install puts `boss-event` on
-/// the worker's PATH (see the wrapper's note), so the hook command
-/// resolves it by name rather than an engine-local absolute path.
-const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
+/// Prints `EMPTY`, `OCCUPIED` or `UNKNOWN` for "does any process owned by the
+/// current user have its cwd in `$1`". Only the user's own processes are
+/// scanned (another user's cwd is unreadable and cannot be a workspace
+/// occupant); an unreadable same-user process, or an unavailable probe tool,
+/// is `UNKNOWN`. A workspace directory that does not exist is `EMPTY`.
+///
+/// A process that exits while it is being scanned is not an unreadable one.
+/// Its cwd stops resolving as soon as it starts to exit, and its `/proc` entry
+/// disappears when its parent reaps it, so "the cwd did not resolve" has to be
+/// followed by a check that the process is still there and still running.
+/// `leaving` makes that check from one read of `/proc/<pid>/stat` by the shell
+/// itself. The earlier form ran `grep` on `status` after an existence test: a
+/// process reaped between the two made `grep` fail, which read as "not a
+/// zombie", and a host with ordinary process churn reported `UNKNOWN` for an
+/// empty workspace.
+///
+/// `$2` replaces `/proc` as the directory to scan. Callers never pass it; the
+/// tests do, to put processes in states a real one holds for microseconds.
+const REMOTE_OCCUPANCY_SCRIPT: &str = r#"
+ws="$1"
+proc="${2:-/proc}"
+if [ ! -e "$ws" ] && [ ! -L "$ws" ]; then echo EMPTY; exit 0; fi
+ws=$(cd "$ws" 2>/dev/null && pwd -P) || { echo UNKNOWN; exit 0; }
+inside() { case "$1" in "$ws"|"$ws"/*) return 0;; esac; return 1; }
+# leaving <proc dir>: succeeds when the process can no longer hold a cwd. It is
+# gone (stat cannot be read), a zombie or dead (state Z or X), or exiting
+# (PF_EXITING, 0x4 in the flags field, set before the cwd is released).
+# After "pid (comm) " the fields are state ppid pgrp session tty tpgid flags;
+# comm may itself contain ") ", so everything up to the last one is dropped.
+# A stat line that does not parse is not proof, and fails.
+leaving() {
+  { read -r st < "$1/stat"; } 2>/dev/null || return 0
+  st=${st##*") "}
+  set -- $st
+  case "$1" in Z|X) return 0;; esac
+  case "$7" in ''|*[!0-9]*) return 1;; esac
+  [ $(( $7 & 4 )) -ne 0 ]
+}
+if [ -d "$proc/self" ]; then
+  unknown=0
+  for p in "$proc"/[0-9]*; do
+    [ -O "$p" ] || continue
+    if c=$(readlink "$p/cwd" 2>/dev/null); then
+      if inside "$c"; then echo OCCUPIED; exit 0; fi
+    elif ! leaving "$p"; then
+      # Same-uid unreadable cwd (sandbox init, non-dumpable helper). Keep
+      # scanning: an occupant later in /proc still makes this OCCUPIED, matching
+      # the local ProcessSnapshot probe. UNKNOWN only if nothing was inside.
+      unknown=1
+    fi
+  done
+  if [ "$unknown" -eq 1 ]; then echo UNKNOWN; else echo EMPTY; fi
+else
+  out=$(lsof -a -u "$(id -u)" -d cwd -Fn 2>/dev/null) || { echo UNKNOWN; exit 0; }
+  if printf '%s
+' "$out" | awk -v ws="$ws" 'index($0, "n" ws) == 1 { r = substr($0, length(ws) + 2, 1); if (r == "" || r == "/") f = 1 } END { exit !f }'; then
+    echo OCCUPIED
+  else
+    echo EMPTY
+  fi
+fi
+"#;
 
 #[async_trait]
 impl Jj for SshHostAdapter {
+    async fn workspace_exists(&self, workspace: &Path) -> Result<bool> {
+        let output = self
+            .transport
+            .run(&["test", "-d", workspace.to_str().context("workspace path is not UTF-8")?])
+            .await?;
+        if output.success() {
+            Ok(true)
+        } else {
+            anyhow::ensure!(
+                output.status == 1 && output.stderr.trim().is_empty(),
+                "remote workspace probe failed: {}",
+                output.stderr
+            );
+            Ok(false)
+        }
+    }
+
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
         let path = repo.to_str().context("shared repo path is not UTF-8")?;
         let mut command = vec!["jj", "--no-pager", "-R", path];
@@ -90,272 +164,20 @@ impl Jj for SshHostAdapter {
 }
 
 /// Paths for engine-owned files in a remote driver's workspace config
-/// directory. Keeping the prompt and ignore file together prevents the
-/// prompt from appearing in the worker's change.
-fn remote_driver_config_paths(
-    workspace: &str,
-    descriptor: &crate::driver::DriverDescriptor,
-) -> (String, String, String) {
+/// directory. Per-run input is staged below it and excluded by the ignore file.
+fn remote_driver_config_paths(workspace: &str, descriptor: &crate::driver::DriverDescriptor) -> (String, String) {
     let directory = format!("{workspace}/{}", descriptor.config_dir);
-    let prompt = format!("{directory}/{}", descriptor.initial_prompt_filename);
     let gitignore = format!("{directory}/.gitignore");
-    (directory, prompt, gitignore)
+    (directory, gitignore)
 }
 
-/// The one implementation behind every `recovery_pr_base` default.
-pub(crate) async fn fetch_recovery_pr_base(origin: &str, pr: u64) -> Result<String> {
-    // A non-GitHub origin can never yield a PR base; every other failure here
-    // (gh, network) is transient and must stay retryable.
-    let slug = git_utils::repo_slug::parse_github_slug(origin).ok_or_else(|| {
-        execution_bookmark::base_unresolvable_error(format!("origin `{origin}` is not a GitHub repository"))
-    })?;
-    git_utils::gh_cli::fetch_pr_base_ref(&slug, pr).await
-}
+#[cfg(test)]
+pub(crate) use boss_host_execution::recovery_pr::closed_recovery_pr_error;
 
-/// Abstracts all host-specific operations: workspace lifecycle and
-/// worker spawn. Later phases extend this with control-channel
-/// (probe/interrupt/stop) and event-socket/transcript-readback setup.
-///
-/// `host_id = "local"` is the special case for the coordinator's own
-/// machine. Every other id corresponds to a registered SSH-reachable
-/// remote (Phase 3+).
-#[async_trait]
-pub trait HostAdapter: Send + Sync {
-    async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {
-        fetch_recovery_pr_base(origin, pr).await
-    }
-
-    async fn create_execution_bookmark(
-        &self,
-        workspace: &Path,
-        execution_id: &str,
-        predecessor: Option<&ExecutionBookmark>,
-        inherited_base: Option<&str>,
-    ) -> Result<ExecutionBookmark> {
-        let _ = (workspace, execution_id, predecessor, inherited_base);
-        bail!("execution bookmarks are not supported by this host adapter")
-    }
-
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        let _ = record;
-        bail!("execution bookmark inspection is not supported by this host adapter")
-    }
-
-    async fn restore_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        self_retry: bool,
-    ) -> Result<bool> {
-        let _ = (record, workspace, self_retry);
-        bail!("execution bookmark recovery is not supported by this host adapter")
-    }
-    /// Drop the baseline left behind when both of an execution's heads are
-    /// gone, so a self-retry can create fresh pointers.
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        let _ = record;
-        bail!("execution bookmark cleanup is not supported by this host adapter")
-    }
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<execution_bookmark::RestoreReport> {
-        let _ = (record, workspace, pr_bookmark, base_branch);
-        bail!("rebased execution recovery is not supported by this host adapter")
-    }
-    /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
-    fn host_id(&self) -> &str;
-
-    // ── Workspace lifecycle ─────────────────────────────────────────────────
-
-    async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
-
-    async fn lease_workspace(
-        &self,
-        repo_id: &str,
-        task: &str,
-        prefer_workspace_id: Option<&str>,
-        allow_dirty: bool,
-        exclude_workspace_ids: &[&str],
-    ) -> Result<CubeWorkspaceLease>;
-
-    async fn release_workspace(&self, lease_id: &str) -> Result<()>;
-
-    async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
-
-    async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()>;
-
-    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle>;
-
-    /// Position the working copy in `workspace_path` as a fresh editable
-    /// child commit atop PR `pr`'s current head. Delegates to
-    /// `cube workspace goto --workspace <path> --pr <n>`. Idempotent: a
-    /// no-op when `@` is already positioned on the PR branch head.
-    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()>;
-
-    /// Position the working copy in `workspace_path` as a fresh editable
-    /// child commit atop an arbitrary commit `sha` (e.g. a post-merge
-    /// review's merge commit). Unlike [`Self::goto_workspace`], this never
-    /// resolves or checks PR state, so it is the only entry point that
-    /// works once a PR has merged or closed. Delegates to `cube workspace
-    /// goto --workspace <path> --revision <sha>`. Idempotent.
-    ///
-    /// Default errors so most test doubles need no change; only the real
-    /// adapters below provide it.
-    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
-        let _ = (workspace_path, sha);
-        Err(anyhow::anyhow!(
-            "goto_workspace_revision is not supported by this adapter"
-        ))
-    }
-
-    async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
-
-    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>>;
-
-    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>>;
-
-    /// Returns `(command_string, cwd)` for the subprocess that would be
-    /// spawned with `args`. Used to populate dispatch-event `cube_command`
-    /// fields for post-mortem diagnostics. Returns `None` for test doubles
-    /// and remote adapters that don't use local subprocesses.
-    fn command_repr(&self, args: &[&str]) -> Option<(String, String)>;
-
-    // ── Worker spawn ────────────────────────────────────────────────────────
-
-    /// Spawn a worker for the given execution in the leased workspace.
-    ///
-    /// For `LocalHostAdapter` this delegates to the `ExecutionRunner`
-    /// (pane spawn via the macOS app). For `SshHostAdapter` (Phase 3)
-    /// this drives the SSH-exec path with remote-forwarded event socket.
-    async fn spawn_worker(
-        &self,
-        worker_id: &str,
-        execution: &WorkExecution,
-        work_item: &WorkItem,
-        workspace_path: &Path,
-        cube_change_id: Option<&str>,
-    ) -> Result<RunOutcome>;
-
-    // ── Live-status + transcript readback (Phase 4) ─────────────────────────
-
-    /// Read up to `max_bytes` from the tail of the transcript at `path`
-    /// on this host.
-    ///
-    /// `Ok(None)` means "the transcript is engine-local — read the path
-    /// off the local filesystem". The default (and [`LocalHostAdapter`])
-    /// returns `None` so the existing local read path is unchanged.
-    /// [`SshHostAdapter`] overrides this to pull the byte suffix over its
-    /// `ControlMaster` and returns `Ok(Some(jsonl))` — giving the
-    /// transcript-tail RPC the same bytes a local run would have read.
-    async fn read_transcript_tail_bytes(&self, _path: &str, _max_bytes: u64) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    /// Re-establish the reverse events-socket forward for a detached run
-    /// (`run_id` is the worker's `BOSS_RUN_ID` / execution id) after an
-    /// engine restart, so its hook stream reaches `engine_events_socket`
-    /// again.
-    ///
-    /// `Ok(false)` means "nothing to reattach": a local worker was a
-    /// child of the previous engine process and is already gone, so the
-    /// default (and [`LocalHostAdapter`]) is a no-op. [`SshHostAdapter`]
-    /// overrides this to clear the stale remote socket and re-open the
-    /// `ssh -R` forward, returning `Ok(true)` on success.
-    async fn reattach_events_forward(&self, _run_id: &str, _engine_events_socket: &str) -> Result<bool> {
-        Ok(false)
-    }
-
-    /// Probe whether a detached remote worker process is still alive.
-    ///
-    /// Used by the periodic remote-lease reconciler
-    /// ([`crate::remote_lease_reconcile`]) to find `waiting_human` remote
-    /// runs whose worker has died without a `Stop` — the remote analogue
-    /// of the local `lost_workspace_sweep` (a `.exists()`/pid probe on the
-    /// engine host is meaningless for a worker on another machine).
-    ///
-    /// - `Ok(Some(true))` — the process is alive.
-    /// - `Ok(Some(false))` — the process is provably gone (`kill -0`
-    ///   reports no such process). Positive evidence of death: safe to
-    ///   reap + release.
-    /// - `Ok(None)` — not applicable / can't probe (the default and
-    ///   [`LocalHostAdapter`]; a local worker is covered by the local
-    ///   sweeps). Never reaped on this signal.
-    /// - `Err(..)` — the probe round-trip itself failed (host down, ssh
-    ///   error). Inconclusive: callers must NOT treat this as death, or a
-    ///   host outage would mass-reap every live worker on it.
-    ///
-    /// [`SshHostAdapter`] overrides this to run a `kill -0` over its
-    /// `ControlMaster`.
-    async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
-        Ok(None)
-    }
-
-    /// Read the tail of the worker's own stdout/stderr log for the run in
-    /// `workspace_path` — the remote wrapper tees it to
-    /// `<workspace>/.boss/worker.log`.
-    ///
-    /// This is the only place a remote worker's *startup* failure is ever
-    /// written down. A worker that dies before its first hook produces no
-    /// events, no transcript, and no `Stop`, so every engine-side surface is
-    /// blank; meanwhile the actual cause — `Failed to authenticate. API
-    /// Error: 401 OAuth access token has expired.` in the case that motivated
-    /// this method — is sitting in that file, which the engine arranged to be
-    /// written and then never read. Callers that have positive evidence a
-    /// remote worker is gone pull this tail so the reason travels with the
-    /// reap instead of being lost with the workspace.
-    ///
-    /// `Ok(None)` means "not applicable" — the default and
-    /// [`LocalHostAdapter`], whose workers log to a local pane, which is
-    /// already directly readable. `Ok(Some(""))` means the log exists but is
-    /// empty (or was never created), which is itself informative and distinct
-    /// from `None`. An `Err` is a transport failure; it must never be
-    /// mistaken for "the worker exited cleanly", so callers surface it as an
-    /// unavailable log rather than an empty one.
-    async fn read_worker_log_tail(&self, _workspace_path: &str, _max_bytes: u64) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    /// Collect a structured-output artifact produced on this host into the
-    /// engine-local destination.
-    ///
-    /// [`CollectOutcome::NotAvailable`] covers both "the worker has not
-    /// written the artifact yet" and any transient condition (a DB error
-    /// resolving the host, a missing adapter provider, an SSH transport
-    /// failure probing or reading the descriptor) that is not itself proof
-    /// the artifact is bad — callers should fall through to the
-    /// transcript/nudge recovery path for these, not terminalize.
-    /// [`CollectOutcome::Failed`] is reserved for positive evidence the
-    /// artifact cannot be trusted: a descriptor that exists but names an
-    /// invalid path, or an artifact that exists but whose copy into place
-    /// failed. Only `Failed` should terminalize a completed remote review.
-    async fn collect_structured_output(
-        &self,
-        _execution_id: &str,
-        _kind: crate::structured_output::StructuredOutputKind,
-        _destination: &Path,
-    ) -> Result<CollectOutcome> {
-        Ok(CollectOutcome::NotAvailable)
-    }
-}
-
-/// Outcome of [`HostAdapter::collect_structured_output`]. See that method's
-/// doc for the terminalize/fail-open contract each variant carries.
-#[derive(Debug)]
-pub enum CollectOutcome {
-    /// The artifact was pulled and installed at the destination.
-    Collected,
-    /// Not available yet, or collection could not be attempted for a
-    /// reason that is not proof the artifact itself is unusable. Not
-    /// terminal — callers should fall back to transcript/nudge recovery.
-    NotAvailable,
-    /// Positive proof the artifact cannot be trusted. Terminal — callers
-    /// should fail the execution, naming `reason`.
-    Failed(String),
-}
+#[cfg(test)]
+pub use boss_execution_contracts::{CollectOutcome, HostAdapter};
+#[cfg(not(test))]
+use boss_execution_contracts::{CollectOutcome, HostAdapter};
 
 /// How much of a dead remote worker's `worker.log` to pull. The interesting
 /// content is a startup failure — an auth error, a missing binary, a config
@@ -369,6 +191,12 @@ pub const WORKER_LOG_TAIL_BYTES: u64 = 4096;
 /// cites that file so relocating it is a one-line change.
 pub fn remote_worker_log_path(workspace_path: &str) -> String {
     format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'))
+}
+
+/// Absolute path of the remote worker PID file the wrapper publishes before
+/// the stderr handshake (`<workspace>/.boss/worker.pid`).
+pub fn remote_worker_pid_path(workspace_path: &str) -> String {
+    format!("{}/.boss/worker.pid", workspace_path.trim_end_matches('/'))
 }
 
 // ── LocalHostAdapter ──────────────────────────────────────────────────────────
@@ -408,54 +236,76 @@ impl HostAdapter for LocalHostAdapter {
             .await
     }
 
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
-        execution_bookmark::unpublished_diff(&LocalJj, record).await
-    }
-
-    async fn restore_execution_bookmark(
+    async fn confirm_workspace_recovery(
         &self,
         record: &ExecutionBookmark,
         workspace: &Path,
-        self_retry: bool,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+        since_unix: Option<i64>,
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
+        self.confirm_workspace_recovery_from(record, workspace, recorded, since_unix, WorkspaceTipSource::Live)
+            .await
+    }
+
+    async fn confirm_workspace_recovery_from(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+        since_unix: Option<i64>,
+        tip_source: WorkspaceTipSource,
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error("recovery host mismatch"));
+        }
+        execution_bookmark::preserve_from(&LocalJj, record, workspace, recorded, since_unix, tip_source).await
+    }
+    async fn restore_preserved_work(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+    ) -> Result<Option<execution_bookmark::RestoreReport>> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::restore_preserved(&LocalJj, record, workspace, recorded).await
+    }
+
+    async fn preserved_work_unpublished(
+        &self,
+        record: &ExecutionBookmark,
+        recorded: &execution_bookmark::PreservedTip,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
-        execution_bookmark::restore_for_retry(&LocalJj, record, workspace, self_retry).await
-    }
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        anyhow::ensure!(
-            record.host_id == "local",
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
-        execution_bookmark::discard_orphaned_baseline(&LocalJj, record).await
-    }
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<execution_bookmark::RestoreReport> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
-        let remotes = Jj::run(&LocalJj, workspace, &["git", "remote", "list"]).await?;
-        let remote = git_utils::repo_slug::parse_github_remote(&remotes)
-            .map(|(name, _)| name)
-            .unwrap_or_else(|| "origin".into());
-        execution_bookmark::restore_rebased(&LocalJj, record, workspace, pr_bookmark, base_branch, &remote).await
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::preserved_work_unpublished(&LocalJj, record, recorded).await
     }
 
+    async fn forget_preserved_references(
+        &self,
+        record: &ExecutionBookmark,
+        scope: execution_bookmark::PreservedScope,
+    ) -> Result<Vec<String>> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::forget_preserved_references(&LocalJj, record, scope).await
+    }
+
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        self.cube_client.positioned_parent(workspace).await
+    }
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
+        execution_bookmark::start_fresh(&LocalJj, workspace).await
+    }
     fn host_id(&self) -> &str {
         "local"
     }
@@ -493,6 +343,10 @@ impl HostAdapter for LocalHostAdapter {
         self.cube_client.release_workspace(lease_id).await
     }
 
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        self.cube_client.release_workspace_with_reset(lease_id).await
+    }
+
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
         self.cube_client.heartbeat_lease(lease_id, ttl_seconds).await
     }
@@ -511,6 +365,18 @@ impl HostAdapter for LocalHostAdapter {
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
         self.cube_client.list_repos().await
+    }
+
+    async fn cleanup_legacy_store(
+        &self,
+        repo: &Path,
+        published_heads: &[String],
+    ) -> Result<execution_bookmark::LegacyCleanupReport> {
+        execution_bookmark::cleanup_legacy_store(&LocalJj, repo, published_heads).await
+    }
+
+    async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
+        self.cube_client.gc_repo(repo_id).await
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
@@ -573,6 +439,10 @@ pub struct SshHostAdapter {
     /// `register_remote_worker_slot`; `None` in unit tests that never
     /// stand up the registry.
     live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// Where the shared prompt composer reads the repo's `BOSS.md` from, so a
+    /// remote coding worker gets the same guidance block as a local one.
+    /// `None` composes no block.
+    repo_guidance: Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>>,
 }
 
 impl SshHostAdapter {
@@ -592,7 +462,17 @@ impl SshHostAdapter {
             non_opus_auto_mode,
             events_socket_path,
             live_worker_states,
+            repo_guidance: None,
         }
+    }
+
+    /// Supply the `BOSS.md` source used when composing remote worker prompts.
+    pub fn with_repo_guidance(
+        mut self,
+        repo_guidance: Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>,
+    ) -> Self {
+        self.repo_guidance = Some(repo_guidance);
+        self
     }
 
     pub fn transport(&self) -> &SshTransport {
@@ -652,7 +532,7 @@ impl SshHostAdapter {
     }
 
     /// Record a dispatch-time cube invocation failure against this host's
-    /// health counter (see `host_registry::record_host_dispatch_failure`).
+    /// health counter (see [`WorkDb::record_host_dispatch_failure`] in `work/host_storage.rs`).
     /// Best-effort: a DB error here must never mask the real dispatch
     /// error the caller is already propagating, so failures just log.
     fn record_host_health_failure(&self, error_text: &str) {
@@ -699,88 +579,157 @@ impl SshHostAdapter {
         }
     }
 
-    /// Append the Bazel pre-push build gate to the worker prompt when the
-    /// remote workspace is a Bazel workspace.
-    ///
-    /// The shared `compose_execution_prompt` injects this gate only when
-    /// `is_bazel_workspace` matches — but that probes the *local*
-    /// filesystem, and the workspace lives on the remote, so it never
-    /// fires for a remote worker. Probe the remote for the marker files
-    /// over the master and append the gate for the same execution kinds
-    /// the local runner gates (`task_implementation` / `chore_implementation`).
-    /// A probe failure logs and leaves the prompt unchanged rather than
-    /// blocking the spawn.
-    async fn append_remote_bazel_gate(
-        &self,
-        execution: &WorkExecution,
-        workspace: &str,
-        prompt_text: String,
-    ) -> String {
-        if !matches!(execution.kind.as_str(), "task_implementation" | "chore_implementation") {
-            return prompt_text;
-        }
-        // Single-string command so the remote shell evaluates the whole
-        // `test … -o …` expression (a multi-token argv would be
-        // space-joined by ssh and mis-parsed). Workspace paths come from
-        // cube and contain no shell metacharacters.
-        let probe = format!(
-            "test -f '{ws}/MODULE.bazel' -o -f '{ws}/WORKSPACE' -o -f '{ws}/WORKSPACE.bazel'",
-            ws = workspace
-        );
-        match self.transport.run_shell(probe.as_str()).await {
-            Ok(out) if out.success() => {
-                let mut prompt_text = prompt_text;
-                // Both flags false: the remote path doesn't yet read
-                // `worker_signal_proposals_seam` or `run_done_proposals_seam`
-                // (see the comment on the `compose_worker_spawn` call above)
-                // — legacy marker text and the absolute do-not-push-red-code
-                // stop match each flag's registry default.
-                prompt_text.push_str(&bazel_prepush_gate_text(false, false));
-                prompt_text
-            }
-            Ok(_) => prompt_text,
-            Err(err) => {
-                tracing::warn!(
-                    host_id = %self.transport.host_id,
-                    error = %format!("{err:#}"),
-                    "remote bazel-marker probe failed; worker prompt omits the pre-push gate",
-                );
-                prompt_text
-            }
-        }
+    /// Probe the remote workspace for Bazel markers *before* composing
+    /// the worker prompt. `Some(true)` / `Some(false)` are confirmed;
+    /// `None` means the probe failed and the composer must not treat a
+    /// missing local path as a non-Bazel repo.
+    async fn probe_remote_bazel_workspace(&self, workspace: &str) -> Option<bool> {
+        probe_remote_bazel_workspace_on(&self.transport, workspace).await
     }
 
     /// `mkdir -p` the parent dir on the remote, stage `contents` to a
     /// local temp file, and `scp` it to `remote_path`. `label` only feeds
     /// the staging filename + error context.
-    async fn ship_file(&self, remote_dir: &str, remote_path: &str, contents: &str, label: &str) -> Result<()> {
-        let host = &self.transport.host_id;
-        let mkdir = self
-            .transport
-            .run_with_remote_paths(&["mkdir", "-p", remote_dir])
-            .await
-            .with_context(|| format!("mkdir {remote_dir} on host {host}"))?;
-        if !mkdir.success() {
-            bail!(
-                "failed to create remote {label} dir {remote_dir} on host {host}: {}",
-                non_empty(&mkdir.stderr, mkdir.status)
-            );
-        }
-        let staged =
-            stage_local_file(label, contents).with_context(|| format!("staging remote {label} for host {host}"))?;
-        let push = self
-            .transport
-            .scp_push(staged.path(), remote_path)
-            .await
-            .with_context(|| format!("scp {label} to host {host}"))?;
-        if !push.success() {
-            bail!(
-                "failed to scp {label} to {remote_path} on host {host}: {}",
-                non_empty(&push.stderr, push.status)
-            );
-        }
-        Ok(())
+    async fn ship_file(
+        &self,
+        run_id: &str,
+        remote_dir: &str,
+        remote_path: &str,
+        contents: &str,
+        label: &str,
+    ) -> Result<()> {
+        ship_file(&self.transport, run_id, remote_dir, remote_path, contents, label).await
     }
+}
+
+/// Interpret the owning host's cleanup report: only a report with no surviving
+/// owned process, no unowned occupant and no unreadable process proves the
+/// workspace empty.
+fn occupancy_from_cleanup(execution_id: &str, output: &SshOutput) -> Result<crate::workspace_lease_release::Occupancy> {
+    anyhow::ensure!(output.success(), "remote process cleanup failed: {}", output.stderr);
+    let result: boss_worker_processes::Cleanup = serde_json::from_str(&output.stdout)?;
+    result.report(execution_id);
+    if result.stray_only() {
+        return Err(boss_execution_contracts::UnownedOccupants {
+            occupants: result.occupants,
+        }
+        .into());
+    }
+    anyhow::ensure!(
+        result.empty(),
+        "remote workspace occupants {:?}; surviving owned processes {:?}; unreadable processes {:?}",
+        result.occupants,
+        result.remaining,
+        result.unknown
+    );
+    Ok(crate::workspace_lease_release::Occupancy::Empty)
+}
+
+/// Map a remote Bazel-marker `test -f A -o -f B -o -f C` result onto the
+/// composer's tri-state. `test` exits 0 (found) or 1 (not found); any
+/// other status means the markers were never evaluated (ssh 255, shell
+/// 126/127, signal termination).
+pub(crate) fn map_remote_bazel_probe_output(result: Result<SshOutput>, host_id: &str) -> Option<bool> {
+    match result {
+        Ok(out) if out.status == 0 => Some(true),
+        Ok(out) if out.status == 1 => Some(false),
+        Ok(out) => {
+            tracing::warn!(
+                host_id,
+                status = out.status,
+                stderr = %out.stderr,
+                "remote bazel-marker probe returned inconclusive exit; composer will not assume a non-Bazel repo",
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                host_id,
+                error = %format!("{err:#}"),
+                "remote bazel-marker probe failed; composer will not assume a non-Bazel repo",
+            );
+            None
+        }
+    }
+}
+
+/// Options for composing a worker prompt on the remote spawn path. Kept as one
+/// function so the merge-review policy wiring is covered by a test.
+fn remote_spawn_opts(
+    max_embed_diff_lines: u64,
+    bazel_workspace: Option<bool>,
+    repo_guidance: Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>>,
+) -> WorkerSpawnOpts {
+    WorkerSpawnOpts::builder()
+        .remote_workspace(true)
+        .review_signal_checks(crate::merge_poller::review_signal_checks_for_owner)
+        .max_embed_diff_lines(max_embed_diff_lines)
+        .maybe_bazel_workspace(bazel_workspace)
+        .maybe_repo_guidance(repo_guidance)
+        .build()
+}
+
+/// A single-string command so the remote shell evaluates the whole
+/// `test … -o …` expression (a multi-token argv would be space-joined
+/// by ssh and mis-parsed). Workspace paths come from cube and contain
+/// no shell metacharacters.
+pub(crate) async fn probe_remote_bazel_workspace_on(exec: &dyn SshExec, workspace: &str) -> Option<bool> {
+    let probe = format!(
+        "test -f '{ws}/MODULE.bazel' -o -f '{ws}/WORKSPACE' -o -f '{ws}/WORKSPACE.bazel'",
+        ws = workspace
+    );
+    map_remote_bazel_probe_output(exec.run_shell(probe.as_str()).await, exec.host_id())
+}
+
+pub(crate) async fn ship_file(
+    transport: &dyn crate::ssh_spawn::SshExec,
+    run_id: &str,
+    remote_dir: &str,
+    remote_path: &str,
+    contents: &str,
+    label: &str,
+) -> Result<()> {
+    let host = transport.host_id();
+    let mkdir = transport
+        .run_with_remote_paths(&["mkdir", "-p", remote_dir])
+        .await
+        .with_context(|| format!("mkdir {remote_dir} on host {host}"))?;
+    if !mkdir.success() {
+        bail!(
+            "failed to create remote {label} dir {remote_dir} on host {host}: {}",
+            non_empty(&mkdir.stderr, mkdir.status)
+        );
+    }
+    let staged =
+        stage_local_file(run_id, label, contents).with_context(|| format!("staging remote {label} for host {host}"))?;
+    // Protect existing destinations before scp overwrites them, too.
+    let protected = transport
+        .run_with_remote_paths(&["install", "-m", "600", "/dev/null", remote_path])
+        .await?;
+    if !protected.success() {
+        bail!(
+            "failed to protect remote {label} at {remote_path}: {}",
+            protected.stderr
+        );
+    }
+    let push = transport
+        .scp_push(staged.path(), remote_path)
+        .await
+        .with_context(|| format!("scp {label} to host {host}"))?;
+    if !push.success() {
+        bail!(
+            "failed to scp {label} to {remote_path} on host {host}: {}",
+            non_empty(&push.stderr, push.status)
+        );
+    }
+    let permissions = transport.run_with_remote_paths(&["chmod", "600", remote_path]).await?;
+    if !permissions.success() {
+        bail!(
+            "failed to protect remote {label} at {remote_path}: {}",
+            permissions.stderr
+        );
+    }
+    Ok(())
 }
 
 /// Probe the remote host's `ARG_MAX` / page size / OS so the argv preflight
@@ -830,12 +779,29 @@ fn non_empty(stderr: &str, status: i32) -> String {
 /// Write `contents` to a unique local staging file so `scp` has a real
 /// on-disk path to push, returning an RAII guard that unlinks it on drop.
 /// Mirrors `wrapper_distribution`'s staging pattern.
-fn stage_local_file(label: &str, contents: &str) -> Result<StagedFile> {
-    let dir = std::env::temp_dir();
-    let nonce = boss_engine_utils::epoch_time::now_epoch_nanos();
-    let path = dir.join(format!("boss-remote-{label}.{}.{}.tmp", std::process::id(), nonce));
-    std::fs::write(&path, contents).with_context(|| format!("writing staging file {path:?}"))?;
-    Ok(StagedFile(path))
+fn stage_local_file(run_id: &str, label: &str, contents: &str) -> Result<StagedFile> {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = std::env::temp_dir().join("boss-remote-input");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
+    // Each guard owns its directory as well as its file: removing a shared
+    // empty directory can race another transfer opening its staging file.
+    // Clock resolution can repeat across concurrent transfers in one process.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = format!(
+        "{}-{}",
+        boss_engine_utils::epoch_time::now_epoch_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let dir = root.join(format!(
+        "{}-{}-{nonce}",
+        crate::ssh_transport::sanitize_for_path(run_id),
+        std::process::id(),
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let path = dir.join(format!("boss-remote-{label}.tmp"));
+    let staged = StagedFile(path);
+    crate::driver::initial_prompt::write_private(staged.path(), contents.as_bytes())?;
+    Ok(staged)
 }
 
 /// RAII guard that unlinks a local staging file on drop. Unlink errors
@@ -852,6 +818,9 @@ impl StagedFile {
 impl Drop for StagedFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        if let Some(directory) = self.0.parent() {
+            let _ = std::fs::remove_dir(directory);
+        }
     }
 }
 
@@ -890,54 +859,76 @@ impl HostAdapter for SshHostAdapter {
         .await
     }
 
-    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
-        execution_bookmark::unpublished_diff(self, record).await
-    }
-
-    async fn restore_execution_bookmark(
+    async fn confirm_workspace_recovery(
         &self,
         record: &ExecutionBookmark,
         workspace: &Path,
-        self_retry: bool,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+        since_unix: Option<i64>,
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
+        self.confirm_workspace_recovery_from(record, workspace, recorded, since_unix, WorkspaceTipSource::Live)
+            .await
+    }
+
+    async fn confirm_workspace_recovery_from(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+        since_unix: Option<i64>,
+        tip_source: WorkspaceTipSource,
+    ) -> anyhow::Result<execution_bookmark::PreserveOutcome> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error("recovery host mismatch"));
+        }
+        execution_bookmark::preserve_from(self, record, workspace, recorded, since_unix, tip_source).await
+    }
+    async fn restore_preserved_work(
+        &self,
+        record: &ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&execution_bookmark::PreservedTip>,
+    ) -> Result<Option<execution_bookmark::RestoreReport>> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::restore_preserved(self, record, workspace, recorded).await
+    }
+
+    async fn preserved_work_unpublished(
+        &self,
+        record: &ExecutionBookmark,
+        recorded: &execution_bookmark::PreservedTip,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
-        execution_bookmark::restore_for_retry(self, record, workspace, self_retry).await
-    }
-    async fn discard_orphaned_execution_baseline(&self, record: &ExecutionBookmark) -> Result<()> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery bookmark belongs to host {}",
-            record.host_id
-        );
-        execution_bookmark::discard_orphaned_baseline(self, record).await
-    }
-    async fn restore_rebased_execution_bookmark(
-        &self,
-        record: &ExecutionBookmark,
-        workspace: &Path,
-        pr_bookmark: Option<&str>,
-        base_branch: &str,
-    ) -> Result<execution_bookmark::RestoreReport> {
-        anyhow::ensure!(
-            record.host_id == self.host_id(),
-            "recovery store belongs to another host"
-        );
-        let remotes = Jj::run(self, workspace, &["git", "remote", "list"]).await?;
-        let remote = git_utils::repo_slug::parse_github_remote(&remotes)
-            .map(|(name, _)| name)
-            .unwrap_or_else(|| "origin".into());
-        execution_bookmark::restore_rebased(self, record, workspace, pr_bookmark, base_branch, &remote).await
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::preserved_work_unpublished(self, record, recorded).await
     }
 
+    async fn forget_preserved_references(
+        &self,
+        record: &ExecutionBookmark,
+        scope: execution_bookmark::PreservedScope,
+    ) -> Result<Vec<String>> {
+        if record.host_id != self.host_id() {
+            return Err(execution_bookmark::pointer_integrity_error(
+                "preserved work belongs to another host",
+            ));
+        }
+        execution_bookmark::forget_preserved_references(self, record, scope).await
+    }
+
+    async fn positioned_parent(&self, workspace: &Path) -> Result<String> {
+        execution_bookmark::positioned_parent(self, workspace).await
+    }
+    async fn start_fresh_workspace(&self, workspace: &Path) -> Result<String> {
+        execution_bookmark::start_fresh(self, workspace).await
+    }
     fn host_id(&self) -> &str {
         &self.transport.host_id
     }
@@ -966,40 +957,27 @@ impl HostAdapter for SshHostAdapter {
     }
 
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
-        let workspace_arg = workspace_path.display().to_string();
-        let pr_str = pr.to_string();
-        let _ = self
-            .run_cube_json(&[
-                "--json",
-                "workspace",
-                "goto",
-                "--workspace",
-                workspace_arg.as_str(),
-                "--pr",
-                pr_str.as_str(),
-            ])
-            .await?;
-        Ok(())
+        crate::cube_commands::goto_workspace(self, workspace_path, "--pr", &pr.to_string()).await
     }
 
     async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
-        let workspace_arg = workspace_path.display().to_string();
-        let _ = self
-            .run_cube_json(&[
-                "--json",
-                "workspace",
-                "goto",
-                "--workspace",
-                workspace_arg.as_str(),
-                "--revision",
-                sha,
-            ])
-            .await?;
-        Ok(())
+        crate::cube_commands::goto_workspace(self, workspace_path, "--revision", sha).await
+    }
+
+    async fn probe_initial_input_alive(&self, workspace: &str, run_id: &str) -> Result<Option<bool>> {
+        crate::remote_input_lifecycle::probe_input_alive(&self.transport, workspace, run_id).await
+    }
+
+    async fn cleanup_initial_input(&self, workspace: &str, run_id: &str) -> Result<()> {
+        crate::remote_input_lifecycle::remove_run_input(&self.transport, workspace, run_id).await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         crate::cube_commands::release_workspace(self, lease_id).await
+    }
+
+    async fn release_workspace_with_reset(&self, lease_id: &str) -> Result<()> {
+        crate::cube_commands::release_workspace_with_reset(self, lease_id).await
     }
 
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
@@ -1024,6 +1002,18 @@ impl HostAdapter for SshHostAdapter {
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
         crate::cube_commands::list_repos(self).await
+    }
+
+    async fn cleanup_legacy_store(
+        &self,
+        repo: &Path,
+        published_heads: &[String],
+    ) -> Result<execution_bookmark::LegacyCleanupReport> {
+        execution_bookmark::cleanup_legacy_store(self, repo, published_heads).await
+    }
+
+    async fn gc_cube_repo(&self, repo_id: &str) -> Result<()> {
+        crate::cube_commands::gc_repo(self, repo_id).await
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
@@ -1075,8 +1065,15 @@ impl HostAdapter for SshHostAdapter {
         //    path so the remote worker gets a byte-identical brief to a
         //    local one (same task framing, branch name, acceptance
         //    criterion, effort addendum, product preamble).
+        // Keep prompt and generated-rules feature gates on the same values.
+        let bazel_workspace = self.probe_remote_bazel_workspace(&workspace).await;
+        let spawn_opts = remote_spawn_opts(
+            self.cfg.work.max_review_embed_diff_lines,
+            bazel_workspace,
+            self.repo_guidance.clone(),
+        );
         let ComposedWorkerSpawn {
-            mut prompt_text,
+            prompt_text,
             spawn_config,
             embedded_output_path,
         } = compose_worker_spawn(
@@ -1123,128 +1120,49 @@ impl HostAdapter for SshHostAdapter {
             // affected today; wiring feature flags into the remote path
             // MUST land before remote bring-up if that seam is on.
             // Every seam flag is left at its builder default (`false`).
-            WorkerSpawnOpts::builder()
-                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
-                .build(),
+            spawn_opts.clone(),
         )
         .await?;
-        // The shared composer runs on the engine and therefore embeds its own
-        // temp path in the review prompt. A remote worker cannot write there:
-        // the wrapper resolves a path under *its* temp root and exports it.
-        // Keep the prompt and environment in one contract by referring to the
-        // exported value instead of shipping a coordinator-local pathname.
-        let structured_output_kind = crate::runner::designated_output_kind(execution, work_item);
-        // Assert against the path the composer actually rendered, not the
-        // path `designated_output_kind` alone would predict: a degraded
-        // fallback (e.g. an automation-triage spawn whose automation row
-        // failed to resolve) legitimately renders the generic prompt with
-        // no structured-output path at all, and that must not fail the
-        // spawn — only a designated kind that WAS supposed to be embedded
-        // but is missing from the prompt is a real bug worth bailing on.
-        if let Some(local_path) = embedded_output_path.as_deref() {
-            if !prompt_text.contains(local_path) {
-                bail!("remote spawn prompt omitted structured-output path {local_path:?} for execution {run_id}");
-            }
-            prompt_text = prompt_text.replace(local_path, "$BOSS_STRUCTURED_OUTPUT");
-        }
-        // `compose_execution_prompt` decides the Bazel pre-push gate by
-        // probing the LOCAL filesystem, which never matches a remote
-        // workspace path — so probe the remote and append it ourselves.
-        let prompt_text = self.append_remote_bazel_gate(execution, &workspace, prompt_text).await;
-
-        // 4. Render the remote worker settings: the same boss-event hooks
-        //    as a local worker, but pointed at the FORWARDED events
-        //    socket and the remote shim, and without the engine-data-dir
-        //    sandbox (there is no Boss engine on the remote). Shipped
-        //    outside the workspace tree and loaded via `--settings`,
-        //    mirroring the local runner.
         let remote_socket = remote_events_socket_path(&run_id);
-        // Mirrors the local pane-spawn path's own lookup: only a review
-        // batch's Supervisor-role member gets the supervisor CLAUDE.md, and
-        // only a PostMergeReviewer-role member gets the post-merge one.
-        let review_batch_member_role = if execution.kind == boss_protocol::ExecutionKind::PrReview {
-            self.work_db
-                .review_batch_member_for_execution(&execution.id)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "determining whether execution {} is a review supervisor: {error}",
-                        execution.id
-                    )
-                })?
-                .map(|member| member.role)
-        } else {
-            None
-        };
-        let is_review_supervisor = review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::Supervisor);
-        let is_post_merge_reviewer =
-            review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::PostMergeReviewer);
-        // Deliberately use the builder: forwarding a new setting here is one
-        // explicit edit, instead of requiring every WorkerSetupInput caller to change.
-        let settings_input = WorkerSetupInput::builder()
-            .run_id(run_id.clone())
-            .lease_id(lease_id.clone())
-            .workspace_path(PathBuf::from(&workspace))
-            .events_socket_path(PathBuf::from(&remote_socket))
-            .boss_event_path(PathBuf::from(REMOTE_BOSS_EVENT_BIN))
-            .execution_kind(execution.kind.as_str().to_owned())
-            .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
-            // Derive the restricted posture the same way the local path does,
-            // so a reviewer/triage/answer-agent dispatched remotely still gets
-            // its reduced surface instead of silently becoming Standard.
-            .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
-            .is_review_supervisor(is_review_supervisor)
-            .is_post_merge_reviewer(is_post_merge_reviewer)
-            // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
-            // worker always gets the legacy marker-only CLAUDE.md, since
-            // SshHostAdapter has no FeatureFlagsStore to read
-            // `automation_outcome_proposals_seam` from.
-            .build();
-        // Resolve the same driver `compose_worker_spawn` already validated
-        // against the registry — settings wiring (ProgressObservation +
-        // ToolUseInterception) must come from that driver, not a hardcoded
-        // Claude reference.
-        let driver = crate::driver::DriverRegistry::default()
-            .require(&spawn_config.driver)
-            .map_err(|err| anyhow::anyhow!("remote spawn: {err}"))?;
-        reject_host_local_remote_spawn_plan(driver.as_ref(), &spawn_config.driver, &host)?;
-        // Fail closed on a driver the remote path cannot observe. The remote
-        // spawn ships exactly one observability channel — this settings
-        // file, whose `boss-event` hooks tunnel back over the reverse
-        // events socket — and the wrapper execs the resolved driver's rendered command. A
-        // driver that reports progress as a byte stream instead renders an
-        // EMPTY hooks map here, so the worker would launch and then be
-        // completely invisible: no live-status entry, no transcript path,
-        // no `Stop`, therefore no completion and no PR, with nothing in the
-        // dispatch timeline to say why. That is not hypothetical — a
-        // settings file containing exactly `"hooks": {}` was recovered from
-        // a remote host after this shipped. Refuse the spawn instead.
-        reject_unobservable_remote_driver(driver.as_ref(), &spawn_config.driver, &settings_input, &host)?;
-        let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
+        let crate::hub_spawn::RemoteLaunch {
+            prompt_text,
+            settings_input,
+            driver,
+            settings_json,
+            structured_output_kind,
+            pr_url_output,
+        } = crate::hub_spawn::prepare_remote_launch(
+            crate::hub_spawn::RemoteLaunchInput::builder()
+                .db(&self.work_db)
+                .execution(execution)
+                .item(work_item)
+                .driver_slug(&spawn_config.driver)
+                .lease_id(&lease_id)
+                .host(&host)
+                .workspace_path(Path::new(&workspace))
+                .events_socket_path(Path::new(&remote_socket))
+                .boss_event_path(Path::new(REMOTE_BOSS_EVENT_BIN))
+                .opts(spawn_opts)
+                .prompt_text(prompt_text)
+                .maybe_embedded_output_path(embedded_output_path.as_deref())
+                .build(),
+        )?;
 
         // 5. Ship the prompt to the path the driver's SpawnPlan reads and
         //    settings outside the workspace tree under `~/.boss-remote/`.
         //    This keeps the remote command identical to the local driver's
         //    command rather than teaching the wrapper a second argv dialect.
-        let (remote_prompt_dir, remote_prompt_path, remote_prompt_gitignore_path) =
+        let (remote_config_dir, remote_prompt_gitignore_path) =
             remote_driver_config_paths(&workspace, driver.descriptor());
+        let input_id = crate::work::next_id("input");
+        let remote_prompt_dir = format!("{remote_config_dir}/runs/{input_id}");
         let remote_home = remote_home_dir(&self.transport).await?;
         let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
 
-        // Resolve the driver's SpawnPlan and fail fast, before shipping
-        // anything to the remote host, if the initial prompt embedded via
-        // this driver's `"$(cat <config_dir>/<initial_prompt_filename>)"`
-        // command substitution would overflow ARG_MAX at the remote CLI's
-        // `execve()` — the exact same E2BIG failure mode
-        // `check_launch_command_arg_max` guards against on the local pane
-        // path, reached here through the identical argv-embedding
-        // mechanism (`driver.spawn_invocation` / `RemoteSpawnPlan::driver_command`,
-        // substituted by the remote wrapper in `ssh_spawn.rs`). Past that
-        // limit the remote shell's `exec` fails invisibly to the engine,
-        // which would otherwise just see the run sit `Spawning` until
-        // `spawn_ack_sweep` gives up and redispatches into the identical,
-        // identically-doomed command.
-        let worker_kind = settings_input.worker_kind;
+        // Budget only the launch command and environment against the remote
+        // exec limits. The brief is read by the terminal launcher, never argv.
+        let worker_kind = &settings_input.worker_kind;
         let driver_binary = driver.descriptor().binary.to_owned();
         let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
             model: &spawn_config.model,
@@ -1254,27 +1172,43 @@ impl HostAdapter for SshHostAdapter {
             permission_mode_override: worker_kind.forced_permission_mode(),
             run_id: Some(&run_id),
         });
-        let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
-        crate::runner::spawn_launch_limits::check_launch_command_arg_max_for_bytes(
-            &driver_spawn_plan.command,
-            driver.descriptor().name,
-            driver.descriptor().config_dir,
-            driver.descriptor().initial_prompt_filename,
-            prompt_text.len(),
-            exec_limits,
-        )?;
+        let engine_socket = self.events_socket_path.display().to_string();
+        let stage = async {
+            stage_remote_agent_rules(&self.transport, &settings_input, driver.as_ref()).await?;
+            let command = stage_remote_initial_input(
+                &self.transport,
+                &run_id,
+                &remote_prompt_dir,
+                &prompt_text,
+                driver.as_ref(),
+                &driver_spawn_plan.command,
+            )
+            .await?;
+            let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
+            crate::runner::spawn_launch_limits::check_launch_command_arg_max_with_limits(
+                &command,
+                driver.descriptor().name,
+                exec_limits,
+            )?;
 
-        self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
+            self.ship_file(
+                &run_id,
+                &remote_config_dir,
+                &remote_prompt_gitignore_path,
+                driver.config_dir_gitignore(),
+                "driver config gitignore",
+            )
             .await?;
-        self.ship_file(
-            &remote_prompt_dir,
-            &remote_prompt_gitignore_path,
-            driver.config_dir_gitignore(),
-            "driver config gitignore",
-        )
-        .await?;
-        self.ship_file(&remote_settings_dir, &remote_settings_path, &settings_json, "settings")
+            self.ship_file(
+                &run_id,
+                &remote_settings_dir,
+                &remote_settings_path,
+                &settings_json,
+                "settings",
+            )
             .await?;
+            Ok(command)
+        };
 
         // 6. Open the reverse events tunnel and launch the detached
         //    remote worker (PR1 orchestration over the one master
@@ -1285,34 +1219,41 @@ impl HostAdapter for SshHostAdapter {
         // wrapper still re-checks PATH so a race between probe and
         // launch surfaces as `host_missing_driver` rather than a silent
         // substitute.
-        let plan = RemoteSpawnPlan::builder()
-            .run_id(run_id.clone())
-            .lease_id(lease_id)
-            .workspace_path(workspace)
-            .maybe_repo_remote_url((!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()))
-            .events_socket_path(remote_socket)
-            .wrapper_path(remote_wrapper_path())
-            .driver_binary(driver_binary.clone())
-            .driver_command(driver_spawn_plan.command)
-            .driver_env(
-                driver_spawn_plan
-                    .env
-                    .iter()
-                    .map(crate::runner::pane_spawn::render_env_directive)
-                    .collect::<String>(),
-            )
-            .maybe_structured_output_kind(structured_output_kind.map(|kind| kind.slug().to_owned()))
-            .pr_url_output(matches!(
-                execution.kind,
-                ExecutionKind::TaskImplementation
-                    | ExecutionKind::ChoreImplementation
-                    | ExecutionKind::ProjectDesign
-                    | ExecutionKind::InvestigationImplementation
-            ))
-            .build();
-
-        let engine_socket = self.events_socket_path.display().to_string();
-        let outcome = perform_remote_launch(&self.transport, &plan, &engine_socket).await?;
+        let driver_env = driver_spawn_plan
+            .env
+            .iter()
+            .map(crate::runner::pane_spawn::render_env_directive)
+            .collect::<String>();
+        let remote_events_socket = remote_socket.clone();
+        let launch = |command: String| {
+            let plan = RemoteSpawnPlan::builder()
+                .run_id(run_id.clone())
+                .lease_id(lease_id)
+                .workspace_path(workspace.clone())
+                .maybe_repo_remote_url(
+                    (!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()),
+                )
+                .events_socket_path(remote_socket)
+                .wrapper_path(remote_wrapper_path())
+                .driver_binary(driver_binary.clone())
+                .driver_command(command)
+                .driver_env(driver_env)
+                .maybe_structured_output_kind(structured_output_kind)
+                .pr_url_output(pr_url_output)
+                .build();
+            let engine_socket = engine_socket.clone();
+            async move { perform_remote_launch(&self.transport, &plan, &engine_socket).await }
+        };
+        let outcome = crate::remote_input_lifecycle::with_input_lifecycle(
+            &self.transport,
+            &self.work_db,
+            &workspace,
+            &input_id,
+            &run_id,
+            stage,
+            launch,
+        )
+        .await?;
 
         if !outcome.launched {
             let reason = outcome.failure_reason.unwrap_or(REASON_WORKER_LAUNCH_FAILED);
@@ -1329,6 +1270,8 @@ impl HostAdapter for SshHostAdapter {
         // the pid is informational, not a spawn precondition.
         if let Some(pid) = outcome.remote_pid {
             match self.work_db.set_run_remote_pid_for_execution(&run_id, pid) {
+                // The attempt-scoped marker remains responsible for input;
+                // the run row independently gates lease and persona teardown.
                 Ok(true) => {}
                 Ok(false) => tracing::warn!(
                     host_id = %host,
@@ -1368,6 +1311,10 @@ impl HostAdapter for SshHostAdapter {
         let live_worker_states = self.live_worker_states.clone();
         let transport = self.transport.clone();
         let wait_run_id = run_id.clone();
+        let reap_run_id = run_id.clone();
+        let reap_workspace = workspace.clone();
+        let reap_remote_socket = remote_events_socket.clone();
+        let reap_engine_socket = engine_socket.clone();
         crate::runner::spawn_confirmation::confirm_turn_start_or_reap(
             driver.descriptor().name,
             &run_id,
@@ -1386,12 +1333,48 @@ impl HostAdapter for SshHostAdapter {
                 }
             },
             || async {
-                if let Some(pid) = remote_pid {
-                    let _ = transport.run(&["kill", &pid.to_string()]).await;
-                }
+                reap_failed_remote_turn(
+                    &transport,
+                    &reap_run_id,
+                    remote_pid,
+                    &reap_workspace,
+                    &reap_remote_socket,
+                    &reap_engine_socket,
+                )
+                .await;
             },
         )
         .await?;
+        // A started driver has not necessarily taken its prompt. Without a
+        // registry nothing can report a turn, so there is nothing to wait for.
+        if let Some(live_worker_states) = self.live_worker_states.clone() {
+            let policy = crate::runner::spawn_confirmation::PromptSubmitPolicy::for_driver(
+                driver.as_ref(),
+                crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT,
+            );
+            crate::runner::spawn_confirmation::confirm_prompt_accepted_or_reap(
+                driver.descriptor().name,
+                &run_id,
+                policy.unattended_timeout(),
+                policy.poll,
+                || {
+                    let accepted = live_worker_states.has_prompt_accepted_for_run(&run_id);
+                    async move { accepted }
+                },
+                || async {
+                    reap_failed_remote_turn(
+                        &transport,
+                        &reap_run_id,
+                        remote_pid,
+                        &reap_workspace,
+                        &reap_remote_socket,
+                        &reap_engine_socket,
+                    )
+                    .await;
+                },
+            )
+            .await?;
+        }
 
         // WorkerPaneAlive: the remote agent is up and working, so the
         // execution stays `running` (never `waiting_human` — nothing is
@@ -1457,6 +1440,45 @@ impl HostAdapter for SshHostAdapter {
         let path = remote_worker_log_path(workspace_path);
         let content = crate::remote_transcript::pull_remote_transcript_tail(&self.transport, &path, max_bytes).await?;
         Ok(Some(content))
+    }
+
+    async fn probe_workspace_occupancy(&self, workspace: &Path) -> Result<crate::workspace_lease_release::Occupancy> {
+        use crate::workspace_lease_release::Occupancy;
+        let workspace = workspace.to_str().context("workspace path is not UTF-8")?;
+        let output = self
+            .transport
+            .run(&["sh", "-c", REMOTE_OCCUPANCY_SCRIPT, "sh", workspace])
+            .await?;
+        anyhow::ensure!(
+            output.success(),
+            "remote occupancy probe failed on {}: {}",
+            self.transport.host_id,
+            output.stderr
+        );
+        Ok(match output.stdout.trim() {
+            "EMPTY" => Occupancy::Empty,
+            "OCCUPIED" => Occupancy::Occupied,
+            _ => Occupancy::Unknown,
+        })
+    }
+
+    async fn cleanup_execution_processes(
+        &self,
+        execution_id: &str,
+        workspace: &Path,
+    ) -> Result<crate::workspace_lease_release::Occupancy> {
+        let output = self
+            .transport
+            .run(&[
+                "python3",
+                "-c",
+                boss_worker_processes::SCRIPT,
+                "BOSS_RUN_ID",
+                execution_id,
+                workspace.to_str().context("workspace is not UTF-8")?,
+            ])
+            .await?;
+        occupancy_from_cleanup(execution_id, &output)
     }
 
     async fn probe_remote_worker_alive(&self, remote_pid: i64) -> Result<Option<bool>> {
@@ -1621,130 +1643,19 @@ pub(crate) fn validate_remote_output_path(
     Ok(path)
 }
 
-// ── HostAdapterCubeClient ─────────────────────────────────────────────────────
-
-/// Presents a [`HostAdapter`]'s cube half as a [`CubeClient`].
-///
-/// [`HostAdapter`] already declares every method [`CubeClient`] requires —
-/// the trait was carved so that "which cube owns this workspace" is a
-/// property of the host, not a global. But the engine's lease bookkeeping
-/// predates host routing and is written against `&dyn CubeClient`
-/// throughout ([`crate::cube_lease_heartbeat`],
-/// [`crate::run_reconcile::confirm_execution_dead`]). This newtype is the
-/// adapter between the two, so a caller that has resolved the *owning*
-/// host can hand its cube to that existing code unchanged instead of
-/// silently falling back to the engine's own local cube.
-///
-/// Every method is a straight delegation — there is no `unimplemented!()`
-/// arm and no behaviour of its own, which is what makes the substitution
-/// safe: code that receives one of these cannot tell it apart from the
-/// local `CommandCubeClient` except by which machine answers.
-pub struct HostAdapterCubeClient {
-    adapter: Arc<dyn HostAdapter>,
-}
-
-impl HostAdapterCubeClient {
-    pub fn new(adapter: Arc<dyn HostAdapter>) -> Self {
-        Self { adapter }
-    }
-}
-
-#[async_trait]
-impl CubeClient for HostAdapterCubeClient {
-    async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
-        self.adapter.ensure_repo(origin).await
-    }
-
-    async fn lease_workspace(
-        &self,
-        repo_id: &str,
-        task: &str,
-        prefer_workspace_id: Option<&str>,
-        allow_dirty: bool,
-        exclude_workspace_ids: &[&str],
-    ) -> Result<CubeWorkspaceLease> {
-        self.adapter
-            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, exclude_workspace_ids)
-            .await
-    }
-
-    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
-        self.adapter.create_change(workspace_path, title).await
-    }
-
-    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
-        self.adapter.goto_workspace(workspace_path, pr).await
-    }
-
-    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
-        self.adapter.goto_workspace_revision(workspace_path, sha).await
-    }
-
-    async fn release_workspace(&self, lease_id: &str) -> Result<()> {
-        self.adapter.release_workspace(lease_id).await
-    }
-
-    async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
-        self.adapter.workspace_status(workspace_path).await
-    }
-
-    async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
-        self.adapter.heartbeat_lease(lease_id, ttl_seconds).await
-    }
-
-    async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
-        self.adapter.force_release_lease(lease_id, reason).await
-    }
-
-    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-        self.adapter.list_workspaces().await
-    }
-
-    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-        self.adapter.list_repos().await
-    }
-
-    fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
-        self.adapter.command_repr(args)
-    }
-}
+pub use boss_engine_completion::remote_host::HostAdapterCubeClient;
 
 // ── HostAdapterProvider ─────────────────────────────────────────────────────────
 
-/// Resolves the [`HostAdapter`] the coordinator should use for a host the
-/// scheduler just selected. This is the seam that replaces the single
-/// hardcoded `LocalHostAdapter` in the dispatch loop: the local host
-/// returns the existing local adapter unchanged, and every other
-/// (SSH-reachable) host gets an [`SshHostAdapter`] over a persistent
-/// `ControlMaster` connection.
-#[async_trait]
-pub trait HostAdapterProvider: Send + Sync {
-    /// Return (or lazily build) the adapter for `host`. Errors surface as
-    /// a pre-start failure in the dispatch loop, leaving the execution
-    /// recoverable on a later kick.
-    async fn adapter_for(&self, host: &Host) -> Result<Arc<dyn HostAdapter>>;
-}
+#[cfg(test)]
+pub use boss_execution_contracts::HostAdapterProvider;
+#[cfg(not(test))]
+use boss_execution_contracts::HostAdapterProvider;
 
-/// The default provider: hands back the one local adapter for every host.
-/// Used by tests and local-only deployments — when no remote hosts are
-/// registered the scheduler only ever picks `local`, so the host argument
-/// is irrelevant. Production swaps in [`SshHostAdapterProvider`].
-pub struct LocalHostAdapterProvider {
-    local: Arc<dyn HostAdapter>,
-}
-
-impl LocalHostAdapterProvider {
-    pub fn new(local: Arc<dyn HostAdapter>) -> Self {
-        Self { local }
-    }
-}
-
-#[async_trait]
-impl HostAdapterProvider for LocalHostAdapterProvider {
-    async fn adapter_for(&self, _host: &Host) -> Result<Arc<dyn HostAdapter>> {
-        Ok(Arc::clone(&self.local))
-    }
-}
+/// The default provider (every host resolves to the one local adapter) lives
+/// beside the trait it implements so the dispatch coordinator can default to it
+/// without depending on this module. Production swaps in [`SshHostAdapterProvider`].
+pub use boss_execution_contracts::LocalHostAdapterProvider;
 
 /// Production provider: returns the local adapter for `host_id = "local"`
 /// and builds (and caches) an [`SshHostAdapter`] for every other host.
@@ -1774,6 +1685,9 @@ pub struct SshHostAdapterProvider {
     /// Live-state registry forwarded into each `SshHostAdapter` so remote
     /// turn-start waits on the same driver-signal predicate as local spawn.
     live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// `BOSS.md` source handed to each built [`SshHostAdapter`]; `None` means
+    /// remote prompts carry no such block.
+    repo_guidance: Option<Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>>,
     /// Lazily-built remote adapters, one per host id.
     #[builder(default = Mutex::new(HashMap::new()))]
     cache: Mutex<HashMap<String, Arc<dyn HostAdapter>>>,
@@ -1797,8 +1711,18 @@ impl SshHostAdapterProvider {
             events_socket_path,
             control_socket_dir,
             live_worker_states,
+            repo_guidance: None,
             cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Supply the `BOSS.md` source remote adapters use when composing prompts.
+    pub fn with_repo_guidance(
+        mut self,
+        repo_guidance: Arc<dyn boss_execution_runner::repo_guidance::RepoGuidanceSource>,
+    ) -> Self {
+        self.repo_guidance = Some(repo_guidance);
+        self
     }
 }
 
@@ -1823,14 +1747,18 @@ impl HostAdapterProvider for SshHostAdapterProvider {
             .open_control_master()
             .await
             .with_context(|| format!("opening ControlMaster to host '{}'", host.id))?;
-        let adapter: Arc<dyn HostAdapter> = Arc::new(SshHostAdapter::new(
+        let mut ssh_adapter = SshHostAdapter::new(
             transport,
             Arc::clone(&self.work_db),
             Arc::clone(&self.cfg),
             self.non_opus_auto_mode,
             self.events_socket_path.clone(),
             self.live_worker_states.clone(),
-        ));
+        );
+        if let Some(repo_guidance) = &self.repo_guidance {
+            ssh_adapter = ssh_adapter.with_repo_guidance(Arc::clone(repo_guidance));
+        }
+        let adapter: Arc<dyn HostAdapter> = Arc::new(ssh_adapter);
         cache.insert(host.id.clone(), Arc::clone(&adapter));
         Ok(adapter)
     }
@@ -1846,7 +1774,7 @@ pub const REASON_HOST_DRIVER_UNSUPPORTED: &str = "host_driver_unsupported";
 /// the coordinator. Remote provisioning for those drivers is not implemented;
 /// descriptor opt-in keeps an added driver from silently inheriting unsafe
 /// remote eligibility.
-fn reject_host_local_remote_spawn_plan(
+pub(crate) fn reject_host_local_remote_spawn_plan(
     driver: &dyn crate::driver::AgentDriver,
     driver_slug: &str,
     host: &str,
@@ -1891,7 +1819,7 @@ async fn remote_home_dir(transport: &SshTransport) -> Result<String> {
 /// Checked on the driver's declared capability rather than its slug, so a
 /// future driver that DOES wire hooks into the settings file passes without
 /// this gate needing to learn its name.
-fn reject_unobservable_remote_driver(
+pub(crate) fn reject_unobservable_remote_driver(
     driver: &dyn crate::driver::AgentDriver,
     driver_slug: &str,
     settings_input: &WorkerSetupInput,
@@ -1908,28 +1836,293 @@ fn reject_unobservable_remote_driver(
     )
 }
 
-/// Resolve a durable host identity once, validating the provider's routing.
-pub(crate) async fn resolve_host_adapter(
-    work_db: &WorkDb,
-    provider: &dyn HostAdapterProvider,
-    host_id: &str,
-) -> Result<Arc<dyn HostAdapter>> {
-    let host = work_db
-        .get_host(host_id)?
-        .with_context(|| format!("host '{host_id}' is no longer in the host registry"))?;
-    let adapter = provider.adapter_for(&host).await?;
-    anyhow::ensure!(
-        adapter.host_id() == host_id,
-        "host adapter for '{host_id}' reports host '{}'",
-        adapter.host_id()
-    );
-    Ok(adapter)
+pub(crate) use boss_engine_completion::remote_host::resolve_host_adapter;
+
+/// Render generated rules and ship them to the remote agent-rules destination.
+pub(crate) async fn stage_remote_agent_rules(
+    transport: &dyn crate::ssh_spawn::SshExec,
+    input: &WorkerSetupInput,
+    driver: &dyn crate::driver::AgentDriver,
+) -> Result<()> {
+    let path = driver.agent_rules_destination(&input.workspace_path, &input.run_id);
+    let parent = path.parent().context("remote agent rules have no parent directory")?;
+    let rules =
+        crate::worker_setup::render_claude_md(input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
+    ship_file(
+        transport,
+        &input.run_id,
+        &parent.to_string_lossy(),
+        &path.to_string_lossy(),
+        &rules,
+        "agent-rules",
+    )
+    .await
+}
+
+/// Stage the real launch artifacts through the same injectable transport as spawn.
+pub(crate) async fn stage_remote_initial_input(
+    transport: &dyn crate::ssh_spawn::SshExec,
+    run_id: &str,
+    directory: &str,
+    prompt: &str,
+    driver: &dyn crate::driver::AgentDriver,
+    command: &str,
+) -> Result<String> {
+    let prefix = format!("python3 -I {}/initial-prompt.py ", driver.descriptor().config_dir);
+    let arguments = command
+        .strip_prefix(&prefix)
+        .context("missing driver terminal launcher")?;
+    let command =
+        crate::driver::initial_prompt::launcher_command(&crate::ssh_transport::shell_quote(directory), arguments);
+    for (name, content) in [
+        ("initial-prompt.txt", prompt.to_owned()),
+        ("initial-prompt.py", crate::driver::initial_prompt::LAUNCHER.to_owned()),
+        (
+            "initial-prompt.json",
+            crate::driver::initial_prompt::launcher_config(driver)?,
+        ),
+    ] {
+        ship_file(
+            transport,
+            run_id,
+            directory,
+            &format!("{directory}/{name}"),
+            &content,
+            "initial-input",
+        )
+        .await?;
+    }
+    Ok(command)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::driver::AgentDriver;
+    use crate::ssh_spawn::SshExec;
+    use crate::ssh_transport::SshOutput;
+    use async_trait::async_trait;
+
+    #[test]
+    fn remote_spawn_opts_carry_the_merge_review_policy() {
+        let opts = remote_spawn_opts(0, None, None);
+        let owner = "linkedin-multiproduct";
+        let expected = crate::merge_poller::review_signal_checks_for_owner(owner);
+        assert!(!expected.is_empty(), "fixture owner must have human-gated checks");
+        assert_eq!((opts.review_signal_checks)(owner), expected);
+    }
+
+    fn run_occupancy_script(workspace: &Path) -> String {
+        run_occupancy_script_scanning(workspace, None)
+    }
+
+    /// Runs the script the way the adapter does, or against `proc_root` in
+    /// place of `/proc` when one is given.
+    fn run_occupancy_script_scanning(workspace: &Path, proc_root: Option<&Path>) -> String {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", REMOTE_OCCUPANCY_SCRIPT, "sh"]).arg(workspace);
+        if let Some(proc_root) = proc_root {
+            command.arg(proc_root);
+        }
+        let output = command.output().expect("run the occupancy script");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// The script decides whether a remote lease is returned, so its verdicts
+    /// are pinned against real processes rather than canned probe results.
+    #[test]
+    fn remote_occupancy_script_reports_empty_occupied_and_prefix_siblings() {
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let sibling = root.path().join("ws-sibling");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        assert_eq!(run_occupancy_script(&root.path().join("missing")), "EMPTY");
+        let empty = run_occupancy_script(&workspace);
+        // An incomplete scan (macOS `lsof` denied; Linux sandbox init with an
+        // unreadable cwd) is UNKNOWN. EMPTY and prefix-sibling assertions run
+        // only when a complete empty scan is possible.
+        let scan_complete = empty != "UNKNOWN";
+        if scan_complete {
+            assert_eq!(empty, "EMPTY");
+        }
+
+        // A process whose cwd merely shares the workspace name as a prefix is not inside it.
+        let _prefix = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .current_dir(&sibling)
+                .spawn()
+                .unwrap(),
+        );
+        if scan_complete {
+            assert_eq!(run_occupancy_script(&workspace), "EMPTY");
+        }
+
+        let nested = workspace.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let _inside = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .current_dir(&nested)
+                .spawn()
+                .unwrap(),
+        );
+        // The child's chdir happens in the forked process; poll until visible.
+        let mut seen = String::new();
+        for _ in 0..100 {
+            seen = run_occupancy_script(&workspace);
+            if seen == "OCCUPIED" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if seen == "UNKNOWN" {
+            // macOS hermetic sandbox denies `lsof`; a Linux host whose every
+            // same-uid cwd is unreadable also cannot observe occupancy.
+            return;
+        }
+        assert_eq!(seen, "OCCUPIED");
+    }
+
+    /// What the script concludes about a process whose cwd does not resolve,
+    /// pinned against a directory laid out like `/proc`. A real process is in
+    /// most of these states for microseconds, and the script used to answer
+    /// `UNKNOWN` when it met one: the first test in this group failed about
+    /// once in six runs of this binary wherever a complete scan was possible,
+    /// because the other tests' children were exiting during its scans.
+    ///
+    /// Linux only: this is the `/proc` branch of the script, and the stat
+    /// lines are in the Linux format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_occupancy_script_classifies_processes_without_a_readable_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let elsewhere = root.path().join("elsewhere");
+        let proc_root = root.path().join("proc");
+        std::fs::create_dir_all(workspace.join("nested")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(proc_root.join("self")).unwrap();
+        // The script compares against the workspace's physical path.
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let elsewhere = std::fs::canonicalize(&elsewhere).unwrap();
+
+        // process <pid> <cwd> <stat line>: a `/proc/<pid>` with those entries,
+        // each of them optional.
+        let process = |pid: &str, cwd: Option<&Path>, stat: Option<&str>| {
+            let dir = proc_root.join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(cwd) = cwd {
+                std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+            }
+            if let Some(stat) = stat {
+                std::fs::write(dir.join("stat"), format!("{stat}\n")).unwrap();
+            }
+        };
+        let verdict = || run_occupancy_script_scanning(&workspace, Some(&proc_root));
+
+        // Flags are decimal in stat. 4194560 is 0x400100, an ordinary process;
+        // 4194564 adds 0x4, PF_EXITING.
+        process(
+            "101",
+            Some(&elsewhere),
+            Some("101 (sleep) S 1 101 101 0 -1 4194560 0 0"),
+        );
+        assert_eq!(verdict(), "EMPTY", "a readable cwd outside the workspace");
+
+        // Reaped after the script saw its directory: nothing left to read. This
+        // is the state the old `grep` took for a live, unreadable process.
+        process("102", None, None);
+        // A zombie, with a name chosen to break a naive parse of the line.
+        process("103", None, Some("103 (a) b) Z 1 103 103 0 -1 4194560 0 0"));
+        // Exiting: the cwd is already released, the state is still running.
+        process("104", None, Some("104 (sh) R 1 104 104 0 -1 4194564 0 0"));
+        assert_eq!(verdict(), "EMPTY", "processes that are gone, zombies or exiting");
+
+        // Alive, not exiting, and unreadable: the scan cannot vouch for it.
+        process("105", None, Some("105 (init) S 0 105 105 0 -1 4194560 0 0"));
+        assert_eq!(verdict(), "UNKNOWN", "a live process with an unreadable cwd");
+        std::fs::remove_dir_all(proc_root.join("105")).unwrap();
+        assert_eq!(verdict(), "EMPTY");
+
+        // A stat line that does not parse proves nothing about the process.
+        process("106", None, Some("not a stat line"));
+        assert_eq!(verdict(), "UNKNOWN", "an unparseable stat line");
+
+        // An occupant outranks an unknown, wherever it comes in the scan.
+        process(
+            "107",
+            Some(&workspace.join("nested")),
+            Some("107 (sleep) S 1 107 107 0 -1 4194560 0 0"),
+        );
+        assert_eq!(verdict(), "OCCUPIED");
+    }
+
+    /// The same property against the real `/proc`: processes that start and
+    /// exit while the script scans must not turn an empty workspace into
+    /// `UNKNOWN`. The test above pins the script's reading of each state; this
+    /// one checks that a real kernel presents an exiting process the way that
+    /// test assumes. It supplies the churn itself, so it does not depend on
+    /// what else is running. It is a weak detector on its own (the old script
+    /// failed it in about one run in twenty), which is why the states are also
+    /// pinned directly.
+    ///
+    /// Under Bazel's `linux-sandbox` the sandbox's init process has a cwd this
+    /// test cannot read, every scan is `UNKNOWN`, and the test has nothing to
+    /// observe; it does its work where the scan is complete, as on a remote
+    /// worker or a real host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_occupancy_script_ignores_processes_that_exit_during_the_scan() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        if run_occupancy_script(&workspace) == "UNKNOWN" {
+            return;
+        }
+
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // Spawn, exit and reap as fast as possible, outside the
+                        // workspace. A spawn that fails must fail the test: with
+                        // no churn it would pass without testing anything.
+                        std::process::Command::new("sleep")
+                            .arg("0")
+                            .current_dir(&elsewhere)
+                            .status()
+                            .expect("spawn a short-lived process");
+                    }
+                });
+            }
+            let verdicts: Vec<String> = (0..40).map(|_| run_occupancy_script(&workspace)).collect();
+            stop.store(true, Ordering::Relaxed);
+            let wrong: Vec<&String> = verdicts.iter().filter(|verdict| *verdict != "EMPTY").collect();
+            assert!(
+                wrong.is_empty(),
+                "{} of {} scans of an empty workspace were not EMPTY while unrelated processes came and went: {wrong:?}",
+                wrong.len(),
+                verdicts.len()
+            );
+        });
+    }
 
     /// A `WorkerSetupInput` shaped like the one the remote spawn builds.
     /// Only the fields `progress_observation_wiring` reads matter here.
@@ -2033,9 +2226,8 @@ mod tests {
     #[test]
     fn remote_spawn_ignores_engine_owned_driver_config_files() {
         let driver = crate::driver::ClaudeDriver;
-        let (directory, prompt, gitignore) = remote_driver_config_paths("/remote/workspace", driver.descriptor());
+        let (directory, gitignore) = remote_driver_config_paths("/remote/workspace", driver.descriptor());
         assert_eq!(directory, "/remote/workspace/.claude");
-        assert_eq!(prompt, "/remote/workspace/.claude/initial-prompt.txt");
         assert_eq!(gitignore, "/remote/workspace/.claude/.gitignore");
         assert_eq!(driver.config_dir_gitignore(), "*\n");
     }
@@ -2064,7 +2256,23 @@ mod tests {
 
     #[test]
     fn stage_local_file_writes_contents_and_embeds_label() {
-        let staged = stage_local_file("mylabel", "hello world").expect("staging file");
+        use std::os::unix::fs::PermissionsExt;
+        let staged = stage_local_file("staging-mode-test", "mylabel", "hello world").expect("staging file");
+        assert!(
+            staged
+                .path()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("staging-mode-test-")
+        );
+        assert_eq!(
+            std::fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         // While the guard is live the file exists with the exact contents.
         assert!(staged.path().exists(), "staged file should exist on disk");
@@ -2083,14 +2291,133 @@ mod tests {
     }
 
     #[test]
+    fn same_run_staging_guards_own_separate_directories() {
+        let first = stage_local_file("same-run-staging", "input", "first").unwrap();
+        let second = stage_local_file("same-run-staging", "input", "second").unwrap();
+        let first_directory = first.path().parent().unwrap().to_path_buf();
+        assert_ne!(Some(first_directory.as_path()), second.path().parent());
+        drop(first);
+        assert!(!first_directory.exists());
+        assert_eq!(std::fs::read_to_string(second.path()).unwrap(), "second");
+    }
+
+    #[test]
+    fn concurrent_staging_guards_keep_independent_contents() {
+        let guards = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|index| {
+                    scope.spawn(move || {
+                        let content = index.to_string();
+                        (
+                            stage_local_file("concurrent-staging", "input", &content).unwrap(),
+                            content,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (guard, content) in guards {
+            assert_eq!(std::fs::read_to_string(guard.path()).unwrap(), content);
+        }
+    }
+
+    #[test]
     fn staged_file_is_removed_on_drop() {
         let path = {
-            let staged = stage_local_file("dropme", "transient").expect("staging file");
+            let staged = stage_local_file("staging-drop-test", "dropme", "transient").expect("staging file");
             assert!(staged.path().exists());
             staged.path().to_path_buf()
         };
         // Guard has dropped: the on-disk file is unlinked.
         assert!(!path.exists(), "staging file should be removed once the guard drops",);
+        assert!(
+            !path.parent().unwrap().exists(),
+            "the staging run directory must be reclaimed"
+        );
+    }
+
+    // ── remote process cleanup report ────────────────────────────────────────
+
+    fn cleanup_report(body: &str) -> SshOutput {
+        SshOutput {
+            status: 0,
+            stdout: format!(
+                r#"{{"terminated":[],"killed":[],"remaining":[],"occupants":[],"unknown":[],"owners":{{}},"elapsed_ms":3{body}}}"#
+            ),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn remote_cleanup_report_with_nothing_left_proves_the_workspace_empty() {
+        assert_eq!(
+            occupancy_from_cleanup("exec", &cleanup_report("")).unwrap(),
+            crate::workspace_lease_release::Occupancy::Empty
+        );
+    }
+
+    #[test]
+    fn remote_cleanup_report_names_occupants_survivors_and_unreadable_processes() {
+        for (field, label) in [
+            ("occupants", "occupants [7]"),
+            ("remaining", "surviving owned processes [7]"),
+            ("unknown", "unreadable processes [7]"),
+        ] {
+            let mut report = cleanup_report("");
+            report.stdout = report
+                .stdout
+                .replace(&format!("\"{field}\":[]"), &format!("\"{field}\":[7]"));
+            let error = occupancy_from_cleanup("exec", &report).unwrap_err();
+            assert!(format!("{error:#}").contains(label), "{field}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn remote_cleanup_report_with_only_unowned_occupants_is_typed_and_owned_ones_are_not() {
+        let mut stray = cleanup_report("");
+        stray.stdout = stray.stdout.replace("\"occupants\":[]", "\"occupants\":[7]");
+        let error = occupancy_from_cleanup("exec", &stray).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<boss_execution_contracts::UnownedOccupants>(),
+            Some(&boss_execution_contracts::UnownedOccupants { occupants: vec![7] })
+        );
+        let mut owned = stray.stdout.clone();
+        owned = owned.replace("\"owners\":{}", "\"owners\":{\"exec_live\":[7]}");
+        let error = occupancy_from_cleanup(
+            "exec",
+            &SshOutput {
+                status: 0,
+                stdout: owned,
+                stderr: String::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
+                .is_none(),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn remote_cleanup_failure_and_garbled_report_are_errors_not_proof() {
+        let failed = SshOutput {
+            status: 255,
+            stdout: String::new(),
+            stderr: "connection refused".into(),
+        };
+        assert!(format!("{:#}", occupancy_from_cleanup("exec", &failed).unwrap_err()).contains("connection refused"));
+        let garbled = SshOutput {
+            status: 0,
+            stdout: "not json".into(),
+            stderr: String::new(),
+        };
+        assert!(occupancy_from_cleanup("exec", &garbled).is_err());
     }
 
     // ── command_repr ─────────────────────────────────────────────────────────
@@ -2221,6 +2548,27 @@ mod tests {
         assert_eq!(adapter.command_repr(&["anything"]), None);
     }
 
+    #[tokio::test]
+    async fn fresh_workspace_reports_the_trunk_commit_it_is_positioned_on() {
+        use boss_engine_test_git::jj::JjRepo;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = JjRepo::new(dir.path());
+        JjRepo::run(&repo.worker, &["bookmark", "set", "main", "-r", "@"]);
+        JjRepo::run(
+            &repo.worker,
+            &["config", "set", "--repo", "revset-aliases.'trunk()'", "main"],
+        );
+        let adapter = LocalHostAdapter::new(
+            Arc::new(ReprCube { repr_some: false }),
+            Arc::new(crate::test_support::NoopRunner),
+        );
+        let positioned = adapter.start_fresh_workspace(&repo.worker).await.unwrap();
+        let trunk = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "main", "-T", "commit_id"]);
+        let parent = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@-", "-T", "commit_id"]);
+        assert_eq!(positioned, trunk);
+        assert_eq!(parent, trunk, "the fresh change sits directly on the reported commit");
+    }
+
     #[test]
     fn remote_output_descriptor_requires_a_safe_absolute_kind_path() {
         use crate::structured_output::StructuredOutputKind::ReviewResult;
@@ -2231,5 +2579,110 @@ mod tests {
             validate_remote_output_path("/tmp/a.review-result.json\n", ReviewResult).unwrap(),
             "/tmp/a.review-result.json"
         );
+    }
+
+    struct ProbeExec {
+        /// `Some(status)` is a completed ssh command; `None` is a transport error.
+        status: Option<i32>,
+    }
+
+    #[async_trait]
+    impl SshExec for ProbeExec {
+        fn host_id(&self) -> &str {
+            "probe-host"
+        }
+        async fn run(&self, _: &[&str]) -> Result<SshOutput> {
+            unreachable!("bazel-marker probe uses run_shell")
+        }
+        async fn run_shell(&self, script: &str) -> Result<SshOutput> {
+            assert!(
+                script.contains("MODULE.bazel") && script.contains("WORKSPACE"),
+                "{script}"
+            );
+            match self.status {
+                Some(status) => Ok(SshOutput {
+                    status,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                None => Err(anyhow::anyhow!("ssh: connection refused")),
+            }
+        }
+        async fn add_reverse_unix_forward(&self, _: &str, _: &str) -> Result<SshOutput> {
+            unreachable!("probe never forwards")
+        }
+        async fn cancel_reverse_unix_forward(&self, _: &str, _: &str) -> Result<SshOutput> {
+            unreachable!("probe never cancels")
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_bazel_probe_maps_exit_0_1_255_and_transport_err() {
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: Some(0) }, "/ws").await,
+            Some(true)
+        );
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: Some(1) }, "/ws").await,
+            Some(false)
+        );
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: Some(255) }, "/ws").await,
+            None
+        );
+        assert_eq!(
+            probe_remote_bazel_workspace_on(&ProbeExec { status: None }, "/ws").await,
+            None
+        );
+        assert_eq!(
+            map_remote_bazel_probe_output(
+                Ok(SshOutput {
+                    status: 126,
+                    stdout: String::new(),
+                    stderr: "permission denied".into(),
+                }),
+                "probe-host",
+            ),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod cube_budget_tests {
+    use crate::ssh_transport::SSH_COMMAND_TIMEOUT;
+    use boss_host_execution::cube_op_budget::*;
+
+    /// The transport timeout precedes the outer timeout so callers receive
+    /// the diagnostic that identifies the failed command.
+    #[test]
+    fn transport_budgets_are_strictly_inside_their_outer_bounds() {
+        assert!(lease_transport_budget() < LEASE);
+        assert!(repo_ensure_transport_budget() < REPO_ENSURE);
+    }
+
+    /// Provisioning budgets exceed the generic command timeout so setup and
+    /// network operations can use their full operation allowance.
+    #[test]
+    fn provisioning_budgets_exceed_the_generic_fast_command_bound() {
+        assert!(
+            lease_transport_budget() > SSH_COMMAND_TIMEOUT,
+            "a remote lease must get more than the generic {}s ssh bound",
+            SSH_COMMAND_TIMEOUT.as_secs()
+        );
+        assert!(
+            repo_ensure_transport_budget() > SSH_COMMAND_TIMEOUT,
+            "a remote repo ensure must get more than the generic {}s ssh bound",
+            SSH_COMMAND_TIMEOUT.as_secs()
+        );
+    }
+
+    /// `saturating_sub` must not silently produce a zero budget if someone
+    /// later sets an outer bound below the grace margin — a zero budget
+    /// would time out every call instantly.
+    #[test]
+    fn transport_budget_never_reaches_zero_for_the_defined_operations() {
+        assert!(!lease_transport_budget().is_zero());
+        assert!(!repo_ensure_transport_budget().is_zero());
     }
 }

@@ -221,13 +221,16 @@ mod tests {
             .unwrap();
 
         let outcome = db
-            .submit_worker_proposal(SubmitWorkerProposalInput {
-                execution_id: &execution.id,
-                work_item_id: &chore.id,
-                kind: ProposalKind::Blocked,
-                payload_json: r#"{"reason":"smoke test"}"#,
-                idempotency_key: "smoke-1",
-            })
+            .submit_worker_proposal_with_liveness(
+                SubmitWorkerProposalInput {
+                    execution_id: &execution.id,
+                    work_item_id: &chore.id,
+                    kind: ProposalKind::Blocked,
+                    payload_json: r#"{"reason":"smoke test"}"#,
+                    idempotency_key: "smoke-1",
+                },
+                &|_| false,
+            )
             .unwrap()
             .unwrap();
 

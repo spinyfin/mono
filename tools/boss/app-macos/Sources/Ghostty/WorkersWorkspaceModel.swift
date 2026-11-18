@@ -2,25 +2,14 @@ import AppKit
 import Darwin
 import Foundation
 import GhosttyKit
+import PaneLayout
 
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
-    /// Interactive worker slots shown on one page (one "Pool" tab). Mirrors
-    /// WORKER_PAGE_SIZE in coordinator.rs.
-    static let workerPageSize = 8
-    /// Number of interactive pages: page 0 "Bridge Crew", page 1 "Lower Decks".
-    /// Mirrors WORKER_PAGE_COUNT in coordinator.rs.
-    static let workerPageCount = 2
-    /// Total interactive/main pool capacity = pages × page size (currently 16).
-    /// Mirrors MAX_WORKER_POOL_SIZE in coordinator.rs; every derived base below
-    /// keys off it so engine and app agree on the slot namespace across pages.
-    static let workerSlotCount = workerPageSize * workerPageCount
-    /// Bridge Crew occupies the first page of slot IDs (1...8); Lower Decks the
-    /// second (9...16). Dispatch fills Bridge Crew before spilling into Lower
-    /// Decks, but both are the same engine pool — indistinguishable except for
-    /// claim-time scheduling priority.
-    static let bridgeCrewSlotRange = 1...workerPageSize                              // 1...8
-    static let lowerDecksSlotRange = (workerPageSize + 1)...workerSlotCount          // 9...16
+    /// Interactive/main pool capacity. Mirrors `MAX_WORKER_POOL_SIZE`.
+    /// Slot ids 1...16 remain engine capacity handles; they are not
+    /// Agents-view pages.
+    static let workerSlotCount = 16
     /// Automation pool occupies slot IDs immediately above the interactive pool.
     /// Matches MAX_AUTOMATION_POOL_SIZE in coordinator.rs.
     static let automationSlotCount = 8
@@ -28,17 +17,27 @@ final class WorkersWorkspaceModel: ObservableObject {
     static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 17...24
     /// Review pool occupies slot IDs immediately above the automation pool.
     /// The count is set dynamically via configureSlots(workerCount:automationCount:reviewCount:)
-    /// when the engine pushes EnginePoolConfig on RegisterAppSession, so the
-    /// app never independently hardcodes a value that drifts from the engine.
-    /// The initial value of 16 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs
-    /// and ensures the slot grid renders correctly before the first pool-config
-    /// push arrives (covering the unlikely race of an AttachWorkerPane before
-    /// EnginePoolConfig, and preventing an empty grid on first launch).
+    /// when the engine pushes EnginePoolConfig on RegisterAppSession.
+    /// The initial value of 16 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs.
     static let reviewSlotBase = automationSlotBase + automationSlotCount   // 25
+    /// Maximum review pool width. Mirrors `MAX_REVIEW_POOL_SIZE` in
+    /// `engine/storage-values/src/pool_policy.rs`; the engine reserves this
+    /// many slot ids for review even when fewer are configured.
+    static let maxReviewSlotCount = 16
+    /// Progression pool width. Mirrors `MAX_PROGRESSION_POOL_SIZE` in
+    /// `engine/storage-values/src/pool_policy.rs`. If either engine constant
+    /// changes, change these with it, or the engine will request slots the
+    /// viewer rejects as unknown.
+    static let progressionSlotCount = 4
+    /// Progression follows the full review range, independent of the
+    /// configured review count.
+    static let progressionSlotBase = reviewSlotBase + maxReviewSlotCount   // 41
+    static let progressionSlotRange = progressionSlotBase...(progressionSlotBase + progressionSlotCount - 1)  // 41...44
 
-    /// Instance-level review slot count, kept in sync with the engine's live
-    /// pool config. Published so the pool-picker header re-renders whenever
-    /// the engine reports a pool size change on reconnect.
+    /// Engine-pushed pool sizes for the Agents pool strip. Existing
+    /// viewers survive capacity changes until detached.
+    @Published private(set) var interactivePoolSize: Int = 16
+    @Published private(set) var automationPoolSize: Int = 8
     @Published private(set) var reviewSlotCount: Int = 16
 
     var reviewSlotRange: ClosedRange<Int> {
@@ -46,48 +45,165 @@ final class WorkersWorkspaceModel: ObservableObject {
     }
 
     let runtime: GhosttyRuntime
-    @Published private(set) var slots: [WorkerSlot]
-    /// Automation-pool slots. These are always idle until the engine wires
-    /// up automation pane spawning; the pool-switcher UI shows them so the
-    /// slot grid is visible before any automation worker runs.
-    @Published private(set) var automationSlots: [WorkerSlot]
-    /// Review-pool slots. Mirror the automation pool layout; always idle
-    /// until the engine routes a `pr_review` execution to this pool.
-    @Published private(set) var reviewSlots: [WorkerSlot]
+    /// Authoritative viewer identity, keyed by run id. Layout cells are
+    /// a separate presentation concern in `AgentsGridModel`.
+    @Published private(set) var viewersByRunId: [String: WorkerSlot] = [:]
+    /// Why this app refused the engine's most recent `AttachWorkerPane` for
+    /// a run, keyed by run id. Written on every rejection in
+    /// `attachWorkerPane`, cleared by a later successful attach or a detach
+    /// for the same run. The Agents card renders it so a live worker whose
+    /// viewer this app turned away shows the reason instead of
+    /// "Connecting…".
+    @Published private(set) var viewerAttachFailuresByRunId: [String: String] = [:]
+    /// Asks the engine to send `AttachWorkerPane` for a run again. Wired by
+    /// `ContentView` to `ChatViewModel.requestWorkerPaneAttach(runId:)`;
+    /// `nil` in builds without an engine connection (tests).
+    var onViewerAttachRequested: ((String) -> Void)?
+    /// Runs a re-attach has already been requested for since the Agents
+    /// view last became visible. One request per run per visibility
+    /// episode: the engine answers with an attach (which clears the entry)
+    /// or with a failure reason on the live-state topic — either way a
+    /// repeat request would add nothing. Cleared when the view is hidden so
+    /// bringing it back asks again.
+    private var requestedViewerRunIds: Set<String> = []
+    private var viewerRequestsByOwner: [String: Set<String>] = [:]
 
-    /// The interactive pool split into its two display pages. Both are drawn
-    /// from `slots` (the single main-pool array) so spawn/release routing stays
-    /// keyed on the flat slot id — the pages are a pure display grouping.
-    var bridgeCrewSlots: [WorkerSlot] {
-        slots.filter { Self.bridgeCrewSlotRange.contains($0.slotId) }
-    }
-    var lowerDecksSlots: [WorkerSlot] {
-        slots.filter { Self.lowerDecksSlotRange.contains($0.slotId) }
+    /// The engine's work-item labels for runs it has released, keyed by run id
+    /// (the execution id). A released run has no live state, so its finished
+    /// pane resolves its title and PR here instead; this is only the engine's
+    /// last answer, refreshed on work-item changes and session registration so
+    /// a renamed work item or a newly bound PR is picked up.
+    @Published private(set) var executionLabelsByRunId: [String: ExecutionWorkLabel] = [:]
+    /// Asks the engine to resolve labels for runs. Wired by `ContentView` to
+    /// `ChatViewModel.requestExecutionLabels(runIds:)`; `nil` in builds
+    /// without an engine connection (tests).
+    var onExecutionLabelsRequested: (([String]) -> Void)?
+    /// Requests expire so lost, rejected or undecodable replies are retried.
+    private var requestedLabelRunIds: Set<String> = []
+    private var labelRequestDates: [String: Date] = [:]
+    private var releasedLabelRunIds: Set<String> = []
+
+    /// Session registration or a work-item mutation invalidates the last answer.
+    func invalidateExecutionLabels() {
+        refreshExecutionLabels(forReleasedRuns: releasedLabelRunIds.sorted())
     }
 
     init() {
         self.runtime = GhosttyRuntime.shared
-        self.slots = (1...Self.workerSlotCount).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+    }
+
+    /// Ask the engine for the label of every released run in `runIds` that has
+    /// neither a label nor an outstanding request. Also drops labels for runs
+    /// no longer rendered, so the map is bounded by what is on screen.
+    func requestExecutionLabels(forReleasedRuns runIds: [String], now: Date = Date()) {
+        let wanted = Set(runIds)
+        releasedLabelRunIds = wanted
+        let expired = Set(labelRequestDates.filter { now.timeIntervalSince($0.value) >= 10 }.keys)
+        labelRequestDates = labelRequestDates.filter { wanted.contains($0.key) && now.timeIntervalSince($0.value) < 10 }
+        requestedLabelRunIds.formIntersection(Set(labelRequestDates.keys))
+        if executionLabelsByRunId.keys.contains(where: { !wanted.contains($0) }) {
+            executionLabelsByRunId = executionLabelsByRunId.filter { wanted.contains($0.key) }
         }
-        self.automationSlots = (Self.automationSlotBase...(Self.automationSlotBase + Self.automationSlotCount - 1)).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+        requestedLabelRunIds.formIntersection(wanted)
+        let missing = runIds.filter {
+            (executionLabelsByRunId[$0] == nil
+                || executionLabelsByRunId[$0]?.status != .resolved || expired.contains($0))
+                && !requestedLabelRunIds.contains($0)
         }
-        self.reviewSlots = (Self.reviewSlotBase...(Self.reviewSlotBase + 16 - 1)).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+        guard !missing.isEmpty else { return }
+        requestedLabelRunIds.formUnion(missing)
+        for id in missing { labelRequestDates[id] = now }
+        onExecutionLabelsRequested?(missing)
+    }
+
+    /// The Agents view came into sight: ask again for every released run so a
+    /// title or PR that changed since the last answer is picked up. The
+    /// previous labels stay on screen until the new ones arrive.
+    func refreshExecutionLabels(forReleasedRuns runIds: [String]) {
+        releasedLabelRunIds = Set(runIds)
+        requestedLabelRunIds = Set(runIds)
+        labelRequestDates = Dictionary(uniqueKeysWithValues: Set(runIds).map { ($0, Date()) })
+        guard !runIds.isEmpty else { return }
+        onExecutionLabelsRequested?(runIds)
+    }
+
+    /// Store the engine's answer. Only runs this model asked about are kept,
+    /// so a late reply for a run that has since left the view cannot grow the
+    /// map.
+    func applyExecutionLabels(_ labels: [ExecutionWorkLabel]) {
+        var next = executionLabelsByRunId
+        for label in labels where requestedLabelRunIds.contains(label.executionId) {
+            next[label.executionId] = label
         }
+        // Keep unresolved replies throttled until the request expires. They may
+        // represent a temporary database read failure, so never cache them forever.
+        let resolvedIds = labels.filter { $0.status == .resolved }.map(\.executionId)
+        requestedLabelRunIds.subtract(resolvedIds)
+        for id in resolvedIds { labelRequestDates.removeValue(forKey: id) }
+        if next != executionLabelsByRunId {
+            executionLabelsByRunId = next
+        }
+    }
+
+    /// Request the engine re-attach viewers for live members the Agents
+    /// view is showing without a terminal. Call when a page or the view
+    /// itself comes into sight, never from a timer: the engine retries a
+    /// failed attach on its own bounded schedule, and this is the
+    /// user-driven path for anything that schedule gave up on. Runs that
+    /// already have a viewer, or that were asked for in this visibility
+    /// episode, are skipped.
+    func requestViewerAttach(forRuns runIds: [String], owner: String = "agents") {
+        for runId in runIds {
+            guard viewersByRunId[runId]?.session == nil else { continue }
+            viewerRequestsByOwner[owner, default: []].insert(runId)
+            guard !requestedViewerRunIds.contains(runId) else { continue }
+            requestedViewerRunIds.insert(runId)
+            onViewerAttachRequested?(runId)
+        }
+    }
+
+    /// The Agents view went out of sight: the next time it shows, every
+    /// still-viewerless member may be asked for again.
+    func resetViewerAttachRequests(owner: String = "agents") {
+        let runs = viewerRequestsByOwner.removeValue(forKey: owner) ?? []
+        for run in runs where !viewerRequestsByOwner.values.contains(where: { $0.contains(run) }) {
+            requestedViewerRunIds.remove(run)
+        }
+    }
+
+    /// A single surface stopped showing one run: allow it to be asked for
+    /// again without clearing requests other surfaces still own.
+    func endViewerAttachRequest(forRun runId: String, owner: String = "agents") {
+        viewerRequestsByOwner[owner]?.remove(runId)
+        if !viewerRequestsByOwner.values.contains(where: { $0.contains(runId) }) {
+            requestedViewerRunIds.remove(runId)
+        }
+    }
+
+    private func recordViewerAttachFailure(runId: String, reason: String) {
+        if viewerAttachFailuresByRunId[runId] != reason {
+            viewerAttachFailuresByRunId[runId] = reason
+        }
+    }
+
+    private func clearViewerAttachFailure(runId: String) {
+        guard viewerAttachFailuresByRunId[runId] != nil else { return }
+        viewerAttachFailuresByRunId.removeValue(forKey: runId)
     }
 
     /// Update pool capacities from the engine's EnginePoolConfig push.
     /// Called every time the app registers a session, so the slot ranges
     /// always mirror the live engine rather than independently-maintained
-    /// constants. Rebuilds the reviewer slot array when the count changes.
+    /// constants. Existing viewers survive capacity changes until detached.
     func configureSlots(workerCount: Int, automationCount: Int, reviewCount: Int) {
-        guard reviewSlotCount != reviewCount else { return }
-        reviewSlotCount = reviewCount
-        let base = WorkersWorkspaceModel.reviewSlotBase
-        reviewSlots = (base...(base + reviewCount - 1)).map { slot in
-            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+        if interactivePoolSize != workerCount {
+            interactivePoolSize = workerCount
+        }
+        if automationPoolSize != automationCount {
+            automationPoolSize = automationCount
+        }
+        if reviewSlotCount != reviewCount {
+            reviewSlotCount = reviewCount
         }
     }
 
@@ -100,19 +216,45 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// honors the requested slot or fails — it never picks a different slot.
     func attachWorkerPane(_ request: EngineAttachRequest) -> EngineAttachResult {
         guard !request.tmuxSocketPath.isEmpty, request.tmuxSocketPath.hasPrefix("/") else {
+            recordViewerAttachFailure(runId: request.runId, reason: "the engine supplied an invalid tmux socket path")
             return .failure(.internalFailure("engine supplied an invalid tmux socket path"))
         }
         let launch = WorkerViewerLaunch(attaching: request)
         switch hostAttachedPane(launch) {
         case .success:
+            clearViewerAttachFailure(runId: request.runId)
+            requestedViewerRunIds.remove(request.runId)
             return .success
         case .failure(let error):
+            recordViewerAttachFailure(runId: request.runId, reason: Self.viewerAttachFailureReason(error))
             return .failure(error)
         }
     }
 
+    func viewer(forRunId runId: String) -> WorkerSlot? {
+        viewersByRunId[runId]
+    }
+
+    /// Card-ready wording for an attach this app refused. Names the
+    /// occupying run on `slotBusy` because that is the one fact a reader
+    /// needs to recognise a stale pane squatting on the slot.
+    static func viewerAttachFailureReason(_ error: EngineSpawnError) -> String {
+        switch error {
+        case .slotBusy(let occupyingRunId):
+            if let occupyingRunId, !occupyingRunId.isEmpty {
+                return "its slot is still hosting run \(occupyingRunId)"
+            }
+            return "its slot is still hosting another pane"
+        case .noAvailableSlot:
+            return "no viewer slot was available"
+        case .internalFailure(let message):
+            return message
+        }
+    }
+
     /// Host an attached worker pane in the slot the engine has claimed for
-    /// this worker (`request.slotId`).
+    /// this worker (`request.slotId`). An existing run keeps its surface and
+    /// original slot metadata and succeeds before slot allocation checks.
     ///
     /// Main-pool slots occupy 1...\(workerSlotCount); automation-pool
     /// slots occupy \(automationSlotBase)...\(automationSlotBase + automationSlotCount - 1).
@@ -124,30 +266,20 @@ final class WorkersWorkspaceModel: ObservableObject {
     ///    a session (engine and app disagree about what's free —
     ///    the engine should reconcile rather than retry blindly).
     private func hostAttachedPane(_ request: WorkerViewerLaunch) -> EngineSpawnResult {
-        let requestedSlot = request.slotId
-        let isAutomation = Self.automationSlotRange.contains(Int(requestedSlot))
-        let isReview = reviewSlotRange.contains(Int(requestedSlot))
-        let targetSlots: [WorkerSlot] = isReview ? reviewSlots : (isAutomation ? automationSlots : slots)
-        guard requestedSlot >= 1,
-              (requestedSlot <= Self.workerSlotCount || isAutomation || isReview),
-              let index = targetSlots.firstIndex(where: { $0.slotId == Int(requestedSlot) })
-        else {
-            let validRanges = "1...\(Self.workerSlotCount) or \(Self.automationSlotBase)...\(Self.automationSlotBase + Self.automationSlotCount - 1) or \(Self.reviewSlotBase)...\(Self.reviewSlotBase + reviewSlotCount - 1)"
-            return .failure(.internalFailure(
-                "engine requested slot \(requestedSlot), valid ranges are \(validRanges)"
-            ))
+        // Reconnection/retry must preserve the exact surface, even if slot
+        // metadata changed. Run identity alone selects an existing viewer.
+        if let existing = viewersByRunId[request.runId] {
+            return .success(slotId: existing.slotId)
         }
-        guard targetSlots[index].session == nil else {
-            return .failure(.slotBusy(occupyingRunId: targetSlots[index].runId))
+        let slotId = request.slotId
+        guard (1...Self.workerSlotCount).contains(slotId)
+                || Self.automationSlotRange.contains(slotId)
+                || reviewSlotRange.contains(slotId)
+                || Self.progressionSlotRange.contains(slotId) else {
+            return .failure(.internalFailure("engine requested unknown slot \(slotId)"))
         }
-
-        let slotId: Int
-        if isReview {
-            slotId = reviewSlots[index].slotId
-        } else if isAutomation {
-            slotId = automationSlots[index].slotId
-        } else {
-            slotId = slots[index].slotId
+        if let occupant = viewersByRunId.values.first(where: { $0.slotId == slotId }) {
+            return .failure(.slotBusy(occupyingRunId: occupant.runId))
         }
 
         let launchSpec = TerminalLaunchSpec(
@@ -161,22 +293,13 @@ final class WorkersWorkspaceModel: ObservableObject {
             role: .worker(slot: slotId),
             launchSpec: launchSpec
         )
-        if isReview {
-            reviewSlots[index].session = session
-            reviewSlots[index].runId = request.runId
-            reviewSlots[index].summary = request.summary
-            reviewSlots[index].taskTitle = request.taskTitle
-        } else if isAutomation {
-            automationSlots[index].session = session
-            automationSlots[index].runId = request.runId
-            automationSlots[index].summary = request.summary
-            automationSlots[index].taskTitle = request.taskTitle
-        } else {
-            slots[index].session = session
-            slots[index].runId = request.runId
-            slots[index].summary = request.summary
-            slots[index].taskTitle = request.taskTitle
-        }
+        viewersByRunId[request.runId] = WorkerSlot(
+            slotId: slotId,
+            session: session,
+            runId: request.runId,
+            summary: request.summary,
+            taskTitle: request.taskTitle
+        )
 
         SpawnDiagnosticsLog.shared.spawnRequested(
             runId: request.runId,
@@ -191,42 +314,18 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// detached tmux session, not by Ghostty, so this does not inspect or
     /// signal any foreground process — it only tears down the app's own
     /// viewer bookkeeping.
-    func detachWorkerPane(slotId: Int) -> EngineReleaseResult {
-        clearWorkerPane(slotId: slotId)
-    }
-
-    private func clearWorkerPane(slotId: Int) -> EngineReleaseResult {
-        let isAutomation = Self.automationSlotRange.contains(slotId)
-        let isReview = reviewSlotRange.contains(slotId)
-        var targetSlots = isReview ? reviewSlots : (isAutomation ? automationSlots : slots)
-        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
+    func detachWorkerPane(runId: String) -> EngineReleaseResult {
+        // A detach means the engine has given up on this run's viewer, so a
+        // refusal recorded for it is stale whether or not a viewer exists —
+        // a viewer-less run's reason must not outlive the engine's intent.
+        clearViewerAttachFailure(runId: runId)
+        requestedViewerRunIds.remove(runId)
+        guard let viewer = viewersByRunId[runId], let session = viewer.session else {
             return .failure(.unknownSlot)
         }
-        guard let session = targetSlots[index].session else {
-            return .failure(.unknownSlot)
-        }
-
-        // Mark released before nil-ing the slot so a display-change retry
-        // racing this release (see `GhosttyTerminalHostView.attemptSurfaceCreation`)
-        // can't create a fresh surface and spawn a duplicate `claude` for the
-        // run the engine just gave up on.
+        // Prevent a display-change retry from recreating a released surface.
         session.markReleased()
-
-        targetSlots[index].session = nil
-        targetSlots[index].runId = nil
-        targetSlots[index].summary = nil
-        targetSlots[index].taskTitle = nil
-        // Re-roll the idle flavor so consecutive idle bouts on the same
-        // slot don't show the same line — fresh recreation each time
-        // the crew member clocks out.
-        targetSlots[index].idleFlavorCycle &+= 1
-        if isReview {
-            reviewSlots = targetSlots
-        } else if isAutomation {
-            automationSlots = targetSlots
-        } else {
-            slots = targetSlots
-        }
+        viewersByRunId.removeValue(forKey: runId)
         return .success
     }
 
@@ -236,7 +335,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// engine diffs this against its own live-worker registry to
     /// surface "husk" panes for `bossctl agents list --all`.
     func listHostedPanes() -> [EngineHostedPaneEntry] {
-        (slots + automationSlots + reviewSlots).compactMap { slot in
+        viewersByRunId.values.sorted { $0.slotId < $1.slotId }.compactMap { slot in
             guard slot.session != nil, let runId = slot.runId else { return nil }
             return EngineHostedPaneEntry(
                 slotId: slot.slotId,
@@ -247,18 +346,45 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
     }
 
+    let agentFocus = AgentFocusCoordinator()
+
+    /// Installed by the Agents view. Applies the run-keyed reveal (filter
+    /// clear, page select, outline) on the view's grid model, forcing the
+    /// grid visible and current first so a request that arrives while another
+    /// mode is showing still resolves against live membership.
+    var agentsRevealHandler: ((String) -> PaneRevealOutcome)?
+
+    /// Run-keyed focus used by `bossctl agents focus` and Doing-card clicks.
+    /// Reveals the run's cell in the Agents view, then focuses its terminal
+    /// once layout has placed it. Success acknowledges reveal; the bounded
+    /// asynchronous responder attempt logs its final outcome. New requests
+    /// cancel superseded focus attempts; a run without a viewer is revealed as its
+    /// viewer-missing card. A run unknown to both membership and the
+    /// viewer map fails as `.unknownSlot`.
+    func revealAgent(runId: String) -> EngineFocusResult {
+        let outcome = agentsRevealHandler?(runId) ?? .notMember
+        let viewer = viewersByRunId[runId]
+        guard outcome != .notMember || viewer != nil else {
+            return .failure(.unknownSlot)
+        }
+        agentFocus.request(runId: runId) { [weak self] in
+            guard let self else { return .failure(.unknownSlot) }
+            if self.viewersByRunId[runId]?.session != nil {
+                return self.focusWorkerPane(runId: runId)
+            }
+            return self.agentFocus.focusCard(runId: runId)
+        }
+        return .success
+    }
+
     /// Bring the slot's libghostty surface to first responder and
     /// raise the host window. Mirrors the user-click path in
     /// `GhosttyTerminalHostView.mouseDown` (which also calls
     /// `makeFirstResponder(self)`), then activates the application so
     /// the window is visible if it was minimised or behind another
     /// app. Used by `bossctl agents focus`.
-    func focusWorkerPane(slotId: Int) -> EngineFocusResult {
-        let targetSlots = reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
-        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
-            return .failure(.unknownSlot)
-        }
-        guard let session = targetSlots[index].session else {
+    func focusWorkerPane(runId: String) -> EngineFocusResult {
+        guard let session = viewersByRunId[runId]?.session else {
             return .failure(.unknownSlot)
         }
         guard let host = session.hostView else {
@@ -276,7 +402,9 @@ final class WorkersWorkspaceModel: ObservableObject {
             window.deminiaturize(nil)
         }
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(host)
+        guard window.makeFirstResponder(host) else {
+            return .failure(.internalFailure("pane refused keyboard focus"))
+        }
         return .success
     }
 }
@@ -295,10 +423,6 @@ struct WorkerSlot: Identifiable, Equatable {
     /// `summary` is nil — rendered as `"<WorkerName>: <taskTitle>"`
     /// so the header still identifies the task without a gerund.
     var taskTitle: String?
-    /// Bumped every time the slot re-enters idle so the flavor line
-    /// changes between idle bouts; kept stable for the lifetime of a
-    /// single bout so renders don't flicker.
-    var idleFlavorCycle: Int = 0
 
     var id: Int { slotId }
 
@@ -307,7 +431,6 @@ struct WorkerSlot: Identifiable, Equatable {
             && lhs.runId == rhs.runId
             && lhs.summary == rhs.summary
             && lhs.taskTitle == rhs.taskTitle
-            && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
     }
 }

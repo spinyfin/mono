@@ -2,9 +2,10 @@ import XCTest
 @testable import Boss
 
 /// The project-card hourglass shares running identity with the global
-/// background-work snapshot (`source_id` = `planner_runs.id`) and keeps
-/// the project-scoped `list_planner_runs` cache for staged/applied
-/// history and popover detail. Design:
+/// background-work snapshot (`source_id` = `planner_runs.id`) and takes
+/// staged/applied/failed history from the per-project summary the work tree
+/// carries; the project-scoped `list_planner_runs` cache is popover and
+/// inspector detail only. Design:
 /// background-task-visibility-toolbar-affordance-for-engine-background-work.md
 /// § "Polling and planner reconciliation".
 @MainActor
@@ -105,31 +106,29 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
         XCTAssertEqual(model.latestPlannerRun(forProjectID: "proj_1")?.outcome, "running")
     }
 
-    /// Project-scoped query returns a terminal outcome for the same id
-    /// while the snapshot still lists the run. Completion through this
-    /// path must hide the hourglass and show the staged/applied icon.
-    func testCompletionViaProjectQueryHidesHourglass() {
+    /// The work tree reports a terminal outcome for the same id while the
+    /// snapshot still lists the run. Completion through this path must hide
+    /// the hourglass and show the staged/applied icon, and the popover waits
+    /// for a fetched full row rather than inventing one from the summary.
+    func testCompletionViaTreeSummaryHidesHourglass() {
         let model = makeModel()
         model.backgroundWork = [makePlannerItem(projectID: "proj_1", sourceID: "run_1")]
         XCTAssertEqual(model.plannerAffordancePresentation(forProjectID: "proj_1")?.isRunning, true)
 
-        model.applyEventForTest(.plannerRunsList(
-            projectID: "proj_1",
-            runs: [makeRun(id: "run_1", projectID: "proj_1", outcome: "staged")]
-        ))
+        model.plannerRunSummaryByProjectID["proj_1"] = makeSummary(runID: "run_1", projectID: "proj_1", outcome: "staged")
 
         let presentation = model.plannerAffordancePresentation(forProjectID: "proj_1")
         XCTAssertEqual(presentation?.runID, "run_1")
         XCTAssertEqual(presentation?.isRunning, false)
         XCTAssertEqual(presentation?.systemImage, "tray.and.arrow.down.fill")
-        XCTAssertEqual(model.latestPlannerRun(forProjectID: "proj_1")?.outcome, "staged")
-        XCTAssertEqual(model.plannerRunForAffordancePopover(forProjectID: "proj_1")?.id, "run_1")
+        XCTAssertNil(model.latestPlannerRun(forProjectID: "proj_1"))
+        XCTAssertNil(model.plannerRunForAffordancePopover(forProjectID: "proj_1"))
     }
 
-    func testCompletionViaProjectQueryAppliedOutcome() {
+    func testCompletionViaTreeSummaryAppliedOutcome() {
         let presentation = PlannerRunAffordancePresentation.from(
             projectID: "proj_1",
-            cachedRuns: [makeRun(id: "run_1", projectID: "proj_1", outcome: "applied")],
+            summary: makeSummary(runID: "run_1", projectID: "proj_1", outcome: "applied"),
             backgroundWork: [makePlannerItem(projectID: "proj_1", sourceID: "run_1")]
         )
         XCTAssertEqual(presentation?.isRunning, false)
@@ -139,26 +138,24 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
     // MARK: - Invariant: no conflicting running outcomes
 
     /// The hourglass running set equals the global planner items whose
-    /// cached row is missing or still `running`. Project B cannot light
-    /// an hourglass for project A's live run, and a cache-only running
-    /// row cannot disagree with a snapshot that does not list it.
+    /// tree summary is missing or names a different run. Project B cannot
+    /// light an hourglass for project A's live run, and a project whose
+    /// snapshot item is absent (proj_c) cannot present as running at all.
     func testHourglassAndGlobalSnapshotCannotDisagreeOnRunning() {
         let items = [
             makePlannerItem(projectID: "proj_a", sourceID: "run_a"),
             makePlannerItem(projectID: "proj_b", sourceID: "run_b"),
         ]
-        let cached: [String: [PlannerRun]] = [
-            "proj_a": [makeRun(id: "run_a", projectID: "proj_a", outcome: "running")],
-            "proj_b": [],
-            "proj_c": [makeRun(id: "run_c", projectID: "proj_c", outcome: "running")],
+        let summaries: [String: PlannerRunSummary] = [
+            "proj_b": makeSummary(runID: "run_old_b", projectID: "proj_b", outcome: "planner_failed"),
+            "proj_c": makeSummary(runID: "run_c", projectID: "proj_c", outcome: "staged"),
         ]
         let projectIDs = ["proj_a", "proj_b", "proj_c"]
 
-        let hourglass = runningPairs(projectIDs: projectIDs, cached: cached, backgroundWork: items)
+        let hourglass = runningPairs(projectIDs: projectIDs, summaries: summaries, backgroundWork: items)
         let global = Set(items.compactMap { item -> String? in
             guard item.isProjectPlanner, let projectID = item.projectID else { return nil }
-            if let cachedRun = cached[projectID]?.first(where: { $0.id == item.sourceID }),
-               !cachedRun.isRunning {
+            if summaries[projectID]?.runID == item.sourceID {
                 return nil
             }
             return "\(projectID):\(item.sourceID)"
@@ -168,7 +165,7 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
         XCTAssertEqual(hourglass, global)
         XCTAssertFalse(
             hourglass.contains("proj_c:run_c"),
-            "a cache-only running row must not present as running when the snapshot omits it"
+            "a settled summary must not present as running when the snapshot omits the run"
         )
         XCTAssertEqual(
             Set(hourglass.map { $0.split(separator: ":")[1] }).count,
@@ -181,25 +178,25 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
         let items = [makePlannerItem(projectID: "proj_a", sourceID: "run_1")]
         let a = PlannerRunAffordancePresentation.liveRunningRunID(
             projectID: "proj_a",
-            cachedRuns: [makeRun(id: "run_1", projectID: "proj_a", outcome: "running")],
+            summary: nil,
             backgroundWork: items
         )
         let b = PlannerRunAffordancePresentation.liveRunningRunID(
             projectID: "proj_b",
-            cachedRuns: [makeRun(id: "run_1", projectID: "proj_b", outcome: "running")],
+            summary: nil,
             backgroundWork: items
         )
         XCTAssertEqual(a, "run_1")
         XCTAssertNil(
             b,
-            "project B's cache cannot light a competing hourglass for project A's live run"
+            "project B cannot light a competing hourglass for project A's live run"
         )
     }
 
-    func testGlobalIdentityWinsOverStaleCachedRunningRow() {
+    func testGlobalIdentityWinsOverOlderSettledSummary() {
         let presentation = PlannerRunAffordancePresentation.from(
             projectID: "proj_1",
-            cachedRuns: [makeRun(id: "run_old", projectID: "proj_1", outcome: "running")],
+            summary: makeSummary(runID: "run_old", projectID: "proj_1", outcome: "planner_failed"),
             backgroundWork: [makePlannerItem(projectID: "proj_1", sourceID: "run_new")]
         )
         XCTAssertEqual(presentation?.runID, "run_new")
@@ -210,7 +207,7 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
     func testConflictRemediationItemsDoNotDriveTheHourglass() {
         let presentation = PlannerRunAffordancePresentation.from(
             projectID: "proj_1",
-            cachedRuns: [],
+            summary: nil,
             backgroundWork: [
                 BackgroundWorkItem(
                     id: "conflict_remediation:crz_1",
@@ -228,41 +225,45 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
         XCTAssertNil(presentation)
     }
 
-    func testStagedHistoryStillComesFromProjectQuery() {
+    func testStagedHistoryComesFromTreeSummary() {
         let model = makeModel()
-        let staged = makeRun(id: "run_done", projectID: "proj_1", outcome: "staged")
-        model.plannerRunsByProjectID["proj_1"] = [staged]
+        model.plannerRunSummaryByProjectID["proj_1"] = makeSummary(runID: "run_done", projectID: "proj_1", outcome: "staged")
         model.backgroundWork = []
 
         let presentation = model.plannerAffordancePresentation(forProjectID: "proj_1")
         XCTAssertEqual(presentation?.runID, "run_done")
         XCTAssertEqual(presentation?.isRunning, false)
         XCTAssertEqual(presentation?.systemImage, "tray.and.arrow.down.fill")
-        XCTAssertEqual(model.latestPlannerRun(forProjectID: "proj_1")?.id, "run_done")
+        XCTAssertEqual(presentation?.tooltip, "Staged tasks ready for review")
+        XCTAssertTrue(
+            model.plannerRuns(forProjectID: "proj_1").isEmpty,
+            "rendering the affordance must not need the project-scoped history"
+        )
     }
 
     /// The newest cached run is `running` (inside the engine's anti-flicker
     /// gate, or after a disconnect cleared the snapshot) and the snapshot
     /// has no matching item. The affordance must fall back to the previous
-    /// terminal run's history icon, never disappear entirely.
+    /// settled run's history icon, never disappear entirely.
     func testCacheOnlyRunningRowFallsBackToHistoryIcon() {
-        let presentation = PlannerRunAffordancePresentation.from(
-            projectID: "proj_1",
-            cachedRuns: [
-                makeRun(id: "run_new", projectID: "proj_1", outcome: "running"),
-                makeRun(id: "run_old", projectID: "proj_1", outcome: "staged"),
-            ],
-            backgroundWork: []
-        )
+        let model = makeModel()
+        model.plannerRunsByProjectID["proj_1"] = [
+            makeRun(id: "run_new", projectID: "proj_1", outcome: "running"),
+            makeRun(id: "run_old", projectID: "proj_1", outcome: "staged"),
+        ]
+        model.plannerRunSummaryByProjectID["proj_1"] = makeSummary(runID: "run_old", projectID: "proj_1", outcome: "staged")
+        model.backgroundWork = []
+
+        let presentation = model.plannerAffordancePresentation(forProjectID: "proj_1")
         XCTAssertEqual(presentation?.runID, "run_old")
         XCTAssertEqual(presentation?.isRunning, false)
         XCTAssertEqual(presentation?.systemImage, "tray.and.arrow.down.fill")
     }
 
-    func testFailedHistoryStillComesFromProjectQuery() {
+    func testFailedHistoryComesFromTreeSummary() {
         let presentation = PlannerRunAffordancePresentation.from(
             projectID: "proj_1",
-            cachedRuns: [makeRun(id: "run_fail", projectID: "proj_1", outcome: "planner_failed")],
+            summary: makeSummary(runID: "run_fail", projectID: "proj_1", outcome: "planner_failed"),
             backgroundWork: []
         )
         XCTAssertEqual(presentation?.isRunning, false)
@@ -314,13 +315,13 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
 
     private func runningPairs(
         projectIDs: [String],
-        cached: [String: [PlannerRun]],
+        summaries: [String: PlannerRunSummary],
         backgroundWork: [BackgroundWorkItem]
     ) -> Set<String> {
         Set(projectIDs.compactMap { projectID in
             guard let runID = PlannerRunAffordancePresentation.liveRunningRunID(
                 projectID: projectID,
-                cachedRuns: cached[projectID] ?? [],
+                summary: summaries[projectID],
                 backgroundWork: backgroundWork
             ) else { return nil }
             return "\(projectID):\(runID)"
@@ -342,6 +343,16 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
             projectID: projectID,
             startedAt: "2026-08-26T12:00:00Z",
             workItemID: nil
+        )
+    }
+
+    private func makeSummary(runID: String, projectID: String, outcome: String) -> PlannerRunSummary {
+        PlannerRunSummary(
+            runID: runID,
+            projectID: projectID,
+            outcome: outcome,
+            createdAt: "1000",
+            updatedAt: "1000"
         )
     }
 

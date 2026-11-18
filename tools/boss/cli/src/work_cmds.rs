@@ -2,6 +2,54 @@
 
 use crate::*;
 
+/// Args for `boss project park`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ProjectParkArgs {
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) selector: String,
+
+    /// Optional free-text reason recorded with the park.
+    #[arg(long)]
+    pub(crate) reason: Option<String>,
+}
+
+/// Args for `boss task park`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TaskParkArgs {
+    /// Task/chore id. Accepts primary id, friendly short id, or
+    /// cross-product form (same as `boss task show`).
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) id: String,
+    /// Resolve a friendly short id against this product (slug or id).
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+    /// Optional free-text reason recorded with the park.
+    #[arg(long)]
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TaskIdArg {
+    /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
+    /// (`42`, `#42`, or the product-local `T`-prefix form), or cross-product
+    /// form (`boss/42` or `boss/#42`). Globally unique short ids resolve
+    /// without `--product`; ambiguous ones error listing every candidate.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) id: String,
+    /// Resolve a friendly short id (`42` or `#42`) against this product
+    /// (slug or id). Optional when the short id is globally unique.
+    /// Ignored when the selector already embeds a product slug
+    /// (`boss/42`) or when the selector is a primary id.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    pub(crate) with_primary_id: bool,
+}
+
 pub(crate) async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
@@ -355,10 +403,13 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             };
             let projects = apply_project_list_filters(
                 projects,
-                &args.status,
-                args.match_term.as_deref(),
-                &resolved_ids,
-                args.limit,
+                ProjectListCriteria::builder()
+                    .statuses(&args.status)
+                    .maybe_match_term(args.match_term.as_deref())
+                    .ids(&resolved_ids)
+                    .maybe_limit(args.limit)
+                    .parked(args.parked.filter())
+                    .build(),
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
             );
@@ -426,6 +477,12 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             print_entity(ctx, &serde_json::json!({ "project": project }), || {
                 print_project_details("Updated project", &project, None, false);
             })
+        }
+        ProjectCommand::Park(args) => {
+            run_park_project(&mut client, ctx, args.product, args.selector, true, args.reason).await
+        }
+        ProjectCommand::Unpark(args) => {
+            run_park_project(&mut client, ctx, args.product, args.selector, false, None).await
         }
         ProjectCommand::Delete(args) => {
             let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
@@ -670,6 +727,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
 pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
+        TaskCommand::RequestCritical { ids, ask } => request_critical(&mut client, ctx, ids, ask).await,
         TaskCommand::Create(args) => {
             // `--automation`: the triage agent's create path. The produced
             // task is product-level (no project) and routed to the automations
@@ -809,6 +867,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .ids(&resolved_ids)
                     .maybe_limit(args.limit)
                     .include_archived(args.include_archived)
+                    .parked(args.parked.filter())
                     .maybe_parent_task_id(parent_task_id.as_deref())
                     .build(),
                 repo_selector.as_ref(),
@@ -824,11 +883,32 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::ByPr(args) => run_by_pr(&mut client, ctx, args).await,
         TaskCommand::ByExec(args) => run_by_exec(&mut client, ctx, args).await,
         TaskCommand::Executions(args) => run_task_executions(&mut client, ctx, args).await,
+        TaskCommand::DismissQuestion(TaskDismissQuestionArgs { id, question, note }) => {
+            let response = client
+                .send_request(&FrontendRequest::DismissOperatorQuestion {
+                    id,
+                    question_id: question,
+                    note,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::WorkItemUpdated { item } => print_entity(ctx, &item, || println!("Question dismissed.")),
+                FrontendEvent::OperatorQuestionError { error } => Err(CliError::application(error.to_string())),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("task dismiss-question", &other)),
+            }
+        }
         TaskCommand::Answer(args) => {
             let response = client
                 .send_request(&FrontendRequest::AnswerOperatorQuestion {
                     id: args.id,
-                    answer: boss_protocol::OperatorAnswer::YesNo { value: args.yes },
+                    answer: match args.choice {
+                        Some(value) => boss_protocol::OperatorAnswer::MultipleChoice { value },
+                        None => boss_protocol::OperatorAnswer::YesNo { value: args.yes },
+                    },
                 })
                 .await
                 .map_err(CliError::internal)?;
@@ -850,6 +930,20 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         TaskCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
+        TaskCommand::Park(args) => run_park_leaf(&mut client, ctx, args, true).await,
+        TaskCommand::Unpark(args) => {
+            run_park_leaf(
+                &mut client,
+                ctx,
+                TaskParkArgs {
+                    id: args.id,
+                    product: args.product,
+                    reason: None,
+                },
+                false,
+            )
+            .await
+        }
         TaskCommand::Reorder(args) => {
             let product = resolve_product_inferable(&mut client, args.product, args.project.as_deref(), ctx).await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
@@ -883,6 +977,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
 pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
+        ChoreCommand::RequestCritical { ids, ask } => request_critical(&mut client, ctx, ids, ask).await,
         ChoreCommand::Create(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let name = required_text(args.name, "Chore name", ctx)?;
@@ -967,6 +1062,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
                     .ids(&resolved_ids)
                     .maybe_limit(args.limit)
                     .include_archived(args.include_archived)
+                    .parked(args.parked.filter())
                     .build(),
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
@@ -983,6 +1079,20 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
         ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         ChoreCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Park(args) => run_park_leaf(&mut client, ctx, args, true).await,
+        ChoreCommand::Unpark(args) => {
+            run_park_leaf(
+                &mut client,
+                ctx,
+                TaskParkArgs {
+                    id: args.id,
+                    product: args.product,
+                    reason: None,
+                },
+                false,
+            )
+            .await
+        }
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
         ChoreCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
         ChoreCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
@@ -1406,6 +1516,10 @@ pub(crate) async fn run_comment_reply(ctx: &RunContext, args: CommentReplyArgs) 
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
+        FrontendEvent::ProposalRejected { error } => Err(CliError::application(error.message)),
         other => Err(unexpected_event("comment reply", &other)),
     }
 }
@@ -1436,6 +1550,10 @@ pub(crate) async fn run_comment_guide_outcome(ctx: &RunContext, args: CommentGui
         .await
         .map_err(CliError::internal)?
     {
+        // A spoke-hosted worker's outcome is queued for the hub, not applied yet.
+        FrontendEvent::WorkerGatewayResult { status, value } => {
+            crate::propose::print_gateway_result(ctx, &status, &value)
+        }
         FrontendEvent::CommentResult { comment } => {
             print_entity(ctx, &serde_json::json!({ "comment": comment }), || {
                 if !ctx.quiet {
@@ -1446,6 +1564,7 @@ pub(crate) async fn run_comment_guide_outcome(ctx: &RunContext, args: CommentGui
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
+        FrontendEvent::ProposalRejected { error } => Err(CliError::application(error.message)),
         other => Err(unexpected_event("comment guide-outcome", &other)),
     }
 }
@@ -1505,6 +1624,11 @@ pub(crate) async fn run_show_leaf(
         other => return Err(unexpected_event("operator question history", &other)),
     };
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
+    let field_audit = field_audit_from_reply(
+        client
+            .send_request(&FrontendRequest::ListTaskFieldAudit { id: item.id.clone() })
+            .await,
+    );
     let mut task_json = task_json_with_runtime(&item, &runtime)?;
     // These keys share a namespace with `Task`'s own serialized fields, so a
     // future `Task` field named `dependencies`/`executions`/`attention_items`/
@@ -1530,40 +1654,20 @@ pub(crate) async fn run_show_leaf(
             "attention_groups".to_owned(),
             serde_json::to_value(&attention_groups).map_err(CliError::internal)?,
         );
+        // Every recorded change to `deferred` / `autostart`, oldest first,
+        // each with the actor and the code path (and calling process) behind it.
+        map.insert(
+            "field_audit".to_owned(),
+            serde_json::to_value(&field_audit).map_err(CliError::internal)?,
+        );
     } else {
         return Err(CliError::internal(anyhow::anyhow!("task JSON was not an object")));
     }
     print_entity(ctx, &task_json, || {
         print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
         for record in &questions {
-            let q = &record.question;
-            println!("\nOperator question {} ({:?}): {}", q.id, record.status, q.text);
-            let answer_type = match &q.answer_type {
-                boss_protocol::OperatorAnswerType::YesNo => "yes_no",
-                boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { .. } => "create_prerequisite_task",
-            };
-            println!(
-                "  Answer type: {answer_type}; asked: {}; execution: {}",
-                q.asked_at, q.execution_id
-            );
-            println!("  Explanation: {}", q.explanation);
-            if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief } = &q.answer_type {
-                println!("  Proposed prerequisite task: {name}");
-                println!("  Proposed brief:");
-                for line in brief.lines() {
-                    println!("    {line}");
-                }
-            }
-            if let Some(boss_protocol::OperatorAnswer::YesNo { value }) = &record.answer {
-                println!(
-                    "  Answer: {}; by: {}; at: {}",
-                    if *value { "Yes" } else { "No" },
-                    record.answered_by.as_deref().unwrap_or(""),
-                    record.answered_at.as_deref().unwrap_or("")
-                );
-            }
-            if let Some(reason) = &record.withdrawn_reason {
-                println!("  Withdrawn: {reason}");
+            for line in crate::operator_question_text::operator_question_lines(record) {
+                println!("{line}");
             }
         }
         print_attention_items_section(&attention_items);
@@ -1571,7 +1675,51 @@ pub(crate) async fn run_show_leaf(
         print_runtime_section(&runtime);
         print_dependency_section(&detail);
         print_executions_section(&execution_runs);
+        print_field_audit_section(&field_audit);
     })
+}
+
+/// Flag history is additive: an older engine, or a failed history read, must
+/// not fail `boss task show`. Treat those replies as no history and warn.
+fn field_audit_from_reply(
+    reply: anyhow::Result<boss_protocol::FrontendEvent>,
+) -> Vec<boss_protocol::TaskFieldAuditRow> {
+    match reply {
+        Ok(boss_protocol::FrontendEvent::TaskFieldAuditList { rows, .. }) => rows,
+        Ok(
+            boss_protocol::FrontendEvent::WorkError { message } | boss_protocol::FrontendEvent::Error { message, .. },
+        ) => {
+            eprintln!("warning: task flag history unavailable ({message})");
+            Vec::new()
+        }
+        Ok(_) => {
+            eprintln!("warning: task flag history unavailable (unexpected engine reply)");
+            Vec::new()
+        }
+        Err(err) => {
+            eprintln!("warning: task flag history unavailable ({err})");
+            Vec::new()
+        }
+    }
+}
+
+/// The `deferred` / `autostart` history of a task, oldest first: what changed,
+/// who the engine attributes it to, and the code path that wrote it.
+fn print_field_audit_section(rows: &[boss_protocol::TaskFieldAuditRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("Flag history ({}):", rows.len());
+    for row in rows {
+        let old = row.old_value.as_deref().unwrap_or("-");
+        let new = row.new_value.as_deref().unwrap_or("-");
+        let lower_bound = if row.age_is_lower_bound { " (or earlier)" } else { "" };
+        println!(
+            "  {} {} -> {} by {} at {}{} via {}",
+            row.property, old, new, row.actor, row.changed_at, lower_bound, row.basis
+        );
+    }
 }
 
 /// Serialise `item` and splice the runtime's `current_execution_id`
@@ -1878,6 +2026,40 @@ pub(crate) async fn run_restore_leaf(
     })
 }
 
+pub(crate) async fn run_park_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskParkArgs,
+    parked: bool,
+) -> Result<(), CliError> {
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product).await?;
+    let item = park_work_item(client, &resolved_id, parked, args.reason).await?;
+    let (task, label) = expect_leaf_work_item(item)?;
+    let task = with_display_status(task);
+    let verb = if parked { "Parked" } else { "Unparked" };
+    print_entity(ctx, &serde_json::json!({ "item": task }), || {
+        print_task_details(&format!("{verb} {}", label_titlecase(label)), &task, None, false);
+    })
+}
+
+pub(crate) async fn run_park_project(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    product: Option<String>,
+    selector: String,
+    parked: bool,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    let product = resolve_product_inferable(client, product, Some(&selector), ctx).await?;
+    let project = resolve_project(client, &product.id, Some(selector), ctx).await?;
+    let item = park_work_item(client, &project.id, parked, reason).await?;
+    let project = expect_project(item)?;
+    let verb = if parked { "Parked" } else { "Unparked" };
+    print_entity(ctx, &serde_json::json!({ "project": project }), || {
+        print_project_details(&format!("{verb} project"), &project, None, false);
+    })
+}
+
 /// "task" -> "Task". The label set comes from
 /// [`expect_leaf_work_item`], so `&'static str` in / out is enough.
 pub(crate) fn label_titlecase(label: &str) -> &'static str {
@@ -2091,5 +2273,61 @@ pub(crate) fn print_org_state_human(org_state: &OrgAuthState) {
             println!("  Authorize: {sso_url}");
         }
         OrgAuthState::Unknown => println!("Org access: unknown (probe failed)"),
+    }
+}
+
+async fn request_critical(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    ids: Vec<String>,
+    ask: String,
+) -> Result<(), CliError> {
+    let id = rpc_call!(
+        client,
+        FrontendRequest::RequestCriticalPriority { ids, ask },
+        "critical priority request",
+        FrontendEvent::CriticalPriorityRequested { id } => id,
+    )?;
+    print_entity(
+        ctx,
+        &serde_json::json!({"id": id, "status": "pending_confirmation", "expires_in_seconds": 300}),
+        || {
+            println!("Pending app confirmation: {id} (expires in five minutes)");
+        },
+    )
+}
+
+#[cfg(test)]
+mod field_audit_show_tests {
+    use super::*;
+    use boss_protocol::FrontendEvent;
+
+    #[test]
+    fn a_history_reply_is_kept() {
+        let rows = vec![boss_protocol::TaskFieldAuditRow {
+            property: "deferred".into(),
+            old_value: None,
+            new_value: Some("0".into()),
+            actor: "human".into(),
+            basis: "insert_task_in_tx_as_actor".into(),
+            changed_at: "1".into(),
+            age_is_lower_bound: false,
+        }];
+        let got = field_audit_from_reply(Ok(FrontendEvent::TaskFieldAuditList {
+            work_item_id: "task_1".into(),
+            rows: rows.clone(),
+        }));
+        assert_eq!(got, rows);
+    }
+
+    #[test]
+    fn an_unknown_verb_or_failed_read_is_absent_history() {
+        assert!(
+            field_audit_from_reply(Ok(FrontendEvent::WorkError {
+                message: "unknown request type".into()
+            }))
+            .is_empty()
+        );
+        assert!(field_audit_from_reply(Err(anyhow::anyhow!("engine closed"))).is_empty());
     }
 }

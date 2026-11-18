@@ -154,7 +154,7 @@ async fn force_start_refused_by_interactive_cap_leaves_no_residue() {
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("exec-busy-{i}"), None)
+            .claim_working(&format!("exec-busy-{i}"), None)
             .await
             .expect("idle slot below the cap");
     }
@@ -545,4 +545,61 @@ async fn evaluate_dispatch_admission_reports_pause_snapshot() {
         paused_admission.blockers.is_empty(),
         "no other blocker should be present"
     );
+}
+
+#[tokio::test]
+async fn critical_force_start_creates_execution_under_pause_and_full_cap() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Critical");
+    db.update_work_item_as_actor(
+        &chore.id,
+        boss_protocol::WorkItemPatch {
+            priority: Some("critical".into()),
+            ..Default::default()
+        },
+        boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+    )
+    .unwrap();
+    assert!(db.list_executions(Some(&chore.id)).unwrap().is_empty());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(2),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..Default::default()
+            }),
+        )
+        .with_max_concurrent_interactive_workers(1),
+    );
+    coordinator
+        .worker_pool()
+        .claim_working("exec_busy", None)
+        .await
+        .unwrap();
+    coordinator.pause_dispatch(42, DispatchPauseOrigin::Operator, PauseReason::new("paused").unwrap());
+    let admission = coordinator.evaluate_dispatch_admission(&chore.id).await.unwrap();
+    assert!(admission.would_dispatch);
+    assert!(!admission.pause.active);
+    assert!(admission.blockers.is_empty());
+    assert_eq!(
+        crate::coordinator::pause_bypass_decision(&admission, Some(42)),
+        Ok(false)
+    );
+    let result = coordinator
+        .dispatch_with_pause_bypass(force_input(&chore.id, Some(42)), live_states())
+        .await
+        .unwrap();
+    wait_for_execution_status(&db, &result.execution.id, ExecutionStatus::Running).await;
+    assert_eq!(coordinator.worker_pool().busy_count().await, 2);
+    assert!(coordinator.is_dispatch_paused());
+
+    coordinator.pause_dispatch(43, DispatchPauseOrigin::Breaker, PauseReason::new("broken").unwrap());
+    let admission = coordinator.evaluate_dispatch_admission(&chore.id).await.unwrap();
+    assert!(admission.pause.active);
+    assert!(!admission.pause.overridable);
+    assert!(crate::coordinator::pause_bypass_decision(&admission, None).is_err());
 }

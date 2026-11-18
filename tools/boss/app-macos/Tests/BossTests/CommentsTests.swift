@@ -258,6 +258,77 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.pendingTypeahead, "")
     }
 
+    func testDeactivatingLayerClosesComposerAndIgnoresKeys() {
+        let layer = CommentLayer()
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        layer.setHostWindow(host)
+        layer.isShowingPopover = true
+        layer.needsCommentTextFocus = true
+        layer.pendingTypeahead = "h"
+        layer.applyActiveState(false)
+        XCTAssertFalse(layer.isActive)
+        XCTAssertFalse(layer.isShowingPopover)
+        XCTAssertEqual(layer.pendingTypeahead, "")
+        XCTAssertFalse(layer.shouldConsumeKeyEvent(chars: "e", mods: [], window: host))
+    }
+
+    func testOpenComposerDoesNotConsumeKeysFromSiblingField() throws {
+        let layer = CommentLayer()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 200))
+        let scope = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
+        let field = NSTextField(frame: NSRect(x: 220, y: 80, width: 160, height: 24))
+        field.stringValue = "unrelated"
+        container.addSubview(scope)
+        container.addSubview(field)
+        window.contentView = container
+        layer.setHostWindow(window)
+        layer.setScopeView(scope)
+        layer.isShowingPopover = true
+        layer.needsCommentTextFocus = true
+        layer.pendingTypeahead = "h"
+        field.selectText(nil)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.selectAll(nil)
+        XCTAssertFalse(layer.shouldConsumeKeyEvent(chars: "a", mods: [], window: window))
+        XCTAssertEqual(layer.pendingTypeahead, "h")
+    }
+
+    func testTypeToCommentUsesVisibleRectNotBoundsMidpoint() {
+        let layer = CommentLayer()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        let scope = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 240))
+        let scroll = NSScrollView(frame: scope.bounds)
+        scroll.hasVerticalScroller = true
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 2400))
+        text.minSize = NSSize(width: 0, height: 2400)
+        text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        text.isVerticallyResizable = true
+        text.string = String(repeating: "line of review guide text\n", count: 120)
+        text.setFrameSize(NSSize(width: 400, height: 2400))
+        scroll.documentView = text
+        scope.addSubview(scroll)
+        window.contentView = scope
+        layer.setHostWindow(window)
+        layer.setScopeView(scope)
+        layer.liveSelectionProvider = { "line" }
+        XCTAssertTrue(window.makeFirstResponder(text))
+        text.scroll(NSPoint(x: 0, y: 0))
+        let bounds = text.convert(text.bounds, to: nil)
+        let mid = NSPoint(x: bounds.midX, y: bounds.midY)
+        XCTAssertFalse(
+            scope.convert(scope.bounds, to: nil).contains(mid),
+            "fixture must place the responder midpoint outside the viewer")
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: "a", mods: [], window: window))
+    }
+
     // MARK: - Window-scoped event handling (cross-window event bleed regression)
 
     /// Regression test: a markdown viewer's `CommentLayer` must judge "is there
@@ -681,6 +752,33 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments[0].status, .answered)
     }
 
+    func testRejectedFollowupAndCommentKeepDraftWhenQueueFull() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([
+            Self.wireComment(id: "cmt_1", exact: "some text", body: "a note", status: "answered")
+        ])
+        backend.acceptsSubmissions = false
+        XCTAssertFalse(layer.postFollowup(body: "draft reply", for: layer.comments[0]))
+        XCTAssertTrue(backend.postFollowupCalls.isEmpty)
+        layer.addComment(quoted: "some text", body: "new comment")
+        XCTAssertTrue(backend.createCalls.isEmpty)
+        backend.acceptsSubmissions = true
+        XCTAssertTrue(layer.postFollowup(body: "draft reply", for: layer.comments[0]))
+        XCTAssertEqual(backend.postFollowupCalls.count, 1)
+    }
+
+    @MainActor
+    func testFullQueueNoticeIdentifiesFollowupAsUnsaved() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        for index in 0..<EngineClient.maxUnsentActions {
+            model.engine.sendLine(["type": "create_product", "name": "p\(index)"])
+        }
+        XCTAssertFalse(model.commentBridge.canAcceptUserSubmission(describing: "Your follow-up reply"))
+        XCTAssertTrue(model.disconnectedActionNotice?.contains("Your follow-up reply was not saved") == true)
+    }
+
     // MARK: - Engine-backed path
 
     func testConfigureRegistersAndListsWhenArtifactPresent() {
@@ -825,6 +923,46 @@ final class CommentLayerTests: XCTestCase {
         layer.showResolved = true
         XCTAssertEqual(backend.listCalls.count, 1)
         XCTAssertEqual(backend.listCalls[0].includeResolved, true)
+    }
+
+    func testReadOnlyLayerBrowsesResolvedCommentsAndBlocksMutation() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "alpha beta", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([
+            Self.wireComment(id: "c1", exact: "alpha", body: "resolved note", status: "resolved"),
+            Self.wireComment(id: "c2", exact: "beta", body: "answered note", status: "answered", intent: "question"),
+        ])
+        layer.applyBannerState(CommentsBannerState(revisable: true, unresolvedCount: 1, inRevisionCount: 0))
+        layer.isReadOnly = true
+        XCTAssertFalse(layer.sidebarExpanded)
+        layer.sidebarExpanded = true
+        XCTAssertTrue(layer.sidebarExpanded)
+        backend.listCalls.removeAll()
+        layer.showResolved = true
+        XCTAssertTrue(layer.showResolved)
+        XCTAssertEqual(backend.listCalls.last?.includeResolved, true)
+        XCTAssertEqual(layer.comments.map(\.body), ["resolved note", "answered note"])
+        layer.requestNewComment()
+        XCTAssertFalse(layer.isShowingPopover)
+        layer.addComment(quoted: "alpha", body: "Must not submit")
+        XCTAssertTrue(backend.createCalls.isEmpty)
+        let answered = layer.comments.first { $0.id == "c2" }!
+        layer.dismiss(answered)
+        layer.setIntent(.revision, for: answered)
+        XCTAssertFalse(layer.postFollowup(body: "reply", for: answered))
+        layer.reviseDoc()
+        XCTAssertTrue(backend.dismissCalls.isEmpty)
+        XCTAssertTrue(backend.setIntentCalls.isEmpty)
+        XCTAssertTrue(backend.postFollowupCalls.isEmpty)
+        XCTAssertTrue(backend.reviseDocCalls.isEmpty)
+        let hosting = NSHostingView(rootView: CommentSidebar(layer: layer, onCollapse: {
+            layer.sidebarExpanded = false
+        }).environment(\.commentsReadOnly, true))
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 700)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        XCTAssertTrue(layer.sidebarExpanded)
     }
 
     // MARK: - Wire Codable mirrors
@@ -1177,6 +1315,8 @@ final class FakeCommentBackend: CommentBackend {
     var fetchBannerStateCalls: [(kind: String, id: String)] = []
     var reviseDocCalls: [(kind: String, id: String)] = []
     var postFollowupCalls: [(commentId: String, body: String)] = []
+    var acceptsSubmissions = true
+    func canAcceptUserSubmission(describing action: String) -> Bool { acceptsSubmissions }
 
     func registerCommentLayer(_ layer: CommentLayer, artifactKind: String, artifactId: String) {
         registerCount += 1

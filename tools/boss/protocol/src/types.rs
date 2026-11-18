@@ -22,6 +22,7 @@
 //! reshuffling, to keep the split reviewable as a pure move, so some
 //! submodules are not strictly sorted yet.
 
+mod answer_labels;
 mod attachment;
 mod attention;
 mod automation;
@@ -29,6 +30,7 @@ mod board;
 mod ci;
 mod comment;
 mod common;
+mod conflict_mismatch;
 mod context;
 mod coordinator_guidance;
 mod coordinator_handoff;
@@ -40,6 +42,7 @@ mod driver_quota;
 mod driver_split;
 mod execution;
 mod idea;
+mod navigator;
 mod planner_run;
 mod pr_status;
 mod probe;
@@ -48,6 +51,8 @@ mod project;
 mod proposal;
 mod review_batch;
 mod review_guide;
+mod review_section;
+mod stuck_report;
 mod task;
 mod work_item;
 mod worker_tier;
@@ -55,6 +60,7 @@ mod worker_tier;
 #[cfg(test)]
 mod tests;
 
+pub use answer_labels::*;
 pub use attachment::*;
 pub use attention::*;
 pub use automation::*;
@@ -62,6 +68,7 @@ pub use board::*;
 pub use ci::*;
 pub use comment::*;
 pub use common::*;
+pub use conflict_mismatch::*;
 pub use context::*;
 pub use coordinator_guidance::*;
 pub use coordinator_handoff::*;
@@ -73,6 +80,7 @@ pub use driver_quota::*;
 pub use driver_split::*;
 pub use execution::*;
 pub use idea::*;
+pub use navigator::*;
 pub use planner_run::*;
 pub use pr_status::*;
 pub use probe::*;
@@ -81,6 +89,8 @@ pub use project::*;
 pub use proposal::*;
 pub use review_batch::*;
 pub use review_guide::*;
+pub use review_section::*;
+pub use stuck_report::*;
 pub use task::*;
 pub use work_item::*;
 pub use worker_tier::*;

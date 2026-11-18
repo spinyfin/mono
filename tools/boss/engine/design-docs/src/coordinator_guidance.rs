@@ -17,6 +17,11 @@
 //! reachable; the product simply has no coordinator guidance). A failure
 //! anywhere else is `Failed` with the classified reason. Nothing here
 //! collapses an error into "no guidance".
+//!
+//! The read is not specific to the coordinator file: [`DesignDocsService::fetch_guidance_file`]
+//! reads any single guidance file this way, and the per-repo worker file
+//! (`BOSS.md`, [`boss_protocol::REPO_BOSS_GUIDANCE_PATH`]) goes through the
+//! same code, cap and classification.
 
 use boss_github::trees::TreeApiErrorKind;
 use boss_protocol::{COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState};
@@ -29,6 +34,10 @@ use crate::cache::CacheKey;
 /// product, not a manual; the cap keeps it that way and keeps the
 /// session-start brief bounded when every product's file is injected.
 pub const MAX_COORDINATOR_GUIDANCE_BYTES: u64 = 32 * 1024;
+
+/// Cap for the per-repo worker file (`BOSS.md`). Deliberately the same as the
+/// coordinator file's: both are sets of operating rules injected into a prompt.
+pub const MAX_REPO_GUIDANCE_BYTES: u64 = MAX_COORDINATOR_GUIDANCE_BYTES;
 
 /// The resolved read of one product's guidance file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +55,16 @@ impl DesignDocsService {
     /// blank is its own reported state ([`CoordinatorGuidanceState::NoRepoConfigured`]),
     /// not an error.
     pub async fn fetch_coordinator_guidance(&self, repo_remote_url: Option<&str>) -> CoordinatorGuidanceFetch {
+        self.fetch_guidance_file(repo_remote_url, COORDINATOR_GUIDANCE_PATH)
+            .await
+    }
+
+    /// Read the guidance file `path` (repo-relative) at the current HEAD of
+    /// the repo's default branch. The cap is [`MAX_COORDINATOR_GUIDANCE_BYTES`]
+    /// (equal to [`MAX_REPO_GUIDANCE_BYTES`]) for every file.
+    ///
+    /// `repo_remote_url` is handled as in [`Self::fetch_coordinator_guidance`].
+    pub async fn fetch_guidance_file(&self, repo_remote_url: Option<&str>, path: &str) -> CoordinatorGuidanceFetch {
         let Some(repo_url) = repo_remote_url.map(str::trim).filter(|s| !s.is_empty()) else {
             return CoordinatorGuidanceFetch {
                 owner_repo: None,
@@ -61,14 +80,20 @@ impl DesignDocsService {
             };
         };
         let owner_repo = format!("{owner}/{repo}");
-        let state = self.resolve_guidance(owner, repo, &owner_repo).await;
+        let state = self.resolve_guidance(owner, repo, &owner_repo, path).await;
         CoordinatorGuidanceFetch {
             owner_repo: Some(owner_repo),
             state,
         }
     }
 
-    async fn resolve_guidance(&self, owner: &str, repo: &str, owner_repo: &str) -> CoordinatorGuidanceState {
+    async fn resolve_guidance(
+        &self,
+        owner: &str,
+        repo: &str,
+        owner_repo: &str,
+        path: &str,
+    ) -> CoordinatorGuidanceState {
         // `commits/HEAD` resolves the repo's current default branch server
         // side, so a rename is observed without a separate default-branch
         // round trip and without the Designs listing cache.
@@ -77,14 +102,11 @@ impl DesignDocsService {
             Err(err) => return failed(owner_repo, "resolve HEAD of the default branch", &err),
         };
 
-        let key = CacheKey::new(owner, repo, COORDINATOR_GUIDANCE_PATH, head_sha.as_str());
+        let key = CacheKey::new(owner, repo, path, head_sha.as_str());
         let markdown = match self.bodies.get(&key) {
             // The key is an immutable sha: a hit is current by construction.
             Some(hit) => hit.markdown,
-            None => match self
-                .fetch_with_retry(owner, repo, COORDINATOR_GUIDANCE_PATH, &head_sha, None)
-                .await
-            {
+            None => match self.fetch_with_retry(owner, repo, path, &head_sha, None).await {
                 Ok(FetchOk::Body { text, etag }) => {
                     if text.len() as u64 <= MAX_COORDINATOR_GUIDANCE_BYTES {
                         self.bodies.put(key, text.clone(), etag);
@@ -97,7 +119,7 @@ impl DesignDocsService {
                     // body.
                     return CoordinatorGuidanceState::Failed {
                         reason: format!(
-                            "GitHub reported `{COORDINATOR_GUIDANCE_PATH}` in `{owner_repo}` unchanged, but no cached copy exists."
+                            "GitHub reported `{path}` in `{owner_repo}` unchanged, but no cached copy exists."
                         ),
                     };
                 }
@@ -106,7 +128,7 @@ impl DesignDocsService {
                     // and visible: a 404 here is the file, not the repo.
                     return CoordinatorGuidanceState::Missing { git_ref: head_sha };
                 }
-                Err(err) => return failed(owner_repo, &format!("read `{COORDINATOR_GUIDANCE_PATH}`"), &err),
+                Err(err) => return failed(owner_repo, &format!("read `{path}`"), &err),
             },
         };
 
@@ -157,6 +179,8 @@ mod tests {
     use async_trait::async_trait;
     use boss_github::trees::{BlobFetch, RepoTree, TreeApiError, TreeApiErrorKind};
 
+    use boss_protocol::REPO_BOSS_GUIDANCE_PATH;
+
     use super::*;
     use crate::GitHubTreeSource;
 
@@ -173,6 +197,7 @@ mod tests {
         head_refs: Mutex<Vec<String>>,
         blob_calls: AtomicUsize,
         head_calls: AtomicUsize,
+        blob_paths: Mutex<Vec<String>>,
     }
 
     impl FakeSource {
@@ -185,6 +210,7 @@ mod tests {
                 head_refs: Mutex::new(Vec::new()),
                 blob_calls: AtomicUsize::new(0),
                 head_calls: AtomicUsize::new(0),
+                blob_paths: Mutex::new(Vec::new()),
             })
         }
 
@@ -241,7 +267,11 @@ mod tests {
             etag: Option<&str>,
         ) -> Result<BlobFetch, TreeApiError> {
             self.blob_calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(path, COORDINATOR_GUIDANCE_PATH);
+            assert!(
+                path == COORDINATOR_GUIDANCE_PATH || path == REPO_BOSS_GUIDANCE_PATH,
+                "unexpected guidance path {path}"
+            );
+            self.blob_paths.lock().unwrap().push(path.to_owned());
             assert!(
                 crate::is_immutable_git_ref(git_ref),
                 "the file must be read at the probed sha, not a branch name; got {git_ref}"
@@ -448,5 +478,56 @@ mod tests {
                 repo_remote_url: "https://gitlab.com/acme/widgets.git".to_owned()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn the_worker_file_is_read_by_path_at_the_probed_sha_with_the_same_cap() {
+        let source = FakeSource::with_body("# worker rules\n");
+        let service = DesignDocsService::with_source(source.clone());
+        let fetch = service.fetch_guidance_file(Some(REPO), REPO_BOSS_GUIDANCE_PATH).await;
+        assert_eq!(fetch.owner_repo.as_deref(), Some("spinyfin/mono"));
+        assert_eq!(
+            fetch.state,
+            CoordinatorGuidanceState::Loaded {
+                git_ref: SHA_A.to_owned(),
+                bytes: 15,
+                markdown: "# worker rules\n".to_owned(),
+            }
+        );
+        assert_eq!(*source.blob_paths.lock().unwrap(), vec![REPO_BOSS_GUIDANCE_PATH]);
+
+        let big = "x".repeat(MAX_REPO_GUIDANCE_BYTES as usize + 1);
+        let over = DesignDocsService::with_source(FakeSource::with_body(&big))
+            .fetch_guidance_file(Some(REPO), REPO_BOSS_GUIDANCE_PATH)
+            .await;
+        assert!(
+            matches!(over.state, CoordinatorGuidanceState::OverCap { .. }),
+            "{:?}",
+            over.state
+        );
+    }
+
+    #[tokio::test]
+    async fn the_two_guidance_files_do_not_share_cached_bodies() {
+        let source = FakeSource::with_body("# rules\n");
+        let service = DesignDocsService::with_source(source.clone());
+        service.fetch_coordinator_guidance(Some(REPO)).await;
+        service.fetch_guidance_file(Some(REPO), REPO_BOSS_GUIDANCE_PATH).await;
+        assert_eq!(
+            *source.blob_paths.lock().unwrap(),
+            vec![COORDINATOR_GUIDANCE_PATH, REPO_BOSS_GUIDANCE_PATH],
+            "a body cached for one path must not answer for the other"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_file_read_failure_names_the_worker_file() {
+        let source = FakeSource::with_blob_error(TreeApiErrorKind::Unreachable, "dial tcp: timeout");
+        let service = DesignDocsService::with_source(source);
+        let fetch = service.fetch_guidance_file(Some(REPO), REPO_BOSS_GUIDANCE_PATH).await;
+        let CoordinatorGuidanceState::Failed { reason } = fetch.state else {
+            panic!("expected Failed, got {:?}", fetch.state);
+        };
+        assert!(reason.contains("read `BOSS.md`"), "{reason}");
     }
 }

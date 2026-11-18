@@ -12,8 +12,10 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/metrics:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
     ] + all_crate_deps(normal = True),
 )
@@ -28,6 +30,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
     ] + all_crate_deps(
         normal = True,

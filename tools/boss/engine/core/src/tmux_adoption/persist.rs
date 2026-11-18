@@ -214,7 +214,7 @@ pub(super) async fn persist_observed_pane_pid(
 /// the first `Unreadable`/`SessionMissing` observation on a row that had
 /// none before, DEBUG for everything else (routine `Alive` polls included)
 /// so the log does not drown lifecycle-significant events in noise.
-pub(crate) fn persist_observed_pane_state(
+pub fn persist_observed_pane_state(
     work_db: &WorkDb,
     execution_id: &str,
     spawn_token: &str,

@@ -12,7 +12,7 @@ final class EngineClientEventBatchingTests: XCTestCase {
         let client = EngineClient(socketPath: "/tmp/boss-event-batch-missing-\(UUID().uuidString).sock")
         let delivered = expectation(description: "decode error delivered")
         client.onEvent = { event in
-            guard case .error(let message) = event else {
+            guard case .error(let message, _) = event else {
                 XCTFail("missing snapshot must not publish worker state")
                 return
             }
@@ -31,7 +31,7 @@ final class EngineClientEventBatchingTests: XCTestCase {
         let client = EngineClient(socketPath: "/tmp/boss-event-batch-malformed-\(UUID().uuidString).sock")
         let delivered = expectation(description: "decode error delivered")
         client.onEvent = { event in
-            guard case .error(let message) = event else {
+            guard case .error(let message, _) = event else {
                 XCTFail("malformed snapshot must not publish worker state")
                 return
             }
@@ -50,7 +50,7 @@ final class EngineClientEventBatchingTests: XCTestCase {
         let client = EngineClient(socketPath: "/tmp/boss-event-batch-dup-run-\(UUID().uuidString).sock")
         let delivered = expectation(description: "duplicate run_id decode error delivered")
         client.onEvent = { event in
-            guard case .error(let message) = event else {
+            guard case .error(let message, _) = event else {
                 XCTFail("duplicate run_id snapshot must not publish worker state")
                 return
             }
@@ -69,7 +69,7 @@ final class EngineClientEventBatchingTests: XCTestCase {
         let client = EngineClient(socketPath: "/tmp/boss-event-batch-dup-slot-\(UUID().uuidString).sock")
         let delivered = expectation(description: "duplicate slot_id decode error delivered")
         client.onEvent = { event in
-            guard case .error(let message) = event else {
+            guard case .error(let message, _) = event else {
                 XCTFail("duplicate slot_id snapshot must not publish worker state")
                 return
             }
@@ -92,7 +92,7 @@ final class EngineClientEventBatchingTests: XCTestCase {
         exp.expectedFulfillmentCount = n
 
         client.onEvent = { event in
-            if case .error(let message) = event {
+            if case .error(let message, _) = event {
                 delivered.withLock { $0.append(message) }
                 exp.fulfill()
             }

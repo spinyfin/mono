@@ -37,7 +37,7 @@ public struct PaneLayoutModel: Equatable, Sendable {
     public let policy: PaneCapacityPolicy
     public private(set) var geometry: PaneGeometry
     public private(set) var limits: GridLimits
-    /// Whether `limits` came from a real cell-size measurement. Hysteresis only
+    /// Whether `limits` came from usable area and cell dimensions. Hysteresis only
     /// applies against measured limits, never the 1x1 unmeasured fallback.
     private var limitsMeasured: Bool
     public private(set) var filter: PaneFilter = .all
@@ -131,7 +131,7 @@ public struct PaneLayoutModel: Equatable, Sendable {
     /// should invoke it at drag end or after the geometry has been quiet, not
     /// on every drag frame. Capacity only moves once the measurement clears the
     /// policy's dead band; an identical or unmeasured (zero, negative, or
-    /// non-finite cell size) measurement is a no-op.
+    /// non-finite area or cell size) measurement is a no-op.
     public mutating func updateGeometry(_ newGeometry: PaneGeometry) {
         guard newGeometry != geometry, newGeometry.isMeasured else { return }
         let anchor = automaticAnchor()
@@ -158,6 +158,18 @@ public struct PaneLayoutModel: Equatable, Sendable {
     /// choosing an anchor.
     public mutating func setFocusedRun(_ runId: String?) {
         focusedRunId = runId
+    }
+
+    /// Brings a run into view for an explicit focus request. Clears a filter
+    /// that hides it, then focuses it and selects its page. A layout boundary.
+    /// Unknown runs change nothing.
+    public mutating func reveal(runId: String) -> PaneRevealOutcome {
+        guard let member = members[runId] else { return .notMember }
+        let clearedFilter = !filter.admits(member)
+        if clearedFilter { filter = .all }
+        focusedRunId = runId
+        repack(anchor: runId)
+        return clearedFilter ? .revealedClearingFilter : .revealed
     }
 
     /// Entering the view is a layout boundary; leaving it changes nothing but
@@ -254,6 +266,9 @@ public struct PaneLayoutModel: Equatable, Sendable {
 
     /// Waiting members among the visible ones, whether or not they have a viewer.
     public var waitingCount: Int { visibleMembers().filter(\.isWaiting).count }
+
+    /// Members waiting on a declared job wait among the visible ones.
+    public var waitingOnJobCount: Int { visibleMembers().filter(\.isWaitingOnJob).count }
 
     /// Waiting members the filter hides, so a filter cannot silently bury one.
     public var hiddenWaitingCount: Int {

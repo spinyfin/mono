@@ -34,7 +34,7 @@ pub struct Attention {
     /// The question shown to the human.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_text: Option<String>,
-    /// JSON array of strings (`multiple_choice` only).
+    /// JSON string array for multiple choice, or an `AnswerOptionLabels` object for labelled Yes/No questions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choice_options: Option<String>,
     /// Captured answer: `"yes"`/`"no"`, chosen index/value, or free text.

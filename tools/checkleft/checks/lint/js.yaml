@@ -14,8 +14,7 @@ include:
 #     pinned here to 10.5.0. The version is part of the package spec, so npx fetches
 #     and runs exactly that release regardless of any globally-installed copy — a
 #     reproducible tool without a parallel Bazel JS toolchain (mono has no
-#     rules_js/node Bazel integration today; Node arrives on PATH via the CI
-#     bootstrap). Re-pin per-repo via CHECKS config:
+#     rules_js/node Bazel integration today; checkleft provisions Node). Re-pin per-repo via CHECKS config:
 #
 #       checks:
 #         - id: lint/js
@@ -25,8 +24,7 @@ include:
 #                 npm:
 #                   version: "10.6.0"
 #
-#   - fallback: when `npx` is not on PATH, the framework uses `eslint` from PATH
-#     and warns loudly on stderr so you know the pinned toolchain was skipped.
+#   - Node and npx use checkleft's SHA-verified runtime pin.
 #
 # Required config key — `config_file` MUST be set in each check instance's config
 # block. There is no auto-discovery default: `--no-config-lookup` prevents ESLint
@@ -46,8 +44,6 @@ needs:
       npm:
         package: "eslint"
         version: "10.5.0"
-    fallback:
-      path: "eslint"
 
 invocations:
   - id: lint

@@ -1,0 +1,637 @@
+//! Behavioural coverage for the core PR-lifecycle state transitions in
+//! `pr_flow.rs`, asserting observable outcomes (return values + re-queried
+//! entity state) rather than internal SQL:
+//!
+//!   - `mark_chore_pr_merged`: the `Some(Task)` merged-transition contract
+//!     (status → `done`, `pr_url` bound) and the `None` no-op when there is
+//!     no eligible PR (already-terminal / missing row).
+//!   - `mark_chore_pr_closed_unmerged`: the closed-unmerged terminal, and how
+//!     it is *distinguished* from the merged path — it does not resolve the
+//!     PR's `in_revision` comments the way a merge does.
+//!   - `record_worker_pr_completion` vs `record_worker_no_op_completion`: the
+//!     PR-produced path binds `pr_url` and advances to `in_review`; the no-op
+//!     path closes to `done` with no `pr_url`. Plus the terminal-execution
+//!     idempotency no-op.
+//!   - `update_task_pr_poll_state`: the persisted CI/review columns reflect
+//!     the input across a couple of representative state changes (complements
+//!     the return-value-focused assertions in `t14`).
+//!
+//! The `update_task_pr_poll_state` return-value semantics, the
+//! `reopen_comments_for_closed_unmerged_pr` fan-out, and the `completed_at`
+//! semantics of the completion helpers are already covered in `t14` / `t10`;
+//! this module deliberately covers the transitions those files do not, rather
+//! than duplicating them.
+
+use super::*;
+
+#[test]
+fn revision_no_op_preserves_specific_attention_with_stamped_pr() {
+    let db = WorkDb::open(temp_db_path("revision-stamped-noop")).unwrap();
+    let (_, task_id, exec_id) = make_waiting_human_chore(&db, "revision-stamped-noop");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'revision', pr_url = 'https://github.com/spinyfin/mono/pull/4042' WHERE id = ?1",
+            [&task_id],
+        )
+        .unwrap();
+    let completion = db
+        .record_worker_no_op_completion(
+            &exec_id,
+            "finding declined",
+            Some(CreateAttentionItemInput {
+                kind: boss_engine_storage_values::attention_kinds::REVISION_NO_OP_ATTENTION_KIND.into(),
+                title: "Finding declined".into(),
+                body_markdown: "The finding was declined rather than fixed.".into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(task_status(&db, &task_id), "done");
+    let attention = completion.filed_attention_item.unwrap();
+    assert_eq!(
+        attention.kind,
+        boss_engine_storage_values::attention_kinds::REVISION_NO_OP_ATTENTION_KIND
+    );
+    assert_eq!(attention.body_markdown, "The finding was declined rather than fixed.");
+}
+
+#[test]
+fn delivered_chore_waiting_for_review_cannot_receive_another_implementation() {
+    let db = WorkDb::open(temp_db_path("delivered-dispatch")).unwrap();
+    let (_, chore_id, exec_id) = make_waiting_human_chore(&db, "delivered-dispatch");
+    db.record_worker_pr_completion(
+        &exec_id,
+        "https://github.com/spinyfin/mono/pull/4041",
+        None,
+        None,
+        WorkerPrCompletionTarget::PendingReview,
+        None,
+    )
+    .unwrap();
+    assert_eq!(task_status(&db, &chore_id), "active");
+    let before = db.list_executions(Some(&chore_id)).unwrap().len();
+    assert!(db.reconcile_active_dispatch(|_| false).unwrap().is_empty());
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&chore_id])
+        .unwrap();
+    assert!(db.rescan_active_dispatch().unwrap().is_empty());
+    assert!(
+        db.dispatch_admission_facts(&chore_id)
+            .unwrap()
+            .ineligible_reason
+            .unwrap()
+            .contains("bound PR")
+    );
+    let error = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(&chore_id).build())
+        .unwrap_err();
+    assert!(error.to_string().contains("bound PR"));
+    assert_eq!(db.list_executions(Some(&chore_id)).unwrap().len(), before);
+}
+
+#[test]
+fn bound_pr_completion_does_not_commit_without_its_attention() {
+    let db = WorkDb::open(temp_db_path("bound-pr-attention-atomic")).unwrap();
+    let (_, chore_id, exec_id) = make_waiting_human_chore(&db, "bound-pr-attention-atomic");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET pr_url = 'https://github.com/spinyfin/mono/pull/4043' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_completion_attention BEFORE INSERT ON work_attention_items
+            WHEN NEW.kind = 'completion_with_bound_pr' BEGIN SELECT RAISE(ABORT, 'attention unavailable'); END;",
+        )
+        .unwrap();
+    }
+    let error = db
+        .record_worker_no_op_completion(&exec_id, "nothing new", None)
+        .unwrap_err();
+    assert!(error.to_string().contains("attention unavailable"));
+    assert_eq!(task_status(&db, &chore_id), "active");
+    assert_eq!(
+        db.get_execution(&exec_id).unwrap().status,
+        ExecutionStatus::WaitingHuman
+    );
+}
+
+// ── mark_chore_pr_merged: core Some/None contract ───────────────────────────
+
+/// The merge path: an `in_review` chore with a bound PR advances to `done`
+/// and returns `Some(Task)` carrying the merged status and the PR url.
+#[test]
+fn mark_chore_pr_merged_advances_in_review_to_done_and_binds_pr() {
+    let db = WorkDb::open(temp_db_path("merged-advance-done")).unwrap();
+    let product_id = make_revision_product(&db, "merged-advance");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4001";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let returned = db.mark_chore_pr_merged(&chore_id, pr_url).unwrap();
+    let returned = returned.expect("a mergeable in_review chore must return Some(Task)");
+    assert_eq!(
+        returned.status,
+        TaskStatus::Done,
+        "the returned task must have advanced to the merged/terminal status",
+    );
+    assert_eq!(
+        returned.pr_url.as_deref(),
+        Some(pr_url),
+        "the returned task must carry the bound PR url",
+    );
+
+    // Re-query to confirm the transition is durable, not just reflected in the
+    // returned value.
+    assert_eq!(task_status(&db, &chore_id), "done");
+    let WorkItem::Chore(requeried) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected a chore");
+    };
+    assert_eq!(requeried.pr_url.as_deref(), Some(pr_url));
+}
+
+/// A review-phase positioning refusal keeps the item `in_review` so the merge
+/// poller can observe the PR. Once that PR merges, the hold and its wait must
+/// lower with the row — otherwise the Done card keeps a "Workspace blocked"
+/// wait forever.
+#[test]
+fn mark_chore_pr_merged_lowers_a_review_phase_positioning_hold() {
+    let db = WorkDb::open(temp_db_path("merged-clears-positioning-hold")).unwrap();
+    let product_id = make_revision_product(&db, "merged-hold");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4008";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Claimed)
+                .pr_url(pr_url)
+                .build(),
+        )
+        .unwrap();
+    db.record_workspace_positioning_refusal(
+        &execution.id,
+        "worker",
+        None,
+        "Cube command failed: refused",
+        "PR 4008 is MERGED",
+    )
+    .unwrap();
+    assert_eq!(task_status(&db, &chore_id), "in_review");
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.status == "open" && item.kind == WORKSPACE_POSITIONING_REFUSED)
+    );
+    assert_eq!(
+        db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.as_deref(),
+        Some(WORKSPACE_POSITIONING_REFUSED)
+    );
+
+    db.mark_chore_pr_merged(&chore_id, pr_url)
+        .unwrap()
+        .expect("in_review chore must transition");
+
+    assert_eq!(task_status(&db, &chore_id), "done");
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .all(|item| item.status != "open"),
+        "positioning-refusal attention must not stay open on a done item"
+    );
+    assert!(
+        db.get_task_runtime(&chore_id).unwrap().dispatch_wait_reason.is_none(),
+        "a done item must not keep a workspace-positioning wait"
+    );
+}
+
+/// No eligible PR to act on: a chore already in a terminal status (its PR was
+/// merged on a prior pass) is a no-op — `mark_chore_pr_merged` returns `None`
+/// and leaves the row untouched. This is what makes the merge poller safe to
+/// re-run against a late-arriving merge event.
+#[test]
+fn mark_chore_pr_merged_noop_when_already_done() {
+    let db = WorkDb::open(temp_db_path("merged-noop-done")).unwrap();
+    let product_id = make_revision_product(&db, "merged-noop");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4002";
+    let chore_id = make_done_chore(&db, &product_id, pr_url);
+
+    let returned = db.mark_chore_pr_merged(&chore_id, pr_url).unwrap();
+    assert!(
+        returned.is_none(),
+        "an already-done chore has no eligible PR transition and must return None",
+    );
+    assert_eq!(task_status(&db, &chore_id), "done", "the row must be untouched");
+}
+
+/// A missing work item is a no-op, not an error — the poller may race a delete.
+#[test]
+fn mark_chore_pr_merged_noop_when_task_missing() {
+    let db = WorkDb::open(temp_db_path("merged-noop-missing")).unwrap();
+    let returned = db
+        .mark_chore_pr_merged("chr_does_not_exist", "https://github.com/spinyfin/mono/pull/4003")
+        .unwrap();
+    assert!(returned.is_none(), "an unknown work item must return None");
+}
+
+// ── mark_chore_pr_closed_unmerged: terminal + distinction from merged ───────
+
+/// The close-unmerged path: an `in_review` chore whose PR was closed without
+/// merging advances to `done` and returns `Some(Task)`.
+#[test]
+fn mark_chore_pr_closed_unmerged_advances_in_review_to_done() {
+    let db = WorkDb::open(temp_db_path("closed-advance-done")).unwrap();
+    let product_id = make_revision_product(&db, "closed-advance");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4010";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let returned = db.mark_chore_pr_closed_unmerged(&chore_id, pr_url).unwrap();
+    let returned = returned.expect("an in_review chore with a matching PR must return Some(Task)");
+    assert_eq!(
+        returned.status,
+        TaskStatus::Done,
+        "a closed-unmerged PR moves the chore to the closed-unmerged (done) outcome",
+    );
+    assert_eq!(task_status(&db, &chore_id), "done", "the transition must be durable");
+}
+
+/// Twin of `mark_chore_pr_merged_clears_stale_merge_queue_state` (t03): a PR
+/// that closes unmerged while still enqueued must not leave the Merging-lane
+/// columns behind on the `done` row.
+///
+/// This was a real asymmetry — the merged path cleared them, this one did
+/// not. `update_pr_poll_state` (the only other writer) is skipped once the PR
+/// stops being `Open`, and for a `trunk_queue` product it would not recompute
+/// them anyway (`preserve_merge_queue_state`), so nothing else would ever fix
+/// the row: a closed-unmerged trunk card retired to `done` still carrying
+/// `queued`, and the client's `isInMergingSection` kept routing it into the
+/// kanban's "Merging" section forever.
+#[test]
+fn mark_chore_pr_closed_unmerged_clears_stale_merge_queue_state() {
+    let db = WorkDb::open(temp_db_path("closed-clears-queue-state")).unwrap();
+    let product_id = make_revision_product(&db, "closed-queue-state");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4012";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    db.update_task_pr_poll_state(
+        &chore_id,
+        PrPollStateInput {
+            ci_required_state: "success",
+            review_required_state: "approved",
+            merge_queue_state: Some("queued"),
+            merge_queue_detail: Some(r#"{"source":"trunk","state":"testing","section_order":1}"#),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let returned = db.mark_chore_pr_closed_unmerged(&chore_id, pr_url).unwrap();
+    assert_eq!(
+        returned.expect("the close must transition the chore").status,
+        TaskStatus::Done,
+    );
+
+    let (state, detail): (Option<String>, Option<String>) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            params![chore_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        state.is_none(),
+        "merge_queue_state must be cleared when the PR closes unmerged, not left stale"
+    );
+    assert!(
+        detail.is_none(),
+        "merge_queue_detail must be cleared alongside merge_queue_state"
+    );
+}
+
+/// Idempotent for a late-arriving close event: a chore already terminal is a
+/// no-op returning `None`.
+#[test]
+fn mark_chore_pr_closed_unmerged_noop_when_already_terminal() {
+    let db = WorkDb::open(temp_db_path("closed-noop-done")).unwrap();
+    let product_id = make_revision_product(&db, "closed-noop");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4011";
+    let chore_id = make_done_chore(&db, &product_id, pr_url);
+
+    let returned = db.mark_chore_pr_closed_unmerged(&chore_id, pr_url).unwrap();
+    assert!(
+        returned.is_none(),
+        "an already-terminal chore must return None on a close-unmerged event",
+    );
+    assert_eq!(task_status(&db, &chore_id), "done");
+}
+
+/// Create an `in_revision` comment on `artifact_id` claimed by `revise_task_id`
+/// (the state a dispatched `[Revise]` batch leaves behind). Returns its id.
+/// Mirrors the small helper `t14` uses for the reopen path.
+fn in_revision_comment(db: &WorkDb, artifact_id: &str, revise_task_id: &str, exact: &str) -> String {
+    let c = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: artifact_id.to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: exact.to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "please revise".to_owned(),
+            author: "human".to_owned(),
+            plain_text_projection_version: 1,
+        })
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_comments SET status = 'in_revision', revise_task_id = ?2 WHERE id = ?1",
+            params![c.id, revise_task_id],
+        )
+        .unwrap();
+    c.id
+}
+
+/// The observable difference between the two terminal paths at the comment
+/// layer: a merge *resolves* the PR's `in_revision` comments (the change
+/// shipped), whereas a close-unmerged deliberately leaves them `in_revision`
+/// (they are reopened separately by `reopen_comments_for_closed_unmerged_pr`,
+/// so this path must not pre-resolve them).
+#[test]
+fn merged_resolves_comments_while_closed_unmerged_leaves_them_in_revision() {
+    let db = WorkDb::open(temp_db_path("merged-vs-closed-comments")).unwrap();
+    // Distinct products so the two chores don't trip the duplicate-name guard
+    // (`make_in_review_chore` uses a fixed chore name).
+    let merged_product = make_revision_product(&db, "merged-vs-closed-a");
+    let closed_product = make_revision_product(&db, "merged-vs-closed-b");
+
+    // Chore A: PR merges → its in_revision comment must be resolved.
+    let merged_pr = "https://github.com/spinyfin/mono/pull/4020";
+    let merged_id = make_in_review_chore(&db, &merged_product, merged_pr);
+    let merged_cmt = in_revision_comment(&db, &merged_id, &merged_id, "shipped behaviour");
+
+    // Chore B: PR closes unmerged → its in_revision comment must be untouched.
+    let closed_pr = "https://github.com/spinyfin/mono/pull/4021";
+    let closed_id = make_in_review_chore(&db, &closed_product, closed_pr);
+    let closed_cmt = in_revision_comment(&db, &closed_id, &closed_id, "never shipped");
+
+    db.mark_chore_pr_merged(&merged_id, merged_pr).unwrap();
+    db.mark_chore_pr_closed_unmerged(&closed_id, closed_pr).unwrap();
+
+    let merged_after = db.get_comment(&merged_cmt).unwrap().unwrap();
+    assert_eq!(
+        merged_after.status, "resolved",
+        "a merged PR must resolve its in_revision comments (the change rode the PR)",
+    );
+
+    let closed_after = db.get_comment(&closed_cmt).unwrap().unwrap();
+    assert_eq!(
+        closed_after.status, "in_revision",
+        "a closed-unmerged PR must NOT resolve its comments — reopen handles them separately",
+    );
+    assert_eq!(
+        closed_after.revise_task_id.as_deref(),
+        Some(closed_id.as_str()),
+        "the closed-unmerged comment must retain its revise_task_id (not yet reopened)",
+    );
+}
+
+// ── record_worker_pr_completion vs record_worker_no_op_completion ────────────
+
+/// The PR-produced path: with `target = InReview`, the task advances to
+/// `in_review` with `pr_url` bound, and the execution finalises to `completed`
+/// with `pr_url` bound and its cube lease retained for teardown.
+#[test]
+fn record_worker_pr_completion_binds_pr_and_advances_to_in_review() {
+    let db = WorkDb::open(temp_db_path("rwpc-inreview-bind")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwpc-inreview");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4030";
+    let pr_head_after = "0123456789abcdef0123456789abcdef01234567";
+
+    let completion = db
+        .record_worker_pr_completion(
+            &exec_id,
+            pr_url,
+            Some(pr_head_after),
+            None,
+            WorkerPrCompletionTarget::InReview,
+            None,
+        )
+        .unwrap()
+        .expect("a live execution must return Some(WorkerPrCompletion)");
+
+    // Returned values.
+    let WorkItem::Chore(task) = &completion.work_item else {
+        panic!("expected a chore work item");
+    };
+    assert_eq!(task.status, TaskStatus::InReview, "the task must advance to in_review");
+    assert_eq!(task.pr_url.as_deref(), Some(pr_url), "the task must bind the PR url");
+    assert_eq!(
+        completion.execution.status,
+        ExecutionStatus::Completed,
+        "the execution must finalise to completed",
+    );
+    assert_eq!(
+        completion.execution.pr_url.as_deref(),
+        Some(pr_url),
+        "the execution row must record the PR url",
+    );
+    assert_eq!(
+        completion.execution.pr_head_after.as_deref(),
+        Some(pr_head_after),
+        "the execution row must record the post-teardown PR head",
+    );
+    assert_eq!(
+        completion.execution.cube_lease_id.as_deref(),
+        Some("lease-1"),
+        "terminal status must retain the lease until teardown claims it",
+    );
+
+    // Re-queried state confirms durability.
+    assert_eq!(task_status(&db, &chore_id), "in_review");
+}
+
+/// The no-op path: `record_worker_no_op_completion` closes the task to `done`
+/// with **no** `pr_url` (the worker verified the work was already on `main`
+/// and correctly refused to fabricate a PR), and finalises the execution.
+#[test]
+fn record_worker_no_op_completion_closes_done_without_pr() {
+    let db = WorkDb::open(temp_db_path("rwnc-noop-done")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwnc-noop");
+
+    let completion = db
+        .record_worker_no_op_completion(&exec_id, "already present on main", None)
+        .unwrap()
+        .expect("a live execution must return Some(WorkerPrCompletion)");
+
+    let WorkItem::Chore(task) = &completion.work_item else {
+        panic!("expected a chore work item");
+    };
+    assert_eq!(task.status, TaskStatus::Done, "the no-op path closes the task to done");
+    assert!(
+        task.pr_url.is_none(),
+        "a no-op completion must NOT bind a pr_url — there is no PR",
+    );
+    assert_eq!(
+        completion.execution.status,
+        ExecutionStatus::Completed,
+        "the execution must finalise to completed",
+    );
+    assert!(
+        completion.execution.pr_url.is_none(),
+        "the execution must record no pr_url for a no-op completion",
+    );
+
+    assert_eq!(task_status(&db, &chore_id), "done");
+}
+
+/// Head-to-head: the two completion signals differ in exactly the way the
+/// engine relies on — the PR path lands in `in_review` *with* a `pr_url`, the
+/// no-op path lands in `done` *without* one. Running both on sibling
+/// executions makes the divergence explicit.
+#[test]
+fn pr_completion_and_no_op_completion_differ_in_status_and_pr_binding() {
+    let db = WorkDb::open(temp_db_path("rwpc-vs-noop")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/4040";
+
+    let (_pa, pr_chore, pr_exec) = make_waiting_human_chore(&db, "pr-path");
+    let (_pb, noop_chore, noop_exec) = make_waiting_human_chore(&db, "noop-path");
+
+    let pr_done = db
+        .record_worker_pr_completion(&pr_exec, pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
+        .unwrap()
+        .unwrap();
+    let noop_done = db
+        .record_worker_no_op_completion(&noop_exec, "already done", None)
+        .unwrap()
+        .unwrap();
+
+    // Task status diverges: in_review (PR) vs done (no-op).
+    assert_eq!(task_status(&db, &pr_chore), "in_review");
+    assert_eq!(task_status(&db, &noop_chore), "done");
+
+    // PR binding diverges: bound (PR) vs unbound (no-op).
+    let pr_url_bound = matches!(&pr_done.work_item, WorkItem::Chore(t) if t.pr_url.as_deref() == Some(pr_url));
+    let noop_url_unbound = matches!(&noop_done.work_item, WorkItem::Chore(t) if t.pr_url.is_none());
+    assert!(pr_url_bound, "PR completion must bind the pr_url");
+    assert!(noop_url_unbound, "no-op completion must leave the pr_url unbound");
+
+    // Both finalise their execution.
+    assert_eq!(pr_done.execution.status, ExecutionStatus::Completed);
+    assert_eq!(noop_done.execution.status, ExecutionStatus::Completed);
+}
+
+/// Idempotency: a second `record_worker_pr_completion` on an
+/// already-finalised execution is a no-op returning `None` — safe against a
+/// Stop hook that fires more than once.
+#[test]
+fn record_worker_pr_completion_noop_when_execution_terminal() {
+    let db = WorkDb::open(temp_db_path("rwpc-terminal-noop")).unwrap();
+    let (_product_id, _chore_id, exec_id) = make_waiting_human_chore(&db, "rwpc-terminal");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4050";
+
+    // First call finalises the execution.
+    db.record_worker_pr_completion(&exec_id, pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
+        .unwrap()
+        .expect("first completion must return Some");
+
+    // Second call sees a terminal execution and no-ops.
+    let repeat = db
+        .record_worker_pr_completion(&exec_id, pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
+        .unwrap();
+    assert!(
+        repeat.is_none(),
+        "a second completion on an already-finalised execution must return None",
+    );
+}
+
+// ── update_task_pr_poll_state: persisted-column reflection ──────────────────
+
+/// Complements `t14` (which asserts the returned `PrPollStateOutcome`): here we
+/// assert the *persisted* `ci_required_state` / `review_required_state` columns
+/// track the input across two representative probes, and that `changed`
+/// reflects whether the state actually moved.
+#[test]
+fn poll_state_persists_ci_and_review_columns_across_changes() {
+    let (db, _p, chore_id) = setup_product_and_chore();
+
+    let read_states = |db: &WorkDb| -> (Option<String>, Option<String>) {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT ci_required_state, review_required_state FROM tasks WHERE id = ?1",
+                params![chore_id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+    };
+
+    // Probe 1: pending CI, pending review.
+    let out = db
+        .update_task_pr_poll_state(
+            &chore_id,
+            PrPollStateInput {
+                ci_required_state: "pending",
+                review_required_state: "pending",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(out.changed, "first probe (NULL → set) must count as changed");
+    assert_eq!(
+        read_states(&db),
+        (Some("pending".to_owned()), Some("pending".to_owned())),
+        "the persisted columns must reflect the first probe's input",
+    );
+
+    // Probe 2: CI recovered, review approved — both dimensions move.
+    let out = db
+        .update_task_pr_poll_state(
+            &chore_id,
+            PrPollStateInput {
+                ci_required_state: "success",
+                review_required_state: "approved",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(out.changed, "a CI+review state change must count as changed");
+    assert_eq!(
+        out.prior_ci_state.as_deref(),
+        Some("pending"),
+        "prior_ci_state must expose the value stored before this probe",
+    );
+    assert_eq!(
+        read_states(&db),
+        (Some("success".to_owned()), Some("approved".to_owned())),
+        "the persisted columns must reflect the second probe's input",
+    );
+
+    // Probe 3: identical to probe 2 — nothing moves, columns unchanged.
+    let out = db
+        .update_task_pr_poll_state(
+            &chore_id,
+            PrPollStateInput {
+                ci_required_state: "success",
+                review_required_state: "approved",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(!out.changed, "an identical probe must not count as changed");
+    assert_eq!(
+        read_states(&db),
+        (Some("success".to_owned()), Some("approved".to_owned())),
+        "an unchanged probe must leave the persisted columns intact",
+    );
+}

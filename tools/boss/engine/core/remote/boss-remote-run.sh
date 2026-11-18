@@ -33,7 +33,7 @@
 #
 # Contract (output): the worker is launched DETACHED (`nohup` +
 # background) so it survives the engine restarting and the launching
-# SSH session closing. A detached supervisor brackets the direct driver
+# SSH session closing. A detached supervisor brackets the terminal launcher
 # child: it publishes that child's PID through `<workspace>/.boss/worker.pid`
 # before the `pid=<n>` stderr handshake, and appends
 # `boss-remote-run: worker exited with status=<n>` to
@@ -87,6 +87,11 @@ if ! command -v "$BOSS_DRIVER" >/dev/null 2>&1; then
     printf 'boss-remote-run: `%s` not found on PATH; install or set up the worker toolchain\n' \
         "$BOSS_DRIVER" 1>&2
     exit 79  # documented sentinel: resolved driver missing
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    printf 'boss-remote-run: python3 is required for private initial brief delivery\n' 1>&2
+    exit 78
 fi
 
 # cube must be reachable for the same reason. The engine leases the
@@ -194,7 +199,7 @@ export BOSS_WORKER_PID_FILE="$worker_pid_file"
 # backgrounding reparents the supervisor off this wrapper. The supervisor
 # writes its direct child PID before waiting for that child and
 # appending its observed exit status to the same log. stdin is taken from
-# /dev/null (the prompt rides the positional arg) and stdout+stderr are
+# /dev/null (the terminal launcher reads the private prompt file), and output is
 # teed to the per-run log. The wrapper returns once it has the worker PID;
 # the supervisor keeps running while the worker does.
 #

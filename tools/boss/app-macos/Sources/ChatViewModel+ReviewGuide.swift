@@ -23,6 +23,7 @@ extension ChatViewModel {
     func openReviewGuide(versionId: String, rootTaskId: String) {
         pendingReviewGuideVersionId = versionId
         pendingReviewGuideRootTaskId = rootTaskId
+        loadAttachments(taskId: rootTaskId)
         // Clear the design-doc / task-description identity guards for this
         // shared singleton window so a late reply for either cannot
         // overwrite the guide we are about to show.
@@ -32,7 +33,7 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.reviewGuideRootTaskId = rootTaskId
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
         asyncMarkdownViewerVM.reviewGuideComparisonId = nil
-        asyncMarkdownViewerVM.state = .loading
+        asyncMarkdownViewerVM.state = .loading(title: reviewGuideViewerTitle(rootTaskId: rootTaskId))
         asyncMarkdownViewerVM.staleReason = nil
         asyncMarkdownViewerVM.canRetry = false
         asyncMarkdownViewerVM.onRetry = { [weak self] in
@@ -41,6 +42,26 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerOpener?()
         pendingReviewGuideRequestId = engine.sendGetReviewGuideContent(versionID: versionId)
+        if pendingReviewGuideRequestId == nil {
+            asyncMarkdownViewerVM.state = .failed(title: "Review guide", message: "Guide request could not be sent. Reconnect and retry.")
+            asyncMarkdownViewerVM.canRetry = true
+            asyncMarkdownViewerVM.onRetry = { [weak self] in
+                self?.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+            }
+        }
+    }
+
+    func loadNavigatorReviewGuide(for root: WorkTask, versionID: String? = nil, refresh: Bool = false) {
+        navigatorReviewGuides.load(root: root, versionID: versionID, refresh: refresh) {
+            engine.sendGetReviewGuideContent(versionID: $0)
+        }
+    }
+
+    /// Window title for a review guide, shared by the loading and loaded
+    /// states so the title does not change while the content arrives.
+    @MainActor
+    func reviewGuideViewerTitle(rootTaskId: String?) -> String {
+        rootTaskId.flatMap { task(withID: $0) }.map { "Review guide: \($0.name)" } ?? "Review guide"
     }
 
     /// Apply a `review_guide_content` reply. Dropped when `versionId` no
@@ -50,8 +71,9 @@ extension ChatViewModel {
     /// `nil` content for the CURRENTLY pending version counts as a real
     /// failure worth showing.
     @MainActor
-    func applyReviewGuideContent(versionId: String, content: ReviewGuideVersionContent?) {
-        guard pendingReviewGuideVersionId == versionId else { return }
+    func applyReviewGuideContent(versionId: String, content: ReviewGuideVersionContent?, requestId: String? = nil) {
+        guard pendingReviewGuideVersionId == versionId,
+              requestId == nil || pendingReviewGuideRequestId == requestId else { return }
         pendingReviewGuideRequestId = nil
         guard let content else {
             asyncMarkdownViewerVM.state = .failed(
@@ -61,7 +83,7 @@ extension ChatViewModel {
             return
         }
         let rootTaskId = pendingReviewGuideRootTaskId
-        let title = rootTaskId.flatMap { task(withID: $0) }.map { "Review guide: \($0.name)" } ?? "Review guide"
+        let title = reviewGuideViewerTitle(rootTaskId: rootTaskId)
         asyncMarkdownViewerVM.renderStartTime = Date()
         asyncMarkdownViewerVM.renderContentID = UUID()
         asyncMarkdownViewerVM.staleReason = nil

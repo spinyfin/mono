@@ -34,13 +34,38 @@ struct WorkBoardSectionItemsView: View {
     /// per section instead of invalidating every mounted card.
     @ObservedObject var liveStates: LiveWorkerStateStore
 
+    /// Live reviewers and supervisors shared by PR identity: primary Review
+    /// cards and held revisions in Doing both link to the same review workers.
+    static func reviewWorkers(for task: WorkTask, index: [ReviewPRIdentity: [WorkerLiveState]]) -> [WorkerLiveState] {
+        guard (task.kind == "revision" && task.aiReviewing) || (task.kind != "revision" && task.boardColumn == .review),
+              let url = task.prURL ?? task.revisionParentPrUrl, !url.isEmpty
+        else { return [] }
+        return index[reviewerKey(url)] ?? []
+    }
+
+    static func reviewerKey(_ url: String) -> ReviewPRIdentity {
+        ReviewPRIdentity(url)
+    }
+
+    static func reviewerIndex(states: [WorkerLiveState]) -> [ReviewPRIdentity: [WorkerLiveState]] {
+        var index: [ReviewPRIdentity: [WorkerLiveState]] = [:]
+        for state in states where state.executionKind == "pr_review" {
+            guard let url = state.prURL, !url.isEmpty else { continue }
+            index[reviewerKey(url), default: []].append(state)
+        }
+        for key in index.keys { index[key]?.sort { $0.slotId < $1.slotId } }
+        return index
+    }
+
     var body: some View {
-        let selectedID = model.selectedTask?.id
+        let selectedID = model.navigator.mode == .kanban ? model.selectedTask?.id : nil
         let highlightID = model.revealHighlightID
         let frontierIDs = model.depFrontierHighlightIDs
         let selectedRevisionParentID = model.selectedRevisionParentID
         let dragRefusal = model.dragRefusalNotice
         let mergeFeedback = model.mergeFeedbackNotice
+        // One PR identity index per section render.
+        let reviewersByPR = Self.reviewerIndex(states: (column == .doing || column == .review) ? Array(liveStates.byRunID.values) : [])
         // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
         // the default (ungrouped) board layout each column is a single section,
         // so this was the actual eagerly-built list of every card in the
@@ -76,23 +101,29 @@ struct WorkBoardSectionItemsView: View {
                     task: task,
                     column: column,
                     snapshot: snapshot,
+                    reviewers: (column == .doing || column == .review) ? Self.reviewWorkers(for: task, index: reviewersByPR) : [],
                     model: model,
                     revisionHighlight: model.revisionHighlightState(for: task.id),
                     isRevealed: highlightID == task.id,
                     dragRefusalMessage: dragRefusal?.taskID == task.id
                         ? dragRefusal?.message : nil,
                     mergeFeedbackMessage: mergeFeedback?.taskID == task.id
-                        ? mergeFeedback?.message : nil
+                        ? mergeFeedback?.message : nil,
+                    isRequestingMerge: model.mergingWhenReadyIDs.contains(task.id)
                 )
                 .id(task.id)
                 .background {
-                    if model.revealScrollTarget == task.id {
+                    if model.revealScrollTarget == task.id || BossRevealCapture.viewportTargetID == task.id {
                         RevealCardViewport(cardID: task.id, generation: model.revealGeneration, model: model)
                             .allowsHitTesting(false)
                     }
                 }
             }
         }
+        // Cards are the column's scroll targets: `WorkBoardColumnScrollView`
+        // anchors the column on the card at the viewport centre so a refresh
+        // that reorders or resizes rows keeps that card where the user left it.
+        .scrollTargetLayout()
     }
 }
 
@@ -113,6 +144,7 @@ struct WorkBoardCardItem: View {
     /// Board column for action routing / debug logs only (value, not observed).
     let column: WorkBoardColumnKey
     let snapshot: WorkCardSnapshot
+    var reviewers: [WorkerLiveState] = []
     /// Non-observing; action dispatch only. Column container owns
     /// observation and snapshot construction.
     let model: ChatViewModel
@@ -124,6 +156,7 @@ struct WorkBoardCardItem: View {
     var dragRefusalMessage: String? = nil
     /// Pre-resolved by the column container from `mergeFeedbackNotice`.
     var mergeFeedbackMessage: String? = nil
+    var isRequestingMerge = false
     @Environment(\.openWindow) private var openWindow
     @State private var showingDeleteConfirmation = false
 
@@ -171,12 +204,21 @@ struct WorkBoardCardItem: View {
             ? { openWindow(id: "attachment-viewer", value: AttachmentViewerRef(taskId: task.id)) }
             : nil
 
+        // Doing cards with a live run can jump to that run's Agents cell.
+        let onFocusAgent: (() -> Void)? = {
+            guard column == .doing,
+                  let runId = model.taskRuntime(for: task.id)?.executionID
+            else { return nil }
+            return { model.focusAgentFromWorkCard(runId) }
+        }()
+
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 model.selectWorkCard(snapshot.isSelected ? nil : task.id)
             } label: {
                 WorkBoardCardView(
                     snapshot: snapshot,
+                    onFocusAgent: onFocusAgent,
                     onRevealQueueBlocker: { blocker in
                         if case .unreachable(let reason) = model.revealWorkCard(blocker.workItemID, productID: blocker.productID) {
                             model.workErrorMessage = "Couldn't reveal \(blocker.label): \(reason)"
@@ -204,6 +246,7 @@ struct WorkBoardCardItem: View {
                     },
                     onOpenTerminal: onOpenTerminal,
                     onMergeWhenReady: onMergeWhenReady,
+                    isRequestingMerge: isRequestingMerge,
                     onOpenReviewGuide: onOpenReviewGuide,
                     onRetryReviewGuide: onRetryReviewGuide,
                     onOpenAttachments: onOpenAttachments,
@@ -217,7 +260,8 @@ struct WorkBoardCardItem: View {
                     },
                     onAnswerOperatorQuestion: { answer in
                         model.answerOperatorQuestion(for: task, answer: answer)
-                    }
+                    },
+                    onDismissOperatorQuestion: { model.dismissOperatorQuestion(for: task) }
                 )
                 // `WorkBoardCardView` is `Equatable` over its snapshot and
                 // keyed revision-hover boolean: without `.equatable()`, every
@@ -265,6 +309,23 @@ struct WorkBoardCardItem: View {
                     .help(reviewGuideMenuPresentation?.tooltip ?? title)
                 }
                 Divider()
+                switch model.parkMenuAction(for: task) {
+                case .unpark:
+                    Button("Unpark") {
+                        model.unpark(id: task.id)
+                    }
+                case .unparkDisabled(let reason):
+                    Button("Unpark") {}
+                        .disabled(true)
+                        .help(reason)
+                case .park:
+                    Button("Park…") {
+                        model.requestPark(task: task)
+                    }
+                case .none:
+                    EmptyView()
+                }
+                Divider()
                 Button("Delete", role: .destructive) {
                     showingDeleteConfirmation = true
                 }
@@ -274,12 +335,12 @@ struct WorkBoardCardItem: View {
             // isPresented reads live model selection (not a constant true) so
             // dismiss set(false) and subsequent get stay consistent.
             .lazyWorkCardSelectionPopover(
-                isSelected: snapshot.isSelected,
+                isSelected: model.navigator.mode == .kanban && snapshot.isSelected,
                 isPresented: Binding(
-                    get: { model.selectedTask?.id == task.id },
+                    get: { model.isWorkCardPopoverPresented(task.id) },
                     set: { presented in
                         if !presented {
-                            model.selectWorkCard(nil)
+                            model.dismissWorkCardPopover()
                         }
                     }
                 )
@@ -295,6 +356,10 @@ struct WorkBoardCardItem: View {
                 WorkDragRefusalBanner(message: dragRefusalMessage) {
                     model.clearDragRefusal()
                 }
+            }
+
+            ForEach(reviewers, id: \.runId) { reviewer in
+                ReviewWorkerLink(reviewer: reviewer, model: model)
             }
 
             if let mergeFeedbackMessage {
@@ -364,6 +429,25 @@ struct WorkBoardCardItem: View {
     }
 }
 
+/// A live review worker on a revision card held in Doing for AI review.
+struct ReviewWorkerLink: View {
+    let reviewer: WorkerLiveState
+    let model: ChatViewModel
+    var title: String { "\(reviewer.displayName) — \(reviewer.badgeLabel)" }
+    let tooltip = "Show live review worker"
+
+    func activate() { model.focusAgentFromWorkCard(reviewer.runId) }
+
+    var body: some View {
+        Button(action: activate) {
+            Label(title, systemImage: "person.crop.circle")
+        }
+        .buttonStyle(.plain)
+        .font(.caption)
+        .help(tooltip)
+    }
+}
+
 /// Rendered directly on a kanban card whenever `task.dispatchFailedReason`
 /// is set — the card has been bounced to Backlog with `autostart` cleared,
 /// so it will NOT auto-retry. Distinguishes "held, needs you" from "waiting
@@ -405,6 +489,8 @@ struct WorkBoardCardItem: View {
 /// every sub-region.
 struct WorkBoardCardView: View, @MainActor Equatable {
     let snapshot: WorkCardSnapshot
+    /// Shows the run in the Agents view; outside `==` like other handlers.
+    var onFocusAgent: (() -> Void)? = nil
     var onRevealQueueBlocker: ((DispatchWaitBlocker) -> Void)? = nil
     /// Keyed revision-hover input, kept outside the snapshot so changing it
     /// does not require rebuilding every card snapshot in the column.
@@ -427,6 +513,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked after the user confirms "Merge When Ready". `nil` hides
     /// the button (also gated by `snapshot.showsMergeWhenReady`).
     var onMergeWhenReady: (() -> Void)? = nil
+    var isRequestingMerge = false
     /// Invoked when the user taps the review-guide document button. `nil`
     /// hides it (also gated by `snapshot.reviewGuidePresentation`).
     var onOpenReviewGuide: (() -> Void)? = nil
@@ -453,11 +540,13 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked with the user's Yes/No when they answer the inline
     /// question. Only called when `snapshot.operatorQuestion` is non-nil.
     var onAnswerOperatorQuestion: ((OperatorAnswer) -> Void)? = nil
+    var onDismissOperatorQuestion: (() -> Void)? = nil
 
     @State private var isHovered: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.snapshot == rhs.snapshot
+            && lhs.isRequestingMerge == rhs.isRequestingMerge
             && lhs.isRevisionHighlighted == rhs.isRevisionHighlighted
             && lhs.aiReviewFindingsTooltipNote == rhs.aiReviewFindingsTooltipNote
     }
@@ -477,14 +566,18 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 WorkBoardCardRevisionHeader(slice: revision)
                     .equatable()
             }
-            WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: snap))
+            WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: snap), onFocusAgent: onFocusAgent)
                 .equatable()
             if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
                 WorkBoardCardLiveStatusRow(slice: liveStatus, onRevealBlocker: onRevealQueueBlocker)
                     .equatable()
             }
+            if let parked = snap.parked {
+                WorkBoardCardParkedRow(presentation: parked)
+                    .equatable()
+            }
             if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {
-                WorkBoardCardOperatorQuestion(slice: operatorQuestion, onAnswer: onAnswerOperatorQuestion)
+                WorkBoardCardOperatorQuestion(slice: operatorQuestion, onAnswer: onAnswerOperatorQuestion, onDismiss: onDismissOperatorQuestion)
                     .equatable()
             }
             WorkBoardCardBadgeStrip(
@@ -494,6 +587,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 onDepBadgeHover: onDepBadgeHover,
                 onOpenTerminal: onOpenTerminal,
                 onMergeWhenReady: onMergeWhenReady,
+                isRequestingMerge: isRequestingMerge,
                 onOpenReviewGuide: onOpenReviewGuide,
                 onRetryReviewGuide: onRetryReviewGuide,
                 onRevealAIReviewFindings: onRevealAIReviewFindings,

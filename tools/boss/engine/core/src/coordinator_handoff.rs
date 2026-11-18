@@ -36,65 +36,31 @@
 //! natural boundaries — whenever the operator states a fact that changed
 //! the world, a decision, or a prohibition — so a handoff always exists
 //! as of the last such boundary, and the brief's writer/age stamps make
-//! any gap visible. See `tools/boss/docs/coordinator-session-handoff.md`.
+//! any gap visible. UI-confirmed resets additionally request a fresh
+//! handoff through its inbox and wait up to 30 seconds after delivery before
+//! replacing a live session. A timeout is reported as missing context.
+//! See `tools/boss/docs/coordinator-session-handoff.md`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use boss_engine_utils::iso8601::{format_elapsed_ago, format_epoch_iso8601};
 use boss_protocol::{CoordinatorGuidanceView, CoordinatorHandoffView, CoordinatorRecreateReason};
-use serde::{Deserialize, Serialize};
 
-use crate::work::{CoordinatorTmuxRecord, WorkDb};
-
-/// Metadata key holding the JSON-encoded [`CoordinatorHandoff`].
-pub(crate) const HANDOFF_METADATA_KEY: &str = "coordinator.handoff";
+use crate::work::CoordinatorTmuxRecord;
 
 /// Upper bound on a handoff body. A handoff is a brief — operator-stated
 /// facts, decisions, open threads, prohibitions — not a transcript
 /// replay; the cap is what keeps it that way when a session is tempted to
 /// dump everything it knows.
-pub(crate) const MAX_HANDOFF_BYTES: usize = 16 * 1024;
+pub const MAX_HANDOFF_BYTES: usize = 16 * 1024;
 
 /// Filename of the session-start brief, written under the coordinator
 /// session directory's `.claude/` (next to the app-managed
 /// `settings.local.json`) and handed to `claude` as its initial prompt.
-pub(crate) const START_BRIEF_FILENAME: &str = "handoff-brief.txt";
+pub const START_BRIEF_FILENAME: &str = "handoff-brief.txt";
 
-/// The stored handoff record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CoordinatorHandoff {
-    pub(crate) body: String,
-    /// Unix epoch seconds.
-    pub(crate) written_at: i64,
-    /// Spawn token of the coordinator record that was live at write time.
-    /// Empty when no coordinator record existed (a handoff written from a
-    /// plain terminal before any coordinator ever ran).
-    pub(crate) writer_spawn_token: String,
-}
-
-/// What the engine found when it looked for a handoff. `Missing` and
-/// `Unreadable` are deliberately separate variants: "no session ever wrote
-/// one" and "one was written but the engine cannot read it back" call for
-/// different operator responses, and collapsing them would hide the
-/// second behind the first.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HandoffState {
-    Present(CoordinatorHandoff),
-    Missing,
-    Unreadable(String),
-}
-
-impl HandoffState {
-    /// Short label for the engine-audit log.
-    pub(crate) fn audit_outcome(&self) -> &'static str {
-        match self {
-            Self::Present(_) => "present",
-            Self::Missing => "missing",
-            Self::Unreadable(_) => "unreadable",
-        }
-    }
-}
+pub(crate) use boss_engine_storage_values::{CoordinatorHandoff, HandoffState};
 
 /// Why a fresh coordinator session is being created. Rendered into the
 /// session-start brief so the incoming session can tell the operator what
@@ -113,6 +79,8 @@ pub(crate) enum CoordinatorStartReason {
     /// An explicit UI-confirmed recreate (model mismatch or operator reset,
     /// the latter also being how a `claude` update is picked up).
     Recreate(CoordinatorRecreateReason),
+    /// Refreshing the handoff was explicitly skipped.
+    RecreateWithoutHandoff(CoordinatorRecreateReason),
 }
 
 impl CoordinatorStartReason {
@@ -127,6 +95,13 @@ impl CoordinatorStartReason {
                 "the previous coordinator's claude process exited (a crash, `/exit`, or a Claude Code update \
                  ending the process) while its tmux session survived"
             }
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::ModelMismatch) => {
+                "the operator replaced the previous coordinator to change its model without waiting for a fresh \
+                 handoff"
+            }
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::OperatorReset) => {
+                "the operator reset the coordinator without waiting for a fresh handoff"
+            }
             Self::Recreate(CoordinatorRecreateReason::ModelMismatch) => {
                 "the operator confirmed replacing the previous coordinator to change its model"
             }
@@ -139,6 +114,12 @@ impl CoordinatorStartReason {
 
     pub(crate) fn audit_label(self) -> &'static str {
         match self {
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::ModelMismatch) => {
+                "recreate_model_mismatch_without_handoff"
+            }
+            Self::RecreateWithoutHandoff(CoordinatorRecreateReason::OperatorReset) => {
+                "recreate_operator_reset_without_handoff"
+            }
             Self::FirstCreation => "first_creation",
             Self::SessionMissing => "session_missing",
             Self::PaneDead => "pane_dead",
@@ -165,46 +146,9 @@ impl From<&CoordinatorTmuxRecord> for PreviousSession {
     }
 }
 
-impl WorkDb {
-    /// Read the stored handoff. Never errors: every failure mode is a
-    /// [`HandoffState`] variant so callers cannot accidentally treat a
-    /// read failure as "nothing stored".
-    pub(crate) fn coordinator_handoff_state(&self) -> HandoffState {
-        match self.get_metadata(HANDOFF_METADATA_KEY) {
-            Ok(None) => HandoffState::Missing,
-            Ok(Some(raw)) => match serde_json::from_str::<CoordinatorHandoff>(&raw) {
-                Ok(handoff) => HandoffState::Present(handoff),
-                Err(error) => {
-                    HandoffState::Unreadable(format!("stored coordinator handoff is not valid JSON: {error}"))
-                }
-            },
-            Err(error) => HandoffState::Unreadable(format!("could not read stored coordinator handoff: {error:#}")),
-        }
-    }
-
-    /// Replace the stored handoff. `body` must already have passed
-    /// [`validate_handoff_body`].
-    pub(crate) fn set_coordinator_handoff(
-        &self,
-        body: &str,
-        writer_spawn_token: &str,
-        now_epoch_secs: i64,
-    ) -> Result<CoordinatorHandoff> {
-        let handoff = CoordinatorHandoff {
-            body: body.to_owned(),
-            written_at: now_epoch_secs,
-            writer_spawn_token: writer_spawn_token.to_owned(),
-        };
-        let raw = serde_json::to_string(&handoff).context("encoding coordinator handoff")?;
-        self.set_metadata(HANDOFF_METADATA_KEY, &raw)
-            .context("persisting coordinator handoff")?;
-        Ok(handoff)
-    }
-}
-
 /// Normalize and bound a handoff body. Returns the trimmed body, or the
 /// operator-facing reason it was refused.
-pub(crate) fn validate_handoff_body(body: &str) -> std::result::Result<String, String> {
+pub fn validate_handoff_body(body: &str) -> std::result::Result<String, String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Err(
@@ -225,7 +169,7 @@ pub(crate) fn validate_handoff_body(body: &str) -> std::result::Result<String, S
 
 /// Wire view of a stored handoff, judged against the coordinator record
 /// that is live *now*.
-pub(crate) fn handoff_view(
+pub fn handoff_view(
     handoff: &CoordinatorHandoff,
     current_spawn_token: Option<&str>,
     now_epoch_secs: i64,
@@ -302,7 +246,11 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
             let written = when(handoff.written_at, now);
             let by_previous =
                 previous.is_some_and(|p| !p.spawn_token.is_empty() && p.spawn_token == handoff.writer_spawn_token);
-            if by_previous {
+            if matches!(reason, CoordinatorStartReason::RecreateWithoutHandoff(_)) {
+                out.push_str(&format!(
+                    "HANDOFF STALE: the operator reset without waiting for a fresh handoff. The saved handoff was written {written}; confirm what changed with the operator before relying on it.\n"
+                ));
+            } else if by_previous {
                 out.push_str(&format!(
                     "HANDOFF PRESENT: written by {previous_phrase}, {written}. Facts in it are current as of that \
                      time, not now.\n"
@@ -376,8 +324,9 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
          1. Your first reply states which handoff state applies (present / stale / missing / unreadable) in one \
          line, then summarizes the handoff in a few lines if there is one. In the same reply, list each product's \
          guidance state from the section above in one line per product (loaded @ sha / missing / over cap / fetch \
-         failed / no repo) — a fetch failure is something the operator needs to hear, not something to work around \
-         silently.\n\
+         failed / cached @ sha, read <time> / no repo) — a fetch failure is something the operator needs to hear, \
+         not something to work around silently. A CACHED entry is a fetch failure served from the last copy read \
+         successfully: report it as \"fetch failed, serving cached @ sha read <time>\", never as loaded.\n\
          2. Treat every infrastructure, host, flag, tmux, or pause fact from the handoff as \"as of the time it was \
          written\". Before filing work, briefing an agent, or raising an alarm that depends on such a fact, \
          confirm it is still true (a fresh read, or ask the operator).\n\
@@ -394,12 +343,16 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
 /// character outside `[A-Za-z0-9]` with `-`. Pure; the caller decides
 /// whether the directory actually exists.
 pub(crate) fn transcript_projects_dir(home: &Path, working_directory: &Path) -> PathBuf {
+    transcript_projects_dir_in_config(&home.join(".claude"), working_directory)
+}
+
+pub(crate) fn transcript_projects_dir_in_config(config: &Path, working_directory: &Path) -> PathBuf {
     let encoded: String = working_directory
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    home.join(".claude").join("projects").join(encoded)
+    config.join("projects").join(encoded)
 }
 
 /// [`transcript_projects_dir`] for the real `$HOME`, only when it exists.
@@ -409,13 +362,14 @@ pub(crate) fn existing_transcript_dir(working_directory: &Path) -> Option<PathBu
     dir.is_dir().then_some(dir)
 }
 
-/// Write the brief where the coordinator's launch command reads it from.
+/// Archive the non-secret brief for inspection in the session directory.
 /// Returns the absolute path written.
 pub(crate) fn write_start_brief(working_directory: &Path, brief: &str) -> Result<PathBuf> {
     let dir = working_directory.join(".claude");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(START_BRIEF_FILENAME);
-    std::fs::write(&path, brief).with_context(|| format!("writing session-start brief to {}", path.display()))?;
+    crate::driver::initial_prompt::write_private(&path, brief.as_bytes())
+        .with_context(|| format!("writing session-start brief to {}", path.display()))?;
     Ok(path)
 }
 
@@ -444,6 +398,7 @@ mod tests {
 
     fn present(written_at: i64, writer: &str) -> HandoffState {
         HandoffState::Present(CoordinatorHandoff {
+            write_id: String::new(),
             body: "- greyarea is shut down (operator, 19:22 PDT)\n- tmux hosting re-enabled\n".to_owned(),
             written_at,
             writer_spawn_token: writer.to_owned(),
@@ -485,24 +440,10 @@ mod tests {
     }
 
     #[test]
-    fn state_distinguishes_missing_present_and_unreadable() {
-        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
-        assert_eq!(db.coordinator_handoff_state(), HandoffState::Missing);
-
-        let written = db.set_coordinator_handoff("- fact", "token-a", NOW).unwrap();
-        assert_eq!(db.coordinator_handoff_state(), HandoffState::Present(written));
-
-        db.set_metadata(HANDOFF_METADATA_KEY, "{not json").unwrap();
-        match db.coordinator_handoff_state() {
-            HandoffState::Unreadable(reason) => assert!(reason.contains("not valid JSON"), "got: {reason}"),
-            other => panic!("corrupt value must read as Unreadable, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn view_marks_current_session_only_on_exact_token_match() {
         let handoff = CoordinatorHandoff {
             body: "- fact".to_owned(),
+            write_id: String::new(),
             written_at: NOW - 240,
             writer_spawn_token: "token-a".to_owned(),
         };
@@ -643,6 +584,9 @@ mod tests {
         assert!(handoff_at < guidance_at && guidance_at < steps_at, "{text}");
         assert!(text.contains("# Boss rules"), "{text}");
         assert!(text.contains("list each product's guidance state"), "{text}");
+        let steps = &text[steps_at..];
+        assert!(steps.contains("cached @ sha, read <time>"), "{text}");
+        assert!(steps.contains("never as loaded"), "{text}");
     }
 
     #[test]

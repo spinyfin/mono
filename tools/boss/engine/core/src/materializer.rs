@@ -7,9 +7,8 @@
 //! `planner_runs.id`, and wires the dependency edges. It is the *only* thing
 //! in the auto-populate flow that writes task rows.
 //!
-//! See `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
-//! (project P783) §3 "The deterministic materializer (apply)". This module is
-//! task 5 of that design.
+//! See `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`,
+//! section 3, "The deterministic materializer (apply)".
 //!
 //! ## Reuses the existing write paths — never a parallel creation path
 //!
@@ -96,7 +95,7 @@ impl Materializer {
         check_graph(output)?;
 
         let mut conn = db.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
 
         // Resolve the product from the project (also validates it exists).
@@ -430,6 +429,15 @@ mod tests {
         .id
     }
 
+    fn flag_history(db: &WorkDb, id: &str, property: &str) -> Vec<(Option<String>, Option<String>, String, String)> {
+        db.list_task_field_audit(id)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.property == property)
+            .map(|row| (row.old_value, row.new_value, row.actor, row.basis))
+            .collect()
+    }
+
     fn ptask(handle: &str, name: &str, kind: TaskKind) -> ProposedTask {
         ProposedTask {
             handle: handle.to_owned(),
@@ -521,6 +529,24 @@ mod tests {
             assert_eq!(task_scalar::<i64>(&db, id, "autostart"), 0, "staged, not dispatching");
             assert_eq!(task_scalar::<String>(&db, id, "planner_run_id"), run);
             assert_eq!(task_scalar::<String>(&db, id, "kind"), "project_task");
+            assert_eq!(
+                flag_history(&db, id, "autostart"),
+                [(
+                    None,
+                    Some("0".into()),
+                    "engine".into(),
+                    "insert_task_in_tx_as_actor".into()
+                )]
+            );
+            assert_eq!(
+                flag_history(&db, id, "deferred"),
+                [(
+                    None,
+                    Some("0".into()),
+                    "engine".into(),
+                    "insert_task_in_tx_as_actor".into()
+                )]
+            );
         }
 
         // Effort-classification is lifted into first-class provenance columns
@@ -582,6 +608,24 @@ mod tests {
         assert_eq!(
             task_scalar::<String>(&db, &res.created[0], "name"),
             "Add bulk-export endpoint"
+        );
+        assert_eq!(
+            flag_history(&db, &res.created[0], "deferred"),
+            [(
+                None,
+                Some("1".into()),
+                "engine".into(),
+                "insert_task_in_tx_as_actor".into()
+            )]
+        );
+        assert_eq!(
+            flag_history(&db, &res.created[0], "autostart"),
+            [(
+                None,
+                Some("0".into()),
+                "engine".into(),
+                "insert_task_in_tx_as_actor".into()
+            )]
         );
     }
 

@@ -33,20 +33,22 @@ use boss_protocol::{
 };
 
 use crate::blocking_signal::{self, SignalKind};
+use crate::conflict_deferral;
 use crate::conflict_ladder;
 use crate::conflict_remediation::{ConflictRemediationQueue, EnqueueOutcome};
-use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out, stored_pr_number};
 #[cfg(test)]
 use crate::work::TaskStatus;
 use crate::work::{
-    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, ArchiveProvenance, ConflictResolutionInsertInput, PendingMergeCheck,
-    PrStateChecker, WorkDb,
+    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, ArchiveProvenance, ClearResolvedSignal,
+    ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb,
 };
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
+use boss_feature_flags::ConflictDeferralArm;
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
-/// (per-product flag or per-PR label) suppresses this conflict-watch
-/// transition. Returns `true` to gate the path off, logging at debug
+/// (per-product flag or per-PR label), or the row being parked, suppresses this
+/// conflict-watch transition. Returns `true` to gate the path off, logging at debug
 /// for traceability. DB-read errors fall through to "not opted out"
 /// so a transient lookup failure doesn't silently drop a real signal —
 /// the per-PR label is the second line of defence in that case.
@@ -59,6 +61,17 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
             "conflict_watch: PR labelled with opt-out; skipping",
+        );
+        return true;
+    }
+    // A parked row atrophies: conflict resolution (including the mechanical
+    // rebase rung it hands to the ladder) is upkeep, so every entry point
+    // that shares this gate leaves the row alone until it is un-parked.
+    if work_db.is_parked_or_assume_not(&candidate.work_item_id, "conflict_watch") {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "conflict_watch: row is parked; skipping",
         );
         return true;
     }
@@ -114,9 +127,9 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
 /// first attempts the engine-direct mechanical rebase (rung 1) before spawning
 /// a worker — see [`crate::conflict_ladder`]. A clean rebase resolves and
 /// pushes the PR with no agent; the harness retires the attempt and this
-/// returns early. `None` (the default at call sites, and whenever the
-/// `conflict_ladder_mechanical_rebase` flag is off) preserves the pre-ladder
-/// worker-only path exactly.
+/// returns early. `None` (passed whenever the
+/// `conflict_ladder_mechanical_rebase` flag, enabled by default, has been set
+/// to `false`) takes the worker-only path.
 pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -129,7 +142,16 @@ pub async fn on_conflict_detected(
         Some(cube) => ConflictRemediationMode::Inline(cube),
         None => ConflictRemediationMode::Disabled,
     };
-    on_conflict_detected_with(work_db, publisher, mode, pr_checker, candidate, probe).await
+    on_conflict_detected_with(
+        work_db,
+        publisher,
+        mode,
+        pr_checker,
+        candidate,
+        probe,
+        ConflictDeferralArm::Off,
+    )
+    .await
 }
 
 /// How a caller of [`on_conflict_detected_with`] wants the mechanical
@@ -155,7 +177,13 @@ pub enum ConflictRemediationMode<'a> {
 }
 
 /// [`on_conflict_detected`] with explicit control over how the escalation
-/// ladder is run — see [`ConflictRemediationMode`].
+/// ladder is run — see [`ConflictRemediationMode`] — and over whether this
+/// PR's conflicts are resolved on detection or just in time.
+///
+/// `deferral` is the PR's arm in the just-in-time rollout. In the deferring
+/// arm a conflict on a PR nobody has asked to merge is recorded in the
+/// ledger and this returns without resolving anything; see
+/// [`crate::conflict_deferral`] for when it is held and when it is released.
 pub async fn on_conflict_detected_with(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -163,6 +191,7 @@ pub async fn on_conflict_detected_with(
     pr_checker: &dyn PrStateChecker,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
+    deferral: ConflictDeferralArm,
 ) -> bool {
     // Phase 6 #18 / Q7: the unified opt-out gates the entire flow.
     // Check it first so opted-out products never even probe the
@@ -193,6 +222,16 @@ pub async fn on_conflict_detected_with(
             );
             return false;
         }
+    }
+    // Just-in-time resolution: a conflict on a PR in the deferring arm that
+    // nobody has asked to merge is recorded and held here. `Proceed` covers
+    // everything else, including a held conflict being released on this
+    // pass, and falls through to the unchanged resolution path below — a
+    // released conflict is never resolved by a shortcut.
+    if let conflict_deferral::Gate::Hold { recorded } =
+        conflict_deferral::gate(work_db, publisher, candidate, probe, deferral).await
+    {
+        return recorded;
     }
     // Pre-flight: when an active revision fix vehicle already exists for this
     // work item, the detection flow is essentially a no-op for an `in_review`
@@ -424,6 +463,7 @@ pub async fn on_conflict_detected_with(
                                     .publish_frontend_event_on_product(
                                         &candidate.product_id,
                                         FrontendEvent::ConflictResolutionStarted {
+                                            attempt: work_db.remediation_entry(active_crz.list_entry()),
                                             product_id: candidate.product_id.clone(),
                                             work_item_id: candidate.work_item_id.clone(),
                                             attempt_id: active_crz.id.clone(),
@@ -494,7 +534,7 @@ pub async fn on_conflict_detected_with(
                     Ok(None) => {
                         // No active crz. Check the most recent crz to decide
                         // whether to re-arm.
-                        let latest = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id) {
+                        let latest = match work_db.latest_conflict_attempt_for_work_item(&candidate.work_item_id) {
                             Ok(latest) => latest,
                             Err(err) => {
                                 tracing::warn!(
@@ -569,10 +609,13 @@ pub async fn on_conflict_detected_with(
                                     }
                                 }
                             }
-                            "pending" => {
+                            "pending" | "deferred" | "superseded" => {
                                 // No previous crz (or brand-new pending one) — fall
                                 // through to the insert path; it handles idempotency
-                                // via the UNIQUE key guard.
+                                // via the UNIQUE key guard. A deferral record
+                                // (`deferred`, or `superseded` once it ended) is
+                                // not an attempt either: the conflict it recorded
+                                // has never been tried, so it gets a fresh one.
                             }
                             other => {
                                 // `churn_threshold_exceeded` is the human-attention
@@ -608,6 +651,36 @@ pub async fn on_conflict_detected_with(
                                             );
                                         }
                                     }
+                                } else if other == "failed"
+                                    && latest
+                                        .as_ref()
+                                        .and_then(|c| c.failure_reason.as_deref())
+                                        .is_some_and(|reason| reason.starts_with("lockfile_regeneration_failed"))
+                                {
+                                    // Terminal only for this PR head. The probe's
+                                    // base oid mirrors GitHub's `baseRefOid`, which
+                                    // does not track `main` moving, so only a head
+                                    // push (or a manual retry) re-arms the attempt.
+                                    // The failed row is kept.
+                                    let same_head = latest.as_ref().is_some_and(|failed| {
+                                        probe.head_ref_oid.is_some()
+                                            && probe.head_ref_oid.as_deref() == failed.head_sha_before.as_deref()
+                                    });
+                                    if same_head {
+                                        tracing::debug!(
+                                            work_item_id = %candidate.work_item_id,
+                                            attempt_id = ?latest.as_ref().map(|c| c.id.as_str()),
+                                            "conflict_watch: lockfile regeneration still failed for this PR head; not retrying",
+                                        );
+                                        return false;
+                                    }
+                                    tracing::info!(
+                                        work_item_id = %candidate.work_item_id,
+                                        pr_url = %candidate.pr_url,
+                                        attempt_id = ?latest.as_ref().map(|c| c.id.as_str()),
+                                        head_ref_oid = ?probe.head_ref_oid,
+                                        "conflict_watch: lockfile regeneration failed on a previous PR head; inserting a fresh attempt",
+                                    );
                                 } else {
                                     tracing::debug!(
                                         work_item_id = %candidate.work_item_id,
@@ -642,6 +715,33 @@ pub async fn on_conflict_detected_with(
             }
         }
     };
+
+    // Another row in the revision family can observe this same PR, and an
+    // ended attempt can still have a live worker. Do not mint a competitor.
+    if work_db
+        .has_live_conflict_revision_for_pr(&candidate.pr_url)
+        .unwrap_or(true)
+    {
+        if task_flipped_to_blocked {
+            tracing::info!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "conflict_watch: a conflict revision for this PR is still running or queued; \
+                 not minting another",
+            );
+            publisher
+                .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "blocked_merge_conflict")
+                .await;
+        } else {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "conflict_watch: a conflict revision for this PR is still running or queued; \
+                 not minting another",
+            );
+        }
+        return false;
+    }
 
     // Trunk merge-queue coordination (design §"Coordination with
     // conflict_watch / ci_watch"): a conflict detected while a Trunk merge
@@ -703,7 +803,10 @@ pub async fn on_conflict_detected_with(
         base_sha_at_trigger: probe.base_ref_oid.clone(),
         head_sha_before: probe.head_ref_oid.clone(),
     }) {
-        Ok(Some(a)) => Some(a),
+        Ok(Some(a)) => {
+            conflict_deferral::label_attempt(work_db, &a, deferral);
+            Some(a)
+        }
         Ok(None) => {
             // UNIQUE collision — a row for this (base, head) key already
             // exists. This used to be silent, which made the preceding
@@ -716,9 +819,43 @@ pub async fn on_conflict_detected_with(
                 .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
                 .ok()
                 .flatten();
+            // Only the live attempt that actually holds this probe's
+            // `(base, head)` key may be reused. Any other active attempt is
+            // stale (it was created for a different head) and adopting it
+            // would aim the fix and the retire path at the wrong attempt.
             let active = work_db
                 .active_conflict_resolution_for_work_item(&candidate.work_item_id)
-                .unwrap_or(None);
+                .unwrap_or(None)
+                .filter(|a| {
+                    let holds_key =
+                        a.base_sha_at_trigger == probe.base_ref_oid && a.head_sha_before == probe.head_ref_oid;
+                    if !holds_key {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            attempt_base_sha = ?a.base_sha_at_trigger,
+                            attempt_head_sha = ?a.head_sha_before,
+                            probe_base_sha = ?probe.base_ref_oid,
+                            probe_head_sha = ?probe.head_ref_oid,
+                            "conflict_watch: active attempt does not hold the colliding key; not adopting it",
+                        );
+                    }
+                    holds_key
+                });
+            // Reusing an attempt must leave the same trail as inserting one:
+            // the task's `blocked_attempt_id` names it, so the retire path can
+            // match the block to the attempt when the PR becomes mergeable.
+            if let Some(a) = active.as_ref()
+                && let Err(err) = work_db.record_blocked_conflict_attempt(&candidate.work_item_id, &a.id)
+            {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    attempt_id = %a.id,
+                    ?err,
+                    "conflict_watch: failed to record adopted attempt as blocked_attempt_id",
+                );
+            }
             // A `pending` attempt with no revision is the row the blocked
             // re-arm path above deliberately falls through on so the ladder
             // can be retried for it. That collision is the *expected*
@@ -869,11 +1006,40 @@ pub async fn on_conflict_detected_with(
                         );
                         return true;
                     }
+                    conflict_ladder::LadderOutcome::LockfileRegenerationFailed => {
+                        // Lockfile regeneration failed in the environment.
+                        // The attempt is terminal for this PR head
+                        // (`failed`, reason recorded, attention item
+                        // filed). A later probe whose head has moved
+                        // starts a fresh attempt; a worker would not do
+                        // better on the same head.
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: lockfile regeneration failed; attempt failed, no worker spawned",
+                        );
+                        return true;
+                    }
                     conflict_ladder::LadderOutcome::FellThrough {
                         residual_conflict_files,
                         ..
                     } => {
                         use_small_agent_profile = conflict_ladder::rung2_eligible(residual_conflict_files);
+                    }
+                    conflict_ladder::LadderOutcome::DeferredForLiveWriter => {
+                        // A worker is live on this PR's chain, so the engine
+                        // must not rebase under it. Like an unavailable
+                        // rung: spawn nothing and leave the attempt
+                        // `pending`; a later tick re-enters the ladder.
+                        mechanical_rungs_unavailable = true;
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: a worker is live on this PR's chain; engine rebase deferred, \
+                             no worker spawned, ladder will retry on the next tick",
+                        );
                     }
                     conflict_ladder::LadderOutcome::MechanicalRungsUnavailable => {
                         // Rung 1's workspace lease failed even after a
@@ -897,7 +1063,7 @@ pub async fn on_conflict_detected_with(
                     }
                 }
             } else {
-                // No cube client → the mechanical-rebase flag is off, so the
+                // No cube client → the mechanical-rebase flag was set to false, so the
                 // escalation ladder (rungs 0/1, including the deterministic
                 // lockfile resolver) is not attempted this dispatch at all.
                 // This used to be a debug-only line, invisible in the
@@ -910,6 +1076,13 @@ pub async fn on_conflict_detected_with(
                     pr_url = %candidate.pr_url,
                     attempt_id = %a.id,
                     "conflict_watch: mechanical rebase ladder disabled (no cube client); spawning worker directly (rung 3)",
+                );
+                conflict_ladder::record_tier(
+                    work_db,
+                    a,
+                    "engine_rebase",
+                    "skipped",
+                    "conflict_ladder_mechanical_rebase feature flag is off; no cube client",
                 );
                 conflict_ladder::log_routing_verdict(
                     &candidate.work_item_id,
@@ -977,12 +1150,7 @@ pub async fn on_conflict_detected_with(
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,
-                FrontendEvent::ConflictResolutionStarted {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: a.id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
+                crate::remediation_push::conflict_detected(work_db, a),
             )
             .await;
     }
@@ -1003,18 +1171,22 @@ pub async fn on_conflict_detected_with(
 }
 
 /// Is `active_crz` (an in-flight attempt with a linked revision) stale?
-/// A crz is stale when either:
+/// A linked revision that is still running or queued (see
+/// [`WorkDb::is_conflict_revision_running_or_queued`]) is never superseded,
+/// even when the PR head has moved: a push can land while the worker is
+/// still resolving, and head movement must not replace a live fix vehicle.
+/// Otherwise the crz is stale when either:
 ///   (a) the probe head SHA has moved since the crz was created — the
 ///       revision pushed a commit but didn't resolve the conflict, then its
 ///       exec was abandoned by the orphan sweep (not NudgeBreakerParked, so
 ///       finalize_conflict_resolution_attempt never ran), leaving the crz
 ///       `pending` with `revision_task_id` set against an old head; or
-///   (b) the linked revision task is dead — either it reached a terminal
-///       status (in_review/done/archived) without the crz ever being
-///       finalised (same orphan-sweep abandonment scenario, head SHA
-///       unchanged), or its execution died outright (e.g. an engine
-///       restart) while the task itself never progressed past a live
-///       status.
+///   (b) a revision is linked (and, having passed the liveness check above,
+///       is dead) — it reached a terminal status (in_review/done/archived)
+///       without the crz ever being finalised (same orphan-sweep
+///       abandonment scenario, head SHA unchanged), or its execution died
+///       outright (e.g. an engine restart) while the task itself never
+///       progressed past a live status.
 /// Mirrors ci_watch's stale-head supersede logic.
 ///
 /// When stale, abandons the row (nullifying `base_sha_at_trigger` when the
@@ -1037,6 +1209,13 @@ fn supersede_if_stale(
     active_crz: &crate::work::ConflictResolution,
 ) -> bool {
     let current_head_sha = probe.head_ref_oid.as_deref();
+    // A push can change the head while the existing worker is still
+    // resolving it. Head movement must not replace a live fix vehicle.
+    if let Some(revision) = active_crz.revision_task_id.as_deref()
+        && work_db.is_conflict_revision_running_or_queued(revision).unwrap_or(true)
+    {
+        return false;
+    }
     let head_sha_stale = match current_head_sha {
         Some(current) => active_crz
             .head_sha_before
@@ -1045,11 +1224,9 @@ fn supersede_if_stale(
             .unwrap_or(false),
         None => false, // can't compare — conservative: don't supersede
     };
-    let revision_dead = active_crz
-        .revision_task_id
-        .as_deref()
-        .map(|rid| !work_db.is_conflict_resolution_revision_live(rid).unwrap_or(true))
-        .unwrap_or(false);
+    // The liveness check above already returned for a live revision, so any
+    // linked revision that reaches here is dead.
+    let revision_dead = active_crz.revision_task_id.is_some();
     if !(head_sha_stale || revision_dead) {
         return false;
     }
@@ -1151,6 +1328,84 @@ fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision
             );
         }
     }
+}
+
+/// Close every engine-created merge-conflict revision of the work item whose
+/// spawning `conflict_resolutions` attempt already ended, now that GitHub
+/// reports the PR mergeable.
+///
+/// [`on_resolved`] only reaches the *active* attempt, and the merge poller
+/// only dispatches it while the parent still carries a `merge_conflict`
+/// signal. A revision whose attempt ended first was parked `blocked` by the
+/// revision reconciler and then closed by nothing, so it kept the parent in
+/// Review > Blocked on a PR that no longer conflicts. The merge poller calls
+/// this on every definitive-clean mergeability probe. Only `merge-conflict:`
+/// revisions are touched; a revision with a live worker is left alone by
+/// [`WorkDb::close_moot_revision_task`]. Returns the number closed.
+pub(crate) fn retire_moot_conflict_revisions(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+    labels: &[String],
+) -> usize {
+    // Ledger cleanup for leftover `pending` attempts: a later attempt that
+    // already reached a terminal state, or a pending row sitting on a
+    // mergeable PR with no live worker. A pending row whose linked
+    // revision is already dead is retired too; only a running/queued
+    // revision or an in-flight mechanical rung keeps the row. Runs even
+    // when the parent is unblocked (the `maybe_clear_blocked` retire path
+    // never sees those rows) and even when the product opted out of
+    // auto-maintenance — this is not a new remediation, it is retiring an
+    // attempt that is no longer live.
+    if let Err(err) = work_db.retire_stale_pending_conflict_attempts(&candidate.work_item_id, true) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            ?err,
+            "conflict_watch: failed to retire stale pending conflict attempts on a mergeable PR",
+        );
+    }
+    if auto_pr_maintenance_disabled(work_db, candidate, labels) {
+        return 0;
+    }
+    let revision_ids = match work_db.open_conflict_revisions_of_ended_attempts(&candidate.work_item_id) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "conflict_watch: failed to look up open conflict revisions of ended attempts",
+            );
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for revision_task_id in &revision_ids {
+        let archival_reason = format!(
+            "PR is mergeable again and the attempt that spawned this merge-conflict revision already ended; \
+             revision moot (work_item_id={}, revision_task_id={revision_task_id})",
+            candidate.work_item_id,
+        );
+        match work_db.close_moot_revision_task(
+            revision_task_id,
+            ArchiveProvenance::new(ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, &archival_reason),
+        ) {
+            Ok(Some(_)) => {
+                closed += 1;
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    revision_task_id,
+                    "conflict_watch: closed a stale merge-conflict revision; its attempt ended and the PR is mergeable",
+                );
+            }
+            Ok(None) => {} // a worker is still live on it, or it just settled
+            Err(err) => tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                revision_task_id,
+                ?err,
+                "conflict_watch: failed to close stale merge-conflict revision",
+            ),
+        }
+    }
+    closed
 }
 
 /// Abandon any active `ci_remediations` attempt for this work item and
@@ -1331,6 +1586,31 @@ async fn maybe_spawn_conflict_revision(
     attempt: &crate::work::ConflictResolution,
     use_small_agent_profile: bool,
 ) -> bool {
+    let tier = if use_small_agent_profile {
+        "small_agent"
+    } else {
+        "full_agent"
+    };
+    if work_db
+        .has_live_conflict_revision_for_pr(&candidate.pr_url)
+        .unwrap_or(true)
+    {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            attempt_id = %attempt.id,
+            "conflict_watch: a conflict revision for this PR is still running or queued; \
+             not spawning another",
+        );
+        conflict_ladder::record_tier(
+            work_db,
+            attempt,
+            tier,
+            "deferred",
+            "a conflict revision is already live, or its absence could not be verified",
+        );
+        return false;
+    }
     let base_branch = probe
         .base_ref_name
         .as_deref()
@@ -1370,6 +1650,13 @@ async fn maybe_spawn_conflict_revision(
                 error = %format!("{err:#}"),
                 "conflict_watch: create_revision failed (parent likely no longer revisable); abandoning attempt",
             );
+            conflict_ladder::record_tier(
+                work_db,
+                attempt,
+                tier,
+                "spawn_failed",
+                &format!("create revision: {err:#}"),
+            );
             if let Err(abandon_err) = work_db.mark_conflict_resolution_abandoned(&attempt.id, "revision_create_failed")
             {
                 tracing::warn!(
@@ -1382,6 +1669,17 @@ async fn maybe_spawn_conflict_revision(
         }
     };
 
+    conflict_ladder::record_tier(
+        work_db,
+        attempt,
+        tier,
+        "spawned",
+        if use_small_agent_profile {
+            "one residual file qualifies for the small agent"
+        } else {
+            "residue is unbounded or mechanical rungs were unavailable"
+        },
+    );
     // Stamp the reverse link. This is the idempotency latch (repeat probes
     // at the same base sha find it set and skip) and the marker that tells
     // the dormant backfill/rescue paths to leave this row alone.
@@ -1468,209 +1766,31 @@ pub async fn on_resolved(
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return false;
     }
-    // Look up the engine-owned attempt row first. If one exists, drive
-    // the strict (attempt-id-guarded) retire path; otherwise fall back
-    // to the relaxed pr_url-only WHERE clause so this module still
-    // closes the loop when Phase 3 wiring hasn't shipped yet.
-    let attempt = match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
-        Ok(found) => found,
+    crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
+    let result = match work_db.clear_resolved_pr_signal(&candidate.work_item_id, &candidate.pr_url, false) {
+        Ok(ClearResolvedSignal::Applied(result)) => *result,
+        Ok(ClearResolvedSignal::QueueSideUnresolved { .. } | ClearResolvedSignal::Nothing) => return false,
         Err(err) => {
             tracing::warn!(
+                ?err,
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
-                ?err,
-                "conflict_watch: failed to look up active conflict_resolutions row; falling back to relaxed retire",
-            );
-            None
-        }
-    };
-
-    let task_result = if let Some(attempt) = attempt.as_ref() {
-        work_db.clear_chore_blocked_merge_conflict_for_attempt(&candidate.work_item_id, &candidate.pr_url, &attempt.id)
-    } else {
-        work_db.clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
-    };
-
-    let task_transitioned = match task_result {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "conflict_watch: failed to clear blocked: merge_conflict",
+                "conflict_watch: signal retirement failed"
             );
             return false;
         }
     };
-
-    // The attempt row's update is independent of the parent flip. The
-    // design (Q5) requires both to happen even if one of them has
-    // already been moved by a concurrent path (manual override, on-Stop
-    // completion, etc.).
-    //
-    // For a `pending` attempt we mark succeeded when:
-    //   (a) The parent was blocked and we just cleared it (`task_transitioned`).
-    //   (b) The parent was `in_review` (revision fix vehicle — the WHERE guard
-    //       on the task clear missed, but the attempt itself should retire).
-    //       We detect this via `revision_task_id` being set: a pending attempt
-    //       with a revision always corresponds to the new-model in-flight path.
-    //   (c) The attempt was already `running` (worker was active).
-    let mut attempt_transitioned = false;
-    if let Some(attempt) = attempt.as_ref() {
-        let parent_in_review_with_revision =
-            !task_transitioned && attempt.status == "pending" && attempt.revision_task_id.is_some();
-        let should_succeed = attempt.status == "running" || task_transitioned || parent_in_review_with_revision;
-        if should_succeed {
-            match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
-                Ok(Some(succeeded)) => {
-                    attempt_transitioned = true;
-                    // When the parent was `in_review` (never blocked:
-                    // merge_conflict — either the happy pending+revision case,
-                    // or the attempt reached `running` under a *foreign*
-                    // scalar block, e.g. `skip_parent_flip` armed a
-                    // `merge_conflict` side-table row on a `blocked:
-                    // dependency` parent), the scalar clear above never ran
-                    // and never touched `task_blocked_signals` — so clear the
-                    // `merge_conflict` signal here whenever the parent flip
-                    // itself did not (`!task_transitioned`), not only in the
-                    // narrower pending+revision case, or the row is left
-                    // armed with no path left to retire it.
-                    if !task_transitioned
-                        && let Err(err) = work_db.clear_merge_conflict_signal_only(&candidate.work_item_id)
-                    {
-                        tracing::warn!(
-                            work_item_id = %candidate.work_item_id,
-                            ?err,
-                            "conflict_watch: failed to clear in-flight signal after retire",
-                        );
-                    }
-                    // Release the cube workspace lease the attempt owned.
-                    // Idempotent on the cube side — the lease may already
-                    // have been released by the worker's on-Stop completion
-                    // path, in which case cube returns a benign error that
-                    // we log at debug.
-                    if let (Some(client), Some(lease_id)) = (cube_client, succeeded.cube_lease_id.as_deref())
-                        && let Err(err) = client.release_workspace(lease_id).await
-                    {
-                        tracing::debug!(
-                            attempt_id = %succeeded.id,
-                            lease_id,
-                            ?err,
-                            "conflict_watch: lease release on retire failed (likely already released)",
-                        );
-                    }
-                    // Close the revision task this attempt spawned so a
-                    // retired attempt never leaves a stale
-                    // todo/active/blocked row behind — see
-                    // `WorkDb::close_moot_revision_task`'s doc for why this
-                    // can't just wait for the eventual parent-PR-merge sweep
-                    // to clean it up.
-                    if let Some(revision_task_id) = succeeded.revision_task_id.as_deref() {
-                        match work_db.close_moot_revision_task(
-                            revision_task_id,
-                            ArchiveProvenance::new(
-                                ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION,
-                                &format!(
-                                    "merge conflict resolved before parent PR merged; revision moot \
-                                     (work_item_id={}, revision_task_id={revision_task_id})",
-                                    candidate.work_item_id,
-                                ),
-                            ),
-                        ) {
-                            Ok(Some(_)) => {
-                                tracing::info!(
-                                    work_item_id = %candidate.work_item_id,
-                                    attempt_id = %succeeded.id,
-                                    revision_task_id,
-                                    "conflict_watch: closed the revision task the resolved attempt spawned",
-                                );
-                            }
-                            Ok(None) => {
-                                // Already terminal/in_review, or a worker is
-                                // still live driving it — nothing to do.
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    work_item_id = %candidate.work_item_id,
-                                    attempt_id = %succeeded.id,
-                                    revision_task_id,
-                                    ?err,
-                                    "conflict_watch: failed to close revision task on retire",
-                                );
-                            }
-                        }
-                    }
-                    publisher
-                        .publish_frontend_event_on_product(
-                            &candidate.product_id,
-                            FrontendEvent::ConflictResolutionSucceeded {
-                                product_id: candidate.product_id.clone(),
-                                work_item_id: candidate.work_item_id.clone(),
-                                attempt_id: succeeded.id.clone(),
-                                pr_url: candidate.pr_url.clone(),
-                            },
-                        )
-                        .await;
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        attempt_id = %attempt.id,
-                        work_item_id = %candidate.work_item_id,
-                        "conflict_watch: attempt row already terminal; skipping succeeded UPDATE",
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        attempt_id = %attempt.id,
-                        ?err,
-                        "conflict_watch: failed to mark conflict_resolution succeeded",
-                    );
-                }
-            }
-        }
-    }
-
-    if !task_transitioned && !attempt_transitioned {
-        return false;
-    }
-    // Publish a work-item status-change event only when the parent actually
-    // transitioned (blocked → in_review). When the parent was already
-    // `in_review` the status didn't change, so no broadcast is needed;
-    // `ConflictResolutionSucceeded` (above) handles the activity-feed entry.
-    if task_transitioned {
-        publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "merge_conflict_resolved",
-            )
-            .await;
-    }
-    // GitHub reporting the PR mergeable again is a trustworthy signal here
-    // (unlike a bare CI-clean probe for a queue-side CI failure) — mergeable
-    // genuinely reflects the rebase the conflict-resolution revision just
-    // pushed. If a Trunk merge intent was superseded by THIS conflict, it's
-    // now clear to resubmit. Scoped to only that sub-state: an eviction
-    // episode (`last_trunk_state` `failed`/`pending_failure`) can be live on
-    // the same work item at once (see `on_conflict_detected`'s takeover of a
-    // `blocked: ci_failure` row) and must not be advanced by an unrelated
-    // conflict resolving — only `ci_watch::on_ci_resolved` owns that fix.
-    crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(
-        work_db,
-        &candidate.work_item_id,
-        &[crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT],
-    );
+    let attempt_id = result.conflict_attempt.as_ref().map(|attempt| attempt.id.clone());
+    let task_transitioned = result.task_transitioned;
+    crate::ci_watch::apply_retired_signal(work_db, publisher, cube_client, candidate, result).await;
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
-        attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
+        attempt_id = attempt_id.as_deref(),
         task_transitioned,
-        attempt_transitioned,
         raw_mergeable,
         raw_merge_state_status,
-        "conflict_watch: PR mergeable again; retire path ran",
+        "conflict_watch: PR mergeable again; retire path ran"
     );
     true
 }

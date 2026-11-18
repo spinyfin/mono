@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/driver-quota:__pkg__",
+        "//tools/boss/engine/spoke-preflight:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )

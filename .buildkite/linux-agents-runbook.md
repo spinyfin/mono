@@ -184,7 +184,43 @@ Bazel's CI-mode output root, disk cache, and repository cache are all pointed at
 - `build:ci-linux --disk_cache=/mnt/ssd/bazel/disk_cache` (`.ci.bazelrc`)
 - `build:ci-linux --repository_cache=/mnt/ssd/bazel/repo_cache` (`.ci.bazelrc`)
 
-This keeps Bazel's large, disk-hungry action cache and sandboxed build outputs off the smaller boot disk and on dedicated capacity sized for it (disk cache GC is configured for up to 3 TB / 60 days via `experimental_disk_cache_gc_max_size`/`_max_age` in `.ci.bazelrc`, which would not fit on the boot disk alongside the OS and everything else on it).
+This keeps Bazel's large, disk-hungry action cache and sandboxed build outputs off the smaller boot disk and on dedicated capacity sized for it. The disk cache's size-based GC cap is computed per host from that capacity (2880 GB on these 3.6 TB disks) rather than fixed in `.ci.bazelrc` — see "Disk-cache GC sizing" below. The age-based GC (60 days, `experimental_disk_cache_gc_max_age` in `.ci.bazelrc`) is fleet-wide.
+
+## Disk-cache GC sizing
+
+`.ci.bazelrc` sets `build:ci --experimental_disk_cache_gc_max_size=3T` fleet-wide. That value only ever fitted these three hosts' 3.6 TB disks, and it is the reason a smaller agent fills up: on a disk below 3 TB the size-based GC never fires and the cache grows until the disk is full. Incident (2026-10-28): a 500 GB Linux agent did exactly that, accumulated ~450 GB of disk cache, and stalled the merge queue — see "Disk-full symptom" below.
+
+Since then `.buildkite/steps/ci-env.sh` sizes the cap to the host on every CI step:
+
+- It reads the `build:ci-linux --disk_cache=` path out of `.ci.bazelrc` (so the cache location is still defined in one place), creates the directory if needed, and asks `df -P -k` for the total size of the filesystem holding it.
+- The cap is **80% of that total**, rounded down to whole gigabytes, passed as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux` on every CI bazel command (the wrapper in `ci-env.sh` and, via `REPOBIN_BAZEL_FLAGS`, repobin's own calls). A flag on the command line after `--config` overrides the rc file's value. The remaining 20% leaves room for what shares the filesystem — the output bases (~10 GB each, one per agent on the host), the repository cache — and for the cache overshooting the cap between GC passes, since GC only runs once the Bazel server has been idle for five minutes.
+- If the filesystem cannot be determined (the rc line is missing, the directory cannot be created, `df` fails or prints nothing usable), the step fails with a `[ci-env] error:` line. It never silently falls back to `3T`.
+- `.ci.bazelrc` keeps `3T` as the fallback for bazel run by hand on a host with `--config=ci-linux`, which does not go through `ci-env.sh`. A hand-run command therefore makes the GC pass that follows it evict nothing — harmless, and the next CI job restores the computed cap — whereas a small fallback would evict most of a 3.6 TB host's cache.
+
+The cap computation is covered by `//.buildkite/steps/tests:disk_cache_gc_cap_test`.
+
+To verify on a host (from the agent's checkout under `/var/lib/buildkite-agent/builds/<agent>/flunge/mono`):
+
+```sh
+df -P -k /mnt/ssd/bazel/disk_cache        # the 1024-blocks total is the cap's input
+bash -c 'source .buildkite/steps/disk-cache-gc-cap.sh &&
+  ci_disk_cache_gc_cap_from_total_kb "$(ci_disk_cache_fs_total_kb /mnt/ssd/bazel/disk_cache)"'
+grep -E "Disk cache garbage collector|Deleted [0-9]+ of [0-9]+ files" /mnt/ssd/bazel/output_base/*/java.log | tail
+```
+
+Every CI step also prints the value it computed at the top of its log (`--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 3600 GB, GC cap 2880G (80%)`), and the `java.log` grep shows the GC actually running (`Deleted N of M files, reclaimed ...`).
+
+### Disk-full symptom: agent connected, jobs stuck in "accepted" with empty logs
+
+A Linux agent whose disk has filled up does **not** drop offline. It stays connected in Buildkite and keeps accepting `bazel-any` jobs, which then sit in "accepted" with empty logs instead of running; the merge queue stalls behind them. If you see that pattern, check the disks first:
+
+```sh
+df -h /mnt/ssd /
+du -sh /mnt/ssd/bazel/disk_cache /mnt/ssd/bazel/output_base /mnt/ssd/bazel/repo_cache \
+  /var/lib/buildkite-agent/.cache/bazelcache /var/lib/buildkite-agent/.cache/bazel
+```
+
+The cache cap is computed from the disk size, so if `/mnt/ssd` is full the CI disk cache should not be the reason any more — look at what else grew (`/var/lib/buildkite-agent/.cache/bazelcache` is the off-CI disk cache, 250G-capped, and `.cache/bazel` the default output base; both fill when a bazel call bypasses the CI flags), or check whether the host's CI steps are actually going through `.buildkite/steps/ci-env.sh` (the `[ci-env] disk cache ...` line should be in every step log). If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it and the next build repopulates it; the computed cap keeps it from recurring, so do not add a cron job for this.
 
 ## Deploy-key posture
 
@@ -195,6 +231,31 @@ Per `.buildkite/README.md` ("Pushing from CI"), pushes from Linux Buildkite agen
 - `.ci.linux.startup.bazelrc` — Linux-only, sets the `/mnt/ssd` output root (see "Disk layout" above). Read by `.buildkite/steps/ci-env.sh` when `OS_TYPE=linux`.
 - `.ci.darwin.startup.bazelrc` — the macOS equivalent; sets the darwin output root to `/private/var/tmp/bazel_darwin_ci_output_base` (it must stay on the internal case-insensitive volume — see the comment in that file, which documents that pointing it at `/Volumes/ssd` is exactly what broke `mac-app-build` under Xcode 26.5 and was deliberately reverted). The macOS Xcode pin is in `.ci.bazelrc` (`build:ci-darwin`), not here — out of this doc's scope.
 - Both are startup-option `.bazelrc`s specifically because `--output_user_root` (and similar) must be a **startup** flag, not a build flag — see the comment in `.buildkite/steps/ci-env.sh` explaining why `CI_BAZEL_STARTUP_FLAGS` is the single source of truth every CI code path must read from, to avoid two daemons running against the same output base at once.
+
+## Remote execution workers
+
+The three hosts are also the remote workers that the Linux agents send their bazel actions to, tests included (what a step sends, and when, is in [`README.md`](README.md), "Remote execution on Linux agents"). This is separate from the Buildkite agent: it runs as the login user, not as `buildkite-agent`, and needs no root.
+
+- **What runs where.** Every host runs a NativeLink worker as a systemd user unit, `nativelink-worker.service`. One host also runs the hub (scheduler, CAS and action cache) as `nativelink-hub.service`; it is the host that has that unit. Lingering is enabled for the user (`loginctl enable-linger`), so the units start at boot without a login.
+- **Files.** Everything is under `~/nativelink/` on each host: the `nativelink` binary, `worker.json5` (and `hub.json5` on the hub host), the per-action sandbox `action-sandbox.sh`, the worker's store and work directory under `worker/`, and the hub's stores under `hub/`. The units are in `~/.config/systemd/user/`. Stores are on the boot disk, not `/mnt/ssd`, which only `buildkite-agent` can write.
+- **Status and logs.** `systemctl --user status nativelink-worker` and `journalctl --user -u nativelink-worker` (likewise `nativelink-hub`). A worker logs `Worker registered with scheduler` when it has joined. Over ssh, set `XDG_RUNTIME_DIR=/run/user/$(id -u)` first if `systemctl --user` cannot find the bus.
+- **Sandbox.** `worker.json5` names `~/nativelink/action-sandbox.sh` as the worker's `entrypoint`, with `additional_environment: { NL_ACTION_DIRECTORY: "action_directory" }`, so the worker runs every action through it. The script is a copy of [`tools/test-sandbox/linux_remote_action_sandbox.sh`](../tools/test-sandbox/linux_remote_action_sandbox.sh) and must stay identical to it: `ci-remote-linux` sends tests to the workers on the strength of what that script enforces. To install or update it, copy the file from a checkout of `main` (`install -m 755 tools/test-sandbox/linux_remote_action_sandbox.sh ~/nativelink/action-sandbox.sh`); the worker reads it for each action, so no restart is needed. It needs `bwrap` (the `bubblewrap` package) and the unprivileged user namespaces described above. A worker without the entrypoint runs tests with no isolation at all and must not be registered with the endpoint the agents use. After installing it on a worker, or changing the script, run the gate in `tools/test-sandbox/README.md`, "Remote execution on Linux workers", against that worker.
+- **Naming one worker.** Each worker declares a `worker-host` platform property with its own name. Nothing asks for it in normal use. A build that adds `--remote_default_exec_properties=worker-host=<name>` to the flags `ci-remote-linux` expands to (the flag accumulates, so `OSFamily=linux` stays) executes only on that worker, which is how the gate is run against each one. The scheduler does not list the key, so it restricts only workers that declare it: every worker must declare one, or a pinned build can land on the worker that does not.
+- **Slots.** `max_inflight_tasks` in `worker.json5`, with `cpu_count` under `platform_properties` kept equal to it. Size it by RAM, not cores, for the reason `/etc/bazel.bazelrc` gives for `--jobs`: a rustc can peak at 2-3 GB. Tests take slots too, and a test action's `/tmp` is a tmpfs, so what a test writes there counts against the host's RAM.
+- **Routing.** The hub's scheduler matches the `OSFamily` property exactly, each worker declares `OSFamily: linux`, and `ci-remote-linux` tags every action with it. Only Linux workers may register with this hub. Do not point a macOS worker at it, and do not point a Linux worker at the macOS hub: the macOS builds do not tag their actions, and an untagged action is offered to every worker its scheduler has.
+- **Restarting.** `systemctl --user restart nativelink-worker` on one host fails the actions that worker was running; Bazel retries them on another worker. Restarting the hub fails every remote step in flight, so pause the Linux agents first (see "Safe maintenance procedure") or wait until none is running a job.
+- **Turning an agent's remote execution on or off.** An agent executes remotely when its `environment` hook exports the endpoint, which needs root because `/etc/buildkite-agent/hooks/` belongs to `buildkite-agent`:
+
+  ```sh
+  # /etc/buildkite-agent/hooks/environment (mode 0755, owner buildkite-agent)
+  export CI_BAZEL_REMOTE_EXECUTOR="grpc://<hub host>:<port>"
+  ```
+
+  It takes effect from the agent's next job. Remove the line to return that agent to local builds, again from its next job and with no merge. With the hub unreachable an agent falls back to building locally by itself and annotates the build.
+
+- **Same toolchain everywhere.** A worker runs an action with the compiler path the agent recorded (`/usr/bin/gcc` and its include directories). Upgrade the compiler, or the distribution, on all three hosts together, with the agents paused. A host that differs produces failures that look like flakiness, as described under "Host inventory".
+- **Trust boundary.** An action runs as the login user, but inside the sandbox above: it can write only to its own action directory, `/tmp` and `/dev/shm`, it has no network unless it opted in, and it cannot see `/home` or reach the sockets under `/run` (the user's D-Bus and systemd instances, ssh and gpg agents). What it keeps is read access to whatever else that user can read on the host, the host's CPU and memory, and the kernel's attack surface from inside an unprivileged user namespace. Bazel's `linux-sandbox` leaves an action on an agent with the same three.
+- **The zig cache.** The musl toolchain (`hermetic_cc_toolchain`) keeps a compiler cache at a fixed host path, `/tmp/zig-cache` unless the client's environment overrides it. Inside the sandbox `/tmp` is private to the action, so the cache starts empty for every action that uses zig and is thrown away with it. That costs time on the few actions that link with zig and keeps one action from planting cache entries for another. A `~/.bazelrc` that points `HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX` somewhere outside `/tmp` makes every zig action fail on a worker, because the path is read-only there: run manual remote builds with `--nohome_rc` if the login user has one.
 
 ## Other configuration observed
 

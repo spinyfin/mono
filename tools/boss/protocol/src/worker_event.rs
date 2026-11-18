@@ -18,6 +18,15 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerEvent {
+    /// A yielded command returned control to the model, or a continuation began waiting.
+    ToolPoll {
+        session_id: String,
+        awaiting_model: bool,
+    },
+    /// Actual model output, excluding usage bookkeeping and retries.
+    ModelProgress {
+        session_id: String,
+    },
     SessionStart {
         session_id: String,
         source: SessionStartSource,
@@ -96,6 +105,13 @@ pub enum StopReason {
 
 #[derive(Debug, Error)]
 pub enum NormalizeError {
+    #[error("progress identity store temporarily unavailable: {0}")]
+    IdentityStoreTransient(String),
+    /// A turn boundary arrived before this run claimed a conversation.
+    /// Retry while the execution is still live; a terminal run must use a
+    /// permanent error so the shim can quarantine the record.
+    #[error("progress boundary arrived before a claimed identity: {0}")]
+    BoundaryBeforeClaim(String),
     #[error("missing or non-string field: {0}")]
     MissingField(&'static str),
     #[error("unknown hook_event_name: {0}")]

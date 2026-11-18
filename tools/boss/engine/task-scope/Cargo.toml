@@ -1,0 +1,11 @@
+[package]
+name = "boss-task-scope"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

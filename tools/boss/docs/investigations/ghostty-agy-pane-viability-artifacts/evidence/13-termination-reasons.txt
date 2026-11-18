@@ -1,0 +1,29 @@
+terminationReason
+=================
+
+The enum in the binary (strings, both versions)
+  agy 1.1.12: EARLY_CONTINUE ERROR HALTED_STEP INJECTED_RESPONSE MAX_FORCED_INVOCATIONS MAX_INVOCATIONS MAX_TOKEN_BUDGET_EXCEEDED NO_TOOL_CALL TERMINAL_CUSTOM_HOOK TERMINAL_STEP_TYPE UNSPECIFIED USER_CANCELED 
+  agy 1.5.5: CHAINED EARLY_CONTINUE ERROR HALTED_STEP INJECTED_RESPONSE MAX_FORCED_INVOCATIONS MAX_INVOCATIONS MAX_TOKEN_BUDGET_EXCEEDED NO_TOOL_CALL TERMINAL_CUSTOM_HOOK TERMINAL_STEP_TYPE UNSPECIFIED USER_CANCELED 
+
+The embedded hooks guide, Stop contract
+  agy 1.1.12: "terminationReason": "model_stop", // e.g., "model_stop", "max_steps_exceeded", "error"
+  agy 1.5.5:  "terminationReason": "NO_TOOL_CALL", // e.g., "NO_TOOL_CALL", "MAX_INVOCATIONS", "ERROR", "USER_CANCELED", "TERMINAL_STEP_TYPE"
+  1.5.5 adds: "The ExecutorTerminationReason enum name with the EXECUTOR_TERMINATION_REASON_ prefix stripped".
+  1.1.12's guide lists no SessionStart event; the 1.1.12 binary fires one all the same (every 1.1.12 session below).
+
+
+Observed in Stop payloads, all scenarios
+
+  agy 1.1.12
+    terminationReason='NO_TOOL_CALL' fullyIdle=False error='': 3 Stop payloads in 2 sessions
+    terminationReason='NO_TOOL_CALL' fullyIdle=True error='': 28 Stop payloads in 23 sessions
+
+  agy 1.5.5
+    terminationReason='NO_TOOL_CALL' fullyIdle=False error='': 3 Stop payloads in 2 sessions
+    terminationReason='NO_TOOL_CALL' fullyIdle=True error='': 32 Stop payloads in 23 sessions
+    terminationReason='TERMINAL_CUSTOM_HOOK' fullyIdle=True error='': 1 Stop payloads in 1 sessions
+
+Turns that ended without any Stop payload
+
+  Escape-interrupted turns: 4 of 4 (two per version; see 07-escape-interrupt.txt), plus two more on 1.5.5 from
+  re-runs of the tool-call scenario with the apparatus as committed. USER_CANCELED was therefore never observed.

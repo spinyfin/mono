@@ -24,9 +24,7 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             if json {
-                let payload = serde_json::json!({
-                    "error": error.to_string(),
-                });
+                let payload = error.json_error();
                 match serde_json::to_string_pretty(&payload) {
                     Ok(output) => eprintln!("{output}"),
                     Err(encoding_error) => {

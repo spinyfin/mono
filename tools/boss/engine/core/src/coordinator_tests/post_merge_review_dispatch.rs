@@ -85,13 +85,13 @@ async fn post_merge_review_batch_member_positions_via_goto_revision_not_pr() {
     let coordinator = Arc::new(coord);
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
@@ -160,12 +160,12 @@ async fn review_guide_positions_at_frozen_comparison_head() {
     coord.set_review_pool(WorkerPool::new_review(1));
     let coordinator = Arc::new(coord);
     let worker = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .unwrap();
     coordinator
-        .schedule_execution(&execution, &worker, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker, DispatchAdmission::Queued)
         .await
         .unwrap();
     let calls = cube.goto_revision_calls.lock().await;

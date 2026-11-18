@@ -28,6 +28,15 @@ impl RunResult {
 
 #[derive(Debug, Error)]
 pub enum CubeError {
+    #[error("shared-store maintenance is rewriting the operation log; retry shortly (temporary contention)")]
+    MaintenanceBusy,
+    /// Repository state must change before positioning can succeed.
+    #[error("{0}")]
+    PositioningRefused(String),
+    #[error(
+        "jj maintenance recovery pending for {0}; retry shortly or run `cube repo gc <repo>` for the owning store; an unknown owner requires verified operator recovery"
+    )]
+    MaintenanceQuarantined(String),
     #[error("{0}")]
     InvalidArgument(String),
     #[error("{0}")]
@@ -193,11 +202,38 @@ pub(super) const JJ_NO_REMOTE_BOOKMARK_SIGNATURE: &str = "no such remote bookmar
 pub(super) const JJ_REVISION_DOESNT_EXIST_SIGNATURE: &str = "doesn't exist";
 
 impl CubeError {
+    /// Machine-readable classification; callers must never parse the diagnostic.
+    pub fn json_error(&self) -> Value {
+        let mut payload = serde_json::json!({
+            "error": self.to_string(),
+        });
+        // Only variants that have a stable kind carry `error_kind`. Labelling
+        // every other failure `command_failed` would pretend classification
+        // that is not actually known.
+        if matches!(self, Self::PositioningRefused(_)) {
+            payload["error_kind"] = Value::String("workspace_positioning_refused".into());
+        }
+        // Only variants whose retryability is known carry the field; an
+        // unclassified error says nothing rather than claiming it is retryable.
+        // `CommandFailed` covers deterministic jj/git state errors as well as
+        // transient ones, so it stays unclassified.
+        let retryable = match self {
+            Self::PositioningRefused(_) => Some(false),
+            Self::MaintenanceBusy | Self::CommandTimedOut { .. } | Self::DeadlineExceeded { .. } => Some(true),
+            _ => None,
+        };
+        if let Some(retryable) = retryable {
+            payload["retryable"] = Value::Bool(retryable);
+        }
+        payload
+    }
+
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::InvalidArgument(_) | Self::NotImplemented(_) => ExitCode::from(2),
+            Self::InvalidArgument(_) | Self::NotImplemented(_) | Self::PositioningRefused(_) => ExitCode::from(2),
             Self::RepoNotFound(_) => ExitCode::from(3),
             Self::NoAvailableWorkspace(_) => ExitCode::from(4),
+            Self::MaintenanceBusy | Self::MaintenanceQuarantined(_) => ExitCode::from(75),
             Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) | Self::ChangeNotFound(_) => ExitCode::from(5),
             Self::SetupStepFailed { .. } => ExitCode::from(6),
             Self::Storage(_)

@@ -5,7 +5,15 @@
 //! under `/tmp`. The process runner is injectable so callers can test command
 //! construction without a live tmux daemon.
 
+mod blocking_dialog;
+pub use blocking_dialog::BlockingDialogOnScreen;
+mod diagnostics;
+mod probe;
+pub mod session_options;
 mod types;
+
+use diagnostics::{is_absent_server_stderr, is_absent_session_stderr, is_diagnostic};
+pub use probe::{PaneProbe, probe_pane};
 
 pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
 pub use boss_shell_quote::shell_quote as quote_for_shell;
@@ -14,6 +22,7 @@ pub use types::{
     Session, TMUX_SPAWN_TOKEN_ENV, TmuxVersion,
 };
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -123,6 +132,23 @@ static PASTE_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// the environment here.
 pub const TEST_SOCKET_PATH: &str = "/state/boss/tmux.sock";
 
+/// The bounded diagnostic history retained in each Boss window.
+pub const PRIVATE_SERVER_HISTORY_LIMIT: &str = "2000";
+
+/// Color environment every Boss tmux session receives at creation.
+///
+/// Claude Code clamps chalk to 256-color whenever `$TMUX` is set, ignoring
+/// `COLORTERM` and `FORCE_COLOR`. `CLAUDE_CODE_TMUX_TRUECOLOR` is the escape
+/// hatch and is read at module load, so it must be present at process launch.
+/// `COLORTERM=truecolor` is explicit rather than inherited because tmux 3.6a
+/// injects it, while the installer supports tmux 3.2 and later. `FORCE_COLOR`
+/// is deliberately omitted because the clamp overrides it and some values
+/// disable a separate TERM-allowlist truecolor path.
+pub fn insert_color_environment(environment: &mut BTreeMap<String, String>) {
+    environment.insert("CLAUDE_CODE_TMUX_TRUECOLOR".to_owned(), "1".to_owned());
+    environment.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+}
+
 /// Operator-facing command prefix for a tmux server addressed by a socket path.
 ///
 /// This intentionally does not resolve a tmux binary: callers that only
@@ -144,6 +170,7 @@ enum ServerAddress {
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
 pub struct Tmux {
+    blocking_dialog_markers: Vec<String>,
     program: PathBuf,
     runner: Arc<dyn CommandRunner>,
     server: ServerAddress,
@@ -161,6 +188,18 @@ impl std::fmt::Debug for Tmux {
             .finish_non_exhaustive()
     }
 }
+
+/// The tmux key name for "press Return" in a pane application's composer.
+///
+/// This is `Enter`, not `C-m`. Boss's tmux server runs with
+/// `extended-keys on`, so once an application requests xterm
+/// modifyOtherKeys mode 2 (`CSI > 4 ; 2 m`), `send-keys C-m` reaches it as
+/// the modified key `ESC [27;5;109~` rather than Return, while `send-keys
+/// Enter` still arrives as `\r` in every mode measured (see
+/// `tools/boss/docs/investigations/ghostty-agy-pane-viability.md`, "The
+/// submit key"). Outside that mode the two are the same byte, so `Enter` is
+/// never worse than `C-m`.
+pub const SUBMIT_KEY: &str = "Enter";
 
 impl Tmux {
     /// Resolves tmux once to a canonical absolute path, scoped to `socket_path`.
@@ -251,6 +290,7 @@ impl Tmux {
             bail!("tmux executable path must be absolute: {program:?}");
         }
         Ok(Self {
+            blocking_dialog_markers: Vec::new(),
             program,
             runner,
             server,
@@ -342,6 +382,27 @@ impl Tmux {
             .copied()
     }
 
+    /// Fresh executable version; unlike compatibility probes this detects upgrades.
+    pub async fn version_output(&self) -> Result<String> {
+        let mut args = self.server_args();
+        args.push("-V".into());
+        Ok(self.invoke(args).await?.stdout.trim().to_owned())
+    }
+
+    /// The running server may predate an executable upgrade. Never starts a server.
+    pub async fn server_version_output(&self) -> Result<Option<String>> {
+        let mut args = self.server_args();
+        args.extend(["display-message".into(), "-p".into(), "#{version}".into()]);
+        let output = self.run(&args).await?;
+        if output.success {
+            Ok(Some(format!("tmux {}", output.stdout.trim())))
+        } else if is_absent_server_stderr(&output.stderr) {
+            Ok(None)
+        } else {
+            command_failed(&args, &output)
+        }
+    }
+
     /// Starts the private server and applies settings before any window exists.
     ///
     /// tmux shuts down an empty server by default. Sending `start-server` and
@@ -354,6 +415,35 @@ impl Tmux {
         args.push("start-server".into());
         push_option_commands(&mut args, settings, true)?;
         self.invoke(args).await.map(|_| ())
+    }
+
+    /// Starts the private server with the defaults every Boss worker window
+    /// needs, in one command sequence so they land before the first window.
+    ///
+    /// `exit-empty=off` keeps the still-windowless server alive;
+    /// `history-limit` only affects windows created afterwards, so it must be
+    /// set here; `remain-on-exit` lets a dead pane's exit status be observed.
+    /// Driver transcripts, not tmux history, are the durable record, so the
+    /// history is bounded at [`PRIVATE_SERVER_HISTORY_LIMIT`].
+    pub async fn start_private_server(&self) -> Result<()> {
+        self.start_server_with_options(&[
+            OptionSetting {
+                scope: OptionScope::Server,
+                option: "exit-empty",
+                value: "off",
+            },
+            OptionSetting {
+                scope: OptionScope::Global,
+                option: "history-limit",
+                value: PRIVATE_SERVER_HISTORY_LIMIT,
+            },
+            OptionSetting {
+                scope: OptionScope::Global,
+                option: "remain-on-exit",
+                value: "on",
+            },
+        ])
+        .await
     }
 
     /// Creates a detached, single-command session with environment set atomically.
@@ -369,10 +459,16 @@ impl Tmux {
         for (name, value) in &session.environment {
             args.extend(["-e".into(), format!("{name}={value}").into()]);
         }
+        let command = if self.runner.manages_host_processes() {
+            let script = quote_for_shell(&boss_worker_processes::install().await?);
+            format!("python3 {script} --exec-file {}", quote_for_shell(&session.command))
+        } else {
+            session.command.clone()
+        };
         args.extend([
             "-c".into(),
             session.working_directory.clone().into_os_string(),
-            session.command.clone().into(),
+            command.into(),
         ]);
         self.invoke(args).await.map(|_| ())
     }
@@ -387,7 +483,7 @@ impl Tmux {
         ]);
         let output = self.run(&args).await?;
         if !output.success {
-            if is_absent_session_stderr(&output.stderr) {
+            if is_absent_server_stderr(&output.stderr) || output.stderr.trim_end() == "no sessions" {
                 return Ok(Vec::new());
             }
             return command_failed(&args, &output);
@@ -415,8 +511,7 @@ impl Tmux {
                 .map(|value| Some(value.to_owned()))
                 .ok_or_else(|| anyhow::anyhow!("unexpected tmux environment output for {name:?}: {value:?}"));
         }
-        if output.stderr.contains("unknown variable")
-            || output.stderr.contains("environment variable not found")
+        if is_diagnostic(&output.stderr, &["unknown variable", "environment variable not found"])
             || is_absent_session_stderr(&output.stderr)
         {
             return Ok(None);
@@ -486,7 +581,7 @@ impl Tmux {
         if output.success {
             return Ok(Some(output.stdout.trim_end().to_owned()));
         }
-        if output.stderr.contains("invalid option") || output.stderr.contains("unknown option") {
+        if is_diagnostic(&output.stderr, &["invalid option", "unknown option"]) {
             return Ok(None);
         }
         command_failed(&args, &output)
@@ -511,7 +606,7 @@ impl Tmux {
         if output.success {
             return Ok(Some(output.stdout.trim_end().to_owned()));
         }
-        if output.stderr.contains("invalid option") || output.stderr.contains("unknown option") {
+        if is_diagnostic(&output.stderr, &["invalid option", "unknown option"]) {
             return Ok(None);
         }
         command_failed(&args, &output)
@@ -521,12 +616,31 @@ impl Tmux {
     /// removed, multi-line text is bracketed-pasted, and exactly one Return
     /// follows. Single-line text keeps the bounded literal-key chunking.
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
+        self.send_keys_with_submit_settle(session, text, std::time::Duration::ZERO)
+            .await
+    }
+
+    /// [`Self::send_keys`], waiting `submit_settle` between the last byte of
+    /// text and the Return that submits it.
+    ///
+    /// For an application that infers a paste from how fast keys arrive and
+    /// then reads a Return landing right behind the text as part of that
+    /// paste, a newline in the composer, rather than as the submit. The wait
+    /// is what lets such an application close its paste window first. Zero is
+    /// exactly [`Self::send_keys`].
+    pub async fn send_keys_with_submit_settle(
+        &self,
+        session: &str,
+        text: &str,
+        submit_settle: std::time::Duration,
+    ) -> Result<()> {
         validate_value("session name", session)?;
         if text.contains('\0') {
             bail!("tmux key input cannot contain NUL");
         }
         let text = text.trim_end_matches(['\r', '\n']);
         if text.contains(['\r', '\n']) {
+            self.check_blocking_dialog(session).await?;
             let buffer_name = format!(
                 "boss-deliver-{session}-{}",
                 PASTE_BUFFER_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -544,17 +658,50 @@ impl Tmux {
             args.extend([
                 "paste-buffer".into(),
                 "-b".into(),
-                buffer_name.into(),
+                buffer_name.clone().into(),
                 "-p".into(),
                 "-d".into(),
                 "-t".into(),
                 session.into(),
             ]);
+            if let Err(error) = self.check_blocking_dialog(session).await {
+                let mut cleanup = self.server_args();
+                cleanup.extend(["delete-buffer".into(), "-b".into(), buffer_name.into()]);
+                let _ = self.invoke(cleanup).await;
+                return Err(error);
+            }
             self.invoke(args).await?;
         } else {
             self.send_literal_chunks(session, text).await?;
         }
-        self.send_key(session, "C-m").await
+        if !submit_settle.is_zero() {
+            sleep(submit_settle).await;
+        }
+        self.send_key_excluding(session, SUBMIT_KEY, text).await
+    }
+
+    /// Takes `session`'s pane out of any tmux mode, so the keys sent next
+    /// reach the pane's application. Returns whether the pane was in one.
+    ///
+    /// While a pane is in a mode (copy-mode, entered by scrolling, which a
+    /// session with `mouse on` does on the first wheel tick), `send-keys`
+    /// hands every key to that mode's key table instead of the application:
+    /// literal text is run as copy-mode commands, `Enter` is swallowed, so a
+    /// bracketed paste lands in the composer and is never submitted, and
+    /// `Escape` only leaves the mode. Each of those returns success. Call
+    /// this before any key the application must receive.
+    ///
+    /// `copy-mode -q` leaves every mode and is a successful no-op outside
+    /// one, so a pane that leaves its mode between the read and the command
+    /// is not an error.
+    pub async fn leave_pane_modes(&self, session: &str) -> Result<bool> {
+        if self.display_message(session, DisplayField::PaneInMode).await? != "1" {
+            return Ok(false);
+        }
+        let mut args = self.server_args();
+        args.extend(["copy-mode".into(), "-q".into(), "-t".into(), session.into()]);
+        self.invoke(args).await?;
+        Ok(true)
     }
 
     async fn send_literal_chunks(&self, session: &str, text: &str) -> Result<()> {
@@ -569,6 +716,7 @@ impl Tmux {
                 "--".into(),
                 chunk.into(),
             ]);
+            self.check_blocking_dialog(session).await?;
             self.invoke(args).await?;
             sleep(DEFAULT_SEND_CHUNK_DELAY).await;
         }
@@ -580,11 +728,39 @@ impl Tmux {
     /// [`Self::send_keys`], which deliberately follows the literal text with
     /// a separate Return keypress.
     pub async fn send_key(&self, session: &str, key: &str) -> Result<()> {
+        self.send_key_excluding(session, key, "").await
+    }
+
+    async fn send_key_excluding(&self, session: &str, key: &str, payload: &str) -> Result<()> {
         validate_value("session name", session)?;
         validate_value("tmux key", key)?;
         let mut args = self.server_args();
         args.extend(["send-keys".into(), "-t".into(), session.into(), key.into()]);
+        self.check_blocking_dialog_excluding(session, payload).await?;
         self.invoke(args).await.map(|_| ())
+    }
+
+    /// Presses the key that submits a pane application's composer.
+    ///
+    /// Sends [`SUBMIT_KEY`], never `C-m`: see that constant for why. Every
+    /// engine path that ends a delivery with Return goes through here.
+    pub async fn send_submit(&self, session: &str) -> Result<()> {
+        self.send_key(session, SUBMIT_KEY).await
+    }
+
+    /// [`Self::send_submit`], gated on `permitted` evaluated after the blocking
+    /// dialog capture and immediately before the key is sent. The capture is
+    /// an await point; state that justified the Return can change during it.
+    /// `Ok(false)` means nothing was sent because `permitted` declined.
+    pub async fn send_submit_if(&self, session: &str, permitted: impl FnOnce() -> bool) -> Result<bool> {
+        validate_value("session name", session)?;
+        let mut args = self.server_args();
+        args.extend(["send-keys".into(), "-t".into(), session.into(), SUBMIT_KEY.into()]);
+        self.check_blocking_dialog_excluding(session, "").await?;
+        if !permitted() {
+            return Ok(false);
+        }
+        self.invoke(args).await.map(|_| true)
     }
 
     /// Captures the visible text of a detached session's pane.
@@ -633,15 +809,23 @@ impl Tmux {
         validate_value("session name", session)?;
         validate_value("expected token", expected_token)?;
         match self.show_environment(session, BOSS_SPAWN_TOKEN_ENV).await? {
-            None => Ok(KillSessionOutcome::Absent),
+            None => {
+                self.cleanup_worker_processes(expected_token).await?;
+                Ok(KillSessionOutcome::Absent)
+            }
             Some(actual) if actual == expected_token => {
+                if self.runner.manages_host_processes() {
+                    boss_worker_processes::capture(BOSS_SPAWN_TOKEN_ENV, expected_token).await?;
+                }
                 // The session can still die on its own between the token
                 // read above and this call — the ordinary worker-completion
                 // race. Treat a kill that fails because the session is
                 // already gone as Absent, not a hard error, so this window
                 // doesn't leak the identity columns the way an unclassified
                 // Refused would.
-                if self.kill_session_unchecked(session).await? {
+                let killed = self.kill_session_unchecked(session).await?;
+                self.cleanup_worker_processes(expected_token).await?;
+                if killed {
                     Ok(KillSessionOutcome::Killed)
                 } else {
                     Ok(KillSessionOutcome::Absent)
@@ -655,23 +839,105 @@ impl Tmux {
         }
     }
 
-    /// Low-level `kill-session -t <name>`, with no identity verification.
-    /// Private: [`Self::kill_session_verified`] is this crate's only public
-    /// teardown entry point, by design — see its doc comment. Returns
-    /// `Ok(true)` when the session was actually killed, `Ok(false)` when it
-    /// had already vanished (a real command failure still becomes `Err`).
+    /// Detached shells retain the spawn token even after setsid and reparenting.
+    /// Await their exit before callers preserve files or return the lease.
+    pub async fn cleanup_worker_processes(&self, token: &str) -> Result<()> {
+        if self.runner.manages_host_processes() {
+            boss_worker_processes::cleanup(BOSS_SPAWN_TOKEN_ENV, token, "").await?;
+        }
+        Ok(())
+    }
+
+    /// Some drivers strip token-like variables from their tool shells (Codex
+    /// removes `*TOKEN*`), so a reparented background shell carries only the
+    /// run id. Stop everything that still carries this run's id.
+    pub async fn cleanup_run_processes(&self, run_id: &str, workspace: &Path) -> Result<()> {
+        if self.runner.manages_host_processes() {
+            boss_worker_processes::cleanup("BOSS_RUN_ID", run_id, &workspace.to_string_lossy()).await?;
+        }
+        Ok(())
+    }
+
+    /// A stopped remote worker must also prove that no unrelated process still
+    /// occupies its lease before the hub can preserve and release it.
+    pub async fn verify_workspace_quiescent(&self, workspace: &Path) -> Result<()> {
+        if self.runner.manages_host_processes() {
+            let result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", &workspace.to_string_lossy()).await?;
+            // Unowned-only occupants are worded as the hub's
+            // `UnownedOccupants` report so it can apply its bounded release
+            // across the stop result; any owned or unreadable occupant keeps
+            // the plain message and the lease.
+            anyhow::ensure!(
+                !result.stray_only(),
+                "unowned workspace occupants {:?}",
+                result.occupants
+            );
+            anyhow::ensure!(
+                result.empty(),
+                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
+                result.occupants,
+                result.owners,
+                result.unknown
+            );
+        }
+        Ok(())
+    }
+
+    /// Private teardown primitive; `kill_session_verified` is the public entry point.
+    /// Detaches viewers and kills only behind an in-queue empty-attached-list guard.
+    /// Returns `Ok(true)` when killed, `Ok(false)` when absent, or `Err` on failure.
+    /// If viewers remain after the polling budget, returns `Err` with the session alive.
     async fn kill_session_unchecked(&self, session: &str) -> Result<bool> {
-        validate_value("session name", session)?;
-        let mut args = self.server_args();
-        args.extend(["kill-session".into(), "-t".into(), session.into()]);
-        let output = self.run(&args).await?;
-        if output.success {
-            return Ok(true);
+        let target = format!("={session}");
+        let mut detach = self.server_args();
+        detach.extend(["detach-client".into(), "-s".into(), target.clone().into()]);
+
+        // detach-client requests an asynchronous handshake. Check inside tmux's
+        // command queue immediately before kill-session, so a new attachment
+        // between our subprocesses cannot leave a sessionless tty reader behind.
+        // session_attached excludes CLIENT_EXIT before the handshake finishes;
+        // session_attached_list includes every client whose session is still set.
+        let mut kill = self.server_args();
+        kill.extend([
+            "if-shell".into(),
+            "-F".into(),
+            "-t".into(),
+            // if-shell takes a pane target: the colon makes this an exact
+            // session, rather than an ambiguous pane/window name.
+            format!("{target}:").into(),
+            "#{==:#{session_attached_list},}".into(),
+            format!("kill-session -t {}", quote_for_shell(&target)).into(),
+            "display-message -p boss-viewers-attached".into(),
+        ]);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let output = self.run(&detach).await?;
+            if !output.success {
+                if is_absent_session_stderr(&output.stderr) {
+                    return Ok(false);
+                }
+                // tmux still resolves an implicit target client for detach-client
+                // even with -s. With no viewers it reports this diagnostic. The
+                // guarded kill below independently verifies that the list is empty.
+                if !is_diagnostic(&output.stderr, &["no current client"]) {
+                    return command_failed(&detach, &output);
+                }
+            }
+            let output = self.run(&kill).await?;
+            if !output.success {
+                if is_absent_session_stderr(&output.stderr) {
+                    return Ok(false);
+                }
+                return command_failed(&kill, &output);
+            }
+            if output.stdout.trim() != "boss-viewers-attached" {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("refusing kill-session for {session:?}: viewers have not finished detaching");
+            }
+            sleep(std::time::Duration::from_millis(20)).await;
         }
-        if is_absent_session_stderr(&output.stderr) {
-            return Ok(false);
-        }
-        command_failed(&args, &output)
     }
 
     /// Destroys the entire private tmux server, tearing down every session
@@ -686,7 +952,7 @@ impl Tmux {
         let mut args = self.server_args();
         args.push("kill-server".into());
         let output = self.run(&args).await?;
-        if output.success || is_absent_session_stderr(&output.stderr) {
+        if output.success || is_absent_server_stderr(&output.stderr) {
             return Ok(());
         }
         command_failed(&args, &output)
@@ -827,50 +1093,6 @@ fn unparseable_session_row_error(line: &str) -> anyhow::Error {
         );
     }
     anyhow::anyhow!("unexpected tmux list-sessions row: {line:?}")
-}
-
-/// True when tmux's stderr indicates the target session (or the whole
-/// private server) simply does not exist, as opposed to a real command
-/// failure. tmux reports this a few different ways depending on whether the
-/// session is missing, the server exited leaving its socket behind, or the
-/// socket file cannot be connected:
-/// `"can't find session: <name>"`, `"session not found: <name>"`,
-/// `"no server running on <socket>"`, and
-/// `"error connecting to <socket> (No such file or directory|Connection refused)"`.
-///
-/// `ENOENT` is the shape a host reboot produces for the legacy `-L boss`
-/// server. macOS clears `/tmp` on boot, so `/tmp/tmux-<uid>/boss` is not just
-/// stale but absent, and tmux switches from "no server running" to a
-/// `connect(2)` error. Reading that as a hard failure strands the
-/// coordinator: every recovery path funnels through
-/// [`Tmux::list_sessions`], which would return `Err` instead of an empty
-/// inventory, so `coordinator_tmux` never reaches the branch that recreates
-/// the session and the pane stays blank until the socket reappears by some
-/// other means.
-///
-/// `Connection refused` is the matching shape for a leftover durable socket
-/// file (`<state-root>/tmux.sock`) with no listener. That path survives
-/// `/tmp` cleanup, so a dead server leaves a unix socket that `connect(2)`
-/// refuses rather than `ENOENT`. [`Tmux::unlink_stale_socket_file`] removes
-/// that file at startup; treating the stderr as absent keeps `list_sessions`
-/// empty if a command races ahead of the unlink.
-///
-/// Other `connect(2)` failures — `Permission denied` on a socket owned by
-/// another uid — describe a socket that exists and is not ours to assume is
-/// empty, and must keep surfacing as real errors.
-fn is_absent_session_stderr(stderr: &str) -> bool {
-    stderr.contains("can't find session")
-        || stderr.contains("session not found")
-        || stderr.contains("no server running")
-        || is_absent_socket_stderr(stderr)
-}
-
-/// True for tmux's `connect(2)` failure against a socket that is gone or has
-/// no listener. See [`is_absent_session_stderr`] for why these are "absent"
-/// rather than "failed".
-fn is_absent_socket_stderr(stderr: &str) -> bool {
-    stderr.contains("error connecting to")
-        && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"))
 }
 
 /// Unlink `path` when it exists as a unix socket with no listener. A live

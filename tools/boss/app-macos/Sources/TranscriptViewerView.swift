@@ -92,8 +92,8 @@ struct ExecutionRow: View {
             Text(runtimeLabel)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            if let start = exec.startedAt {
-                Text(formattedDate(start))
+            if let start = startedText {
+                Text(start)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -146,24 +146,11 @@ struct ExecutionRow: View {
         }
     }
 
-    private func formattedDate(_ iso: String) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: iso) {
-            let display = DateFormatter()
-            display.dateStyle = .short
-            display.timeStyle = .short
-            return display.string(from: date)
-        }
-        // Fall back without fractional seconds
-        let formatter2 = ISO8601DateFormatter()
-        if let date = formatter2.date(from: iso) {
-            let display = DateFormatter()
-            display.dateStyle = .short
-            display.timeStyle = .short
-            return display.string(from: date)
-        }
-        return iso
+    /// The parsed start time (decoded once in `parseExecutionVM`) as a local
+    /// short date/time; an unparseable raw value is shown verbatim.
+    var startedText: String? {
+        if let date = exec.startedDate { return AttachmentDateFormatting.format(date) }
+        return exec.startedAt
     }
 }
 
@@ -177,6 +164,9 @@ struct TranscriptViewerView: View {
 
     @EnvironmentObject private var chatModel: ChatViewModel
     @State private var selectedExecutionId: String?
+    /// Identifies this window to `ChatViewModel` as a consumer of the task's
+    /// execution history; see `WorkCardPopoverView.executionsConsumerToken`.
+    @State private var executionsConsumerToken = UUID()
 
     private var executions: [ExecutionVM] {
         chatModel.executionsByTaskID[ref.taskId] ?? []
@@ -210,11 +200,14 @@ struct TranscriptViewerView: View {
             transcriptDetail
         }
         .onAppear {
-            chatModel.loadExecutions(taskId: ref.taskId)
+            chatModel.beginExecutionsConsumer(taskID: ref.taskId, token: executionsConsumerToken)
             if let preselect = ref.preselectExecutionId {
                 selectedExecutionId = preselect
                 chatModel.loadTranscript(executionId: preselect)
             }
+        }
+        .onDisappear {
+            chatModel.endExecutionsConsumer(taskID: ref.taskId, token: executionsConsumerToken)
         }
         .onChange(of: selectedExecutionId) { _, newValue in
             if let execId = newValue {

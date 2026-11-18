@@ -33,12 +33,87 @@ Compared to the other terminal statuses:
 - `orphaned`: the row had a live worker once; the engine no longer
   has signal that it does.
 
-**Critical difference from `cancelled`:** the cube workspace lease on
-an orphaned row is intentionally **not** released. The workspace
-filesystem typically still holds in-flight commits the next worker
-should resume against. The engine clears `cube_lease_id` /
-`cube_workspace_id` / `workspace_path` only when the human explicitly
-cancels, or when cube's lease TTL elapses and cube force-releases it.
+**Lease handling:** resume reads preserved work from the
+`preserved/<execution>` bookmark in the shared jj store, not from the
+originating workspace. After an orphan is recorded, the engine releases the cube lease
+once the pane is confirmed gone and no process has its cwd inside the
+workspace. Teardown preservation of the current workspace commit is best
+effort and runs first; a failure is reported through a
+`preserved_work_needs_inspection` item and never holds the lease. Inconclusive
+probes keep the lease held; cube's 24-hour TTL does not prove work was preserved.
+A release attempt atomically claims
+`cube_lease_id` before calling cube; a genuine failure restores the claim.
+Successful release, including an already-absent lease, clears the remaining
+workspace metadata. The leftover sweep checks at most 100 recent local
+executions per pass and does not infer teardown from terminal status alone.
+
+**A successor waits for that release.** A finished run's unpublished work is
+preserved as its lease is released, so while the lease is still recorded
+dispatch cannot tell "no work to restore" from "work not yet preserved". A
+`ready` execution whose recovery predecessor (the latest earlier execution of
+the same work item and kind that ran) is terminal but still records a cube
+lease is therefore held with the dispatch wait reason
+`awaiting_predecessor_preservation`; it never starts from trunk in the
+meantime. This applies to the drain and to `bossctl agents launch` alike, and
+to a lookup that fails, including after inline liveness reconciliation. The
+hold ends when the predecessor's lease is released (the cleared lease columns
+are what dispatch reads). The leftover sweep also retries leases older than
+cube's TTL. What keeps a
+lease recorded is a pane or process still in the workspace, occupancy that
+cannot be confirmed, or a cube failure; the leftover sweep keeps retrying —
+including a fresh occupancy scan for a lease that was kept because the
+workspace was occupied, even when the finished run never recorded a worker
+pid — and the successor stays held behind it rather than abandoning the work.
+A successor retry checks the owning-host registry after confirming worker death.
+If the lease is already absent, it preserves the predecessor's work before
+clearing the stale engine record. An unchanged claim counter on a free workspace
+allows live preservation after occupancy agrees the workspace is empty; an
+absent or reassigned workspace uses the recorded lease boundary. No workspace
+is reset or released during this reconciliation. Failing to run preservation
+(jj, unreachable host, missing recovery record or path) keeps the successor
+held, with the workspace path in the diagnostic, until recovery succeeds or
+the wait bound fails the successor. Completing preservation with an inspection
+still reconciles, matching the held-lease path. Cube's lease-not-found release
+result remains idempotent.
+An occupancy hold has distinct durable evidence that the pane gate passed.
+Open legacy cleanup items titled "Workspace recovery needs process cleanup",
+"Workspace recovery could not release its lease", or "Remote workspace recovery
+needs process cleanup" also supply that evidence; the first match converts them
+into the occupancy-kept marker. Host-resolution and cube-registry faults file a
+separate recovery-unavailable item so they cannot rewrite those titles.
+"Terminal worker still holds its workspace" never authorizes a no-pid retry.
+The sweep and dispatch both require absence from the live registry and
+confirmed death of any recorded shell PID before retrying. Remote retries
+resolve and validate the owning host adapter and confirm any recorded remote
+PID is dead. Routing errors keep the lease and appear in the cleanup evidence.
+When a successor is waiting on such a lease, dispatch re-scans occupancy at
+most once per minute, with a fresh check at the failure bound. Blocking scans
+run off the async executor. After a scan: an empty workspace (or one that holds only
+unowned occupants past the existing bound) is preserved and released so the
+successor can start, and a still-occupied workspace fails with the occupants
+seen on that scan. For a lease cube still holds, a
+preservation failure does not hold the lease: the release goes ahead and a
+`preserved_work_needs_inspection` attention item on the predecessor carries the
+error and the lease id, so a successor that then starts without that work does
+so with the loss on record.
+
+Transient recovery confirms pane teardown, preserves the stalled run's work,
+and releases its lease through the same inferred-death release the dead-pid,
+stale-worker and spawn-ack sweeps use (for a remote run, through the owning
+host's adapter) before inserting a successor. Unconfirmed teardown leaves the
+execution live for reconciliation and retry. Once teardown is confirmed, one
+transaction orphans the stalled run and inserts its successor (reusing an
+existing successor if a concurrent reconciler created one), whether or not the
+release completed. If the release was kept or refused, the orphaned
+predecessor keeps its lease and dispatch holds the successor until the
+responsible reconciler finishes preservation and release: the leftover-lease
+sweep for a local run, and the remote lease reconcile for a remote run with a
+recorded worker pid. A remote run with no recorded pid is beyond that
+reconciler, so an incomplete release raises a `preserved_work_needs_inspection`
+attention item on the predecessor rather than holding silently. If the run was
+cancelled or otherwise settled while its work was being preserved, no successor
+is created. The successor carries no workspace preference and leases any free
+workspace; the work reaches it through the preserved tip.
 
 ## How orphans get detected
 
@@ -137,103 +212,62 @@ Once the predecessor is `orphaned`:
    the orphan was working on; from there it can push and open / update
    the PR as if no crash had happened.
 
-## Automatic workspace patch backup
+## Review-guide attempts across a restart
 
-Preserving the lease keeps the in-flight work _reachable_ only as long as
-the workspace's dirty working copy survives — it is still lost the moment
-that workspace is re-leased and reset, or if cube cannot reclaim it. As a
-precaution, every path that transitions a live execution to `orphaned`
-now also snapshots the workspace's uncommitted work to a durable patch
-**at death-detection time**, independent of whether the workspace can
-later be reclaimed.
+A `pr_review_guide` execution carries a `pr_review_guide_attempts` row that
+the orphan reap closes together with the execution (`failed`, reason
+"execution orphaned"). Because `orphaned` is an inferred death, that closure
+has to be as reversible as the status it was derived from:
 
-The capture is implemented in
-`tools/boss/engine/src/recovery_backup.rs` and invoked from all three
-at-death hooks:
+- **Re-adoption reopens the attempt.** When a live worker disproves the
+  inference (`execution re-adopted: inferred death disproven by a live
+worker`), the same transaction puts the attempt back to `running` and the
+  series back to `generating`, provided the attempt failed _after_ a worker
+  ran, its comparison is still the series' selected one, nothing has been
+  published for it and no other attempt is live for the series. The trace
+  line names the reopened attempt in `reopened_review_guide_attempt`. A
+  pre-start failure stays failed (the re-enqueue pass owns those).
+- **The startup reconcile checks liveness before closing.** The pass that
+  finishes attempts bound to terminal executions
+  (`review_guide_attempt_reconcile`) runs after the tmux adoption pass and
+  treats an `orphaned` execution as live when adoption observed its pane
+  (adopted, or handed to re-adoption) or when its durable shell pid is
+  alive. Such an attempt is logged `action = "kept_open"` and left for
+  re-adoption; every attempt it does finish, fail or dispatch is logged with
+  `attempt_id`, `execution_id`, `reason` and `action`. A failed _read_ of
+  the execution leaves the attempt untouched rather than failing it. The
+  periodic terminal-work sweep applies the same pid probe.
+- **A guide submitted against a closed attempt stores nothing.**
+  `boss propose review-guide` is refused with `not_accepted` (exit 6) before
+  any `worker_proposals` row is written, so the worker's retry after
+  re-adoption is a fresh submission rather than a replay of the refusal.
+- **Guides older engines stored as refused are recovered on startup.**
+  `review_guide_submission_recovery` finds `rejected` review-guide
+  proposals whose reason was "this execution has no running review-guide
+  attempt", validates the stored body against the recorded comparison at
+  the execution's workspace, reopens the attempt under the fences above,
+  applies the proposal against it and publishes. A body that no longer
+  validates (for example because the workspace is gone) is logged and left
+  untouched; regenerate that PR's guide by hand.
 
-- `dead_pid_sweep` — worker PID probe reports the process is gone.
-- `stale_worker_sweep` — worker is wedged past the staleness threshold.
-- the startup reaper in `app.rs` — cube probe verdict `Dead` across an
-  engine/UI restart.
+The restart-during-spawn shape — a guide run spawned seconds before an
+engine restart, orphaned by the restarted engine's recovery probe, re-adopted
+on the worker's next hook, and submitting its guide minutes later — is
+covered by `restart_during_spawn_reopens_the_attempt_with_the_readopted_execution_and_publishes_the_guide`
+in `tools/boss/engine/work-db/src/review_guide_jobs_tests.rs`.
 
-Each hook runs `jj diff --git` against the dead worker's leased workspace
-(equivalent to `jj diff --git -R <ws>`) and, if the working copy is
-dirty, writes the git-format patch to:
+## Workspace patch backup (retired)
 
-```
-$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch
-```
+The engine no longer exports a patch when it records a death. A worker's
+unpublished work is preserved once, at teardown, under the
+`preserved/<execution>` bookmark in the shared jj store (see
+[execution-recovery-pointers.md](execution-recovery-pointers.md)), which is
+what resume restages from. The death-detection hooks (`dead_pid_sweep`,
+`dead_pane_sweep`, `lost_workspace_sweep`, `stale_worker_sweep`,
+`spawn_ack_sweep` and the startup reaper) write no patch, and their
+`[engine-reconcile]` audit lines and dispatch events carry no `recovery_patch`.
 
-(overridable via the `BOSS_RECOVERY_DIR` env var). The path is recorded
-in two places so a human or a resuming worker can find it: the
-`[engine-reconcile]` audit line appended to the work item's description
-(`Uncommitted work backed up to <path>.`), and the `recovery_patch`
-field of the `dead_pid_reconcile` / `stale_worker_reconcile` dispatch
-event.
-
-The capture is **best-effort and non-fatal**: a missing workspace path,
-an unavailable `jj`, or an empty diff is logged and swallowed, and the
-reap proceeds regardless.
-
-Boss's own bookkeeping (`.boss/`, notably the `events-pending.jsonl`
-hook spool) is filtered out of the capture. Patch size is not a signal
-of value: three of the four patches taken at 14:42 PDT on 2026-07-23
-were 203 KB / 197 KB / 38 KB of nothing but that spool, and only an
-11 KB patch held real code.
-
-**Scope:** the patch captures _uncommitted_ working-copy changes only.
-Local commits the worker already `jj describe`d into ancestors of `@`
-are not captured (capturing `trunk..@` is a possible future
-enhancement), and branches already pushed to origin are already durable
-there.
-
-## Automatic recovery: cube first, patch second
-
-The engine replays these patches itself — you do not normally need to
-apply one by hand. `tools/boss/engine/core/src/recovery_apply.rs` is the
-read side, driven from `coordinator.rs::reconcile_workspace_recovery`
-on every resume dispatch:
-
-1. **Cube first.** The resume leases `--prefer <workspace> --allow-dirty`,
-   which reclaims the dead worker's own workspace _without_ resetting it.
-   Cube reports `dirty_verified` on the lease payload: `true` means the
-   working copy still held work existing on no remote, i.e. the work was
-   recovered in place, with its jj operation log intact. Nothing is
-   replayed — applying the patch on top would duplicate or conflict with
-   work that is already there.
-2. **Patch second.** Only when cube could _not_ recover — the lease
-   failed, or it succeeded with `dirty_verified: false` because the tree
-   had already been reset — is the patch applied (`git apply --3way`)
-   into whatever workspace the resuming worker actually got.
-
-The outcome is recorded three ways: a `workspace_recovery` dispatch
-event (`source` = `cube_in_place` | `patch`, with restored file and line
-counts); a `.boss/recovery-report.json` marker in the workspace, which
-the worker's `## STARTUP RECOVERY` prompt block reads so the worker
-knows it is resuming and what it is resuming _from_; and, on success, a
-rename of the patch to `<exec-id>.patch.applied` so a later restart does
-not replay it over the work it already restored.
-
-**A failed apply is loud.** It emits `workspace_recovery` with
-`outcome=error`, logs at ERROR, leaves the patch un-consumed for manual
-salvage, and writes a marker whose prompt block tells the worker
-explicitly not to assume anything was recovered. Recovery code that
-fails quietly is worse than none: the worker rebuilds from scratch while
-believing it is resuming.
-
-To replay a patch by hand (e.g. one left behind by a failed apply):
-
-```
-git apply --3way "$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch"
-```
-
-**Retention.** Patches are load bearing now, so GC must not race
-recovery. Applied patches are renamed to `*.patch.applied` at recovery
-time and are the safe thing to age out; an un-consumed `*.patch` is
-either awaiting a resume that has not happened yet or the residue of a
-failed apply, and is the one thing a human may still need. Boothby's
-recovery-patch GC (catalogue action #17) is scoped accordingly — see
-`docs/designs/boothby.md`.
+Patches written by earlier engines remain in the engine's `recovery/` directory as `<exec-id>.patch`. The engine no longer reads `BOSS_RECOVERY_DIR` or automatically replays these files. The legacy helpers in `engine/recovery/src/recovery_apply.rs` have no production dispatch caller. Recover any still-needed historical patch manually into an isolated workspace, inspect the result, and retain the original patch until the recovered work has been published.
 
 ## Recovery cheat-sheet
 

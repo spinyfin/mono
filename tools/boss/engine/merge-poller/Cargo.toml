@@ -1,0 +1,52 @@
+[package]
+name = "boss-engine-merge-poller"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[features]
+# Exposes the fixtures the engine's integration suite drives.
+# Always on under `cfg(test)`; never enabled in production builds.
+test-support = [
+  "boss-execution-contracts/test-support",
+  "boss-work-db/test-support",
+  "dep:boss-engine-recovery",
+  "dep:rusqlite",
+  "dep:tempfile",
+]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-ci-log-reader = { path = "../ci-log-reader" }
+boss-engine-gh-invocation = { path = "../gh-invocation" }
+boss-engine-recovery = { path = "../recovery", optional = true }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-engine-utils = { path = "../utils" }
+boss-event-bus = { path = "../event-bus" }
+boss-execution-contracts = { path = "../execution-contracts" }
+boss-gh-telemetry = { path = "../../gh_telemetry" }
+boss-github = { path = "../../github" }
+boss-metrics = { path = "../metrics" }
+boss-observation-contracts = { path = "../observation-contracts" }
+boss-protocol = { path = "../../protocol" }
+boss-task-scope = { path = "../task-scope" }
+boss-trunk-client = { path = "../../trunk_client" }
+boss-work-db = { path = "../work-db" }
+chrono = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+boss-engine-recovery = { path = "../recovery" }
+boss-execution-contracts = { path = "../execution-contracts", features = ["test-support"] }
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+toml = { workspace = true }

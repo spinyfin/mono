@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use git_utils::pr_bookmark;
 use serde_json::json;
 
 use crate::command_runner::{CommandRunner, RealCommandRunner};
@@ -12,8 +11,9 @@ use crate::store::Store;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
-use crate::app::jj::{run_jj, run_jj_network};
+use crate::app::jj::{is_bookkeeping_bookmark, rebase_branch_onto, run_jj, run_jj_network};
 use crate::app::pr::verify_push_reached_github;
+use crate::app::pr_head;
 use crate::app::provision::find_workspace_record;
 use crate::app::reset::resolve_github_remote_for_workspace;
 
@@ -21,6 +21,14 @@ use crate::app::reset::resolve_github_remote_for_workspace;
 /// revset (and nothing for clean ones), so an empty result means "no commit
 /// in this range carries jj's conflict flag".
 const CONFLICT_COMMITS_TMPL: &str = r#"if(conflict, commit_id ++ "\n")"#;
+
+/// Bare bookmark names on a commit, local and remote. `jj bookmark list -r`
+/// only considers local targets, so a fetched parent-PR branch with no local
+/// bookmark is invisible even with `--all-remotes`. `local_bookmarks` /
+/// `remote_bookmarks` on `jj log` include those remotes; `.name()` strips
+/// the `@remote` suffix so [`is_bookkeeping_bookmark`] classifies them.
+pub(crate) const BOOKMARK_NAMES_TMPL: &str =
+    r#"local_bookmarks.map(|b| b.name()).join("\n") ++ "\n" ++ remote_bookmarks.map(|b| b.name()).join("\n") ++ "\n""#;
 
 /// Upper bound on collapse iterations in [`try_linearize_replay_conflicts`],
 /// as a multiple of the conflicted-commit count. Each iteration removes at
@@ -32,10 +40,10 @@ const LINEARIZE_MAX_ROUNDS_FACTOR: usize = 2;
 /// The `runner` / `database_path` / `cwd` triple every `jj` call in this
 /// module threads through. Bundled so the collapse helpers take a single
 /// context argument instead of repeating the same three parameters.
-struct JjCtx<'a> {
-    runner: &'a dyn CommandRunner,
-    database_path: Option<&'a Path>,
-    cwd: &'a Path,
+pub(super) struct JjCtx<'a> {
+    pub(super) runner: &'a dyn CommandRunner,
+    pub(super) database_path: Option<&'a Path>,
+    pub(super) cwd: &'a Path,
 }
 
 impl JjCtx<'_> {
@@ -60,7 +68,7 @@ impl JjCtx<'_> {
 /// [`crate::app::errors::RunResult`] → the engine's `RebaseOutcome`) in the
 /// conflict ladder's own trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinearizeDecline {
+pub(super) enum LinearizeDecline {
     /// The head that would be pushed is itself conflicted — a genuine content
     /// conflict, never collapsible.
     ConflictedHead,
@@ -118,13 +126,40 @@ impl LinearizeDecline {
 }
 
 /// The result of one replay-only collapse attempt.
-enum LinearizeOutcome {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LinearizeOutcome {
     /// The collapse landed and verified. `descriptions` holds the collapsed
     /// commits' messages, oldest first, which were also merged into the
     /// surviving head's description.
     Collapsed { commits: usize, descriptions: Vec<String> },
     /// The attempt declined; the workspace is exactly as the rebase left it.
     Declined(LinearizeDecline),
+}
+
+/// Who asked for the collapse, so log lines and the surviving-head
+/// description header match the caller's verb.
+#[derive(Clone, Copy)]
+enum CollapseCaller {
+    Rebase,
+    Push,
+}
+
+impl CollapseCaller {
+    fn log_label(self) -> &'static str {
+        match self {
+            Self::Rebase => "workspace rebase",
+            Self::Push => "workspace push",
+        }
+    }
+
+    fn description_header(self) -> &'static str {
+        match self {
+            Self::Rebase => "Collapsed replay-only conflicted commits (content unchanged; their messages follow):",
+            Self::Push => {
+                "Conflicted ancestors collapsed into this resolution (resulting tree verified unchanged); their messages follow:"
+            }
+        }
+    }
 }
 
 /// Outcome of vetting one collapse target: the child to squash into, or the
@@ -189,20 +224,35 @@ type VettedTarget = std::result::Result<String, LinearizeDecline>;
 /// jj workspaces sharing one repo and one operation log, so restoring global
 /// state would revert every concurrent sibling worker's bookmark moves,
 /// working-copy pointers, and fetches.
-fn try_linearize_replay_conflicts(ctx: &JjCtx<'_>, main_ref: &str, boss_branch: &str) -> Result<LinearizeOutcome> {
+fn try_linearize_replay_conflicts(
+    ctx: &JjCtx<'_>,
+    main_ref: &str,
+    boss_branch: &str,
+    bookmark_policy: BookmarkPolicy<'_>,
+    caller: CollapseCaller,
+) -> Result<LinearizeOutcome> {
     // Operations this attempt issued that rewrote history, oldest first. Only
     // these are ever undone — never anything a sibling workspace landed.
     let mut issued_ops: Vec<String> = Vec::new();
     let mut descriptions: Vec<String> = Vec::new();
 
-    let attempt = collapse_and_verify(ctx, main_ref, boss_branch, &mut issued_ops, &mut descriptions);
+    let attempt = collapse_and_verify(
+        ctx,
+        main_ref,
+        boss_branch,
+        bookmark_policy,
+        caller,
+        &mut issued_ops,
+        &mut descriptions,
+    );
 
     let outcome = match attempt {
         Ok(outcome) => outcome,
         Err(err) => {
             eprintln!(
-                "cube: workspace rebase: {boss_branch}: replay-only collapse probe failed: {err}; \
-                 falling back to the ordinary conflict hand-off"
+                "cube: {}: {boss_branch}: replay-only collapse probe failed: {err}; \
+                 falling back to the ordinary conflict hand-off",
+                caller.log_label()
             );
             LinearizeOutcome::Declined(LinearizeDecline::ProbeError)
         }
@@ -244,6 +294,8 @@ fn collapse_and_verify(
     ctx: &JjCtx<'_>,
     main_ref: &str,
     boss_branch: &str,
+    bookmark_policy: BookmarkPolicy<'_>,
+    caller: CollapseCaller,
     issued_ops: &mut Vec<String>,
     descriptions: &mut Vec<String>,
 ) -> Result<LinearizeOutcome> {
@@ -278,7 +330,7 @@ fn collapse_and_verify(
     // those declines owe no rollback at all.
     let mut vetted: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for target in &initial {
-        match vet_collapse_target(ctx, target)? {
+        match vet_collapse_target(ctx, target, bookmark_policy)? {
             Ok(child) => {
                 vetted.insert(target.clone(), child);
             }
@@ -311,7 +363,7 @@ fn collapse_and_verify(
         // and the rollback above is what makes it safe.
         let child = match vetted.get(&target) {
             Some(child) => child.clone(),
-            None => match vet_collapse_target(ctx, &target)? {
+            None => match vet_collapse_target(ctx, &target, bookmark_policy)? {
                 Ok(child) => child,
                 Err(decline) => return Ok(LinearizeOutcome::Declined(decline)),
             },
@@ -370,7 +422,7 @@ fn collapse_and_verify(
     // commit that survives every round and the one GitHub shows on the PR.
     // `jj describe -m` is non-interactive, so no `$EDITOR` is needed.
     if !descriptions.is_empty() {
-        merge_collapsed_descriptions(ctx, boss_branch, descriptions)?;
+        merge_collapsed_descriptions(ctx, boss_branch, descriptions, caller.description_header())?;
         issued_ops.push(current_operation_id(ctx)?);
     }
 
@@ -382,13 +434,19 @@ fn collapse_and_verify(
 
 /// Append the collapsed commits' messages to `boss_branch`'s description so
 /// no commit message is lost to the collapse.
-fn merge_collapsed_descriptions(ctx: &JjCtx<'_>, boss_branch: &str, descriptions: &[String]) -> Result<()> {
+fn merge_collapsed_descriptions(
+    ctx: &JjCtx<'_>,
+    boss_branch: &str,
+    descriptions: &[String],
+    header: &str,
+) -> Result<()> {
     let head_description = ctx.run(&["log", "-r", boss_branch, "--no-graph", "-T", "description"])?;
     let mut combined = head_description.trim_end().to_owned();
     if !combined.is_empty() {
         combined.push_str("\n\n");
     }
-    combined.push_str("Collapsed replay-only conflicted commits (content unchanged; their messages follow):\n");
+    combined.push_str(header);
+    combined.push('\n');
     for description in descriptions {
         combined.push('\n');
         combined.push_str(description.trim_end());
@@ -413,8 +471,8 @@ fn current_operation_id(ctx: &JjCtx<'_>) -> Result<String> {
 /// it, and rewriting it would silently move that PR's head. No child (the
 /// head itself) or more than one (a fork) means there is no single
 /// unambiguous place for the content to go.
-fn vet_collapse_target(ctx: &JjCtx<'_>, target: &str) -> Result<VettedTarget> {
-    if commit_has_bookmark(ctx, target)? {
+fn vet_collapse_target(ctx: &JjCtx<'_>, target: &str, bookmark_policy: BookmarkPolicy<'_>) -> Result<VettedTarget> {
+    if commit_has_blocking_bookmark(ctx, target, bookmark_policy)? {
         return Ok(Err(LinearizeDecline::BookmarkedAncestor));
     }
     let children = ctx.run(&[
@@ -448,10 +506,36 @@ fn commit_is_conflicted(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
     Ok(!conflicted_in_range(ctx, revision)?.is_empty())
 }
 
-/// Whether any bookmark points at `revision` — the stacked-PR guard.
-fn commit_has_bookmark(ctx: &JjCtx<'_>, revision: &str) -> Result<bool> {
-    let out = ctx.run(&["log", "-r", revision, "--no-graph", "-T", "bookmarks"])?;
-    Ok(!out.trim().is_empty())
+/// Which bookmarks on a conflicted ancestor count as a stacked-PR boundary.
+#[derive(Clone, Copy)]
+pub(super) enum BookmarkPolicy<'a> {
+    /// Rebase path: bookkeeping pointers (`pr/<n>`, engine recovery /
+    /// preserved namespaces) are not stack boundaries, locally or on a
+    /// remote. Any other bookmark still blocks, including a parent-PR
+    /// branch that exists only as a fetched remote ref.
+    Strict,
+    /// Push path: same classification as [`Self::Strict`], and the branch
+    /// about to be advanced to `@` is also not a stack boundary.
+    PushBranch(&'a str),
+}
+
+pub(super) fn commit_has_blocking_bookmark(
+    ctx: &JjCtx<'_>,
+    revision: &str,
+    policy: BookmarkPolicy<'_>,
+) -> Result<bool> {
+    let skip_branch = match policy {
+        BookmarkPolicy::Strict => None,
+        BookmarkPolicy::PushBranch(branch) => Some(branch),
+    };
+    let out = ctx.run(&["log", "-r", revision, "--no-graph", "-T", BOOKMARK_NAMES_TMPL])?;
+    Ok(out.lines().map(str::trim).any(|name| {
+        !name.is_empty()
+            && skip_branch.is_none_or(|branch| name != branch)
+            // These aliases were never publishable and have not been maintained
+            // since mono#3511. A leftover alias is not another PR's branch.
+            && !is_bookkeeping_bookmark(name)
+    }))
 }
 
 /// Position the workspace working copy on the head of a PR branch.
@@ -524,6 +608,7 @@ pub(super) fn workspace_goto(
         );
     }
 
+    let mut pr_head: Option<pr_head::PrHead> = None;
     let branch: String = if let Some(b) = bookmark {
         strip_remote_suffix(&b).to_string()
     } else if let Some(n) = pr {
@@ -531,65 +616,67 @@ pub(super) fn workspace_goto(
             .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo}: {e}")))?;
         let state = gh_pr::state(&pr_info);
         if state == "MERGED" || state == "CLOSED" {
-            return Err(CubeError::InvalidArgument(format!(
+            return Err(CubeError::PositioningRefused(format!(
                 "PR {n} ({owner_repo}) is {state} — cannot position on a non-open PR. \
                  Use `cube workspace lease` for a fresh task (don't run `cube workspace goto`), or verify the PR number."
             )));
         }
-        gh_pr::head_ref(&pr_info)
+        let branch = gh_pr::head_ref(&pr_info)
             .ok_or_else(|| {
-                CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no head.ref from GitHub"))
+                CubeError::PositioningRefused(format!(
+                    "PR {n} ({owner_repo}) returned no head.ref from GitHub; verify the PR head before launching again"
+                ))
             })?
-            .to_string()
+            .to_string();
+        // GitHub's `head.sha` is the PR head. The branch name only labels it:
+        // on a fork-headed PR the same name on the base remote is an
+        // unrelated branch.
+        pr_head = Some(pr_head::resolve_pr_head(
+            runner,
+            database_path,
+            &cwd,
+            &owner_repo,
+            n,
+            &pr_info,
+            None,
+        )?);
+        branch
     } else {
         return Err(CubeError::InvalidArgument(
             "cube workspace goto: either --bookmark or --pr must be provided".to_string(),
         ));
     };
 
-    let remote_ref = format!("{branch}@{github_remote}");
-
-    if runner
-        .run(&RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
-        ))
-        .is_err()
-    {
-        return Err(CubeError::InvalidArgument(format!(
-            "branch `{branch}` was not found on remote `{github_remote}` \
-             (looked for `{remote_ref}`). Confirm the bookmark exists and is pushed, \
-             or pass `--pr <n>` to let cube resolve the head from GitHub."
-        )));
-    }
-
-    // Set the local bookmark to track the remote head (idempotent; --allow-backwards
-    // handles any local divergence).
-    run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &["bookmark", "set", &branch, "-r", &remote_ref, "--allow-backwards"],
-        ),
-    )?;
-
-    // Also set the pr/<n> bookmark when the caller specified --pr so that
-    // `cube pr push` and `cube workspace rebase` can find the PR number later.
-    if let Some(n) = pr {
-        let pr_bm = pr_bookmark::pr_bookmark_name(n);
-        run_jj(
-            runner,
-            database_path,
-            &RealCommandRunner::invocation(
-                &cwd,
-                "jj",
-                &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
-            ),
-        )?;
-    }
+    let remote_ref = match &pr_head {
+        Some(head) => head.sha.clone(),
+        None => {
+            let remote_ref = format!("{branch}@{github_remote}");
+            let found = run_jj(
+                runner,
+                database_path,
+                &RealCommandRunner::invocation(
+                    &cwd,
+                    "jj",
+                    &[
+                        "log",
+                        "-r",
+                        &format!("present({remote_ref})"),
+                        "--no-graph",
+                        "-T",
+                        "commit_id",
+                    ],
+                ),
+            )?;
+            if found.trim().is_empty() {
+                return Err(CubeError::PositioningRefused(format!(
+                    "branch `{branch}` was not found on remote `{github_remote}` \
+                     (looked for `{remote_ref}`). Confirm the bookmark exists and is pushed, \
+                     or pass `--pr <n>` to let cube resolve the head from GitHub."
+                )));
+            }
+            remote_ref
+        }
+    };
 
     // Idempotency check: if @ already has <remote_ref> as a direct parent,
     // skip `jj new` — the workspace is already positioned correctly.
@@ -614,6 +701,21 @@ pub(super) fn workspace_goto(
             runner,
             database_path,
             &RealCommandRunner::invocation(&cwd, "jj", &["new", &remote_ref]),
+        )?;
+    }
+
+    // Set the local bookmark to track the head (idempotent; --allow-backwards
+    // handles any local divergence). A fork's branch name is never mapped onto
+    // a local bookmark: it could be `main`.
+    if pr_head.as_ref().is_none_or(|head| head.same_repo) {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["bookmark", "set", &branch, "-r", &remote_ref, "--allow-backwards"],
+            ),
         )?;
     }
 
@@ -848,15 +950,7 @@ pub(super) fn rebase_workspace_branch(
     // required because the boss commit is referenced via its immutable
     // `@<remote>` form.
     let main_ref = format!("{main_branch}@{github_remote}");
-    let rebase_out = run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &["rebase", "-b", &boss_branch, "-d", &main_ref, "--ignore-immutable"],
-        ),
-    )?;
+    let rebase_out = rebase_branch_onto(runner, database_path, cwd, &boss_branch, &main_ref)?;
 
     // Check whether the rebase left any conflicts anywhere in the range of
     // commits this rebase will push — not just the working-copy tip. `@` is
@@ -912,7 +1006,13 @@ pub(super) fn rebase_workspace_branch(
             database_path,
             cwd,
         };
-        match try_linearize_replay_conflicts(&ctx, &main_ref, &boss_branch)? {
+        match try_linearize_replay_conflicts(
+            &ctx,
+            &main_ref,
+            &boss_branch,
+            BookmarkPolicy::Strict,
+            CollapseCaller::Rebase,
+        )? {
             LinearizeOutcome::Collapsed { commits, descriptions } => {
                 linearized_commits = commits;
                 linearized_descriptions = descriptions;
@@ -934,6 +1034,10 @@ pub(super) fn rebase_workspace_branch(
         }
     }
 
+    let push_cmd = match opts.explicit_pr {
+        Some(n) => format!("cube workspace push --pr {n}"),
+        None => format!("cube pr update --branch {boss_branch}"),
+    };
     if has_conflicts {
         // Best-effort: list conflicted files across every conflicted commit
         // in the range, deduped by path (the same file can show as
@@ -960,9 +1064,6 @@ pub(super) fn rebase_workspace_branch(
         } else {
             conflicted_files.join(", ")
         };
-        let push_cmd = format!(
-            "jj bookmark set {boss_branch} -r @ --allow-backwards && jj git push -b {boss_branch} --remote {github_remote}"
-        );
         // Which guard refused the mechanical collapse is the difference
         // between "a real content conflict at the head" and "the tree drifted
         // after three squashes". Report it on both surfaces so the engine can
@@ -1024,7 +1125,7 @@ pub(super) fn rebase_workspace_branch(
             format!(
                 "REBASED_CLEAN: branch `{boss_branch}` rebased onto `{main_branch}` with no conflicts.\
                  {linearized_note} Push skipped (--no-push); update the PR with \
-                 `jj git push -b {boss_branch} --remote {github_remote}`."
+                 `{push_cmd}`."
             ),
             json!({
                 "status": "clean",
@@ -1054,7 +1155,7 @@ pub(super) fn rebase_workspace_branch(
             "rebase of `{boss_branch}` onto `{main_branch}` succeeded, but pushing it to \
              `{github_remote}` failed: {err}. If the remote head moved since the fetch, re-run \
              `cube workspace rebase`; otherwise push manually with \
-             `jj git push -b {boss_branch} --remote {github_remote}`."
+             `{push_cmd}`."
         )));
     }
     verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
@@ -1078,6 +1179,44 @@ pub(super) fn rebase_workspace_branch(
     )
 }
 
+/// Collapse conflicted ancestors of a resolved `@` into their children, over
+/// the range `jj git push` would send (`remote_bookmarks()..@`). A decline
+/// leaves history exactly as it was. An initial probe failure is best-effort
+/// (the push still runs and reports the real refusal). A failed rollback
+/// after a declined collapse is propagated so the caller cannot push a
+/// half-rewritten history.
+pub(super) fn collapse_resolved_ancestors(ctx: &JjCtx<'_>, boss_branch: &str) -> Result<LinearizeOutcome> {
+    match conflicted_in_range(ctx, "remote_bookmarks()..@") {
+        Ok(conflicted) if conflicted.is_empty() => {
+            return Ok(LinearizeOutcome::Declined(LinearizeDecline::NothingToCollapse));
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("cube: workspace push: could not probe ancestors for conflicts: {err}");
+            return Ok(LinearizeOutcome::Declined(LinearizeDecline::ProbeError));
+        }
+    }
+    let outcome = try_linearize_replay_conflicts(
+        ctx,
+        "remote_bookmarks()",
+        "@",
+        BookmarkPolicy::PushBranch(boss_branch),
+        CollapseCaller::Push,
+    )?;
+    match &outcome {
+        LinearizeOutcome::Collapsed { commits, .. } => eprintln!(
+            "cube: workspace push: {boss_branch}: {commits} resolved-over conflicted ancestor(s) collapsed \
+             forward; pushed tree verified byte-identical"
+        ),
+        LinearizeOutcome::Declined(decline) => eprintln!(
+            "cube: workspace push: {boss_branch}: conflicted ancestors not collapsed (`{}`: {})",
+            decline.slug(),
+            decline.explain()
+        ),
+    }
+    Ok(outcome)
+}
+
 /// `cube workspace push`: advance this workspace's `boss/exec_*` branch
 /// bookmark to `@` and push it to GitHub, without re-running a rebase.
 ///
@@ -1093,6 +1232,16 @@ pub(super) fn workspace_push(
     pr: Option<u64>,
 ) -> Result<RunResult> {
     let cwd = std::env::current_dir().map_err(CubeError::Io)?;
+    workspace_push_at(cwd, database_path, runner, bookmark, pr)
+}
+
+pub(super) fn workspace_push_at(
+    cwd: PathBuf,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    bookmark: Option<String>,
+    pr: Option<u64>,
+) -> Result<RunResult> {
     let (github_remote, owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
 
     let opts = RebaseOpts {
@@ -1118,15 +1267,12 @@ pub(super) fn workspace_push(
         ));
     }
 
-    // `jj git push` refuses to push a commit with an empty description. This
-    // command lands whatever is already resolved in the working copy without
-    // an intervening `jj describe` — the deterministic-resolver rung
-    // (`attempt_rung0` in conflict_ladder.rs) edits conflicted files directly
-    // via the resolver registry and never describes `@` itself, so without
-    // this check its resolution reaches here undescribed and the push below
-    // is rejected outright. Stamp a deterministic description only when `@`
-    // doesn't already have one, so a description a human or an earlier step
-    // already set is left untouched.
+    // `jj git push` refuses to push a commit with an empty description. Stamp
+    // the resolve-conflict message *before* collapsing conflicted ancestors so
+    // the surviving head keeps that title rather than a collapse-only header.
+    // The deterministic-resolver rung (`attempt_rung0`) edits files directly
+    // and never describes `@`; without this stamp the push is rejected. Leave
+    // an existing description (human or earlier step) untouched.
     let description = run_jj(
         runner,
         database_path,
@@ -1143,6 +1289,14 @@ pub(super) fn workspace_push(
             &RealCommandRunner::invocation(&cwd, "jj", &["describe", "-r", "@", "-m", &message]),
         )?;
     }
+
+    // A lockfile-only conflict is resolved by rewriting the file at `@`, which
+    // is a child of the (rebased, still conflicted) PR commit. `@` is clean
+    // but its ancestor keeps jj's conflict flag, and `jj git push` rejects the
+    // whole unpublished range. Collapse those ancestors forward when the
+    // pushed tree provably does not change; otherwise fall through and let the
+    // push report the real refusal. A failed rollback aborts the push.
+    collapse_resolved_ancestors(&ctx, &boss_branch)?;
 
     // Advance the branch bookmark to @. A prior rebase already legitimately
     // moved it off its previous remote position, so --allow-backwards is

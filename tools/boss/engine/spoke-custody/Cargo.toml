@@ -1,0 +1,17 @@
+[package]
+name = "boss-spoke-custody"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+boss-engine-structured-output = { path = "../structured-output" }
+boss-protocol = { path = "../../protocol" }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+boss-work-db = { path = "../work-db" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

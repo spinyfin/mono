@@ -1,0 +1,320 @@
+//! Daily, durable calibration. Readers consume the published values rather
+//! than scanning the ledger on each sweep. Overrides survive recalibration.
+use super::*;
+use boss_engine_storage_values::progression::*;
+use boss_protocol::{ProgressionCalibration, ProgressionLimit};
+use std::collections::BTreeMap;
+
+pub(crate) const REPORT_KEY: &str = "progression.calibration";
+const CONFIG_KEY: &str = "progression.calibration_config";
+pub(super) const DAY: i64 = 86400;
+pub(super) const WINDOW_DAYS: i64 = 28;
+const MINIMUM_DAYS: usize = 7;
+
+pub(super) fn read_report(conn: &Connection) -> Result<Option<ProgressionCalibration>> {
+    let json: Option<String> = conn
+        .query_row("SELECT value FROM metadata WHERE key = ?1", [REPORT_KEY], |r| r.get(0))
+        .optional()?;
+    Ok(json.and_then(|json| match serde_json::from_str(&json) {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(?error, "invalid progression calibration report; ignoring");
+            None
+        }
+    }))
+}
+
+#[work_db_boundary::instrument]
+impl WorkDb {
+    /// Publish configuration and fallbacks without measuring history.
+    /// Unchanged configuration preserves the calibrated values.
+    pub fn configure_progression_calibration(&self, settings: &ProgressionSettings) -> Result<()> {
+        let json = serde_json::to_string(settings)?;
+        if self.get_metadata(CONFIG_KEY)?.as_deref() != Some(&json) {
+            let mut conn = self.connect()?;
+            let conn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            conn.execute("DELETE FROM metadata WHERE key = ?1", [REPORT_KEY])?;
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES (?1,?2)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![CONFIG_KEY, json],
+            )?;
+            for setting in CALIBRATED_SETTINGS {
+                let value = (setting.value)(settings);
+                if let Some(value) = value {
+                    conn.execute(
+                        "INSERT INTO metadata(key,value) VALUES (?1,?2)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        params![setting.metadata_key, value.to_string()],
+                    )?;
+                } else {
+                    conn.execute("DELETE FROM metadata WHERE key=?1", [setting.metadata_key])?;
+                }
+            }
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES ('progression.max_creates_window_secs',?1)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [settings.max_creates_window_secs.to_string()],
+            )?;
+            conn.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn calibrate_progression(&self, now: i64) -> Result<ProgressionCalibration> {
+        let reader = self.reader()?;
+        let mut conn = reader.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if let Some(report) = read_report(&tx)?
+            && report.computed_at.div_euclid(DAY) == now.div_euclid(DAY)
+        {
+            return Ok(report);
+        }
+        let config: Option<String> = tx
+            .query_row("SELECT value FROM metadata WHERE key = ?1", [CONFIG_KEY], |r| r.get(0))
+            .optional()?;
+        let settings: ProgressionSettings = config
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default();
+        let mut report = super::progression_calibration_data::measure(&tx, now, settings.max_creates_window_secs)?;
+        let enough = report.snapshot_days >= MINIMUM_DAYS;
+        let defaults = ProgressionSettings::default();
+        let m = &report.inputs;
+        let measurement = |key: &str| m.get(key).copied();
+        let triple = |key: &str| measurement(key).map(|v| v.saturating_mul(3));
+        // One descriptor per published key: formula, basis and sanity bound
+        // travel with the named setting, metadata key and override bit.
+        let remind_default = u64::from(boss_engine_storage_values::progression::DEFAULT_REMIND_AFTER_SECS);
+        let descriptors = [
+            Descriptor::new(
+                POOL_SIZE_SETTING,
+                measurement("peak_candidates_per_day")
+                    .zip(measurement("mean_run_seconds"))
+                    .map(|(count, seconds)| {
+                        count
+                            .saturating_mul(seconds)
+                            .div_ceil(DAY as u64)
+                            .saturating_mul(3)
+                            .max(1)
+                    }),
+                "ceil(peak daily candidates * mean run seconds / 86400) * 3",
+                64,
+            ),
+            Descriptor::new(
+                STUCK_AFTER_SECS_SETTING,
+                triple("automatic_pause_p99_secs"),
+                "3 * p99 automatic remediation scheduling pause",
+                DAY as u64,
+            ),
+            // Resolve the grace first: sweep latency follows its effective
+            // value, including overrides, rather than idle ledger gaps.
+            Descriptor::new(
+                SWEEP_INTERVAL_SECS_SETTING,
+                None,
+                "effective stuck grace / 10, rounded down; at least the 300-second placeholder",
+                3600,
+            ),
+            Descriptor::new(
+                COOLDOWN_SECS_SETTING,
+                triple("revision_to_review_max_secs"),
+                "3 * longest progression revision time to first review",
+                7 * DAY as u64,
+            ),
+            Descriptor::new(
+                MAX_CREATES_PER_ITEM_WINDOW_SETTING,
+                triple("remediation_attempts_p99"),
+                "3 * outlier-trimmed p99 per-item remediation attempts in a create-budget window",
+                100,
+            ),
+            Descriptor::new(
+                RUN_TIMEOUT_SECS_SETTING,
+                triple("run_duration_p99_secs"),
+                "3 * p99 completed progression run duration",
+                DAY as u64,
+            ),
+            // The placeholder is a ceiling: reminders may only get more
+            // frequent than the default when people answer faster, never
+            // less frequent when answers slow down.
+            Descriptor::new(
+                REMIND_AFTER_SECS_SETTING,
+                measurement("answer_latency_p75_secs").map(|v| v.clamp(MIN_REMIND_SECS, remind_default)),
+                "p75 observed answer latency, at least 1 hour and at most the 3-day placeholder",
+                remind_default,
+            )
+            .ceiling_at_default(),
+            Descriptor::new(
+                EXPECTED_QUESTIONS_PER_WEEK_SETTING,
+                measurement("progression_questions")
+                    .zip(measurement("engine_ladder_questions"))
+                    .filter(|(p, l)| p + l > 0)
+                    .map(|(p, l)| (p + l).saturating_mul(7).div_ceil(WINDOW_DAYS as u64)),
+                "ceil((progression + ladder questions) * 7 / 28); alarm only",
+                100,
+            ),
+        ];
+        for descriptor in &descriptors {
+            let setting = descriptor.setting;
+            let key = setting.key;
+            let computed = if key == SWEEP_INTERVAL_SECS_SETTING.key {
+                report.limits.get(STUCK_AFTER_SECS_SETTING.key).and_then(|grace| {
+                    (grace.source != "fallback")
+                        .then_some(grace.value)
+                        .flatten()
+                        .map(|v| v / 10)
+                })
+            } else {
+                descriptor.computed
+            };
+            let default = (setting.value)(&defaults);
+            let configured = (setting.value)(&settings);
+            let overridden = settings.explicit_overrides & setting.override_bit != 0 || configured != default;
+            let (value, source, basis) = if overridden {
+                (configured, "overridden", "explicit configuration".to_owned())
+            } else if enough && computed.is_some() {
+                (
+                    computed.map(|v| {
+                        if descriptor.default_is_ceiling {
+                            v.min(default.unwrap_or(u64::MAX))
+                        } else {
+                            v.max(default.unwrap_or(0))
+                        }
+                    }),
+                    "computed",
+                    descriptor.basis.to_owned(),
+                )
+            } else {
+                (
+                    default,
+                    "fallback",
+                    if enough {
+                        "no eligible measurement samples".to_owned()
+                    } else {
+                        format!("{} daily snapshots; need {MINIMUM_DAYS}", report.snapshot_days)
+                    },
+                )
+            };
+            // Diagnostic bounds expose extreme computed values without hiding
+            // the measurement or overriding explicit configuration.
+            let basis = if source == "computed" && value.is_some_and(|v| v > descriptor.sanity_bound) {
+                format!(
+                    "{basis}; WARNING: computed value exceeds sanity bound {}",
+                    descriptor.sanity_bound
+                )
+            } else {
+                basis
+            };
+            let ceiling = match key {
+                "pool_size" => boss_engine_storage_values::pool_policy::MAX_PROGRESSION_POOL_SIZE as u64,
+                "max_creates_per_item_window" | "expected_questions_per_week" => u32::MAX as u64,
+                _ => i64::MAX as u64,
+            };
+            let limited = value.map(|v| v.min(ceiling));
+            report.limits.insert(
+                key.into(),
+                ProgressionLimit {
+                    value: limited,
+                    source: source.into(),
+                    basis: if limited != value {
+                        format!("{basis}; clamped to representable ceiling {ceiling}")
+                    } else {
+                        basis
+                    },
+                },
+            );
+        }
+        tx.commit()?;
+        drop(conn);
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_config: Option<String> = tx
+            .query_row("SELECT value FROM metadata WHERE key=?1", [CONFIG_KEY], |r| r.get(0))
+            .optional()?;
+        anyhow::ensure!(
+            current_config == config,
+            "progression configuration changed during measurement"
+        );
+        for descriptor in &descriptors {
+            let setting = descriptor.setting;
+            let limit = &report.limits[setting.key];
+            if let Some(value) = limit.value {
+                tx.execute(
+                    "INSERT INTO metadata(key,value) VALUES (?1,?2)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![setting.metadata_key, value.to_string()],
+                )?;
+            } else {
+                tx.execute("DELETE FROM metadata WHERE key=?1", [setting.metadata_key])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO metadata(key,value) VALUES ('progression.max_creates_window_secs',?1)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [settings.max_creates_window_secs.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO metadata(key,value) VALUES (?1,?2)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![REPORT_KEY, serde_json::to_string(&report)?],
+        )?;
+        tx.commit()?;
+        tracing::info!(calibration = %serde_json::to_string(&report)?, "progression limits recalibrated");
+        Ok(report)
+    }
+
+    /// Read a published progression limit by its full `METADATA_KEY_*` key.
+    pub fn progression_limit(&self, metadata_key: &str, fallback: u64) -> Result<u64> {
+        Ok(self
+            .get_metadata(metadata_key)?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fallback))
+    }
+}
+
+/// Minimum computed reminder interval.
+const MIN_REMIND_SECS: u64 = 3600;
+
+/// How one published key is calibrated.
+struct Descriptor {
+    setting: CalibrationSetting,
+    computed: Option<u64>,
+    basis: &'static str,
+    sanity_bound: u64,
+    /// The placeholder caps the computed value instead of flooring it.
+    default_is_ceiling: bool,
+}
+
+impl Descriptor {
+    fn new(setting: CalibrationSetting, computed: Option<u64>, basis: &'static str, sanity_bound: u64) -> Self {
+        Self {
+            setting,
+            computed,
+            basis,
+            sanity_bound,
+            default_is_ceiling: false,
+        }
+    }
+
+    fn ceiling_at_default(mut self) -> Self {
+        self.default_is_ceiling = true;
+        self
+    }
+}
+
+pub(super) fn empty_report(now: i64) -> ProgressionCalibration {
+    ProgressionCalibration::builder()
+        .computed_at(now)
+        .window_start((now.div_euclid(DAY) - WINDOW_DAYS) * DAY)
+        .snapshot_days(0)
+        .minimum_snapshot_days(MINIMUM_DAYS)
+        .inputs(BTreeMap::new())
+        .limits(BTreeMap::new())
+        .fingerprint_changes_per_item(BTreeMap::new())
+        .fingerprint_risk("insufficient fingerprint observations")
+        .build()
+}
+
+#[cfg(test)]
+#[path = "progression_calibration_tests.rs"]
+mod tests;

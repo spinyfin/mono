@@ -36,7 +36,7 @@ final class WorkItemDocLinkAffordanceTests: XCTestCase {
         let task = makeWorkItem(kind: "chore", docLinkState: resolvedState(rawContentURL: nil))
         let ctx = WorkCardSnapshotContext(
             column: .review,
-            designDocState: task.docLinkState
+            designDocPresentation: task.docLinkState.flatMap { ProjectDesignDocAffordancePresentation.from(state: $0) }
         )
         let snap = WorkCardSnapshot.build(task: task, context: ctx)
         XCTAssertTrue(
@@ -48,13 +48,13 @@ final class WorkItemDocLinkAffordanceTests: XCTestCase {
         XCTAssertEqual(presentation?.kind, .resolved)
     }
 
-    /// `workItemDocState` must return a chore's per-task pointer so the
+    /// `workItemDocPresentation` must return a chore's per-task pointer so the
     /// selected-card detail popover (and the kanban snapshot builder)
     /// agree with the card icon.
     func testWorkItemDocStateReturnsChorePerTaskPointer() {
         let model = makeModel()
         let task = makeWorkItem(kind: "chore", docLinkState: resolvedState(rawContentURL: nil))
-        XCTAssertEqual(model.workItemDocState(for: task), task.docLinkState)
+        XCTAssertEqual(model.workItemDocPresentation(for: task), task.docLinkState.flatMap { ProjectDesignDocAffordancePresentation.from(state: $0) })
     }
 
     // MARK: - openTaskDoc dispatch

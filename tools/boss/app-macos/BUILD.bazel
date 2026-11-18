@@ -11,10 +11,16 @@ load(
 )
 load("//tools/boss/installer:pkg.bzl", "boss_short_version_plist")
 load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
+load(":test_shards.bzl", "app_test_shards")
 
 config_setting(
     name = "coverage_enabled",
     values = {"collect_code_coverage": "true"},
+)
+
+config_setting(
+    name = "fastbuild_mode",
+    values = {"compilation_mode": "fastbuild"},
 )
 
 _COVERAGE_LINKOPTS = select({
@@ -43,12 +49,20 @@ exports_files([
     "ghosttykit.BUILD",
 ])
 
-# Live Swift source `include_str!`'d by engine_lib so the combined
+# Live Swift source `include_str!`'d by the work-db unit test so the combined
 # park+churn marker cannot drift from WorkDispatchFailureBanner.
 filegroup(
     name = "work_board_banners_swift",
     srcs = ["Sources/WorkBoardBanners.swift"],
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = ["//tools/boss/engine/work-db:__pkg__"],
+)
+
+# Live Swift source read by the protocol-spoke contract test so the viewer's
+# stale threshold cannot drift from the spoke capture keep-alive.
+filegroup(
+    name = "remote_pane_viewer_swift",
+    srcs = ["Sources/RemotePaneViewer.swift"],
+    visibility = ["//tools/boss/protocol-spoke:__pkg__"],
 )
 
 swift_library(
@@ -83,10 +97,21 @@ swift_library(
         "-swift-version",
         "6",
         "-strict-concurrency=complete",
-    ],
+    ] + select({
+        # Bazel accounts for this entire action as one CPU, including driver
+        # subprocesses. Keep the default modest on shared CI hosts.
+        # Opt and dbg retain their existing driver arguments.
+        ":fastbuild_mode": [
+            "-j",
+            "2",
+        ],
+        "//conditions:default": [],
+    }),
     module_name = "Boss",
     deps = [
         "//tools/boss/app-macos/Sources/CrashWatchdog",
+        "//tools/boss/app-macos/Sources/DiagnosticIO",
+        "//tools/boss/app-macos/Sources/PaneLayout",
         "//tools/boss/app-macos/Sources/UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
@@ -108,6 +133,8 @@ genrule(
 # without the checked-in copy being regenerated.
 sh_test(
     name = "engine_binary_name_swift_up_to_date_test",
+    # A byte comparison of two small files in bash; about one second on CI.
+    size = "small",
     srcs = ["engine_binary_name_swift_up_to_date_test.sh"],
     args = [
         "$(location Sources/EngineBinaryName.swift)",
@@ -119,38 +146,133 @@ sh_test(
     ],
 )
 
-# BossTests is sharded across four independent macos_unit_test targets so
-# each one fits comfortably inside the "small" (60s) timeout as the suite
-# grows (see CI timeout in exec_18bf0a6008fc0cc0_170). rules_apple's default
-# macos test runner (apple/testing/default_runner) does not implement Bazel's
-# native shard_count sharding protocol (no TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
-# handling), so `shard_count` on a single macos_unit_test is a no-op here —
-# splitting into separate targets is the mechanism that actually parallelizes
-# test execution for this rule.
+# Independent bundles keep each test action inside the small (60s) timeout.
+# The macOS runner does not implement Bazel's shard_count protocol, so each
+# partition must be a separate macos_unit_test target.
 #
 # CommentsTests.swift + TranscriptViewTests.swift are split into their own
 # shard because CommentLayerTests alone accounts for ~85% of total XCTest
 # runtime (~12.8s of ~14.9s measured locally); bundling it with anything else
-# risks that shard alone approaching the timeout. The remaining files are
-# split into three buckets balanced by source line count.
+# risks that shard alone approaching the timeout. MarkdownDocumentChromeTests
+# is its own shard: bundled with the other AppKit render suites it reached
+# 26.8 s of XCTest wall (57.0 s bazel wall) in an isolated uncached run, which
+# is too close to the 60 s budget. The remaining table-overflow and revision-
+# footer suites stay in the Render shard. The remaining files are split into
+# the explicit source groups below plus a catch-all that is distributed
+# across four further bundles. Every new test file is included automatically.
 #
-# Shard3 is a catch-all glob rather than a fourth hand-listed file set: the
-# first three shards' file lists are named below and fed into both their own
-# srcs and shard3's glob exclude, so those two views of the same lists can
-# never drift apart. Any new file added under Tests/BossTests/ therefore
-# automatically lands in shard3 and runs, instead of silently being skipped
-# by every shard (a false green) because no one remembered to hand-list it.
+# When a shard creeps towards its budget, measure before moving files:
+# `bazel test --nocache_test_results --test_verbose_timeout_warnings
+# //tools/boss/app-macos:BossTestsShard3`, then read the per-suite
+# "Test Suite '...' passed at" timestamps in bazel-testlogs/.../test.log.
+# Keep each shard's isolated local wall time inside the 60 s budget with
+# enough slack that a slow sample still finishes. Isolated uncached in this
+# workspace after the Chrome split (`bazel test --nocache_test_results
+# --test_verbose_timeout_warnings`, PASSED-in test action wall): Chrome
+# 7.3 / 6.8 / 5.8 s, Render 13.8 / 20.3 / 14.5 s, Shard3 9.3 / 6.9 / 7.3 s
+# then 23.9 / 11.0 / 8.8 s, Shard5 9.2 / 20.9 / 52.5 s then 7.2 / 10.2 /
+# 6.3 s. Slowest dedicated-shard sample 52.5 s (Shard5, first set) still
+# finished inside the 60 s budget. That is the measured headroom, not a
+# half-budget cap.
+#
+# The shared principal is compiled into every bundle: it is the bundle's
+# NSPrincipalClass, which XCTest instantiates before the first test runs, and
+# it installs the missing-review-section assertion before XCTest starts. See
+# BossTestsPrincipal.swift and Tests/BossTests/Info.plist.
+_BOSS_TESTS_PRINCIPAL_SRCS = [
+    "Tests/BossTests/BossTestsPrincipal.swift",
+    # Test support used from more than one bundle: ResyncRefetchTests is in
+    # Shard1 and InvalidationRefetchCoalescingTests is in the catch-all.
+    "Tests/BossTests/ManualRefetchClock.swift",
+    "Tests/BossTests/RevisionBriefCaptureFixture.swift",
+]
+
+_BOSS_TESTS_INFOPLISTS = ["Tests/BossTests/Info.plist"]
+
+_CHROME_SHARD_SRCS = [
+    "Tests/BossTests/MarkdownDocumentChromeTests.swift",
+]
+
+_RENDER_SHARD_SRCS = [
+    "Tests/BossTests/MarkdownTableOverflowTests.swift",
+    "Tests/BossTests/RevisionFooterRenderTests.swift",
+]
+
+# Shared by the navigator shards. Not a test target of its own.
+_NAVIGATOR_SUPPORT_SRCS = [
+    "Tests/BossTests/NavigatorTestFixture.swift",
+]
+
+_NAVIGATOR_SHARD_SRCS = [
+    "Tests/BossTests/NavigatorSelectionTests.swift",
+    "Tests/BossTests/NavigatorModeRegressionTests.swift",
+    "Tests/BossTests/NavigatorRowTests.swift",
+    "Tests/BossTests/NavigatorActivityTests.swift",
+    "Tests/BossTests/NavigatorLifecycleTests.swift",
+    "Tests/BossTests/NavigatorReviewTests.swift",
+]
+
+# Attention snapshot captures take ~50s of XCTest wall on their own, which
+# leaves the rest of the navigator suite no room inside the 60s small budget.
+_NAVIGATOR_ATTENTION_SHARD_SRCS = [
+    "Tests/BossTests/NavigatorAttentionTests.swift",
+]
+
+macos_unit_test(
+    name = "BossTestsNavigator",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_navigator_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_navigator_lib",
+    testonly = True,
+    srcs = _NAVIGATOR_SHARD_SRCS + _NAVIGATOR_SUPPORT_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsNavigator",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsNavigatorAttention",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_navigator_attention_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_navigator_attention_lib",
+    testonly = True,
+    srcs = _NAVIGATOR_ATTENTION_SHARD_SRCS + _NAVIGATOR_SUPPORT_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsNavigatorAttention",
+    deps = [":boss_mac_app_lib"],
+)
+
 _COMMENTS_TRANSCRIPT_SHARD_SRCS = [
     "Tests/BossTests/CommentsTests.swift",
     "Tests/BossTests/TranscriptViewTests.swift",
 ]
 
 _SHARD1_SRCS = [
+    "Tests/BossTests/ResyncRefetchTests.swift",
+    "Tests/BossTests/AdmissionErrorCorrelationTests.swift",
+    "Tests/BossTests/TestSocketServer.swift",
     "Tests/BossTests/APIKeyStoreTests.swift",
     "Tests/BossTests/ApplyAttentionGroupsListTests.swift",
     "Tests/BossTests/AttachmentAffordanceTests.swift",
     "Tests/BossTests/DesignsTests.swift",
     "Tests/BossTests/EngineAutoChoreKanbanTests.swift",
+    "Tests/BossTests/EngineClientLifecycleOrderingTests.swift",
     "Tests/BossTests/KanbanExternalRefLinkTests.swift",
     "Tests/BossTests/KanbanRepoChipTests.swift",
     "Tests/BossTests/KanbanShortIDBadgeTests.swift",
@@ -166,10 +288,12 @@ _SHARD1_SRCS = [
     "Tests/BossTests/RevisionKanbanTests.swift",
     "Tests/BossTests/WorkBlockedBadgeTests.swift",
     "Tests/BossTests/WorkCreateRepoFieldTests.swift",
+    "Tests/BossTests/WorkFetchOwnershipTests.swift",
     "Tests/BossTests/WorkersWorkspaceModelTests.swift",
 ]
 
 _SHARD2_SRCS = [
+    "Tests/BossTests/AgentsToolbarLayoutTests.swift",
     "Tests/BossTests/ActiveProductsFilterTests.swift",
     "Tests/BossTests/ActivityLogTests.swift",
     "Tests/BossTests/AttentionGroupsListRaceTests.swift",
@@ -197,9 +321,31 @@ _SHARD2_SRCS = [
 ]
 
 macos_unit_test(
+    name = "EngineReconnectIntegrationTests",
+    size = "medium",
+    data = ["//tools/boss/engine/core:engine_fixture_test"],
+    env = XCODE_TEST_ENV,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":engine_reconnect_integration_tests_lib"],
+)
+
+swift_library(
+    name = "engine_reconnect_integration_tests_lib",
+    testonly = True,
+    srcs = [
+        "Tests/EngineIntegration/EngineReconnectIntegrationTests.swift",
+        "Tests/EngineIntegration/NavigatorLifecycleIntegrationTests.swift",
+    ],
+    module_name = "EngineReconnectIntegrationTests",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
     name = "BossTestsCommentsTranscript",
     size = "small",
     env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_comments_transcript_lib"],
@@ -208,7 +354,7 @@ macos_unit_test(
 swift_library(
     name = "boss_mac_app_tests_comments_transcript_lib",
     testonly = True,
-    srcs = _COMMENTS_TRANSCRIPT_SHARD_SRCS,
+    srcs = _COMMENTS_TRANSCRIPT_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsCommentsTranscript",
@@ -216,9 +362,50 @@ swift_library(
 )
 
 macos_unit_test(
+    name = "BossTestsChrome",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_chrome_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_chrome_lib",
+    testonly = True,
+    srcs = _CHROME_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsChrome",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsRender",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":boss_mac_app_tests_render_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_render_lib",
+    testonly = True,
+    srcs = _RENDER_SHARD_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "BossTestsRender",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
     name = "BossTestsShard1",
     size = "small",
     env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard1_lib"],
@@ -227,7 +414,7 @@ macos_unit_test(
 swift_library(
     name = "boss_mac_app_tests_shard1_lib",
     testonly = True,
-    srcs = _SHARD1_SRCS,
+    srcs = _SHARD1_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard1",
@@ -238,6 +425,7 @@ macos_unit_test(
     name = "BossTestsShard2",
     size = "small",
     env = XCODE_TEST_ENV,
+    infoplists = _BOSS_TESTS_INFOPLISTS,
     minimum_os_version = "15.0",
     runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard2_lib"],
@@ -246,23 +434,14 @@ macos_unit_test(
 swift_library(
     name = "boss_mac_app_tests_shard2_lib",
     testonly = True,
-    srcs = _SHARD2_SRCS,
+    srcs = _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
     linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard2",
     deps = [":boss_mac_app_lib"],
 )
 
-macos_unit_test(
-    name = "BossTestsShard3",
-    size = "small",
-    env = XCODE_TEST_ENV,
-    minimum_os_version = "15.0",
-    runner = "//tools/test-sandbox:macos_direct_test_runner",
-    deps = [":boss_mac_app_tests_shard3_lib"],
-)
-
-# TestSourcesDoNotCallRealOpenerTests.swift (which lands in this shard via the
+# TestSourcesDoNotCallRealOpenerTests.swift (included by the catch-all
 # glob below) scans all BossTests sources for banned real-OS-opener APIs. Under
 # `swift test`/Xcode it does that scan at test *runtime* using `#filePath`, but
 # `bazel test` compiles Swift with `-file-prefix-pwd-is-dot`, which rewrites
@@ -282,20 +461,30 @@ genrule(
     tools = ["Tests/BossTests/scan_for_real_openers.sh"],
 )
 
-swift_library(
-    name = "boss_mac_app_tests_shard3_lib",
-    testonly = True,
+# Same build-action pattern, pointed at the production sources: flags any
+# report-only modal (a SwiftUI `.alert(isPresented:)` or `NSAlert` with
+# fewer than two buttons, or any `.alert` driven by `workErrorMessage`) so
+# a non-actionable status/error message can never regain a modal dialog.
+# ReportOnlyAlertScanTests.swift asserts on the result; the rule is spelled
+# out in tools/boss/app-macos/AGENTS.md.
+genrule(
+    name = "generate_report_only_alert_scan",
+    srcs = glob(
+        ["Sources/**/*.swift"],
+        exclude = ["Sources/EngineBinaryName.swift"],
+    ),
+    outs = ["GeneratedReportOnlyAlertScanResult.swift"],
+    cmd = "bash $(location Tests/BossTests/scan_for_report_only_alerts.sh) $(SRCS) > $@",
+    tools = ["Tests/BossTests/scan_for_report_only_alerts.sh"],
+)
+
+app_test_shards(
     srcs = glob(
         ["Tests/BossTests/**/*.swift"],
-        exclude = _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS,
-    ) + [":generate_real_opener_scan"],
-    copts = [
-        "-DTEXTUAL_ENABLE_TEXT_SELECTION",
-        "-DBOSS_BAZEL_TEST_BUILD",
-    ],
+        exclude = _CHROME_SHARD_SRCS + _RENDER_SHARD_SRCS + _NAVIGATOR_SHARD_SRCS + _NAVIGATOR_ATTENTION_SHARD_SRCS + _NAVIGATOR_SUPPORT_SRCS + _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS + _BOSS_TESTS_PRINCIPAL_SRCS,
+    ),
     linkopts = _COVERAGE_LINKOPTS,
-    module_name = "BossTestsShard3",
-    deps = [":boss_mac_app_lib"],
+    principal_srcs = _BOSS_TESTS_PRINCIPAL_SRCS,
 )
 
 # Stamps CFBundleShortVersionString (full version, e.g. "1.0.4-dev-f3be785") and
@@ -315,9 +504,13 @@ macos_application(
     # a single `bazel build //tools/boss/app-macos:Boss` produces a fully
     # self-contained .app (design doc Q3 on-disk layout, Q4 Phase 1).
     # cube is bundled so the engine can find it even when the macOS GUI launchd
-    # PATH excludes the user's shell PATH (see config.rs resolve_cube_command).
-    # Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
-    # so they continue to resolve cube (and jj, gh, claude, etc.) from PATH.
+    # PATH excludes the user's shell PATH (see AgentConfig::load_for_engine in config.rs and
+    # boss_engine_worker_bin::resolve_cube_cli_for_engine).
+    # Boss-owned tools (boss, cube, bossctl, boss-event, repobin) are always run
+    # from this bundle by absolute path: the engine resolves them through
+    # //tools/boss/engine/worker-bin and workers get them via per-workspace
+    # launchers, never via a PATH search that a ~/bin repobin shim can win.
+    # Third-party tools (jj, gh, claude, etc.) still resolve from PATH.
     additional_contents = {
         ENGINE_BINARY_TARGET: "Resources/bin",
         "//tools/boss/cli:boss": "Resources/bin",
@@ -331,6 +524,10 @@ macos_application(
         # Bundled at Resources/ top level so the app resolves it with
         # Bundle.main.url(forResource: "relaunch-helper", withExtension: "sh").
         "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:relaunch_helper": "Resources",
+        # exit-observer: the helper's kqueue NOTE_EXITSTATUS probe for the new
+        # app's exit code / signal. Lives in Resources/bin/ with the other bundled
+        # Mach-Os so release.sh signs it (hardened runtime) before notarization.
+        "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:exit-observer": "Resources/bin",
     },
     bundle_id = "dev.spinyfin.bossmacapp",
     infoplists = [
@@ -342,10 +539,27 @@ macos_application(
     deps = [":boss_mac_app_lib"],
 )
 
+filegroup(
+    name = "handoff_prompt_source",
+    srcs = ["Sources/Ghostty/BossPaneModel.swift"],
+    visibility = ["//tools/boss/cli:__pkg__"],
+)
+
 # Production sources scanned by `//tools/boss/engine/core:tmux_only_surface_test`,
 # the architecture guard for the tmux-only local-pane invariant.
 filegroup(
     name = "swift_sources",
     srcs = glob(["Sources/**/*.swift"]),
     visibility = ["//tools/boss/engine/core:__pkg__"],
+)
+
+# The portrait grid table and the bundled sheet, scanned by
+# `//tools/boss/protocol:worker_roster_parity_test` against the Rust roster.
+filegroup(
+    name = "crew_roster_sources",
+    srcs = [
+        "Sources/TrekPortraitGrid.swift",
+        "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons",
+    ],
+    visibility = ["//tools/boss/protocol:__pkg__"],
 )

@@ -4,17 +4,26 @@ import Foundation
 /// task by the engine (`Task.operator_question`, `OperatorQuestionView` on the
 /// wire). `nil` on `WorkTask` once the question is answered or withdrawn.
 ///
-/// The card renders `text` inline and keeps `explanation` behind the "Why?"
-/// popover; `askedAt` orders the Doing column's "Needs Attention" section.
+/// The card renders `text` with labeled decision context from `explanation`;
+/// technical details stay in the "Why?" popover. `askedAt` orders awaiting-answer
+/// cards at the top of the Doing column's Queued section.
 struct OperatorQuestion: Hashable {
-    /// How the user answers. Mirrors `OperatorAnswerType`. Both kinds are
-    /// answered with Yes/No; a payload carrying any other kind is not decoded
-    /// (see [[parse(_:)]]) because the card has no UI to answer it.
+    /// How the user answers. Mirrors `OperatorAnswerType`. The yes/no and
+    /// prerequisite kinds are answered with two buttons (named by
+    /// [[optionLabels]] when the engine sent names, Yes / No otherwise), a
+    /// multiple-choice question with one button per option; a payload carrying any other kind
+    /// is not decoded (see [[parse(_:)]]) because the card has no UI to answer it.
     enum AnswerType: String, Hashable {
         case yesNo = "yes_no"
+        /// One button per entry of [[OperatorQuestion.choices]]; the answer is
+        /// the chosen string, verbatim.
+        case multipleChoice = "multiple_choice"
         /// The worker proposes a task that must land before it can proceed;
         /// the proposal rides on [[OperatorQuestion.prerequisiteTask]].
         case createPrerequisiteTask = "create_prerequisite_task"
+        /// Wait for an existing open task the worker named by id or PR;
+        /// the existing task rides on [[OperatorQuestion.prerequisiteTask]].
+        case linkPrerequisiteTask = "link_prerequisite_task"
     }
 
     let id: String
@@ -26,16 +35,29 @@ struct OperatorQuestion: Hashable {
     /// The run that asked; the answer restarts the task in a new run.
     let executionID: String
     var runSummary: String? = nil
-    /// The proposed task, present exactly when `answerType` is
-    /// `.createPrerequisiteTask`. The card shows it behind "Why?".
+    /// The proposed or existing task, present when `answerType` is
+    /// `.createPrerequisiteTask` or `.linkPrerequisiteTask`. The card
+    /// shows it behind "Why?".
     var prerequisiteTask: PrerequisiteTaskProposal? = nil
+    /// The options of a `.multipleChoice` question, in the worker's order;
+    /// empty for every other answer type.
+    var choices: [String] = []
+    /// What the engine calls the two answers of a prerequisite question whose
+    /// answers are distinct actions (Split / Bypass limit). `nil` for a genuine
+    /// Yes/No question and for any question stored before options were named,
+    /// which keep Yes / No. The card shows exactly what the engine sent.
+    var optionLabels: AnswerOptionLabels? = nil
+
+    /// How many options the engine accepts on a multiple-choice question
+    /// (`OperatorAnswerType::MIN_CHOICES` / `MAX_CHOICES`).
+    static let choiceCountRange = 2...6
 
     /// Decode the wire `operator_question` object. Absent / null / malformed
     /// → `nil`, and so is a question whose `answer_type.kind` this build
     /// cannot render: a stored question the card cannot answer would be a
     /// permanent park, so such a task falls back to the plain blocked card
     /// in Backlog (its tooltip already carries the question text via
-    /// `blocked_detail`) rather than a Needs Attention card with no buttons.
+    /// `blocked_detail`) rather than a Queued card with no buttons.
     static func parse(_ value: Any?) -> OperatorQuestion? {
         guard let dict = value as? [String: Any],
               let id = dict["id"] as? String,
@@ -54,6 +76,34 @@ struct OperatorQuestion: Hashable {
             else { return nil }
             prerequisiteTask = PrerequisiteTaskProposal(name: name, brief: brief)
         }
+        if answerType == .linkPrerequisiteTask {
+            guard let name = answerTypeDict["name"] as? String, !name.isEmpty
+            else { return nil }
+            prerequisiteTask = PrerequisiteTaskProposal(
+                name: name,
+                brief: "",
+                pullRequest: answerTypeDict["pr_url"] as? String,
+                existing: true
+            )
+        }
+        var optionLabels: AnswerOptionLabels? = nil
+        if answerType == .createPrerequisiteTask {
+            optionLabels = AnswerOptionLabels.parse(answerTypeDict["option_labels"])
+        }
+        var choices: [String] = []
+        if answerType == .multipleChoice {
+            // Options the card cannot render as distinct buttons make a
+            // question nobody can answer; fall back to the plain blocked card.
+            guard let wireChoices = answerTypeDict["choices"] as? [String],
+                  choiceCountRange.contains(wireChoices.count),
+                  // Compare scalars, as the engine compares bytes: String equality
+                  // would merge canonically equivalent spellings the engine
+                  // accepts as distinct.
+                  Set(wireChoices.map { Array($0.unicodeScalars.map(\.value)) }).count == wireChoices.count,
+                  !wireChoices.contains(where: { $0.isEmpty })
+            else { return nil }
+            choices = wireChoices
+        }
         return OperatorQuestion(
             id: id,
             text: text,
@@ -62,28 +112,56 @@ struct OperatorQuestion: Hashable {
             askedAt: askedAt,
             executionID: (dict["execution_id"] as? String) ?? "",
             runSummary: dict["run_summary"] as? String,
-            prerequisiteTask: prerequisiteTask
+            prerequisiteTask: prerequisiteTask,
+            choices: choices,
+            optionLabels: optionLabels
         )
     }
 }
 
-/// The task a blocked worker proposes as its prerequisite
-/// (`OperatorAnswerType::CreatePrerequisiteTask` on the wire).
+/// What the engine calls the two answers of a two-path question
+/// (`AnswerOptionLabels` on the wire). The card renders these verbatim.
+/// `yes` is the button that answers [[OperatorAnswer.yesNo]]`(true)`, `no` the
+/// one that answers `false`; the app attaches no meaning to the words.
+struct AnswerOptionLabels: Hashable {
+    let yes: String
+    let no: String
+
+    static func parse(_ value: Any?) -> AnswerOptionLabels? {
+        // Half a pair or indistinguishable names must fall back to Yes / No.
+        guard let wire = value as? [String: Any],
+              let yes = wire["yes"] as? String, let no = wire["no"] as? String,
+              !yes.isEmpty, !no.isEmpty, yes != no else { return nil }
+        return AnswerOptionLabels(yes: yes, no: no)
+    }
+}
+
+/// The task a blocked worker proposes as its prerequisite, or the existing
+/// task a link question waits for (`CreatePrerequisiteTask` /
+/// `LinkPrerequisiteTask` on the wire).
 struct PrerequisiteTaskProposal: Hashable {
     let name: String
-    /// The proposed task's self-contained brief.
+    /// The proposed task's self-contained brief. Empty on a link question.
     let brief: String
+    /// Bound pull request URL when the existing task owns one.
+    var pullRequest: String? = nil
+    /// `true` when this is an existing task to wait for, not a proposal to create.
+    var existing: Bool = false
 }
 
 /// The user's answer, shaped by the question's `AnswerType`. Encodes to
 /// the wire `OperatorAnswer` tagged object.
 enum OperatorAnswer: Equatable {
     case yesNo(Bool)
+    /// The chosen option of a multiple-choice question, exactly as offered.
+    case multipleChoice(String)
 
     var wirePayload: [String: Any] {
         switch self {
         case .yesNo(let value):
             return ["kind": "yes_no", "value": value]
+        case .multipleChoice(let value):
+            return ["kind": "multiple_choice", "value": value]
         }
     }
 }
@@ -107,9 +185,34 @@ struct OperatorQuestionPresentation: Equatable {
     /// Set for a "create a prerequisite task" question; the details popover
     /// shows the proposed task's name and brief.
     var prerequisiteTask: PrerequisiteTaskProposal? = nil
+    /// The options of a multiple-choice question, one button each; empty for
+    /// a Yes/No question, which keeps its Yes / No buttons.
+    var choices: [String] = []
+    /// Names for the two buttons of a prerequisite question whose answers are
+    /// distinct actions; `nil` keeps Yes / No.
+    var optionLabels: AnswerOptionLabels? = nil
 
     /// The inline question is capped here; the popover shows the whole text.
     static let inlineLineLimit = 3
+}
+
+extension OperatorQuestionPresentation {
+    /// Shared mapping from the engine's operator-question payload. Callers
+    /// keep their own gating (Kanban column vs Navigator family membership).
+    init(question: OperatorQuestion, answerInFlight: Bool, errorMessage: String?) {
+        self.init(
+            questionID: question.id,
+            text: question.text,
+            explanation: question.explanation,
+            askedAt: question.askedAt,
+            answerInFlight: answerInFlight,
+            errorMessage: errorMessage,
+            runSummary: question.runSummary,
+            prerequisiteTask: question.prerequisiteTask,
+            choices: question.choices,
+            optionLabels: question.optionLabels
+        )
+    }
 }
 
 /// User-readable text for the engine's typed `OperatorQuestionError`
@@ -125,8 +228,12 @@ enum OperatorQuestionFailure {
         case "conflict":
             let state = (dict["state"] as? String) ?? "closed"
             var message = "This question can no longer be answered (it was \(state))."
-            if let answer = dict["answer"] as? [String: Any], let yes = answer["value"] as? Bool {
-                message += " Recorded answer: \(yes ? "Yes" : "No")."
+            if let answer = dict["answer"] as? [String: Any] {
+                if let yes = answer["value"] as? Bool {
+                    message += " Recorded answer: \(yes ? "Yes" : "No")."
+                } else if let choice = answer["value"] as? String {
+                    message += " Recorded answer: \(choice)."
+                }
             }
             return message
         case "validation_failed":

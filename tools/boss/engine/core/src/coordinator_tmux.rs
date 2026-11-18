@@ -24,6 +24,9 @@ use crate::spawn_flow::TMUX_SESSION_SCHEMA;
 use crate::tmux_session_options::insert_color_environment;
 use crate::work::{CoordinatorTmuxRecord, WorkDb};
 
+pub mod inbox;
+pub mod reset_handoff;
+
 pub const COORDINATOR_SESSION_NAME: &str = "boss-coordinator";
 const SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 const SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
@@ -52,13 +55,13 @@ const PROMPT_NUDGE_HASH_KEY: &str = "coordinator.prompt_nudge_hash";
 /// [`coordinator_update_available`] for why the *comparison* is a separate,
 /// fully pure function.
 #[async_trait::async_trait]
-pub(crate) trait ClaudeVersionProbe: Send + Sync {
+pub trait ClaudeVersionProbe: Send + Sync {
     async fn probe(&self) -> Option<String>;
 }
 
 /// Production probe: shells out to `claude --version` with a bounded
 /// timeout. See [`probe_installed_claude_version`].
-pub(crate) struct RealClaudeVersionProbe;
+pub struct RealClaudeVersionProbe;
 
 #[async_trait::async_trait]
 impl ClaudeVersionProbe for RealClaudeVersionProbe {
@@ -76,7 +79,7 @@ impl ClaudeVersionProbe for RealClaudeVersionProbe {
 /// lifecycle function below take one borrowed context instead of
 /// threading the same five values through positionally at every call.
 #[derive(Clone, Copy, bon::Builder)]
-pub(crate) struct CoordinatorSpawn<'a> {
+pub struct CoordinatorSpawn<'a> {
     pub(crate) work_db: &'a WorkDb,
     pub(crate) tmux: &'a Tmux,
     pub(crate) create_tmux: &'a Tmux,
@@ -240,7 +243,7 @@ async fn recreate_and_record(
 /// resolve it once via [`coordinator_working_directory`]. `spawn.version_probe`
 /// is only ever consulted when this call actually creates a new session (see
 /// [`start_new`]).
-pub(crate) async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<CoordinatorTmuxRecord> {
+pub async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<CoordinatorTmuxRecord> {
     match spawn.work_db.coordinator_tmux_record()? {
         None => start_new(spawn, CoordinatorStartReason::FirstCreation)
             .await
@@ -256,7 +259,7 @@ pub(crate) async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<Co
 ///
 /// Returns the replacement record only when the viewer must reattach. A
 /// healthy session and a live model mismatch are deliberately left alone.
-pub(crate) async fn restart_if_dead(
+pub async fn restart_if_dead(
     spawn: &CoordinatorSpawn<'_>,
     supervisor_restart_churn_before: u32,
 ) -> Result<Option<CoordinatorTmuxRecord>> {
@@ -381,7 +384,7 @@ pub(crate) async fn restart_if_dead(
 /// unchecked that churns forever with no backoff and no operator signal, so
 /// `record_restart` gives that path its own escalating backoff and its own
 /// ceiling attention, reset only by a genuinely idle pass (`Ok(None)`).
-pub(crate) struct CoordinatorRestartFailures {
+pub struct CoordinatorRestartFailures {
     consecutive_failures: u32,
     ceiling_notified: bool,
     restart_churn: u32,
@@ -389,24 +392,30 @@ pub(crate) struct CoordinatorRestartFailures {
 }
 
 /// What the supervisor should do after recording a failed pass.
-pub(crate) struct RestartFailureDecision {
+pub struct RestartFailureDecision {
     pub delay: Duration,
     /// Raise the operator attention; true only the first time we reach the ceiling.
     pub notify: bool,
 }
 
 /// What the supervisor should do after recording a successful restart.
-pub(crate) struct RestartChurnDecision {
+pub struct RestartChurnDecision {
     pub delay: Duration,
     /// Raise the operator attention; true only the first time we reach the ceiling.
     pub notify: bool,
 }
 
-impl CoordinatorRestartFailures {
-    pub(crate) const LIMIT: u32 = 5;
-    pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(60);
+impl Default for CoordinatorRestartFailures {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    pub(crate) fn new() -> Self {
+impl CoordinatorRestartFailures {
+    pub const LIMIT: u32 = 5;
+    pub const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+    pub fn new() -> Self {
         Self {
             consecutive_failures: 0,
             ceiling_notified: false,
@@ -415,17 +424,17 @@ impl CoordinatorRestartFailures {
         }
     }
 
-    pub(crate) fn consecutive_failures(&self) -> u32 {
+    pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
 
-    pub(crate) fn restart_churn(&self) -> u32 {
+    pub fn restart_churn(&self) -> u32 {
         self.restart_churn
     }
 
     /// Record a genuinely healthy pass: no restart was needed. Resets both
     /// the failure counter and the restart-churn counter.
-    pub(crate) fn record_success(&mut self) {
+    pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.ceiling_notified = false;
         self.restart_churn = 0;
@@ -435,7 +444,7 @@ impl CoordinatorRestartFailures {
     /// Record a failed pass (`Err`, or session directory not ready). The
     /// retry cadence stays flat at `BACKOFF_CAP` once the ceiling is
     /// reached — the supervisor keeps retrying, it does not pause.
-    pub(crate) fn record_failure(&mut self) -> RestartFailureDecision {
+    pub fn record_failure(&mut self) -> RestartFailureDecision {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures < Self::LIMIT {
             return RestartFailureDecision {
@@ -456,7 +465,7 @@ impl CoordinatorRestartFailures {
     /// its own backoff (2s, 4s, 8s, 16s, 32s, capped at `BACKOFF_CAP`) so a
     /// crash-looping `claude` child cannot respawn every 2s forever, and
     /// raises its own ceiling attention once per streak.
-    pub(crate) fn record_restart(&mut self) -> RestartChurnDecision {
+    pub fn record_restart(&mut self) -> RestartChurnDecision {
         self.consecutive_failures = 0;
         self.ceiling_notified = false;
         self.restart_churn = self.restart_churn.saturating_add(1);
@@ -481,10 +490,11 @@ impl CoordinatorRestartFailures {
 /// created by a concurrent restart recovery. `reason` is recorded to the
 /// audit log so a manual reset is distinguishable there both from the
 /// automatic model-mismatch path and from a crash/session-loss restart.
-pub(crate) async fn recreate_after_confirmation(
+pub async fn recreate_after_confirmation(
     spawn: &CoordinatorSpawn<'_>,
     expected_spawn_token: &str,
     reason: CoordinatorRecreateReason,
+    force_without_handoff: bool,
 ) -> Result<CoordinatorTmuxRecord> {
     let mut record = spawn
         .work_db
@@ -537,7 +547,11 @@ pub(crate) async fn recreate_after_confirmation(
             },
             supervisor_restart_churn_before: None,
         },
-        CoordinatorStartReason::Recreate(reason),
+        if force_without_handoff {
+            CoordinatorStartReason::RecreateWithoutHandoff(reason)
+        } else {
+            CoordinatorStartReason::Recreate(reason)
+        },
     )
     .await
 }
@@ -733,7 +747,7 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
 /// `legacy_tmux` is `None` when the caller could not build a legacy handle
 /// (e.g. no resolved tmux executable yet) — in that case this always
 /// returns `socket_tmux`, matching the engine's pre-migration behavior.
-pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux: Option<&'a Tmux>) -> &'a Tmux {
+pub async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux: Option<&'a Tmux>) -> &'a Tmux {
     let Some(legacy) = legacy_tmux else {
         return socket_tmux;
     };
@@ -761,7 +775,7 @@ pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux
 /// Read the detached coordinator pane's real pid for the engine's trust
 /// root. A Ghostty surface attached to tmux is only a client and must not be
 /// recorded here.
-pub(crate) async fn pane_pid(tmux: &Tmux, record: &CoordinatorTmuxRecord) -> Result<libc::pid_t> {
+pub async fn pane_pid(tmux: &Tmux, record: &CoordinatorTmuxRecord) -> Result<libc::pid_t> {
     let raw = tmux
         .display_message(&record.session_name, DisplayField::PanePid)
         .await?;
@@ -903,6 +917,11 @@ async fn maybe_nudge_prompt_change(
         "Your coordinator instructions changed since this session started. Re-read {} now and follow the updated instructions.",
         prompt_path.display()
     );
+    let markers = crate::driver::DriverRegistry::default()
+        .require("claude")
+        .expect("the coordinator driver is registered")
+        .blocking_dialog_markers();
+    let tmux = tmux.clone().with_blocking_dialog_markers(markers);
     match tmux.send_keys(&record.session_name, &message).await {
         Ok(()) => {
             if let Err(error) = work_db.set_metadata(PROMPT_NUDGE_HASH_KEY, &current_hash) {
@@ -998,6 +1017,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         Ok(products) => {
             crate::coordinator_guidance::load_product_guidance(
                 design_docs,
+                work_db,
                 &products,
                 crate::coordinator_guidance::SESSION_START_FETCH_BUDGET,
                 boss_engine_utils::epoch_time::now_epoch_secs(),
@@ -1018,6 +1038,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         reason,
         &guidance,
         guidance_error.as_deref(),
+        &spawn_token,
     );
 
     let mut environment = BTreeMap::from([
@@ -1031,13 +1052,18 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         environment.insert("BOSS_BIN".to_owned(), format!("{bin_dir}/boss"));
     }
     insert_color_environment(&mut environment);
-    let quoted_model = boss_ssh_transport::shell_quote(model);
-    // The brief rides along as `claude`'s positional initial prompt — the
-    // same shape worker panes use for `.claude/initial-prompt.txt` — so the
-    // incoming session consumes it on its first turn with no pane injection
-    // and no dependence on it choosing to read a file.
+    // Keep one bounded input directory for this singleton session. The relay
+    // loads the brief before the next coordinator can replace these files.
+    let input_dir = working_directory.with_extension("coordinator-input");
+    std::fs::create_dir_all(&input_dir).context("creating private coordinator input home")?;
+    crate::driver::initial_prompt::warm_preflight()
+        .await
+        .context("checking python3 for coordinator terminal input")?;
+    crate::driver::initial_prompt::provision(&input_dir, &input_dir, &initial_prompt, &crate::driver::ClaudeDriver)
+        .context("provisioning coordinator terminal input")?;
+    let launch = inbox::relay_launch_command(&input_dir, "claude", model);
     let command = format!(
-        "{}unset ANTHROPIC_API_KEY; exec claude --model {quoted_model} --permission-mode auto {initial_prompt}",
+        "{}unset ANTHROPIC_API_KEY; {launch}",
         crate::runner::pane_spawn::path_prepend_clause("BOSS_BIN_DIR")
     );
     crate::tmux_session_options::prepare_server(tmux)
@@ -1085,11 +1111,10 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
 }
 
 /// Compose the session-start handoff brief for a fresh coordinator
-/// session, persist it under the session directory, and return the shell
-/// fragment that hands it to `claude` as the positional initial prompt.
+/// session, persist it under the session directory, and return its text for
+/// private terminal delivery.
 ///
-/// Never fails session creation. If the brief file cannot be written, the
-/// fragment is instead a short inline prompt that says so and points the
+/// If the archived brief cannot be written, return a short recovery prompt that says so and points the
 /// session at `boss handoff show` — the incoming session must never start
 /// silently, as if there were nothing to hand off, because the engine hit
 /// a filesystem error. Every outcome is audited as
@@ -1101,6 +1126,7 @@ fn prepare_session_start_brief(
     reason: CoordinatorStartReason,
     guidance: &[boss_protocol::CoordinatorGuidanceView],
     guidance_error: Option<&str>,
+    spawn_token: &str,
 ) -> String {
     let state = work_db.coordinator_handoff_state();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -1145,7 +1171,7 @@ fn prepare_session_start_brief(
             "write_error": written.as_ref().err().map(|error| format!("{error:#}")),
         }),
     );
-    match written {
+    let mut delivered = match written {
         Ok(path) => {
             tracing::info!(
                 path = %path.display(),
@@ -1153,16 +1179,13 @@ fn prepare_session_start_brief(
                 start_reason = reason.audit_label(),
                 "coordinator handoff: session-start brief written for the incoming session"
             );
-            format!(
-                "\"$(cat {})\"",
-                boss_ssh_transport::shell_quote(&path.to_string_lossy())
-            )
+            brief
         }
         Err(error) => {
             let error = format!("{error:#}");
             tracing::error!(
                 error = %error,
-                "coordinator handoff: could not write the session-start brief; launching with an inline notice instead"
+                "coordinator handoff: could not archive the session-start brief; preparing a private recovery notice instead"
             );
             audit::record_event(
                 "coordinator_handoff_brief",
@@ -1172,7 +1195,7 @@ fn prepare_session_start_brief(
                     "error": error,
                 }),
             );
-            boss_ssh_transport::shell_quote(&format!(
+            format!(
                 "[Boss coordinator session start] The engine could not write your session-start handoff brief \
                  ({error}). Stored handoff state per the engine: {}. Run `boss handoff show` now to read the \
                  stored coordinator handoff, tell the operator in your first reply that the brief could not be \
@@ -1180,9 +1203,29 @@ fn prepare_session_start_brief(
                  delivered. Before product-scoped work, run `boss guidance show` and report each product's \
                  guidance state in your first reply; a failure means unknown rules, not no guidance.",
                 state.audit_outcome()
-            ))
+            )
+        }
+    };
+    match work_db.coordinator_handoff_authorization() {
+        Ok(Some(authorization)) => {
+            delivered.push_str(&format!(
+                "\nPrivate handoff write authorization: {authorization}\nUse `boss handoff write --authorization {authorization} -`. Never share this credential with subagents or store it in shared files. After compaction, run `boss handoff show --redeliver` to request delivery to the main session inbox.\n"
+            ));
+            // The brief is the fresh session's first prompt, so adoption
+            // after a later engine restart must not redeliver the credential.
+            if let Err(error) = work_db.record_coordinator_handoff_authorization_delivered(spawn_token) {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "coordinator handoff: could not record that the brief carries the credential"
+                );
+            }
+        }
+        result => {
+            tracing::error!(?result, "coordinator handoff authorization unavailable");
+            delivered.push_str("\nHandoff authorization is unavailable; report this to the operator.\n");
         }
     }
+    delivered
 }
 
 /// Parse `claude --version` stdout, e.g. `"2.1.237 (Claude Code)\n"` — the
@@ -1250,7 +1293,7 @@ fn is_strictly_newer(installed: &str, running: &str) -> bool {
 /// date" state from this. Deliberately pure — `installed` is resolved by
 /// the caller (see `probe_installed_claude_version`/[`ClaudeVersionProbe`]),
 /// so this is directly testable without spawning a real process.
-pub(crate) fn coordinator_update_available(record: &CoordinatorTmuxRecord, installed: Option<&str>) -> Option<String> {
+pub fn coordinator_update_available(record: &CoordinatorTmuxRecord, installed: Option<&str>) -> Option<String> {
     let running = record.launched_claude_version.as_deref()?;
     let installed = installed?;
     is_strictly_newer(installed, running).then_some(installed.to_owned())
@@ -1259,7 +1302,7 @@ pub(crate) fn coordinator_update_available(record: &CoordinatorTmuxRecord, insta
 /// Resolve the production coordinator session directory under Application
 /// Support. Callers pass the result into lifecycle helpers so tests can
 /// inject a prepared temporary directory instead.
-pub(crate) fn coordinator_working_directory() -> Result<PathBuf> {
+pub fn coordinator_working_directory() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required for the coordinator session"))?;
     Ok(PathBuf::from(home)
         .join("Library")
@@ -1270,6 +1313,7 @@ pub(crate) fn coordinator_working_directory() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    mod reset_handoff_tests;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::Path;
@@ -1285,15 +1329,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".claude"), "not a directory").unwrap();
         let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
-        let prompt =
-            prepare_session_start_brief(&db, dir.path(), None, CoordinatorStartReason::FirstCreation, &[], None);
+        db.record_coordinator_tmux_spawn_intent("boss-coordinator", "fallback-token", "opus", None)
+            .unwrap();
+        let prompt = prepare_session_start_brief(
+            &db,
+            dir.path(),
+            None,
+            CoordinatorStartReason::FirstCreation,
+            &[],
+            None,
+            "fallback-token",
+        );
+        assert!(prompt.contains(&db.coordinator_handoff_authorization().unwrap().unwrap()));
+        assert!(
+            db.coordinator_handoff_authorization_delivered_to("fallback-token")
+                .unwrap(),
+            "a brief that carries the credential counts as delivering it"
+        );
         assert!(prompt.contains("Product guidance was NOT delivered"), "{prompt}");
         assert!(
             prompt.contains("Before product-scoped work, run `boss guidance show`"),
             "{prompt}"
         );
         assert!(prompt.contains("guidance state in your first reply"), "{prompt}");
-        assert!(prompt.contains("boss handoff show"), "{prompt}");
+        assert!(prompt.contains("boss handoff show --redeliver"), "{prompt}");
     }
 
     #[test]
@@ -1579,7 +1638,7 @@ mod tests {
                     }
                     (true, String::new(), String::new())
                 }
-                Some("start-server") | Some("new-session") | Some("kill-session") => {
+                Some("start-server") | Some("new-session") | Some("detach-client") | Some("if-shell") => {
                     (true, String::new(), String::new())
                 }
                 Some("send-keys") if self.send_keys_fails => (
@@ -1587,6 +1646,7 @@ mod tests {
                     String::new(),
                     "tmux server unreachable (fake failure)".to_owned(),
                 ),
+                Some("capture-pane") => (true, String::new(), String::new()),
                 Some("send-keys") => (true, String::new(), String::new()),
                 other => panic!("unexpected tmux command: {other:?}, args={args:?}"),
             };
@@ -2058,13 +2118,15 @@ mod tests {
         let calls = server.calls();
         let kill = calls
             .iter()
-            .position(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+            .position(|call| call.get(2).map(String::as_str) == Some("if-shell"))
             .unwrap();
         let new = calls
             .iter()
             .position(|call| call.get(2).map(String::as_str) == Some("new-session"))
             .unwrap();
         assert!(kill < new);
+        assert_eq!(calls[kill - 1][2], "detach-client");
+        assert_eq!(calls[kill - 1][4], format!("={COORDINATOR_SESSION_NAME}"));
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -2147,7 +2209,7 @@ mod tests {
             !server
                 .calls()
                 .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+                .any(|call| call.get(2).map(String::as_str) == Some("if-shell"))
         );
     }
 
@@ -2169,7 +2231,7 @@ mod tests {
             !server
                 .calls()
                 .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("kill-session")
+                .any(|call| call.get(2).map(String::as_str) == Some("if-shell")
                     || call.get(2).map(String::as_str) == Some("new-session"))
         );
     }
@@ -2199,6 +2261,7 @@ mod tests {
                 &spawn_ctx(&db, &tmux, &tmux, "sonnet", dir.path(), &NoneProbe),
                 "stale",
                 CoordinatorRecreateReason::OperatorReset,
+                false,
             )
             .await
             .is_err()
@@ -2207,7 +2270,7 @@ mod tests {
             !server
                 .calls()
                 .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+                .any(|call| call.get(2).map(String::as_str) == Some("if-shell"))
         );
     }
 
@@ -2238,6 +2301,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &FixedProbe("2.1.238")),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
@@ -2250,8 +2314,10 @@ mod tests {
         let kill = calls
             .iter()
             .position(|call| {
-                call.get(2).map(String::as_str) == Some("kill-session")
-                    && call.iter().any(|a| a == COORDINATOR_SESSION_NAME)
+                call.get(2).map(String::as_str) == Some("if-shell")
+                    && call
+                        .get(5)
+                        .is_some_and(|a| a == &format!("={COORDINATOR_SESSION_NAME}:"))
             })
             .expect("expected a kill-session for the coordinator");
         let old_pane_read = calls
@@ -2302,7 +2368,7 @@ mod tests {
         assert!(
             record_line["relaunch_command"]
                 .as_str()
-                .is_some_and(|command| command.contains("exec claude"))
+                .is_some_and(|command| command.contains("initial-prompt.py 'claude'"))
         );
     }
 
@@ -2317,6 +2383,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "sonnet", dir.path(), &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
@@ -2342,8 +2409,13 @@ mod tests {
         assert!(
             new_session
                 .iter()
-                .any(|arg| arg.contains("exec claude --model") && arg.contains("sonnet")),
+                .any(|arg| arg.contains("initial-prompt.py 'claude' --model") && arg.contains("sonnet")),
             "the replacement must launch the current claude binary with the requested model, got {new_session:?}"
+        );
+        assert!(
+            new_session.iter().any(|arg| arg.contains("--settings")
+                && arg.contains(&boss_ssh_transport::shell_quote(inbox::COORDINATOR_INBOUND_SETTINGS))),
+            "the coordinator must explicitly accept cross-session input for reset delivery, got {new_session:?}"
         );
     }
 
@@ -2363,14 +2435,17 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
 
         assert!(
             server.calls().iter().all(|call| {
-                call.get(2).map(String::as_str) != Some("kill-session")
-                    || call.iter().any(|a| a == COORDINATOR_SESSION_NAME)
+                call.get(2).map(String::as_str) != Some("if-shell")
+                    || call
+                        .get(5)
+                        .is_some_and(|a| a == &format!("={COORDINATOR_SESSION_NAME}:"))
             }),
             "no kill-session may name anything but the coordinator session"
         );
@@ -2387,6 +2462,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();
@@ -2394,7 +2470,7 @@ mod tests {
         let calls = server.calls();
         let kills = calls
             .iter()
-            .filter(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+            .filter(|call| call.get(2).map(String::as_str) == Some("if-shell"))
             .count();
         let creates = calls
             .iter()
@@ -2416,6 +2492,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", &missing, &NoneProbe),
             "token",
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap_err();
@@ -2648,17 +2725,25 @@ mod tests {
             .unwrap();
 
         let command = new_session_command(&server.calls()).expect("a new-session call");
-        let brief_path = dir
-            .path()
-            .join(".claude")
-            .join(coordinator_handoff::START_BRIEF_FILENAME);
-        let expected_fragment = format!(
-            "--permission-mode auto \"$(cat {})\"",
-            boss_ssh_transport::shell_quote(&brief_path.to_string_lossy())
-        );
-        assert!(
-            command.ends_with(&expected_fragment),
-            "launch command must hand the brief to claude as its positional initial prompt, got {command:?}"
+        assert!(command.contains("initial-prompt.py"), "{command}");
+        assert!(!command.contains("$(cat"), "{command}");
+        assert!(!command.contains("NO HANDOFF"), "{command}");
+        assert_eq!(
+            std::fs::read_to_string(
+                dir.path()
+                    .with_extension("coordinator-input")
+                    .join("initial-prompt.txt")
+            )
+            .unwrap(),
+            prepare_session_start_brief(
+                &db,
+                dir.path(),
+                None,
+                CoordinatorStartReason::FirstCreation,
+                &[],
+                None,
+                &db.coordinator_tmux_record().unwrap().unwrap().spawn_token,
+            ),
         );
         let brief = start_brief(dir.path());
         assert!(
@@ -2666,6 +2751,41 @@ mod tests {
             "the very first session must not be told a handoff is missing, got {brief:?}"
         );
         assert!(brief.contains("first coordinator session on this engine"), "{brief}");
+        let authorization = db.coordinator_handoff_authorization().unwrap().unwrap();
+        assert!(!brief.contains(&authorization));
+        fn assert_no_credential(path: &Path, credential: &str) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    assert_no_credential(&path, credential);
+                } else {
+                    assert!(
+                        !std::fs::read_to_string(&path).unwrap().contains(credential),
+                        "{}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_no_credential(dir.path(), &authorization);
+        assert!(
+            !server.calls().iter().flatten().any(|arg| arg.contains(&authorization)),
+            "credential must not be exported to tmux or launch arguments"
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join(RENDERED_PROMPT_FILENAME))
+                .unwrap()
+                .contains(&authorization)
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let brief_path = dir
+            .path()
+            .join(".claude")
+            .join(coordinator_handoff::START_BRIEF_FILENAME);
+        assert_eq!(
+            std::fs::metadata(brief_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
@@ -2768,8 +2888,7 @@ mod tests {
         let created = ensure_for_attach(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe))
             .await
             .unwrap();
-        db.set_metadata(coordinator_handoff::HANDOFF_METADATA_KEY, "{corrupt")
-            .unwrap();
+        db.set_metadata(crate::work::HANDOFF_METADATA_KEY, "{corrupt").unwrap();
 
         let (tmux, _server) = tmux_for(FakeTmux::new(
             vec![COORDINATOR_SESSION_NAME],
@@ -2780,6 +2899,7 @@ mod tests {
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe),
             &created.spawn_token,
             CoordinatorRecreateReason::OperatorReset,
+            false,
         )
         .await
         .unwrap();

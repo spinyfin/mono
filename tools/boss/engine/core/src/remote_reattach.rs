@@ -24,30 +24,10 @@
 //! [`crate::ssh_spawn::reestablish_events_forward`], unit-tested against a
 //! stubbed transport.
 
-use crate::host_adapter::HostAdapterProvider;
 use crate::work::WorkDb;
+use boss_execution_contracts::HostAdapterProvider;
 
-/// Tally from one [`reattach_remote_runs`] pass.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ReattachSummary {
-    /// Runs whose reverse events forward was re-established.
-    pub reattached: usize,
-    /// Runs whose host could not be resolved or whose adapter / forward
-    /// re-establishment failed. Logged per-run; the run stays in the DB
-    /// and a later pass (or manual `hosts probe`) can retry.
-    pub failed: usize,
-    /// Runs whose `host_id` no longer exists in the `hosts` table (host
-    /// removed since the run started). Counted separately from `failed`
-    /// because it is not an error the engine can recover from.
-    pub host_missing: usize,
-}
-
-impl ReattachSummary {
-    /// True when the pass touched at least one detached remote run.
-    pub fn had_candidates(&self) -> bool {
-        self.reattached + self.failed + self.host_missing > 0
-    }
-}
+pub use boss_execution_contracts::ReattachSummary;
 
 /// Re-establish reverse events forwards for every detached remote run the
 /// engine knows about. Best-effort and total: a failure on one run is
@@ -168,12 +148,12 @@ pub async fn reattach_remote_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_adapter::HostAdapter;
     use crate::host_registry::Host;
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, WorkDb};
     use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
+    use boss_execution_contracts::HostAdapter;
     use boss_protocol::RequestExecutionInput;
     use std::sync::Arc;
     use std::sync::Mutex;

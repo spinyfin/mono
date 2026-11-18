@@ -1,0 +1,55 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# The spoke package's enroll step is the only consumer so far (the daemon is
+# added to `visibility` in the PR that makes it depend on this crate).
+rust_library(
+    name = "spoke-credentials",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_spoke_credentials",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/spoke-package:__pkg__"],
+    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "spoke-credentials_test",
+    size = "small",
+    crate = ":spoke-credentials",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The client against the real hub-side credential authority (a real CA and
+# database, time under the test's control): enrollment, renewal, a lost reply,
+# and a crash between persisting the request and installing the answer.
+rust_test(
+    name = "lifecycle_test",
+    size = "small",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/lifecycle.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-credentials",
+        "//tools/boss/engine/host-enrollment",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -137,23 +137,29 @@ Conservative estimate, with the recommended cadence:
 
 The status is a string and a timestamp. Render rules:
 
-| Worker condition                                 | `live_status` content                                                                | UI render                                                                                      |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `Spawning`, no transcript yet                    | `None`                                                                               | empty (card shows existing activity dot only)                                                  |
-| `Working`, first summary still in flight         | `None`                                                                               | empty                                                                                          |
-| `Working`, summary landed                        | the sentence                                                                         | sentence                                                                                       |
-| `Idle` and last summary ≤ 30s old                | last sentence (still relevant)                                                       | sentence, dimmed                                                                               |
-| `Idle` > 30s                                     | cleared to `None`                                                                    | empty                                                                                          |
-| `WaitingForInput`                                | last sentence if recent, else `"awaiting input"`                                     | sentence, accent colour to match the "needs human" pill                                        |
-| `Errored`                                        | `"errored — check logs"` (literal)                                                   | sentence, red                                                                                  |
-| `Terminated`                                     | `None`                                                                               | (slot is being released anyway)                                                                |
-| Summarizer call failed                           | keep prior value (do not overwrite)                                                  | as before; `last_status_at` timestamp does not advance — the staleness UI takes over after 90s |
-| Summarizer call timed out (>5s)                  | keep prior; log and back off the timer to 120s for this slot for the next two cycles | as before                                                                                      |
-| No summarizer activity for >5min while `Working` | dim the rendered status and append `" (stale)"`                                      | dimmed sentence with `(stale)` suffix                                                          |
+| Worker condition                                 | `live_status` content                                                                 | UI render                                                                                      |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `Spawning`, no transcript yet                    | `None`                                                                                | empty (card shows existing activity dot only)                                                  |
+| `Working`, first summary still in flight         | `None`                                                                                | empty                                                                                          |
+| `Working`, summary landed                        | the sentence                                                                          | sentence                                                                                       |
+| `Idle` and last summary ≤ 30s old                | last sentence (still relevant)                                                        | sentence, dimmed                                                                               |
+| `Idle` > 30s                                     | cleared to `None`                                                                     | empty                                                                                          |
+| `WaitingForInput`                                | last sentence if recent, else `"awaiting input"`                                      | sentence, accent colour to match the "needs human" pill                                        |
+| `Errored`                                        | `"errored — check logs"` (literal)                                                    | sentence, red                                                                                  |
+| `Terminated`                                     | `None`                                                                                | (slot is being released anyway)                                                                |
+| Summarizer call failed                           | keep prior value (do not overwrite)                                                   | as before; `last_status_at` timestamp does not advance — the staleness UI takes over after 90s |
+| Summarizer reports `insufficient_input`          | keep prior value; engine logs an **error** naming the model's reason and what it sent | as before — the model's own "I can't tell" is never rendered as a status                       |
+| Summarizer reply is not a status-tool call       | keep prior value; engine logs an error (`malformed_reply`)                            | as before                                                                                      |
+| Summarizer call timed out (>5s)                  | keep prior; log and back off the timer to 120s for this slot for the next two cycles  | as before                                                                                      |
+| No summarizer activity for >5min while `Working` | dim the rendered status and append `" (stale)"`                                       | dimmed sentence with `(stale)` suffix                                                          |
 
 ### Why prefer "keep prior" over "blank" on failure
 
 A flickering label that empties on every transient API hiccup is worse than a label that's two minutes old. The pane_summary fallback story is the same — silent failure, retry next time.
+
+### Structured reply, never free text
+
+The summarizer forces a single tool call (`report_status`) rather than reading the model's first text block. Its input is either a `status` phrase or `insufficient_input: true` with a one-sentence `reason`; the engine reads the flag first, so an explanation the model also typed into `status` can never reach the card. This closed a field incident where a code-mode Codex worker's card read _"I don't have enough context from the transcript to determine…"_ verbatim: the model's meta-reply had come back as text and passed every post-filter, because nothing distinguished "a status" from "a sentence about not having a status". Text matching on the reply would be the wrong fix — the next phrasing would get through — so the distinction is structural. An `insufficient_input` reply is an engine error (logged with the reason, the number of transcript lines and redacted bytes sent, and the raw entry count), not a status, and the prior label is kept exactly as for any other failure. A reply that carries no tool call, or one outside the schema, is `malformed_reply` and handled the same way.
 
 ### "Awaiting input" literal
 
@@ -367,7 +373,7 @@ Transcripts contain raw tool output: file contents, bash output, environment var
 
 **Layer 1 — pre-summarizer redaction.** Before assembling the prompt, the engine runs the transcript window through a redactor that:
 
-- Strips any `tool_input` / `tool_response` JSON values longer than 2KB and replaces with `<truncated>`. (Removes the "we sent the entire file" attack surface.)
+- Clips any string value longer than 2KB to its first 256 bytes plus `<truncated>`. (Removes the "we sent the entire file" attack surface.) Only string leaves are ever replaced; the entry's structure — content blocks, tool names, keys — is walked, never collapsed. The first implementation replaced any `content` / `input` _container_ whose serialised size crossed the ceiling with the bare marker, which erased the tool name along with the payload: a code-mode Codex cell script longer than 2KB (or a Claude `Write` with a large body, or any assistant message past 2KB) vanished from the prompt entirely while its result still showed up as `tool: Bash returned <truncated>`. A long stretch of such tool calls therefore looked to the summarizer like no activity at all — the input that produced the `insufficient_input` incident above.
 - Replaces matches for high-confidence secret patterns with `<redacted>`:
   - Patterns: `sk-[A-Za-z0-9]{20,}`, `ghp_[A-Za-z0-9]{20,}`, `aws_[a-z_]*key[a-z_]*=\S+`, `AKIA[0-9A-Z]{16}`, `Bearer [A-Za-z0-9._-]+`, `password[=:]\s*\S+`, generic 32+ hex, generic 40+ base64.
   - Patterns are deliberately broad. False positives ("a stack trace got `<redacted>` in it") are fine; false negatives are not.

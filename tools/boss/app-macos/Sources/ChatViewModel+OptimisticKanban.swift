@@ -17,6 +17,7 @@ extension ChatViewModel {
 
     /// A drag-to-Doing waiting on its `EvaluateDispatchAdmission` reply.
     struct PendingDragAdmissionCheck: Equatable {
+        var requestID: String = UUID().uuidString
         let taskID: String
         let column: WorkBoardColumnKey
         let group: WorkBoardGroupKey?
@@ -67,8 +68,8 @@ extension ChatViewModel {
     /// its groups. That is strictly less intent than a group-qualified drop,
     /// and the engine treats it as such.
     func attemptDrop(_ taskID: String, onColumn column: WorkBoardColumnKey, group: WorkBoardGroupKey?) -> Bool {
+        guard canSubmitUserActions() else { return false }
         guard let task = task(withID: taskID) else { return false }
-        let group = group.flatMap { $0.isEngineBoardGroup ? $0 : nil }
 
         // Whether the card visibly moved. This is a *rendering* fact the
         // client already owns (it is how the board lays sections out), not a
@@ -137,8 +138,9 @@ extension ChatViewModel {
             // an ordinary drag on the hard-blocker check even with no
             // pause active at all, so it skips evaluation entirely and
             // goes straight to the normal drop below.
-            pendingDragAdmissionCheck = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
-            engine.sendEvaluateDispatchAdmission(workItemId: taskID)
+            let pending = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
+            pendingDragAdmissionChecks[taskID] = pending
+            engine.sendEvaluateDispatchAdmission(workItemId: taskID, requestId: pending.requestID)
             return true
         }
 
@@ -151,12 +153,13 @@ extension ChatViewModel {
     /// placed drop, offers a pause-only confirmation, or bounces the card
     /// back — see `attemptDrop`'s Doing-column branch for what queued this.
     func handleDispatchAdmissionEvaluated(_ admission: DispatchAdmission) {
-        guard let pending = pendingDragAdmissionCheck, pending.taskID == admission.workItemID else {
-            // Stale reply (superseded by a later drag) or an evaluation the
-            // app requested for some other reason — nothing to forward.
+        guard let pending = pendingDragAdmissionChecks[admission.workItemID] else {
+            engine.finishAdmissionRetry(taskID: admission.workItemID)
+            // Evaluation the app requested for some other reason (or already
+            // settled) — nothing to forward.
             return
         }
-        pendingDragAdmissionCheck = nil
+        pendingDragAdmissionChecks[admission.workItemID] = nil
 
         // Check "is there even a pause to override" FIRST. When there is
         // no active pause, this evaluation exists only to decide whether a
@@ -182,19 +185,21 @@ extension ChatViewModel {
         // force never lifts a hard blocker either.
         let hardBlockers = admission.hardBlockers
         if !hardBlockers.isEmpty {
-            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
+            engine.finishAdmissionRetry(taskID: pending.taskID)
+            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "), only: [pending.taskID])
             return
         }
 
         if !admission.pause.overridable {
+            engine.finishAdmissionRetry(taskID: pending.taskID)
             let reason = "dispatch is paused" + (admission.pause.reason.map { ": \($0)" } ?? "")
                 + " — this pause is not overridable"
-            bounceBackOptimisticMoves(message: reason)
+            bounceBackOptimisticMoves(message: reason, only: [pending.taskID])
             return
         }
 
         let taskName = task(withID: pending.taskID)?.name ?? pending.taskID
-        pendingPauseOverrideConfirmation = PauseOverrideConfirmation(
+        let confirmation = PauseOverrideConfirmation(
             taskID: pending.taskID,
             taskName: taskName,
             column: pending.column,
@@ -203,13 +208,24 @@ extension ChatViewModel {
             pausedSinceEpochS: admission.pause.pausedSinceEpochS,
             informationalBlockers: admission.blockers.filter { dispatchAdmissionInformationalOnlyBlockerCodes.contains($0.code) }
         )
+        if pendingPauseOverrideConfirmation == nil {
+            pendingPauseOverrideConfirmation = confirmation
+        } else {
+            queuedPauseOverrideConfirmations.append(confirmation)
+        }
+    }
+
+    /// Present the next queued confirmation, if any, once one is settled.
+    private func presentNextPauseOverrideConfirmation() {
+        pendingPauseOverrideConfirmation = queuedPauseOverrideConfirmations.isEmpty
+            ? nil : queuedPauseOverrideConfirmations.removeFirst()
     }
 
     /// Operator confirmed the pause-override dialog: send the drop with
     /// the confirmed bypass and the observed pause generation.
     func confirmPauseOverrideDrag() {
         guard let confirmation = pendingPauseOverrideConfirmation else { return }
-        pendingPauseOverrideConfirmation = nil
+        presentNextPauseOverrideConfirmation()
         engine.sendMoveWorkItemOnBoard(
             id: confirmation.taskID,
             column: confirmation.column,
@@ -222,19 +238,19 @@ extension ChatViewModel {
     /// Operator cancelled the pause-override dialog: bounce the
     /// optimistically-placed card back to its origin column.
     func cancelPauseOverrideDrag() {
-        guard pendingPauseOverrideConfirmation != nil else { return }
-        pendingPauseOverrideConfirmation = nil
-        bounceBackOptimisticMoves(message: nil)
+        guard let confirmation = pendingPauseOverrideConfirmation else { return }
+        engine.finishAdmissionRetry(taskID: confirmation.taskID)
+        presentNextPauseOverrideConfirmation()
+        bounceBackOptimisticMoves(message: nil, only: [confirmation.taskID])
     }
 
     /// Which of its column's named groups `task` currently renders in, or
-    /// `nil` for a column with no groups. Mirrors the Doing- and Done-column
-    /// splits in `computeWorkSections`; kept here so the drop path and the
-    /// section builder cannot drift.
+    /// `nil` for a column with no groups. Mirrors the Done-column split in
+    /// `computeWorkSections`; kept here so the drop path and the section
+    /// builder cannot drift. Doing's sections (Coding, Reviewing, Queued) are
+    /// engine-reported membership lanes, not drop-target groups.
     func boardGroup(for task: WorkTask) -> WorkBoardGroupKey? {
         switch effectiveBoardColumn(for: task) {
-        case .doing:
-            return task.isAwaitingOperatorAnswer ? .needsAttention : nil
         case .done:
             return task.isInMergingSection ? .merging : .completed
         default:
@@ -258,13 +274,32 @@ extension ChatViewModel {
         }
     }
 
+    /// Settles only drags that are not parked for Retry: a parked drag's
+    /// request is still in the unsent queue and its continuation must
+    /// survive until the user retries or discards it.
+    func bounceUnparkedDrags(message: String?, includeMovesWithoutCheck: Bool = true) {
+        let parked = engine.unsentDragTaskIDs()
+        var ids = Set(pendingDragAdmissionChecks.keys)
+        if includeMovesWithoutCheck { ids.formUnion(pendingMoveOriginByTaskID.keys) }
+        ids.subtract(parked)
+        guard !ids.isEmpty else { return }
+        for id in ids { pendingDragAdmissionChecks[id] = nil }
+        bounceBackOptimisticMoves(message: message, only: ids)
+    }
+
     /// Bounce all unconfirmed in-flight optimistic moves back to their origin
     /// columns and surface an inline notice. Called when `work_error` arrives
     /// while moves are pending, or when `workItemUpdated` reports an unexpected
     /// status (engine silently rejected the transition).
-    func bounceBackOptimisticMoves(message: String?) {
-        guard !pendingMoveOriginByTaskID.isEmpty else { return }
-        let bouncedIDs = Array(pendingMoveOriginByTaskID.keys)
+    /// Parked drags are excluded unless explicitly selected.
+    /// Returns whether any card was bounced, so a caller can fall back to a
+    /// modal error when nothing was eligible (e.g. only parked drags pending).
+    @discardableResult
+    func bounceBackOptimisticMoves(message: String?, only: Set<String>? = nil) -> Bool {
+        guard !pendingMoveOriginByTaskID.isEmpty else { return false }
+        let selected = only ?? Set(pendingMoveOriginByTaskID.keys).subtracting(engine.unsentDragTaskIDs())
+        let bouncedIDs = pendingMoveOriginByTaskID.keys.filter { selected.contains($0) }
+        guard !bouncedIDs.isEmpty else { return false }
         for id in bouncedIDs {
             optimisticColumnByTaskID.removeValue(forKey: id)
             pendingMoveOriginByTaskID.removeValue(forKey: id)
@@ -274,6 +309,7 @@ extension ChatViewModel {
             dragRefusalNotice = DragRefusalNotice(taskID: firstID, message: message)
             scheduleDragRefusalDismiss(for: firstID)
         }
+        return true
     }
 
     /// After the engine's work tree arrives and `tasksByProjectID` reflects

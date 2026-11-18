@@ -1,6 +1,16 @@
 # ==========================================
 # CI GARBAGE COLLECTION
 # ==========================================
+# The size cap below is only a fallback for bazel run by hand on a CI host.
+# Every CI step sources .buildkite/steps/ci-env.sh, which computes a cap from
+# the filesystem that actually holds the disk cache (80% of its total size)
+# and passes it on the command line after --config=ci-<os>, where it overrides
+# this value. 3T only ever fitted the 3.6 TB office hosts: on a smaller disk
+# the size-based GC never fires and the cache fills the disk, and an agent on
+# a full disk stays connected and accepts jobs it never runs. 3T is kept rather
+# than lowered because a hand-run command that evicts nothing is harmless,
+# whereas a small fallback would evict most of a 3.6 TB host's cache. See
+# .buildkite/linux-agents-runbook.md, "Disk-cache GC sizing".
 build:ci --experimental_disk_cache_gc_max_size=3T
 build:ci --experimental_disk_cache_gc_max_age=60d
 build:ci --experimental_disk_cache_gc_idle_delay=5m
@@ -17,8 +27,11 @@ build:ci --announce_rc
 # only take effect if something passed `--config=ci` as a startup flag (i.e.
 # before the subcommand) -- nothing does; `--config=ci-<os>` is always passed
 # as a build/test flag after the subcommand, which only reaches `build:ci`/
-# `test:ci` lines. Per-pipeline idle TTL is set directly on the command line
-# instead -- see CI_BAZEL_STARTUP_FLAGS in .buildkite/steps/ci-env.sh.
+# `test:ci` lines. The idle TTL (--max_idle_secs=1800, the same for every CI
+# pipeline and OS) is set on the command line instead -- see
+# CI_BAZEL_STARTUP_FLAGS in .buildkite/steps/ci-env.sh. That command-line
+# flag takes precedence over the local default of 7200s (2h) set by
+# `startup --max_idle_secs=7200` in the root .bazelrc.
 
 # Linux cache configuration
 build:ci-linux --config=ci
@@ -45,7 +58,67 @@ build:ci-darwin --disk_cache=/Volumes/ssd/bazel/disk_cache
 # at analysis/toolchain-config time instead of half-building.
 #
 # When the fleet's Xcode is upgraded, bump BOTH flags together.
-build:ci-darwin --xcode_version=26.5.0.17F42
-common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-26.5.0.app/Contents/Developer
+build:ci-darwin --xcode_version=27.2.0.27B52
+common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-27.2.0.app/Contents/Developer
 
+# ==========================================
+# REMOTE EXECUTION (macOS)
+# ==========================================
+# Selected by .buildkite/steps/ci-env.sh, after --config=ci-darwin, together
+# with --remote_executor and --remote_cache. The endpoint is not written here
+# on purpose: it comes from the agent's environment, and the conditions under
+# which a step executes remotely are in .buildkite/steps/remote-execution.sh.
+# Do not pass --config=ci-remote by hand without an executor: the test strategy
+# below names `remote` alone, so every test would fail to schedule.
+#
+# The disk cache from build:ci-darwin stays on, in front of the remote cache.
+# Do not switch it off here. One output base serves both kinds of step, and a
+# step that built on the agent leaves outputs that exist only as entries in
+# the disk cache. With the disk cache off, a remote step that needs one fails
+# with "Lost inputs no longer available remotely" and Bazel starts the build
+# again; with it on, the blob is found and uploaded.
+# The agent's own core count no longer bounds the build; the workers do.
+build:ci-remote --jobs=64
+# A remote failure fails the step. ci-env.sh decides once per step whether to
+# execute remotely, so a step never mixes worker results with agent results.
+# The one exception is the app build in .buildkite/steps/boss-release.sh, which
+# overrides this on its command line; the reason is in that script.
+build:ci-remote --noremote_local_fallback
+# Tests execute on the workers too; see `test:remote-tests` in .bazelrc.
+test:ci-remote --config=remote-tests
+# Blobs travel between the agent and the remote cache zstd-compressed. The
+# endpoint has to advertise zstd in its capabilities: against one that does
+# not, Bazel 9.1 fails the first action that touches the remote cache with
+# "--remote_cache_compression requested but remote does not support
+# compression". So do not switch compression off on the endpoint while this
+# line is here.
+build:ci-remote --remote_cache_compression
 
+# ==========================================
+# REMOTE EXECUTION (Linux)
+# ==========================================
+# Selected by .buildkite/steps/ci-env.sh on a Linux x86-64 agent, after
+# --config=ci-linux, together with --remote_executor and --remote_cache. As
+# with ci-remote above, the endpoint comes from the agent's environment and
+# the conditions are in .buildkite/steps/remote-execution.sh.
+#
+# The disk cache from build:ci-linux stays on, for the reason given under
+# ci-remote.
+build:ci-remote-linux --jobs=64
+build:ci-remote-linux --noremote_local_fallback
+build:ci-remote-linux --remote_cache_compression
+# The tag that routes the build: every action asks for a worker whose
+# OSFamily is linux, and the Linux scheduler offers an action only to workers
+# that declare that value. The property is part of each action's cache key, so
+# a step that executes remotely and one that builds on the agent do not share
+# results, in either the remote cache or the disk cache.
+build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux
+# Tests execute on the workers too; see `test:remote-tests` in .bazelrc. This
+# replaces `test:linux --strategy=TestRunner=linux-sandbox` for the step, so
+# Bazel's linux-sandbox is not around a test any more. The boundary is the
+# sandbox every Linux worker runs each action in,
+# tools/test-sandbox/linux_remote_action_sandbox.sh, and this line is only
+# sound while every worker on the endpoint runs it. Before pointing an agent
+# at an endpoint, or adding a worker to one, run the gate in
+# tools/test-sandbox/README.md, "Remote execution on Linux workers".
+test:ci-remote-linux --config=remote-tests

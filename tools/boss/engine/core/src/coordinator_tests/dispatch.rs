@@ -94,7 +94,7 @@ async fn record_run_completion_tears_down_driver_workspace_on_terminal_outcome()
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         wait_state: Some(RunWaitState::Terminal),
         ..FakeExecutionRunner::default()
@@ -655,12 +655,12 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("exec-busy-{i}"), None)
+            .claim_working(&format!("exec-busy-{i}"), None)
             .await
             .expect("idle slot below the cap");
     }
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     // Never dispatched: no run, no cube activity, still `ready`.
     assert!(db.active_run_ids_for_execution(&execution.id).unwrap().is_empty());
@@ -669,8 +669,8 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
     assert_eq!(held.status, ExecutionStatus::Ready);
     let reason = held.dispatch_wait_reason.unwrap_or_default();
     assert!(
-        reason.contains("interactive concurrency cap"),
-        "wait reason should name the cap, got: {reason}",
+        reason.contains("Waiting for an available worker"),
+        "wait reason should say it is waiting for a worker, got: {reason}",
     );
 
     // `bossctl dispatch stats` derives the held-row view entirely from
@@ -706,7 +706,7 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
 
     // One worker frees → the next drain dispatches the held row.
     coordinator.worker_pool().release_worker("worker-1", None).await;
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert!(
         !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
@@ -817,12 +817,12 @@ async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
             .worker_pool()
-            .claim_worker(&format!("exec-busy-{i}"), None)
+            .claim_working(&format!("exec-busy-{i}"), None)
             .await
             .expect("idle slot below the cap");
     }
 
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     assert!(
         db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
         "row must be held at the cap before it is raised",
@@ -835,7 +835,7 @@ async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
         .set_max_concurrent_interactive_workers(MAX_CONCURRENT_INTERACTIVE_WORKERS + 1)
         .expect("in-range raise applies verbatim");
     assert_eq!(outcome.applied, MAX_CONCURRENT_INTERACTIVE_WORKERS + 1);
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
 
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert!(
@@ -879,7 +879,7 @@ async fn pin_to_disabled_host_yields_no_eligible_host() {
         .await
         .expect("worker available");
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "no eligible host must fail the dispatch");
 
@@ -924,7 +924,7 @@ async fn host_selection_fails_closed_when_enabled_local_has_no_driver_capability
         .await
         .expect("worker available");
     let err = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await
         .unwrap_err();
     assert!(
@@ -973,7 +973,7 @@ async fn no_eligible_host_emits_terminal_host_selected_error_event() {
         .await
         .expect("worker available");
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "no eligible host must fail the dispatch");
 
@@ -1288,7 +1288,9 @@ async fn release_worker_and_kick_frees_pool_slot() {
         .expect("pool has free slots");
     assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 
-    coordinator.release_worker_and_kick(&claimed, Some("ws-1")).await;
+    coordinator
+        .release_worker_and_kick(&claimed, "exec-pre", Some("ws-1"))
+        .await;
 
     assert_eq!(
         coordinator.worker_pool().idle_count().await,
@@ -1298,7 +1300,9 @@ async fn release_worker_and_kick_frees_pool_slot() {
     // Idempotent: a second release on the same already-idle slot
     // is a no-op (the pane-spawn lifecycle can racily re-enter
     // this path from completion + chore-done).
-    coordinator.release_worker_and_kick(&claimed, Some("ws-1")).await;
+    coordinator
+        .release_worker_and_kick(&claimed, "exec-pre", Some("ws-1"))
+        .await;
     assert_eq!(coordinator.worker_pool().idle_count().await, 2);
 }
 
@@ -1463,4 +1467,285 @@ async fn successful_remote_launch_keeps_persona_lease_and_live_state() {
         .unwrap();
     let second_persona = db.persona_display_name(&second.id).unwrap().expect("second persona");
     assert_ne!(second_persona, persona, "reserved persona must not be reallocated");
+}
+
+// ── `critical` priority: the human-only escape hatch ─────────────────────
+//
+// See `work/critical_priority.rs`. A critical row is sorted ahead of every
+// non-critical row, is not held by the interactive concurrency cap, and
+// still dispatches under an operator pause. These tests pin each of those
+// three properties against the gates in `drain_ready_queue`.
+
+fn raise_to_critical(db: &WorkDb, task_id: &str) {
+    db.update_work_item_as_actor(
+        task_id,
+        WorkItemPatch {
+            priority: Some("critical".to_owned()),
+            ..WorkItemPatch::default()
+        },
+        boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+    )
+    .expect("a human may raise to critical");
+}
+
+/// With the interactive pool at its concurrency cap, a drain pass still
+/// dispatches a `critical` row into one of the idle slots beyond the cap,
+/// while a sibling `high` row is held by the cap exactly as before.
+#[tokio::test]
+async fn critical_item_dispatches_past_a_full_interactive_cap() {
+    use crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS;
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let urgent = create_test_chore(&db, product.id.clone(), "Critical fix");
+    let ordinary = create_test_chore(&db, product.id.clone(), "Held by cap");
+    db.reconcile_product_executions(&product.id).unwrap();
+    // Raised AFTER its execution was queued: the exemption keys on the
+    // task's current level, not the level at enqueue time.
+    raise_to_critical(&db, &urgent.id);
+    let urgent_execution = db.list_executions(Some(&urgent.id)).unwrap().pop().unwrap();
+    let ordinary_execution = db.list_executions(Some(&ordinary.id)).unwrap().pop().unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(MAX_CONCURRENT_INTERACTIVE_WORKERS + 4),
+            cube.clone(),
+            runner.clone(),
+        )
+        .with_pre_start_retry_delays(Vec::new())
+        .with_dispatch_events(recording.clone()),
+    );
+    for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
+        coordinator
+            .worker_pool()
+            .claim_working(&format!("exec-busy-{i}"), None)
+            .await
+            .expect("idle slot below the cap");
+    }
+
+    coordinator.drain_ready_queue_for_test().await;
+
+    wait_for_execution_status(db.as_ref(), &urgent_execution.id, ExecutionStatus::Running).await;
+    assert!(
+        !db.active_run_ids_for_execution(&urgent_execution.id)
+            .unwrap()
+            .is_empty(),
+        "the critical row must take a slot beyond the cap",
+    );
+    let request_recorded = recording
+        .events_for(&urgent_execution.id)
+        .await
+        .into_iter()
+        .find(|e| e.stage == crate::dispatch_events::Stage::RequestRecorded.as_str())
+        .expect("the critical row must enter the dispatch pipeline");
+    assert_eq!(
+        request_recorded.details.get("critical").and_then(|v| v.as_bool()),
+        Some(true),
+        "dispatch events must flag the row as critical for `bossctl dispatch stats`: {:?}",
+        request_recorded.details,
+    );
+
+    let held = db.get_execution(&ordinary_execution.id).unwrap();
+    assert_eq!(
+        held.status,
+        ExecutionStatus::Ready,
+        "the ordinary row stays held by the cap"
+    );
+    assert!(
+        held.dispatch_wait_reason
+            .unwrap_or_default()
+            .contains("Waiting for an available worker"),
+        "the ordinary row must still report the cap hold",
+    );
+    // No worker was preempted or killed to make room.
+    assert_eq!(
+        coordinator.worker_pool().busy_count().await,
+        MAX_CONCURRENT_INTERACTIVE_WORKERS + 1,
+        "the critical row must add a live worker, never replace one",
+    );
+}
+
+/// A `critical` row beats an older `high` row that also carries a higher
+/// execution-level priority for the single free slot: the critical key
+/// sorts ahead of dispatch class, execution priority, and age alike.
+#[tokio::test]
+async fn critical_item_is_picked_before_older_high_priority_items() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let older = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Older high")
+                .priority("high")
+                .build(),
+        )
+        .unwrap();
+    let newer = create_test_chore(&db, product.id.clone(), "Newer critical");
+    db.reconcile_product_executions(&product.id).unwrap();
+    // The older row also wins every pre-existing tiebreak: a bumped
+    // execution-level priority on top of its earlier creation.
+    db.request_execution(
+        RequestExecutionInput::builder()
+            .work_item_id(older.id.clone())
+            .priority(10)
+            .build(),
+    )
+    .unwrap();
+    raise_to_critical(&db, &newer.id);
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_pre_start_retry_delays(Vec::new()),
+    );
+    coordinator.drain_ready_queue_for_test().await;
+
+    let newer_execution = db.list_executions(Some(&newer.id)).unwrap().pop().unwrap();
+    wait_for_execution_status(db.as_ref(), &newer_execution.id, ExecutionStatus::Running).await;
+    let older_execution = db.list_executions(Some(&older.id)).unwrap().pop().unwrap();
+    assert_eq!(
+        older_execution.status,
+        ExecutionStatus::Ready,
+        "the older high-priority row must still be queued behind the critical one",
+    );
+}
+
+/// Under an operator dispatch pause a `critical` row still dispatches,
+/// while a non-critical row stays held with the ordinary pause reason —
+/// and the pause itself is untouched.
+#[tokio::test]
+async fn critical_item_dispatches_while_dispatch_is_paused_and_non_critical_stays_held() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let urgent = create_test_chore(&db, product.id.clone(), "Critical fix");
+    let ordinary = create_test_chore(&db, product.id.clone(), "Ordinary");
+    db.reconcile_product_executions(&product.id).unwrap();
+    raise_to_critical(&db, &urgent.id);
+    let urgent_execution = db.list_executions(Some(&urgent.id)).unwrap().pop().unwrap();
+    let ordinary_execution = db.list_executions(Some(&ordinary.id)).unwrap().pop().unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(2), cube.clone(), runner.clone())
+            .with_pre_start_retry_delays(Vec::new())
+            .with_dispatch_events(recording.clone()),
+    );
+    coordinator.pause_dispatch(
+        0,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
+
+    coordinator.drain_ready_queue_for_test().await;
+
+    wait_for_execution_status(db.as_ref(), &urgent_execution.id, ExecutionStatus::Running).await;
+    let held = db.get_execution(&ordinary_execution.id).unwrap();
+    assert_eq!(
+        held.status,
+        ExecutionStatus::Ready,
+        "the non-critical row must stay held"
+    );
+    assert_eq!(
+        held.dispatch_wait_reason.as_deref(),
+        Some("dispatch_paused"),
+        "the held row reports the ordinary pause reason",
+    );
+    assert!(
+        coordinator.is_dispatch_paused(),
+        "dispatching a critical row must not resume global dispatch",
+    );
+    assert_eq!(
+        coordinator.dispatch_paused_reason().as_deref(),
+        Some("test: operator pause"),
+        "the pause reason is untouched",
+    );
+}
+
+/// The one pause a `critical` row does NOT get past: a breaker-origin
+/// pause means the spawn path itself is broken, so the row is held like
+/// everything else rather than spent against a dead path.
+#[tokio::test]
+async fn critical_item_is_still_held_by_a_breaker_pause() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let urgent = create_test_chore(&db, product.id.clone(), "Critical fix");
+    db.reconcile_product_executions(&product.id).unwrap();
+    raise_to_critical(&db, &urgent.id);
+    let urgent_execution = db.list_executions(Some(&urgent.id)).unwrap().pop().unwrap();
+
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(2),
+        Arc::new(FakeCubeClient::default()),
+        runner.clone(),
+    ));
+    coordinator.pause_dispatch(
+        0,
+        DispatchPauseOrigin::Breaker,
+        PauseReason::new("test: breaker pause").unwrap(),
+    );
+
+    coordinator.drain_ready_queue_for_test().await;
+
+    assert_eq!(
+        runner.calls.lock().await.len(),
+        0,
+        "no run may start under a breaker pause"
+    );
+    let held = db.get_execution(&urgent_execution.id).unwrap();
+    assert_eq!(held.status, ExecutionStatus::Ready);
+    assert_eq!(held.dispatch_wait_reason.as_deref(), Some("dispatch_paused"));
+}
+
+#[test]
+fn critical_rows_are_oldest_first_despite_execution_priority_and_class() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let product = create_test_product(&db);
+    let older = create_test_chore(&db, product.id.clone(), "Older critical");
+    let newer = create_test_chore(&db, product.id.clone(), "Newer critical");
+    db.reconcile_product_executions(&product.id).unwrap();
+    raise_to_critical(&db, &older.id);
+    raise_to_critical(&db, &newer.id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = '2026-01-01T00:00:00Z' WHERE work_item_id = ?1",
+            rusqlite::params![older.id],
+        )
+        .unwrap();
+    db.connect().unwrap().execute(
+        "UPDATE work_executions SET created_at = '2026-01-02T00:00:00Z', priority = 10, kind = 'revision_implementation' WHERE work_item_id = ?1",
+        rusqlite::params![newer.id],
+    ).unwrap();
+    let ready = db.list_ready_executions().unwrap();
+    assert_eq!(ready[0].work_item_id, older.id);
+    assert_eq!(ready[1].work_item_id, newer.id);
 }

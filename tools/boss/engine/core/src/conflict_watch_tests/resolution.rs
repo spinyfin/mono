@@ -49,13 +49,13 @@ async fn resolution_retires_attempt_when_parent_was_in_review() {
     );
 }
 
-/// T3 (this chore): a resolved merge-conflict attempt must close the
-/// revision task it spawned, not just its own `conflict_resolutions` row —
-/// otherwise the parent shows a phantom "in revision" badge until the
-/// parent's PR eventually merges (or forever, if the revision never
-/// advances on its own; see the 2026-07-16 incident). A freshly-spawned,
-/// never-dispatched revision has no live execution, so `on_resolved` must
-/// close it out (archived as moot) immediately.
+/// A resolved merge-conflict attempt must close the revision task it spawned,
+/// not just its own `conflict_resolutions` row — otherwise the parent shows a
+/// phantom "in revision" badge until the parent's PR eventually merges (or
+/// forever, if the revision never advances on its own; see the 2026-07-16
+/// incident). A freshly-spawned, never-dispatched revision has no live
+/// execution, so `on_resolved` must close it out (archived as moot)
+/// immediately.
 #[tokio::test]
 async fn resolution_closes_the_revision_task_it_spawned() {
     let dir = tempdir().unwrap();
@@ -343,5 +343,92 @@ async fn cycle_conflict_resolve_conflict() {
             "conflict_revision_in_flight".to_owned(),
             "blocked_merge_conflict".to_owned(),
         ],
+    );
+}
+
+fn file_lockfile_attention(db: &WorkDb, work_item_id: &str) {
+    db.create_attention_item(crate::work::CreateAttentionItemInput {
+        work_item_id: Some(work_item_id.to_owned()),
+        kind: crate::conflict_ladder::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND.to_owned(),
+        title: "Lockfile conflict could not be regenerated automatically".to_owned(),
+        body_markdown: "test".to_owned(),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    })
+    .unwrap();
+}
+
+fn open_lockfile_attention_count(db: &WorkDb, work_item_id: &str) -> usize {
+    db.list_attention_items_for_work_item(work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.kind == crate::conflict_ladder::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND && i.status == "open")
+        .count()
+}
+
+#[tokio::test]
+async fn resolving_the_conflict_clears_lockfile_regeneration_attention() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/83";
+    let (product, chore) = make_in_review(&db, "C-lockfile-attn-clear", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+    db.insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+        product_id: product.clone(),
+        work_item_id: chore.clone(),
+        pr_url: pr.into(),
+        pr_number: 83,
+        head_branch: "feature".into(),
+        base_branch: "main".into(),
+        base_sha_at_trigger: Some("abc123".into()),
+        head_sha_before: Some("head456".into()),
+    })
+    .unwrap()
+    .expect("attempt");
+    file_lockfile_attention(&db, &chore);
+    assert_eq!(open_lockfile_attention_count(&db, &chore), 1);
+
+    assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await);
+    assert_eq!(
+        open_lockfile_attention_count(&db, &chore),
+        0,
+        "clearing the conflict must resolve the lockfile-regeneration attention item"
+    );
+}
+
+#[tokio::test]
+async fn retrying_a_failed_attempt_clears_lockfile_regeneration_attention() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/84";
+    let (product, chore) = make_in_review(&db, "C-lockfile-attn-retry", pr);
+    db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+    let attempt = db
+        .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+            product_id: product,
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 84,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("abc123".into()),
+            head_sha_before: Some("head456".into()),
+        })
+        .unwrap()
+        .expect("attempt");
+    db.mark_conflict_resolution_failed(&attempt.id, "lockfile_regeneration_failed: Cargo.lock")
+        .unwrap();
+    file_lockfile_attention(&db, &chore);
+    assert_eq!(open_lockfile_attention_count(&db, &chore), 1);
+
+    db.retry_conflict_resolution(&attempt.id)
+        .unwrap()
+        .expect("retry must reset the failed row");
+    assert_eq!(
+        open_lockfile_attention_count(&db, &chore),
+        0,
+        "re-arming the attempt must resolve the lockfile-regeneration attention item"
     );
 }

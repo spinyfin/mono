@@ -102,7 +102,7 @@ pub struct Project {
     pub created_at: String,
     pub description: String,
     pub goal: String,
-    /// Who made the most recent status change. Four values, parseable as
+    /// Who made the most recent status change. Five values, parseable as
     /// [`StatusActor`]:
     /// - `'human'` (default) — a CLI / app caller with no registered
     ///   Boss-session ancestry, or a drag-drop gesture in the macOS app.
@@ -114,10 +114,12 @@ pub struct Project {
     /// - `'boothby'` — the autonomous groundskeeper decided this row was
     ///   stale / empty / wedged during a maintenance pass. Audited with
     ///   pre/post images in `boothby_actions`, and undoable from there.
+    /// - `'progression'` — a scoped progression session unblocked or advanced
+    ///   this row. A deliberate per-row decision, not an engine cascade.
     ///
     /// The auto-unblock path only flips a `blocked` row back to `todo`
-    /// when this is `'engine'` — manual, Boss-driven and Boothby blocks
-    /// all stick, because each is a deliberate decision about this row
+    /// when this is `'engine'` — manual, Boss-driven, Boothby and progression
+    /// blocks all stick, because each is a deliberate decision about this row
     /// rather than cascade bookkeeping the engine owns reversing. See
     /// [`StatusActor::is_engine_cascade`], which states that rule once.
     #[serde(default = "default_human_actor")]
@@ -156,6 +158,32 @@ pub struct Project {
     /// separate-doc-repo case at work).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_doc_repo_remote_url: Option<String>,
+
+    /// When the owner parked this project (epoch seconds, decimal string).
+    /// `None` → not parked. Parking a project also stamps every open child
+    /// task (see [`Task::parked_via`](super::task::Task::parked_via)); its
+    /// `parked_via` is always `direct` in v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at: Option<String>,
+
+    /// Status actor that parked the project (`human` or `boss`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_by: Option<String>,
+
+    /// Optional free text from the owner explaining the park.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_reason: Option<String>,
+
+    /// Always `direct` for projects in v1; present for symmetry with tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_via: Option<String>,
+}
+
+impl Project {
+    /// `true` when the owner parked this project and it is still open.
+    pub fn is_parked(&self) -> bool {
+        self.parked_at.is_some() && !matches!(self.status, ProjectStatus::Done | ProjectStatus::Archived)
+    }
 }
 
 /// Wire-level state returned by `ResolveProjectDesignDoc`. The UI

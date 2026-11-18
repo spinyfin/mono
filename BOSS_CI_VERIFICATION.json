@@ -1,0 +1,32 @@
+{
+  "mono/mac-app-build": [
+    {
+      "kind": "build",
+      "tool": "bazel",
+      "command": "bazel build //tools/boss/app-macos/... //tools/boss/installer/..."
+    },
+    {
+      "kind": "test",
+      "tool": "bazel",
+      "command": "bazel test --test_output=errors //tools/boss/app-macos/..."
+    },
+    {
+      "kind": "test",
+      "tool": "bazel",
+      "command": "bazel test --test_output=errors //tools/boss/installer/..."
+    }
+  ],
+  "mono/bazel-build-test": [
+    {
+      "kind": "build",
+      "tool": "bazel",
+      "command": "bazel build --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/..."
+    },
+    {
+      "kind": "test",
+      "tool": "bazel",
+      "command": "bazel test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/..."
+    }
+  ],
+  "mono/checks": [{ "kind": "lint", "tool": "project", "command": "checkleft run" }]
+}

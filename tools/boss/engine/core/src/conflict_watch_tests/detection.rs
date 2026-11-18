@@ -43,6 +43,15 @@ async fn detection_keeps_parent_in_review_when_revision_spawns() {
     let attempt = attempt.unwrap();
     assert_eq!(attempt.status, "pending");
     assert!(attempt.revision_task_id.is_some(), "revision must have been spawned");
+    let typed = pub_.typed_events.lock().await;
+    assert!(
+        typed.iter().any(|(_, event)| matches!(
+            event,
+            FrontendEvent::ConflictResolutionStarted { attempt: row, .. }
+                if row.extra.get("revision_task_id") == attempt.revision_task_id.as_ref()
+        )),
+        "push must include the revision attached during detection"
+    );
 }
 
 /// When `create_revision` fails (parent PR closed/unmerged) or the churn cap
@@ -82,6 +91,15 @@ async fn detection_blocks_parent_when_revision_fails() {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].status, "abandoned");
     assert_eq!(attempts[0].failure_reason.as_deref(), Some("revision_create_failed"),);
+    let typed = pub_.typed_events.lock().await;
+    assert!(
+        typed.iter().any(|(_, event)| matches!(
+            event,
+            FrontendEvent::ConflictResolutionAbandoned { attempt: row, .. }
+                if row.status == "abandoned" && row.failure_reason.as_deref() == Some("revision_create_failed")
+        )),
+        "a failed dispatch must publish the resulting abandoned row"
+    );
 }
 
 #[tokio::test]

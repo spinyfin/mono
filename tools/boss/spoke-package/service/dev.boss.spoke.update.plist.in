@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{{label}}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{installer}}</string>
+		<string>apply-update</string>
+		<string>--config</string>
+		<string>{{config}}</string>
+	</array>
+	<key>WatchPaths</key>
+	<array>
+		<string>{{request}}</string>
+		<string>{{claimed}}</string>
+		<string>{{active}}</string>
+	</array>
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>{{request}}</key>
+			<true/>
+			<key>{{claimed}}</key>
+			<true/>
+			<key>{{active}}</key>
+			<true/>
+		</dict>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>TimeOut</key>
+	<integer>2700</integer>
+	<key>Nice</key>
+	<integer>5</integer>
+</dict>
+</plist>

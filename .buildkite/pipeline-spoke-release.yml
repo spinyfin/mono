@@ -1,0 +1,34 @@
+# mono-spoke-release Buildkite pipeline.
+#
+# Cuts a GitHub Release of the signed `boss-spoke` worker-host packages on
+# spinyfin/mono, tagged boss-spoke-vX.Y.Z, with one package, manifest, detached
+# signature, standalone installer and installer signature per platform. The hub-and-spoke design
+# (tools/boss/docs/designs/hub-and-spoke-distributed-engine.md, "Manual
+# enrollment and upgrades") installs these by hand on each worker host.
+#
+# This is a SEPARATE pipeline from the main `mono` CI pipeline, modeled on the
+# checkleft release (.buildkite/pipeline-checkleft-release.yml). Registration is
+# NOT automatic: it ships inert until the fleet administrator registers it and
+# stores the release signing key. See tools/boss/spoke-package/README.md.
+#
+# Trigger model: scheduled (cron) builds skip unless a spoke crate changed since
+# the last tag; manual builds always release. Do not wire it to build on push.
+#
+# Structure: a static `prepare` step (skip logic, version, tag, DRAFT GitHub
+# Release) uploads .buildkite/pipeline-spoke-release-builds.yml only when a
+# release is actually being cut; that fragment holds one signing build step per
+# platform and the `publish` step that verifies every required asset and flips
+# the draft to published. The concurrency_group is on `prepare` so two release
+# runs cannot create tags at once.
+
+steps:
+  - label: ":mag: spoke-release (prepare)"
+    key: "spoke-release-prepare"
+    command: ".buildkite/steps/spoke-release.sh prepare"
+    agents:
+      queue: bazel-any
+      os: linux
+    concurrency: 1
+    concurrency_group: "spoke-release"
+    retry:
+      automatic: false

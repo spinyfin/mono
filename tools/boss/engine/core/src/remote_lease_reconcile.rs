@@ -62,30 +62,17 @@ use boss_protocol::{CreateAttentionItemInput, ExecutionKind};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::host_adapter::HostAdapter;
-use crate::host_adapter::HostAdapterProvider;
 use crate::work::{RemoteRunHandle, WorkDb};
+use boss_execution_contracts::HostAdapter;
+use boss_execution_contracts::HostAdapterProvider;
 
-/// `work_attention_items.kind` for a remote worker the reconciler found
-/// dead. Declared in [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`].
-pub const REMOTE_WORKER_DIED_ATTENTION_KIND: &str = "remote_worker_died";
+pub use boss_engine_storage_values::attention_kinds::REMOTE_WORKER_DIED_ATTENTION_KIND;
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
 /// interval.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Counts from one pass; logged at `info` when any reaping occurred.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct RemoteLeaseReconcileOutcome {
-    /// Remote runs whose worker was provably dead → reaped + lease released.
-    pub reaped: usize,
-    /// Remote runs confirmed alive (left running).
-    pub alive: usize,
-    /// Remote runs we could not adjudicate — no recorded `remote_pid`, an
-    /// inconclusive probe (host unreachable), or a host that has since been
-    /// removed / whose adapter could not be built. Left ALONE.
-    pub skipped: usize,
-}
+pub use boss_execution_contracts::RemoteLeaseReconcileOutcome;
 
 impl crate::sweep_loop::SweepOutcome for RemoteLeaseReconcileOutcome {
     fn has_activity(&self) -> bool {
@@ -123,6 +110,10 @@ pub async fn reconcile_remote_leases(
     pane_releaser: Option<&dyn crate::completion::WorkerPaneReleaser>,
 ) -> RemoteLeaseReconcileOutcome {
     let mut outcome = RemoteLeaseReconcileOutcome::default();
+
+    // Staged briefs whose launch failed or was interrupted before a remote pid
+    // was recorded; nothing else in this pass can find them.
+    crate::remote_input_lifecycle::retry_pending(work_db, provider).await;
 
     // Terminal remote executions that still hold a persona or cube lease
     // (cancelled while the worker ran, or a crash between terminalization
@@ -301,6 +292,11 @@ async fn reap_dead_remote_execution(
         return false;
     }
 
+    if let Err(error) = crate::remote_input_lifecycle::cleanup_execution_inputs(work_db, adapter, &execution.id).await {
+        tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
+        return false;
+    }
+
     let prior_status = execution.status.as_str().to_owned();
 
     // Recover WHY it died before the workspace goes back to cube and takes
@@ -321,7 +317,7 @@ async fn reap_dead_remote_execution(
 
     let reason = format!(
         "remote-lease reconcile: worker pid {remote_pid} on host `{}` is gone (kill -0: no such process); \
-         reaping execution and force-releasing its cube lease (prior status `{prior_status}`){log_clause}",
+         reaping execution; its cube lease is released only once the release gates pass (prior status `{prior_status}`){log_clause}",
         handle.host_id,
     );
 
@@ -364,24 +360,21 @@ async fn reap_dead_remote_execution(
         );
     }
 
-    // Force-release the leaked lease on the REMOTE cube (the correct one —
-    // the heartbeat/lost-workspace sweeps would target the LOCAL cube).
-    // Best-effort: a failure logs and is retried next pass; cube's own TTL
-    // reclaims it eventually regardless.
-    if let Some(lease_id) = execution.cube_lease_id.as_deref()
-        && let Err(err) = adapter
-            .force_release_lease(lease_id, Some("remote-lease reconcile: worker process gone"))
-            .await
-    {
-        tracing::warn!(
-            execution_id = %execution.id,
-            lease_id,
-            host_id = %handle.host_id,
-            error = %format!("{err:#}"),
-            "remote-lease reconcile: force-release of the leaked remote lease failed \
-             (will retry next pass; cube TTL reclaims it otherwise)",
-        );
-    }
+    // Release the leaked lease on the REMOTE cube (the correct one — the
+    // heartbeat/lost-workspace sweeps would target the LOCAL cube). A dead
+    // pid is inferred death: the lease is returned only once the owning
+    // host confirms no process there has its cwd in the workspace. Otherwise
+    // it stays recorded for a later pass (`release_terminal_remote_resources`);
+    // cube's own TTL is the backstop. Preserving unpushed edits is best effort:
+    // a failure is reported through `preserved_work_needs_inspection` and does
+    // not hold the lease.
+    let lease_outcome = release_dead_remote_lease(
+        work_db,
+        adapter,
+        &execution.id,
+        "remote-lease reconcile: worker process gone",
+    )
+    .await;
 
     // Raise an attention item. A dispatch event alone is a forensic
     // surface that has to be sought out deliberately; a dead remote worker
@@ -401,7 +394,9 @@ async fn reap_dead_remote_execution(
     let attention_body = format!(
         "Execution `{exec_id}` was dispatched to host `{host}` and its worker process (pid {remote_pid}) is gone \
          without ever reporting completion.\n\n\
-         The execution has been reaped and its cube lease released, so the work item can be re-dispatched.\n\n\
+         The execution has been reaped, so the work item can be re-dispatched. Its cube lease is released once the \
+         owning host confirms the workspace is unoccupied; a failure to preserve unpushed edits is reported in a \
+         separate inspection item and does not hold the lease.\n\n\
          **Last worker output** (`{worker_log_path}` on `{host}`):\n\n```\n{log}\n```\n\n\
          If that output shows a host-level problem — expired agent credentials, a missing binary — every dispatch \
          to `{host}` will fail the same way until it is fixed.",
@@ -439,6 +434,7 @@ async fn reap_dead_remote_execution(
                     "host_id": handle.host_id,
                     "remote_pid": remote_pid,
                     "cube_lease_id": execution.cube_lease_id,
+                    "lease_release_outcome": format!("{lease_outcome:?}"),
                     "cube_workspace_id": execution.cube_workspace_id,
                     "kind": execution.kind.as_str(),
                     "worker_log_tail": worker_log,
@@ -452,11 +448,30 @@ async fn reap_dead_remote_execution(
         host_id = %handle.host_id,
         remote_pid,
         prior_status = %prior_status,
+        lease_release_outcome = ?lease_outcome,
         worker_log_tail = worker_log.as_deref().unwrap_or("<unreadable>"),
-        "remote-lease reconcile: reaped remote execution whose worker is gone and force-released its lease",
+        "remote-lease reconcile: reaped remote execution whose worker is gone; lease release attempted",
     );
 
     true
+}
+
+/// Durable evidence that a terminal remote run's lease is being kept, so a
+/// recovery successor fails with a reason once its bounded wait ends instead of
+/// holding forever. Lowered by the release path when the lease returns.
+fn keep_terminal_remote_lease(work_db: &WorkDb, handle: &RemoteRunHandle, reason: &str) {
+    if let Ok(execution) = work_db.get_execution(&handle.execution_id) {
+        crate::workspace_lease_release::raise_attention(
+            work_db,
+            &execution,
+            crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND,
+            "Remote worker could not be confirmed gone",
+            &format!(
+                "Host {}: {reason}. The workspace lease stays held until the worker is proven gone or cube's TTL returns it. Restore connectivity or inspect the worker on that host.",
+                handle.host_id
+            ),
+        );
+    }
 }
 
 /// Release a terminal remote execution's persona, live state and cube lease
@@ -479,6 +494,7 @@ async fn release_terminal_remote_resources(
         // (the cube lease does), so free its roster name rather than
         // leaking it permanently; the cube TTL reclaims the lease.
         release_persona_only(work_db, pane_releaser, &handle.execution_id).await;
+        keep_terminal_remote_lease(work_db, handle, "the worker's process id was never recorded");
         return;
     };
     // Persona names have no TTL. Bound their retention independently of the
@@ -503,35 +519,54 @@ async fn release_terminal_remote_resources(
     if expired || matches!(work_db.get_host(&handle.host_id), Ok(None)) {
         release_persona_only(work_db, pane_releaser, &handle.execution_id).await;
     }
-    let Ok(adapter) = crate::host_adapter::resolve_host_adapter(work_db, provider, &handle.host_id).await else {
-        return;
+    let adapter = match crate::host_adapter::resolve_host_adapter(work_db, provider, &handle.host_id).await {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            keep_terminal_remote_lease(work_db, handle, &format!("host unreachable: {error:#}"));
+            return;
+        }
     };
     if !matches!(adapter.probe_remote_worker_alive(remote_pid).await, Ok(Some(false))) {
+        keep_terminal_remote_lease(work_db, handle, "the worker's liveness could not be confirmed");
         return;
     }
     release_dead_remote_slot_and_persona(work_db, pane_releaser, &handle.execution_id).await;
     let Ok(execution) = work_db.get_execution(&handle.execution_id) else {
         return;
     };
-    let Some(lease_id) = execution.cube_lease_id.as_deref() else {
-        return;
-    };
-    match adapter
-        .force_release_lease(lease_id, Some("remote-lease reconcile: worker process gone"))
-        .await
+    if let Err(error) =
+        crate::remote_input_lifecycle::cleanup_execution_inputs(work_db, adapter.as_ref(), &execution.id).await
     {
-        Ok(()) => {
-            if let Err(err) = work_db.clear_execution_workspace(&execution.id) {
-                tracing::warn!(execution_id = %execution.id, ?err, "remote-lease reconcile: clearing lease columns failed");
-            }
-        }
-        Err(err) => tracing::warn!(
-            execution_id = %execution.id,
-            lease_id,
-            error = %format!("{err:#}"),
-            "remote-lease reconcile: terminal remote lease release failed; will retry",
-        ),
+        tracing::warn!(?error, "remote input cleanup failed; retaining lease for retry");
+        return;
     }
+    release_dead_remote_lease(
+        work_db,
+        adapter.as_ref(),
+        &execution.id,
+        "remote-lease reconcile: worker process gone",
+    )
+    .await;
+}
+
+pub(crate) use boss_engine_completion::workspace_lease_release::release_remote_lease;
+
+/// [`release_remote_lease`] for a dead worker, releasing through the same
+/// host's adapter.
+async fn release_dead_remote_lease(
+    work_db: &WorkDb,
+    adapter: &dyn HostAdapter,
+    execution_id: &str,
+    reason: &str,
+) -> crate::workspace_lease_release::LeaseReleaseOutcome {
+    release_remote_lease(
+        work_db,
+        adapter,
+        execution_id,
+        crate::workspace_lease_release::PaneStatus::Gone,
+        |lease_id| async move { adapter.force_release_lease(&lease_id, Some(reason)).await },
+    )
+    .await
 }
 
 async fn release_persona_only(

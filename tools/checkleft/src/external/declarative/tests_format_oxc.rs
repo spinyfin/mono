@@ -75,7 +75,7 @@ fn format_oxc_args_use_list_different_and_never_write() {
 }
 
 #[test]
-fn format_oxc_needs_npm_default_pinned_to_0_55_0_with_path_fallback() {
+fn format_oxc_needs_npm_default_pinned_to_0_55_0_without_host_fallback() {
     let package = parse_format_oxc_package();
     let req = package.needs.get("oxfmt").expect("oxfmt binary must be declared");
     match &req.default {
@@ -86,8 +86,8 @@ fn format_oxc_needs_npm_default_pinned_to_0_55_0_with_path_fallback() {
         other => panic!("default binding must be an npm version-pinned binding; got: {other:?}"),
     }
     assert!(
-        matches!(req.fallback, Some(super::BinaryBinding::Path(_))),
-        "fallback binding must be a PATH binary for non-npx environments; got: {:?}",
+        req.fallback.is_none(),
+        "host fallback must be absent; got: {:?}",
         req.fallback
     );
 }
@@ -162,9 +162,9 @@ fn format_oxc_npm_default_resolves_to_npx_with_pinned_version() {
     assert_eq!(
         oxfmt.prefix_args,
         vec!["--yes".to_owned(), "oxfmt@0.55.0".to_owned()],
-        "default pin must produce `npx --yes oxfmt@0.55.0`"
+        "default pin must resolve through the pinned runtime npx for oxfmt@0.55.0"
     );
-    assert_eq!(oxfmt.display_invocation, "npx --yes oxfmt@0.55.0");
+    assert_eq!(oxfmt.display_invocation, "npx --yes 'oxfmt@0.55.0'");
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn format_oxc_npm_version_override_repins() {
         vec!["--yes".to_owned(), "oxfmt@0.56.0".to_owned()],
         "version override must re-pin to 0.56.0 while inheriting the package name"
     );
-    assert_eq!(resolved["oxfmt"].display_invocation, "npx --yes oxfmt@0.56.0");
+    assert_eq!(resolved["oxfmt"].display_invocation, "npx --yes 'oxfmt@0.56.0'");
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn format_oxc_transform_emits_one_file_level_finding_with_dynamic_remediation() 
 
 fn format_oxc_manifest_with_path_default(script: &Path) -> String {
     let replaced = FORMAT_OXC_MANIFEST.replace(
-        "needs:\n  oxfmt:\n    default:\n      npm:\n        package: \"oxfmt\"\n        version: \"0.55.0\"\n    fallback:\n      path: \"oxfmt\"",
+        "needs:\n  oxfmt:\n    default:\n      npm:\n        package: \"oxfmt\"\n        version: \"0.55.0\"",
         &format!("needs:\n  oxfmt:\n    default:\n      path: \"{}\"", script.display()),
     );
     assert_ne!(

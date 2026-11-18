@@ -1,0 +1,19 @@
+[package]
+name = "boss-spoke-preflight"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-engine-codex-hook-trust = { path = "../codex-hook-trust" }
+boss-engine-driver-quota = { path = "../driver-quota" }
+bon = { workspace = true }
+boss-host-execution = { path = "../host-execution" }
+boss-tmux = { path = "../../tmux" }
+fs4 = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

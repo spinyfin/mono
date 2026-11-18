@@ -1,0 +1,16 @@
+[package]
+name = "boss-engine-storage-values"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+boss-engine-effort = { path = "../effort" }
+boss-protocol = { path = "../../protocol" }
+sha2 = { workspace = true }
+bon = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

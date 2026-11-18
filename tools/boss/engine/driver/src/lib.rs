@@ -20,7 +20,34 @@ use boss_protocol::{
     WorkerEvent,
 };
 
+mod bounded_command;
+pub mod discovery;
+pub mod git_store_guard;
+pub mod hook_settings;
+pub mod initial_prompt;
+pub mod scoped_home;
 pub mod transcript_store;
+
+/// Wall-clock cap, in seconds, on each of the two sequential subprocesses the
+/// checkleft push guard script runs (the repobin probe, then `checkleft run`).
+/// Must match `CHECKLEFT_PROBE_TIMEOUT_SECONDS` / `CHECKLEFT_TIMEOUT_SECONDS`
+/// in the generated guard script (pinned by a worker_setup test).
+pub const CHECKLEFT_GUARD_STEP_TIMEOUT_SECS: u64 = 7200;
+
+/// Slack above the guard's own total budget so the script can emit its own
+/// decision before the outer runner kills it.
+const CHECKLEFT_GUARD_MARGIN_SECS: u64 = 300;
+
+/// Outer hook budget for the checkleft push guard in every driver: it covers
+/// the probe and the run back to back, plus margin, so a slow probe cannot
+/// eat into the run's own two-hour budget.
+pub const CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS: u64 = 2 * CHECKLEFT_GUARD_STEP_TIMEOUT_SECS + CHECKLEFT_GUARD_MARGIN_SECS;
+
+/// Codex's hook runner sits above the shim's own deadline
+/// (`BOSS_GUARD_TIMEOUT_SECONDS`, [`CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS`]) so the
+/// shim can emit its decision before the runner kills it.
+pub const CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS: u64 =
+    CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS + CHECKLEFT_GUARD_MARGIN_SECS;
 
 /// `large`/`max`-effort worker-prompt addendum, shared verbatim across every
 /// driver's `*_prompt_addendum_for_level` table so the wording cannot drift
@@ -37,8 +64,8 @@ pub mod transcript_store;
 /// underspecified item does not become a silent guess. Escalation for a
 /// genuinely blocked worker (stop and summarize) is intentionally untouched.
 pub(crate) const LARGE_EFFORT_PROMPT_ADDENDUM: &str = "Begin with a written plan. Identify the files you expect to touch \
-     and the order you'll touch them in. Check that plan against the work item's description yourself before \
-     writing code — do not ask the operator to confirm scope. If the description genuinely leaves a decision \
+     and the order you'll touch them in. Check that plan against the task description yourself before \
+     writing code — do not ask anyone to confirm scope. If the description genuinely leaves a decision \
      open, pick the option consistent with the project's design and conventions, state which you picked and why \
      in your summary, and continue.";
 
@@ -70,6 +97,9 @@ pub enum WorkerKind {
     /// allowlisted mutating command at all. Runs exclusively on the Codex
     /// driver's fixed `gpt-6-astra`/`high` profile.
     ReviewGuide,
+    /// Checkout-free progression agent for a stuck work item: allowlist-only
+    /// (`dontAsk`), no file edits, no VCS, no GitHub writes.
+    Progression,
 }
 
 /// All inputs Boss provides to a driver for its [`Capability::PermissionPolicy`]:
@@ -115,6 +145,10 @@ pub struct PermissionInput {
     /// Absolute path to the materialised `boss-checkleft-push-guard.py`
     /// script, when the local checkleft push guard applies. `None` for remote.
     pub checkleft_guard_script: Option<PathBuf>,
+    /// Absolute path to the materialised `boss-git-store-guard.py` script
+    /// (see [`git_store_guard`]), when the shared-source-store write gate
+    /// applies. `None` for remote workers: the script is never shipped.
+    pub git_store_guard_script: Option<PathBuf>,
     /// Codex-only: mirrors the `codex_sandbox_enforced` feature flag. When
     /// `false` (the flag's default), Codex's Standard/Triage/AnswerAgent
     /// workers get `--sandbox danger-full-access` instead of the OS-enforced
@@ -469,6 +503,9 @@ impl CapabilitySet {
     }
 }
 
+/// Resolve a selected model and effort into their concrete spawn values.
+pub type ModelEffortResolver = fn(&str, Option<&str>) -> (String, Option<&'static str>);
+
 /// Per-driver model and effort menu (capability: [`Capability::ModelAndEffortMenu`]).
 ///
 /// All fields are function pointers so the menu can live in a `static`
@@ -481,6 +518,9 @@ impl CapabilitySet {
 /// force every construction site to change.
 #[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct ModelMenu {
+    /// Resolve a selected family and effort into a concrete catalogue id and rung.
+    /// Drivers with independent model and effort flags leave this unset.
+    pub resolve_model_effort: Option<ModelEffortResolver>,
     /// Engine-default model slug for this driver (resolve-spawn precedence step 5:
     /// last resort when no override, pool override, effort level, or product default applies).
     pub engine_default: &'static str,
@@ -1288,12 +1328,15 @@ pub enum ProgressStreamSource {
     AgentJsonlFile,
 }
 
-/// Run-scoped context supplied when a JSONL progress reader starts.
+/// Run-scoped context supplied when a progress reader or hook-callback
+/// decode session starts.
 ///
 /// Stream protocols commonly omit session identity after their first
 /// envelope. Mutable correlation therefore belongs to the reader session,
 /// not the registry's shared [`AgentDriver`] instance. `run_id` also lets a
 /// driver resolve run-owned artifacts without scanning another run's state.
+/// Hook-callback drivers that correlate identity across connections (agy
+/// conversation-id filtering) receive the same config per connection.
 #[derive(Clone, Default)]
 pub struct ProgressSessionConfig {
     pub run_id: Option<String>,
@@ -1328,10 +1371,34 @@ impl std::fmt::Debug for ProgressSessionConfig {
 /// Engine-owned durable storage for one run's current provider session id.
 ///
 /// The driver must not persist this identity inside an agent-writable home.
-/// Implementations atomically compare and replace the one bounded identity
-/// for `run_id`; `Ok(true)` means the same id was already present (resume).
 pub trait ProgressIdentityStore: Send + Sync {
+    /// Atomically install only if absent; never overwrite a different stored id.
+    /// Returns the stored id (which may differ from `session_id`) and `existed`.
+    /// `existed == true` covers both resuming the same id and losing a claim race.
+    fn claim_progress_identity_if_absent(&self, run_id: &str, session_id: &str) -> Result<(String, bool), String>;
+
+    /// Atomically compare and replace the bounded identity for `run_id`.
+    /// `Ok(true)` means the same id was already present (resume).
     fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String>;
+
+    /// Read the currently claimed provider session id for `run_id`, if any.
+    ///
+    /// Distinct from [`Self::claim_progress_identity`]: this is a non-mutating
+    /// peek so a driver that must never replace a claimed identity (agy
+    /// subagent filtering) can refuse a different id without calling claim.
+    /// `Ok(None)` means this run has never claimed one. There is no default:
+    /// a silent `Ok(None)` would re-claim after a restart and let a child's
+    /// first event replace the parent.
+    fn claimed_progress_identity(&self, run_id: &str) -> Result<Option<String>, String>;
+
+    /// Whether `run_id`'s execution is still non-terminal.
+    ///
+    /// A boundary that arrives before any claim is retried only while this
+    /// is `Ok(true)`. `Ok(false)` means the run will never claim (it is
+    /// already finished, or the row is gone) and the boundary must be
+    /// rejected permanently. A store failure is `Err` so the caller can
+    /// retry the lookup.
+    fn progress_run_is_non_terminal(&self, run_id: &str) -> Result<bool, String>;
 }
 
 /// Mutable normalizer owned by one progress ingress.
@@ -1340,6 +1407,12 @@ pub trait ProgressIdentityStore: Send + Sync {
 /// this trait are not shared. The reader invokes both methods in stream order,
 /// so sticky session identity and transcript discovery cannot cross streams.
 pub trait ProgressSessionNormalizer: Send {
+    /// Whether the last decoded envelope came from a child of the claimed session.
+    /// Applies to the envelope's entire fanout; unknown origins default to main.
+    fn last_event_from_subagent(&self) -> bool {
+        false
+    }
+
     fn normalize_progress_event(&mut self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
     /// Normalize one provider envelope into its ordered worker-event fanout.
@@ -1447,6 +1520,13 @@ pub struct ToolUseInterceptionConfig {
     /// Absolute path to the `boss-checkleft-push-guard.py` script materialised
     /// next to the worker settings file. `None` for remote workers.
     pub checkleft_guard_script: Option<PathBuf>,
+    /// Absolute path to the `boss-git-store-guard.py` script materialised
+    /// next to the worker settings file (see [`git_store_guard`]). Armed for
+    /// every local worker kind: the shared store is a boundary like the Boss
+    /// data dir, not a posture. `None` for remote workers. The guard derives
+    /// cube's repos root from `workspace_path` (passed on the hook command as
+    /// `BOSS_WORKSPACE`) at decision time.
+    pub git_store_guard_script: Option<PathBuf>,
     /// Whether this is a revision execution. Revision workers must not open
     /// new PRs — the revision PR guard blocks `gh pr create`, `cube pr create`,
     /// and the deprecated `cube pr ensure`.
@@ -1470,6 +1550,39 @@ pub struct ToolUseInterceptionConfig {
     /// Workspace path (Codex project trust / hooks observation cwd). Claude
     /// ignores this.
     pub workspace_path: Option<PathBuf>,
+}
+impl ToolUseInterceptionConfig {
+    pub fn from_permission_input(input: &PermissionInput) -> Self {
+        ToolUseInterceptionConfig {
+            data_dir: if input.is_remote {
+                None
+            } else {
+                input.events_socket_path.parent().map(|p| p.to_path_buf())
+            },
+            path_guard_script: if input.is_remote {
+                None
+            } else {
+                input.path_guard_script.clone()
+            },
+            checkleft_guard_script: if input.is_remote {
+                None
+            } else {
+                input.checkleft_guard_script.clone()
+            },
+            git_store_guard_script: if input.is_remote {
+                None
+            } else {
+                input.git_store_guard_script.clone()
+            },
+            is_revision: input.execution_kind == "revision_implementation"
+                || input.task_kind.as_deref() == Some("revision"),
+            is_standard_worker: input.worker_kind == WorkerKind::Standard,
+            is_reviewer: input.worker_kind == WorkerKind::Reviewer,
+            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
+            run_id: Some(input.run_id.clone()),
+            workspace_path: Some(input.workspace_path.clone()),
+        }
+    }
 }
 
 /// The PreToolUse hook entries the driver wires for [`Capability::ToolUseInterception`].
@@ -1777,6 +1890,38 @@ pub enum EnvDirective {
     Unset(String),
 }
 
+/// Render one [`EnvDirective`] as a shell statement to prepend to a worker
+/// pane's spawn command. Generic over every driver: the caller turns `Set` /
+/// `Unset` into shell syntax but never knows which variables a driver names.
+pub fn render_env_directive(directive: &EnvDirective) -> String {
+    match directive {
+        EnvDirective::Set(key, value) => format!("export {key}={}; ", boss_ssh_transport::shell_quote(value)),
+        EnvDirective::Unset(key) => format!("unset {key}; "),
+    }
+}
+
+/// Outcome of a post-spawn settings-log check when nothing is wrong yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsLogCheck {
+    /// The CLI has not logged its settings yet. Not a failure: ask again.
+    NotYetInitialized,
+    /// Every initialisation line matches the rendered settings and no rule has
+    /// been reported invalid *so far*. The grant store reports malformed
+    /// entries on a separate, later line (observed roughly a second after the
+    /// initialisation line with agy, which is why `SETTINGS_SETTLE` is 2s), so this is not final: the caller must check again right
+    /// before it delivers input, and treat a later failure as fatal.
+    ConsistentSoFar,
+}
+
+/// Driver-owned admission against a CLI settings log.
+///
+/// The launcher and host supervisor query this through [`AgentDriver`] so
+/// neither names a driver. `verify` reads that driver's runtime state.
+#[derive(Clone, Copy)]
+pub struct SettingsLogCheckSpec {
+    pub verify: fn(&DriverRuntimeState) -> anyhow::Result<SettingsLogCheck>,
+}
+
 /// What [`AgentDriver::spawn_invocation`] produces for [`Capability::Spawn`]:
 /// the environment adjustments and command line the spawn flow applies to
 /// the worker pane, verbatim and in order. A driver owns both its command
@@ -1788,7 +1933,7 @@ pub struct SpawnPlan {
     /// `command` runs.
     pub env: Vec<EnvDirective>,
     /// The command line to run after `env` has been applied (e.g.
-    /// `claude --model … "$(cat …)"\n`).
+    /// `python3 -I .claude/initial-prompt.py claude --model …\n`).
     pub command: String,
 }
 
@@ -1806,6 +1951,18 @@ pub trait AgentDriver: Send + Sync {
 
     fn descriptor(&self) -> &DriverDescriptor;
     fn capabilities(&self) -> CapabilitySet;
+
+    /// Dialog policy shared by every pane input transport.
+    fn blocking_dialog_markers(&self) -> Vec<String> {
+        self.pane_monitor_spec()
+            .map(|spec| spec.blocking_dialog_markers)
+            .unwrap_or_default()
+    }
+
+    /// Whether unpinned traffic can launch on this driver. Skeletons opt out.
+    fn launch_ready(&self) -> bool {
+        true
+    }
 
     /// Explicit remote-spawn declaration. Drivers default to host-local until
     /// they prove their per-run state can be provisioned remotely.
@@ -1834,6 +1991,43 @@ pub trait AgentDriver: Send + Sync {
     /// Interactive drivers that own a distinctive surface override this
     /// with their own markers.
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
+        None
+    }
+
+    /// Extra screen text that means this driver is still starting (onboarding,
+    /// sign-in, connecting splash), so the initial-brief launcher holds
+    /// delivery. Launcher-only: unlike `pane_monitor_spec().starting_markers`
+    /// these never feed the pane monitor. Each driver owns its own strings.
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Screen text this driver's composer shows once it holds a pasted brief
+    /// (its placeholder for a large paste). The initial-brief launcher sends
+    /// Return only after one appears, because a composer that commits a paste
+    /// late drops a Return sent before the commit.
+    ///
+    /// Declare one only for a driver whose composer can commit a paste after
+    /// reading it. The default, none, tells the launcher this driver handles
+    /// input in order, so its first output after the paste is evidence enough.
+    fn paste_landed_markers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Screen text that, shortly after the brief is submitted, means the CLI
+    /// discarded it without starting a turn (a vendor error with no hook to
+    /// follow). The initial-brief launcher watches for these after the submit
+    /// and exits non-zero, so the spawn fails explicitly instead of waiting on
+    /// a hook that will never fire. The default, none, watches nothing.
+    fn post_submit_failure_markers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Optional post-spawn settings-log admission. When `Some`, the
+    /// initial-brief launcher waits for a matching initialization line
+    /// (plus a settle period) before pasting, and the host supervisor
+    /// verifies the same log before admitting later input.
+    fn settings_log_check(&self) -> Option<SettingsLogCheckSpec> {
         None
     }
 
@@ -1966,12 +2160,16 @@ pub trait AgentDriver: Send + Sync {
     /// [`boss_protocol::normalize_hook_event`].
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
-    /// Create mutable correlation state for one stdout ingress.
+    /// Create mutable correlation state for one progress ingress.
     ///
-    /// Hook-callback drivers return `None` and keep using the stateless
-    /// methods above. A stdout driver whose wire omits session identity after
-    /// its first record returns a fresh normalizer here; the generic reader
-    /// owns it for exactly one stream.
+    /// A stdout driver whose wire omits session identity after its first
+    /// record returns a fresh normalizer here; the generic reader owns it
+    /// for exactly one stream. A hook-callback driver that needs identity
+    /// correlation across connections (agy conversation-id filtering) also
+    /// returns a session; the events-socket decode constructs one per
+    /// connection with the engine-owned identity store. Drivers whose hook
+    /// payload is fully self-describing per invocation keep returning
+    /// `None` and use the stateless methods above.
     fn progress_session(&self, _config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
         None
     }
@@ -2221,6 +2419,23 @@ pub trait AgentDriver: Send + Sync {
         MidTurnPaneInput::Rejects
     }
 
+    /// How long the engine waits between the last byte of text it types into
+    /// this driver's composer and the Return that submits it.
+    ///
+    /// Defaults to zero: a composer that reads typed text and the Return
+    /// after it in order needs no gap. Override for a composer that decides
+    /// "this is a paste" from how fast keys arrive, and then takes a Return
+    /// landing inside that window as a newline in the pasted text. Such a
+    /// composer keeps the text and never submits it, and the pane write still
+    /// reports success.
+    ///
+    /// This shortens the common case and nothing depends on it for
+    /// correctness: the engine confirms that a parked write started a turn,
+    /// and presses Return again when it did not.
+    fn pane_submit_settle(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// Pre-interrupt snapshot for the bounded turn-end recovery the engine
     /// runs immediately after delivering an interrupt to this driver's
     /// worker — see [`InterruptRecoverySnapshot`] for why this must be
@@ -2235,7 +2450,13 @@ pub trait AgentDriver: Send + Sync {
     /// driver that needs recovery resolves its own per-run state (Grok:
     /// `GROK_HOME`, session id, workspace) without the engine knowing
     /// anything about that shape.
-    fn prepare_interrupt_recovery(&self, _run_id: &str) -> Option<InterruptRecoverySnapshot> {
+    /// `claimed_session_id` is the persisted progress identity, read before
+    /// interrupt delivery. Drivers with child conversations must use it.
+    fn prepare_interrupt_recovery(
+        &self,
+        _run_id: &str,
+        _claimed_session_id: Option<&str>,
+    ) -> Option<InterruptRecoverySnapshot> {
         None
     }
 
@@ -2252,6 +2473,13 @@ pub trait AgentDriver: Send + Sync {
     /// never consulted for a driver that returns `None` there.
     fn is_interrupt_recovery_turn_end(&self, _raw: &serde_json::Value) -> bool {
         false
+    }
+
+    /// Match a complete evidence line against the pre-interrupt snapshot.
+    /// JSONL drivers retain their existing matcher; text-log drivers can
+    /// decode their own format and enforce snapshot identity here.
+    fn is_interrupt_recovery_line(&self, line: &str, _snapshot: &InterruptRecoverySnapshot) -> bool {
+        serde_json::from_str(line).is_ok_and(|raw| self.is_interrupt_recovery_turn_end(&raw))
     }
 
     /// How long this driver's foreground worker process lives relative to the
@@ -2320,13 +2548,37 @@ pub trait AgentDriver: Send + Sync {
     fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate>;
 }
 
+macro_rules! agent_rules_preamble {
+    ($observation:literal, $extra:literal) => {
+        concat!(
+            "You are running inside a managed worker session. The engine\n\
+     spawned you in a leased cube workspace and observes this session\n\
+     ",
+            $observation,
+            "\n\
+     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
+     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+     strong stated justification.\n\
+     Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
+     in a shell `timeout`.",
+            $extra
+        )
+    };
+}
+
+/// Source of the deterministic pre-push checkleft gate (PreToolUse hook).
+pub const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = include_str!("checkleft_push_guard.py");
+
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod grok;
 pub mod registry;
 
 // Also available in-module for trait signatures (pub use is an import + re-export).
+pub use agy::AgyDriver;
 pub use boss_protocol::DriverRuntimeState;
+pub use bounded_command::abandon_in_flight_commands;
 pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;
 pub use grok::GrokDriver;
@@ -2336,3 +2588,195 @@ pub mod test_support;
 
 #[cfg(test)]
 mod tests;
+
+// The outer hook budget must cover the guard's sequential probe + run budgets
+// with margin, and Codex's runner must outlive the shim's own deadline.
+const _: () = {
+    assert!(CHECKLEFT_GUARD_STEP_TIMEOUT_SECS >= 7200);
+    assert!(CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS > 2 * CHECKLEFT_GUARD_STEP_TIMEOUT_SECS);
+    assert!(CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS > CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS);
+};
+
+mod guard_python;
+mod hook_guards;
+
+pub mod capability_rules {
+    //! Claude-grammar capability rule tables shared by every driver that has to
+    //! express a worker kind's allow/deny posture: `boss_engine::worker_setup`
+    //! renders them into Claude's `permissions` block, and the Grok driver renders
+    //! the progression set as `--allow` / `--deny` arguments. They live here, below
+    //! both consumers, so there is exactly one table per posture. All functions are
+    //! pure string-list builders.
+
+    /// The permission mode the engine forces for `worker_kind`, if any.
+    ///
+    /// The single driver-side mirror of `WorkerKind::forced_permission_mode`
+    /// in `boss-engine-execution-contracts` (this crate cannot depend on it);
+    /// the Grok and Antigravity drivers both delegate here, and the engine's
+    /// drift test pins this function. `Some("dontAsk")` marks the
+    /// capability-restricted, deny-by-default kinds. The match is exhaustive:
+    /// a new kind must choose a posture.
+    pub fn forced_permission_mode(worker_kind: crate::WorkerKind) -> Option<&'static str> {
+        use crate::WorkerKind;
+        match worker_kind {
+            WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => Some("dontAsk"),
+            WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
+        }
+    }
+
+    /// The one state-mutating command the answer agent may run: posting its
+    /// thread reply. Shared by the answer-agent allowlist
+    /// ([`answer_agent_allow_rules`]) and the reply handler and prompt in
+    /// `execution-runner` (which re-exports it as `THREAD_REPLY_COMMAND`), so
+    /// the allowlist and the command it admits cannot drift apart.
+    pub const ANSWER_AGENT_THREAD_REPLY_COMMAND: &str = "boss comment reply";
+
+    /// The `permissions.allow` allowlist for `WorkerKind::AnswerAgent` — the
+    /// hard-coded reduced tool table.
+    ///
+    /// Under the forced `dontAsk` permission mode this is the ENTIRE set of
+    /// non-read-only actions the answer agent can take. It deliberately holds
+    /// only the read-only inspection tools (`Read`/`Grep`/`Glob`, which must be
+    /// listed because `dontAsk` only auto-approves read-only *Bash*) and the
+    /// single reply command ([`ANSWER_AGENT_THREAD_REPLY_COMMAND`]).
+    ///
+    /// Every entry MUST be read-only or the single reply command. Adding a
+    /// mutating entry is a capability escalation and must be reviewed as such.
+    pub fn answer_agent_allow_rules() -> Vec<String> {
+        vec![
+            "Read".to_owned(),
+            "Grep".to_owned(),
+            "Glob".to_owned(),
+            format!("Bash({ANSWER_AGENT_THREAD_REPLY_COMMAND}:*)"),
+        ]
+    }
+
+    /// The `permissions.allow` allowlist for `WorkerKind::Progression`.
+    ///
+    /// Under the forced `dontAsk` mode this is the ENTIRE set of non-read-only
+    /// actions the progression agent can take. It holds the read-only inspection
+    /// tools, the declaration command (`propose`, in both the bare `boss` and the
+    /// `"$BOSS_BIN"` spelling workers are taught), read-only task/PR status
+    /// queries, and read-only `gh pr` inspection. There is deliberately no
+    /// `Edit`, no `jj`/`git`/`cube`, and no mutating `gh`/`boss` verb.
+    ///
+    /// Every entry MUST be read-only or a declaration. Adding a mutating entry is a
+    /// capability escalation and must be reviewed as such.
+    pub fn progression_allow_rules() -> Vec<String> {
+        let mut rules = vec!["Read".to_owned(), "Grep".to_owned(), "Glob".to_owned()];
+        for bin in ["boss", r#""$BOSS_BIN""#] {
+            for sub in ["propose", "task show", "task list", "pr status"] {
+                rules.push(format!("Bash({bin} {sub}:*)"));
+            }
+        }
+        rules.push("Bash(gh pr view:*)".to_owned());
+        rules.push("Bash(gh pr checks:*)".to_owned());
+        rules
+    }
+
+    /// Defense-in-depth `permissions.deny` belt for `WorkerKind::Progression`.
+    ///
+    /// The primary enforcement is the `dontAsk` allowlist
+    /// ([`progression_allow_rules`]); deny always wins over allow. On top of the
+    /// read-only worker set (file writes, publish verbs, all of `cube`) it denies
+    /// every `jj` and `git` invocation (the agent holds no checkout), the mutating
+    /// `gh pr` / `gh issue` verbs beyond the publish set, and all `gh api` calls.
+    pub fn progression_deny_rules() -> Vec<String> {
+        let mut rules = read_only_worker_deny_rules();
+        for vcs in ["jj", "git"] {
+            rules.push(format!("Bash({vcs})"));
+            rules.push(format!("Bash({vcs}:*)"));
+        }
+        for verb in [
+            "pr ready",
+            "pr reopen",
+            "pr lock",
+            "pr unlock",
+            "issue reopen",
+            "issue delete",
+            "issue transfer",
+            "issue pin",
+            "issue unpin",
+            "issue lock",
+            "issue unlock",
+        ] {
+            rules.push(format!("Bash(gh {verb}:*)"));
+        }
+        rules.push("Bash(gh api)".to_owned());
+        rules.push("Bash(gh api:*)".to_owned());
+        rules
+    }
+
+    /// Shared deny body for workers that must not write files, publish, or
+    /// mutate cube state. The answer-agent and review-guide builders in
+    /// `boss_engine::worker_setup` stay as named public builders so the two
+    /// postures can still diverge and so each kind's tests can assert its own
+    /// set.
+    pub fn read_only_worker_deny_rules() -> Vec<String> {
+        let mut rules = vec!["Edit(**)".to_owned(), "NotebookEdit(**)".to_owned()];
+        rules.extend(publish_deny_rules());
+        // `publish_deny_rules` already denies `cube pr`; deny the rest of `cube`
+        // (workspace lease/release, config, …) so the worker cannot touch cube state.
+        rules.push("Bash(cube)".to_owned());
+        rules.push("Bash(cube:*)".to_owned());
+        rules.push(r#"Bash("$CUBE_BIN")"#.to_owned());
+        rules.push(r#"Bash("$CUBE_BIN":*)"#.to_owned());
+        rules.push("Bash($CUBE_BIN)".to_owned());
+        rules.push("Bash($CUBE_BIN:*)".to_owned());
+        rules
+    }
+
+    /// Shared no-publish deny set used by both reviewer and triage workers:
+    /// neither kind may push commits or write to GitHub. The file-write deny is
+    /// kind-specific and lives in the reviewer and triage deny builders
+    /// (workspace-scoped vs. blanket), so it is NOT part of this set.
+    ///
+    /// Rules cover:
+    /// - VCS push — `jj git push` and `git push` in all their CLI forms
+    /// - PR mutation via `gh` — create, merge, close, edit, comment, review
+    /// - Issue write via `gh` — create, comment, close, edit
+    /// - `cube pr create` / `cube pr update` — Boss's PR helpers
+    ///
+    /// Note: `jj describe`, `jj bookmark create`, and similar *local* VCS
+    /// operations are intentionally not denied. They touch only the local
+    /// repo state and can never publish commits or PR changes to GitHub.
+    pub fn publish_deny_rules() -> Vec<String> {
+        vec![
+            // VCS push — both the bare command and the trailing-args form.
+            "Bash(jj git push)".to_owned(),
+            "Bash(jj git push:*)".to_owned(),
+            "Bash(git push)".to_owned(),
+            "Bash(git push:*)".to_owned(),
+            // gh PR mutations — creation, merge, close, edit, comments, reviews.
+            "Bash(gh pr create)".to_owned(),
+            "Bash(gh pr create:*)".to_owned(),
+            "Bash(gh pr merge)".to_owned(),
+            "Bash(gh pr merge:*)".to_owned(),
+            "Bash(gh pr close)".to_owned(),
+            "Bash(gh pr close:*)".to_owned(),
+            "Bash(gh pr edit)".to_owned(),
+            "Bash(gh pr edit:*)".to_owned(),
+            "Bash(gh pr comment)".to_owned(),
+            "Bash(gh pr comment:*)".to_owned(),
+            "Bash(gh pr review)".to_owned(),
+            "Bash(gh pr review:*)".to_owned(),
+            // gh issue mutations — these workers should never file or update issues.
+            "Bash(gh issue create)".to_owned(),
+            "Bash(gh issue create:*)".to_owned(),
+            "Bash(gh issue comment)".to_owned(),
+            "Bash(gh issue comment:*)".to_owned(),
+            "Bash(gh issue close)".to_owned(),
+            "Bash(gh issue close:*)".to_owned(),
+            "Bash(gh issue edit)".to_owned(),
+            "Bash(gh issue edit:*)".to_owned(),
+            // cube pr operations — Boss's PR management helper. Workers are
+            // taught `"$CUBE_BIN"` so the named-binary form must be denied too.
+            "Bash(cube pr)".to_owned(),
+            "Bash(cube pr:*)".to_owned(),
+            r#"Bash("$CUBE_BIN" pr)"#.to_owned(),
+            r#"Bash("$CUBE_BIN" pr:*)"#.to_owned(),
+            "Bash($CUBE_BIN pr)".to_owned(),
+            "Bash($CUBE_BIN pr:*)".to_owned(),
+        ]
+    }
+}

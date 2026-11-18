@@ -17,18 +17,23 @@
 //! drill demonstrates: the login shell is substituted for a lightweight
 //! heartbeat script (as the existing tmux-recovery fixture already does)
 //! so the drill needs no live model credentials, and it drives `serve()`
-//! in-process rather than the compiled `boss-engine` binary as a
-//! subprocess — `serve()` *is* the whole engine; `main.rs` is only argv
-//! parsing and logging setup around it.
+//! in-process rather than the compiled `boss-engine` binary as a subprocess.
+//! Each engine gets its own runtime and exercises production runtime shutdown
+//! before the worker's survival is checked. A merge sweep sleeps through the
+//! shutdown request, and a real task panic exercises the engine panic hook.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+mod restart_shutdown_probe;
+use restart_shutdown_probe::SleepingProbe;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use boss_client::{BossClient, wait_for_socket};
-use boss_engine::app::{SendToAppError, serve};
+use boss_engine::app::{SendToAppError, ServeOverrides, process_is_alive, serve_with_overrides};
 use boss_engine::config::{RuntimeConfig, WorkConfig, tmux_socket_path_beside_db};
 use boss_engine::driver::ClaudeDriver;
 use boss_engine::engine_control::ControlTokenFile;
@@ -173,6 +178,13 @@ async fn shutdown_and_join(control_token_path: &Path, engine: tokio::task::JoinH
 #[tokio::test]
 async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<()> {
     let temp = tempfile::tempdir()?;
+    let trace_path = temp.path().join("panic-trace.log");
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::sync::Mutex::new(std::fs::File::create(&trace_path)?))
+        .try_init()
+        .map_err(|err| anyhow!("installing test trace subscriber: {err}"))?;
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace)?;
     let home = temp.path().join("home");
@@ -180,7 +192,7 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
 
     let worker_shell = write_fixture_shell(temp.path(), "still-working.sh", STILL_WORKING)?;
     let _home = boss_engine::driver::test_support::home_override(&home);
-    let _shell = boss_engine::driver::test_support::shell_override(&worker_shell);
+    let shell_override = boss_engine::driver::test_support::shell_override(&worker_shell);
 
     let db_path = temp.path().join("state.db");
     let tmux_socket = tmux_socket_path_beside_db(&db_path)?;
@@ -208,7 +220,7 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
     // own dispatch would have: a real private tmux session running a real
     // OS process, with `work_runs.tmux_hosted = 1` recorded durably.
     let session_name = "boss-worker-1-restart-drill".to_owned();
-    let execution_id = {
+    let (execution_id, shell_pid) = {
         let work_db = Arc::new(WorkDb::open(db_path.clone())?);
         let product = work_db.create_product(
             CreateProductInput::builder()
@@ -218,7 +230,7 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
         )?;
         let chore = work_db.create_chore(
             CreateChoreInput::builder()
-                .product_id(product.id)
+                .product_id(product.id.clone())
                 .name("exercise the engine-restart drill")
                 .autostart(true)
                 .build(),
@@ -262,11 +274,31 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
         .await?;
         assert!(started.shell_pid > 0, "worker must have a real OS process");
 
-        execution.id
+        let review = work_db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id)
+                .name("sleeping merge probe")
+                .autostart(false)
+                .build(),
+        )?;
+        work_db.update_work_item(
+            &review.id,
+            boss_protocol::WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/example/restart-drill/pull/1".into()),
+                ..Default::default()
+            },
+        )?;
+        (execution.id, started.shell_pid)
         // `work_db` (and its Arc clone held by `spawn_store`) is dropped
         // here, before either engine opens its own connection to the same
         // sqlite file.
     };
+
+    // The heartbeat script substitutes only for the worker's login shell.
+    // Restore the real shell before boot: capability discovery invokes SHELL
+    // too, and must not accidentally start a never-ending heartbeat script.
+    drop(shell_override);
 
     let heartbeat_path = workspace.join("heartbeat.log");
     let initial_len = wait_for_growth(&heartbeat_path, 0, GROWTH_TIMEOUT).await?;
@@ -285,10 +317,38 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
             .build(),
         None,
     ));
+    let probe1 = Arc::new(SleepingProbe::default());
     let engine1 = {
         let sock = socket_path.clone();
         let token_path = control_token_path.clone();
-        tokio::spawn(async move { serve(cfg1, sock, None, None, Some(token_path), None).await })
+        let probe = probe1.clone();
+        // Each engine owns a real multithread runtime. Join includes runtime
+        // shutdown, so the worker is checked after the time driver is gone.
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
+            let result = runtime.block_on(serve_with_overrides(
+                cfg1,
+                sock,
+                None,
+                None,
+                Some(token_path),
+                None,
+                ServeOverrides {
+                    merge_poll_probe: Some(probe.clone()),
+                    ..Default::default()
+                },
+            ));
+            assert!(
+                probe.dropped.load(Ordering::SeqCst),
+                "serve returned before its sleeping sweep drained"
+            );
+            let shutdown = boss_engine::runtime_shutdown::shutdown_engine_runtime(runtime);
+            assert!(!shutdown.abandoned_blocking_tasks, "fixture engine did not drain");
+            result
+        })
     };
     if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
         engine1.abort();
@@ -296,9 +356,32 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
     }
     wait_for_dispatch_event(temp.path(), &execution_id, "tmux_adopt", 1, ADOPTION_TIMEOUT).await?;
 
+    tokio::time::timeout(STARTUP_TIMEOUT, probe1.entered.notified()).await?;
+    // A panic in an unrelated task invokes the actual process-wide engine
+    // hook while its live registry contains the adopted worker.
+    let before_panic = heartbeat_len(&heartbeat_path).await;
+    assert!(
+        tokio::spawn(async { panic!("tmux preservation regression panic") })
+            .await
+            .unwrap_err()
+            .is_panic()
+    );
+    assert!(process_is_alive(shell_pid));
+    wait_for_growth(&heartbeat_path, before_panic, GROWTH_TIMEOUT).await?;
+    let trace = std::fs::read_to_string(&trace_path)?;
+    let panic_line = trace
+        .lines()
+        .find(|line| line.contains("tmux preservation regression panic"))
+        .expect("panic payload must be recorded via tracing");
+    assert!(
+        panic_line.contains("location=") && panic_line.contains("thread="),
+        "{panic_line}"
+    );
+
     // --- Real shutdown: the production `Shutdown` RPC, not a direct call
     // into `ServerState::shutdown_workers`. ---
     shutdown_and_join(&control_token_path, engine1).await?;
+    assert!(process_is_alive(shell_pid), "worker died during runtime teardown");
 
     // Snapshot the adopt count *after* engine #1 has fully exited, so any
     // extra `tmux_adopt` its husk-pane sweep emitted during its own
@@ -323,7 +406,8 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
         sessions.iter().any(|session| session.name == session_name),
         "tmux-hosted session must survive engine #1's shutdown, got {sessions:?}"
     );
-    let len_after_shutdown = wait_for_growth(&heartbeat_path, initial_len, GROWTH_TIMEOUT).await?;
+    let exit_len = heartbeat_len(&heartbeat_path).await;
+    let len_after_shutdown = wait_for_growth(&heartbeat_path, exit_len, GROWTH_TIMEOUT).await?;
 
     // --- Engine #2: the actual restart, against the same durable state
     // and the same still-running tmux session. ---
@@ -334,10 +418,38 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
             .build(),
         None,
     ));
+    let probe2 = Arc::new(SleepingProbe::default());
     let engine2 = {
         let sock = socket_path.clone();
         let token_path = control_token_path.clone();
-        tokio::spawn(async move { serve(cfg2, sock, None, None, Some(token_path), None).await })
+        let probe = probe2.clone();
+        // Each engine owns a real multithread runtime. Join includes runtime
+        // shutdown, so the worker is checked after the time driver is gone.
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
+            let result = runtime.block_on(serve_with_overrides(
+                cfg2,
+                sock,
+                None,
+                None,
+                Some(token_path),
+                None,
+                ServeOverrides {
+                    merge_poll_probe: Some(probe.clone()),
+                    ..Default::default()
+                },
+            ));
+            assert!(
+                probe.dropped.load(Ordering::SeqCst),
+                "serve returned before its sleeping sweep drained"
+            );
+            let shutdown = boss_engine::runtime_shutdown::shutdown_engine_runtime(runtime);
+            assert!(!shutdown.abandoned_blocking_tasks, "fixture engine did not drain");
+            result
+        })
     };
     if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
         engine2.abort();
@@ -357,7 +469,18 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
     let len_after_restart = wait_for_growth(&heartbeat_path, len_after_shutdown, GROWTH_TIMEOUT).await?;
     assert!(len_after_restart > len_after_shutdown);
 
+    tokio::time::timeout(STARTUP_TIMEOUT, probe2.entered.notified()).await?;
     shutdown_and_join(&control_token_path, engine2).await?;
+    assert!(
+        process_is_alive(shell_pid),
+        "worker died during second runtime teardown"
+    );
+    let trace = std::fs::read_to_string(&trace_path)?;
+    assert_eq!(
+        trace.lines().filter(|line| line.contains("engine panic")).count(),
+        1,
+        "only the deliberate panic may fire; runtime shutdown must not panic: {trace}"
+    );
 
     // Durable identity survived both the shutdown and the restart intact —
     // checked only now, after both engines have fully exited, so this

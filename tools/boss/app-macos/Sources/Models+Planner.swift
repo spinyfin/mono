@@ -54,6 +54,46 @@ struct PlannerRun: Identifiable, Codable, Hashable {
     }
 }
 
+/// Swift mirror of `boss_protocol::PlannerRunSummary`: the blob-free
+/// projection of a project's latest settled (non-`running`) planner run that
+/// rides in every `work_tree` snapshot and delta. It is everything the kanban
+/// affordance needs to pick its glyph, and the freshness stamp
+/// (`updatedAt`) that tells whether a locally cached full `PlannerRun` is
+/// still current. Full rows come from `list_planner_runs`, on demand.
+struct PlannerRunSummary: Identifiable, Codable, Hashable {
+    var runID: String
+    var projectID: String
+    /// One of the `PLANNER_OUTCOME_*` constants other than `running`.
+    var outcome: String
+    var createdAt: String
+    var updatedAt: String
+
+    var id: String { projectID }
+
+    var outcomeLabel: String { PlannerRun.outcomeLabel(for: outcome) }
+
+    enum CodingKeys: String, CodingKey {
+        case runID = "run_id"
+        case projectID = "project_id"
+        case outcome
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    /// `true` when `run` reflects this summary's run at or after the state the
+    /// summary records, so its detail (outcome, result text, Release/Undo
+    /// eligibility) is safe to show. A row cached before the run transitioned
+    /// (staged → applied) is older and must be refetched. `updated_at` is epoch
+    /// seconds; if either side is not numeric, only exact equality counts.
+    func isNoNewerThan(_ run: PlannerRun) -> Bool {
+        guard run.id == runID else { return false }
+        if let cached = Int64(run.updatedAt), let current = Int64(updatedAt) {
+            return cached >= current
+        }
+        return run.updatedAt == updatedAt
+    }
+}
+
 extension PlannerRun {
     /// `true` once this run has staged a batch awaiting operator release.
     var isStaged: Bool { outcome == "staged" }
@@ -66,7 +106,9 @@ extension PlannerRun {
 
     /// Human-readable summary of the `PLANNER_OUTCOME_*` tag, matching the
     /// language the CLI and the engine's attention items use.
-    var outcomeLabel: String {
+    var outcomeLabel: String { Self.outcomeLabel(for: outcome) }
+
+    static func outcomeLabel(for outcome: String) -> String {
         switch outcome {
         case "running": return "Planner is running…"
         case "staged": return "Staged tasks ready for review"

@@ -113,13 +113,15 @@ struct AttentionGroupCard: View {
     @EnvironmentObject private var model: ChatViewModel
     let group: AttentionGroup
     @State private var isExpanded = true
-    /// Local drafts for `prompt`-type questions, keyed by attention id. Seeded
-    /// from the persisted answer; flushed to the engine on submit.
-    @State private var promptDrafts: [String: String] = [:]
+    /// Lifecycle probes expose the production control bindings to hosted tests.
+    var onExpansionBinding: ((Binding<Bool>) -> Void)? = nil
+    var onPromptBinding: ((String, Binding<String>) -> Void)? = nil
     @State private var showingAssociationPopover = false
+    /// Prompt drafts live on the card so collapsing and expanding keeps
+    /// typed-but-unsent answers. The body is rebuilt; this dictionary is not.
+    @State private var promptDrafts: [String: AttentionPromptDraft] = [:]
 
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
-    private var answeredCount: Int { members.filter(\.isAnswered).count }
     private var hasExtracted: Bool { members.contains { $0.confidenceSource == "extracted" } }
     /// Provenance badge for a member staged from `boss propose
     /// followup-task` (design: worker-proposal-api §"UI visibility and
@@ -135,18 +137,10 @@ struct AttentionGroupCard: View {
             cardHeader
             if isExpanded {
                 Divider()
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(members) { member in
-                        AttentionMemberRow(
-                            group: group,
-                            member: member,
-                            promptDraft: promptBinding(for: member)
-                        )
-                    }
-                }
-                footer
+                AttentionGroupBody(group: group, promptDrafts: $promptDrafts, onPromptBinding: onPromptBinding)
             }
         }
+        .onAppear { onExpansionBinding?($isExpanded) }
         .padding(14)
         .background(
             RoundedRectangle(cornerRadius: 10)
@@ -279,6 +273,61 @@ struct AttentionGroupCard: View {
         }
     }
 
+}
+
+/// Owns prompt drafts when the parent does not. Navigator and isolated
+/// captures use this so the body is a plain `@Binding` (an optional
+/// Binding stored on the view itself is not Equatable and can loop
+/// layout). `AttentionGroupCard` passes its own store so collapse can
+/// drop the body without losing typed text.
+struct OwnedAttentionGroupBody: View {
+    let group: AttentionGroup
+    @State private var promptDrafts: [String: AttentionPromptDraft] = [:]
+
+    var body: some View {
+        AttentionGroupBody(
+            group: group,
+            promptDrafts: $promptDrafts
+        )
+    }
+}
+
+/// Member rows, prompt drafts and the group-action footer. Notifications,
+/// the design-doc panel and Navigator Attention all use this so answering
+/// here is the same `AnswerAttention` / `ActionAttentionGroup` path.
+struct AttentionGroupBody: View {
+    @EnvironmentObject private var model: ChatViewModel
+    let group: AttentionGroup
+    /// Parent-owned drafts, keyed by attention id. Seeded from the
+    /// persisted answer; flushed to the engine on submit.
+    @Binding var promptDrafts: [String: AttentionPromptDraft]
+    var onPromptBinding: ((String, Binding<String>) -> Void)? = nil
+
+    private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
+    private var answeredCount: Int { members.filter(\.isAnswered).count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(members) { member in
+                AttentionMemberRow(
+                    group: group,
+                    member: member,
+                    promptDraft: promptBinding(for: member)
+                )
+                .onAppear { onPromptBinding?(member.id, promptBinding(for: member)) }
+            }
+            if let error = model.attentionAnswerError(forGroup: group.id) {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("attention-group-error")
+            }
+            footer
+        }
+        .id("\(group.id)-\(group.generation)")
+    }
+
     @ViewBuilder
     private var footer: some View {
         if group.kind != "followup" {
@@ -294,6 +343,7 @@ struct AttentionGroupCard: View {
                 .help(canSubmit
                       ? "Action this group — unanswered items are skipped"
                       : "Answer or accept at least one item first")
+                .accessibilityIdentifier("attention-group-submit")
             }
         }
     }
@@ -307,28 +357,69 @@ struct AttentionGroupCard: View {
     private var hasPendingPromptDraft: Bool {
         members.contains { member in
             member.questionType == "prompt"
-                && !(promptDrafts[member.id] ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && AttentionPromptDraft.flushable(promptDrafts[member.id], member: member) != nil
         }
     }
 
     private func promptBinding(for member: Attention) -> Binding<String> {
         Binding(
-            get: { promptDrafts[member.id] ?? member.answer ?? "" },
-            set: { promptDrafts[member.id] = $0 }
+            get: { AttentionPromptDraft.visibleText(promptDrafts[member.id], member: member) },
+            set: {
+                promptDrafts[member.id] = AttentionPromptDraft(
+                    text: $0, base: member.answer, baseState: member.answerState
+                )
+            }
         )
     }
 
     /// Flush any edited prompt drafts, then action the group. Sends share one
     /// ordered socket, so the answers are processed before the action.
     private func submit() {
+        Self.submit(model: model, group: group, members: members,
+                    drafts: promptDrafts)
+    }
+
+    /// A draft is only sent while the recorded answer is still the one the
+    /// user started editing from; one recorded elsewhere meanwhile is kept,
+    /// not resubmitted over it.
+    static func submit(
+        model: ChatViewModel,
+        group: AttentionGroup,
+        members: [Attention],
+        drafts: [String: AttentionPromptDraft]
+    ) {
         for member in members where member.questionType == "prompt" {
-            let draft = (promptDrafts[member.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !draft.isEmpty, draft != (member.answer ?? "") {
+            if let draft = AttentionPromptDraft.flushable(drafts[member.id], member: member) {
                 model.answerAttention(member.id, answer: draft)
             }
         }
         model.actionAttentionGroup(group.id)
+    }
+}
+
+/// A locally edited `prompt` answer plus the recorded answer and resolution
+/// state it was edited from. If another client answers or skips the member,
+/// the draft is stale: the field shows the recorded value and Submit does
+/// not send the draft; typing again starts a fresh draft.
+struct AttentionPromptDraft: Equatable {
+    var text: String
+    var base: String?
+    var baseState: String
+
+    static func isCurrent(_ draft: AttentionPromptDraft, member: Attention) -> Bool {
+        draft.base == member.answer && draft.baseState == member.answerState
+    }
+
+    static func visibleText(_ draft: AttentionPromptDraft?, member: Attention) -> String {
+        guard let draft, isCurrent(draft, member: member) else { return member.answer ?? "" }
+        return draft.text
+    }
+
+    /// The trimmed text to send, or `nil` when empty, unchanged or stale.
+    static func flushable(_ draft: AttentionPromptDraft?, member: Attention) -> String? {
+        guard let draft, isCurrent(draft, member: member) else { return nil }
+        let trimmed = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == (member.answer ?? "") ? nil : trimmed
     }
 }
 
@@ -433,8 +524,8 @@ struct AttentionMemberRow: View {
     private var yesNoControl: some View {
         Picker("", selection: yesNoBinding) {
             Text("—").tag("")
-            Text("Yes").tag("yes")
-            Text("No").tag("no")
+            Text(member.optionLabels?.yes ?? "Yes").tag("yes")
+            Text(member.optionLabels?.no ?? "No").tag("no")
         }
         .labelsHidden()
         .pickerStyle(.segmented)

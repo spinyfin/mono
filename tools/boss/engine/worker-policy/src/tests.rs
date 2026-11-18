@@ -101,6 +101,7 @@ fn conflict_worker_telemetry_verbs_stay_allowed() {
     assert_allowed(FrontendRequest::MarkConflictResolutionFailed {
         attempt_id: "cr_1".into(),
         reason: "unresolvable".into(),
+        evidence: None,
     });
 }
 
@@ -108,10 +109,12 @@ fn conflict_worker_telemetry_verbs_stay_allowed() {
 fn ci_remediation_worker_marks_stay_allowed() {
     // Every `boss engine ci …` verb the CI worker prompt instructs.
     assert_allowed(FrontendRequest::ClassifyCiRemediation {
+        queue_ci_evidence: None,
         attempt_id: "ci_1".into(),
         triage_class: "tractable".into(),
     });
     assert_allowed(FrontendRequest::MarkCiRemediationFailed {
+        queue_ci_evidence: None,
         attempt_id: "ci_1".into(),
         reason: "unfixable".into(),
     });
@@ -300,10 +303,31 @@ fn mutating_taxonomy_verbs_are_denied_and_name_a_proposal_verb() {
 
     let denial = assert_denied(FrontendRequest::UpdateWorkItem {
         id: "task_1".into(),
-        patch: WorkItemPatch::default(),
+        patch: Box::new(WorkItemPatch::default()),
     });
     assert_eq!(denial.reason, WorkerTierDenialReason::MutatingTaxonomy);
-    assert!(denial.use_instead.is_some());
+    assert_eq!(
+        denial.use_instead.as_deref(),
+        Some("boss propose (pr-created, effort-escalation, blocked, ...)")
+    );
+
+    let denial = assert_denied(FrontendRequest::UpdateWorkItem {
+        id: "task_1".into(),
+        patch: Box::new(WorkItemPatch {
+            pr_url: Some("https://example/pr/1".into()),
+            ..WorkItemPatch::default()
+        }),
+    });
+    assert_eq!(denial.use_instead.as_deref(), Some("boss propose pr-created"));
+
+    let denial = assert_denied(FrontendRequest::UpdateWorkItem {
+        id: "task_1".into(),
+        patch: Box::new(WorkItemPatch {
+            effort_level: Some("large".into()),
+            ..WorkItemPatch::default()
+        }),
+    });
+    assert_eq!(denial.use_instead.as_deref(), Some("boss propose effort-escalation"));
 }
 
 #[test]
@@ -346,11 +370,14 @@ fn coordinator_verbs_stay_closed() {
             work_item_id: "task_1".into(),
         },
         FrontendRequest::RecreateCoordinator {
+            force_without_handoff: false,
             expected_spawn_token: "token".into(),
             reason: CoordinatorRecreateReason::OperatorReset,
         },
-        FrontendRequest::GetCoordinatorHandoff,
+        FrontendRequest::GetCoordinatorHandoff { redeliver: false },
+        FrontendRequest::GetCoordinatorHandoff { redeliver: true },
         FrontendRequest::SetCoordinatorHandoff {
+            authorization: String::new(),
             body: "- greyarea is down".into(),
         },
         FrontendRequest::ListCoordinatorGuidance { product_id: None },
@@ -493,7 +520,19 @@ fn every_run_carrying_event_is_sanitized() {
             runs: vec![run(), run()],
         },
     ] {
-        assert_nothing_leaked(&sanitize_event_for_worker(event));
+        let mut expected = serde_json::to_value(&event).unwrap();
+        if let Some(runs) = expected.get_mut("runs") {
+            for run in runs.as_array_mut().unwrap() {
+                run["transcript_path"] = serde_json::Value::Null;
+                run["artifacts_path"] = serde_json::Value::Null;
+            }
+        } else {
+            expected["run"]["transcript_path"] = serde_json::Value::Null;
+            expected["run"]["artifacts_path"] = serde_json::Value::Null;
+        }
+        let after = sanitize_event_for_worker(event);
+        assert_nothing_leaked(&after);
+        assert_eq!(serde_json::to_value(after).unwrap(), expected);
     }
 }
 
@@ -521,13 +560,16 @@ fn execution_rows_carry_no_runtime_half_fields() {
             execution: execution(),
             work_item_id: "chore_1".into(),
             pr_url: "https://github.com/o/r/pull/1".into(),
-            batch_id: None,
-            batch_generation: None,
-            batch_execution_ids: Vec::new(),
-            already_active: false,
+            batch_id: Some("batch_1".into()),
+            batch_generation: Some(4),
+            batch_execution_ids: vec!["exec_1".into(), "exec_2".into()],
+            already_active: true,
         },
     ] {
-        assert_nothing_leaked(&sanitize_event_for_worker(event));
+        let before = serde_json::to_value(&event).unwrap();
+        let after = sanitize_event_for_worker(event);
+        assert_nothing_leaked(&after);
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
     }
 }
 
@@ -566,7 +608,7 @@ fn worker_context_bundle() -> WorkerContextBundle {
 
 /// `boss context`'s bundle carries no `WorkExecution`/`WorkRun` rows, so it
 /// has nothing to strip — but it still has to be a deliberate, named
-/// pass-through in `sanitize_event_for_worker`'s exhaustive match (a
+/// pass-through in the event declaration (a
 /// compile error otherwise), and this pins that it stays leak-free even so.
 #[test]
 fn worker_context_result_carries_no_runtime_half_fields() {
@@ -599,9 +641,37 @@ fn pr_status_and_pr_body_results_carry_no_runtime_half_fields() {
 
 #[test]
 fn unrelated_events_pass_through_untouched() {
-    let before = FrontendEvent::ProductsList { products: vec![] };
-    let after = sanitize_event_for_worker(before);
-    assert!(matches!(after, FrontendEvent::ProductsList { .. }));
+    for event in [
+        FrontendEvent::ProductsList { products: vec![] },
+        FrontendEvent::ShutdownAccepted,
+        FrontendEvent::WorkRuntimePatch {
+            product_id: "prod_1".into(),
+            items: vec![],
+            absent: vec!["task_1".into()],
+        },
+        // TopicEvent remains pass-through, including its own host vocabulary;
+        // execution/run redaction must not turn into a recursive JSON scrubber.
+        FrontendEvent::TopicEvent {
+            topic: "worker.pane".into(),
+            revision: 7,
+            origin_session_id: "session_1".into(),
+            origin_request_id: Some("request_1".into()),
+            event: boss_protocol::TopicEventPayload::WorkerPaneCapture {
+                run_id: "run_1".into(),
+                host_id: "host_1".into(),
+                state: boss_protocol::PaneCaptureState::Live,
+                text: "pane contents".into(),
+                truncated: true,
+                observed_unix_ms: Some(100),
+                received_unix_ms: 200,
+                detail: Some("details".into()),
+            },
+        },
+    ] {
+        let before = serde_json::to_value(&event).unwrap();
+        let after = sanitize_event_for_worker(event);
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
+    }
 }
 
 fn idea_with_body() -> Idea {
@@ -632,6 +702,10 @@ fn work_tree_strips_ideas_for_workers() {
         .build();
     let before = FrontendEvent::WorkTree {
         product: product.clone(),
+        attention_items: vec![],
+        attention_groups: vec![],
+        attention_members: vec![],
+        planner_runs: vec![],
         projects: vec![],
         tasks: vec![],
         chores: vec![],
@@ -639,7 +713,10 @@ fn work_tree_strips_ideas_for_workers() {
         dependencies: vec![],
         ideas: vec![idea_with_body()],
     };
+    let mut expected = serde_json::to_value(&before).unwrap();
+    expected["ideas"] = json!([]);
     let after = sanitize_event_for_worker(before);
+    assert_eq!(serde_json::to_value(&after).unwrap(), expected);
     let FrontendEvent::WorkTree {
         ideas,
         product: after_product,
@@ -654,6 +731,30 @@ fn work_tree_strips_ideas_for_workers() {
     assert_eq!(after_product.id, product.id);
     assert!(tasks.is_empty());
     assert!(chores.is_empty());
+}
+
+#[test]
+fn work_tree_updates_strip_ideas_for_workers() {
+    for base_sequence in [None, Some(1)] {
+        let event = FrontendEvent::WorkTreeUpdate {
+            update: boss_protocol::work_tree_delta::WorkTreeUpdate {
+                product_id: "prod_1".into(),
+                sequence: 2,
+                base_sequence,
+                changes: serde_json::json!({"ideas": [{"body": "private draft"}], "tasks": []}),
+            },
+        };
+        let FrontendEvent::WorkTreeUpdate { update } = sanitize_event_for_worker(event) else {
+            panic!("update")
+        };
+        assert!(!serde_json::to_string(&update).unwrap().contains("private draft"));
+        assert_eq!(update.changes["tasks"], serde_json::json!([]));
+        if base_sequence.is_none() {
+            assert_eq!(update.changes["ideas"], serde_json::json!([]));
+        } else {
+            assert!(update.changes.get("ideas").is_none());
+        }
+    }
 }
 
 #[test]
@@ -684,6 +785,7 @@ fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
         assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
     }
     assert_allowed(FrontendRequest::GetWorkTree {
+        delta: false,
         product_id: "prod_1".into(),
         fetch_seq: None,
     });

@@ -111,3 +111,12 @@ parses the JSON lease result (workspace path, lease id) to place a
 worker, then drives `heartbeat` and `release` over the lease's lifetime.
 `cube` has no internal crate dependencies and is not depended on as a
 library — it is consumed purely as a binary at the process boundary.
+
+## Recovering a damaged store
+
+To recover a damaged shared jj store, run `cube repo reclone <repo>` after
+releasing all its workspaces and stopping tools using its source or workspaces.
+This keeps the original store in a timestamped sibling directory, purges the
+old workspaces, and clones from the recorded origin. Repo settings, the declared
+oldest jj version, and setup inputs are retained. See
+[store recovery](docs/store-gc-recovery.md#replacing-a-damaged-store) for details.

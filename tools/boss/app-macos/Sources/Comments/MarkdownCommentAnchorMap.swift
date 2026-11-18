@@ -41,6 +41,7 @@ enum MarkdownCommentAnchorMap {
             source: String,
             headings: Set<String>,
             chunks: [MarkdownDocumentChunk],
+            parsed: [AttributedString]? = nil,
             highlighted: [CommentAnchor],
             flashing: CommentAnchor?,
             baseURL: URL?
@@ -60,7 +61,7 @@ enum MarkdownCommentAnchorMap {
             self.flashing = flashing
             self.baseURL = baseURL
             if !projectionIsCurrent {
-                projection = MarkdownCommentAnchorMap.projection(for: chunks, baseURL: baseURL)
+                projection = MarkdownCommentAnchorMap.projection(for: chunks, baseURL: baseURL, parsed: parsed)
             }
             value = MarkdownCommentAnchorMap.assign(
                 highlighted: highlighted,
@@ -90,8 +91,8 @@ enum MarkdownCommentAnchorMap {
     }
 
     @MainActor
-    private static func projection(for chunks: [MarkdownDocumentChunk], baseURL: URL?) -> Projection {
-        let plains = chunks.map { CommentProjection.plainText(for: $0.renderedText, baseURL: baseURL) }
+    private static func projection(for chunks: [MarkdownDocumentChunk], baseURL: URL?, parsed: [AttributedString]? = nil) -> Projection {
+        let plains = parsed?.map { String($0.characters) } ?? chunks.map { CommentProjection.plainText(for: $0.renderedText, baseURL: baseURL) }
         var starts: [Int] = []
         var cursor = 0
         for plain in plains {

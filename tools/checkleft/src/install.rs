@@ -129,7 +129,7 @@ fn write_executable(path: &Path, content: &str) -> io::Result<()> {
 }
 
 /// Single-quote a string for POSIX `sh`, escaping embedded single quotes.
-fn shell_single_quote(value: &str) -> String {
+pub(crate) fn shell_single_quote(value: &str) -> String {
     let escaped = value.replace('\'', r#"'\''"#);
     format!("'{escaped}'")
 }

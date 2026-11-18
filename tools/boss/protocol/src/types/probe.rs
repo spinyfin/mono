@@ -125,6 +125,29 @@ impl ProbeDeliveryExpectation {
     }
 }
 
+/// Whether the worker's CLI was seen taking an interrupting delivery's text
+/// as a prompt (and so resuming work), recorded alongside the free-text
+/// `detail` so consumers need not string-match it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeResumeEvidence {
+    /// A matching prompt hook or transcript entry showed the worker took the
+    /// text and resumed.
+    Confirmed,
+    /// The text was written but no prompt hook or transcript entry matched
+    /// within the verification window (at most a pane echo was seen).
+    Unconfirmed,
+}
+
+impl ProbeResumeEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
 /// Observable delivery state of one probe, keyed by probe id.
 ///
 /// Queried with `FrontendRequest::ProbeStatus`. The states are ordered by

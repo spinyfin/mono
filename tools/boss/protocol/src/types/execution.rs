@@ -2,7 +2,7 @@
 //! and the runs an execution is made of.
 
 use super::attention::CreateAttentionItemInput;
-use super::common::BranchNaming;
+use super::common::{BranchNaming, DispatchPauseScope};
 use serde::{Deserialize, Serialize};
 
 /// Opaque per-execution runtime state owned by an agent driver.
@@ -70,16 +70,34 @@ pub enum ExecutionKind {
     PrReviewGuide,
     ProductDesign,
     ProjectDesign,
+    /// Administrative agent that diagnoses and unsticks one non-parked work
+    /// item that has no live work (design: task-persistence-parking-and-
+    /// autonomous-progression, section 2.2). Bound to the stuck item itself
+    /// (`work_executions.work_item_id`), minted by the engine's
+    /// `progression_sweep` and run in its own pool. It never writes a repository
+    /// or a PR branch: anything that needs a diff is expressed as a revision or
+    /// a task for a coding agent.
+    Progression,
     RevisionImplementation,
     TaskImplementation,
 }
 
 impl ExecutionKind {
-    /// Kinds that only ever read the PR and never write to its branch. They
-    /// cannot race a writer for the shared jj backing store, so per-PR
-    /// writer serialization (chain serialization) does not apply to them.
-    pub fn is_read_only_review(&self) -> bool {
-        matches!(self, Self::PrReview | Self::PrReviewGuide)
+    /// Kinds that never write to a PR branch: the read-only review kinds, which
+    /// only read the PR, and `progression`, which holds no checkout at all. They
+    /// cannot race a writer for the shared jj backing store, so per-PR writer
+    /// serialization (chain serialization) does not apply to them, and a live
+    /// one is never a writer on the PR chain.
+    pub fn never_writes_pr_branch(&self) -> bool {
+        matches!(self, Self::PrReview | Self::PrReviewGuide | Self::Progression)
+    }
+
+    /// Whether a run of this kind is given a cube workspace lease. A
+    /// `progression` run holds no checkout: it runs in an engine-owned scratch
+    /// directory, so lease-keyed spawn, reconcile and teardown paths must not
+    /// expect a lease id or workspace for it.
+    pub fn holds_cube_lease(&self) -> bool {
+        !matches!(self, Self::Progression)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -94,6 +112,7 @@ impl ExecutionKind {
             Self::PrReviewGuide => "pr_review_guide",
             Self::ProductDesign => "product_design",
             Self::ProjectDesign => "project_design",
+            Self::Progression => "progression",
             Self::RevisionImplementation => "revision_implementation",
             Self::TaskImplementation => "task_implementation",
         }
@@ -120,13 +139,14 @@ impl std::str::FromStr for ExecutionKind {
             "pr_review_guide" => Ok(Self::PrReviewGuide),
             "product_design" => Ok(Self::ProductDesign),
             "project_design" => Ok(Self::ProjectDesign),
+            "progression" => Ok(Self::Progression),
             "revision_implementation" => Ok(Self::RevisionImplementation),
             "task_implementation" => Ok(Self::TaskImplementation),
             other => Err(format!(
                 "unknown execution kind: `{other}`; expected one of: \
                  answer_agent, automation_triage, chore_implementation, ci_remediation, \
                  conflict_resolution, investigation_implementation, pr_review, pr_review_guide, \
-                 product_design, project_design, revision_implementation, task_implementation"
+                 product_design, project_design, progression, revision_implementation, task_implementation"
             )),
         }
     }
@@ -358,6 +378,101 @@ pub struct CreateRunInput {
     pub transcript_path: Option<String>,
 }
 
+/// Why a worker-failure status write happened.
+///
+/// The shipped `blocked_reason` trigger records a new `worker_failed`
+/// observation for every variant, even when the displayed reason is
+/// unchanged; its repeat-observation list is generated from [`Self::ALL`].
+/// [`Self::OperatorNo`] remains the historical basis for a declined answer
+/// that parked the task; live No answers now redispatch.
+/// A delivery whose conflict resolution cannot be verified is recorded as
+/// [`Self::DeliveredWithoutPr`]: the worker declared delivery that the engine
+/// could not confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailureBasis {
+    BlockingDialogOnScreen,
+    NudgeBreaker,
+    DeclaredBlocked,
+    DeliveredWithoutPr,
+    ForeignPrBinding,
+    OperatorNo,
+}
+
+macro_rules! worker_failure_basis_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl WorkerFailureBasis {
+            /// Every basis, sharing the exhaustive string mapping.
+            pub const ALL: &'static [WorkerFailureBasis] = &[$(WorkerFailureBasis::$variant),+];
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $str),+ }
+            }
+        }
+    };
+}
+
+worker_failure_basis_variants! {
+    BlockingDialogOnScreen => "blocking_dialog_on_screen",
+    NudgeBreaker => "nudge_breaker",
+    DeclaredBlocked => "declared_blocked",
+    DeliveredWithoutPr => "delivered_without_pr",
+    ForeignPrBinding => "foreign_pr_binding",
+    OperatorNo => "operator_no",
+}
+
+impl WorkerFailureBasis {
+    /// Whether a failure with this basis is a worker's declared blocker that
+    /// was never turned into a typed question (design section 2.9): the worker
+    /// stopped and asked for a human without saying what it needs. Such a row
+    /// is not a hold; it is a progression candidate with the
+    /// `progression.stuck_after` grace waived, so it is picked up within one
+    /// sweep interval. The other bases are real failures that age like any other
+    /// stuck state, and `OperatorNo` is the owner's recorded refusal.
+    pub fn waives_progression_grace(self) -> bool {
+        matches!(self, Self::DeclaredBlocked | Self::NudgeBreaker)
+    }
+
+    /// Inverse of [`Self::as_str`]. Unknown strings are rejected so a
+    /// caller cannot stamp an unattributed basis.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|basis| basis.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for WorkerFailureBasis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for WorkerFailureBasis {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| format!("unknown worker failure basis `{s}`"))
+    }
+}
+
+#[cfg(test)]
+mod worker_failure_basis_tests {
+    use super::WorkerFailureBasis;
+    use std::str::FromStr;
+
+    #[test]
+    fn as_str_parse_and_from_str_roundtrip_every_variant() {
+        for basis in WorkerFailureBasis::ALL {
+            assert_eq!(WorkerFailureBasis::parse(basis.as_str()), Some(*basis));
+            assert_eq!(WorkerFailureBasis::from_str(basis.as_str()).unwrap(), *basis);
+            assert_eq!(basis.to_string(), basis.as_str());
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unknown_values() {
+        assert_eq!(WorkerFailureBasis::parse("not_a_basis"), None);
+        assert!(WorkerFailureBasis::from_str("not_a_basis").is_err());
+    }
+}
+
 /// Everything needed to finish the active run of an execution in one atomic
 /// DB transaction (see `WorkDb::finish_execution_run`): the execution's new
 /// status, the run's terminal status and result/error text, whether to clear
@@ -387,12 +502,21 @@ pub struct FinishExecutionRunInput {
     /// retryable pre-start failure.
     #[builder(default)]
     pub increment_pre_start_failure_count: bool,
+    /// Persist pre-start launch failure, including slot collisions, through teardown.
+    #[builder(default)]
+    pub launch_failed: bool,
     /// Write `error_text` onto `work_executions.last_error`. Decoupled from
     /// [`Self::increment_pre_start_failure_count`] so every pre-pane failure
     /// (including `SlotBusy`) persists the reason even when the counter is
     /// left alone.
     #[builder(default)]
     pub record_last_error: bool,
+    /// Optional worker-failure basis recorded on the linked work item in
+    /// this same transaction. A spawn-time blocking-dialog refusal uses
+    /// this so the dispatcher is the only writer that terminalizes the
+    /// execution: the task is parked `blocked` with that audit basis
+    /// rather than demoted back onto the dispatch queue.
+    pub worker_failure_basis: Option<WorkerFailureBasis>,
     pub attention: Option<CreateAttentionItemInput>,
 }
 
@@ -539,8 +663,9 @@ pub enum DispatchAdmissionEntryPoint {
 /// dispatch. This list mixes two different kinds of constraint — see the
 /// design doc's "Exactly what force overrides" section:
 ///
-/// - `INTERACTIVE_CONCURRENCY_CAP`, `UNMET_DEPENDENCY`, and
-///   `INELIGIBLE_STATUS` are genuinely enforced: force never bypasses them.
+/// - `INTERACTIVE_CONCURRENCY_CAP`, `UNMET_DEPENDENCY`,
+///   `INELIGIBLE_STATUS`, and `FOCUS_MODE` are genuinely enforced: force never
+///   bypasses them.
 /// - `CHURN_GUARD_PARKED`, `AUTOSTART_DISABLED`, and `DELIBERATE_PARKED`
 ///   are informational only (see `INFORMATIONAL_ONLY_BLOCKER_CODES` in
 ///   `coordinator/dispatch_admission.rs`) — an explicit dispatch request
@@ -558,6 +683,10 @@ pub const ADMISSION_BLOCKER_CHURN_GUARD_PARKED: &str = "churn_guard_parked";
 pub const ADMISSION_BLOCKER_AUTOSTART_DISABLED: &str = "autostart_disabled";
 pub const ADMISSION_BLOCKER_DELIBERATE_PARKED: &str = "deliberate_parked";
 pub const ADMISSION_BLOCKER_INELIGIBLE_STATUS: &str = "ineligible_status";
+/// The work item is outside the dispatch focus set (`bossctl dispatch
+/// focus`). Genuinely enforced, like the concurrency cap: a pause-only force
+/// start never bypasses it. `bossctl agents launch` is the explicit override.
+pub const ADMISSION_BLOCKER_FOCUS_MODE: &str = "focus_mode";
 
 /// One non-overridable reason [`DispatchAdmission`] found dispatch would
 /// currently refuse for, independent of the dispatch pause.
@@ -576,8 +705,10 @@ pub struct DispatchAdmissionBlocker {
 /// can tell a stale confirmation (the pause was lifted, or re-raised with a
 /// different reason) from a fresh one — see the design's "pause-generation
 /// race" handling.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DispatchPauseSnapshot {
+    #[builder(default)]
     pub active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -585,10 +716,15 @@ pub struct DispatchPauseSnapshot {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_since_epoch_s: Option<u64>,
-    /// `true` only when `active` and `origin == "operator"` — a
-    /// breaker-originated pause is never overridable, since it signals the
-    /// spawn path itself is unhealthy rather than an operator decision to
-    /// hold work back.
+    /// What the pause holds (`"new_work"` / `"all_spawns"`); see
+    /// [`DispatchPauseScope`]. `None` when not `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<DispatchPauseScope>,
+    /// `true` only when `active`, `origin == "operator"`, and `scope` is
+    /// `new_work` — a breaker-originated pause is never overridable, since
+    /// it signals the spawn path itself is unhealthy rather than an operator
+    /// decision to hold work back, and an operator `all_spawns` pause says
+    /// the same thing in the operator's own words.
     pub overridable: bool,
 }
 
@@ -675,6 +811,32 @@ pub struct RequestExecutionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_pause_since_epoch_s: Option<u64>,
 
+    /// `true` when a human-initiated start (kanban drag, `bossctl work
+    /// start`, an affirmative answer to the item's question) is asking for
+    /// this execution. Only an explicit start re-opens a retired spawning
+    /// attempt of an engine-spawned revision and lifts the block that
+    /// retirement left; automatic recovery sweeps leave it `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub explicit_start: bool,
+
+    /// Actor for every status and flag write this request makes, including
+    /// `last_status_actor`; the RequestExecution handler overwrites it from
+    /// the socket peer. Automatic callers leave it unset so those writes
+    /// record `engine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_actor: Option<String>,
+
+    /// Ledger caller identity for those writes (`rpc:request_execution …` or
+    /// `board_drop:request_execution …`). Combined with the helper name
+    /// (`explicit_start_clears_deferred`) at the write. Automatic callers
+    /// set this to the code path that requested the execution
+    /// (`reconcile_active_dispatch`, `rescan_active_dispatch`,
+    /// `dispatch_failure_recovery`, `preemption_requeue`,
+    /// `slot_busy_replacement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_basis: Option<String>,
+
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,
     /// Host selected for this one dispatch request. This is intentionally
@@ -715,15 +877,13 @@ pub struct WorkExecution {
     /// unclassified; `None` with no driver is a pre-recording execution.
     #[serde(default)]
     pub effort_level: Option<super::common::EffortLevel>,
-    /// When `true`, the cube lease call for this execution will include
-    /// `--allow-dirty`, causing cube to reclaim the named preferred workspace
-    /// with its uncommitted working copy intact rather than resetting it.
-    /// Set on the orphan recovery re-dispatch path (when the predecessor
-    /// execution was `orphaned`), merge-cancelled review followups, and by the
-    /// transient-recovery auto-resume path (`WorkDb::request_resume_execution`
-    /// in `boss-engine`) so the recovering worker lands on the exact dirty
-    /// workspace its predecessor left behind instead of cube silently
-    /// wiping it. Normal first-time dispatches leave this `false`.
+    /// Recorded when the row is created on the orphan recovery re-dispatch
+    /// path (when the predecessor execution was `orphaned`) and for
+    /// merge-cancelled review followups. Dispatch does not read it: it
+    /// always leases a clean workspace (never `--allow-dirty`) and recovers
+    /// the predecessor's work through its preserved tip. The transient-recovery
+    /// auto-resume path (`WorkDb::request_resume_execution`) does not set it.
+    /// Normal first-time dispatches leave this `false`.
     #[serde(default)]
     #[builder(default)]
     pub allow_dirty: bool,
@@ -920,4 +1080,64 @@ pub struct WorkRun {
     pub result_summary: Option<String>,
     pub started_at: Option<String>,
     pub transcript_path: Option<String>,
+}
+
+// ── Execution labels ─────────────────────────────────────────────────────────
+//
+// The human label of an execution (the work item it ran for, that item's PR
+// and what the run was for), resolved by the engine from the durable
+// execution → work item → PR binding via `ResolveExecutionLabels`. A frontend
+// must not keep its own copy: a raw execution id is never an acceptable label.
+
+/// How an execution's label resolved. `Resolved` is the only state in which
+/// the work-item fields are filled; every other state is rendered as words
+/// by the frontend (never as the execution id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionLabelStatus {
+    /// The work item the run was bound to still exists.
+    Resolved,
+    /// The run is bound to a work item that has since been deleted (or whose
+    /// row can no longer be read).
+    WorkItemDeleted,
+    /// The execution kind is not bound to a work item at all (an answer
+    /// agent or an automation triage run). `purpose` still says what it was.
+    NoWorkItem,
+    /// The engine has no execution row with this id.
+    ExecutionUnknown,
+}
+
+/// The engine-resolved label for one execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ExecutionWorkLabel {
+    pub execution_id: String,
+    pub status: ExecutionLabelStatus,
+    /// [`crate::ExecutionKind::as_str`] of the run, when the execution row
+    /// exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Product that owns the work item, so the frontend can reveal its card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Display name of the product, as the left nav shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
+    /// Name of the project the work item belongs to; `None` when unfiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    /// PR bound to the work item (or, for a revision, to its chain root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    /// What the run was for, for the runs where the work-item title alone
+    /// would not say: `"Review"`, `"Review guide"`, `"Revision"`, … `None`
+    /// for plain implementation runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_short_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_title: Option<String>,
 }

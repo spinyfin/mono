@@ -61,12 +61,6 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
 ///
 /// Mirrors `boss_protocol::BoardGroup` — the raw values go on the wire.
 enum WorkBoardGroupKey: String {
-    /// Doing ▸ "Needs Attention": `blocked` rows waiting on the user's
-    /// answer to a worker's question (`WorkTask.isAwaitingOperatorAnswer`).
-    /// A **client-only** key: the engine's `BoardGroup` has no such group,
-    /// so it never goes on the wire (see `isEngineBoardGroup`) and a drop on
-    /// the section reports just the column.
-    case needsAttention = "needs_attention"
     /// Done ▸ "Merging": `in_review` rows whose PR is in a merge queue or has
     /// Merge When Ready armed. In flight, **not** complete.
     case merging
@@ -75,14 +69,37 @@ enum WorkBoardGroupKey: String {
     /// wire value because a drop cannot choose which bucket a card lands in —
     /// that is derived from `completed_at`.
     case completed
+}
 
-    /// Whether the engine's `BoardGroup` vocabulary includes this key. Only
-    /// those are sent in a `move_work_item_on_board` target; sending any
-    /// other would fail the request's deserialization engine-side.
-    var isEngineBoardGroup: Bool {
+/// The labelled sections the Review column is grouped into, in display order
+/// (`allCases` order is the order the sections render in).
+///
+/// Mirrors `boss_protocol::ReviewSection` — the raw values come off the wire
+/// as `Task.review_section`. The engine owns the classification (see
+/// `classify_review_section`); this type only names the sections and their
+/// headers.
+enum ReviewSection: String, CaseIterable {
+    /// Nothing left for an agent to do; only review / merge remains.
+    case ready
+    /// A revision is running or queued on the PR.
+    case inRevision = "in_revision"
+    /// An AI review is queued or running, or reported findings no revision
+    /// has started on yet.
+    case aiReview = "ai_review"
+    /// Open PR that is not ready yet and has nothing wrong: required CI is
+    /// still running or unpolled, or mergeability is unknown.
+    case pending
+    /// Needs a human or a fix: blocked work item, failing CI, merge
+    /// conflict, or only blocked revisions.
+    case blocked
+
+    var title: String {
         switch self {
-        case .merging, .completed: return true
-        case .needsAttention: return false
+        case .ready: return "Ready"
+        case .inRevision: return "In Revision"
+        case .aiReview: return "AI Review"
+        case .pending: return "Pending"
+        case .blocked: return "Blocked"
         }
     }
 }
@@ -316,6 +333,7 @@ struct WorkBoardSection: Identifiable {
     /// rollup). `nil` for every section except "Merging" while a tracked
     /// Trunk queue is non-`running`.
     var queueBannerText: String? = nil
+    var countLabel: String? = nil
 
     /// The group a drop landing on this section should report to the engine:
     /// [`groupKey`], except that a **collapsed** section reports `nil`.
@@ -389,6 +407,20 @@ func parseGitHubPRURL(_ urlString: String) -> (org: String, repo: String, number
     return (org: parts[0], repo: parts[1], number: parts[3])
 }
 
+/// Normalized identity shared by review lookups and PR link deduplication.
+enum ReviewPRIdentity: Hashable {
+    case github(org: String, repo: String, number: String)
+    case other(String)
+
+    init(_ url: String) {
+        if let pr = parseGitHubPRURL(url) {
+            self = .github(org: pr.org.lowercased(), repo: pr.repo.lowercased(), number: pr.number)
+        } else {
+            self = .other(url)
+        }
+    }
+}
+
 /// Whether two PR URL strings identify the same GitHub pull request.
 /// Compares the parsed `(org, repo, number)` triple case-insensitively
 /// on org/repo so incidental formatting differences don't defeat the
@@ -397,12 +429,7 @@ func parseGitHubPRURL(_ urlString: String) -> (org: String, repo: String, number
 /// two different task fields (e.g. a revision's own `prURL` and its
 /// `revisionParentPrUrl`) happen to resolve to the same PR.
 func sameGitHubPR(_ a: String, _ b: String) -> Bool {
-    if let pa = parseGitHubPRURL(a), let pb = parseGitHubPRURL(b) {
-        return pa.org.lowercased() == pb.org.lowercased()
-            && pa.repo.lowercased() == pb.repo.lowercased()
-            && pa.number == pb.number
-    }
-    return a == b
+    ReviewPRIdentity(a) == ReviewPRIdentity(b)
 }
 
 /// Repo names (lowercased) that appear with two or more distinct orgs

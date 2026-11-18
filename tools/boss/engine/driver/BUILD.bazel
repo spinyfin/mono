@@ -1,5 +1,5 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("//tools/boss/engine/core:codex_cli_version.bzl", "CODEX_CLI_VERSION")
 load("//tools/boss/engine/core:engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND")
 
@@ -8,7 +8,16 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "driver",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = glob(["src/grok/testdata/**"]) + ["src/codex-tmux.conf"],
+    compile_data = glob([
+        "src/agy/testdata/**",
+        "src/grok/testdata/**",
+    ]) + [
+        "//tools/boss/tmux:blocking_dialog_cases.json",
+        "src/codex-tmux.conf",
+        "src/initial_prompt.py",
+        "src/agy/adapter.py",
+        "src/checkleft_push_guard.py",
+    ],
     crate_name = "boss_engine_driver",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -21,18 +30,27 @@ rust_library(
         "BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND,
     },
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
+        "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/host-execution:__pkg__",
+        "//tools/boss/engine/live-worker-state:__pkg__",
+        "//tools/boss/engine/spoke:__pkg__",
         "//tools/boss/engine/stdout-progress:__pkg__",
+        "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
         "//tools/boss/codex_auth",
+        "//tools/boss/command-runner",
         "//tools/boss/engine/codex-hook-trust",
         "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utils",
+        "//tools/boss/engine/worker-bin",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -41,11 +59,27 @@ rust_library(
 rust_test(
     name = "driver_test",
     size = "small",
-    compile_data = glob(["src/grok/testdata/**"]) + ["src/codex-tmux.conf"],
+    compile_data = glob([
+        "src/agy/testdata/**",
+        "src/grok/testdata/**",
+    ]) + [
+        "//tools/boss/tmux:blocking_dialog_cases.json",
+        "src/codex-tmux.conf",
+        "src/initial_prompt.py",
+        "src/agy/adapter.py",
+        "src/checkleft_push_guard.py",
+    ],
     crate = ":driver",
-    data = [":codex_test_binary"],
+    data = [
+        ":codex_test_binary",
+        "@driver_signature_test_tools//:runtime",
+    ],
     edition = "2024",
     env = {"BOSS_TEST_CODEX": "$(rootpath :codex_test_binary)"},
+    # The agy adapter tests spawn a python3 hook process per case. Spread the
+    # crate's tests over native shards so each shard stays well inside the small
+    # budget, instead of raising the limit (see the engine core test target).
+    experimental_enable_sharding = True,
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
@@ -57,12 +91,16 @@ rust_test(
         # release the test binaries were fetched from.
         "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
     },
+    shard_count = 8,
     # Thirty real app-server trust observations retain the production 10s
     # deadline. Run after parallel engine shards instead of contending with
-    # them; neither the production deadline nor the small test budget changes.
-    tags = ["exclusive"],
+    # them; the production deadline is unchanged. `exclusive-if-local` and
+    # not `exclusive`: the latter also forces local execution, so the test
+    # could not be scheduled on a remote worker at all.
+    tags = ["exclusive-if-local"],
     deps = [
         "//tools/boss/codex_auth",
+        "//tools/boss/command-runner",
         "//tools/boss/engine/codex-hook-trust",
         "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/pr-review",
@@ -70,6 +108,7 @@ rust_test(
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utils",
+        "//tools/boss/engine/worker-bin",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
@@ -119,7 +158,9 @@ filegroup(
         ":aarch64_linux": ["@codex_test_aarch64_linux//:codex"],
     }),
     # engine/core's conformance live pins run against the same pinned release.
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )
 
 filegroup(
@@ -131,7 +172,9 @@ filegroup(
         ":aarch64_linux": ["@codex_test_aarch64_linux//:code_mode_host"],
     }),
     # engine/core's conformance live pins run against the same pinned release.
-    visibility = ["//tools/boss/engine/core:__pkg__"],
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
 )
 
 # Production sources scanned by `//tools/boss/engine/core:tmux_only_surface_test`,
@@ -139,5 +182,21 @@ filegroup(
 filegroup(
     name = "srcs",
     srcs = glob(["src/**/*.rs"]),
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
+)
+
+rust_binary(
+    name = "agy_rules_probe",
+    srcs = ["bin/agy_rules_probe.rs"],
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [":driver"] + all_crate_deps(normal = True),
+)
+
+filegroup(
+    name = "agy_blocked_marker_capture",
+    srcs = ["src/agy/testdata/blocked_marker_1.5.9.jsonl"],
     visibility = ["//tools/boss/engine/core:__pkg__"],
 )

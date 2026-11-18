@@ -11,10 +11,12 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/dispatch-events",
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
@@ -31,6 +33,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/engine/dispatch-events",
+        "//tools/boss/engine/task-scope",
         "//tools/boss/engine/utils",
         "//tools/boss/log-files",
     ] + all_crate_deps(

@@ -67,7 +67,7 @@
 //! ONE ready **non-review** execution as a canary while the breaker is
 //! tripped. This is the pause's one automatic exception, and it is declared:
 //! it goes through the coordinator's admission gate as
-//! [`crate::coordinator::DispatchAdmission::BreakerRecoveryProbe`] and emits
+//! [`boss_execution_contracts::DispatchAdmission::BreakerRecoveryProbe`] and emits
 //! a [`Stage::BreakerRecoveryProbeAdmitted`] event, so it is distinguishable
 //! in `bossctl dispatch tail` from a pause that is not being honoured.
 //! `pr_review` rows are never eligible — see
@@ -93,14 +93,15 @@ use std::sync::{Arc, Mutex};
 use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 use serde::Serialize;
 
-use crate::app::handler_helpers::{
-    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSED,
-    METADATA_KEY_DISPATCH_PAUSED_SINCE,
-};
 use crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER;
-use crate::coordinator::{DispatchAdmission, DispatchPauseOrigin, ExecutionCoordinator};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::WorkDb;
+use boss_execution_contracts::{DispatchAdmission, DispatchPauseOrigin};
+use boss_execution_contracts::{
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSE_SCOPE,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+};
 
 /// Number of **distinct** work items whose spawn must fail inside the window
 /// before the breaker trips. Set above the noise of a single flaky spawn but
@@ -112,9 +113,7 @@ pub const SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD: usize = 3;
 /// Sliding window (seconds) over which distinct failing work items are counted.
 pub const SPAWN_HEALTH_WINDOW_SECS: i64 = 300;
 
-/// Kind string for the single loud attention item raised when the breaker
-/// trips. Stable — external tooling and the app's attention pane pin it.
-pub const SPAWN_CAPABILITY_ATTENTION_KIND: &str = "app_spawn_capability_unhealthy";
+pub use boss_engine_storage_values::attention_kinds::SPAWN_CAPABILITY_ATTENTION_KIND;
 
 /// Backoff before the first half-open recovery probe after a trip, and the
 /// base of the exponential backoff applied after each subsequent probe
@@ -227,6 +226,7 @@ struct FailureWindowConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnFailureClass {
+    PromptNotAccepted,
     /// No shell ever came up for the pane: a dispatch-level spawn timeout or a pane
     /// death before any proof of life. The engine's tmux pane-spawn path is
     /// the thing to look at.
@@ -242,6 +242,7 @@ impl SpawnFailureClass {
     /// Stable, greppable label.
     pub fn as_str(self) -> &'static str {
         match self {
+            SpawnFailureClass::PromptNotAccepted => "prompt_not_accepted",
             SpawnFailureClass::NoShell => "no_shell",
             SpawnFailureClass::ShellWithoutDriverSignal => "shell_without_driver_signal",
         }
@@ -250,6 +251,7 @@ impl SpawnFailureClass {
     /// One clause describing what this class of failure actually observed.
     pub fn observed(self) -> &'static str {
         match self {
+            SpawnFailureClass::PromptNotAccepted => "the driver never accepted its initial prompt",
             SpawnFailureClass::NoShell => "no shell ever came up for the pane",
             SpawnFailureClass::ShellWithoutDriverSignal => {
                 "a pane and shell came up but no driver-originated signal was observed within the \
@@ -291,6 +293,7 @@ pub struct SpawnFailureEvidence {
 /// pause reason and attention item that say what was observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureComposition {
+    pub prompt_not_accepted: usize,
     pub no_shell: usize,
     pub shell_without_driver_signal: usize,
     /// True when every `ShellWithoutDriverSignal` row had `shell_pid > 0`.
@@ -310,6 +313,7 @@ pub struct TranscriptCauses {
 impl FailureComposition {
     pub fn of(evidence: &[SpawnFailureEvidence]) -> Self {
         let mut composition = Self {
+            prompt_not_accepted: 0,
             no_shell: 0,
             shell_without_driver_signal: 0,
             every_driver_start_had_a_shell: true,
@@ -317,6 +321,7 @@ impl FailureComposition {
         };
         for entry in evidence {
             match entry.class {
+                SpawnFailureClass::PromptNotAccepted => composition.prompt_not_accepted += 1,
                 SpawnFailureClass::NoShell => composition.no_shell += 1,
                 SpawnFailureClass::ShellWithoutDriverSignal => {
                     composition.shell_without_driver_signal += 1;
@@ -335,6 +340,13 @@ impl FailureComposition {
     /// `2 spawns with no shell (...) and 1 driver-start timeout (...)`.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
+        if self.prompt_not_accepted > 0 {
+            parts.push(format!(
+                "{} prompt confirmation failure(s) ({})",
+                self.prompt_not_accepted,
+                SpawnFailureClass::PromptNotAccepted.observed()
+            ));
+        }
         if self.no_shell > 0 {
             parts.push(format!(
                 "{} spawn(s) with no shell ({})",
@@ -363,6 +375,9 @@ impl FailureComposition {
 
     /// Where the operator should look first, given what was observed.
     pub fn diagnosis_hint(&self) -> &'static str {
+        if self.prompt_not_accepted > 0 {
+            return "Some workers never accepted their initial prompt. Check launcher delivery logs and current-run turn evidence alongside any other spawn failures.";
+        }
         match (self.no_shell, self.with_transcript.driver_start_timeouts) {
             (0, n) if n > 0 && self.every_driver_start_had_a_shell => {
                 "Every failure in the window had a working pane and shell, so tmux session \
@@ -414,7 +429,8 @@ struct FailureLog {
 /// counts distinct work items in-window. Cheap to share (`Arc`): a
 /// `std::sync::Mutex` guards the small vector and is never held across an
 /// `.await`.
-#[derive(Debug)]
+#[derive(Debug, bon::Builder)]
+#[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
 pub struct SpawnHealthTracker {
     /// In-window failures — see [`FailureLog`].
     failures: FailureLog,
@@ -439,6 +455,8 @@ pub struct SpawnHealthTracker {
     /// path would otherwise re-signal (and raise a fresh durable attention
     /// item) on every single success/failure cycle.
     last_disabled_signal_at: AtomicI64,
+    /// Operator pause episode for which spawn failure attention was raised.
+    operator_pause_signaled: Mutex<Option<u64>>,
 }
 
 impl Default for SpawnHealthTracker {
@@ -459,16 +477,17 @@ impl SpawnHealthTracker {
     /// that exercise the disabled (observability-only) path must opt out
     /// explicitly via `.with_breaker_enabled(false)`.
     pub fn with_config(threshold: usize, window_secs: i64) -> Self {
-        Self {
-            failures: FailureLog::default(),
-            window: FailureWindowConfig {
+        Self::builder()
+            .failures(FailureLog::default())
+            .window(FailureWindowConfig {
                 threshold: threshold.max(1),
                 window_secs: window_secs.max(1),
-            },
-            probe: Mutex::new(ProbeState::default()),
-            breaker_enabled: DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
-            last_disabled_signal_at: AtomicI64::new(NO_DISABLED_SIGNAL_YET),
-        }
+            })
+            .probe(Mutex::new(ProbeState::default()))
+            .breaker_enabled(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER)
+            .last_disabled_signal_at(AtomicI64::new(NO_DISABLED_SIGNAL_YET))
+            .operator_pause_signaled(Mutex::new(None))
+            .build()
     }
 
     /// Set whether a trip is allowed to actually pause dispatch. Consuming
@@ -726,12 +745,36 @@ pub async fn maybe_admit_recovery_probe(
     // Reviews are ineligible (see the module-level rationale above); the
     // coordinator's gate would refuse them anyway, and filtering here means
     // a queue whose tail happens to be reviews still gets a canary from the
-    // rows behind them.
+    // rows behind them. So are progression runs: they are the least urgent
+    // rows in the queue, which is exactly where this probe looks, but a run
+    // bound to a stuck item proves nothing about the coding-worker spawn path
+    // the breaker is probing, and a failed canary would be recorded against
+    // the very item it is meant to help.
     let eligible: Vec<&WorkExecution> = ready
         .iter()
-        .filter(|e| !coordinator.execution_targets_review_pool(e))
+        .filter(|e| !coordinator.execution_targets_review_pool(e) && !coordinator.execution_targets_progression_pool(e))
         .collect();
     let skipped_reviews = total_ready - eligible.len();
+    // Dispatch focus mode holds out-of-scope rows from every automatic path,
+    // and this probe is one: only an explicit `bossctl agents launch` may
+    // bypass focus. Drop held rows before choosing a canary, and admit nothing
+    // when scope cannot be resolved (fail closed, like the queue drain).
+    let focus = coordinator.dispatch_focus();
+    let eligible: Vec<&WorkExecution> = if focus.is_active() {
+        match work_db.executions_outside_dispatch_focus(&ready, &focus) {
+            Ok(held) => eligible.into_iter().filter(|e| !held.contains(&e.id)).collect(),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "spawn-capability breaker: failed to resolve dispatch focus scope; \
+                     admitting no recovery probe this tick",
+                );
+                return;
+            }
+        }
+    } else {
+        eligible
+    };
     // `list_ready_executions` orders by dispatch class then FIFO, so
     // `.first()` would be the fleet's single most urgent row (typically a
     // merge-conflict revision) — sacrificing it repeatedly to a sustained
@@ -841,6 +884,7 @@ pub async fn resume_dispatch_after_breaker_recovery(
         .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
         .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "0"))
         .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_REASON, ""))
+        .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, ""))
     {
         tracing::warn!(
             ?err,
@@ -935,7 +979,11 @@ pub struct TripSignal<'a> {
 /// otherwise keep dispatching into the dead path and keep tripping this
 /// function forever. In that case this still escalates: it re-pauses with
 /// [`DispatchPauseOrigin::Breaker`] (clearing the review exemption) and
-/// raises the attention item, rather than skipping as a duplicate.
+/// raises the attention item, rather than skipping as a duplicate. An
+/// *operator all-spawns* pause already holds reviews and is
+/// manual-resume-only, so it is never replaced: the trip raises the attention
+/// item (saying so) and leaves the pause, its origin and its persisted scope
+/// untouched.
 ///
 /// **Disabled:** idempotency instead comes from
 /// [`SpawnHealthTracker::mark_disabled_trip_signaled`] (dispatch is never
@@ -983,9 +1031,17 @@ pub async fn trip_spawn_capability_circuit(
         composition.describe()
     );
 
+    // An operator pause with the `all_spawns` scope already holds everything
+    // the breaker would, and it is manual-resume-only. A trip must neither
+    // replace it with a Breaker pause (which the recovery probe could then
+    // auto-resume, lifting a hold the operator placed) nor stay silent about
+    // the spawn failures — so the trip still raises the attention item but
+    // leaves the operator's pause alone.
+    let mut operator_all_spawns_hold = false;
     if breaker_enabled {
-        if coordinator
-            .dispatch_pause()
+        let existing = coordinator.dispatch_pause();
+        if existing
+            .as_ref()
             .is_some_and(|p| p.origin == DispatchPauseOrigin::Breaker)
         {
             tracing::debug!(
@@ -994,6 +1050,24 @@ pub async fn trip_spawn_capability_circuit(
             );
             return;
         }
+        operator_all_spawns_hold = existing.as_ref().is_some_and(|p| p.reviews_held());
+        let mut signaled = spawn_health.operator_pause_signaled.lock().unwrap();
+        if let Some(pause) = existing.filter(|p| p.reviews_held()) {
+            if *signaled == Some(pause.since_epoch_s) {
+                return;
+            }
+            *signaled = Some(pause.since_epoch_s);
+        } else {
+            *signaled = None;
+        }
+    }
+    if breaker_enabled && operator_all_spawns_hold {
+        tracing::debug!(
+            tripping_execution_id,
+            "spawn-capability breaker: operator all-spawns pause already holds dispatch; \
+             leaving it in place and raising attention only",
+        );
+    } else if breaker_enabled {
         let now_u64 = now_epoch_secs.max(0) as u64;
         // The breaker is a programmatic pauser — it must supply its own
         // specific reason describing what tripped, never a generic
@@ -1014,6 +1088,12 @@ pub async fn trip_spawn_capability_circuit(
                 work_db.set_metadata(
                     METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
                     DispatchPauseOrigin::Breaker.as_metadata_str(),
+                )
+            })
+            .and_then(|()| {
+                work_db.set_metadata(
+                    METADATA_KEY_DISPATCH_PAUSE_SCOPE,
+                    DispatchPauseOrigin::Breaker.default_scope().as_str(),
                 )
             })
             .and_then(|()| {
@@ -1085,7 +1165,14 @@ pub async fn trip_spawn_capability_circuit(
          Per execution:\n{per_execution}",
         composition.diagnosis_hint(),
     );
-    let body = if breaker_enabled {
+    let body = if breaker_enabled && operator_all_spawns_hold {
+        format!(
+            "{what_happened}\n\n\
+             Dispatch is already held by an **operator all-spawns pause** (reviews included), so the \
+             breaker did not replace it and will not probe or auto-resume: that pause is \
+             manual-resume-only. Run `bossctl dispatch resume` once the spawn path is confirmed healthy."
+        )
+    } else if breaker_enabled {
         format!(
             "{what_happened}\n\n\
              Dispatch has been **paused** (reviews included) to stop the engine from burning spawn \
@@ -1115,6 +1202,7 @@ pub async fn trip_spawn_capability_circuit(
         )
     };
     let title = match (composition.no_shell, composition.shell_without_driver_signal) {
+        _ if composition.prompt_not_accepted > 0 => "Worker prompt confirmation failed; dispatch breaker tripped",
         (0, n) if n > 0 => "Worker spawns produced panes but no driver signal; dispatch breaker tripped",
         (n, 0) if n > 0 => "Worker-pane spawn capability is unhealthy (no shell came up)",
         _ => "Worker spawn failures (no shell and no driver signal); dispatch breaker tripped",
@@ -1143,10 +1231,12 @@ pub async fn trip_spawn_capability_circuit(
                     "distinct_work_items": distinct_work_items,
                     "window_secs": window_secs,
                     "breaker_enabled": breaker_enabled,
-                    "dispatch_paused": breaker_enabled,
+                    "dispatch_paused": coordinator.is_dispatch_paused(),
+                    "operator_all_spawns_hold": operator_all_spawns_hold,
                     "rule": rule,
                     "threshold": threshold,
                     "failure_classes": {
+                        "prompt_not_accepted": composition.prompt_not_accepted,
                         "no_shell": composition.no_shell,
                         "shell_without_driver_signal": composition.shell_without_driver_signal,
                     },
@@ -1160,7 +1250,7 @@ pub async fn trip_spawn_capability_circuit(
     // every trip after the first, and doesn't pause at all — see the module
     // docs' "breaker flag" section — so there is no pause episode to record
     // in that mode).
-    if breaker_enabled {
+    if breaker_enabled && !operator_all_spawns_hold {
         dispatch_events
             .emit(
                 DispatchEvent::new(Stage::DispatchPaused, Outcome::Ok, tripping_execution_id)
@@ -2015,6 +2105,7 @@ mod tests {
             .epoch_secs(epoch_secs)
             .class(class)
             .cause(match class {
+                SpawnFailureClass::PromptNotAccepted => "prompt_not_accepted",
                 SpawnFailureClass::NoShell => "driver_start_timeout",
                 SpawnFailureClass::ShellWithoutDriverSignal => "driver_start_timeout",
             })
@@ -2043,6 +2134,7 @@ mod tests {
         assert_eq!(
             composition,
             FailureComposition {
+                prompt_not_accepted: 0,
                 no_shell: 0,
                 shell_without_driver_signal: 4,
                 every_driver_start_had_a_shell: true,

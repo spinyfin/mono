@@ -7,6 +7,7 @@ workspace = "../../.."
 [dependencies]
 anyhow = { workspace = true }
 boss-backoff = { path = "../backoff" }
+boss-engine-utils = { path = "../engine/utils" }
 boss-log-files = { path = "../log-files" }
 boss-protocol = { path = "../protocol" }
 libc = { workspace = true }

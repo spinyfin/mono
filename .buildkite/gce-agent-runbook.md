@@ -62,13 +62,26 @@ gcloud compute ssh bk-bazel-any-gce-1 --zone=ZONE --project=PROJECT
 
 The dead hosts' CPU and RAM were never recorded. `n2-standard-16` (16 vCPU / 64 GB) is inferred from observed action parallelism (58 concurrent test actions at peak) and warm-build timings: Linux `bazel-build-test` p50 18s / p90 152s across 77 sampled jobs, roughly at parity with the M-series Macs. `n2-standard-8` works; expect the p90 cases to stretch. Do not go below 32 GB — the hosts set `--shutdown_on_low_sys_mem`, and `.bazelrc:1` sets `--jobs=200`.
 
-Disk: each mono output base measures ~10 GB, the shared disk cache ~40 GB. 500 GB is comfortable. Note `.ci.bazelrc:4` sets `--experimental_disk_cache_gc_max_size=3T`, so cache GC will never fire on a smaller disk. If disk climbs:
+Disk: each mono output base measures ~10 GB, the shared disk cache ~40 GB at steady state. 500 GB is comfortable. The disk cache's size-based GC cap is sized to the host, not fixed: `steps/ci-env.sh` computes it on every CI step as 80% of the total size of the filesystem holding `/mnt/ssd/bazel/disk_cache` (~391 GB on a 500 GB boot disk) and passes it as `--experimental_disk_cache_gc_max_size` after `--config=ci-linux`, overriding the fleet-wide `3T` in `.ci.bazelrc`, which on a disk this size would never fire. The age-based GC (60 days) is unchanged. Each CI step prints the computed cap at the top of its log:
 
-```sh
-sudo rm -rf /mnt/ssd/bazel/disk_cache
+```
+--- [ci-env] disk cache /mnt/ssd/bazel/disk_cache: filesystem is 489 GB, GC cap 391G (80%)
 ```
 
-**Do not edit `.ci.bazelrc`** — it is fleet-wide config sized for the real hosts.
+To verify on the host (from the agent's checkout, e.g. `/var/lib/buildkite-agent/builds/<agent>/flunge/mono`):
+
+```sh
+df -P -k /mnt/ssd/bazel/disk_cache        # the 1024-blocks total is the cap's input
+bash -c 'source .buildkite/steps/disk-cache-gc-cap.sh &&
+  ci_disk_cache_gc_cap_from_total_kb "$(ci_disk_cache_fs_total_kb /mnt/ssd/bazel/disk_cache)"'
+grep -E "Disk cache garbage collector|Deleted [0-9]+ of [0-9]+ files" /mnt/ssd/bazel/output_base/*/java.log | tail
+```
+
+The last command shows the GC actually running (`Deleted N of M files, reclaimed ...`); it runs about five minutes after a build, once the Bazel server goes idle.
+
+**Disk-full symptom.** An agent whose disk has filled up does not go offline. It stays connected in Buildkite and keeps accepting `bazel-any` jobs, which then sit in "accepted" with empty logs and stall the merge queue. If jobs are stuck that way, run `df -h /mnt/ssd /` on the host first, then `du -sh /mnt/ssd/bazel/disk_cache /mnt/ssd/bazel/output_base /mnt/ssd/bazel/repo_cache /var/lib/buildkite-agent/.cache/bazelcache /var/lib/buildkite-agent/.cache/bazel`. The CI cache cap is computed from the disk size, so a full disk now points at something other than the CI disk cache — typically `.cache/bazelcache` (the off-CI cache, 250G cap) or `.cache/bazel` from a bazel call that bypassed the CI flags — or at a host whose CI steps are not going through `steps/ci-env.sh`. If the disk cache itself is what filled the disk, a one-time `sudo rm -rf /mnt/ssd/bazel/disk_cache` frees it; the computed cap keeps it from recurring, so do not add a cron job for this.
+
+**Do not edit `.ci.bazelrc`'s GC lines for a host's disk size** — the cap is computed per host; `.ci.bazelrc` is fleet-wide config.
 
 Use persistent disk, not Local SSD. Local SSD is ephemeral, so every stop/start rebuilds the whole cache.
 
@@ -204,27 +217,20 @@ This happened on the first GCE host: flunge's `MODULE.bazel` pinned `rules_mypy`
 
 ## Node
 
-```sh
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
-node --version && npx --version
-```
+checkleft provisions Node **24.8.0** itself for npm-backed checks such as
+`format/oxc` and `lint/oxc`. It downloads the official distribution, verifies
+an embedded SHA-256 digest, and publishes it atomically in its platform cache.
+The host Node installation and PATH order do not select the runtime.
 
-`checks` shells out to `npx --yes oxfmt@0.55.0` and `oxlint@1.70.0` via checkleft's declarative external-tool resolution. Node is a host package, not a Bazel toolchain — `MODULE.bazel` has no `rules_js`, `rules_nodejs`, or node `http_archive`.
+Give the agent write access to its normal cache directory and network access to
+`nodejs.org` for a cold runtime cache and the npm registry for package
+provisioning. On Linux the runtime and npm caches live under checkleft's
+directory in `$XDG_CACHE_HOME` (default `$HOME/.cache`). Both x86-64 and ARM64
+agents are supported.
 
-Node **≥ 22** specifically, enforced by `MIN_NODE_MAJOR_VERSION` in `tools/checkleft/src/external/declarative/resolve.rs:218`. A Node 20 host fails with `ERR_UNKNOWN_FILE_EXTENSION`, which does not look like a Node version problem.
-
-If the agent is already running, restart it so it picks up the new PATH:
-
-```sh
-sudo systemctl restart buildkite-agent
-```
-
-`checks` is a **required merge context** (`REQUIRED_CHECKS.md:19`), and `format/oxc`'s include glob covers `md, markdown, mdx, yaml, yml, toml, json, css, html`, so it fires on nearly every PR — including doc-only ones. Without Node a fresh host can run `bazel-build-test` fine but cannot pass PR CI at all.
-
-`mono-integrity` → `integrity-checkleft` (`.buildkite/steps/integrity-checkleft.sh:15`) also needs it. `bazel-build-test`, `mac-app-build`, `boss-release`, `checkleft-release` and `changelog-release` do not.
-
-There is a declared fallback to a bare `oxfmt`/`oxlint` on `PATH`, but on a host with neither `npx` nor those binaries it resolves to the bare name and then fails at spawn — it does not save you.
+The PR `checks` step and `mono-integrity`'s `integrity-checkleft` step use this
+same provisioner. There is no CI-specific Node bootstrap, version-floor guard,
+or fallback to host `oxfmt`/`oxlint`; provisioning failures fail the check.
 
 ## Configure the agent
 

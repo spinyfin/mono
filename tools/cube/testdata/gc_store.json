@@ -1,0 +1,12 @@
+{
+  "generator_sha256": "cd071238c72cc511647d113a798a838df50172be40dfc5df0ad05d2efbf35d76",
+  "jj_archives": {
+    "aarch64-apple-darwin": "464243d23f511e626228afd4ca01d83c5fec93ea2358312ab9c59d3e1d5cd50d",
+    "aarch64-unknown-linux-musl": "a67aa1bde26375a2b542b908a6dd567826b0c32fd07e2073f220beb75453f489",
+    "x86_64-apple-darwin": "259344bce7bd0bea889543fbd372055f2de43f79057f0d3947b815eec7166c32",
+    "x86_64-unknown-linux-musl": "9f0be0f1348a2372b7c08d0130cae994ee9061f9a6c2eebe458f9266cd1e0faa"
+  },
+  "jj_version": "0.26.0",
+  "sha256": "f064c52d42e977c8e59cff3f5e658f3911cbd0b9ea51167486e5217021605fdf",
+  "url": "https://github.com/spinyfin/mono/releases/download/cube-test-data-gc-store-v1/gc-store.tar.gz"
+}

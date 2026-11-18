@@ -14,6 +14,7 @@
 //! to write engine state, it takes a port trait the engine implements; see
 //! [`github_oauth::OrgStateSink`].
 
+pub mod auth_forwarder;
 pub mod credentials;
 pub mod github;
 pub mod github_oauth;

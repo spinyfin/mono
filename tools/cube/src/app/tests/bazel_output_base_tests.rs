@@ -78,10 +78,66 @@ fn sweep_never_removes_a_hash_matching_a_live_workspace() {
     let root = tempfile::tempdir().expect("root");
     let live_hash = hash_workspace_path(&live_path);
     std::fs::create_dir_all(root.path().join(&live_hash)).expect("live-hashed dir");
+    let retired = root.path().join(format!("{live_hash}.cube-removing"));
+    let owner = root.path().join(format!("{live_hash}.cube-removing-owner"));
+    std::fs::create_dir_all(&retired).unwrap();
+    std::fs::write(&owner, live_path.display().to_string()).unwrap();
 
     let report = sweep_orphaned_output_bases(&store, root.path(), false);
 
     assert!(report.removed.is_empty());
-    assert_eq!(report.skipped_now_live, 1);
+    assert_eq!(report.skipped_now_live, 3);
     assert!(root.path().join(&live_hash).exists());
+    assert!(retired.exists());
+    assert!(owner.exists());
+}
+
+#[test]
+fn sweep_removes_retired_orphans_and_owner_only_records() {
+    let (_db, database) = with_database_path();
+    let store = Store::open_at(&database).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let retired = root.path().join(format!("{hash}.cube-removing"));
+    let owner = root.path().join(format!("{hash}.cube-removing-owner"));
+    std::fs::create_dir_all(retired.join("external/repo")).unwrap();
+    std::fs::write(&owner, "removed workspace").unwrap();
+    let owner_only = root.path().join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cube-removing-owner");
+    std::fs::write(&owner_only, "removed workspace").unwrap();
+    let dry = sweep_orphaned_output_bases(&store, root.path(), true);
+    assert_eq!(dry.removed.len(), 3);
+    assert!(retired.exists());
+    assert!(owner.exists());
+    let report = sweep_orphaned_output_bases(&store, root.path(), false);
+    assert!(report.failed.is_empty());
+    assert!(!retired.exists());
+    assert!(!owner.exists());
+    assert!(!owner_only.exists());
+}
+
+#[test]
+fn teardown_removes_retired_tree_and_ownership_record() {
+    use crate::app::bazel_output_base::{BazelUserRootCache, CleanupOutcome, cleanup_output_base_for_workspace};
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let hash = hash_workspace_path(&workspace);
+    let retired = root.path().join(format!("{hash}.cube-removing"));
+    let owner = root.path().join(format!("{hash}.cube-removing-owner"));
+    std::fs::create_dir_all(&retired).unwrap();
+    std::fs::write(&owner, workspace.display().to_string()).unwrap();
+    let probe = root.path().join("source");
+    let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+        probe.clone(),
+        "bazel",
+        &["info", "output_base"],
+        root.path().join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").to_str().unwrap(),
+    )]);
+    let cache = BazelUserRootCache::new(&runner, vec![probe]);
+    assert!(matches!(
+        cleanup_output_base_for_workspace(&cache, &workspace),
+        CleanupOutcome::Removed(_)
+    ));
+    assert!(!retired.exists());
+    assert!(!owner.exists());
+    runner.assert_exhausted();
 }

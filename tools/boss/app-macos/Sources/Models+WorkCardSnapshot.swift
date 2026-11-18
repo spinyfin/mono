@@ -24,15 +24,18 @@ struct WorkCardRevisionRollup: Equatable, Identifiable {
     let revisionSeq: Int?
     let name: String
     let revisionParentPrUrl: String?
+    let blockedReason: String?
 
-    init(id: String, revisionSeq: Int?, name: String, revisionParentPrUrl: String?) {
+    init(id: String, revisionSeq: Int?, name: String, revisionParentPrUrl: String?, blockedReason: String? = nil) {
         self.id = id
         self.revisionSeq = revisionSeq
         self.name = name
+        self.blockedReason = blockedReason
         self.revisionParentPrUrl = revisionParentPrUrl
     }
 
     init(revision: WorkTask) {
+        self.blockedReason = revision.status == "blocked" ? revision.blockedReason : nil
         self.id = revision.id
         self.revisionSeq = revision.revisionSeq
         self.name = revision.name
@@ -53,6 +56,7 @@ struct WorkCardSnapshotContext: Equatable {
     var runtime: WorkTaskRuntime? = nil
     var liveState: WorkerLiveState? = nil
     var dispatchWaitBlocker: DispatchWaitBlocker? = nil
+    var dispatchFailures: [DispatchFailureAttempt] = []
     /// Pre-resolved free-text live-status subtitle. Callers compute any
     /// time-relative phrasing (dispatch retry / wait-since) before
     /// building so the snapshot itself stays pure / Equatable-stable.
@@ -70,13 +74,16 @@ struct WorkCardSnapshotContext: Equatable {
     var showsCIAutoFixedBadge: Bool = false
     var ciFailureBadge: CiFailureBadge? = nil
     var isFrontierHighlighted: Bool = false
-    var designDocState: ProjectDesignDocState? = nil
+    var designDocPresentation: ProjectDesignDocAffordancePresentation? = nil
     var externalRefLink: ExternalRefLinkPresentation? = nil
     var ambiguousRepoNames: Set<String> = []
     var inReviewRevisions: [WorkCardRevisionRollup] = []
     var parentShortID: Int? = nil
     var deferredScopeItems: [DeferredScopeAttention] = []
     var deferredScopeActionInFlightIDs: Set<String> = []
+    /// Pre-resolved "Parked · <relative time> · <reason>" chip for a parked
+    /// card (time-relative text is fixed here so the snapshot stays pure).
+    var parked: ParkedChipPresentation? = nil
     /// An answer to this card's open question is awaiting the engine's
     /// reply (`ChatViewModel.operatorAnswerInFlightByTaskID`).
     var operatorAnswerInFlight: Bool = false
@@ -133,6 +140,7 @@ struct WorkCardSnapshot: Equatable {
     let assignedSlotId: Int?
     var assignedWorkerName: String? = nil
     let dispatchWaitBlocker: DispatchWaitBlocker?
+    let dispatchFailures: [DispatchFailureAttempt]
     let liveStatus: String?
     let liveStatusActivity: WorkerActivity?
     let liveStatusLastEventAt: String?
@@ -142,7 +150,7 @@ struct WorkCardSnapshot: Equatable {
     let repoChip: RepoChipPresentation?
     let ciFailureBadge: CiFailureBadge?
     let isFrontierHighlighted: Bool
-    let designDocState: ProjectDesignDocState?
+    let designDocPresentation: ProjectDesignDocAffordancePresentation?
     let ciRequiredState: String?
     let ciRequiredDetail: String?
     let reviewRequiredState: String?
@@ -182,9 +190,16 @@ struct WorkCardSnapshot: Equatable {
     /// conflict/CI remediation.
     let showsBlockedLock: Bool
     let showsHighPriorityChip: Bool
+    /// Solid red `CRIT` capsule for the human-only `critical` priority —
+    /// distinct from the tinted `H` chip because this is the one level
+    /// that changes dispatch behaviour (see `WorkPriority.critical`).
+    let showsCriticalPriorityChip: Bool
     let showsEffortChip: Bool
     let showsReasoningChip: Bool
     let showsDeferredBadge: Bool
+    /// Non-nil for a parked card; drives the chip and, when the card still
+    /// has a live execution, the "finishing current run" sub-label.
+    let parked: ParkedChipPresentation?
     let showsHumanDrivenBadge: Bool
     let showsProjectBadge: Bool
     let aiReviewState: String?
@@ -253,7 +268,8 @@ struct WorkCardSnapshot: Equatable {
                 isDispatchPending: isDispatchPending,
                 isResolvingConflicts: isResolvingConflicts,
                 isRemediatingCI: isRemediatingCI,
-                isAIReviewing: isAIReviewing)
+                isAIReviewing: isAIReviewing,
+                aiReviewStage: task.aiReviewStage)
             : nil
 
         let assignedSlotId: Int? = column == .doing ? context.liveState?.slotId : nil
@@ -294,20 +310,15 @@ struct WorkCardSnapshot: Equatable {
 
         // Gated on the effective column, not just the task: an optimistic
         // drag out of Doing must not leave answer buttons on a card that has
-        // visibly left Needs Attention.
+        // visibly left the Queued section.
         let operatorQuestion: OperatorQuestionPresentation? = {
             guard column == .doing, task.isAwaitingOperatorAnswer,
                   let question = task.operatorQuestion
             else { return nil }
             return OperatorQuestionPresentation(
-                questionID: question.id,
-                text: question.text,
-                explanation: question.explanation,
-                askedAt: question.askedAt,
+                question: question,
                 answerInFlight: context.operatorAnswerInFlight,
-                errorMessage: context.operatorAnswerError,
-                runSummary: question.runSummary,
-                prerequisiteTask: question.prerequisiteTask
+                errorMessage: context.operatorAnswerError
             )
         }()
 
@@ -343,12 +354,7 @@ struct WorkCardSnapshot: Equatable {
         let tagChips = WorkTagPresentation.chips(for: task.tags)
         let liveStatusNonEmpty = liveStatus.map { !$0.isEmpty } ?? false
 
-        // Design-doc affordance: state must resolve to a presentation, and
-        // the caller must have wired a button (matches today's body gate).
-        let designDocPresentation: Bool = {
-            guard let state = context.designDocState else { return false }
-            return ProjectDesignDocAffordancePresentation.from(state: state) != nil
-        }()
+        let showsDesignDoc = context.designDocPresentation != nil
 
         // Revision parent PR row only when it points somewhere different
         // from the card's own PR (avoids the #1829 double-link).
@@ -397,6 +403,7 @@ struct WorkCardSnapshot: Equatable {
             assignedSlotId: assignedSlotId,
             assignedWorkerName: assignedSlotId == nil ? nil : context.liveState?.displayName,
             dispatchWaitBlocker: context.dispatchWaitBlocker,
+            dispatchFailures: context.dispatchFailures,
             liveStatus: liveStatus,
             liveStatusActivity: liveStatusActivity,
             liveStatusLastEventAt: liveStatusLastEventAt,
@@ -406,7 +413,7 @@ struct WorkCardSnapshot: Equatable {
             repoChip: context.repoChip,
             ciFailureBadge: context.ciFailureBadge,
             isFrontierHighlighted: context.isFrontierHighlighted,
-            designDocState: context.designDocState,
+            designDocPresentation: context.designDocPresentation,
             ciRequiredState: ciRequiredState,
             ciRequiredDetail: ciRequiredDetail,
             reviewRequiredState: reviewRequiredState,
@@ -432,9 +439,11 @@ struct WorkCardSnapshot: Equatable {
                 && !isResolvingConflicts
                 && !isRemediatingCI,
             showsHighPriorityChip: WorkPriority.parse(task.priority) == .high,
+            showsCriticalPriorityChip: WorkPriority.parse(task.priority) == .critical,
             showsEffortChip: effortNonEmpty,
             showsReasoningChip: task.reasoning == "investigation",
             showsDeferredBadge: task.deferred,
+            parked: context.parked,
             showsHumanDrivenBadge: task.humanDriven,
             showsProjectBadge: projectNameNonEmpty,
             aiReviewState: column == .review ? task.aiReviewState : nil,
@@ -454,7 +463,7 @@ struct WorkCardSnapshot: Equatable {
             showsAutomationBadge: task.sourceAutomationId != nil,
             showsPlannerStagedBadge: task.isPlannerStaged,
             showsExternalRefLink: context.externalRefLink != nil,
-            showsDesignDocAffordance: designDocPresentation,
+            showsDesignDocAffordance: showsDesignDoc,
             showsAttachmentsAffordance: task.hasAttachments,
             showsTerminalButton: context.showsTerminalButton,
             showsMergeWhenReady: context.showsMergeWhenReady,
@@ -497,9 +506,10 @@ enum WorkCardLiveStatus {
         column: WorkBoardColumnKey,
         runtime: WorkTaskRuntime?,
         liveState: WorkerLiveState?,
+        isNextUp: Bool = false,
         now: Date = Date()
     ) -> String? {
-        guard column == .doing else { return nil }
+        guard column == .doing || (column == .review && isQueued(task: task, runtime: runtime)) else { return nil }
 
         // Human-driven rows occupy Doing without a worker — never paint
         // them as "Waiting for a slot" / stalled agent work.
@@ -514,18 +524,32 @@ enum WorkCardLiveStatus {
         let isAIReviewing = task.aiReviewing && task.status == "active"
 
         if runtime?.executionStatus == "claimed" { return "Starting worker" }
-        if isQueued(task: task, runtime: runtime) {
-            return queuedLabel(runtime: runtime, now: now)
-        }
-        if isResolvingConflicts { return nil }
-        if isRemediatingCI { return nil }
-        if isAIReviewing { return nil }
         // Transient-recovery banner wins outright — a worker being
         // auto-resumed after a Claude API error looks idle to every
         // other signal, so without this the card would silently show
         // stale/no text instead of "recovering from API error …".
         if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
             return recovering
+        }
+        if !isAIReviewing && isQueued(task: task, runtime: runtime) {
+            return isNextUp
+                ? nextUpLabel(runtime: runtime, now: now)
+                : queuedLabel(runtime: runtime, now: now,
+                              lead: task.status != "todo" && !isPendingExecution(runtime) ? "Waiting" : "Queued")
+        }
+        // A declared job wait names what the worker is waiting on, so it
+        // is shown even for conflict / CI-remediation runs.
+        if let liveState, liveState.isWaitingOnJob {
+            return AgentActivityState.waitCaption(liveState)
+        }
+        if liveState?.hungSince != nil { return "Hung — inspect or restart worker" }
+        if isResolvingConflicts { return nil }
+        if isRemediatingCI { return nil }
+        // A card held for AI review has no worker of its own to describe (a
+        // revision's reviewers are bound to the PR's chain root), so say what
+        // the engine reports it is waiting on rather than leaving a bare dot.
+        if isAIReviewing {
+            return liveState == nil ? AgentActivityState.aiReviewCaption(stage: task.aiReviewStage) : nil
         }
         return liveState?.liveStatus
     }

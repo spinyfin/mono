@@ -1,4 +1,5 @@
 import Foundation
+import PaneLayout
 
 // ===========================================================================
 // Live worker state. `WorkerLiveState` is the per-worker snapshot the app polls
@@ -52,6 +53,7 @@ struct WorkerLiveState {
     /// worker's next hook event proves it resumed, or once the slot is
     /// released.
     let recoveryStatus: String?
+    let hungSince: String?
     /// Mirrors the engine's `LiveWorkerState.tmux_hosted`: `true` for a
     /// local worker hosted in a tmux session. `nil` when the engine hasn't
     /// reported it — remote SSH workers, which remain valid without a
@@ -63,6 +65,63 @@ struct WorkerLiveState {
     let waitReason: String?
     /// ISO-8601 expiry of that wait, when one is set.
     let waitExpiresAt: String?
+    /// Wire badge type (`"coding"`, `"review"`, …). Missing or unrecognised
+    /// values render as Unknown; they are never dropped from membership.
+    let agentType: String?
+    /// Engine-reported stage of an AI review (`"reviewers"` or
+    /// `"consolidation"`); `nil` for non-review runs and older engines.
+    let reviewStage: String?
+    /// Durable execution kind reported by the engine.
+    let executionKind: String?
+    let projectId: String?
+    let projectName: String?
+    /// Host the run executes on. Agents membership is
+    /// `hostId == WorkerLiveState.localHostId`; remote workers stay out.
+    let hostId: String?
+    /// ISO-8601 execution start; the Agents grid sorts by this then `runId`.
+    let startedAt: String?
+    /// Attributed pool: `"main"`, `"automation"`, or `"review"`. Independent
+    /// of the physical slot — spilled automation still reports `"automation"`.
+    let pool: String?
+    /// Mirrors the engine's `LiveWorkerState.viewer_attach_error`: why the
+    /// engine's most recent attempt to attach this worker's viewer failed.
+    /// `nil` while nothing has failed (no attempt yet, or the last attempt
+    /// succeeded), which is what lets the Agents card say "Connecting…"
+    /// rather than guessing. Cleared by the engine on a later success.
+    let viewerAttachError: String?
+    /// Bound work item for this pane. `nil` for ad-hoc / unbound runs.
+    let workItemId: String?
+    let workItemName: String?
+    let owningWorkItemId: String?
+    let owningWorkItemTitle: String?
+    let workItemShortId: Int?
+    /// Product that owns `workItemId`. Needed to reveal the Work card.
+    let productId: String?
+    /// Display name of `productId`, as the left nav shows it.
+    let productName: String?
+    /// GitHub PR URL bound to the work item; updates when a PR is opened
+    /// mid-run.
+    let prURL: String?
+
+    /// Wire value the engine stamps on local workers. Keep in lock-step
+    /// with `boss_protocol::LOCAL_HOST_ID`.
+    static let localHostId = "local"
+
+    var badgeType: AgentType { AgentType.resolve(wire: agentType, reviewStage: reviewStage, executionKind: executionKind) }
+    var badgeLabel: String { badgeType.badgeLabel }
+
+    var agentProject: AgentProject {
+        if let projectId, !projectId.isEmpty { return .project(id: projectId) }
+        return .unfiled
+    }
+
+    var isLocalMember: Bool { hostId == Self.localHostId }
+
+    /// The engine named a host that is not this machine. A missing `hostId` is
+    /// a local run (spawns outside the dispatch path, older engines) and must
+    /// not be listed as remote — selecting one would subscribe a pane topic
+    /// the engine answers Unsupported for.
+    var isSpokeHosted: Bool { hostId.map { $0 != Self.localHostId } ?? false }
 
     init(
         name: String? = nil,
@@ -79,8 +138,27 @@ struct WorkerLiveState {
         recoveryStatus: String?,
         tmuxHosted: Bool?,
         waitReason: String? = nil,
-        waitExpiresAt: String? = nil
+        waitExpiresAt: String? = nil,
+        agentType: String? = nil,
+        reviewStage: String? = nil,
+        executionKind: String? = nil,
+        projectId: String? = nil,
+        projectName: String? = nil,
+        hostId: String? = nil,
+        startedAt: String? = nil,
+        pool: String? = nil,
+        viewerAttachError: String? = nil,
+        hungSince: String? = nil,
+        workItemId: String? = nil,
+        workItemName: String? = nil,
+        owningWorkItemId: String? = nil,
+        owningWorkItemTitle: String? = nil,
+        workItemShortId: Int? = nil,
+        productId: String? = nil,
+        productName: String? = nil,
+        prURL: String? = nil
     ) {
+        self.hungSince = hungSince
         self.name = name
         self.slotId = slotId
         self.runId = runId
@@ -96,6 +174,23 @@ struct WorkerLiveState {
         self.tmuxHosted = tmuxHosted
         self.waitReason = waitReason
         self.waitExpiresAt = waitExpiresAt
+        self.agentType = agentType
+        self.reviewStage = reviewStage
+        self.executionKind = executionKind
+        self.projectId = projectId
+        self.projectName = projectName
+        self.hostId = hostId
+        self.startedAt = startedAt
+        self.pool = pool
+        self.viewerAttachError = viewerAttachError
+        self.workItemId = workItemId
+        self.workItemName = workItemName
+        self.owningWorkItemId = owningWorkItemId
+        self.owningWorkItemTitle = owningWorkItemTitle
+        self.workItemShortId = workItemShortId
+        self.productId = productId
+        self.productName = productName
+        self.prURL = prURL
     }
 
     /// False when two entries share a `runId` or a `slotId`. A snapshot
@@ -109,6 +204,18 @@ struct WorkerLiveState {
             if !slotIds.insert(state.slotId).inserted { return false }
         }
         return true
+    }
+}
+
+extension WorkerLiveState {
+    /// The worker declared a wait on a job and the owner is not needed.
+    /// The engine snapshot is authoritative: it normalizes a wait whose
+    /// declaring turn has ended to `.idle`, and keeps `.waitingForInput`
+    /// (which still carries `waitReason`) for a prompt raised mid-turn,
+    /// which is a real ask of the owner. So a job wait is exactly idle plus
+    /// a declared reason; any other activity is never a job wait.
+    var isWaitingOnJob: Bool {
+        activity == .idle && !(waitReason ?? "").isEmpty
     }
 }
 
@@ -137,9 +244,27 @@ extension WorkerLiveState: Hashable {
             && lhs.liveStatus == rhs.liveStatus
             && lhs.liveStatusAt == rhs.liveStatusAt
             && lhs.recoveryStatus == rhs.recoveryStatus
+            && lhs.hungSince == rhs.hungSince
             && lhs.tmuxHosted == rhs.tmuxHosted
             && lhs.waitReason == rhs.waitReason
             && lhs.waitExpiresAt == rhs.waitExpiresAt
+            && lhs.agentType == rhs.agentType
+            && lhs.reviewStage == rhs.reviewStage
+            && lhs.executionKind == rhs.executionKind
+            && lhs.projectId == rhs.projectId
+            && lhs.projectName == rhs.projectName
+            && lhs.hostId == rhs.hostId
+            && lhs.startedAt == rhs.startedAt
+            && lhs.pool == rhs.pool
+            && lhs.viewerAttachError == rhs.viewerAttachError
+            && lhs.workItemId == rhs.workItemId
+            && lhs.workItemName == rhs.workItemName
+            && lhs.owningWorkItemId == rhs.owningWorkItemId
+            && lhs.owningWorkItemTitle == rhs.owningWorkItemTitle
+            && lhs.workItemShortId == rhs.workItemShortId
+            && lhs.productId == rhs.productId
+            && lhs.productName == rhs.productName
+            && lhs.prURL == rhs.prURL
     }
 
     func hash(into hasher: inout Hasher) {
@@ -153,9 +278,27 @@ extension WorkerLiveState: Hashable {
         hasher.combine(liveStatus)
         hasher.combine(liveStatusAt)
         hasher.combine(recoveryStatus)
+        hasher.combine(hungSince)
         hasher.combine(tmuxHosted)
         hasher.combine(waitReason)
         hasher.combine(waitExpiresAt)
+        hasher.combine(agentType)
+        hasher.combine(reviewStage)
+        hasher.combine(executionKind)
+        hasher.combine(projectId)
+        hasher.combine(projectName)
+        hasher.combine(hostId)
+        hasher.combine(startedAt)
+        hasher.combine(pool)
+        hasher.combine(viewerAttachError)
+        hasher.combine(workItemId)
+        hasher.combine(workItemName)
+        hasher.combine(owningWorkItemId)
+        hasher.combine(owningWorkItemTitle)
+        hasher.combine(workItemShortId)
+        hasher.combine(productId)
+        hasher.combine(productName)
+        hasher.combine(prURL)
     }
 }
 
@@ -181,6 +324,16 @@ enum WorkerActivity: String, Hashable {
         case .terminated: "Terminated"
         }
     }
+
+    /// Agents-pane activity pill. Spawning is a neutral "Starting"; an
+    /// engine terminal state is "Exited" until the snapshot releases the run.
+    var agentsPaneLabel: String {
+        switch self {
+        case .spawning: "Starting"
+        case .terminated: "Exited"
+        default: label
+        }
+    }
 }
 
 enum AgentActivityState: Equatable {
@@ -195,9 +348,10 @@ enum AgentActivityState: Equatable {
     case unknown(reason: String)
     case errored(reason: String)
     case none
-    /// The row is `status=todo, autostart=true` and no worker slot is
-    /// free yet. The engine has committed to dispatching it; the pool
-    /// is just full. Renders as a hourglass rather than a coloured dot
+    /// The card is queued: no worker is attached to it yet. Why it is
+    /// waiting is the engine's to say and is shown on the card's status
+    /// line (`WorkCardLiveStatus.queuedLabel`); this state carries no
+    /// reason of its own. Renders as a hourglass rather than a coloured dot
     /// so it reads as "queued" rather than "active or paused worker".
     case dispatchPending
 
@@ -221,8 +375,10 @@ enum AgentActivityState: Equatable {
             // Gating on it here would paint every such worker as "Run
             // completed".
             self = .active
-        case "ready":
-            self = .waiting(reason: "Queued for a worker")
+        case "ready", "waiting_dependency":
+            // Not started yet. Why is the engine's to say: the same line the
+            // card shows, never a reason inferred from the execution status.
+            self = .waiting(reason: WorkCardLiveStatus.queuedLabel(runtime: runtime, now: Date()))
         case "claimed":
             self = .waiting(reason: "Starting worker")
         case "waiting_human":
@@ -231,8 +387,6 @@ enum AgentActivityState: Equatable {
             self = .waiting(reason: "Waiting on review")
         case "waiting_merge":
             self = .waiting(reason: "Waiting on merge")
-        case "waiting_dependency":
-            self = .waiting(reason: "Waiting on dependency")
         case "failed":
             self = .waiting(reason: "Last run failed")
         case "completed":
@@ -253,13 +407,17 @@ enum AgentActivityState: Equatable {
                 self = .errored(reason: Self.identityUnavailableReason)
                 return
             }
+            if liveState.hungSince != nil {
+                self = .waiting(reason: "Hung — driver has stopped responding")
+                return
+            }
             switch liveState.activity {
             case .working:
                 self = .active
             case .waitingForInput:
                 self = .waiting(reason: "Waiting on user input")
             case .idle:
-                if let waitReason = liveState.waitReason, !waitReason.isEmpty {
+                if liveState.isWaitingOnJob {
                     self = .waiting(reason: Self.waitCaption(liveState))
                 } else if let recovering = liveState.recoveryStatus, !recovering.isEmpty {
                     self = .waiting(reason: recovering)
@@ -291,17 +449,19 @@ enum AgentActivityState: Equatable {
     ///    missing identity is an invariant failure, never a supported
     ///    local hosting mode. Remote workers (`tmuxHosted == nil`) skip
     ///    this rule.
-    /// 3. A worker paused on a permission prompt
-    ///    (`activity == .waitingForInput`) reads as *waiting*, not
-    ///    active. Without this, the card shows a green "working" dot
-    ///    while the run is actually stalled on an input prompt no one
-    ///    is watching for. This must precede the bound-slot shortcut
-    ///    below; it clears on its own once the worker resumes and the
-    ///    activity flips back to `.working`.
-    /// 4. An idle worker with a declared wait (`waitReason`) reads as
+    /// 3. An idle worker with a declared wait (`waitReason`) reads as
     ///    *waiting* with the wait caption, matching
-    ///    `init(runtime:liveState:)`. A worker that has resumed (any other
-    ///    activity) falls through even if the wait has not yet expired.
+    ///    `init(runtime:liveState:)`. The engine normalizes a wait whose
+    ///    declaring turn has ended to idle; any other activity falls
+    ///    through even if the wait has not yet expired.
+    /// 4. A worker paused on a permission prompt
+    ///    (`activity == .waitingForInput`, including a prompt raised
+    ///    mid-turn while a wait is declared) reads as *waiting on the
+    ///    owner*, not active. Without this, the card shows a green
+    ///    "working" dot while the run is actually stalled on an input
+    ///    prompt no one is watching for. This must precede the bound-slot
+    ///    shortcut below; it clears on its own once the worker resumes
+    ///    and the activity flips back to `.working`.
     /// 5. A slot-bound worker which has not reported a hook-derived state
     ///    reads as unknown rather than being guessed as active: after
     ///    re-adoption, `.spawning` means the engine knows the process exists
@@ -316,7 +476,8 @@ enum AgentActivityState: Equatable {
         isDispatchPending: Bool,
         isResolvingConflicts: Bool,
         isRemediatingCI: Bool,
-        isAIReviewing: Bool = false
+        isAIReviewing: Bool = false,
+        aiReviewStage: String? = nil
     ) -> AgentActivityState {
         if isDispatchPending {
             return .dispatchPending
@@ -324,14 +485,17 @@ enum AgentActivityState: Equatable {
         if liveState?.tmuxHosted == false {
             return .errored(reason: Self.identityUnavailableReason)
         }
+        if let liveState, liveState.isWaitingOnJob {
+            return .waiting(reason: waitCaption(liveState))
+        }
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
         }
-        if let liveState, liveState.activity == .idle, let reason = liveState.waitReason, !reason.isEmpty {
-            return .waiting(reason: waitCaption(liveState))
-        }
         if liveState?.activity == .spawning {
             return .unknown(reason: "Worker state not yet reported")
+        }
+        if liveState?.hungSince != nil {
+            return .waiting(reason: "Hung — driver has stopped responding")
         }
         if liveState?.slotId != nil {
             return .active
@@ -343,15 +507,35 @@ enum AgentActivityState: Equatable {
             return .waiting(reason: "Resolving CI failure")
         }
         if isAIReviewing {
-            return .waiting(reason: "AI review in progress")
+            return .waiting(reason: aiReviewCaption(stage: aiReviewStage))
         }
         return AgentActivityState(runtime: runtime, liveState: liveState)
     }
 
+    /// Doing-card caption for a held AI review. The engine reports the stage;
+    /// the consolidating agent reads differently from the parallel reviewers.
+    static func aiReviewCaption(stage: String?) -> String {
+        switch stage {
+        case AgentReviewStage.applying: "Applying AI review verdict"
+        case AgentReviewStage.consolidation: "Consolidating review findings"
+        default: "AI review in progress"
+        }
+    }
+
+    private static func clockTime(_ iso: String) -> String {
+        let parser = ISO8601DateFormatter()
+        guard let date = parser.date(from: iso) else { return iso }
+        return date.formatted(date: .omitted, time: .shortened)
+    }
+
     static func waitCaption(_ liveState: WorkerLiveState) -> String {
-        let reason = liveState.waitReason ?? "long-running job"
-        if let expiry = liveState.waitExpiresAt, !expiry.isEmpty {
-            return "Waiting: \(reason) (until \(expiry))"
+        waitCaption(reason: liveState.waitReason, expiresAt: liveState.waitExpiresAt)
+    }
+
+    static func waitCaption(reason: String?, expiresAt: String?) -> String {
+        let reason = reason ?? "long-running job"
+        if let expiry = expiresAt, !expiry.isEmpty {
+            return "Waiting: \(reason) · until \(Self.clockTime(expiry))"
         }
         return "Waiting: \(reason)"
     }
@@ -369,7 +553,9 @@ enum AgentActivityState: Equatable {
         case .none:
             return "No agent attached"
         case .dispatchPending:
-            return "Queued — waiting for a worker slot"
+            // No reason here: a full pool is only one of the things a queued
+            // card can be waiting on, and the status line names the real one.
+            return "Queued — no worker attached yet; the status line says why"
         }
     }
 }

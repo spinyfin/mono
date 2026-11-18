@@ -1,10 +1,7 @@
 //! Shared asynchronous process runner for Boss components.
 
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -17,51 +14,9 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
-/// Run a prepared command, capturing its output, and kill it if it does not
-/// exit before `timeout`.
-///
-/// Reader threads keep a command that writes heavily to both pipes from
-/// deadlocking. On timeout their output is intentionally discarded: child
-/// processes can inherit the pipe descriptors, so joining the readers after
-/// killing only the direct child could wait indefinitely for those descendants.
-pub fn output_blocking_timeout(command: &mut Command, timeout: Duration) -> std::io::Result<Output> {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut stderr = child.stderr.take().expect("stderr piped");
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).map(|_| buf)
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stderr.read_to_end(&mut buf).map(|_| buf)
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(stdout_thread);
-                drop(stderr_thread);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("{program} exceeded {timeout:?} timeout"),
-                ));
-            }
-        }
-    };
-    let stdout = stdout_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")))?;
-    let stderr = stderr_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")))?;
-    Ok(Output { status, stdout, stderr })
-}
+pub use process_runner::output_blocking_timeout;
+#[cfg(unix)]
+pub use process_runner::{kill_process_group, output_blocking_timeout_in_group};
 
 /// Process-spawning seam for components that construct commands.
 #[async_trait]
@@ -99,6 +54,16 @@ pub trait CommandRunner: Send + Sync {
     /// through an injected fake.
     fn is_real(&self) -> bool {
         false
+    }
+
+    /// Whether worker-process registration and host-wide cleanup (signalling
+    /// processes by inherited execution identity) apply to this runner. A
+    /// separate capability from [`Self::is_real`]: that one guards tests from
+    /// reaching a live server and must stay false for every fake, while a
+    /// fixture that needs to exercise real ownership cleanup opts in here.
+    /// Defaults to the runner's realness.
+    fn manages_host_processes(&self) -> bool {
+        self.is_real()
     }
 }
 
@@ -257,6 +222,8 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     /// A runner that implements no methods beyond the trait's defaults, to
     /// pin `CommandRunner::is_real`'s default value independently of any
@@ -279,6 +246,8 @@ mod tests {
     fn is_real_defaults_to_false_and_is_true_only_for_the_real_runner() {
         assert!(!DefaultOnlyRunner.is_real());
         assert!(RealCommandRunner.is_real());
+        assert!(!DefaultOnlyRunner.manages_host_processes());
+        assert!(RealCommandRunner.manages_host_processes());
     }
 
     #[tokio::test]
@@ -333,5 +302,64 @@ mod tests {
             .await
             .expect("spawn shell");
         assert!(is_utf8_locale(&output.stdout), "child LC_CTYPE was {:?}", output.stdout);
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// A timeout must take the child's descendants down too: `cube workspace
+    /// status` hung for hours under a `git ls-remote` grandchild that a
+    /// direct-child kill left running.
+    #[cfg(unix)]
+    #[test]
+    fn group_timeout_kills_grandchildren() {
+        let pid_file = std::env::temp_dir().join(format!("boss-cmd-runner-grandchild-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pid_file.display()));
+        let err = output_blocking_timeout_in_group(&mut command, Duration::from_millis(500), |_| {}).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        let grandchild: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_alive(grandchild),
+            "grandchild {grandchild} survived the timeout"
+        );
+    }
+
+    /// A child that exits while a descendant keeps its pipe open must not
+    /// block the caller past the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn group_drain_is_bounded_when_a_descendant_holds_the_pipe() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 60 & exit 0");
+        let started = Instant::now();
+        let err = output_blocking_timeout_in_group(&mut command, Duration::from_millis(500), |_| {}).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_run_captures_output_and_reports_the_pid() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("echo out; echo err >&2");
+        let mut seen = None;
+        let output =
+            output_blocking_timeout_in_group(&mut command, Duration::from_secs(10), |pid| seen = Some(pid)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+        assert!(seen.is_some());
     }
 }

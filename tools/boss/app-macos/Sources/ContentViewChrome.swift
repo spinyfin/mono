@@ -11,6 +11,28 @@ func shouldShowEngineUnreachableBanner(
     !isConnected && (showConnectionLostBanner || supervisionState != .running)
 }
 
+/// Whether any titlebar chrome banner has something to show. The accessory is
+/// installed and visible exactly when this is true.
+func chromeBannersPresent(
+    isConnected: Bool,
+    showConnectionLostBanner: Bool,
+    supervisionState: EngineSupervisionState,
+    hasHealthIssues: Bool,
+    hasDisconnectedActionNotice: Bool,
+    hasWorkErrorMessage: Bool,
+    hasRollbackNotice: Bool
+) -> Bool {
+    shouldShowEngineUnreachableBanner(
+        isConnected: isConnected,
+        showConnectionLostBanner: showConnectionLostBanner,
+        supervisionState: supervisionState
+    )
+        || (isConnected && hasHealthIssues)
+        || hasDisconnectedActionNotice
+        || hasWorkErrorMessage
+        || hasRollbackNotice
+}
+
 struct ResizeDivider: NSViewRepresentable {
     let currentWidth: CGFloat
     let minWidth: CGFloat
@@ -309,7 +331,11 @@ struct EngineHealthBanner: View {
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(issues) { issue in
+                    // Keyed by position, not `issue.id` (the kind): the engine
+                    // can report several issues of one kind at once — one
+                    // spawn-failure streak alert per driver and worker kind —
+                    // and duplicate ids would render the first one repeatedly.
+                    ForEach(Array(issues.enumerated()), id: \.offset) { _, issue in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(issue.title)
                                 .font(.callout.weight(.semibold))
@@ -332,15 +358,25 @@ struct EngineHealthBanner: View {
         .accessibilityLabel(accessibilityLabel)
     }
 
-    private var headlineText: String {
+    private var headlineText: String { Self.headline(for: issues) }
+
+    private var accessibilityLabel: String { Self.accessibilityLabel(for: issues) }
+
+    /// The collapsed banner's one line: the first issue's engine-written
+    /// title, verbatim, plus a count of the rest. The engine orders issues
+    /// by priority and owns the wording; nothing here is inferred. Static
+    /// so tests can pin the rendered text without hosting the view.
+    static func headline(for issues: [EngineHealthIssue]) -> String {
+        guard let first = issues.first else { return "" }
         if issues.count == 1 {
-            return issues[0].title
+            return first.title
         }
-        let first = issues[0].title
-        return "\(first) (\(issues.count - 1) more)"
+        return "\(first.title) (\(issues.count - 1) more)"
     }
 
-    private var accessibilityLabel: String {
+    /// Every issue's title and body, verbatim — the same text the expanded
+    /// banner shows.
+    static func accessibilityLabel(for issues: [EngineHealthIssue]) -> String {
         issues.map { "\($0.title). \($0.body)" }.joined(separator: " ")
     }
 }
@@ -755,7 +791,7 @@ private struct UpdateBadgePopover: View {
         case .installFailed(let v, let reason) where v == update.version:
             return "Install failed: \(reason)"
         default:
-            return nil
+            return UpdateInstallAction.blockedStatusNote(for: update, updateModel: updateModel)
         }
     }
 
@@ -763,7 +799,7 @@ private struct UpdateBadgePopover: View {
         switch updateModel.downloadState {
         case .failed(let v, _) where v == update.version: return true
         case .installFailed(let v, _) where v == update.version: return true
-        default: return false
+        default: return updateModel.isBlocked(update.version)
         }
     }
 

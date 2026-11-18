@@ -28,12 +28,6 @@ struct WorkCardPopoverView: View {
     /// from rather than dropping back to the kanban underneath.
     @State private var presentingRepoPicker: Bool = false
 
-    /// Reveals never-started `abandoned` executions in the list below,
-    /// which the Executions section collapses by default behind a
-    /// disclosure since they dominate high-churn work items without
-    /// being interesting to a human reviewing status.
-    @State private var showAllAbandonedAttempts: Bool = false
-
     var body: some View {
         // Content is only in-graph while the parent card is selected
         // (see type docs). Keep the body as one presented surface.
@@ -41,7 +35,7 @@ struct WorkCardPopoverView: View {
             .padding(20)
             .frame(width: 360, alignment: .leading)
             .onAppear {
-                model.loadExecutions(taskId: task.id)
+                model.engine.sendLine(["type": "list_attention_items_for_work_item", "work_item_id": task.id])
             }
             // Always-attached sheet: idle cost is one unpresented sheet on
             // the single selected popover; conditional insert broke the
@@ -123,18 +117,22 @@ struct WorkCardPopoverView: View {
                 metadataPRRow(prURL: task.prURL)
                 docRow
                 reviewGuideRow
-                if task.kind == "followup" {
-                    let originParts = [
-                        task.originTaskShortId.map { "T\($0)" },
-                        task.originPrNumber.map { "PR #\($0)" }
-                    ].compactMap { $0 }
-                    if !originParts.isEmpty {
-                        metadataRow("Origin", value: originParts.joined(separator: " / "))
-                    }
+                if let origin = task.followupOriginDescription {
+                    metadataRow("Origin", value: origin)
                 }
                 sourceChipRow
                 if task.sourceAutomationId != nil {
                     automationRow
+                }
+            }
+
+            ForEach((model.attentionItemsByWorkItemID[task.id] ?? []).filter {
+                $0.kind == "execution_bookmark_recovery_retired"
+            }) { note in
+                DisclosureGroup(note.title) {
+                    Text(note.bodyMarkdown)
+                        .font(.caption)
+                        .textSelection(.enabled)
                 }
             }
 
@@ -282,67 +280,8 @@ struct WorkCardPopoverView: View {
         return false
     }
 
-    @ViewBuilder
     private var executionsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Executions")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("View transcripts…") {
-                    openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: task.id))
-                }
-                .buttonStyle(.link)
-                .font(.caption)
-                .accessibilityIdentifier("work-card-view-transcripts")
-            }
-            if let executions = model.executionsByTaskID[task.id] {
-                if executions.isEmpty {
-                    Text("No executions yet.")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                } else {
-                    let neverStartedAbandoned = executions.filter { $0.status == "abandoned" && $0.startedAt == nil }
-                    let visibleExecutions = showAllAbandonedAttempts
-                        ? executions
-                        : executions.filter { !($0.status == "abandoned" && $0.startedAt == nil) }
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(visibleExecutions) { exec in
-                                Button {
-                                    openWindow(
-                                        id: "transcript-viewer",
-                                        value: TranscriptViewerRef(taskId: task.id, preselectExecutionId: exec.id)
-                                    )
-                                } label: {
-                                    ExecutionRow(exec: exec)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            if !neverStartedAbandoned.isEmpty {
-                                Button {
-                                    showAllAbandonedAttempts.toggle()
-                                } label: {
-                                    Text(
-                                        showAllAbandonedAttempts
-                                            ? "Hide abandoned attempts"
-                                            : "\(neverStartedAbandoned.count) abandoned attempts"
-                                    )
-                                    .font(.caption)
-                                }
-                                .buttonStyle(.link)
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 240)
-                }
-            } else {
-                ProgressView()
-                    .controlSize(.small)
-            }
-        }
+        WorkExecutionsList(model: model, taskIDs: [task.id], transcriptTaskID: task.id)
     }
 
     @ViewBuilder
@@ -442,8 +381,7 @@ struct WorkCardPopoverView: View {
     /// for design cards, per-task otherwise) shows the same row.
     @ViewBuilder
     private var docRow: some View {
-        if let state = model.workItemDocState(for: task),
-           let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+        if let presentation = model.workItemDocPresentation(for: task) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Doc")
                     .font(.caption)
@@ -654,6 +592,7 @@ struct RepoOverridePicker: View {
 struct WorkDependenciesSection: View {
     @ObservedObject var model: ChatViewModel
     let taskID: String
+    var onNavigate: ((WorkDependencyRow) -> Void)? = nil
 
     var body: some View {
         let prereqs = model.dependencyPrereqsByTaskID[taskID] ?? []
@@ -688,7 +627,11 @@ struct WorkDependenciesSection: View {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(rows) { row in
                     WorkDependencyRowView(row: row) {
-                        model.selectWorkCard(row.id)
+                        if let onNavigate {
+                            onNavigate(row)
+                        } else {
+                            model.selectWorkCard(row.id)
+                        }
                     }
                 }
             }

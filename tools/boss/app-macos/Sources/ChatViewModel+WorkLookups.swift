@@ -44,7 +44,7 @@ extension ChatViewModel {
     /// IDs may still be in the filter set (so toggling Show Archived
     /// back on restores the prior selection), but counts and badges
     /// must only reflect what the user can see.
-    private var visibleSelectedProjectFilterIDs: Set<String> {
+    var visibleSelectedProjectFilterIDs: Set<String> {
         guard !selectedProjectFilterIDs.isEmpty else { return [] }
         let visibleIDs = Set(projectsForSelectedProduct.map(\.id))
         return selectedProjectFilterIDs.intersection(visibleIDs)
@@ -149,6 +149,14 @@ extension ChatViewModel {
         // Do NOT filter them out here: a chore in in_review status needs to
         // be visible so the operator can review and merge the PR.
 
+        // Parked rows are left off the board unless "Show parked" is on. The
+        // toggle only ever adds rows back: un-parked rows are never hidden by
+        // it, and every other filter below still applies to parked rows.
+        if !showParked {
+            let parkedProjects = parkedProjectsByID
+            items = items.filter { !isParked($0, parkedProjects: parkedProjects) }
+        }
+
         if showBlockedOnly {
             items = items.filter { $0.status == "blocked" }
         }
@@ -225,14 +233,14 @@ extension ChatViewModel {
         // re-renders live (OAuth device-flow design §4, TOPIC_GITHUB_AUTH).
         // `engine.health` carries health-state changes (dispatch pause/resume,
         // etc.) so the banner updates live without polling or restarting.
-        var topics: Set<String> = ["work.products", "worker.live_states", "github.auth", "engine.health"]
+        var topics: Set<String> = ["work.products", "work.decisions", "worker.live_states", "github.auth", "engine.health"]
         if let productID = currentSelectedProductID {
             topics.insert(workTopic(forProductID: productID))
         }
         return topics
     }
 
-    func refreshWorkSubscriptions() {
+    func refreshWorkSubscriptions(refreshRemediation: Bool = true) {
         guard isConnected else { return }
         let desired = desiredWorkTopics
         let toSubscribe = desired.subtracting(subscribedWorkTopics)
@@ -246,6 +254,11 @@ extension ChatViewModel {
         }
 
         subscribedWorkTopics = desired
+        // Switching products can miss lifecycle pushes while unsubscribed.
+        // Recover compact card state after subscribing, without loading history.
+        if refreshRemediation, toSubscribe.contains(where: { $0.hasPrefix("work.product.") }) {
+            refreshRemediationState()
+        }
     }
 
     func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {

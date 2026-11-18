@@ -1,0 +1,600 @@
+//! Release a cube workspace lease when a run has provably ended, driven from
+//! the engine host: the leftover-lease sweep and the host process scan that
+//! supplies its occupancy evidence. The release policy itself (`decide`,
+//! `apply_release`, the occupancy gate and teardown preservation) lives in
+//! `boss_engine_completion::workspace_lease_release` and is re-exported here.
+//!
+//! Resume reads preserved work from `preserved/<execution>` bookmarks
+//! in the shared jj store, never from the originating working copy.
+
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use boss_protocol::WorkExecution;
+
+use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::work::WorkDb;
+use boss_execution_contracts::CubeClient;
+
+pub use boss_engine_completion::workspace_lease_release::*;
+use boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND;
+
+/// Cadence for the leftover-lease sweep. Fires on boot so leases left by a
+/// previous engine process return to the pool without waiting a day.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Scan local processes for a cwd inside the workspace.
+pub struct HostOccupancy;
+
+impl WorkspaceOccupancy for HostOccupancy {
+    fn cleanup<'a>(
+        &'a self,
+        db: &'a WorkDb,
+        execution: &'a WorkExecution,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = Result<Occupancy>> + Send + 'a>>> {
+        Some(Box::pin(async move {
+            let workspace = execution
+                .workspace_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workspace path missing"))?;
+            let mut result = boss_worker_processes::cleanup("BOSS_RUN_ID", &execution.id, workspace).await?;
+            // Older occupants are eligible only with durable terminal status
+            // and proof that their recorded shell is gone: the PID is absent,
+            // or it now belongs to a process without that run's identity (a
+            // reused PID). Unknown identities and terminal rows whose worker
+            // is still alive are never signalled.
+            for owner in result.owners.keys() {
+                if owner != &execution.id
+                    && let Ok(old) = db.get_execution(owner)
+                    && old.status.is_terminal()
+                    && db
+                        .execution_host_id(owner)
+                        .is_ok_and(|host| host.is_none_or(|host| host == "local"))
+                    && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
+                    && let Ok(pid) = u32::try_from(pid)
+                    && !boss_worker_processes::shell_alive("BOSS_RUN_ID", owner, pid).await?
+                {
+                    boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
+                }
+            }
+            if !result.owners.is_empty() {
+                result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
+            }
+            if result.stray_only() && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
+                // Nothing in the registry owns these and they are not safe to
+                // signal. Holding the lease forever strands a 10-20 GiB
+                // workspace, so return it loudly, naming the PIDs.
+                tracing::error!(
+                    execution_id = %execution.id,
+                    occupants = ?result.occupants,
+                    "releasing workspace lease with unowned processes still in it"
+                );
+                raise_attention(
+                    db,
+                    execution,
+                    UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND,
+                    "Workspace lease released with unowned processes inside",
+                    &format!(
+                        "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No live run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the engine host and stop them if they are stale.",
+                        result.occupants
+                    ),
+                );
+                return Ok(Occupancy::Empty);
+            }
+            anyhow::ensure!(
+                result.empty(),
+                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
+                result.occupants,
+                result.owners,
+                result.unknown
+            );
+            Ok(Occupancy::Empty)
+        }))
+    }
+
+    fn occupancy(&self, workspace_path: &Path) -> Occupancy {
+        occupancy_of(workspace_path)
+    }
+}
+
+/// Inferred-death helper used by pane/pid/lost-workspace reconcilers.
+/// Occupancy is scanned on the host; a live pane still mapped in
+/// `live_states` is treated as present. Remote rows go through
+/// [`release_remote_lease`] when `adapter` is the owning host; without an
+/// adapter the lease stays held.
+pub async fn release_lease_after_inferred_death(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    pane: PaneStatus,
+    adapter: Option<&dyn boss_execution_contracts::HostAdapter>,
+    cube: Option<&dyn CubeClient>,
+    do_release: impl Future<Output = Result<()>>,
+) -> LeaseReleaseOutcome {
+    release_lease_after_inferred_death_with(work_db, execution, pane, adapter, None, cube, do_release).await
+}
+
+/// [`release_lease_after_inferred_death`] with an explicit occupancy probe.
+/// `None` scans the host's process table; a caller that has to be
+/// deterministic injects its own probe.
+pub async fn release_lease_after_inferred_death_with(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    pane: PaneStatus,
+    adapter: Option<&dyn boss_execution_contracts::HostAdapter>,
+    occupancy: Option<&dyn WorkspaceOccupancy>,
+    cube: Option<&dyn CubeClient>,
+    do_release: impl Future<Output = Result<()>>,
+) -> LeaseReleaseOutcome {
+    let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+        return LeaseReleaseOutcome::NoLease;
+    };
+    let local = matches!(work_db.execution_host_id(&execution.id), Ok(None))
+        || matches!(work_db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
+    if !local {
+        return match adapter {
+            Some(host) => release_remote_lease(work_db, host, &execution.id, pane, |_| do_release).await,
+            None => LeaseReleaseOutcome::Kept {
+                reason: KeepReason::OccupancyUnconfirmed,
+            },
+        };
+    }
+    let occupancy: &dyn WorkspaceOccupancy = match occupancy {
+        Some(probe) => probe,
+        None => &HostOccupancy,
+    };
+    let plain = DbPreservation::new(work_db, adapter);
+    let with_cube = cube.map(|cube| DbPreservation::new(work_db, adapter).with_cube(cube));
+    let preservation: &dyn Preservation = match with_cube.as_ref() {
+        Some(preservation) => preservation,
+        None => &plain,
+    };
+    apply_release(
+        work_db,
+        execution,
+        lease_id,
+        ReleaseEvidence {
+            cause: TerminalCause::Inferred,
+            pane,
+            occupancy,
+            preservation,
+        },
+        do_release,
+    )
+    .await
+}
+
+fn occupancy_of(workspace_path: &Path) -> Occupancy {
+    ProcessSnapshot::capture().occupancy(workspace_path)
+}
+
+const CAPTURE_ATTEMPTS: u32 = 5;
+const CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+struct ProcessSnapshot {
+    cwds: Vec<(u32, PathBuf)>,
+    complete: bool,
+}
+
+impl ProcessSnapshot {
+    /// A process caught mid-fork/exec briefly refuses its cwd even to its
+    /// own user, so an incomplete scan is retried a few times before it is
+    /// reported as inconclusive.
+    fn capture() -> Self {
+        let mut snapshot = Self::capture_once();
+        for _ in 1..CAPTURE_ATTEMPTS {
+            if snapshot.complete {
+                break;
+            }
+            std::thread::sleep(CAPTURE_RETRY_DELAY);
+            snapshot = Self::capture_once();
+        }
+        snapshot
+    }
+
+    fn capture_once() -> Self {
+        let mut snapshot = Self {
+            cwds: Vec::new(),
+            complete: true,
+        };
+        if let Err(err) = process_cwds(&mut snapshot) {
+            tracing::warn!(error = %err, "workspace occupancy enumeration failed");
+            snapshot.complete = false;
+        }
+        snapshot
+    }
+
+    /// Record one process's cwd lookup. `owner_uid` is consulted only after
+    /// a failed lookup: a process owned by another user is unreadable to a
+    /// non-root engine and cannot be a workspace occupant, while a failure
+    /// for a same-uid process (or one whose owner is unknown) is inconclusive.
+    fn record(&mut self, pid: u32, cwd: std::io::Result<PathBuf>, owner_uid: impl FnOnce() -> Option<u32>) {
+        match cwd {
+            Ok(path) => match path.canonicalize() {
+                Ok(path) => self.cwds.push((pid, path)),
+                // A deleted cwd lies inside no existing workspace.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => self.complete = false,
+            },
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(_) => {
+                // SAFETY: geteuid has no preconditions.
+                let own_uid = unsafe { libc::geteuid() };
+                if !owner_uid().is_some_and(|uid| uid != own_uid) {
+                    self.complete = false;
+                }
+            }
+        }
+    }
+}
+
+impl WorkspaceOccupancy for ProcessSnapshot {
+    fn occupancy(&self, workspace_path: &Path) -> Occupancy {
+        // No process can have its cwd in a directory that does not exist.
+        if workspace_provably_absent(workspace_path) {
+            return Occupancy::Empty;
+        }
+        let root = match workspace_path.canonicalize() {
+            Ok(root) => root,
+            Err(_) => return Occupancy::Unknown,
+        };
+        if self
+            .cwds
+            .iter()
+            .any(|(pid, cwd)| *pid != std::process::id() && path_is_inside(cwd, &root))
+        {
+            Occupancy::Occupied
+        } else if self.complete {
+            Occupancy::Empty
+        } else {
+            Occupancy::Unknown
+        }
+    }
+}
+
+fn path_is_inside(cwd: &Path, workspace: &Path) -> bool {
+    cwd == workspace || cwd.starts_with(workspace)
+}
+
+fn process_cwds(snapshot: &mut ProcessSnapshot) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // Only the engine user's processes: the kernel refuses another
+        // user's cwd to a non-root engine, and such a process cannot be a
+        // workspace occupant. A failure for one of these is inconclusive.
+        // SAFETY: geteuid has no preconditions.
+        let own_uid = unsafe { libc::geteuid() };
+        for pid in crate::libproc::list_pids_for_uid(own_uid)? {
+            snapshot.record(pid as u32, crate::libproc::proc_cwd(pid), || Some(own_uid));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = linux_occupancy_pid(&entry.file_name()) else {
+                continue;
+            };
+            // A zombie or exiting process has no cwd and cannot occupy anything,
+            // though kill(0) still reports it alive.
+            if std::fs::read_to_string(entry.path().join("status")).is_ok_and(|status| proc_state_is_gone(&status)) {
+                continue;
+            }
+            let cwd = std::fs::read_link(entry.path().join("cwd"));
+            // A failed lookup is inconclusive, unless kill(0) independently
+            // confirms that the process is gone. A same-uid process that
+            // refuses its cwd (non-dumpable, e.g. ssh-agent) is deliberately
+            // inconclusive too: its cwd is unknown, so it is never assumed to
+            // lie outside the workspace.
+            if cwd.is_err()
+                && i32::try_from(pid).ok().is_some_and(|pid| {
+                    matches!(
+                        crate::dead_pid_sweep::probe_pid(pid),
+                        crate::dead_pid_sweep::PidStatus::Dead
+                    )
+                })
+            {
+                continue;
+            }
+            snapshot.record(pid, cwd, || proc_uid(&entry.path()));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = snapshot;
+        Err(std::io::Error::other("unsupported occupancy probe"))
+    }
+}
+
+/// Linux `/proc` names the occupancy enumerator considers. PID 0 and 1 are
+/// never workers: namespace init predates launched processes and can refuse
+/// its cwd to a same-uid scanner, which would otherwise make occupancy
+/// Unknown. Matches the Python scanner's `pid > 1` filter.
+#[cfg(any(target_os = "linux", test))]
+fn linux_occupancy_pid(name: &std::ffi::OsStr) -> Option<u32> {
+    let pid: u32 = name.to_str()?.parse().ok()?;
+    (pid > 1).then_some(pid)
+}
+
+/// `State:` of `/proc/<pid>/status` is a zombie (`Z`) or dead (`X`).
+#[cfg(any(target_os = "linux", test))]
+fn proc_state_is_gone(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .and_then(|state| state.trim().chars().next())
+        .is_some_and(|state| matches!(state, 'Z' | 'X' | 'x'))
+}
+
+/// Effective uid from the `Uid:` line of `/proc/<pid>/status`.
+#[cfg(target_os = "linux")]
+fn proc_uid(proc_dir: &Path) -> Option<u32> {
+    let status = std::fs::read_to_string(proc_dir.join("status")).ok()?;
+    let line = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn sweep_pane_status(db: &WorkDb, live: &LiveWorkerStateRegistry, execution: &WorkExecution) -> PaneStatus {
+    retry_pane_status(
+        db,
+        live.snapshot().iter().any(|state| state.run_id == execution.id),
+        execution,
+    )
+}
+
+pub(crate) fn retry_pane_status(db: &WorkDb, is_live: bool, execution: &WorkExecution) -> PaneStatus {
+    if !execution.status.is_terminal() || is_live {
+        return PaneStatus::Present;
+    }
+    promote_legacy_occupancy_keep(db, execution);
+    // Cancelled and failed rows go through durable death evidence: a recorded
+    // worker pid that is dead. A cancelled in-flight spawn (no pid recorded
+    // yet) and a failed viewer abort (pid still alive) therefore stay held.
+    match db.latest_local_shell_pid_for_execution(&execution.id) {
+        Ok(Some(pid))
+            if i32::try_from(pid).ok().is_some_and(|pid| {
+                matches!(
+                    crate::dead_pid_sweep::probe_pid(pid),
+                    crate::dead_pid_sweep::PidStatus::Dead
+                )
+            }) =>
+        {
+            PaneStatus::Gone
+        }
+        // A row that never recorded a pid (a pre-start failure, or a spawn
+        // that failed before its pane) is retried after an earlier release
+        // attempt passed the pane gate: occupancy kept the lease, or cube
+        // failed after every gate. Either is proof the spawn had settled;
+        // occupancy is scanned again here so a workspace that has since
+        // emptied can be preserved and returned.
+        Ok(None) if previous_release_passed_pane_gate(db, &execution.id) => PaneStatus::Gone,
+        _ => PaneStatus::Present,
+    }
+}
+
+fn occupancy_keep_evidence(kind: &str, title: &str) -> bool {
+    kind == LEASE_OCCUPANCY_KEPT_ATTENTION_KIND
+        || (kind == LEASE_UNRELEASED_ATTENTION_KIND
+            && matches!(
+                title,
+                boss_engine_storage_values::attention_kinds::LEASE_PROCESS_CLEANUP_TITLE
+                    | boss_engine_storage_values::attention_kinds::LEASE_RELEASE_UNCONFIRMED_TITLE
+                    | boss_engine_storage_values::attention_kinds::LEASE_REMOTE_PROCESS_CLEANUP_TITLE
+                    | boss_engine_storage_values::attention_kinds::LEASE_PRESERVATION_FAILED_TITLE
+            ))
+}
+
+fn promote_legacy_occupancy_keep(db: &WorkDb, execution: &WorkExecution) {
+    let Ok(items) = db.list_attention_items(&execution.id) else {
+        return;
+    };
+    if !items.iter().any(|item| {
+        item.status == "open"
+            && item.kind == LEASE_UNRELEASED_ATTENTION_KIND
+            && occupancy_keep_evidence(&item.kind, &item.title)
+    }) {
+        return;
+    }
+    raise_attention(
+        db,
+        execution,
+        LEASE_OCCUPANCY_KEPT_ATTENTION_KIND,
+        "Workspace is waiting for remaining processes to exit",
+        "The worker has exited. The engine will check the workspace again and return its lease automatically once it is empty.",
+    );
+}
+
+pub(crate) fn previous_occupancy_keep(db: &WorkDb, execution: &WorkExecution) -> bool {
+    promote_legacy_occupancy_keep(db, execution);
+    db.list_attention_items(&execution.id).is_ok_and(|items| {
+        items
+            .iter()
+            .any(|item| item.status == "open" && occupancy_keep_evidence(&item.kind, &item.title))
+    })
+}
+
+pub(crate) fn previous_release_passed_pane_gate(db: &WorkDb, execution_id: &str) -> bool {
+    db.list_attention_items(execution_id).is_ok_and(|items| {
+        items.iter().any(|item| {
+            item.status == "open"
+                && (item.kind == LEASE_RELEASE_FAILED_ATTENTION_KIND
+                    || occupancy_keep_evidence(&item.kind, &item.title))
+        })
+    })
+}
+
+/// Counts from one leftover-lease pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EndedRunLeaseSweepOutcome {
+    pub released: usize,
+    /// Rows without durable death evidence (no dead worker pid, or a live
+    /// pane). Expected to persist across passes, so not activity.
+    pub held: usize,
+    /// Rows with death evidence whose release gates or cube call kept the lease.
+    pub kept: usize,
+}
+
+impl crate::sweep_loop::SweepOutcome for EndedRunLeaseSweepOutcome {
+    fn has_activity(&self) -> bool {
+        self.released > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            released = self.released,
+            kept = self.kept,
+            held = self.held,
+            "ended-run lease sweep: pass complete",
+        );
+    }
+}
+
+/// Spawn the leftover-lease sweep. Fires immediately on boot.
+pub fn spawn_loop(
+    work_db: Arc<WorkDb>,
+    cube_client: Arc<dyn CubeClient>,
+    live_states: Arc<LiveWorkerStateRegistry>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let cube_client = Arc::clone(&cube_client);
+        let live_states = Arc::clone(&live_states);
+        async move { run_one_pass(work_db.as_ref(), cube_client.as_ref(), live_states.as_ref()).await }
+    })
+}
+
+/// Release every terminal execution that still holds a cube lease, subject
+/// to the pane / occupancy gates.
+pub async fn run_one_pass(
+    work_db: &WorkDb,
+    cube_client: &dyn CubeClient,
+    live_states: &LiveWorkerStateRegistry,
+) -> EndedRunLeaseSweepOutcome {
+    run_one_pass_with_occupancy(work_db, cube_client, live_states, || async { HostOccupancy }).await
+}
+
+async fn run_one_pass_with_occupancy<O: WorkspaceOccupancy, Fut: Future<Output = O>>(
+    work_db: &WorkDb,
+    cube_client: &dyn CubeClient,
+    live_states: &LiveWorkerStateRegistry,
+    capture: impl FnOnce() -> Fut,
+) -> EndedRunLeaseSweepOutcome {
+    let mut outcome = EndedRunLeaseSweepOutcome::default();
+    let candidates = match work_db.list_terminal_executions_holding_lease() {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "ended-run lease sweep: candidate query failed");
+            return outcome;
+        }
+    };
+    let mut occupancy = None;
+    let mut capture = Some(capture);
+    let mut listing = None;
+    for execution in candidates {
+        let Some(lease_id) = execution.cube_lease_id.clone() else {
+            continue;
+        };
+        // A terminal registry entry may still own a pane; absence from the
+        // registry is not proof after a restart. Require durable pid death,
+        // or a prior occupancy-keep / cube-failure that already passed the
+        // pane gate (so occupancy can be scanned again).
+        let pane = sweep_pane_status(work_db, live_states, &execution);
+        if pane == PaneStatus::Present {
+            // Unconfirmed death is diagnostic evidence only. It never
+            // authorizes a later pass to skip the pane gate.
+            if !live_states.snapshot().iter().any(|state| state.run_id == execution.id) {
+                let pid = work_db
+                    .latest_local_shell_pid_for_execution(&execution.id)
+                    .ok()
+                    .flatten();
+                let death = match pid {
+                    Some(pid) => {
+                        format!("recorded shell PID {pid} has no live execution registration and death is unconfirmed")
+                    }
+                    None => "no shell PID was recorded and death is unconfirmed".to_owned(),
+                };
+                raise_attention(
+                    work_db,
+                    &execution,
+                    LEASE_UNRELEASED_ATTENTION_KIND,
+                    "Terminal worker still holds its workspace",
+                    &format!(
+                        "Lease {lease_id} cannot be preserved safely: {death}. Confirm the worker has stopped on the owning host and retry recovery; the workspace has not been reset.",
+                    ),
+                );
+            }
+            outcome.held += 1;
+            continue;
+        }
+        if listing.is_none() {
+            listing = Some(cube_client.list_workspaces().await);
+        }
+        // An expired or reassigned lease must preserve successfully before
+        // dropping the engine's recovery record. Never release its new holder.
+        // A listing error falls through to apply_release.
+        if let Some(Ok(rows)) = listing.as_ref()
+            && !rows
+                .iter()
+                .any(|row| row.lease_id.as_deref() == Some(lease_id.as_str()))
+        {
+            let (tip_source, _) = workspace_tip_source_from_listing(
+                &execution,
+                work_db.workspace_lease_boundary(&execution.id).ok().flatten(),
+                work_db.workspace_lease_generation(&execution.id).ok().flatten(),
+                rows,
+            );
+            if matches!(tip_source, WorkspaceTipSource::Live) && occupancy.is_none() {
+                occupancy = Some(capture.take().expect("one scan per pass")().await);
+            }
+            match reconcile_absent_lease(
+                work_db,
+                &execution,
+                &lease_id,
+                None,
+                Some(cube_client),
+                occupancy.as_ref().map(|probe| probe as &dyn WorkspaceOccupancy),
+                Some(rows.as_slice()),
+            )
+            .await
+            {
+                Ok(LeaseReleaseOutcome::Released) => outcome.released += 1,
+                Ok(LeaseReleaseOutcome::NoLease) => {}
+                _ => outcome.kept += 1,
+            }
+            continue;
+        }
+        if occupancy.is_none() {
+            occupancy = Some(capture.take().expect("one scan per pass")().await);
+        }
+        let occupancy = occupancy.as_ref().expect("scanned above");
+        let result = apply_release(
+            work_db,
+            &execution,
+            &lease_id,
+            ReleaseEvidence {
+                cause: TerminalCause::Inferred,
+                pane,
+                occupancy,
+                preservation: &DbPreservation::new(work_db, None).with_cube(cube_client),
+            },
+            cube_client.release_workspace(&lease_id),
+        )
+        .await;
+        match result {
+            LeaseReleaseOutcome::Released => outcome.released += 1,
+            LeaseReleaseOutcome::Kept { .. } | LeaseReleaseOutcome::CubeFailed { .. } => outcome.kept += 1,
+            LeaseReleaseOutcome::NoLease => {}
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod recovery_tests;
+#[cfg(test)]
+mod tests;

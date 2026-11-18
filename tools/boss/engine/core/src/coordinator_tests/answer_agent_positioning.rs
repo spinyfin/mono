@@ -84,13 +84,13 @@ async fn answer_agent_goto_success_positions_and_stamps_true() {
     ));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
@@ -140,13 +140,13 @@ async fn answer_agent_goto_failure_falls_back_without_failing_dispatch() {
     ));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_ok(),

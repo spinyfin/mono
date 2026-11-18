@@ -1,0 +1,289 @@
+//! Spoke delivery is durable before connect and requires an explicit receipt.
+use super::*;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+struct UnlinkOnDrop(Option<PathBuf>);
+
+impl Drop for UnlinkOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+const MAX_FIELD: usize = 8192;
+
+/// Bounds each field of an oversized hook without discarding the small
+/// lifecycle fields (`stop_hook_active`, `source`, `model`, `reason`, ...) that
+/// change how the event is interpreted. Tool payloads become markers; other
+/// large strings keep a bounded prefix and large nested values are dropped.
+pub(super) fn bound_fields(object: &mut serde_json::Map<String, serde_json::Value>) {
+    use serde_json::Value;
+    object.retain(|key, value| {
+        let size = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+        if size <= MAX_FIELD {
+            return true;
+        }
+        if key == "toolCall" {
+            let mut bounded = serde_json::json!({"_boss_truncated": true});
+            for field in ["name", "id"] {
+                if let Some(text) = value.get(field).and_then(Value::as_str) {
+                    let mut end = MAX_FIELD.min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    bounded[field] = text[..end].into();
+                }
+            }
+            *value = bounded;
+            return true;
+        }
+        match value {
+            Value::String(text) if !matches!(key.as_str(), "tool_input" | "tool_response") => {
+                let mut end = MAX_FIELD.min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                true
+            }
+            _ if matches!(key.as_str(), "tool_input" | "tool_response") => {
+                *value = serde_json::json!({"_boss_truncated": true});
+                true
+            }
+            _ => false,
+        }
+    });
+}
+
+pub fn deliver(directory: &Path, socket: &str, payload: &[u8], deadline: Instant) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
+        "hook spool must be a private directory"
+    );
+    let mut value: serde_json::Value = serde_json::from_slice(payload)?;
+    // Leave room for producer metadata before enforcing the ingress envelope bound.
+    if payload.len() > MAX_HOOK_BYTES - 1024 {
+        let object = value.as_object_mut().ok_or_else(|| anyhow!("hook is not an object"))?;
+        bound_fields(object);
+        object.insert("_boss_payload_truncated".into(), true.into());
+    }
+    let payload_size = serde_json::to_vec(&value)?.len();
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(directory.join("producer.lock"))?;
+    FileExt::lock_exclusive(&lock)?;
+    let state_path = directory.join("producer.state");
+    let mut random = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let (id, sequence): (String, u64) = if state_path.exists() {
+        serde_json::from_slice(&std::fs::read(&state_path)?)?
+    } else {
+        (random.iter().map(|b| format!("{b:02x}")).collect(), 1)
+    };
+    let used = std::fs::read_dir(directory)?.try_fold(0u64, |total, entry| {
+        Ok::<_, io::Error>(total.saturating_add(entry?.metadata()?.len()))
+    })?;
+    anyhow::ensure!(
+        used.saturating_add(payload_size as u64 + 1024) <= 64 * 1024 * 1024,
+        "pending hook spool full; existing events retained"
+    );
+    let next = sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("producer sequence exhausted"))?;
+    let mut state = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(directory.join("producer.next"))?;
+    state.write_all(&serde_json::to_vec(&(id.clone(), next))?)?;
+    state.sync_all()?;
+    std::fs::rename(directory.join("producer.next"), &state_path)?;
+    let object = value.as_object_mut().ok_or_else(|| anyhow!("hook is not an object"))?;
+    object.insert("_boss_producer_id".into(), id.clone().into());
+    object.insert("_boss_producer_sequence".into(), sequence.into());
+    object.insert(
+        "_boss_observed_unix_ms".into(),
+        (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64)
+            .into(),
+    );
+    let bytes = serde_json::to_vec(&value)?;
+    anyhow::ensure!(bytes.len() <= MAX_HOOK_BYTES, "hook envelope exceeds 256 KiB");
+    let path = directory.join(format!("{sequence:020}-{id}.json"));
+    let temporary = directory.join(format!("{sequence:020}-{id}.tmp"));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let mut guard = UnlinkOnDrop(Some(temporary.clone()));
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &path)?;
+    guard.0 = None;
+    File::open(directory)?.sync_all()?;
+    FileExt::unlock(&lock)?;
+    match connect_with_retry(socket, deadline).and_then(|stream| send_to_stream(stream, &bytes, deadline)) {
+        Ok(EngineResponse::Recorded) => {
+            // The daemon's independent drain may already have removed it.
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(error.into());
+            }
+            File::open(directory)?.sync_all()?;
+            Ok(())
+        }
+        Ok(EngineResponse::Rejected(reason)) => Err(anyhow!("spoke rejected hook; source retained: {reason}")),
+        _ => {
+            eprintln!("boss-event: pending event retained for spoke recovery");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn oversized_post_tool_use_is_durably_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "session",
+            "tool_name": "Write", "_boss_run_id": "run", "agent_id": "child",
+            "tool_input": {"content": "x".repeat(1024 * 1024)},
+            "tool_response": "x".repeat(1024 * 1024),
+        });
+        deliver(
+            root.path(),
+            "/tmp/boss-event-missing.sock",
+            &serde_json::to_vec(&payload).unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        let path = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() < MAX_HOOK_BYTES);
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for key in ["hook_event_name", "session_id", "tool_name", "_boss_run_id", "agent_id"] {
+            assert_eq!(saved[key], payload[key]);
+        }
+        assert_eq!(saved["tool_input"]["_boss_truncated"], true);
+        assert_eq!(saved["tool_response"]["_boss_truncated"], true);
+        assert_eq!(saved["_boss_producer_sequence"], 1);
+        assert_eq!(saved["_boss_producer_id"].as_str().unwrap().len(), 32);
+    }
+
+    fn deliver_oversized(payload: serde_json::Value) -> serde_json::Value {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        deliver(
+            root.path(),
+            "/tmp/boss-event-missing.sock",
+            &serde_json::to_vec(&payload).unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        let path = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .unwrap();
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn oversized_agy_tools_keep_name_and_id() {
+        for event in ["PreToolUse", "PostToolUse"] {
+            let saved = deliver_oversized(serde_json::json!({
+                "hookEventName": event, "conversationId": "session",
+                "toolCall": {"name": "run_command", "id": "call-123",
+                    "args": {"command": "x".repeat(MAX_HOOK_BYTES + 1)}},
+            }));
+            assert_eq!(saved["toolCall"]["name"], "run_command");
+            assert_eq!(saved["toolCall"]["id"], "call-123");
+            assert_eq!(saved["toolCall"]["_boss_truncated"], true);
+            assert!(saved["toolCall"].get("args").is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_stop_keeps_continuation_flag() {
+        let saved = deliver_oversized(serde_json::json!({
+            "hook_event_name": "Stop", "session_id": "session", "_boss_run_id": "run",
+            "stop_hook_active": true, "reason": "r",
+            "last_assistant_message": "x".repeat(1024 * 1024),
+            "extra": {"nested": "y".repeat(1024 * 1024)},
+        }));
+        assert_eq!(saved["stop_hook_active"], true);
+        assert_eq!(saved["reason"], "r");
+        assert_eq!(saved["_boss_payload_truncated"], true);
+        assert!(saved["last_assistant_message"].as_str().unwrap().len() <= MAX_FIELD);
+        assert!(saved.get("extra").is_none());
+        assert!(saved.get("tool_input").is_none());
+    }
+
+    #[test]
+    fn oversized_user_prompt_keeps_bounded_prefix() {
+        let saved = deliver_oversized(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit", "session_id": "session", "_boss_run_id": "run",
+            "prompt": format!("start{}", "é".repeat(1024 * 1024)),
+        }));
+        let prompt = saved["prompt"].as_str().unwrap();
+        assert!(prompt.starts_with("start") && prompt.len() <= MAX_FIELD);
+        assert_eq!(saved["_boss_payload_truncated"], true);
+    }
+
+    #[test]
+    fn full_spool_rejects_without_advancing_sequence() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("pending");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let producer = "0123456789abcdef0123456789abcdef";
+        std::fs::write(
+            directory.join("producer.state"),
+            serde_json::to_vec(&(producer, 7u64)).unwrap(),
+        )
+        .unwrap();
+        let existing = directory.join(format!("00000000000000000006-{producer}.json"));
+        let filler = std::fs::File::create(&existing).unwrap();
+        filler.set_len(64 * 1024 * 1024).unwrap();
+        drop(filler);
+        let error = deliver(
+            &directory,
+            "/tmp/boss-event-missing.sock",
+            br#"{"hook_event_name":"Stop"}"#,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pending hook spool full"), "{error}");
+        assert_eq!(std::fs::metadata(&existing).unwrap().len(), 64 * 1024 * 1024);
+        let pending: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|e| {
+                let path = e.unwrap().path();
+                matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "tmp")).then_some(path)
+            })
+            .collect();
+        assert_eq!(pending, vec![existing]);
+        let (id, sequence): (String, u64) =
+            serde_json::from_slice(&std::fs::read(directory.join("producer.state")).unwrap()).unwrap();
+        assert_eq!((id, sequence), (producer.to_owned(), 7));
+    }
+}

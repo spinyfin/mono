@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-task-scope = { path = "../task-scope" }
 tokio = { workspace = true, features = ["rt", "macros"] }
 anyhow = { workspace = true }
 bon = { workspace = true }

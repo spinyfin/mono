@@ -1,0 +1,558 @@
+use anyhow::{Context, Result};
+use boss_engine_driver::{DriverRegistry, ProgressSessionConfig, ProgressStreamSource, discovery};
+use boss_host_execution::worker::{ExecutionRecord, ObservationConfig, Phase};
+use boss_protocol_spoke::{
+    v1::{Gap, Record, Stamp, TranscriptDelta, record, worker_event::Event},
+    worker_event,
+};
+use boss_spoke_journal::Admission;
+use boss_spoke_outbound::SharedJournal;
+use boss_transcript_tail::raw;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+
+// A source checkpoint is limited to 512 KiB. Base64 for 256 KiB uses
+// 342 KiB, leaving room for the cursor and normalizer state. Raw transcript
+// bytes remain journaled even when this progress-only bound rejects a line.
+const MAX_PARTIAL: usize = 256 * 1024;
+
+#[derive(Default, Serialize, Deserialize)]
+struct Progress {
+    #[serde(with = "partial_bytes")]
+    partial: Vec<u8>,
+    normalizer: Option<serde_json::Value>,
+    /// Raw cursor still advances; JSON assembly waits for the next newline.
+    #[serde(default)]
+    skip_until_newline: bool,
+}
+
+// Byte arrays expand up to fourfold in JSON. Base64 keeps even a partial
+// 256 KiB entry within the bounded durable checkpoint, including split UTF-8.
+mod partial_bytes {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        STANDARD
+            .decode(String::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+#[derive(Default, Serialize, Deserialize)]
+struct Checkpoint {
+    path: PathBuf,
+    cursor: raw::Cursor,
+    progress: Progress,
+    eof: bool,
+    incarnation: u64,
+}
+
+/// Where the transcript is: the file ingress scan when the driver feeds one,
+/// otherwise the path the latest hook reported. Keeps following an attached
+/// file when another candidate appears; before attachment, ambiguity must
+/// never pick a run by recency.
+async fn resolve_path(
+    observation: &ObservationConfig,
+    checkpoint: &Checkpoint,
+    hint: Option<Vec<u8>>,
+) -> Result<Option<PathBuf>> {
+    if let Some((ingress, baseline)) = &observation.file {
+        let ingress = ingress.clone();
+        let baseline = baseline.iter().cloned().collect();
+        let scan = tokio::task::spawn_blocking(move || {
+            let prepared = discovery::PreparedSource::with_baseline(ingress, baseline)?;
+            discovery::scan_once_classified(&prepared)
+        })
+        .await?
+        .map_err(|failure| match failure {
+            // Retryable I/O (EMFILE, EINTR, ...) in listing, candidate
+            // validation or preparation leaves the run undrained so a later
+            // poll retries; permanent failures become a source gap.
+            discovery::ScanFailure::Transient(message) => anyhow::Error::from(TransientSource(message)),
+            discovery::ScanFailure::Permanent(message) => anyhow::Error::from(SourceFailure(message)),
+        })?;
+        if scan.matched.iter().any(|c| c.path == checkpoint.path) {
+            Ok(Some(checkpoint.path.clone()))
+        } else {
+            if scan.matched.len() > 1 {
+                return Err(SourceFailure("multiple correlated transcript candidates".into()).into());
+            }
+            Ok(scan.matched.into_iter().next().map(|c| c.path))
+        }
+    } else {
+        Ok(hint
+            .map(|bytes| serde_json::from_slice::<crate::hooks::Receipt>(&bytes))
+            .transpose()?
+            .and_then(|r| r.path))
+    }
+}
+
+fn containment_root(execution: &ExecutionRecord, observation: &ObservationConfig) -> Result<Option<PathBuf>> {
+    Ok(if let Some((ingress, _)) = &observation.file {
+        Some(ingress.directory.clone())
+    } else {
+        DriverRegistry::default()
+            .require(&execution.driver_id)?
+            .transcript_containment_root(&execution.run_id)?
+    })
+}
+
+/// The transcript source as observed now, independent of how much has been
+/// ingested or of bulk credit: the generation and size a completion boundary
+/// (proposal, Stop) must be validated against. Reading only checkpoints
+/// assigns no transcript sequence. An error means the source cannot be
+/// resolved and the boundary must carry explicit unavailable evidence.
+pub async fn current_watermark(journal: &SharedJournal, execution: &ExecutionRecord) -> Result<(String, u64)> {
+    let observation = execution
+        .observation
+        .as_ref()
+        .context("missing observation configuration")?;
+    let run = crate::run_identity(execution);
+    let (saved, hint) = {
+        let journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+        (journal.source(&run, "transcript")?, journal.latest_source(&run)?)
+    };
+    let checkpoint: Checkpoint = saved
+        .map(|b| serde_json::from_slice(&b))
+        .transpose()?
+        .unwrap_or_default();
+    let path = resolve_path(observation, &checkpoint, hint)
+        .await?
+        .context("no transcript source resolved")?;
+    watermark(journal, execution, &path).await
+}
+
+/// Stop describes the source observed at the boundary, even when bulk credit
+/// is exhausted. Reading only checkpoints assigns no transcript sequence.
+pub async fn watermark(
+    journal: &SharedJournal,
+    execution: &ExecutionRecord,
+    path: &std::path::Path,
+) -> Result<(String, u64)> {
+    let saved = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
+        .source(&crate::run_identity(execution), "transcript")?;
+    let mut checkpoint: Checkpoint = saved
+        .map(|b| serde_json::from_slice(&b))
+        .transpose()?
+        .unwrap_or_default();
+    if checkpoint.path != path {
+        checkpoint.incarnation += 1;
+        checkpoint.cursor = raw::Cursor::default();
+    }
+    let root = match &execution.observation {
+        Some(observation) => containment_root(execution, observation)?,
+        None => DriverRegistry::default()
+            .require(&execution.driver_id)?
+            .transcript_containment_root(&execution.run_id)?,
+    };
+    let chunk = raw::read_contained(path, root.as_deref(), &checkpoint.cursor, 0).await?;
+    Ok((
+        format!("{}-{}", checkpoint.incarnation, chunk.cursor.generation),
+        chunk.observed_size,
+    ))
+}
+
+#[derive(Debug)]
+struct SourceFailure(String);
+impl std::fmt::Display for SourceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for SourceFailure {}
+
+/// A classified, retryable source I/O failure (EMFILE, EIO, ESTALE, ...).
+/// Journal admission errors such as `Fault::Full` are backpressure, not source
+/// failures, and never carry this marker.
+#[derive(Debug)]
+struct TransientSource(String);
+impl std::fmt::Display for TransientSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for TransientSource {}
+
+/// Continuous awake time a Terminal run (no pending hooks) may fail with a
+/// classified transient source error before it is drained with a transcript
+/// gap. Without a bound, a persistent errno (EIO, ESTALE, ...) would block
+/// reclaim forever with nothing recorded. Awake time, not poll count, so a
+/// short burst never gives up unread bytes.
+const TERMINAL_TRANSIENT_BUDGET_NS: u64 = 5 * 60 * 1_000_000_000;
+const TRANSIENT_SOURCE: &str = "transient_since";
+
+pub async fn poll(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
+    let result = poll_source(journal, execution, stamp).await;
+    let run = crate::run_identity(execution);
+    // Backpressure or any other non-source error means the source read itself
+    // succeeded, so the continuous-failure streak is over, whichever arm below
+    // handles the error. The original error is still returned unchanged.
+    if let Err(error) = &result
+        && error.downcast_ref::<TransientSource>().is_none()
+        && error.downcast_ref::<SourceFailure>().is_none()
+    {
+        clear_transient(journal, &run)?;
+    }
+    match &result {
+        Ok(()) => clear_transient(journal, &run)?,
+        Err(error)
+            if execution.phase == Phase::Terminal
+                && let Some(observation) = &execution.observation
+                && !crate::hooks::has_pending(&observation.pending)? =>
+        {
+            let exhausted = error.downcast_ref::<SourceFailure>().is_some()
+                || (error.downcast_ref::<TransientSource>().is_some()
+                    && note_transient(journal, &run, stamp)? >= TERMINAL_TRANSIENT_BUDGET_NS);
+            if exhausted {
+                let checkpoint = current_checkpoint(journal, &run)?;
+                return finish_gap(
+                    journal,
+                    &run,
+                    stamp,
+                    gap_resource(&checkpoint),
+                    checkpoint.cursor.offset,
+                    error.to_string(),
+                );
+            }
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+type Streak = (Option<Vec<u8>>, Option<(String, u64)>);
+
+/// The streak start, recorded with the boot it was measured in: `awake_ns`
+/// counters are only comparable within one boot.
+fn transient_since(journal: &boss_spoke_journal::Journal, run: &boss_protocol_spoke::v1::Run) -> Result<Streak> {
+    let old = journal.source(run, TRANSIENT_SOURCE)?;
+    // Legacy bare-counter values and "none" fail to parse and so restart the
+    // streak.
+    let since = old
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.rsplit_once(':'))
+        .and_then(|(boot, ns)| Some((boot.to_string(), ns.parse::<u64>().ok()?)));
+    Ok((old, since))
+}
+
+/// Durably record the first awake instant of the current failure streak and
+/// return how long it has lasted. A streak from another boot, or whose counter
+/// went backwards, restarts at the current stamp.
+fn note_transient(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run, stamp: &Stamp) -> Result<u64> {
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+    let (old, since) = transient_since(&journal, run)?;
+    if let Some((boot, since)) = &since
+        && *boot == stamp.boot_id
+        && stamp.awake_ns >= *since
+    {
+        return Ok(stamp.awake_ns - since);
+    }
+    journal.commit_source(
+        run,
+        TRANSIENT_SOURCE,
+        old.as_deref(),
+        format!("{}:{}", stamp.boot_id, stamp.awake_ns).as_bytes(),
+        Vec::new(),
+    )?;
+    Ok(0)
+}
+
+/// A successful poll ends the streak; the budget measures continuous failure.
+fn clear_transient(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run) -> Result<()> {
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+    let (old, since) = transient_since(&journal, run)?;
+    if since.is_some() {
+        journal.commit_source(run, TRANSIENT_SOURCE, old.as_deref(), b"none", Vec::new())?;
+    }
+    Ok(())
+}
+
+async fn poll_source(journal: &SharedJournal, execution: &ExecutionRecord, stamp: &Stamp) -> Result<()> {
+    let observation = execution
+        .observation
+        .as_ref()
+        .context("missing observation configuration")?;
+    let run = crate::run_identity(execution);
+    let (saved, hint, credit) = {
+        let journal = journal
+            .lock()
+            .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+        (
+            journal.source(&run, "transcript")?,
+            journal.latest_source(&run)?,
+            journal.bulk_credit(),
+        )
+    };
+    let mut checkpoint: Checkpoint = saved
+        .as_ref()
+        .map(|b| serde_json::from_slice(b))
+        .transpose()?
+        .unwrap_or_default();
+    let path = resolve_path(observation, &checkpoint, hint).await?;
+    let Some(path) = path else {
+        if execution.phase == Phase::Terminal && !crate::hooks::has_pending(&observation.pending)? {
+            finish_missing(journal, &run, stamp, &checkpoint)?;
+        }
+        return Ok(());
+    };
+    if !path.is_absolute() {
+        return Err(SourceFailure("transcript path must be absolute".into()).into());
+    }
+    let mut switched = None;
+    if checkpoint.path != path {
+        if !checkpoint.path.as_os_str().is_empty() {
+            switched = Some(Gap {
+                resource: format!("transcript:{}-{}", checkpoint.incarnation, checkpoint.cursor.generation),
+                from_offset: checkpoint.cursor.offset,
+                through_offset: checkpoint.cursor.offset,
+                reason: "transcript path changed before final drain; previous final size unknown".into(),
+            });
+        }
+        checkpoint.incarnation += 1;
+        checkpoint.path = path;
+        checkpoint.cursor = raw::Cursor::default();
+        checkpoint.progress = Progress::default();
+        checkpoint.eof = false;
+    }
+    let root = containment_root(execution, observation)?;
+    // A missing terminal source is lifecycle evidence even without bulk
+    // credit. A zero-byte probe can establish that without advancing a cursor.
+    let chunk = match raw::read_contained(
+        &checkpoint.path,
+        root.as_deref(),
+        &checkpoint.cursor,
+        credit.as_ref().copied().unwrap_or(0),
+    )
+    .await
+    {
+        Ok(chunk) => chunk,
+        Err(boss_transcript_tail::TailError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound
+                && execution.phase == Phase::Terminal
+                && !crate::hooks::has_pending(&observation.pending)? =>
+        {
+            return finish_missing(journal, &run, stamp, &checkpoint);
+        }
+        Err(error) => {
+            let permanent = match &error {
+                boss_transcript_tail::TailError::Io(io) => !discovery::io_error_is_transient(io),
+                _ => true,
+            };
+            return Err(if permanent {
+                SourceFailure(error.to_string()).into()
+            } else {
+                TransientSource(error.to_string()).into()
+            });
+        }
+    };
+    let _ = credit?;
+    if chunk.replaced {
+        checkpoint.progress = Progress::default();
+    }
+    let generation = format!("{}-{}", checkpoint.incarnation, chunk.cursor.generation);
+    let mut records = Vec::new();
+    let make = |body| Record {
+        observed: Some(stamp.clone()),
+        run: Some(run.clone()),
+        body: Some(body),
+        ..Default::default()
+    };
+    if let Some(gap) = switched {
+        records.push((make(record::Body::Gap(gap)), Admission::Lifecycle));
+    }
+    if chunk.replaced {
+        records.push((
+            make(record::Body::Gap(Gap {
+                resource: format!("transcript:{}-{}", checkpoint.incarnation, checkpoint.cursor.generation),
+                from_offset: checkpoint.cursor.offset,
+                through_offset: chunk.previous_size.max(checkpoint.cursor.offset),
+                reason: "source replaced or truncated; any unobserved suffix is unavailable".into(),
+            })),
+            Admission::Lifecycle,
+        ));
+    }
+    if !chunk.data.is_empty() || !checkpoint.eof || chunk.replaced {
+        records.push((
+            make(record::Body::Transcript(TranscriptDelta {
+                generation: generation.clone(),
+                offset: chunk.offset,
+                sha256: Sha256::digest(&chunk.data).to_vec(),
+                data: chunk.data.clone(),
+                eof: chunk.eof,
+            })),
+            Admission::Bulk,
+        ));
+    }
+    let mut turn_stopped = false;
+    if observation.file.is_some() {
+        let driver = DriverRegistry::default().require(&execution.driver_id)?;
+        let mut session = driver.progress_session(&ProgressSessionConfig {
+            run_id: Some(run.run_id.clone()),
+            source: ProgressStreamSource::AgentJsonlFile,
+            transcript_path: Some(checkpoint.path.clone()),
+            resume_state: checkpoint.progress.normalizer.clone(),
+            ..Default::default()
+        });
+        let normalizer = session.as_mut().context("file driver has no progress normalizer")?;
+        if let Some(state) = &checkpoint.progress.normalizer {
+            normalizer.restore_resume_state(state).map_err(anyhow::Error::msg)?;
+        }
+        use boss_engine_stdout_progress::{RawLine, ReaderConfig, ReaderStats, frame_chunk, normalize_line};
+        let config = ReaderConfig {
+            max_line_bytes: MAX_PARTIAL,
+        };
+        let frames = frame_chunk(
+            &mut checkpoint.progress.partial,
+            &mut checkpoint.progress.skip_until_newline,
+            &chunk.data,
+            execution.phase == Phase::Terminal && chunk.eof,
+            config,
+        );
+        let mut stats = ReaderStats::default();
+        for frame in frames {
+            if matches!(frame, RawLine::Oversized) {
+                records.push((
+                    make(record::Body::Gap(Gap {
+                        resource: format!("transcript:{generation}:entry"),
+                        from_offset: checkpoint.cursor.offset,
+                        through_offset: chunk.cursor.offset,
+                        reason: "transcript progress entry exceeds 256 KiB checkpoint bound; raw bytes retained".into(),
+                    })),
+                    Admission::Lifecycle,
+                ));
+            }
+            for envelope in normalize_line(frame, driver.as_ref(), &mut session, config, &mut stats) {
+                let mut wire = worker_event::to_wire(&envelope.event);
+                if let Some(Event::Stop(stop)) = &mut wire.event {
+                    turn_stopped = true;
+                    stop.transcript_generation = generation.clone();
+                    stop.transcript_through = chunk.cursor.offset;
+                }
+                records.push((make(record::Body::Event(wire)), Admission::Lifecycle));
+            }
+        }
+        checkpoint.progress.normalizer = session.as_ref().and_then(|session| session.resume_state());
+    }
+    checkpoint.cursor = chunk.cursor;
+    checkpoint.eof = chunk.eof;
+    if turn_stopped {
+        let epoch = boss_spoke_worker_api::note_turn_stop(journal, &run)?;
+        for (record, _) in &mut records {
+            if let Some(record::Body::Event(event)) = &mut record.body
+                && let Some(Event::Stop(stop)) = &mut event.event
+            {
+                stop.capture_epoch = epoch;
+            }
+        }
+    }
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+    journal.commit_source(
+        &run,
+        "transcript",
+        saved.as_deref(),
+        &serde_json::to_vec(&checkpoint)?,
+        records,
+    )?;
+    if execution.phase == Phase::Terminal
+        && checkpoint.eof
+        && checkpoint.progress.partial.is_empty()
+        && !crate::hooks::has_pending(&observation.pending)?
+    {
+        journal.commit_source(&run, "drained", None, b"true", Vec::new())?;
+    }
+    drop(journal);
+    Ok(())
+}
+
+fn finish_missing(
+    journal: &SharedJournal,
+    run: &boss_protocol_spoke::v1::Run,
+    stamp: &Stamp,
+    checkpoint: &Checkpoint,
+) -> Result<()> {
+    let reason = if checkpoint.path.as_os_str().is_empty() {
+        "terminal run never attached a transcript source"
+    } else {
+        "attached transcript disappeared before final drain; final size unknown"
+    };
+    finish_gap(
+        journal,
+        run,
+        stamp,
+        gap_resource(checkpoint),
+        checkpoint.cursor.offset,
+        reason.into(),
+    )
+}
+
+/// Names the generation that stopped short once a transcript was attached;
+/// a plain `transcript` otherwise (never attached).
+fn gap_resource(checkpoint: &Checkpoint) -> String {
+    if checkpoint.path.as_os_str().is_empty() {
+        "transcript".into()
+    } else {
+        format!("transcript:{}-{}", checkpoint.incarnation, checkpoint.cursor.generation)
+    }
+}
+
+fn current_checkpoint(journal: &SharedJournal, run: &boss_protocol_spoke::v1::Run) -> Result<Checkpoint> {
+    let saved = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
+        .source(run, "transcript")?;
+    Ok(saved
+        .map(|b| serde_json::from_slice(&b))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn finish_gap(
+    journal: &SharedJournal,
+    run: &boss_protocol_spoke::v1::Run,
+    stamp: &Stamp,
+    resource: String,
+    offset: u64,
+    reason: String,
+) -> Result<()> {
+    let mut journal = journal
+        .lock()
+        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+    if journal.source(run, "drained")?.is_some() {
+        return Ok(());
+    }
+    journal.commit_source(
+        run,
+        "drained",
+        None,
+        b"true",
+        vec![(
+            Record {
+                observed: Some(stamp.clone()),
+                run: Some(run.clone()),
+                body: Some(record::Body::Gap(Gap {
+                    resource,
+                    from_offset: offset,
+                    through_offset: offset,
+                    reason,
+                })),
+                ..Default::default()
+            },
+            Admission::Lifecycle,
+        )],
+    )?;
+    Ok(())
+}

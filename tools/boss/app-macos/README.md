@@ -105,6 +105,12 @@ only when both `BOSS_SOCKET_PATH` is non-production and
 and bare binary launches remain blocked. The hard gate in
 `agent_launch_guard.rs` is unchanged.
 
+**Screenshot viewer capture:** add `--capture-reveal-state=attachment-viewer
+--capture-attachments=2 --capture-attachment-image=<png>` to a `--capture-to`
+run to render the real screenshot viewer with a fixture image; add
+`--capture-viewer-resize` to capture it again after a live window resize and
+sidebar collapse.
+
 **Known capture limits (measured on macOS 26):**
 
 - `NavigationSplitView` sidebar with `.listStyle(.sidebar)` loses **row text**

@@ -40,6 +40,10 @@ allow_bypass = true
 bypass_name = "BYPASS_NO_USFA_TYPO"
 ```
 
+## Design principle: bypass directives are uniform
+
+Every bypass has the same shape: `BYPASS_<NAME>=<reason>`, where `<reason>` is a free-form, human-readable justification. A check must not define its own directive syntax. It must not parse limits, counts, flags or other structured data or instructions out of the reason, and it must not change behaviour based on the reason's contents. If a check needs a configurable threshold or a per-change exception with parameters, that belongs in check configuration (`CHECKS.yaml`) or a separate reviewed mechanism, never encoded in the bypass text.
+
 ## Directive format
 
 Use a single-line directive in the commit description or the PR description. **The commit description is the durable surface** — it is read in every CI context with no network dependency. The PR description is a best-effort convenience surface: reading it requires resolving which PR the current build belongs to and making an authenticated GitHub API call, both of which can fail or be unavailable depending on CI context (see [CI/environment context](#cienvironment-context) below). Prefer the commit description for anything you need to be certain survives to the build that actually gates a merge.

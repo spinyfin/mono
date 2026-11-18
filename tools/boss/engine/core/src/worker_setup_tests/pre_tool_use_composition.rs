@@ -9,14 +9,15 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
-    // Must have 6 entries: the shim, the deterministic path guard, the
+    // Must have 7 entries: the shim, the deterministic path guard, the
+    // shared-source-store guard,
     // always-on boss-launch guard, the PR redirect guard (all standard workers),
     // the checkleft push guard (local standard worker), and the revision-only
     // gh-pr-create guard.
     assert_eq!(
         pre.len(),
-        6,
-        "revision_implementation PreToolUse must have shim + path guard + boss-launch guard + PR redirect guard + checkleft push guard + revision pr guard, got {pre:?}",
+        7,
+        "revision_implementation PreToolUse must have shim + path guard + git store guard + boss-launch guard + PR redirect guard + checkleft push guard + revision pr guard, got {pre:?}",
     );
     // The revision pr-guard is the Bash-matcher entry whose command inspects
     // `cube pr ensure`; both the PR redirect guard and the boss-launch guard are
@@ -41,6 +42,13 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         "revision guard block message must point workers at `$CUBE_BIN` pr update: {guard_cmd}",
     );
     assert!(
+        guard_cmd.contains("BOSS_BIN")
+            && guard_cmd.contains("--summary")
+            && guard_cmd.contains("--answer-type create-prerequisite-task")
+            && guard_cmd.contains("propose followup-task --name"),
+        "revision guard block message must point workers at `$BOSS_BIN` create-prerequisite-task for blocking work and propose followup-task for later work: {guard_cmd}",
+    );
+    assert!(
         guard_cmd.contains("block"),
         "revision guard must produce a block decision: {guard_cmd}",
     );
@@ -60,6 +68,83 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         redirect_cmd.contains("CUBE_BIN") && redirect_cmd.contains("pr update"),
         "PR redirect guard block message must mention $CUBE_BIN pr update: {redirect_cmd}",
     );
+    assert!(
+        redirect_cmd.contains("BOSS_REVISION_WORKER=1"),
+        "revision PreToolUse must set BOSS_REVISION_WORKER so the redirect rejection is revision-shaped: {redirect_cmd}",
+    );
+}
+
+/// A revision worker's `gh pr create` hits the generic PR-redirect guard
+/// first. The reason that guard emits (with `BOSS_REVISION_WORKER=1`) must
+/// name `propose followup-task`, not `cube pr create`.
+#[test]
+fn revision_worker_gh_pr_create_redirect_reason_names_followup_task() {
+    let mut input = sample_input();
+    input.execution_kind = "revision_implementation".into();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+    let redirect_cmd = parsed["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse must be an array")
+        .iter()
+        .filter_map(|e| e["hooks"][0]["command"].as_str())
+        .find(|cmd| {
+            cmd.contains("jj git push")
+                && cmd.contains("CUBE_BIN")
+                && cmd.contains("pr create")
+                && !cmd.contains("ensure")
+        })
+        .expect("revision PreToolUse must include the PR redirect guard")
+        .to_owned();
+    assert!(
+        redirect_cmd.contains("BOSS_REVISION_WORKER=1"),
+        "installed redirect command must set the revision env: {redirect_cmd}",
+    );
+
+    use std::io::Write as _;
+    let stdin_payload = serde_json::json!({
+        "tool_input": {"command": "gh pr create --title x --body y"}
+    })
+    .to_string();
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&redirect_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh must be available");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_payload.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "PR redirect guard produced invalid JSON: {e}\nstdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    assert_eq!(
+        parsed["decision"].as_str().unwrap_or("missing"),
+        "block",
+        "gh pr create must still be blocked: {parsed}"
+    );
+    let reason = parsed["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("--summary")
+            && reason.contains("Otherwise report the dependency")
+            && reason.contains("--answer-type create-prerequisite-task")
+            && reason.contains("propose followup-task"),
+        "revision worker's gh pr create reason must name create-prerequisite-task and propose followup-task, got: {reason}",
+    );
+    assert!(
+        !reason.contains("pr create --branch"),
+        "revision worker's gh pr create reason must not recommend cube pr create, got: {reason}",
+    );
 }
 
 #[test]
@@ -69,13 +154,13 @@ fn chore_implementation_has_pr_redirect_guard_but_no_revision_guard() {
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
-    // chore: [boss-event shim, deterministic path guard, boss-launch guard,
+    // chore: [boss-event shim, deterministic path guard, git store guard, boss-launch guard,
     // PR redirect guard (all standard workers), checkleft push guard].
     // The revision-only `gh pr create` guard (which blocks `cube pr ensure`) must NOT be present.
     assert_eq!(
         pre.len(),
-        5,
-        "chore_implementation PreToolUse must have shim + path guard + boss-launch guard + PR redirect guard + checkleft push guard, got {pre:?}",
+        6,
+        "chore_implementation PreToolUse must have shim + path guard + git store guard + boss-launch guard + PR redirect guard + checkleft push guard, got {pre:?}",
     );
     assert_eq!(
         pre[0]["matcher"],
@@ -206,14 +291,14 @@ fn revision_task_kind_adds_gh_pr_create_guard_even_with_wrong_execution_kind() {
         .as_array()
         .expect("PreToolUse must be an array");
 
-    // shim + path guard + boss-launch guard + PR redirect guard (all standard)
-    // + checkleft push guard + revision-specific pr guard = 6 total
+    // shim + path guard + git store guard + boss-launch guard + PR redirect guard
+    // (all standard) + checkleft push guard + revision-specific pr guard = 7 total
     assert_eq!(
         pre.len(),
-        6,
+        7,
         "revision task_kind must add the revision pr guard on top of the PR redirect guard \
-         (shim + path guard + boss-launch guard + PR redirect guard + checkleft push guard + \
-         revision pr guard) even when execution_kind is wrong, got {pre:?}",
+         (shim + path guard + git store guard + boss-launch guard + PR redirect guard + \
+         checkleft push guard + revision pr guard) even when execution_kind is wrong, got {pre:?}",
     );
     // The revision-specific guard blocks `cube pr ensure` — find it by that token.
     let revision_pr_guard = pre

@@ -6,6 +6,7 @@ use super::idea::Idea;
 use super::product::Product;
 use super::project::Project;
 use super::task::{Task, TaskRuntime};
+use crate::{Attention, AttentionGroup, PlannerRunSummary, WorkAttentionItem};
 use serde::{Deserialize, Serialize};
 
 /// Input to `LinkWorkItemExternalRef`: manually bind a work item to a
@@ -166,7 +167,7 @@ pub struct WorkItemPatch {
     /// Set or clear `archived_reason` on a task. `None` → leave unchanged.
     /// `Some("")` → clear (write NULL). A non-empty string is stored
     /// verbatim. Required when an automated actor (`boss`, `engine`,
-    /// `boothby`) moves the row to `archived`; optional for a human
+    /// `boothby`, `progression`) moves the row to `archived`; optional for a human
     /// archive. When the actor is `boothby` and this field is omitted,
     /// the engine fills it from the armed Boothby action's rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,6 +266,21 @@ pub struct WorkItemPatch {
     pub pr_url: Option<String>,
     pub priority: Option<String>,
 
+    /// Park (`Some(true)`) or un-park (`Some(false)`) a task, chore or
+    /// project. `None` → leave unchanged. Only the human and boss caller
+    /// tiers may set it; the engine refuses every other tier at the write
+    /// boundary, the way it refuses a raise to `critical`. A parking patch
+    /// carries only `parked` / `parked_reason`: park and un-park are their
+    /// own request ([`crate::FrontendRequest::ParkWorkItem`] builds exactly
+    /// this patch), so they never ride along with an unrelated edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<bool>,
+
+    /// Optional free-text reason recorded with a park. Ignored unless
+    /// `parked` is `Some(true)`; an empty string records no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_reason: Option<String>,
+
     /// Move a leaf work item's project membership. `None` → leave
     /// unchanged. `Some("")` → move to the no-project state: a
     /// `project_task` becomes a `chore` and its `ordinal` is cleared.
@@ -316,6 +332,25 @@ pub struct WorkItemPatch {
     pub remove_tags: Option<Vec<String>>,
 }
 
+impl WorkItemPatch {
+    /// `true` when this patch asks to park or un-park and changes nothing
+    /// else. Compared against the serialized default patch rather than a
+    /// field list, so a field added to the patch later is covered without
+    /// anyone remembering to extend this check.
+    pub fn is_parking_only(&self) -> bool {
+        if self.parked.is_none() && self.parked_reason.is_none() {
+            return false;
+        }
+        let mut rest = self.clone();
+        rest.parked = None;
+        rest.parked_reason = None;
+        matches!(
+            (serde_json::to_value(&rest), serde_json::to_value(WorkItemPatch::default())),
+            (Ok(rest), Ok(empty)) if rest == empty
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkTree {
@@ -340,4 +375,23 @@ pub struct WorkTree {
     /// field existed.
     #[serde(default)]
     pub ideas: Vec<Idea>,
+    /// Product-scoped operational alerts, including resolved items, matching
+    /// `list_attention_items_for_work_item` for this product.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_items: Vec<WorkAttentionItem>,
+    /// Open and partially answered groups, matching `list_attention_groups`.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_groups: Vec<AttentionGroup>,
+    /// Members of the included groups, bucketed by `group_id` by clients.
+    #[serde(default)]
+    #[builder(default)]
+    pub attention_members: Vec<Attention>,
+    /// Per project, the latest settled (non-`running`) planner run, without
+    /// blobs. At most one entry per project; projects that never had a
+    /// settled run have none. Full history stays on `list_planner_runs`.
+    #[serde(default)]
+    #[builder(default)]
+    pub planner_runs: Vec<PlannerRunSummary>,
 }

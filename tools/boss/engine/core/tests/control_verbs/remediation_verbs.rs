@@ -71,7 +71,29 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: attempt.id.clone(),
+            reason: "gave_up".to_owned(),
+            evidence: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("not an allowed mark-failed reason"),
+                "expected canonical-reason rejection, got: {message}",
+            );
+            assert!(
+                message.contains("normal conflict work"),
+                "unhelpful rejection: {message}",
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+
+    let response = client
+        .send_request(&FrontendRequest::MarkConflictResolutionFailed {
+            attempt_id: attempt.id.clone(),
             reason: "product_decision_required".to_owned(),
+            evidence: None,
         })
         .await?;
     let flipped = match response {
@@ -88,7 +110,8 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: attempt.id.clone(),
-            reason: "ignored".to_owned(),
+            reason: "obsolescence_suspected".to_owned(),
+            evidence: None,
         })
         .await?;
     match response {
@@ -106,7 +129,8 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: "crz_does_not_exist".to_owned(),
-            reason: "nope".to_owned(),
+            reason: "obsolescence_suspected".to_owned(),
+            evidence: None,
         })
         .await?;
     match response {
@@ -872,6 +896,75 @@ async fn mark_ci_remediation_retriggered_rejects_queue_side_failures() -> Result
             row.status, "pending",
             "a rejected {failure_kind} verb must leave the attempt actionable, not terminal",
         );
+        let response = client
+            .send_request(&FrontendRequest::ClassifyCiRemediation {
+                attempt_id: attempt.id.clone(),
+                triage_class: "tractable".into(),
+                queue_ci_evidence: None,
+            })
+            .await?;
+        assert!(matches!(response, FrontendEvent::CiRemediationClassified { .. }));
+        if failure_kind == "merge_queue_rebounce" {
+            let response = client
+                .send_request(&FrontendRequest::ClassifyCiRemediation {
+                    attempt_id: attempt.id.clone(),
+                    triage_class: "unfixable".into(),
+                    queue_ci_evidence: None,
+                })
+                .await?;
+            assert!(matches!(response, FrontendEvent::WorkError { .. }));
+            // The give-up gate is "anything but tractable", so a class the
+            // engine has never heard of must not bypass it.
+            for class in ["infra", "flaky", "cannot_complete"] {
+                let response = client
+                    .send_request(&FrontendRequest::ClassifyCiRemediation {
+                        attempt_id: attempt.id.clone(),
+                        triage_class: class.into(),
+                        queue_ci_evidence: None,
+                    })
+                    .await?;
+                assert!(matches!(response, FrontendEvent::WorkError { .. }), "{class}");
+                let row = work_db.get_ci_remediation(&attempt.id)?.unwrap();
+                assert_eq!(row.status, "pending", "{class}");
+                assert_eq!(row.triage_class.as_deref(), Some("tractable"), "{class}");
+            }
+            let evidence = boss_protocol::QueueCiEvidence::builder()
+                .main_sha("a".repeat(40))
+                .verified_head_sha("b".repeat(40))
+                .queue_sha("c".repeat(40))
+                .queue_base_sha("d".repeat(40))
+                .runs(vec![boss_protocol::QueueCiRun {
+                    check_name: "bazel-build-test".into(),
+                    source_url: "https://buildkite.com/foo/bar/builds/1".into(),
+                    command: "bazel test //...".into(),
+                    exit_code: 0,
+                    output: "verbose output must not enter failure_reason".into(),
+                    coverage: "full job".into(),
+                }])
+                .build();
+            let response = client
+                .send_request(&FrontendRequest::ClassifyCiRemediation {
+                    attempt_id: attempt.id.clone(),
+                    triage_class: "infra".into(),
+                    queue_ci_evidence: Some(evidence.clone()),
+                })
+                .await?;
+            assert!(matches!(response, FrontendEvent::CiRemediationClassified { .. }));
+            client
+                .send_request(&FrontendRequest::MarkCiRemediationFailed {
+                    attempt_id: attempt.id.clone(),
+                    reason: "External queue outage".into(),
+                    queue_ci_evidence: Some(evidence),
+                })
+                .await?;
+            let row = work_db.get_ci_remediation(&attempt.id)?.unwrap();
+            assert_eq!(row.status, "failed");
+            let reason = row.failure_reason.unwrap();
+            assert!(reason.contains(&"a".repeat(40)));
+            assert!(reason.contains(&"b".repeat(40)));
+            assert!(reason.contains("bazel-build-test: bazel test //... (exit 0)"));
+            assert!(!reason.contains("verbose output"));
+        }
     }
 
     // Control: an ordinary `pr_branch_ci` attempt is still accepted, so the
@@ -981,7 +1074,8 @@ async fn engine_conflicts_list_and_show_round_trip() -> Result<()> {
         .await?;
     match response {
         FrontendEvent::ConflictResolutionsList { attempts } => {
-            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].id, b.id);
             assert!(attempts.iter().all(|a| a.status == "pending"));
         }
         other => return Err(anyhow!("unexpected response: {other:?}")),
@@ -1079,7 +1173,8 @@ async fn engine_conflicts_retry_resets_terminal_rows() -> Result<()> {
     client
         .send_request(&FrontendRequest::MarkConflictResolutionFailed {
             attempt_id: b.id.clone(),
-            reason: "architectural_mismatch".to_owned(),
+            reason: "obsolescence_suspected".to_owned(),
+            evidence: None,
         })
         .await?;
 
@@ -1210,6 +1305,12 @@ async fn seed_two_conflict_resolutions(
             head_sha_before: Some("ddd".to_owned()),
         })?
         .expect("first insert seeds the row");
+    // A newer attempt retires older `pending` ones, so the first attempt is
+    // moved to `running` (which holds a worker lease and is never retired)
+    // before the second is inserted.
+    work_db
+        .mark_conflict_resolution_running(&a.id, "lease-seed", "ws-seed", "worker-seed")?
+        .expect("seeded attempt flips to running");
     // `created_at` has second resolution (`now_string()` stamps whole
     // epoch seconds), so the second row only sorts after the first once
     // the wall clock ticks into a new second. Poll for that instead of a
@@ -1233,4 +1334,111 @@ async fn seed_two_conflict_resolutions(
         .expect("second insert seeds the row (different base_sha)");
     drop(work_db);
     Ok((product, chore, a, b))
+}
+
+/// `mark-failed --reason architectural_mismatch` over the socket: refactor-only
+/// or missing evidence is rejected with guidance and leaves the attempt live;
+/// valid evidence is recorded without failing the attempt, so the PR is never
+/// left in a dead-end failed state.
+#[tokio::test]
+async fn architectural_mismatch_requires_evidence_and_never_fails_the_attempt() -> Result<()> {
+    use boss_protocol::{ArchitecturalMismatchEvidence, MismatchBasis};
+
+    let engine = spawn_engine().await?;
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
+    let pr_url = "https://github.com/foo/bar/pull/43";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr_url.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    let attempt = work_db
+        .insert_conflict_resolution(boss_engine::work::ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr_url.to_owned(),
+            pr_number: 43,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("abc123".to_owned()),
+            head_sha_before: Some("def456".to_owned()),
+        })?
+        .expect("insert should succeed on a fresh row");
+    let revision = work_db.create_revision(
+        boss_protocol::CreateRevisionInput::builder()
+            .parent_task_id(chore.id.clone())
+            .description("Resolve merge conflict against main")
+            .created_via(format!(
+                "{}{}",
+                boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX,
+                attempt.id
+            ))
+            .build(),
+        &boss_engine::work::StaticPrStateChecker(boss_engine::work::PrOpenState::Open),
+    )?;
+    work_db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)?;
+    drop(work_db);
+
+    let evidence = ArchitecturalMismatchEvidence {
+        basis: MismatchBasis::SubsystemDeleted,
+        conflicting_commits: "abc123".into(),
+        main_changes: "the legacy queue was deleted".into(),
+        attempted_port: "searched main for a replacement and found none".into(),
+        contradiction: "Main deleted the legacy queue entirely, so the new queue priority has nowhere to live.".into(),
+        recommendation: "Rewrite around the dispatcher.".into(),
+    };
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let mark = |evidence| FrontendRequest::MarkConflictResolutionFailed {
+        attempt_id: attempt.id.clone(),
+        reason: "architectural_mismatch".to_owned(),
+        evidence,
+    };
+
+    for rejected in [
+        None,
+        Some(ArchitecturalMismatchEvidence {
+            contradiction: "The files moved into the dispatch crate and the helpers became private.".into(),
+            ..evidence.clone()
+        }),
+    ] {
+        match client.send_request(&mark(rejected)).await? {
+            FrontendEvent::WorkError { message } => {
+                assert!(
+                    message.contains("normal conflict work"),
+                    "unhelpful rejection: {message}"
+                );
+            }
+            other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+        }
+    }
+
+    match client.send_request(&mark(Some(evidence))).await? {
+        FrontendEvent::ConflictResolution { attempt: recorded } => {
+            assert_eq!(recorded.id, attempt.id);
+            assert_eq!(
+                recorded.status, "pending",
+                "recording the mismatch must not fail the attempt"
+            );
+            assert_eq!(recorded.failure_reason, None);
+            assert!(!recorded.mismatch_exit_barred);
+        }
+        other => return Err(anyhow!("expected the live attempt, got: {other:?}")),
+    }
+    Ok(())
 }

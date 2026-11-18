@@ -32,11 +32,14 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use boss_protocol::{
-    AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload, DeferredScopeProposalPayload,
+    ArchiveRevisionProposalPayload, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
+    CLEARABLE_BLOCK_REASONS, ClearSignalProposalPayload, DeferredScopeProposalPayload, DependProposalPayload,
     EffortEscalationProposalPayload, FollowupTaskProposalPayload, PROPOSAL_CAP_PER_KIND_PER_EXECUTION,
-    PROPOSAL_CAP_TOTAL_PER_EXECUTION, PrCreatedProposalPayload, ProposalErrorCode, ProposalFieldError, ProposalKind,
-    ProposalSubmissionError, ReviewReportProposalPayload, ReviewVerdictProposalPayload, RunDoneOutcome,
-    RunDoneProposalPayload, WAIT_MAX_DURATION_SECS, WaitProposalPayload,
+    PROPOSAL_CAP_TOTAL_PER_EXECUTION, PrCreatedProposalPayload, PrecursorProposalPayload, ProgressionQuestionCriterion,
+    ProposalErrorCode, ProposalFieldError, ProposalKind, ProposalSubmissionError, RedispatchProposalPayload,
+    ReviewReportProposalPayload, ReviewVerdictProposalPayload, ReviseProposalPayload, RunDoneOutcome,
+    RunDoneProposalPayload, UnblockProposalPayload, UndependProposalPayload, WAIT_MAX_DURATION_SECS,
+    WaitProposalPayload,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -278,12 +281,31 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             let outcome = reader.required_enum::<RunDoneOutcome>("outcome");
             let summary = reader.required_text("summary", MAX_SHORT_FIELD_CHARS);
             let question = reader.operator_question(outcome);
+            let criterion = reader.optional_enum::<ProgressionQuestionCriterion>("criterion");
+            if criterion.is_some() && question.is_none() {
+                reader.error(
+                    "criterion",
+                    "a criterion only accompanies a question: it says which of the numbered reasons for \
+                     asking the owner this question meets",
+                );
+            }
+            let queue_ci_evidence = reader.raw("queue_ci_evidence").and_then(|value| {
+                match serde_json::from_value::<boss_protocol::QueueCiEvidence>(value.clone()) {
+                    Ok(evidence) => Some(evidence),
+                    Err(err) => {
+                        reader.error("queue_ci_evidence", err.to_string());
+                        None
+                    }
+                }
+            });
             reader.finish()?;
-            to_json(&RunDoneProposalPayload {
+            let canonical = to_json(&RunDoneProposalPayload {
                 outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
                 summary: summary.unwrap_or_default(),
                 question,
-            })
+                queue_ci_evidence,
+            });
+            with_criterion(canonical, criterion)
         }
         ProposalKind::Wait => {
             let duration_secs = reader.required_u64("duration_secs", 1, WAIT_MAX_DURATION_SECS);
@@ -295,6 +317,66 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                 reason: reason.unwrap_or_default(),
                 waiting_on,
             })
+        }
+        ProposalKind::Revise => {
+            let brief = reader.required_text("brief", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&ReviseProposalPayload {
+                brief: brief.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Precursor => {
+            let name = reader.required_text("name", MAX_PREREQUISITE_NAME_CHARS);
+            if let Some(name) = name.as_deref()
+                && name.contains(['\n', '\r'])
+            {
+                reader.error("name", "must be a single line");
+            }
+            let brief = reader.required_text("brief", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&PrecursorProposalPayload {
+                name: name.unwrap_or_default(),
+                brief: brief.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Depend => {
+            let on = reader.required_work_item_ref("on");
+            reader.finish()?;
+            to_json(&DependProposalPayload {
+                on: on.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Undepend => {
+            let on = reader.required_work_item_ref("on");
+            reader.finish()?;
+            to_json(&UndependProposalPayload {
+                on: on.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Redispatch => {
+            let brief_addendum = reader.optional_text("brief_addendum", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&RedispatchProposalPayload { brief_addendum })
+        }
+        ProposalKind::ClearSignal => {
+            let reason = reader.required_one_of("reason", CLEARABLE_BLOCK_REASONS);
+            reader.finish()?;
+            to_json(&ClearSignalProposalPayload {
+                reason: reason.unwrap_or_default(),
+            })
+        }
+        ProposalKind::ArchiveRevision => {
+            let revision = reader.required_work_item_ref("revision");
+            let reason = reader.required_text("reason", MAX_SHORT_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&ArchiveRevisionProposalPayload {
+                revision: revision.unwrap_or_default(),
+                reason: reason.unwrap_or_default(),
+            })
+        }
+        ProposalKind::Unblock => {
+            reader.finish()?;
+            to_json(&UnblockProposalPayload {})
         }
     };
 
@@ -366,6 +448,28 @@ pub fn derive_idempotency_key(execution_id: &str, kind: ProposalKind, canonical_
     let digest = hasher.finalize();
     let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
     format!("auto:{kind}:{hex}")
+}
+
+/// Choose the idempotency key for a submission: the one policy shared by the
+/// engine and any spoke-local gateway.
+///
+/// A caller-supplied key (blank counts as absent, since an unset shell variable
+/// expands to an empty string) is validated and replays. A keyless `Wait` gets
+/// a fresh identity from `unique` so re-running it renews the deadline instead
+/// of replaying the original row. Every other keyless submission derives its
+/// key from the content, so a retried command is replay-safe.
+pub fn select_idempotency_key(
+    execution_id: &str,
+    kind: ProposalKind,
+    canonical_json: &str,
+    supplied: Option<&str>,
+    unique: u128,
+) -> Result<String, ProposalFieldError> {
+    match supplied.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => validate_caller_idempotency_key(key).map(|()| key.to_owned()),
+        None if kind == ProposalKind::Wait => Ok(format!("auto:wait:{execution_id}:{unique}")),
+        None => Ok(derive_idempotency_key(execution_id, kind, canonical_json)),
+    }
 }
 
 /// The prefix [`derive_idempotency_key`] reserves for keys it derives itself.
@@ -473,6 +577,24 @@ fn to_json<T: serde::Serialize>(payload: &T) -> String {
     serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// Add the progression question `criterion` to a canonical `run_done` payload.
+/// It rides beside the typed payload (see
+/// [`boss_protocol::run_done_question_criterion`]) and, being part of the
+/// canonical form, is part of the idempotency hash: re-asking the same question
+/// under a different criterion is a different submission.
+fn with_criterion(canonical: String, criterion: Option<ProgressionQuestionCriterion>) -> String {
+    let Some(criterion) = criterion else {
+        return canonical;
+    };
+    match serde_json::from_str::<Value>(&canonical) {
+        Ok(Value::Object(mut object)) => {
+            object.insert("criterion".to_owned(), Value::String(criterion.as_str().to_owned()));
+            Value::Object(object).to_string()
+        }
+        _ => canonical,
+    }
+}
+
 /// Read `automation_outcome`'s tag-dependent field set.
 ///
 /// The payload is an internally-tagged enum, so which fields are required
@@ -578,7 +700,10 @@ impl<'a> PayloadReader<'a> {
             self.error("question", "a question is only meaningful on a blocked declaration");
         }
         if let Some(kind) = value.pointer("/answer_type/kind").and_then(Value::as_str)
-            && !matches!(kind, "yes_no" | "create_prerequisite_task")
+            && !matches!(
+                kind,
+                "yes_no" | "create_prerequisite_task" | "link_prerequisite_task" | "multiple_choice"
+            )
         {
             self.error("question.answer_type.kind", format!("unsupported answer type: {kind}"));
             return None;
@@ -590,7 +715,15 @@ impl<'a> PayloadReader<'a> {
                 return None;
             }
         };
-        if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief } = question.answer_type {
+        if let boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+            name,
+            brief,
+            file_count_bypass,
+            option_labels: _,
+            existing_id,
+            existing_pr,
+        } = question.answer_type
+        {
             let name = self.text_from(
                 "question.answer_type.name",
                 &Value::String(name),
@@ -605,11 +738,123 @@ impl<'a> PayloadReader<'a> {
             if name.contains(['\n', '\r']) {
                 self.error("question.answer_type.name", "must be a single line");
             }
+            if let Some(spec) = file_count_bypass
+                && let Err(message) = spec.validate()
+            {
+                self.error("question.answer_type.file_count_bypass", message);
+            }
             // The engine owns the wording so the card always reads the same;
             // whatever the worker sent as `text` is replaced.
-            question.text = boss_protocol::OperatorAnswerType::prerequisite_question_text(&name);
-            question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask { name, brief };
+            question.text = match file_count_bypass {
+                Some(spec) => boss_protocol::OperatorAnswerType::file_count_split_question_text(&name, spec),
+                None => boss_protocol::OperatorAnswerType::prerequisite_question_text(&name),
+            };
+            // The engine also owns the option names: a split-vs-bypass question
+            // names its two actions, an ordinary prerequisite stays Yes/No, and
+            // whatever labels the worker sent are replaced.
+            let existing_id = existing_id.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_id",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            let existing_pr = existing_pr.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_pr",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            if file_count_bypass.is_some() && (existing_id.is_some() || existing_pr.is_some()) {
+                self.error(
+                    "question.answer_type.existing_pr",
+                    "a split-vs-bypass question cannot also name existing work to wait for",
+                );
+            }
+            question.answer_type = boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name,
+                brief,
+                file_count_bypass,
+                option_labels: file_count_bypass.map(|_| boss_protocol::AnswerOptionLabels::split_or_bypass()),
+                existing_id,
+                existing_pr,
+            };
+        } else if let boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+            existing_id,
+            existing_pr,
+            work_item_id,
+            name,
+            pr_url,
+        } = question.answer_type
+        {
+            let existing_id = existing_id.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_id",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            let existing_pr = existing_pr.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.existing_pr",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            let work_item_id = if work_item_id.trim().is_empty() {
+                String::new()
+            } else {
+                self.text_from(
+                    "question.answer_type.work_item_id",
+                    &Value::String(work_item_id),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+                .unwrap_or_default()
+            };
+            let name = if name.trim().is_empty() {
+                String::new()
+            } else {
+                self.text_from(
+                    "question.answer_type.name",
+                    &Value::String(name),
+                    MAX_PREREQUISITE_NAME_CHARS,
+                )
+                .unwrap_or_default()
+            };
+            let pr_url = pr_url.and_then(|value| {
+                self.text_from(
+                    "question.answer_type.pr_url",
+                    &Value::String(value),
+                    MAX_SHORT_FIELD_CHARS,
+                )
+            });
+            if existing_id.is_none() && existing_pr.is_none() && work_item_id.is_empty() {
+                self.error(
+                    "question.answer_type.existing_id",
+                    "a link question must name an existing task id or pull request",
+                );
+            }
+            question.text = if name.is_empty() {
+                boss_protocol::OperatorAnswerType::link_prerequisite_unresolved_question_text()
+            } else {
+                let pr_label = pr_url.as_deref().and_then(boss_github::pr_url::compact_pr_label);
+                boss_protocol::OperatorAnswerType::link_prerequisite_question_text(&name, pr_label.as_deref())
+            };
+            question.answer_type = boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+                existing_id,
+                existing_pr,
+                work_item_id,
+                name,
+                pr_url,
+            };
         } else {
+            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type
+                && let Err(message) = boss_protocol::OperatorAnswerType::validate_choices(choices)
+            {
+                self.error("question.answer_type.choices", message);
+                return None;
+            }
             question.text = self.text_from("question.text", &Value::String(question.text), 500)?;
             if question.text.contains(['\n', '\r']) {
                 self.error("question.text", "must be a single line");
@@ -723,6 +968,24 @@ impl<'a> PayloadReader<'a> {
         None
     }
 
+    /// Read `field` as a work-item reference: a `task_…` id or a short `T<n>` id.
+    /// Shape only; the engine resolves it and checks it against the run's
+    /// neighbourhood.
+    fn required_work_item_ref(&mut self, field: &'static str) -> Option<String> {
+        let text = self.required_text(field, MAX_SHORT_FIELD_CHARS)?;
+        let short = text
+            .strip_prefix(['T', 't'])
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+        if !(text.starts_with("task_") || short) || text.contains(char::is_whitespace) {
+            self.error(
+                field,
+                format!("`{text}` is not a work-item id; expected a `task_…` id or a short `T<n>` id"),
+            );
+            return None;
+        }
+        Some(text)
+    }
+
     /// Read `field` as a canonical GitHub PR URL.
     ///
     /// Shape validation only — the product-repo-slug and branch-match checks
@@ -798,7 +1061,7 @@ mod operator_question_tests {
             invalid["outcome"] = json!(outcome);
             assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
         }
-        for kind in ["multiple_choice", "prompt", "unknown"] {
+        for kind in ["prompt", "unknown"] {
             let mut invalid = valid.clone();
             invalid["question"]["answer_type"]["kind"] = json!(kind);
             assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err());
@@ -834,6 +1097,58 @@ mod operator_question_tests {
         }})
     }
 
+    fn multiple_choice_payload(choices: serde_json::Value) -> serde_json::Value {
+        json!({"outcome":"blocked", "summary":"Needs a decision", "question":{
+            "text":"  Which rollout should I use?  ",
+            "answer_type":{"kind":"multiple_choice", "choices": choices},
+            "explanation":"The brief allows both."
+        }})
+    }
+
+    #[test]
+    fn multiple_choice_question_is_accepted_with_two_to_six_distinct_choices() {
+        let canonical = validate_payload(
+            ProposalKind::RunDone,
+            &multiple_choice_payload(json!(["Gradual", "All at once"])),
+        )
+        .unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(question.text, "Which rollout should I use?");
+        assert_eq!(
+            question.answer_type,
+            boss_protocol::OperatorAnswerType::MultipleChoice {
+                choices: vec!["Gradual".into(), "All at once".into()]
+            }
+        );
+        let six = json!(["a", "b", "c", "d", "e", "f"]);
+        assert!(validate_payload(ProposalKind::RunDone, &multiple_choice_payload(six)).is_ok());
+        for choices in [
+            json!([]),
+            json!(["only one"]),
+            json!(["a", "b", "c", "d", "e", "f", "g"]),
+            json!(["a", ""]),
+            json!(["a", "   "]),
+            json!(["a", "a"]),
+            json!(["a", "two\nlines"]),
+            json!(["a", 7]),
+        ] {
+            assert!(
+                validate_payload(ProposalKind::RunDone, &multiple_choice_payload(choices.clone())).is_err(),
+                "{choices}"
+            );
+        }
+        let mut missing = multiple_choice_payload(json!(["a", "b"]));
+        missing["question"]["answer_type"]
+            .as_object_mut()
+            .unwrap()
+            .remove("choices");
+        assert!(validate_payload(ProposalKind::RunDone, &missing).is_err());
+        let mut not_blocked = multiple_choice_payload(json!(["a", "b"]));
+        not_blocked["outcome"] = json!("delivered");
+        assert!(validate_payload(ProposalKind::RunDone, &not_blocked).is_err());
+    }
+
     #[test]
     fn prerequisite_question_is_canonicalized_and_owns_its_wording() {
         let canonical = validate_payload(ProposalKind::RunDone, &prerequisite_payload()).unwrap();
@@ -848,6 +1163,10 @@ mod operator_question_tests {
             boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
                 name: "Fix the retention-cleanup fixture race".into(),
                 brief: "A stand-alone brief.".into(),
+                file_count_bypass: None,
+                option_labels: None,
+                existing_id: None,
+                existing_pr: None,
             }
         );
         assert_eq!(
@@ -890,5 +1209,102 @@ mod operator_question_tests {
         let mut no_explanation = prerequisite_payload();
         no_explanation["question"]["explanation"] = json!("");
         assert!(validate_payload(ProposalKind::RunDone, &no_explanation).is_err());
+    }
+
+    #[test]
+    fn file_count_split_question_is_canonicalized_and_rejects_a_non_over_limit_count() {
+        let payload = json!({"outcome":"blocked", "summary":"Over the file-count limit", "question":{
+            "text":"Worker wording should be replaced",
+            "answer_type":{"kind":"create_prerequisite_task",
+                "name":"  Extract the first capability  ",
+                "brief":"  Land the first PR.  ",
+                "file_count_bypass":{"files":48,"limit":30}},
+            "explanation":"  48 files, limit 30.  "
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &payload).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(
+            question.text,
+            "Split this 48-file change (limit 30) by landing 'Extract the first capability' first, or bypass the limit and keep it in one PR?"
+        );
+        assert_eq!(
+            question.answer_type,
+            boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                name: "Extract the first capability".into(),
+                brief: "Land the first PR.".into(),
+                file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 48, limit: 30 }),
+                option_labels: Some(boss_protocol::AnswerOptionLabels::split_or_bypass()),
+                existing_id: None,
+                existing_pr: None,
+            }
+        );
+        // The engine owns the option names: labels a worker sends are replaced,
+        // and an ordinary prerequisite question never gains any.
+        let mut spoofed = payload.clone();
+        spoofed["question"]["answer_type"]["option_labels"] = json!({"yes": "Approve", "no": "Reject"});
+        let canonical = validate_payload(ProposalKind::RunDone, &spoofed).unwrap();
+        assert!(canonical.canonical_json.contains("\"Bypass limit\""));
+        assert!(!canonical.canonical_json.contains("Approve"));
+        let mut ordinary = prerequisite_payload();
+        ordinary["question"]["answer_type"]["option_labels"] = json!({"yes": "Approve", "no": "Reject"});
+        let canonical = validate_payload(ProposalKind::RunDone, &ordinary).unwrap();
+        assert!(!canonical.canonical_json.contains("option_labels"));
+        for spec in [
+            json!({"files":30,"limit":30}),
+            json!({"files":0,"limit":30}),
+            json!({"files":48,"limit":0}),
+            json!({"files":29,"limit":30}),
+        ] {
+            let mut invalid = payload.clone();
+            invalid["question"]["answer_type"]["file_count_bypass"] = spec.clone();
+            assert!(validate_payload(ProposalKind::RunDone, &invalid).is_err(), "{spec}");
+        }
+    }
+
+    #[test]
+    fn link_prerequisite_question_requires_an_id_or_pr_and_owns_its_wording() {
+        let payload = json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
+            "text":"Worker wording should be replaced",
+            "answer_type":{"kind":"link_prerequisite_task",
+                "existing_pr":"  https://github.com/acme/widget/pull/9  "},
+            "explanation":"  The other change is already in review.  "
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &payload).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        let question = parsed.question.unwrap();
+        assert_eq!(
+            question.text,
+            "Wait for the existing work this request names? This task will wait for it."
+        );
+        assert_eq!(
+            question.answer_type,
+            boss_protocol::OperatorAnswerType::LinkPrerequisiteTask {
+                existing_id: None,
+                existing_pr: Some("https://github.com/acme/widget/pull/9".into()),
+                work_item_id: String::new(),
+                name: String::new(),
+                pr_url: None,
+            }
+        );
+        let mut missing = payload.clone();
+        missing["question"]["answer_type"]
+            .as_object_mut()
+            .unwrap()
+            .remove("existing_pr");
+        assert!(validate_payload(ProposalKind::RunDone, &missing).is_err());
+        let resolved = json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
+            "answer_type":{"kind":"link_prerequisite_task",
+                "work_item_id":"task_abc",
+                "name":"Land the wiring",
+                "pr_url":"https://github.com/acme/widget/pull/9"},
+            "explanation":"The other change is already in review."
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &resolved).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        assert_eq!(
+            parsed.question.unwrap().text,
+            "Wait for 'Land the wiring' (acme/widget#9)? This task will wait for it."
+        );
     }
 }

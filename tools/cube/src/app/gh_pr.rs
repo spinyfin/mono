@@ -8,15 +8,6 @@
 //! GraphQL budget never blocks these lookups — the separate, far-less-
 //! contended REST (`core`) quota serves them.
 //!
-//! Every remaining lookup here is about *one* PR the caller already has in
-//! hand. There is deliberately no bulk PR-state helper: the sole caller that
-//! ever wanted one was GC's closed-PR bookmark sweep, and that sweep no
-//! longer consults GitHub at all — it decides which `pr/<n>` bookmarks are
-//! still referenced from local workspace state instead (see
-//! [`crate::app::gc::collect_unreferenced_pr_bookmarks`]). Reintroducing a
-//! batch helper here would mean some caller is once again sizing a GitHub
-//! round trip by how much local bookkeeping has piled up, which is the shape
-//! that hung `cube workspace release` for 4-6+ minutes.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,6 +34,11 @@ pub(super) fn fetch_pr_json(runner: &dyn CommandRunner, cwd: &Path, owner_repo: 
 /// Extract `head.ref` from a PR's REST JSON.
 pub(super) fn head_ref(value: &Value) -> Option<&str> {
     value.get("head").and_then(|h| h.get("ref")).and_then(|v| v.as_str())
+}
+
+/// Extract `head.sha` from a PR's REST JSON.
+pub(super) fn head_sha(value: &Value) -> Option<&str> {
+    value.get("head").and_then(|h| h.get("sha")).and_then(|v| v.as_str())
 }
 
 /// Normalize a PR's REST JSON to the `"OPEN"` / `"CLOSED"` / `"MERGED"`

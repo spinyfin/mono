@@ -3,6 +3,26 @@ import Foundation
 extension ChatViewModel {
     @discardableResult
     func prepareReveal(_ taskID: String) -> RevealCardResult {
+        if navigator.mode == .navigator {
+            if let task = task(withID: taskID), let projection = task.navigator,
+               projection.version == 1, let root = self.task(withID: projection.rootTaskId),
+               root.navigator?.root?.knownSection != nil, navigatorIncludes(root) {
+                selectedWorkCardID = root.id
+                selectNavigatorRoot(root.id, askID: taskID != root.id ? taskID : nil)
+                navigatorRevealRootID = root.id
+                revealNavigatorSelection()
+                armRevealDeadline(taskID: taskID, waitingForTree: false)
+                return .revealed(cardID: root.id)
+            }
+            navigator.mode = .kanban
+            defaults.set(WorkViewMode.kanban.rawValue, forKey: "boss.work.viewMode")
+        }
+        // Reveal's contract is "show me this card", so a parked target turns
+        // "Show parked" on for the session (not persisted: it is not the
+        // user's standing preference).
+        if !showParked, let target = task(withID: taskID), isParked(target) {
+            showParked = true
+        }
         let outcome = revealCardTarget(for: taskID)
         guard case .revealed(let cardID) = outcome else {
             let reason: String
@@ -41,7 +61,7 @@ extension ChatViewModel {
         let generation = revealGeneration
         let token = UUID()
         revealDeadlineToken = token
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+        revealDeadlineScheduler { [weak self] in
             guard let self, self.revealGeneration == generation,
                   self.revealDeadlineToken == token else { return }
             self.finishReveal(.failure(.internalFailure(
@@ -54,10 +74,12 @@ extension ChatViewModel {
 
     func finishReveal(_ result: EngineRevealResult) {
         revealDeadlineToken = UUID()
+        navigatorRevealRootID = nil
         let completion = revealCompletion
         revealCompletion = nil
         revealScrollTarget = nil
         pendingRevealScrollID = nil
+        pendingRevealReconcilesProjectFilter = false
         revealProductID = nil
         completion?(result)
     }

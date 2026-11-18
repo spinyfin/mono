@@ -9,15 +9,29 @@
 //! Anything reachable via `WorkerSpawner` is fair game without
 //! standing up a full engine; the broadcast / coordinator side
 //! lives in `coordinator.rs` tests.
-use super::super::{bound_control_token_path, engine_events_socket_path};
 use super::*;
-use crate::app::SendToAppError;
+use super::{bound_control_token_path, engine_events_socket_path};
+use crate::live_worker_state::DriverSignalKind;
+use crate::spawn_flow::TmuxWorkerHost;
+use crate::work::WorkDb;
+use anyhow::Result;
+use async_trait::async_trait;
+use boss_execution_runner::pane_spawn::path_prepend_clause;
+use boss_execution_runner::spawn_confirmation::current_run_has_turn_start_evidence;
+use boss_execution_runner::test_exports::{
+    capture_shows_driver_ready, confirm_spawn_started, ensure_worker_bin_dir_for_engine,
+};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
 use crate::driver::AgentDriver;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{AttachWorkerPaneResult, EngineToAppRequest, EngineToAppResponse, EnvVar};
 use crate::test_support::*;
 use crate::work::{CreateChoreInput, CreateProjectInput, CreateTaskInput, EffortLevel, Task, WorkExecution, WorkItem};
 use crate::worker_registry::WorkerRegistry;
+use boss_execution_contracts::SendToAppError;
 use boss_protocol::{ExecutionKind, ExecutionStatus, TaskKind, TaskStatus};
 use boss_tmux::{CommandOutput, CommandRunner, Tmux};
 use std::ffi::OsString;
@@ -39,6 +53,7 @@ struct CapturedSpawn {
 /// and cannot see the ancestor `cfg(test)`.
 #[cfg(test)]
 struct CapturingSpawner {
+    pending_run_id: StdMutex<String>,
     registry: WorkerRegistry,
     live_states: LiveWorkerStateRegistry,
     last: StdMutex<Option<CapturedSpawn>>,
@@ -69,11 +84,79 @@ struct CapturingSpawner {
     hook_before_registration: std::sync::atomic::AtomicBool,
     /// Cancel exactly when confirmation first observes the pane.
     cancel_on_capture: StdMutex<Option<(Arc<WorkDb>, String)>>,
+    /// Cancels the execution when the engine first sends a key to the pane,
+    /// which only happens in the prompt wait after a driver start.
+    cancel_on_send_keys: StdMutex<Option<(Arc<WorkDb>, String)>>,
+    /// When true (the default), the stand-in worker takes its prompt: a
+    /// `UserPromptSubmit` is recorded wherever the pane is launched or read.
+    /// False models the driver that starts and then sits at its composer.
+    accept_prompt: std::sync::atomic::AtomicBool,
+    /// When true, a Return re-sent by the engine is taken as the submit.
+    accept_prompt_on_resubmit: std::sync::atomic::AtomicBool,
+    /// A launcher marker to leave in the run's delivery home when the pane
+    /// starts, as `(driver config dir, marker file name)`.
+    delivery_marker: StdMutex<Option<(PathBuf, &'static str)>>,
+    /// Every key the engine sent to the pane with `send-keys`.
+    sent_keys: StdMutex<Vec<String>>,
+    /// When true, the first live-state lookup after confirmation has first
+    /// read the pane delivers a `SessionStart`: a driver that starts just
+    /// after the start wait gave up.
+    late_session_start: std::sync::atomic::AtomicBool,
+    /// Set by the first `capture-pane`.
+    capture_seen: std::sync::atomic::AtomicBool,
+    /// Keeps the per-run homes root pointed inside the test's workspace for
+    /// as long as the spawner lives. See [`HomesPin`].
+    homes_pin: StdMutex<Option<HomesPin>>,
+    /// The GitHub-backed docs service handed to the prompt composer; `None`
+    /// (the default) composes prompts without a repo `BOSS.md` block.
+    design_docs: StdMutex<Option<Arc<boss_engine_design_docs::DesignDocsService>>>,
+}
+
+/// Pins `BOSS_CODEX_HOMES_DIR` to a directory inside the test's own workspace.
+///
+/// Claude provisioning writes the private brief under the per-run homes root
+/// and leaves `.claude/initial-prompt.txt` as a symlink to it. That root comes
+/// from a process-global env var which sibling tests repoint at their own temp
+/// dirs, so a spawn that lands inside such a window leaves a symlink into a
+/// directory that is deleted when that sibling finishes, and the read-back
+/// fails with `NotFound`. Holding the override for the whole test (on a helper
+/// thread, because its guard is a blocking lock that must not be held across
+/// `.await`) keeps the brief where the test can read it.
+struct HomesPin {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HomesPin {
+    fn new(root: PathBuf) -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _guard = crate::driver::test_support::codex_homes_override(&root);
+            ready_tx.send(()).unwrap();
+            let _ = released.recv();
+        });
+        ready.recv().unwrap();
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for HomesPin {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl CapturingSpawner {
     fn new() -> Self {
         Self {
+            pending_run_id: StdMutex::new(String::new()),
             registry: WorkerRegistry::new(),
             live_states: LiveWorkerStateRegistry::new(),
             last: StdMutex::new(None),
@@ -86,7 +169,31 @@ impl CapturingSpawner {
             capture_log: StdMutex::new(Vec::new()),
             hook_before_registration: std::sync::atomic::AtomicBool::new(false),
             cancel_on_capture: StdMutex::new(None),
+            cancel_on_send_keys: StdMutex::new(None),
+            accept_prompt: std::sync::atomic::AtomicBool::new(true),
+            accept_prompt_on_resubmit: std::sync::atomic::AtomicBool::new(false),
+            delivery_marker: StdMutex::new(None),
+            sent_keys: StdMutex::new(Vec::new()),
+            late_session_start: std::sync::atomic::AtomicBool::new(false),
+            capture_seen: std::sync::atomic::AtomicBool::new(false),
+            homes_pin: StdMutex::new(None),
+            design_docs: StdMutex::new(None),
         }
+    }
+
+    /// Record the turn evidence a worker that took its prompt would send.
+    fn record_prompt_accepted(&self, run_id: &str) {
+        self.live_states.record_turn_evidence(
+            run_id,
+            &boss_protocol::WorkerEvent::UserPromptSubmit {
+                session_id: "session".into(),
+                prompt: "brief".into(),
+            },
+        );
+    }
+
+    fn sent_keys(&self) -> Vec<String> {
+        self.sent_keys.lock().unwrap().clone()
     }
 
     fn spawn_input(&self) -> CapturedSpawn {
@@ -129,6 +236,10 @@ impl crate::spawn_flow::WorkerSpawner for CapturingSpawner {
         &self.registry
     }
 
+    fn design_docs(&self) -> Option<Arc<boss_engine_design_docs::DesignDocsService>> {
+        self.design_docs.lock().unwrap().clone()
+    }
+
     async fn reap_worker_pane(&self, run_id: &str) {
         self.reaped.lock().unwrap().push(run_id.to_owned());
         // Mirror production teardown enough for the test: drop the
@@ -137,6 +248,13 @@ impl crate::spawn_flow::WorkerSpawner for CapturingSpawner {
     }
 
     fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
+        use std::sync::atomic::Ordering;
+        if self.capture_seen.load(Ordering::SeqCst) && self.late_session_start.swap(false, Ordering::SeqCst) {
+            let run_id = self.pending_run_id.lock().unwrap().clone();
+            self.live_states.record_hook_event_kind(&run_id, "SessionStart");
+            self.live_states
+                .record_driver_signal(&run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+        }
         Some(&self.live_states)
     }
 }
@@ -166,15 +284,36 @@ impl CommandRunner for CapturingSpawner {
                     env,
                     initial_input: args.last().unwrap().clone(),
                 });
+                let run_id = self.pending_run_id.lock().unwrap().clone();
                 if self.hook_before_registration.load(std::sync::atomic::Ordering::SeqCst) {
-                    self.live_states.record_hook_event_kind("exec-test-1", "SessionStart");
+                    self.live_states.record_hook_event_kind(&run_id, "SessionStart");
                     self.live_states
-                        .record_driver_signal("exec-test-1", crate::live_worker_state::DriverSignalKind::HookEvent);
+                        .record_driver_signal(&run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+                }
+                if self.accept_prompt.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.record_prompt_accepted(&run_id);
+                }
+                if let Some((config_dir, marker)) = self.delivery_marker.lock().unwrap().as_ref() {
+                    let home = crate::driver::initial_prompt::delivery_home(config_dir);
+                    std::fs::write(home.join(marker), "").unwrap();
+                }
+                ""
+            }
+            Some("send-keys") => {
+                self.sent_keys.lock().unwrap().push(args.last().unwrap().clone());
+                if let Some((db, execution_id)) = self.cancel_on_send_keys.lock().unwrap().take() {
+                    db.cancel_running_execution(&execution_id).unwrap();
+                }
+                if self.accept_prompt_on_resubmit.load(std::sync::atomic::Ordering::SeqCst) {
+                    for state in self.live_states.snapshot() {
+                        self.record_prompt_accepted(&state.run_id);
+                    }
                 }
                 ""
             }
             Some("display-message") => "4242",
             Some("capture-pane") => {
+                self.capture_seen.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Some((db, execution_id)) = self.cancel_on_capture.lock().unwrap().take() {
                     db.cancel_running_execution(&execution_id).unwrap();
                 }
@@ -182,6 +321,11 @@ impl CommandRunner for CapturingSpawner {
                     for state in self.live_states.snapshot() {
                         self.live_states
                             .record_driver_signal(&state.run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+                    }
+                }
+                if self.accept_prompt.load(std::sync::atomic::Ordering::SeqCst) {
+                    for state in self.live_states.snapshot() {
+                        self.record_prompt_accepted(&state.run_id);
                     }
                 }
                 let history_only = self.history_only_text.lock().unwrap().clone();
@@ -234,7 +378,8 @@ impl CommandRunner for CapturingSpawner {
 }
 
 impl crate::spawn_flow::TmuxSpawnStore for CapturingSpawner {
-    fn record_tmux_spawn_intent(&self, _: &str, _: &str, _: &str, _: &str) -> Result<bool> {
+    fn record_tmux_spawn_intent(&self, execution_id: &str, _: &str, _: &str, _: &str) -> Result<bool> {
+        *self.pending_run_id.lock().unwrap() = execution_id.to_owned();
         Ok(true)
     }
     fn record_tmux_session_created(&self, _: &str, _: &str, _: i64, _: &str, _: &str) -> Result<bool> {
@@ -250,18 +395,35 @@ fn bind_runner(
     runner.set_skip_spawn_confirm(true);
     runner.set_server_state(weak);
     let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
-    assert!(
-        runner
-            .overrides
-            .tmux_host
-            .set(TmuxWorkerHost::new(tmux, spawner.clone(), "boss-test-worker".into()))
-            .is_ok()
-    );
+    runner.set_tmux_host(TmuxWorkerHost::new(tmux, spawner.clone(), "boss-test-worker".into()));
+}
+
+fn sample_execution_id(workspace: &Path) -> String {
+    format!(
+        "exec-test-1-{}",
+        workspace.file_name().unwrap().to_str().unwrap().trim_start_matches('.')
+    )
 }
 
 fn sample_execution(workspace_path: &Path) -> WorkExecution {
+    // Claude now records its private input home on the execution. Keep this
+    // fixture backed by a real row, as production spawn always is.
+    let db = WorkDb::open(workspace_path.join("state.db")).unwrap();
+    if db.get_execution(&sample_execution_id(workspace_path)).is_err() {
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "pane spawn fixture");
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+                 VALUES (?1, ?2, 'chore_implementation', 'running', 'git@example.com:foo.git', '1')",
+                rusqlite::params![&sample_execution_id(workspace_path), chore.id],
+            )
+            .unwrap();
+    }
+
     WorkExecution::builder()
-        .id("exec-test-1")
+        .id(sample_execution_id(workspace_path))
         .work_item_id("task-1")
         .kind(ExecutionKind::ChoreImplementation)
         .status(ExecutionStatus::Running)
@@ -346,6 +508,7 @@ fn spawn_test_env(
     Arc<WorkDb>,
 ) {
     let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+    *spawner.homes_pin.lock().unwrap() = Some(HomesPin::new(workspace.path().join("codex-homes")));
     let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
         Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
     let cfg = test_runtime_config(
@@ -403,11 +566,101 @@ async fn writes_initial_prompt_to_workspace_dot_claude() {
     // Spot-check: the prompt should mention the work item title and
     // execution id so the worker actually has its task in hand.
     assert!(prompt.contains("Improve top header"), "prompt missing work item name");
-    assert!(prompt.contains("exec-test-1"), "prompt missing execution id");
+    assert!(
+        prompt.contains(&sample_execution_id(workspace.path())),
+        "prompt missing execution id"
+    );
     assert!(
         prompt.contains("## Summary"),
         "prompt missing required output section header"
     );
+}
+
+/// A GitHub that serves one fixed `BOSS.md` at one fixed sha.
+struct FixedBossMd {
+    sha: &'static str,
+    body: &'static str,
+}
+
+#[async_trait]
+impl boss_engine_design_docs::GitHubTreeSource for FixedBossMd {
+    async fn default_branch(&self, _owner: &str, _repo: &str) -> Result<String, boss_github::trees::TreeApiError> {
+        Ok("main".to_owned())
+    }
+    async fn head_sha(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _git_ref: &str,
+    ) -> Result<String, boss_github::trees::TreeApiError> {
+        Ok(self.sha.to_owned())
+    }
+    async fn markdown_tree(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _sha: &str,
+    ) -> Result<boss_github::trees::RepoTree, boss_github::trees::TreeApiError> {
+        unreachable!("BOSS.md is read by path, never by listing the tree")
+    }
+    async fn fetch_blob(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        path: &str,
+        _git_ref: &str,
+        _etag: Option<&str>,
+    ) -> Result<boss_github::trees::BlobFetch, boss_github::trees::TreeApiError> {
+        assert_eq!(path, "BOSS.md");
+        Ok(boss_github::trees::BlobFetch::Content {
+            text: self.body.to_owned(),
+            etag: None,
+            rate_limit_remaining: None,
+        })
+    }
+}
+
+/// The whole local path: `run_execution` binds a host from the spawner, the
+/// host supplies the engine's `BOSS.md` loader, and the prompt written to the
+/// worker's workspace carries the block, sha-stamped, under the preamble.
+#[tokio::test]
+async fn a_coding_worker_prompt_carries_the_repo_boss_guidance_block() {
+    const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    *spawner.design_docs.lock().unwrap() = Some(Arc::new(boss_engine_design_docs::DesignDocsService::with_source(
+        Arc::new(FixedBossMd {
+            sha: SHA,
+            body: "- Attach screenshots of visual changes with `boss attach`.\n",
+        }),
+    )));
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    let execution = sample_execution(workspace.path());
+    // The fixture's stored chore belongs to a real product row (the item
+    // `sample_chore()` points at a product that does not exist).
+    let stored = work_db.get_execution(&execution.id).unwrap();
+    let work_item = work_db.get_work_item(&stored.work_item_id).unwrap();
+
+    runner
+        .run_execution("worker-1", &execution, &work_item, workspace.path(), Some("change-1"))
+        .await
+        .unwrap();
+
+    let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+    assert!(
+        prompt.starts_with(&format!("[repo-boss-guidance repo=spinyfin/mono sha={SHA}]\n")),
+        "{prompt}"
+    );
+    let rule = prompt
+        .find("Attach screenshots of visual changes with `boss attach`.")
+        .unwrap();
+    let close = prompt.find("[/repo-boss-guidance]").unwrap();
+    let task = prompt.find("You are a reusable worker").unwrap();
+    assert!(rule < close && close < task, "{prompt}");
 }
 
 #[tokio::test]
@@ -419,12 +672,16 @@ async fn implementation_prompt_states_pr_url_acceptance_criterion() {
     let workspace = TempDir::new().unwrap();
     let _spawner = run_once(&workspace, None).await.unwrap();
     let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+    let rules = std::fs::read_to_string(
+        crate::driver::ClaudeDriver.agent_rules_destination(workspace.path(), &sample_execution_id(workspace.path())),
+    )
+    .unwrap();
     assert!(
-        prompt.contains("the deliverable is a PR URL"),
+        rules.contains("A task is not complete until a PR exists"),
         "implementation prompt must state the PR-URL acceptance criterion: {prompt}",
     );
     assert!(
-        prompt.contains("on its own line"),
+        rules.contains("on its own line"),
         "implementation prompt must tell the worker to print the URL on its own line: {prompt}",
     );
     assert!(
@@ -435,7 +692,7 @@ async fn implementation_prompt_states_pr_url_acceptance_criterion() {
         "implementation prompt must mention gh pr commands or cube pr create: {prompt}",
     );
     assert!(
-        prompt.contains("jj diff -r @"),
+        rules.contains("jj diff -r @"),
         "implementation prompt must tell the worker to verify the diff before pushing: {prompt}",
     );
 }
@@ -453,8 +710,11 @@ async fn implementation_prompt_dictates_engine_supplied_branch_name() {
     let workspace = TempDir::new().unwrap();
     let _spawner = run_once(&workspace, None).await.unwrap();
     let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
-    let expected_branch =
-        crate::completion::expected_branch_name("exec-test-1", &boss_protocol::BranchNaming::BossExecPrefix, None);
+    let expected_branch = crate::completion::expected_branch_name(
+        &sample_execution_id(workspace.path()),
+        &boss_protocol::BranchNaming::BossExecPrefix,
+        None,
+    );
     assert!(
         prompt.contains(&expected_branch),
         "prompt must name the engine-supplied branch `{expected_branch}`, got: {prompt}",
@@ -473,7 +733,7 @@ async fn spawn_attaches_a_viewer_after_launching_tmux() {
     assert_eq!(
         spawner
             .registry
-            .pane_for_run("exec-test-1")
+            .pane_for_run(&sample_execution_id(workspace.path()))
             .unwrap()
             .tmux_session_name
             .as_deref(),
@@ -510,8 +770,8 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // worker just sits at the bash prompt forever (as it did before
     // #174).
     assert!(
-        script.contains(".claude/initial-prompt.txt"),
-        "expected the initial-input script to read from the prompt file, got: {script:?}",
+        script.contains("python3 -I .claude/initial-prompt.py claude ") && !script.contains("$(cat"),
+        "expected private terminal delivery without prompt expansion, got: {script:?}",
     );
     // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
     // bundled `cube`/`boss` win over any `~/bin` repobin shim the
@@ -522,7 +782,7 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // construction site.
     assert!(
         script.starts_with(&format!(
-            "{}{}unset ANTHROPIC_API_KEY; {}claude",
+            "{}{}unset ANTHROPIC_API_KEY; {}python3 -I .claude/initial-prompt.py claude",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             boss_engine_worker_bin::environment::shell_environment_clause(
@@ -704,7 +964,7 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "{}{}unset ANTHROPIC_API_KEY; {}claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+            "{}{}unset ANTHROPIC_API_KEY; {}python3 -I .claude/initial-prompt.py claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}'\n",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             boss_engine_worker_bin::environment::shell_environment_clause(
@@ -722,7 +982,7 @@ async fn untagged_row_spawn_matches_engine_default() {
     // must be the first thing the worker sees.
     let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
     assert!(
-        prompt.starts_with("You are a reusable Boss worker"),
+        prompt.starts_with("You are a reusable worker"),
         "untagged-row prompt must start with the original framing, got: {prompt:?}",
     );
     assert!(
@@ -774,10 +1034,10 @@ async fn large_standard_row_spawns_sonnet_but_keeps_xhigh_and_the_addendum() {
 }
 
 /// A `small` investigation row gets the dedicated Fable/Astra tier while
-/// preserving the driver's default effort. The row's work-size estimate
-/// stays honest and does not imply a driver effort override.
+/// preserving the driver's effort mapping. The row's work-size estimate
+/// stays honest and selects medium effort independently of the model tier.
 #[tokio::test]
-async fn small_investigation_row_spawns_fable_at_default_effort() {
+async fn small_investigation_row_spawns_fable_with_mapped_effort() {
     let workspace = TempDir::new().unwrap();
     let chore_input = CreateChoreInput::builder()
         .product_id(String::new())
@@ -799,8 +1059,8 @@ async fn small_investigation_row_spawns_fable_at_default_effort() {
         "small + investigation must spawn Fable, got: {script:?}",
     );
     assert!(
-        !script.contains("--effort "),
-        "the dedicated tier must preserve the driver's default effort, got: {script:?}",
+        script.contains("--effort medium"),
+        "the dedicated tier must preserve the driver's small-effort mapping, got: {script:?}",
     );
     assert!(
         script.contains("--permission-mode auto"),
@@ -1457,7 +1717,7 @@ async fn run_execution_stamps_work_item_binding_on_live_state() {
     );
     assert_eq!(
         state.execution_id.as_deref(),
-        Some("exec-test-1"),
+        Some(sample_execution_id(workspace.path()).as_str()),
         "execution_id should match the WorkExecution row id"
     );
     assert_eq!(
@@ -1712,9 +1972,13 @@ async fn spawn_prompt_for_auto_design_task_states_design_only_directive() {
 
     // The PR-URL acceptance criterion still applies to design
     // runs — they produce a PR, it just contains the doc only.
+    let rules = std::fs::read_to_string(
+        crate::driver::ClaudeDriver.agent_rules_destination(workspace.path(), &sample_execution_id(workspace.path())),
+    )
+    .unwrap();
     assert!(
-        prompt.contains("the deliverable is a PR URL"),
-        "design prompt must keep the PR-URL acceptance criterion:\n{prompt}",
+        rules.contains("A task is not complete until a PR exists"),
+        "design worker rules must keep the PR-URL acceptance criterion: {rules}",
     );
 
     // Deliverable 2 — the breakdown sizing contract: the design worker
@@ -1857,364 +2121,6 @@ async fn settings_json_uses_absolute_boss_event_path() {
     );
 }
 
-/// `BOSS_EVENT_BIN` short-circuits everything else.
-#[test]
-fn resolve_boss_event_prefers_env_override() {
-    let dir = TempDir::new().unwrap();
-    let engine = dir.path().join("engine");
-    std::fs::write(&engine, b"").unwrap();
-    let override_path = PathBuf::from("/opt/whatever/boss-event");
-    let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path), None, None);
-    assert_eq!(resolved, Some(override_path));
-}
-
-/// `BOSS_BIN_DIR` is the installed-mode path; it wins over the
-/// dev-mode runfiles and workspace-bazel-bin candidates so a
-/// deployed Boss.app never silently falls through to a workspace clone.
-#[test]
-fn resolve_boss_event_prefers_boss_bin_dir_over_runfiles() {
-    let dir = TempDir::new().unwrap();
-    let engine = dir.path().join("engine");
-    std::fs::write(&engine, b"").unwrap();
-
-    // Synthesize the bundle bin/ directory (installed mode).
-    let bundle_bin = dir.path().join("bundle-bin");
-    std::fs::create_dir_all(&bundle_bin).unwrap();
-    let bundle_shim = bundle_bin.join("boss-event");
-    std::fs::write(&bundle_shim, b"").unwrap();
-
-    // Also synthesize runfiles (dev mode) — must NOT be picked.
-    let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
-    std::fs::create_dir_all(&runfiles).unwrap();
-    std::fs::write(runfiles.join("boss-event"), b"").unwrap();
-
-    let resolved = resolve_boss_event_binary(&engine, None, None, Some(&bundle_bin), None);
-    assert_eq!(resolved, Some(bundle_shim));
-}
-
-/// When the engine binary has runfiles at the bazel-conventional
-/// path, the resolver must pick that up — this is the production
-/// path under `bazel run //tools/boss/engine/core:engine` once the
-/// engine `rust_binary` has the `data` dep on
-/// `//tools/boss/event-shim:boss-event`. The original #174 fix
-/// only covered the BOSS_EVENT_BIN branch; this test covers the
-/// branch that actually fires in real launches.
-#[test]
-fn resolve_boss_event_uses_runfiles_when_present() {
-    let dir = TempDir::new().unwrap();
-    let engine = dir.path().join("engine");
-    std::fs::write(&engine, b"").unwrap();
-
-    // Synthesize the bazel runfiles tree the data dep produces.
-    let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
-    std::fs::create_dir_all(&runfiles).unwrap();
-    let shim = runfiles.join("boss-event");
-    std::fs::write(&shim, b"").unwrap();
-
-    let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
-    assert_eq!(resolved, Some(shim));
-}
-
-/// Workspace `bazel-bin` symlink path is the secondary candidate
-/// — covers `bazel build` + non-`bazel run` scenarios where the
-/// engine binary is invoked directly but `BUILD_WORKSPACE_DIRECTORY`
-/// is set.
-#[test]
-fn resolve_boss_event_falls_back_to_workspace_bazel_bin() {
-    let dir = TempDir::new().unwrap();
-    let engine = dir.path().join("engine");
-    std::fs::write(&engine, b"").unwrap();
-
-    let workspace = dir.path().join("workspace");
-    let bazel_bin = workspace.join("bazel-bin/tools/boss/event-shim");
-    std::fs::create_dir_all(&bazel_bin).unwrap();
-    let shim = bazel_bin.join("boss-event");
-    std::fs::write(&shim, b"").unwrap();
-
-    let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None, None, None);
-    assert_eq!(resolved, Some(shim));
-}
-
-/// The `PATH`-prepend clauses compose so that the clause emitted
-/// LAST ends up FIRST on `PATH`. The worker launcher dir has to be
-/// last for that reason, and each clause must no-op on an unset var.
-#[test]
-fn path_prepend_clauses_compose_with_the_last_one_winning() {
-    let line = format!(
-        "{}{}",
-        path_prepend_clause("BOSS_BIN_DIR"),
-        path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
-    );
-    assert_eq!(
-        line,
-        "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
-             [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; "
-    );
-
-    // Both vars set: the launcher dir must be the first PATH entry.
-    let out = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!("{line}printf '%s' \"$PATH\""))
-        .env("PATH", "/usr/bin")
-        .env("BOSS_BIN_DIR", "/bundle/bin")
-        .env("BOSS_WORKER_BIN_DIR", "/worker/bin")
-        .output()
-        .expect("sh must be available");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "/worker/bin:/bundle/bin:/usr/bin");
-
-    // Neither set (dev mode, launcher write failed): PATH unchanged,
-    // and in particular no empty leading entry.
-    let out = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!("{line}printf '%s' \"$PATH\""))
-        .env("PATH", "/usr/bin")
-        .env_remove("BOSS_BIN_DIR")
-        .env_remove("BOSS_WORKER_BIN_DIR")
-        .output()
-        .expect("sh must be available");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr/bin");
-}
-
-/// `ensure_worker_bin_dir` always leaves a usable `boss` (and `cube`)
-/// behind, even when nothing resolves — an unresolved launcher that
-/// fails loudly beats letting the worker PATH-resolve a build-from-source
-/// shim. `bossctl` stays Boss-tier. The dir is keyed by workspace name
-/// so concurrent spawns do not share a path. A workspace with no
-/// `REPOBIN.toml` must not get a `checkleft` launcher.
-#[test]
-fn ensure_worker_bin_dir_writes_boss_and_cube_never_bossctl() {
-    let dir = TempDir::new().unwrap();
-    let workspace = dir.path().join("workspaces/mono-agent-007");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let bin_dir = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
-    assert_eq!(bin_dir, dir.path().join("bin").join("mono-agent-007"));
-
-    let mut entries: Vec<String> = std::fs::read_dir(&bin_dir)
-        .expect("readdir")
-        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-        .collect();
-    entries.sort();
-    assert_eq!(
-        entries,
-        vec!["boss".to_owned(), "cube".to_owned()],
-        "workers get `boss` and `cube` launchers; `bossctl` is Boss-tier; checkleft requires REPOBIN.toml",
-    );
-}
-
-#[test]
-fn ensure_worker_bin_dir_omits_checkleft_when_workspace_has_no_repobin_toml() {
-    let dir = TempDir::new().unwrap();
-    let workspace = dir.path().join("workspaces/checkleft-sandbox");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let bin_dir = dir.path().join("bin").join("checkleft-sandbox");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::write(bin_dir.join("checkleft"), "#!/bin/sh\nexit 92\n").unwrap();
-
-    let out = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
-    assert_eq!(out, bin_dir);
-    assert!(
-        !bin_dir.join("checkleft").exists(),
-        "a leftover checkleft launcher must be removed when the workspace has no REPOBIN.toml"
-    );
-}
-
-#[test]
-fn ensure_worker_bin_dir_writes_checkleft_when_repobin_toml_declares_it() {
-    let dir = TempDir::new().unwrap();
-    let workspace = dir.path().join("workspaces/mono-agent-009");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::write(
-        workspace.join("REPOBIN.toml"),
-        "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
-    )
-    .unwrap();
-    let bin_dir = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
-    let launcher = std::fs::read_to_string(bin_dir.join("checkleft")).expect("checkleft launcher");
-    assert!(
-        launcher.contains(" exec 'checkleft'") || launcher.contains("refusing a host PATH fallback"),
-        "declared checkleft must write a launcher, got:\n{launcher}"
-    );
-
-    std::fs::write(
-        workspace.join("REPOBIN.toml"),
-        "version = 1\n[pins.checkleft]\nrepo = \"https://example.invalid/mono.git\"\ntag = \"v1\"\n",
-    )
-    .unwrap();
-    let again = ensure_worker_bin_dir(dir.path(), &workspace).expect("pin rewrite");
-    assert!(again.join("checkleft").is_file());
-}
-
-/// Export the spawn-path launchers as Bazel artifacts for validation in a
-/// leased checkout without starting an agent. Repository builds must run
-/// outside the test sandbox. The dispatcher path comes from
-/// `BOSS_TEST_REPOBIN` (`$(rootpath //tools/repobin)`), not from the
-/// rules_rust test-wrapper filename.
-#[test]
-fn worker_environment_probe_artifacts_use_the_bundled_dispatcher() {
-    let output = PathBuf::from(std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").unwrap());
-    let workspace = output.join("probe-workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::write(
-        workspace.join("REPOBIN.toml"),
-        "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
-    )
-    .unwrap();
-    let test_repobin = PathBuf::from(
-        std::env::var("BOSS_TEST_REPOBIN").expect("BOSS_TEST_REPOBIN must be $(rootpath //tools/repobin)"),
-    );
-    let engine_dir = output.join("probe-engine");
-    std::fs::create_dir_all(&engine_dir).unwrap();
-    let dispatcher = engine_dir.join("repobin");
-    std::fs::copy(&test_repobin, &dispatcher).expect("copy rust_test-provided repobin beside the fake engine");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dispatcher).unwrap().permissions();
-        perms.set_mode(perms.mode() | 0o111);
-        std::fs::set_permissions(&dispatcher, perms).unwrap();
-    }
-    let engine_path = engine_dir.join("engine");
-    std::fs::write(&engine_path, b"").unwrap();
-    let bin = ensure_worker_bin_dir_for_engine(&output, &workspace, &engine_path).unwrap();
-    let launcher = std::fs::read_to_string(bin.join("checkleft")).unwrap();
-    let quoted = format!("'{}'", dispatcher.display().to_string().replace('\'', r"'\''"));
-    assert!(
-        launcher.contains(&format!("exec {quoted} exec 'checkleft'")),
-        "launcher must exec the rust_test-provided repobin at {dispatcher:?}: {launcher}"
-    );
-    let activate = format!(
-        "export PATH={}:\"$PATH\"; {}\n",
-        crate::ssh_transport::shell_quote(&bin.display().to_string()),
-        boss_engine_worker_bin::environment::shell_environment_clause(&bin),
-    );
-    std::fs::write(output.join("activate-worker-environment.sh"), activate).unwrap();
-}
-
-/// A non-derived spawn must still call `write_cube_launcher` so a stale
-/// derived-PR compose wrapper left by a PREVIOUS worker in this same
-/// workspace cannot linger and silently run for the new worker. Simulate
-/// that stale state directly (bypassing `ensure_worker_bin_dir`, which
-/// would itself already overwrite it) and assert the overwrite lands.
-#[test]
-fn ensure_worker_bin_dir_clears_a_stale_compose_wrapper() {
-    let dir = TempDir::new().unwrap();
-    let workspace = dir.path().join("workspaces/mono-agent-008");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let bin_dir = dir.path().join("bin").join("mono-agent-008");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::write(
-        bin_dir.join("cube"),
-        "#!/bin/sh\n# Prior worker PR body header\nexec cube \"$@\"\n",
-    )
-    .expect("seed a stale compose wrapper");
-    let stale = std::fs::read_to_string(bin_dir.join("cube")).unwrap();
-    assert!(
-        stale.contains("Prior worker PR body header"),
-        "test setup must actually seed the compose wrapper"
-    );
-
-    let out = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
-    assert_eq!(out, bin_dir);
-    let after = std::fs::read_to_string(bin_dir.join("cube")).unwrap();
-    assert!(
-        !after.contains("Prior worker PR body header"),
-        "a non-derived spawn must overwrite a stale compose wrapper from a previous worker, got:\n{after}",
-    );
-}
-
-/// Distinct workspaces get distinct launcher dirs under the shared
-/// settings root — never a single host-wide `bin/boss`.
-#[test]
-fn ensure_worker_bin_dir_is_per_workspace() {
-    let dir = TempDir::new().unwrap();
-    let ws_a = dir.path().join("workspaces/mono-agent-a");
-    let ws_b = dir.path().join("workspaces/mono-agent-b");
-    std::fs::create_dir_all(&ws_a).unwrap();
-    std::fs::create_dir_all(&ws_b).unwrap();
-
-    let a = ensure_worker_bin_dir(dir.path(), &ws_a).expect("a");
-    let b = ensure_worker_bin_dir(dir.path(), &ws_b).expect("b");
-    assert_ne!(a, b);
-    assert!(a.ends_with("bin/mono-agent-a"));
-    assert!(b.ends_with("bin/mono-agent-b"));
-    assert!(a.join("boss").exists());
-    assert!(b.join("boss").exists());
-}
-
-/// When nothing resolves the function returns `None` — the caller
-/// (`boss_event_binary`) turns this into a hard panic rather than
-/// silently baking a bare `boss-event` into hook commands (which
-/// causes `command not found` in the worker's sanitized PATH).
-#[test]
-fn resolve_boss_event_returns_none_when_nothing_resolves() {
-    let dir = TempDir::new().unwrap();
-    let engine = dir.path().join("engine");
-    std::fs::write(&engine, b"").unwrap();
-    let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
-    assert_eq!(resolved, None);
-}
-
-/// The stable bin dir (installed by the engine at startup) is
-/// preferred over bazel runfiles and bazel-bin so a `bazel clean`
-/// doesn't break hook paths already baked into worker settings.json.
-#[test]
-fn resolve_boss_event_prefers_stable_bin_dir_over_runfiles() {
-    let dir = TempDir::new().unwrap();
-    let engine = dir.path().join("engine");
-    std::fs::write(&engine, b"").unwrap();
-
-    // Synthesize the stable bin dir (engine startup installs it here).
-    let stable_bin = dir.path().join("stable-bin");
-    std::fs::create_dir_all(&stable_bin).unwrap();
-    let stable_shim = stable_bin.join("boss-event");
-    std::fs::write(&stable_shim, b"stable").unwrap();
-
-    // Also synthesize runfiles — must NOT be picked when stable exists.
-    let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
-    std::fs::create_dir_all(&runfiles).unwrap();
-    std::fs::write(runfiles.join("boss-event"), b"runfiles").unwrap();
-
-    let resolved = resolve_boss_event_binary(&engine, None, None, None, Some(&stable_bin));
-    assert_eq!(resolved, Some(stable_shim));
-}
-
-/// `install_boss_event_to_stable_bin` copies the shim and marks it
-/// executable so workers can invoke it directly.
-#[test]
-fn install_boss_event_to_stable_bin_copies_and_makes_executable() {
-    let dir = TempDir::new().unwrap();
-    let source = dir.path().join("boss-event-source");
-    std::fs::write(&source, b"#!/bin/sh\necho ok\n").unwrap();
-
-    let stable_bin = dir.path().join("stable/bin");
-    let result = install_boss_event_to_stable_bin(&source, &stable_bin);
-    assert!(result.is_ok(), "install should succeed: {result:?}");
-    let stable = result.unwrap();
-    assert_eq!(stable, stable_bin.join("boss-event"));
-    assert!(stable.exists());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&stable).unwrap().permissions().mode();
-        assert!(mode & 0o111 != 0, "boss-event must be executable after install");
-    }
-}
-
-/// Installing when src == dst is a no-op (doesn't fail or corrupt the file).
-#[test]
-fn install_boss_event_to_stable_bin_no_op_when_already_stable() {
-    let dir = TempDir::new().unwrap();
-    let stable_bin = dir.path().join("bin");
-    std::fs::create_dir_all(&stable_bin).unwrap();
-    let stable = stable_bin.join("boss-event");
-    std::fs::write(&stable, b"#!/bin/sh\n").unwrap();
-
-    let result = install_boss_event_to_stable_bin(&stable, &stable_bin);
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), stable);
-}
-
 #[tokio::test]
 async fn mismatched_guide_head_fails_attempt_without_spawning() {
     use crate::work::{PrSourceCapturePersistOutcome, PrSourceCaptureTrigger};
@@ -2258,269 +2164,272 @@ async fn mismatched_guide_head_fails_attempt_without_spawning() {
     assert!(failed.error.unwrap().contains(&packet.head_sha));
 }
 
-#[tokio::test]
-async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
-    let workspace = TempDir::new().unwrap();
-    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
-    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-        workspace.path().join("feature-flags.toml"),
-    ));
-    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    bind_runner(&runner, weak, &spawner);
-    runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(40));
-
-    let err = runner
-        .run_execution(
-            "worker-1",
-            &sample_execution(workspace.path()),
-            &sample_chore(),
-            workspace.path(),
-            Some("change-1"),
-        )
-        .await
-        .expect_err("absent composer chrome must fail the spawn");
-    let msg = err.to_string();
-    assert!(msg.contains("composer never became ready"), "{msg}");
-    assert!(msg.contains("failed spawn"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+#[test]
+fn probe_and_nudge_texts_avoid_internal_vocabulary() {
+    use crate::completion::{
+        NO_OP_DECLARATION_REFUSED_PROBE, PROBE_EMPTY_PR, PROBE_NO_PR, PROBE_STALE_PR, WORKER_WAIT_NUDGE_DIRECTIVE,
+        probe_push_to_existing_pr,
+    };
+    let pr = "https://github.com/org/repo/pull/42";
+    for (label, text) in [
+        ("no PR probe", PROBE_NO_PR.to_owned()),
+        ("existing PR probe", probe_push_to_existing_pr(pr)),
+        ("stale PR probe", PROBE_STALE_PR.to_owned()),
+        ("empty PR probe", PROBE_EMPTY_PR.to_owned()),
+        ("refused no-op probe", NO_OP_DECLARATION_REFUSED_PROBE.to_owned()),
+        ("wait nudge directive", WORKER_WAIT_NUDGE_DIRECTIVE.to_owned()),
+        (
+            "declare-done probe",
+            crate::run_done_backstop::PROBE_DECLARE_DONE.to_owned(),
+        ),
+        (
+            "conflict still present probe",
+            crate::conflict_stop_gate::probe_conflict_still_present(pr, "CONFLICTING", "DIRTY"),
+        ),
+        (
+            "conflict mergeability unknown probe",
+            crate::conflict_stop_gate::probe_conflict_mergeability_unknown(pr),
+        ),
+    ] {
+        assert!(
+            crate::prose_vocabulary::forbidden_prose(&text).is_empty(),
+            "{label}: {text}"
+        );
+    }
 }
 
-#[tokio::test]
-async fn spawn_confirmation_ready_chrome_without_a_hook_fails_turn_start_and_reaps() {
-    let workspace = TempDir::new().unwrap();
-    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
-    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
-    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-        workspace.path().join("feature-flags.toml"),
-    ));
-    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    bind_runner(&runner, weak, &spawner);
-    runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(40));
-
-    let err = runner
-        .run_execution(
-            "worker-1",
-            &sample_execution(workspace.path()),
-            &sample_chore(),
-            workspace.path(),
-            Some("change-1"),
-        )
-        .await
-        .expect_err("ready chrome without a driver hook must fail the spawn");
-    let msg = err.to_string();
-    assert!(msg.contains("no driver hook or session event"), "{msg}");
-    assert!(msg.contains("failed spawn"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
-}
-
-#[tokio::test]
-async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
-    let workspace = TempDir::new().unwrap();
-    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
-    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
-    spawner
-        .auto_confirm_turn
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-        workspace.path().join("feature-flags.toml"),
-    ));
-    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    bind_runner(&runner, weak, &spawner);
-    runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(200));
-
-    runner
-        .run_execution(
-            "worker-1",
-            &sample_execution(workspace.path()),
-            &sample_chore(),
-            workspace.path(),
-            Some("change-1"),
-        )
-        .await
-        .expect("composer chrome plus a recorded hook must complete spawn");
-    assert!(spawner.reaped_run_ids().is_empty());
-}
-
-#[tokio::test]
-async fn spawn_confirmation_passes_when_hook_arrives_without_chrome() {
-    let workspace = TempDir::new().unwrap();
-    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
-    spawner.pane_chrome.store(false, std::sync::atomic::Ordering::SeqCst);
-    spawner
-        .auto_confirm_turn
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-        workspace.path().join("feature-flags.toml"),
-    ));
-    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    bind_runner(&runner, weak, &spawner);
-    runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(200));
-
-    runner
-        .run_execution(
-            "worker-1",
-            &sample_execution(workspace.path()),
-            &sample_chore(),
-            workspace.path(),
-            Some("change-1"),
-        )
-        .await
-        .expect("a recorded hook without composer chrome must complete spawn");
-    assert!(spawner.reaped_run_ids().is_empty());
-}
-
-#[tokio::test]
-async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
-    let workspace = TempDir::new().unwrap();
-    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
-    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
-
-    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
-    let chore = create_test_chore(&work_db, product.id.clone(), "Cancel during confirm");
-    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
-    let (execution, _run) = work_db
-        .start_execution_run(
-            &ready.id,
-            "worker-1",
-            "foo",
-            "lease-1",
-            "foo-agent-001",
-            workspace.path().to_str().unwrap(),
-        )
+#[test]
+fn current_run_turn_start_accepts_a_driver_signal_without_transcript_path() {
+    let (_dir, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product(&db);
+    let chore = crate::test_support::create_test_chore(&db, product.id.clone(), "Hook only");
+    let ready = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
+    let (execution, _run) = db
+        .start_execution_run(&ready.id, "worker-1", "foo", "lease-1", "ws-1", "/tmp/ws-1")
         .unwrap();
+    let registry = LiveWorkerStateRegistry::new();
+    registry.register_spawn(1, execution.id.clone(), "opus", 42, None);
+    registry.record_driver_signal(&execution.id, DriverSignalKind::HookEvent);
+    assert!(db.transcript_path_for_execution(&execution.id).unwrap().is_none());
+    assert!(current_run_has_turn_start_evidence(&db, Some(&registry), &execution.id));
+}
+#[tokio::test]
+async fn turn_start_predicate_can_read_driver_signal_registry() {
+    let registry = Arc::new(LiveWorkerStateRegistry::new());
+    registry.register_spawn(1, "exec-hook", "opus", 42, None);
+    let live = Arc::clone(&registry);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        live.record_driver_signal("exec-hook", DriverSignalKind::HookEvent);
+    });
+    confirm_spawn_started(
+        "claude",
+        "exec-hook",
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+        Duration::from_millis(5),
+        std::future::pending::<bool>,
+        || async { registry.has_driver_signal_for_run("exec-hook") },
+    )
+    .await
+    .expect("a recorded hook must count as turn-start evidence");
+}
 
-    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-        workspace.path().join("feature-flags.toml"),
-    ));
-    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
-    bind_runner(&runner, weak, &spawner);
-    runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(80));
-
-    // Synchronize cancellation with confirmation instead of racing a sleep
-    // against its timeout on a loaded test host.
-    *spawner.cancel_on_capture.lock().unwrap() = Some((work_db.clone(), execution.id.clone()));
-
-    let chore_item = work_db.get_work_item(&chore.id).unwrap();
-    let outcome = runner
-        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        outcome.wait_state,
-        RunWaitState::CancelledDuringSpawn,
-        "a cancel that lands during confirmation must yield CancelledDuringSpawn",
+/// Export the spawn-path launchers as Bazel artifacts for validation in a
+/// leased checkout without starting an agent. Repository builds must run
+/// outside the test sandbox. The dispatcher path comes from
+/// `BOSS_TEST_REPOBIN` (`$(rootpath //tools/repobin)`), not from the rules_rust
+/// test-wrapper filename.
+#[test]
+fn worker_environment_probe_artifacts_use_the_bundled_dispatcher() {
+    let output = PathBuf::from(std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").unwrap());
+    let workspace = output.join("probe-workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("REPOBIN.toml"),
+        "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let test_repobin = PathBuf::from(
+        std::env::var("BOSS_TEST_REPOBIN").expect("BOSS_TEST_REPOBIN must be $(rootpath //tools/repobin)"),
     );
-    assert!(outcome.slot_id.is_none());
+    let engine_dir = output.join("probe-engine");
+    std::fs::create_dir_all(&engine_dir).unwrap();
+    let dispatcher = engine_dir.join("repobin");
+    std::fs::copy(&test_repobin, &dispatcher).expect("copy rust_test-provided repobin beside the fake engine");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dispatcher).unwrap().permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        std::fs::set_permissions(&dispatcher, perms).unwrap();
+    }
+    let engine_path = engine_dir.join("engine");
+    std::fs::write(&engine_path, b"").unwrap();
+    let bin = ensure_worker_bin_dir_for_engine(&output, &workspace, &engine_path).unwrap();
+    let launcher = std::fs::read_to_string(bin.join("checkleft")).unwrap();
+    let quoted = format!("'{}'", dispatcher.display().to_string().replace('\'', r"'\''"));
     assert!(
-        spawner.cancel_on_capture.lock().unwrap().is_none(),
-        "confirmation must observe the pane and trigger cancellation",
+        launcher.contains(&format!("exec {quoted} exec 'checkleft'")),
+        "launcher must exec the rust_test-provided repobin at {dispatcher:?}: {launcher}"
     );
-    assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
+    let activate = format!(
+        "export PATH={}:\"$PATH\"; {}\n",
+        crate::ssh_transport::shell_quote(&bin.display().to_string()),
+        boss_engine_worker_bin::environment::shell_environment_clause(&bin),
+    );
+    std::fs::write(output.join("activate-worker-environment.sh"), activate).unwrap();
 }
 
-/// Run a confirming spawn against a pane whose visible screen is empty and
-/// whose scrollback holds `history`; returns the spawn result and spawner.
-async fn confirm_with_history_only(history: &str) -> (Result<RunOutcome>, Arc<CapturingSpawner>) {
+/// The local adapter must hand the merge-review policy to the runner: a
+/// remote owned by `linkedin-multiproduct` gets every human-gated check in the
+/// worker prompt.
+#[tokio::test]
+async fn merge_review_policy_reaches_worker_prompt_through_adapter() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
-    *spawner.history_only_text.lock().unwrap() = Some(history.to_owned());
     let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
     bind_runner(&runner, weak, &spawner);
-    runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
-    let result = runner
-        .run_execution(
-            "worker-1",
-            &sample_execution(workspace.path()),
-            &sample_chore(),
-            workspace.path(),
-            Some("change-1"),
-        )
-        .await;
-    (result, spawner)
-}
-
-#[tokio::test]
-async fn spawn_confirmation_finds_banner_that_only_exists_in_scrollback() {
-    // Composer readiness is satisfied by history alone; with no hook the
-    // failure is therefore the turn-start one, not "composer never ready".
-    let (result, spawner) = confirm_with_history_only("Claude Code 2.1.283\n").await;
-    let msg = result.expect_err("no hook, so turn start must fail").to_string();
-    assert!(msg.contains("no driver hook or session event"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
-    // Banner is absent from the visible screen, so only the history read can
-    // have supplied it; removing the fallback leaves composer never ready.
-    let log = spawner.capture_log.lock().unwrap().clone();
-    assert_eq!(&log[..2], [false, true], "visible read must miss, then history is read");
-}
-
-#[tokio::test]
-async fn spawn_confirmation_scrollback_without_a_marker_still_fails() {
-    let (result, spawner) = confirm_with_history_only("bash: exec: claude: not found\nlogin: \n❯ \n").await;
-    let msg = result
-        .expect_err("shell/error scrollback is not driver evidence")
-        .to_string();
-    assert!(msg.contains("composer never became ready"), "{msg}");
-    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
-}
-
-#[tokio::test]
-async fn spawn_confirmation_passes_on_a_hook_delivered_before_registration() {
-    let workspace = TempDir::new().unwrap();
-    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
-    spawner
-        .hook_before_registration
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-        workspace.path().join("feature-flags.toml"),
-    ));
-    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    bind_runner(&runner, weak, &spawner);
-    runner.set_skip_spawn_confirm(false);
-    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(60));
-
-    // No pane marker and no hook after registration: the only evidence is
-    // the one delivered while the run had no live-state entry.
+    let mut execution = sample_execution(workspace.path());
+    execution.repo_remote_url = "git@github.com:linkedin-multiproduct/some-repo.git".into();
     runner
         .run_execution(
             "worker-1",
-            &sample_execution(workspace.path()),
+            &execution,
             &sample_chore(),
             workspace.path(),
             Some("change-1"),
         )
         .await
-        .expect("a pre-registration hook must count as driver evidence");
-    assert!(spawner.reaped_run_ids().is_empty());
-    assert_eq!(
-        spawner.live_states.first_hook_event_for_run("exec-test-1").as_deref(),
-        Some("SessionStart")
-    );
+        .unwrap();
+    let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+    let checks = crate::merge_poller::review_signal_checks_for_owner("linkedin-multiproduct");
+    assert!(!checks.is_empty());
+    for check in checks {
+        assert!(prompt.contains(check), "missing merge observer check {check}");
+    }
+    assert!(prompt.contains("Owner Approval"));
 }
 
-#[tokio::test]
-async fn visible_capture_snapshot_survives_a_stalled_history_capture() {
-    let spawner = Arc::new(CapturingSpawner::new());
-    *spawner.history_only_text.lock().unwrap() = Some("never returned".to_owned());
-    *spawner.visible_text.lock().unwrap() = "bash: claude: command not found\n".to_owned();
-    spawner.history_stalls.store(true, std::sync::atomic::Ordering::SeqCst);
-    let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
-    let snapshot = std::sync::Mutex::new(String::from("older snapshot"));
-    let probe = capture_shows_driver_ready(&tmux, "boss-test-worker", None, &snapshot);
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), probe).await;
-    assert!(outcome.is_err(), "history capture stalls until the deadline");
-    assert_eq!(
-        *snapshot.lock().unwrap(),
-        "bash: claude: command not found\n",
-        "visible text must be retained as failure evidence",
-    );
+#[test]
+fn actual_driver_spawn_prefix_pins_boss_and_cube_before_path_decoys() {
+    use crate::driver::{DriverRegistry, SpawnRequest, grok, test_support};
+    use crate::protocol::EnvVar;
+    use std::os::unix::fs::PermissionsExt;
+    // Held until the environment is restored: this test sets `BOSS_BIN_DIR`
+    // for the whole process.
+    let _ambient = crate::spawn_flow::BOSS_BIN_DIR_TEST_LOCK.blocking_lock();
+    let root = TempDir::new().unwrap();
+    let _codex = test_support::codex_auth_source_override(&root.path().join("codex"), &root.path().join("auth.json"));
+    let _grok = test_support::grok_homes_override(&root.path().join("grok"));
+    let bundle = root.path().join("bundle");
+    let decoy = root.path().join("decoy");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::create_dir_all(&decoy).unwrap();
+    for name in ["boss", "cube"] {
+        for (dir, output) in [(&bundle, "bundled"), (&decoy, "decoy")] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho {output}-{name}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    struct DeliveryEnvironment {
+        prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl Drop for DeliveryEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in &self.prior {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+    let mut restore = DeliveryEnvironment { prior: Vec::new() };
+    for key in [
+        "BOSS_BIN_DIR",
+        "BOSS_CLI_BIN",
+        "CUBE_CLI_BIN",
+        "BUILD_WORKSPACE_DIRECTORY",
+    ] {
+        restore.prior.push((key, std::env::var_os(key)));
+        unsafe { std::env::remove_var(key) };
+    }
+    unsafe { std::env::set_var("BOSS_BIN_DIR", &bundle) };
+    let run_id = "run-tool-prefix";
+    let grok_home = grok::grok_home_for_run(run_id).unwrap();
+    std::fs::create_dir_all(&grok_home).unwrap();
+    std::fs::write(
+        grok_home.join("boss-session-id"),
+        "22222222-3333-4444-8555-666666666666\n",
+    )
+    .unwrap();
+    std::fs::write(
+        grok_home.join("boss-workspace-path"),
+        format!("{}\n", root.path().display()),
+    )
+    .unwrap();
+    let worker_bin = boss_execution_runner::test_exports::ensure_worker_bin_dir_for_engine(
+        root.path(),
+        root.path(),
+        &bundle.join("engine"),
+    )
+    .unwrap();
+    let inherited = format!("{}:/bin:/usr/bin", decoy.display());
+    let mut env = vec![
+        EnvVar {
+            key: "PATH".into(),
+            value: inherited.clone(),
+        },
+        EnvVar {
+            key: boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
+            value: worker_bin.display().to_string(),
+        },
+    ];
+    crate::spawn_flow::apply_worker_tool_env(&mut env, bundle.to_str());
+    let registry = DriverRegistry::default();
+    for slug in registry.slugs() {
+        let driver = registry.require(slug).unwrap();
+        let mut plan = driver.spawn_invocation(SpawnRequest {
+            model: driver.descriptor().model_menu.engine_default,
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some(run_id),
+        });
+        // Keep the real driver env directives; substitute only its CLI so the
+        // assembled prefix can be exercised without starting an agent.
+        plan.command = format!(
+            "/bin/bash -c {}",
+            crate::ssh_transport::shell_quote("command -v boss; command -v cube; \"$BOSS_BIN\"; \"$CUBE_BIN\"")
+        );
+        let assembled = boss_execution_runner::test_exports::assemble_worker_command("", &worker_bin, &plan);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &assembled])
+            .env("PATH", &inherited)
+            .envs(env.iter().map(|entry| (&entry.key, &entry.value)))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{slug}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = format!(
+            "{}/boss\n{}/cube\nbundled-boss\nbundled-cube\n",
+            worker_bin.display(),
+            worker_bin.display()
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{slug}: {assembled}");
+    }
 }
+
+#[path = "spawn_confirmation_tests.rs"]
+mod spawn_confirmation_tests;

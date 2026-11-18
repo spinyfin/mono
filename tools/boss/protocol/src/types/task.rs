@@ -8,6 +8,7 @@ use super::common::{
 };
 use super::execution::ExecutionStatus;
 use super::project::ProjectDesignDocState;
+use super::review_section::ReviewSection;
 use super::work_item::WorkItemExternalRef;
 use serde::{Deserialize, Serialize};
 
@@ -38,18 +39,28 @@ pub enum TaskStatus {
     Archived,
 }
 
-impl TaskStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Todo => "todo",
-            Self::Active => "active",
-            Self::Blocked => "blocked",
-            Self::InReview => "in_review",
-            Self::Done => "done",
-            Self::Archived => "archived",
+macro_rules! task_status_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl TaskStatus {
+            /// Every persisted status, sharing the exhaustive string mapping.
+            pub const ALL: &'static [TaskStatus] = &[$(TaskStatus::$variant),+];
+            pub fn as_str(&self) -> &'static str {
+                match self { $(Self::$variant => $str),+ }
+            }
         }
-    }
+    };
+}
 
+task_status_variants! {
+    Todo => "todo",
+    Active => "active",
+    Blocked => "blocked",
+    InReview => "in_review",
+    Done => "done",
+    Archived => "archived",
+}
+
+impl TaskStatus {
     /// True for statuses that represent terminal/closed states where no further
     /// engine action is expected.
     pub fn is_terminal(&self) -> bool {
@@ -187,8 +198,9 @@ pub struct CreateChoreInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
 
-    /// One of `low` / `medium` / `high`. Omitted → engine default
-    /// (`medium`).
+    /// One of `low` / `medium` / `high` / `critical`. Omitted → engine
+    /// default (`medium`). `critical` is accepted only from the human
+    /// caller tier — see [`Task::priority`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
 
@@ -276,6 +288,9 @@ pub struct CreateInvestigationInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
 
+    /// One of `low` / `medium` / `high` / `critical`. Omitted → engine
+    /// default (`medium`). `critical` is accepted only from the human
+    /// caller tier — see [`Task::priority`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
 
@@ -391,9 +406,10 @@ pub struct CreateTaskInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
 
-    /// One of `low` / `medium` / `high`. Omitted → engine default
-    /// (`medium`), which is the right answer for the vast majority
-    /// of tasks; only callers who care should set this.
+    /// One of `low` / `medium` / `high` / `critical`. Omitted → engine
+    /// default (`medium`), which is the right answer for the vast majority
+    /// of tasks; only callers who care should set this. `critical` is
+    /// accepted only from the human caller tier — see [`Task::priority`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
 
@@ -691,20 +707,67 @@ pub struct Task {
 
     pub kind: TaskKind,
     /// Who made the most recent status change — `'human'`, `'boss'`,
-    /// `'engine'`, or `'boothby'`. See `Project.last_status_actor` for
+    /// `'engine'`, `'boothby'`, or `'progression'`. See `Project.last_status_actor` for
     /// full semantics and [`StatusActor`] for the parsed vocabulary.
     #[serde(default = "default_human_actor")]
     #[builder(default = default_human_actor())]
     pub last_status_actor: String,
 
     pub name: String,
-    /// One of `low` / `medium` / `high`. Mirrors `Project.priority`
-    /// exactly so kanban surfaces can render every work-item kind with
-    /// the same vocabulary. Existing rows from before this column was
-    /// introduced default to `medium`.
+    /// One of `low` / `medium` / `high` / `critical`. The first three
+    /// mirror `Project.priority` exactly so kanban surfaces can render
+    /// every work-item kind with the same vocabulary. Existing rows from
+    /// before this column was introduced default to `medium`.
+    ///
+    /// `critical` is the human owner's escape hatch above `high`: the
+    /// engine accepts a raise to `critical` only from the human caller
+    /// tier (never from the coordinator session, a worker, an engine
+    /// sweep, an automation, or Boothby), and a critical item is
+    /// dispatched ahead of every non-critical item, is not held by the
+    /// interactive concurrency cap, and still dispatches under an
+    /// operator dispatch pause. Lowering from `critical` is an ordinary
+    /// priority change. Provenance of the raise is in
+    /// [`Self::critical_set_by`] / [`Self::critical_set_at`].
     #[serde(default = "default_priority")]
     #[builder(default = default_priority())]
     pub priority: String,
+
+    /// Who raised this row to `critical` — the resolved caller tier
+    /// (`"human"`). `None` unless [`Self::priority`] is currently
+    /// `critical`; cleared when the row is lowered again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_set_by: Option<String>,
+
+    /// When this row was raised to `critical`. Same lifetime as
+    /// [`Self::critical_set_by`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_set_at: Option<String>,
+
+    /// When the owner parked this row (epoch seconds, decimal string).
+    /// `None` → not parked. Parking is orthogonal to [`Self::status`]: a
+    /// parked row keeps its lifecycle position, leaves the default board,
+    /// and is skipped by automatic dispatch and upkeep until un-parked.
+    /// `parked_at IS NOT NULL` is the single load-bearing fact; the three
+    /// fields below are provenance. A row can also be *effectively* parked
+    /// without carrying this stamp (its project is parked, or its revision
+    /// chain root is) — the engine's `is_parked` predicate is the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at: Option<String>,
+
+    /// Status actor that parked the row (`human` or `boss`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_by: Option<String>,
+
+    /// Optional free text from the owner explaining the park.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_reason: Option<String>,
+
+    /// How the stamp got here: [`PARKED_VIA_DIRECT`] (the row itself was
+    /// parked) or `project:<project_id>` (its project's park cascaded onto
+    /// it; see [`parked_via_project`]). Un-parking a project clears only the
+    /// rows whose stamp names that project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_via: Option<String>,
 
     pub status: TaskStatus,
     pub updated_at: String,
@@ -857,7 +920,7 @@ pub struct Task {
     /// the task falls back to rendering under Review. It is also forced to
     /// `None` (regardless of what GitHub still reports) whenever the same
     /// poll observes `ci_required_state == "fail"` while this field was
-    /// `Some("auto_merge_enabled")` (mono#2023 / T2675): GitHub keeps
+    /// `Some("auto_merge_enabled")` (mono#2023): GitHub keeps
     /// auto-merge armed on red required checks — that's what "merge when
     /// ready" means — so without this override a card can sit in Merging
     /// with a simultaneous red CI chip. This override is deliberately
@@ -905,7 +968,7 @@ pub struct Task {
     /// armed) while this reads `"conflicting"`: that combination means "GitHub
     /// will merge the moment the conflict clears," not "safe to merge now,"
     /// and client badge logic must check both before claiming mergeability
-    /// (T3271 / mono#2303 — a card previously rendered a green "mergeable"
+    /// (mono#2303 — a card previously rendered a green "mergeable"
     /// checkmark derived from CI alone while GitHub reported the PR
     /// CONFLICTING).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -916,6 +979,16 @@ pub struct Task {
     /// Stored verbatim — the engine does not validate the slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// Engine-computed Navigator Work-view projection: the section, ordering
+    /// and reason of the row this task belongs to. A derived projection, not a
+    /// stored column, populated by the same assembly (and incremental refresh)
+    /// as the Kanban fields; absent for work the Work view excludes
+    /// (automation-owned tasks) and from engines that predate it. Boxed so the
+    /// card stays small: `Task` is held by value throughout the engine, and an
+    /// inline projection is several hundred bytes on every copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigator: Option<Box<super::NavigatorProjection>>,
 
     /// What *kind of thinking* this work item needs, independent of how big
     /// it is (`effort_level`). See [`ReasoningMode`].
@@ -1002,6 +1075,9 @@ pub struct Task {
     /// until a readable version exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_guide_stale_source: Option<bool>,
+    /// Engine-rendered incremental update status, scoped to this PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_update_status: Option<String>,
 
     /// Engine-recorded reason the series is `"failed"`, taken from the
     /// latest failed attempt's `error` (the pre-start / spawn / generation
@@ -1030,13 +1106,13 @@ pub struct Task {
     /// Starts at 0; incremented after each `pr_review` execution finishes.
     /// The engine skips enqueueing a new reviewer pass when this value
     /// reaches `max_review_cycles` (config knob; default 3). Only
-    /// meaningful on tasks that carry a `pr_url`. P992 design §7.
+    /// meaningful on tasks that carry a `pr_url`.
     #[serde(default)]
     #[builder(default)]
     pub review_cycle: i64,
 
     /// HEAD SHA of the PR at the time the most recent reviewer pass
-    /// completed. Used by the no-op skip gate (P992 design §8, task 10)
+    /// completed. Used by the no-op skip gate
     /// to detect pure rebases and skip re-review when nothing meaningful
     /// changed since the last pass. `None` until at least one reviewer
     /// pass has finished.
@@ -1066,18 +1142,27 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_automation_id: Option<String>,
 
-    /// `true` while an independent `pr_review` reviewer execution is
-    /// running for this task. The task is held in the Doing column
-    /// (`status = "active"`) until the reviewer finalises (or a timeout
-    /// forces the advance). Surfaces as a "Reviewing (AI)" badge on the
-    /// kanban card so the user can tell the hold is intentional.
-    ///
-    /// This is a derived projection set by the engine's `get_work_tree`
-    /// path (not a stored DB column). It is always `false` for tasks
-    /// not currently undergoing an AI review pass.
+    /// True while a reviewer is running for this task, or a held revision's
+    /// started review batch is awaiting reviewers, consolidation or verdict apply.
+    /// First admission to the review pool remains queued. Derived by the engine
+    /// together with Doing membership so the card explains the entire hold.
     #[serde(default, skip_serializing_if = "is_false")]
     #[builder(default)]
     pub ai_reviewing: bool,
+
+    /// The revision is represented by its parent card and has no standalone board card.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub board_folded_revision: bool,
+
+    /// Which stage of the AI review cycle this is: `"reviewers"` (the
+    /// parallel reviewers) or `"consolidation"` (the agent merging their
+    /// findings into one review), or `"applying"` (verdict application), using
+    /// [`crate::ReviewStage::as_str`]. Set
+    /// only while `ai_reviewing` is true; a derived projection, not a stored
+    /// column. Clients render it and never infer it themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_review_stage: Option<String>,
 
     /// Engine-resolved AI review for the PR owner's current observed head.
     /// States: reviewing, review_queued, not_reviewed, reviewed_with_findings,
@@ -1126,6 +1211,38 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "is_false")]
     #[builder(default)]
     pub ready_for_review: bool,
+
+    /// The labelled Review-column section this card is grouped under:
+    /// `ready` / `in_revision` / `ai_review` / `pending` / `blocked`. `None`
+    /// for a row that is not a Review-lane card.
+    ///
+    /// A derived projection set by the engine's `get_work_tree` path (not a
+    /// stored DB column), resolved after `ready_for_review`,
+    /// `has_in_progress_revision` and `ai_review_state` because it reads all
+    /// three. Each card lands in exactly one section by first match, in the
+    /// order blocked, in revision, AI review, ready, pending — see
+    /// `classify_review_section` in the engine for the rule and why it is in
+    /// that order.
+    ///
+    /// Always serialized — as `null` for a non-Review row — unlike the other
+    /// derived projections. The macOS client uses the key's presence to tell
+    /// an engine that predates the field (key absent: the client may fall
+    /// back) from a section-aware engine that sent a Review card with no
+    /// section (key `null`: a defect the client reports rather than hides).
+    #[serde(default)]
+    pub review_section: Option<ReviewSection>,
+
+    /// GitHub's `updatedAt` for this card's bound PR (RFC 3339), as of the
+    /// merge poller's last probe. `None` until a probe has reported one, or
+    /// when the row has no PR. Read by the macOS client, together with
+    /// `updated_at`, to order the Review column's Pending section by most
+    /// recent activity. Unlike `pr_state_polled_at` it moves only when the PR
+    /// itself changes, not on every poll.
+    ///
+    /// Populated from the `tasks.pr_updated_at` column by the engine's
+    /// `attach_pr_updated_at` on the `get_work_tree` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_updated_at: Option<String>,
 
     /// Resolved doc-link state for this work item, derived from the
     /// task's own `doc_*` columns. Independent of `kind`: any work item
@@ -1197,7 +1314,7 @@ pub struct Task {
 }
 
 impl Task {
-    /// Operator-facing short form (`"T2344"`) for embedding in human-readable
+    /// Operator-facing short form for embedding in human-readable
     /// text — never the canonical `task_*` id, which is an internal
     /// implementation detail. Falls back to a generic, non-identifying label
     /// on the (in-practice-unreachable) `short_id = None` case rather than
@@ -1205,6 +1322,57 @@ impl Task {
     pub fn short_label(&self) -> String {
         short_id_label(self.short_id).unwrap_or_else(|| "a task".to_owned())
     }
+
+    /// `true` when the row itself carries a park stamp and is still open.
+    /// Terminal rows (`done` / `archived`) are never reported as parked: a
+    /// parked PR that merges keeps its stamp as history, but the card is
+    /// finished work and must not hide behind the parked filter. This reads
+    /// only the row's own stamp. A revision of a parked parent is born with
+    /// a copy of that stamp, so list and show agree with dispatch. The
+    /// engine's SQL predicate remains the backstop for a row whose project
+    /// is parked and whose stamp has not yet been written.
+    pub fn is_parked(&self) -> bool {
+        self.parked_at.is_some() && !self.status.is_terminal()
+    }
+}
+
+/// `parked_via` for a row the owner parked directly.
+pub const PARKED_VIA_DIRECT: &str = "direct";
+
+/// `parked_via` for a row stamped by its project's park cascade.
+pub fn parked_via_project(project_id: &str) -> String {
+    format!("project:{project_id}")
+}
+
+/// [`TaskRuntime::dispatch_wait_reason`] for a wait the engine could not
+/// name. Not a reason: it marks a break in the engine's state model, which the
+/// engine logs and raises as a `dispatch_wait_unclassified` attention item. A
+/// client shows it as an unexpected state, never as an ordinary queue reason.
+pub const DISPATCH_WAIT_REASON_UNCLASSIFIED: &str = "unclassified";
+
+/// One recorded change to a task's `deferred` or `autostart` flag, from the
+/// engine's field-change ledger. `actor` is who the engine attributes the write
+/// to (`human`, `boss`, `engine`, `progression`, ...); `basis` names the code
+/// path that made it and, for a write that arrived over the socket, the
+/// calling process and request so it can be joined to the engine logs. A
+/// `basis` of `unattributed_write` marks a write that bypassed the engine's
+/// attribution helper; `unknown_legacy` marks the baseline row of an item that
+/// predates the ledger, whose `changed_at` is only a lower bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct TaskFieldAuditRow {
+    /// `deferred` or `autostart`.
+    pub property: String,
+    /// Value before the change; `None` for the row recorded at creation.
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub actor: String,
+    pub basis: String,
+    /// Unix epoch seconds (decimal string).
+    pub changed_at: String,
+    #[serde(default)]
+    #[builder(default)]
+    pub age_is_lower_bound: bool,
 }
 
 /// Live runtime status for a single task/chore — the current execution
@@ -1245,12 +1413,21 @@ pub struct TaskRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_retry_at: Option<String>,
 
-    /// The current pending execution's wait reason: recorded scheduler hold,
-    /// dependency gating, or future dispatch deadline. Absent after claiming
-    /// a slot, when a recorded blocker has stopped running, or when no reason
-    /// is known. Consumers must not infer capacity from an absent reason.
+    /// Why the item is waiting rather than running: a wait code (dependency
+    /// gating, project order, a scheduler hold, a future dispatch deadline,
+    /// ...) or the scheduler's own sentence for one hold. Present for every
+    /// pending execution and for a queued item with no execution; absent only
+    /// when the item is not waiting on dispatch (running, claimed, finished).
+    /// `unclassified` marks a wait the engine could not name, which it reports
+    /// as an anomaly. Consumers must not infer capacity from an absent reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_reason: Option<String>,
+
+    /// The phrase to show for `dispatch_wait_reason`, produced by the same
+    /// engine classifier. Clients render it as given; they never map a wait
+    /// code to text themselves. Present whenever `dispatch_wait_reason` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_label: Option<String>,
 
     /// Unix epoch seconds (as a string) since `dispatch_wait_reason` took
     /// its current value. `None` whenever `dispatch_wait_reason` is `None`.
@@ -1264,6 +1441,22 @@ pub struct TaskRuntime {
     /// Currently gating work item, resolved by the engine's dispatch rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_blocker: Option<DispatchWaitBlocker>,
+
+    /// Failed attempts that produced the current failure-backoff wait.
+    /// Empty unless `dispatch_wait_reason` is `failure_backoff`. Newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub dispatch_failures: Vec<DispatchFailureAttempt>,
+}
+
+/// One recorded failure that fed a `failure_backoff` wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchFailureAttempt {
+    /// Error text, orphaning reason, or attention body. Never empty.
+    pub error_text: String,
+    /// Unix epoch seconds (as a string) when this failure was recorded; empty
+    /// for a legacy failure whose time was never recorded.
+    pub happened_at: String,
 }
 
 /// A prerequisite selected by the same gating rules used for dispatch.
@@ -1334,5 +1527,42 @@ mod tests {
     fn all_has_no_duplicate_entries() {
         let unique: std::collections::HashSet<_> = TaskKind::ALL.iter().collect();
         assert_eq!(unique.len(), TaskKind::ALL.len(), "TaskKind::ALL has a duplicate entry");
+    }
+
+    fn bare_task() -> Task {
+        Task::builder()
+            .id("task_1")
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::InReview)
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    /// The macOS client tells an engine that predates `review_section` (key
+    /// absent) from a section-aware engine that sent a Review card with no
+    /// section (key `null`) by the key's presence. Re-adding
+    /// `skip_serializing_if` here would make every sectionless Review card
+    /// look like it came from an old engine and silence the client's defect
+    /// report.
+    #[test]
+    fn review_section_key_is_always_serialized() {
+        let mut task = bare_task();
+        task.review_section = None;
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().get("review_section"),
+            Some(&serde_json::Value::Null),
+            "a non-Review row must serialize review_section as null, not omit it",
+        );
+
+        task.review_section = Some(ReviewSection::Ready);
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["review_section"], serde_json::json!("ready"));
+        let back: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(back.review_section, Some(ReviewSection::Ready));
     }
 }

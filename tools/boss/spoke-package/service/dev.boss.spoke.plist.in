@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{{label}}</string>
+	<key>UserName</key>
+	<string>{{user}}</string>
+	<key>ProgramArguments</key>
+	<array>
+{{arguments}}
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+{{environment}}
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>{{state_dir}}</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<!-- Installing this file enrolls nothing. The daemon needs the client
+	     certificate that enrollment installs, so launchd keeps the job running
+	     only while that file exists, and restarts it if it exits. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>{{credentials_dir}}/cert.pem</key>
+			<true/>
+		</dict>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<!-- The daemon starts the host's private tmux server as a child, so every
+	     worker pane is in the job's process group. By default launchd kills the
+	     whole group when the job stops or restarts; this leaves the panes alone.
+	     The restarted daemon adopts them by spawn token and replays its journal. -->
+	<key>AbandonProcessGroup</key>
+	<true/>
+</dict>
+</plist>

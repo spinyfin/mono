@@ -18,7 +18,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             return
         }
 
-        let session = model.slots.first(where: { $0.slotId == 1 })?.session
+        let session = model.viewersByRunId["run-tmux"]?.session
         XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -S '/state/boss/tmux.sock' attach-session -t 'boss-1-run-tmux'\n")
         XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
         XCTAssertEqual(session?.launchSpec.workingDirectory, FileManager.default.homeDirectoryForCurrentUser.path)
@@ -46,14 +46,14 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
     }
 
     func testDetachUnknownSlotReturnsUnknownSlot() {
-        let result = WorkersWorkspaceModel().detachWorkerPane(slotId: 99)
+        let result = WorkersWorkspaceModel().detachWorkerPane(runId: "unknown")
         guard case .failure(.unknownSlot) = result else {
             return XCTFail("expected unknownSlot, got \(result)")
         }
     }
 
     func testDetachIdleSlotReturnsUnknownSlot() {
-        let result = WorkersWorkspaceModel().detachWorkerPane(slotId: 1)
+        let result = WorkersWorkspaceModel().detachWorkerPane(runId: "run-tmux")
         guard case .failure(.unknownSlot) = result else {
             return XCTFail("expected unknownSlot, got \(result)")
         }
@@ -70,12 +70,12 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             taskTitle: nil
         ))
 
-        let result = model.detachWorkerPane(slotId: 1)
+        let result = model.detachWorkerPane(runId: "run-tmux")
         guard case .success = result else {
             XCTFail("expected tmux pane detach to succeed, got \(result)")
             return
         }
-        XCTAssertNil(model.slots.first(where: { $0.slotId == 1 })?.session)
+        XCTAssertNil(model.viewersByRunId["run-tmux"]?.session)
     }
 
     func testAttachRejectsEmptyTmuxSocketPath() {
@@ -270,7 +270,7 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
     func testFocusUnknownSlotReturnsUnknownSlot() {
         let model = WorkersWorkspaceModel()
         // Interactive grid is 1...16 (Bridge Crew + Lower Decks); 99 has no slot at all.
-        let result = model.focusWorkerPane(slotId: 99)
+        let result = model.focusWorkerPane(runId: "unknown")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for nonexistent slot, got \(result)")
             return
@@ -284,7 +284,7 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
         // app has nothing to raise. Mirrors the
         // `detachWorkerPane` semantics for idle slots so the engine
         // can treat both cases the same way.
-        let result = model.focusWorkerPane(slotId: 1)
+        let result = model.focusWorkerPane(runId: "run-tmux")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
             return
@@ -294,6 +294,77 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
 
 @MainActor
 final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
+    func testProgressionSlotsAttachAndRejectAnOccupiedSlot() {
+        let model = WorkersWorkspaceModel()
+        // Progression follows the fixed review capacity, even when fewer
+        // reviewers are configured.
+        model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 8)
+        for slot in 41...44 {
+            guard case .success = model.attachWorkerPane(makeAttachRequest(slot: slot, runId: "progression-\(slot)")) else {
+                return XCTFail("progression slot \(slot) must attach")
+            }
+            guard case .failure(.slotBusy(occupyingRunId: "progression-\(slot)")) =
+                    model.attachWorkerPane(makeAttachRequest(slot: slot, runId: "replacement-\(slot)")) else {
+                return XCTFail("a second run cannot displace the progression viewer")
+            }
+        }
+        XCTAssertEqual(Set(model.listHostedPanes().map(\.slotId)), Set(41...44))
+        guard case .failure(.internalFailure) = model.attachWorkerPane(makeAttachRequest(slot: 45)) else {
+            return XCTFail("slots beyond the progression hard cap must be rejected")
+        }
+    }
+
+    func testSameRunAttachPreservesSurfaceAndOriginalSlotMetadata() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3))
+        let session = model.viewersByRunId["run-test"]?.session
+        for slot in [3, 5] {
+            guard case .success = model.attachWorkerPane(makeAttachRequest(slot: slot)) else {
+                return XCTFail("same-run attach must succeed")
+            }
+            XCTAssertTrue(model.viewersByRunId["run-test"]?.session === session)
+            XCTAssertEqual(model.listHostedPanes().map(\.slotId), [3])
+            XCTAssertEqual(model.listHostedPanes().map(\.runId), ["run-test"])
+        }
+    }
+
+    func testDelayedDetachAndFocusCannotTargetReplacementInReusedSlot() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "old-run"))
+        guard case .success = model.detachWorkerPane(runId: "old-run") else {
+            return XCTFail("first detach must succeed")
+        }
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "new-run"))
+        let replacement = model.viewersByRunId["new-run"]?.session
+        guard case .failure(.unknownSlot) = model.detachWorkerPane(runId: "old-run") else {
+            return XCTFail("delayed detach must report the old viewer absent")
+        }
+        guard case .failure(.unknownSlot) = model.focusWorkerPane(runId: "old-run") else {
+            return XCTFail("delayed focus must report the old viewer absent")
+        }
+        guard case .failure(.internalFailure("pane has no live surface")) = model.focusWorkerPane(runId: "new-run") else {
+            return XCTFail("focus must resolve the new viewer before checking its surface")
+        }
+        XCTAssertTrue(model.viewersByRunId["new-run"]?.session === replacement)
+        XCTAssertEqual(model.listHostedPanes().map(\.runId), ["new-run"])
+        XCTAssertEqual(model.listHostedPanes().map(\.slotId), [3])
+    }
+
+    func testViewerReportSurvivesGridCapacityChangesUntilDetach() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 40, runId: "review-run"))
+        let session = model.viewersByRunId["review-run"]?.session
+        model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 8)
+        XCTAssertEqual(model.reviewSlotCount, 8)
+        XCTAssertEqual(model.listHostedPanes().map(\.slotId), [40])
+        XCTAssertEqual(model.listHostedPanes().map(\.runId), ["review-run"])
+        XCTAssertTrue(model.viewersByRunId["review-run"]?.session === session)
+        guard case .success = model.detachWorkerPane(runId: "review-run") else {
+            return XCTFail("viewer outside the grid must remain detachable by run")
+        }
+        XCTAssertTrue(model.listHostedPanes().isEmpty)
+    }
+
     private func makeAttachRequest(slot: Int, runId: String = "run-test") -> EngineAttachRequest {
         EngineAttachRequest(
             runId: runId,
@@ -317,13 +388,11 @@ final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
             return
         }
         XCTAssertNotNil(
-            model.slots.first(where: { $0.slotId == 5 })?.session,
+            model.viewersByRunId["run-test"]?.session,
             "slot 5 should now host a session"
         )
-        XCTAssertNil(
-            model.slots.first(where: { $0.slotId == 1 })?.session,
-            "no other slot should be touched when the engine asked for slot 5"
-        )
+        XCTAssertEqual(model.viewersByRunId["run-test"]?.slotId, 5)
+        XCTAssertEqual(model.viewersByRunId.count, 1)
     }
 
     func testAttachIntoOccupiedSlotReturnsSlotBusy() {
@@ -357,6 +426,102 @@ final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
             XCTFail("expected .internalFailure for slot 99, got \(highResult)")
             return
         }
+    }
+}
+
+/// Attach outcomes the Agents card renders, and the visibility-driven
+/// re-attach request. A live member with no viewer reads "Connecting…"
+/// only while nothing has failed; a refusal by this app is recorded with
+/// its reason until a later attach succeeds or the run is detached.
+@MainActor
+final class WorkersWorkspaceModelViewerAttachTests: XCTestCase {
+    func testRefusedAttachRecordsTheReasonAndALaterSuccessClearsIt() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-old"))
+        XCTAssertTrue(model.viewerAttachFailuresByRunId.isEmpty)
+
+        guard case .failure(.slotBusy) = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-new")) else {
+            return XCTFail("slot 3 is occupied; the attach must be refused")
+        }
+        XCTAssertEqual(
+            model.viewerAttachFailuresByRunId["run-new"],
+            "its slot is still hosting run run-old",
+            "the card needs to name the squatting run"
+        )
+
+        // The engine evicts the stale occupant and retries: success clears.
+        _ = model.detachWorkerPane(runId: "run-old")
+        guard case .success = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-new")) else {
+            return XCTFail("the retry into the freed slot must succeed")
+        }
+        XCTAssertNil(model.viewerAttachFailuresByRunId["run-new"])
+        XCTAssertNotNil(model.viewersByRunId["run-new"]?.session)
+    }
+
+    func testOutOfRangeSlotAndBadSocketRecordReasons() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 99, runId: "run-range"))
+        XCTAssertEqual(model.viewerAttachFailuresByRunId["run-range"], "engine requested unknown slot 99")
+
+        _ = model.attachWorkerPane(EngineAttachRequest(
+            runId: "run-socket", slotId: 1, sessionName: "boss-1-run-socket",
+            tmuxSocketPath: "relative/tmux.sock", summary: nil, taskTitle: nil
+        ))
+        XCTAssertEqual(
+            model.viewerAttachFailuresByRunId["run-socket"],
+            "the engine supplied an invalid tmux socket path"
+        )
+    }
+
+    func testDetachClearsARecordedFailure() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-old"))
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 3, runId: "run-new"))
+        XCTAssertNotNil(model.viewerAttachFailuresByRunId["run-new"])
+        // A detach for a run with no viewer reports unknownSlot but still
+        // retires the stale reason: the engine has given up on that attach.
+        guard case .failure(.unknownSlot) = model.detachWorkerPane(runId: "run-new") else {
+            return XCTFail("run-new never had a viewer")
+        }
+        XCTAssertNil(model.viewerAttachFailuresByRunId["run-new"])
+    }
+
+    /// One request per run per visibility episode: the engine answers
+    /// with an attach or a failure reason, so repeating adds nothing.
+    /// Hiding and re-showing the view asks again; an attached run is never
+    /// asked for.
+    func testRequestViewerAttachAsksOncePerVisibilityEpisode() {
+        let model = WorkersWorkspaceModel()
+        var requested: [String] = []
+        model.onViewerAttachRequested = { requested.append($0) }
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 1, runId: "run-attached"))
+
+        model.requestViewerAttach(forRuns: ["run-a", "run-attached", "run-b"])
+        XCTAssertEqual(requested, ["run-a", "run-b"])
+        model.requestViewerAttach(forRuns: ["run-a", "run-b"])
+        XCTAssertEqual(requested, ["run-a", "run-b"], "a second request in the same episode is a no-op")
+
+        model.resetViewerAttachRequests()
+        model.requestViewerAttach(forRuns: ["run-a"])
+        XCTAssertEqual(requested, ["run-a", "run-b", "run-a"], "re-showing the view asks again")
+
+        // A viewer that arrives retires the dedupe entry, so a later detach
+        // followed by a fresh viewer-less sighting can ask again too.
+        _ = model.attachWorkerPane(makeAttachRequest(slot: 2, runId: "run-b"))
+        _ = model.detachWorkerPane(runId: "run-b")
+        model.requestViewerAttach(forRuns: ["run-b"])
+        XCTAssertEqual(requested.last, "run-b")
+    }
+
+    private func makeAttachRequest(slot: Int, runId: String) -> EngineAttachRequest {
+        EngineAttachRequest(
+            runId: runId,
+            slotId: slot,
+            sessionName: "boss-\(slot)-\(runId)",
+            tmuxSocketPath: "/state/boss/tmux.sock",
+            summary: nil,
+            taskTitle: nil
+        )
     }
 }
 
@@ -414,50 +579,41 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
         )
     }
 
-    func testInteractivePoolIsSixteenSlotsSplitIntoTwoPages() {
-        // The interactive pool is now two pages of 8: Bridge Crew (slots
-        // 1...8) and Lower Decks (slots 9...16). Both are drawn from the flat
-        // `slots` array; the pages must be disjoint and cover it exactly.
+    func testInteractivePoolCapacityAndAutomationBaseStayPinned() {
         let model = WorkersWorkspaceModel()
-        XCTAssertEqual(model.slots.count, 16, "main pool must span both pages")
-        XCTAssertEqual(model.bridgeCrewSlots.map(\.slotId), Array(1...8))
-        XCTAssertEqual(model.lowerDecksSlots.map(\.slotId), Array(9...16))
-        // Namespace agreement with the engine: automation floats immediately
-        // above the interactive pool (worker 16 → automation base 17).
+        XCTAssertEqual(WorkersWorkspaceModel.workerSlotCount, 16)
         XCTAssertEqual(WorkersWorkspaceModel.automationSlotBase, 17)
+        XCTAssertEqual(model.interactivePoolSize, 16)
+        XCTAssertEqual(model.automationPoolSize, 8)
+        XCTAssertEqual(model.reviewSlotCount, 16)
     }
 
-    func testAttachIntoLowerDecksSlotSucceedsAndRoutesToMainPool() {
-        // Slot 9 is Lower Decks slot 1 — the first spillover slot. Before the
-        // second page existed it was the automation pool and would not host a
-        // main worker; now it must attach into the main `slots` array and show
-        // up under `lowerDecksSlots`, indistinguishable from a Bridge Crew pane.
+    func testAttachIntoInteractiveSpilloverSlotSucceeds() {
         let model = WorkersWorkspaceModel()
         let result = model.attachWorkerPane(makeAttachRequest(slot: 9, runId: "run-ld1"))
         guard case .success = result else {
-            XCTFail("expected .success attaching Lower Decks slot 9, got \(result)")
+            XCTFail("expected .success attaching slot 9, got \(result)")
             return
         }
-        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 9 })?.session)
-        XCTAssertNotNil(
-            model.lowerDecksSlots.first(where: { $0.slotId == 9 })?.session,
-            "the attached pane must appear on the Lower Decks page"
-        )
-        XCTAssertTrue(
-            model.bridgeCrewSlots.allSatisfy { $0.session == nil },
-            "attaching Lower Decks must not touch any Bridge Crew slot"
-        )
+        XCTAssertEqual(model.viewersByRunId["run-ld1"]?.slotId, 9)
+        XCTAssertNotNil(model.viewersByRunId["run-ld1"]?.session)
     }
 
-    func testAttachIntoTopLowerDecksSlotSucceeds() {
-        // Slot 16 is the last interactive slot. It must be a valid attach
-        // target (it was out of range when the pool capped at 8).
+    func testAttachIntoLastInteractiveSlotSucceeds() {
         let model = WorkersWorkspaceModel()
         let result = model.attachWorkerPane(makeAttachRequest(slot: 16, runId: "run-ld8"))
         guard case .success = result else {
-            XCTFail("expected .success attaching Lower Decks slot 16, got \(result)")
+            XCTFail("expected .success attaching slot 16, got \(result)")
             return
         }
-        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 16 })?.session)
+        XCTAssertEqual(model.viewersByRunId["run-ld8"]?.slotId, 16)
+    }
+
+    func testConfigureSlotsPublishesEnginePoolSizes() {
+        let model = WorkersWorkspaceModel()
+        model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 12)
+        XCTAssertEqual(model.interactivePoolSize, 16)
+        XCTAssertEqual(model.automationPoolSize, 8)
+        XCTAssertEqual(model.reviewSlotCount, 12)
     }
 }

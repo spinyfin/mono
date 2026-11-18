@@ -5,7 +5,7 @@
 //!
 //! A worker's normal terminal act is opening its PR; the engine reaps it
 //! immediately afterward via the completion path's
-//! [`crate::app::ServerState::release_worker_pane`]. But that teardown can
+//! `boss_engine::app::ServerState::release_worker_pane`. But that teardown can
 //! fail to land: the laptop is closed, an API call wedges, the run hangs
 //! mid-turn. The worker then sits alive — typically in `waiting_for_input`
 //! — holding its slot indefinitely, long after its task went `done` and
@@ -134,11 +134,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::coordinator::CubeClient;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::teardown_registry::{TeardownRegistry, TeardownState};
 use crate::work::WorkDb;
+use boss_execution_contracts::CubeClient;
 
 /// How often the terminal-work reconciler runs. 60s mirrors the dead-pid,
 /// stale-worker, and pool-claim sweeps. Because reaping requires a
@@ -147,7 +147,7 @@ use crate::work::WorkDb;
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Tears down a live worker pane bound to a run id. Implemented by
-/// [`crate::app::ServerState`] (delegating to `release_worker_pane`);
+/// `boss_engine::app::ServerState` (delegating to `release_worker_pane`);
 /// stubbed in tests and in contexts without an app session.
 #[async_trait::async_trait]
 pub trait WorkerReaper: Send + Sync {
@@ -230,7 +230,9 @@ pub fn spawn_loop(
     // `Arc<Mutex>` it can borrow each iteration — a single task ever holds
     // the lock, so there is no real contention.
     let seen_terminal: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    let mut previous_pass = None;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        crate::sweep_metrics::TERMINAL_WORK_SWEEP.record_tick(work_db.metrics_registry(), &mut previous_pass);
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let reaper = Arc::clone(&reaper);
@@ -240,13 +242,29 @@ pub fn spawn_loop(
         let seen_terminal = Arc::clone(&seen_terminal);
         async move {
             let mut seen_terminal = seen_terminal.lock().await;
-            run_one_pass(
+            // The candidate-gathering phase is synchronous SQLite work (one
+            // execution point-read per live slot plus one batched status
+            // read); keep it off the async worker threads so a slow pass
+            // cannot stall the runtime's other tasks. The reap phase that
+            // follows awaits the reaper / cube client and stays async.
+            let gather_db = Arc::clone(&work_db);
+            let gathered = crate::work::db_diagnostics::spawn_blocking(move || {
+                gather_reap_candidates(gather_db.as_ref(), live_states.as_ref(), teardown_registry.as_ref())
+            })
+            .await;
+            let gathered = match gathered {
+                Ok(gathered) => gathered,
+                Err(err) => {
+                    tracing::error!(?err, "terminal-work sweep: candidate gathering did not complete");
+                    return TerminalWorkSweepOutcome::default();
+                }
+            };
+            reap_confirmed_candidates(
+                gathered,
                 work_db.as_ref(),
-                live_states.as_ref(),
                 reaper.as_ref(),
                 cube_client.as_ref(),
                 dispatch_events.as_ref(),
-                teardown_registry.as_ref(),
                 &mut seen_terminal,
             )
             .await
@@ -268,8 +286,42 @@ pub async fn run_one_pass(
     teardown_registry: &TeardownRegistry,
     seen_terminal: &mut HashSet<String>,
 ) -> TerminalWorkSweepOutcome {
+    let gathered = gather_reap_candidates(work_db, live_states, teardown_registry);
+    reap_confirmed_candidates(gathered, work_db, reaper, cube_client, dispatch_events, seen_terminal).await
+}
+
+/// Everything the synchronous half of a pass produces: the per-slot
+/// counters so far and this pass's reap candidates, keyed on `run_id` for
+/// the two-pass confirmation helper.
+pub(crate) struct GatheredCandidates {
+    outcome: TerminalWorkSweepOutcome,
+    candidates: Vec<(String, ReapCandidate)>,
+}
+
+/// The synchronous half of a pass: inspect every live slot, decide whether
+/// it is a reap candidate, and collect the candidates. All DB work happens
+/// here — one execution point-read per slot plus ONE batched status read
+/// for every bound task (see `work/sweep_reads.rs`). No
+/// awaits, so [`spawn_loop`] can run it on the blocking pool.
+pub(crate) fn gather_reap_candidates(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    teardown_registry: &TeardownRegistry,
+) -> GatheredCandidates {
+    let registry = work_db.metrics_registry();
+    let timer = crate::sweep_metrics::TERMINAL_WORK_SWEEP.begin();
     let mut outcome = TerminalWorkSweepOutcome::default();
-    if let Err(err) = work_db.reconcile_pr_review_guide_attempts() {
+    if let Err(err) =
+        work_db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|id| {
+            crate::durable_liveness::probe_execution_worker_within(
+                work_db,
+                id,
+                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )
+            .is_alive()
+        })
+    {
         tracing::warn!(?err, "terminal-work sweep: review-guide attempt reconcile failed",);
     }
     // One clock read per pass: every candidate's teardown mark is judged
@@ -281,16 +333,19 @@ pub async fn run_one_pass(
     // these into the confirmed/pending partitions below.
     let mut candidates: Vec<(String, ReapCandidate)> = Vec::new();
 
-    for state in live_states.snapshot() {
+    let states = live_states.snapshot();
+    let items = states.len();
+    let mut slots = Vec::with_capacity(states.len());
+    for state in states {
         // `run_id` on a live-state entry IS the execution id (see
         // dead_pid_sweep / pool_claim_sweep).
-        let run_id = state.run_id;
+        let run_id = state.run_id.clone();
 
         // Look up the execution: it gives us both the execution's own
         // terminality and the bound work-item id. A DB error is not proof
         // of anything — skip conservatively and retry next pass.
-        let execution = match work_db.get_execution(&run_id) {
-            Ok(execution) => execution,
+        match work_db.get_execution(&run_id) {
+            Ok(execution) => slots.push((state, execution)),
             Err(err) => {
                 tracing::warn!(
                     run_id = %run_id,
@@ -299,10 +354,39 @@ pub async fn run_one_pass(
                     "terminal-work sweep: failed to look up execution; skipping this pass",
                 );
                 outcome.lookup_failed_skipped += 1;
-                continue;
             }
-        };
+        }
+    }
 
+    // One batched status read for every task/chore bound by a live slot.
+    // A slot whose id is absent from the map (a comment binding, a row that
+    // vanished, or a failed batch) falls back to the per-id read below,
+    // whose error path is what distinguishes "gone" from "DB hiccup".
+    let bound_task_ids: Vec<String> = {
+        let mut ids: Vec<String> = slots
+            .iter()
+            .filter(|(_, execution)| {
+                !never_binds_work_item(&execution.kind) && execution.work_item_id.starts_with("task_")
+            })
+            .map(|(_, execution)| execution.work_item_id.clone())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let closed_states = match work_db.task_closed_states(&bound_task_ids) {
+        Ok(closed) => closed,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "terminal-work sweep: batched work-item status read failed; falling back to per-slot reads",
+            );
+            std::collections::HashMap::new()
+        }
+    };
+
+    for (state, execution) in slots {
+        let run_id = state.run_id;
         let execution_terminal = execution.status.is_terminal();
 
         // `AutomationTriage`'s `work_item_id` is an automation id, and
@@ -313,12 +397,7 @@ pub async fn run_one_pass(
         // recovery so it can finalize through the answer-agent path and
         // file its lost-signal attention item. Skip all three here and fall
         // back to execution status.
-        let never_bound_work_item = matches!(
-            execution.kind,
-            boss_protocol::ExecutionKind::AutomationTriage
-                | boss_protocol::ExecutionKind::AnswerAgent
-                | boss_protocol::ExecutionKind::PrReviewGuide
-        );
+        let never_bound_work_item = never_binds_work_item(&execution.kind);
 
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / comment resolved|dismissed|answered) even though the
@@ -346,7 +425,11 @@ pub async fn run_one_pass(
         let work_item_terminal = if never_bound_work_item {
             false
         } else {
-            match work_db.is_bound_work_item_closed(&execution.work_item_id) {
+            let closed = match closed_states.get(&execution.work_item_id) {
+                Some(&closed) => Ok(closed),
+                None => work_db.is_bound_work_item_closed(&execution.work_item_id),
+            };
+            match closed {
                 Ok(closed) => {
                     if !closed {
                         false
@@ -472,6 +555,36 @@ pub async fn run_one_pass(
         ));
     }
 
+    timer.finish(registry, items);
+    GatheredCandidates { outcome, candidates }
+}
+
+/// Whether an execution kind's `work_item_id` is something other than a
+/// product/project/task/comment, so bound-item closedness can never be
+/// established for it (see the comment at the use site).
+fn never_binds_work_item(kind: &boss_protocol::ExecutionKind) -> bool {
+    matches!(
+        kind,
+        boss_protocol::ExecutionKind::AutomationTriage
+            | boss_protocol::ExecutionKind::AnswerAgent
+            | boss_protocol::ExecutionKind::PrReviewGuide
+    )
+}
+
+/// The async half of a pass: confirm this pass's candidates against the
+/// previous pass's and reap the confirmed ones.
+async fn reap_confirmed_candidates(
+    gathered: GatheredCandidates,
+    work_db: &WorkDb,
+    reaper: &dyn WorkerReaper,
+    cube_client: &dyn CubeClient,
+    dispatch_events: &dyn DispatchEventSink,
+    seen_terminal: &mut HashSet<String>,
+) -> TerminalWorkSweepOutcome {
+    let GatheredCandidates {
+        mut outcome,
+        candidates,
+    } = gathered;
     // Two-pass confirmation (shared with `husk_pane_sweep`): only reap a run
     // that was ALSO a terminal+live candidate on the previous pass. A
     // teardown still in flight would have completed within the interval, so
@@ -508,31 +621,14 @@ pub async fn run_one_pass(
         // reflects reality and `bossctl agents transcript` still resolves
         // the row. Best-effort: if the execution turns out already terminal
         // (a race with some other teardown) this is a conservative no-op.
-        if candidate.work_item_missing {
-            if let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
-            {
-                tracing::warn!(
-                    run_id = %candidate.run_id,
-                    ?err,
-                    "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
-                );
-            }
-
-            // `mark_execution_orphaned` keeps lease columns for provenance, and
-            // this sweep is the terminalizer for this candidate — nothing else
-            // will free the lease once the row drops out of every
-            // lease-reclaim path's non-terminal filter.
-            if let Some(lease_id) = candidate.cube_lease_id.as_deref() {
-                crate::execution_liveness::force_release_lease_best_effort(
-                    &candidate.run_id,
-                    lease_id,
-                    cube_client.force_release_lease(
-                        lease_id,
-                        Some("terminal-work sweep: bound work item row no longer exists"),
-                    ),
-                )
-                .await;
-            }
+        if candidate.work_item_missing
+            && let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
+        {
+            tracing::warn!(
+                run_id = %candidate.run_id,
+                ?err,
+                "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
+            );
         }
 
         // Reap via the canonical, idempotent, run-id-keyed teardown. If the
@@ -558,11 +654,34 @@ pub async fn run_one_pass(
         )
         .await;
 
+        if candidate.work_item_missing {
+            // `mark_execution_orphaned` keeps lease columns for provenance, and
+            // this sweep is the terminalizer for this candidate — nothing else
+            // will free the lease once the row drops out of every
+            // lease-reclaim path's non-terminal filter.
+            if let Some(lease_id) = candidate.cube_lease_id.as_deref()
+                && let Ok(execution) = work_db.get_execution(&candidate.run_id)
+            {
+                crate::workspace_lease_release::release_lease_after_inferred_death(
+                    work_db,
+                    &execution,
+                    crate::workspace_lease_release::PaneStatus::Gone,
+                    None,
+                    Some(cube_client),
+                    cube_client.force_release_lease(
+                        lease_id,
+                        Some("terminal-work sweep: bound work item row no longer exists"),
+                    ),
+                )
+                .await;
+            }
+        }
+
         dispatch_events
             .emit(
                 DispatchEvent::new(Stage::TerminalWorkReconcile, Outcome::Ok, &candidate.run_id)
                     .with_work_item(&candidate.work_item_id)
-                    .with_worker(crate::coordinator::worker_id_for_slot(candidate.slot_id))
+                    .with_worker(boss_execution_contracts::worker_id_for_slot(candidate.slot_id))
                     .with_details(serde_json::json!({
                         "reason": candidate.reason,
                         "slot_id": candidate.slot_id,
@@ -1194,6 +1313,8 @@ mod tests {
             .unwrap();
         let work_item_id = revision.id;
         let execution_id = create_execution(&db, &work_item_id);
+        db.force_started_at_for_test(&execution_id, boss_engine_utils::epoch_time::now_epoch_secs())
+            .unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         register_live_worker(&live_states, 25, &execution_id, &work_item_id);
@@ -1213,6 +1334,23 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let lease_id = "lease-25";
         force_cube_lease_id(&db, &execution_id, lease_id);
+        // A path that does not exist is provably empty, so the occupancy
+        // gate does not swallow the missing recovery pointer. A live
+        // tempfile would be UNKNOWN on a Linux sandbox whose /proc scan
+        // hits an unreadable same-uid cwd, and that keep reason does not
+        // file bookmark attention.
+        let missing_workspace = {
+            let dir = tempfile::tempdir().unwrap();
+            dir.path().join("never-created").display().to_string()
+        };
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET workspace_path = ?2 WHERE id = ?1",
+                rusqlite::params![execution_id, missing_workspace],
+            )
+            .unwrap();
+        }
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
@@ -1257,17 +1395,17 @@ mod tests {
             "execution must be marked orphaned since deletion never tore it down",
         );
 
-        // The cube lease must be force-released: `mark_execution_orphaned`
-        // deliberately leaves `cube_lease_id` intact, and orphaning the
-        // execution drops it out of every other lease-reclaim path's
-        // non-terminal filter — this sweep is the only remaining owner.
-        assert_eq!(
-            cube.force_released.lock().unwrap().as_slice(),
-            [(
-                lease_id.to_owned(),
-                Some("terminal-work sweep: bound work item row no longer exists".to_owned())
-            )],
-            "the stranded cube lease must be force-released when the sweep orphans the execution",
+        // Reaping releases the lease too. No recovery pointer was recorded
+        // for this fixture, so teardown cannot preserve anything: it says so
+        // in an inspection warning and still returns the workspace.
+        assert_eq!(cube.force_released.lock().unwrap().len(), 1);
+        assert_eq!(execution.cube_lease_id.as_deref(), None);
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
         );
 
         let events = sink.events().await;

@@ -73,8 +73,13 @@ pub fn parse_github_owner_repo(url: &str) -> Result<(&str, &str), ParseError> {
 /// returning the joined slug. Thin owned-`String` wrapper over
 /// [`parse_github_owner_repo`] for call sites that want a single value.
 pub fn parse_github_slug(remote_url: &str) -> Option<String> {
-    let (owner, repo) = parse_github_owner_repo(remote_url).ok()?;
-    Some(format!("{owner}/{repo}"))
+    parse_github_slug_result(remote_url).ok()
+}
+
+/// Parse a GitHub repository slug while preserving the validation error.
+pub fn parse_github_slug_result(remote_url: &str) -> anyhow::Result<String> {
+    let (owner, repo) = parse_github_owner_repo(remote_url)?;
+    Ok(format!("{owner}/{repo}"))
 }
 
 /// Short name of a repo URL: the path basename minus a trailing `.git`.
@@ -277,6 +282,21 @@ mod tests {
     use super::*;
 
     // ── short_name_for / parse_github_owner_repo (ex boss-github) ──────────
+
+    #[test]
+    fn result_slug_preserves_parser_errors() {
+        for remote in ["git@github.com:owner/repo.git", "https://github.com/owner/repo/"] {
+            assert_eq!(parse_github_slug_result(remote).unwrap(), "owner/repo");
+            assert_eq!(parse_github_slug(remote).as_deref(), Some("owner/repo"));
+        }
+        for remote in ["https://gitlab.com/owner/repo", "https://github.com/owner"] {
+            assert_eq!(
+                parse_github_slug_result(remote).unwrap_err().to_string(),
+                parse_github_owner_repo(remote).unwrap_err().to_string(),
+            );
+            assert!(parse_github_slug(remote).is_none());
+        }
+    }
 
     #[test]
     fn short_name_for_handles_ssh_and_https() {

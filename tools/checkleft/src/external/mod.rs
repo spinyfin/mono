@@ -21,6 +21,7 @@ pub const GENERATED_IMPLEMENTATION_PREFIX: &str = "generated:";
 pub const BUNDLED_IMPLEMENTATION_PREFIX: &str = "bundled:";
 
 pub mod declarative;
+pub(crate) mod environment;
 pub(crate) mod timeout;
 
 pub use declarative::{

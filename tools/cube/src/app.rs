@@ -8,27 +8,41 @@
 mod bazel_output_base;
 mod change;
 mod checkleft_gate;
+mod cleanup;
 mod disk;
 mod dispatch;
 mod display;
 mod errors;
 mod excludes;
+mod fs_util;
 mod gc;
 mod gh_pr;
 mod health;
 mod jj;
+mod lease_reclaim;
+mod periodic_cleanup;
 mod pr;
+mod pr_head;
 mod provision;
 mod reclaim;
 mod reconcile;
+mod registration;
+mod release_bookmark_gc;
 mod repo;
+mod repo_reclone;
 mod reset;
 mod salvage;
 mod stage;
+pub(crate) mod store_gc;
+mod store_gc_integrity;
 mod util;
 mod workspace;
+mod workspace_local_rebase;
 mod workspace_ops;
+pub(crate) mod workspace_status;
 
+#[cfg(test)]
+mod test_fs;
 #[cfg(test)]
 mod tests;
 

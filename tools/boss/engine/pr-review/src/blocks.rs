@@ -25,25 +25,11 @@ pub fn render_supersession_flag_block(flag_lines: &[String]) -> String {
     let mut out = String::new();
     out.push_str("## Supersession-claim citation check (engine-flagged) — CRITICAL\n\n");
     out.push_str(
-        "The engine's deterministic scan found **supersession / obsolescence \
-         language** in this PR's body, commits, or comments. A claim that one \
-         surface \"supersedes\", \"obsoletes\", \"replaces\", is \"now-dead\", \
-         or is \"orphaned\" is a **design decision** the worker is not \
-         authorised to make unilaterally — in incident-002 exactly such a \
-         narrative laundered the deletion of a merged feature that the design \
-         doc specified as a sibling surface.\n\n\
-         For EACH flagged phrase below you MUST verify:\n\n\
-         1. Does the PR cite a specific **design doc + section** that authorises \
-         the supersession? (A clean build, \"it looks dead\", or \"this same PR \
-         removed its only caller\" are NOT authorisation.)\n\
-         2. Read the cited section. Does it **actually support** the claim (say \
-         the surface is replaced), or does it contradict it (specify the \
-         surface as still-required / a sibling)?\n\n\
-         If a flagged claim has no design-doc citation, or the citation does not \
-         support it, raise a `regression` finding: the removal it justifies is \
-         presumptively wrong and must be restored or escalated. Do not accept \
-         the narrative at face value.\n\n\
-         Flagged phrases:\n\n",
+        "For EACH flagged replacement or obsolescence claim below, require design authorization: \
+         verify a specific design doc citation (path + section), read it, and raise a `regression` \
+         finding if it is absent or does not support replacement. A clean build, apparent dead \
+         code, or this PR removing the only caller is not authorization. The finding should require restoring the removed surface \
+         or escalating; do not accept the narrative at face value.\n\nFlagged phrases:\n\n",
     );
     for line in flag_lines {
         out.push_str(&format!("- {line}\n"));
@@ -116,13 +102,13 @@ pub fn render_verdict_submission_block(batch_id: &str, body_path: &str) -> Strin
          2. Submit it immediately with:\n\
          \n\
          ```sh\n\
-         boss propose review-verdict --batch-id {batch_id} --verdict-file \"{body_path}\"\n\
+         \"$BOSS_BIN\" propose review-verdict --batch-id {batch_id} --verdict-file \"{body_path}\"\n\
          ```\n\
          \n\
          The command validates the verdict immediately. If it rejects the file, correct the\n\
          reported field errors and submit again before ending your turn. Do not put the JSON\n\
          in your final response: transcript recovery is intentionally unavailable for batch\n\
-         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
+         reviews. The one body-file write and this local `\"$BOSS_BIN\" propose` call are permitted;\n\
          do not edit repository files or publish anything.\n",
         body_path = body_path,
         batch_id = batch_id,

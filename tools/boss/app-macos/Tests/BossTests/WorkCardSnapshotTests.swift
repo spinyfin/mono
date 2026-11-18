@@ -71,6 +71,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "blockedDetail",
         "operatorQuestion",
         "aiReviewing",
+        "aiReviewStage",
         "aiReviewState",
         "aiReviewBadge",
         "aiReviewFindingsRevisionId",
@@ -107,6 +108,10 @@ final class WorkCardSnapshotTests: XCTestCase {
         "externalRef",
         "parentTaskId",
         "readyForReview",
+        "reviewSection",
+        "reviewSectionReported",
+        "boardFoldedRevision",
+        "prUpdatedAt",
         "docLinkState",
         "reviewGuideSelectedComparisonId",
         "originTaskShortId",
@@ -116,6 +121,14 @@ final class WorkCardSnapshotTests: XCTestCase {
         "dispatchFailedError",
         "dispatchFailedAt",
         "completionSummary",
+        // Navigator placement is independent of the Kanban card snapshot.
+        "navigator",
+        // The parked chip reaches the snapshot as `context.parked` (the stamp
+        // may come from the project), so the raw stamp fields are not read.
+        "parkedAt",
+        "parkedBy",
+        "parkedReason",
+        "parkedVia",
     ]
 
     /// Fails when a new stored property is added to `WorkTask` without
@@ -177,6 +190,10 @@ final class WorkCardSnapshotTests: XCTestCase {
         base.externalRef = nil
         base.docLinkState = nil
         base.completionSummary = nil
+        base.parkedAt = nil
+        base.parkedBy = nil
+        base.parkedReason = nil
+        base.parkedVia = nil
 
         var other = Self.makeTask(
             id: "task_shared",
@@ -208,6 +225,10 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
         other.docLinkState = .broken(reason: "missing path")
         other.completionSummary = "done by hand, no agent run"
+        other.parkedAt = "1799990000"
+        other.parkedBy = "human"
+        other.parkedReason = "not now"
+        other.parkedVia = "direct"
 
         let context = WorkCardSnapshotContext(column: .backlog)
         let a = WorkCardSnapshot.build(task: base, context: context)
@@ -256,6 +277,10 @@ final class WorkCardSnapshotTests: XCTestCase {
             }),
             ("parentTaskId", { t in var t = t; t.parentTaskId = "task_parent"; return t }),
             ("readyForReview", { t in var t = t; t.readyForReview = true; return t }),
+            ("boardFoldedRevision", { t in var t = t; t.boardFoldedRevision = true; return t }),
+            ("reviewSection", { t in var t = t; t.reviewSection = .blocked; return t }),
+            ("reviewSectionReported", { t in var t = t; t.reviewSectionReported = true; return t }),
+            ("prUpdatedAt", { t in var t = t; t.prUpdatedAt = "2026-05-25T00:00:00Z"; return t }),
             ("docLinkState", { t in
                 var t = t; t.docLinkState = .notSet; return t
             }),
@@ -278,6 +303,23 @@ final class WorkCardSnapshotTests: XCTestCase {
             }),
             ("completionSummary", { t in
                 var t = t; t.completionSummary = "shipped without agent run"; return t
+            }),
+            ("navigator", { t in
+                var t = t
+                t.navigator = NavigatorProjection(version: 1, rootTaskId: "other_root", root: nil)
+                return t
+            }),
+            ("parkedAt", { t in
+                var t = t; t.parkedAt = "1799990000"; return t
+            }),
+            ("parkedBy", { t in
+                var t = t; t.parkedBy = "human"; return t
+            }),
+            ("parkedReason", { t in
+                var t = t; t.parkedReason = "not now"; return t
+            }),
+            ("parkedVia", { t in
+                var t = t; t.parkedVia = "project:proj_a"; return t
             }),
         ]
 
@@ -571,6 +613,19 @@ final class WorkCardSnapshotTests: XCTestCase {
                 }
             ),
             Case(
+                name: "aiReviewStage",
+                context: doing,
+                base: {
+                    var t = Self.makeTask(id: "task_1", status: "active")
+                    t.aiReviewing = true
+                    t.aiReviewStage = "reviewers"
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.aiReviewStage = "consolidation"; return t
+                }
+            ),
+            Case(
                 name: "aiReviewBadge",
                 context: review,
                 base: { Self.makeTask(id: "task_1", status: "in_review") },
@@ -822,6 +877,23 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNotEqual(lowSnap, highSnap)
     }
 
+    /// `critical` gets its own marker, distinct from the `H` chip: a
+    /// critical card must never read as merely high, and a high card must
+    /// never read as critical.
+    func testPriorityCriticalShowsDistinctChip() {
+        let high = Self.makeTask(id: "task_1", priority: "high")
+        let critical = Self.makeTask(id: "task_1", priority: "critical")
+        let ctx = WorkCardSnapshotContext(column: .backlog)
+        let highSnap = WorkCardSnapshot.build(task: high, context: ctx)
+        let criticalSnap = WorkCardSnapshot.build(task: critical, context: ctx)
+        XCTAssertTrue(criticalSnap.showsCriticalPriorityChip)
+        XCTAssertFalse(criticalSnap.showsHighPriorityChip)
+        XCTAssertFalse(highSnap.showsCriticalPriorityChip)
+        XCTAssertNotEqual(highSnap, criticalSnap)
+        XCTAssertEqual(WorkPriority.parse("CRITICAL"), .critical)
+        XCTAssertEqual(WorkPriority.critical.label, "Critical")
+    }
+
     func testTagsChangeProducesHasTagChips() {
         var a = Self.makeTask(id: "task_1")
         a.tags = ["alpha"]
@@ -895,6 +967,19 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
         XCTAssertTrue(snap.isAIReviewing)
         XCTAssertNil(snap.aiReviewState)
+    }
+
+    /// The Doing card words a consolidating review differently from the
+    /// parallel reviewers, from the engine-reported stage alone.
+    func testDoingCardCaptionFollowsEngineReviewStage() {
+        func caption(stage: String?) -> AgentActivityState? {
+            var task = Self.makeTask(status: "active")
+            task.aiReviewing = true
+            task.aiReviewStage = stage
+            return WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .doing)).activityState
+        }
+        XCTAssertEqual(caption(stage: "reviewers"), .waiting(reason: "AI review in progress"))
+        XCTAssertEqual(caption(stage: "consolidation"), .waiting(reason: "Consolidating review findings"))
     }
 
     func testIsAIReviewingFalseOutsideDoing() {
@@ -1923,7 +2008,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         ))
     }
 
-    func testLiveStatusDispatchPendingWithoutReasonIsUnknown() {
+    func testLiveStatusDispatchPendingWithoutReasonIsAnUnexpectedState() {
         let task = Self.makeTask(status: "todo", autostart: true)
         let runtime = WorkTaskRuntime(
             workItemID: task.id,
@@ -1938,7 +2023,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Queued — reason unknown"
+            "Unexpected state — the engine sent no reason for this wait"
         )
     }
 
@@ -1969,14 +2054,15 @@ final class WorkCardSnapshotTests: XCTestCase {
             runStatus: nil,
             executionID: nil,
             dispatchRetryAt: nil,
-            dispatchWaitReason: nil,
-            dispatchWaitSince: nil
+            dispatchWaitReason: "project_order",
+            dispatchWaitSince: nil,
+            dispatchWaitLabel: "waiting for an earlier task in its project"
         )
         XCTAssertEqual(
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Queued — reason unknown"
+            "Queued — waiting for an earlier task in its project"
         )
     }
 
@@ -1989,7 +2075,8 @@ final class WorkCardSnapshotTests: XCTestCase {
             executionID: "exec-1",
             dispatchRetryAt: nil,
             dispatchWaitReason: "pool_exhausted",
-            dispatchWaitSince: nil
+            dispatchWaitSince: nil,
+            dispatchWaitLabel: "worker pool full"
         )
         XCTAssertEqual(
             WorkCardLiveStatus.resolve(
@@ -2019,6 +2106,26 @@ final class WorkCardSnapshotTests: XCTestCase {
         let live = Self.makeLiveState(liveStatus: "Resolving")
         XCTAssertNil(WorkCardLiveStatus.resolve(
             task: task, column: .doing, runtime: nil, liveState: live
+        ))
+    }
+
+    /// A held card whose reviewers live on another work item (a revision's
+    /// PR review is bound to the chain root) still says it is in AI review.
+    func testLiveStatusNamesAIReviewWhenCardHasNoWorkerOfItsOwn() {
+        var task = Self.makeTask(status: "active")
+        task.aiReviewing = true
+        task.aiReviewStage = "reviewers"
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task, column: .doing, runtime: nil, liveState: nil),
+            "AI review in progress"
+        )
+        task.aiReviewStage = "consolidation"
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(task: task, column: .doing, runtime: nil, liveState: nil),
+            "Consolidating review findings"
+        )
+        XCTAssertNil(WorkCardLiveStatus.resolve(
+            task: task, column: .doing, runtime: nil, liveState: Self.makeLiveState(liveStatus: "Reading")
         ))
     }
 

@@ -240,9 +240,12 @@ struct ActivityLogView: View {
             mainContent
         }
         .onAppear {
+            chat.activityIsVisible = true
+            chat.refreshEngineAttempts()
             model.start()
         }
         .onDisappear {
+            chat.activityIsVisible = false
             model.stop()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -711,7 +714,9 @@ private struct ActivityEngineDetailPane: View {
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
-        .task(id: row.id) {
+        .task(id: "\(row.id)|\(row.status)|\(row.finishedAt ?? "")") {
+            // Re-fetch when a push moves the same attempt on, so the cached
+            // detail never lags the row.
             if row.hasKindSpecificDetail {
                 chat.fetchEngineAttemptDetail(row)
             }

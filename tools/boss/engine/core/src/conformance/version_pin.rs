@@ -24,10 +24,14 @@
 use std::process::Command;
 
 use crate::conformance::fixtures::{
-    CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, assert_codex_spawn_contract,
-    codex_shaped_driver, decode_jsonl,
+    AGY_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE,
+    assert_codex_spawn_contract, codex_shaped_driver, decode_jsonl,
 };
-use crate::conformance::{codex_cli_binary, require_codex_cli, require_grok_cli};
+use crate::conformance::{agy_cli_binary, codex_cli_binary, require_agy_cli, require_codex_cli, require_grok_cli};
+use crate::driver::agy::{
+    AGY_VERSION_TIMEOUT, DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE, MIN_QUALIFIED_AGY_VERSION,
+    parse_agy_version, run_agy_bounded, version_at_least,
+};
 use crate::driver::{AgentDriver, GrokDriver};
 
 /// Parse `codex-cli X.Y.Z` (or `codex X.Y.Z`) stdout from `codex --version`.
@@ -253,6 +257,7 @@ fn generated_config_toml_loads_under_strict_config_on_pinned_codex() {
     let guards = vec![crate::driver::codex::MaterializedGuard {
         command_path: PathBuf::from("/bin/true"),
         matcher: Some(".*"),
+        timeout_sec: None,
     }];
     let full = crate::driver::codex::append_hooks_toml(&base, &guards);
     std::fs::write(codex_home.join("config.toml"), &full).expect("write config.toml");
@@ -609,4 +614,157 @@ fn grok_models_menu_matches_pinned_descriptor() {
          update GROK_DESCRIPTOR's model menu (model_menu.rs) deliberately (design A-11 / T-20) \
          rather than being silently absorbed as a stale pin. got stdout={stdout:?}",
     );
+}
+
+// ─── agy live-CLI version pin ───────────────────────────────────────────────
+//
+// Qualified floor is [`MIN_QUALIFIED_AGY_VERSION`] (1.5.7): `auto_approve` and
+// `deny_unless_prior_grant` were measured on 1.5.7 and 1.5.9, not 1.5.5
+// (permission / shared-HOME studies). This is a minimum, not an exact pin —
+// Boss freezes installed bytes and disables updates; a checksum-pinned copy is not in the
+// Bazel graph the way Codex is.
+//
+// Live `agy --version` soft-skips when the binary is absent, or when the
+// invocation itself fails, unless `BOSS_REQUIRE_AGY_CLI=1` asks for a
+// failure. CI cannot authenticate `agy` (OAuth against a personal Google
+// account, keychain-backed), so the live check is meaningful only on a
+// signed-in developer machine. Fixture-side pins in this module and in
+// `agy_goldens` / `ingress_equivalence` / `boundary_equivalence` carry the
+// hook contract everywhere else. Authenticated probes (rules discovery)
+// are the non-test `agy_rules_probe` binary, which cannot run under
+// `bazel test`'s mandatory sandbox.
+
+// Boss driver maintainers own qualification; replacing the installed pin
+// is a deployment step. Before adoption, maintainers run the pane,
+// hook-surface and permission recipes, commit sanitized captures with version
+// and hash provenance, and run conformance with BOSS_REQUIRE_AGY_CLI=1.
+// To replace it, stop Boss and all workers, archive homes-root bin/agy for
+// rollback, remove that copy, and provision with BOSS_AGY_BIN pointing at
+// the qualified signed candidate. First-install copying verifies identity
+// and version and protects the copy. Restart only after provisioning succeeds.
+// Overrides cannot replace an existing pin; bumping the floor is not an upgrade.
+
+#[test]
+fn agy_version_examples_match_qualification() {
+    assert_eq!(parse_agy_version("agy 1.5.9").unwrap(), "1.5.9");
+    assert!(version_at_least("1.5.7", "1.5.7"));
+    assert!(version_at_least("1.5.9", "1.5.7"));
+    assert!(!version_at_least("1.5.5", "1.5.7"));
+    assert!(!version_at_least("invalid", "1.5.7"));
+}
+
+#[test]
+fn installed_agy_meets_qualified_minimum_when_present() {
+    // Soft-skip when `agy` is absent. CI images typically have neither the
+    // binary nor a signed-in account; fixture-side pins below still defend
+    // the hook contract. Set BOSS_REQUIRE_AGY_CLI=1 on a signed-in
+    // developer machine that re-captures fixtures.
+    let require = require_agy_cli();
+    let Some(agy_bin) = agy_cli_binary() else {
+        if require {
+            panic!("BOSS_REQUIRE_AGY_CLI is set but agy is not on PATH (and BOSS_AGY_BIN is unset)");
+        }
+        eprintln!(
+            "agy not on PATH; skipping live version check (set BOSS_REQUIRE_AGY_CLI=1 to require it). \
+             CI cannot authenticate agy — fixture-side pins carry the contract here."
+        );
+        return;
+    };
+    let tmp = tempfile::TempDir::new().expect("tempdir for agy --version HOME");
+    let mut command = Command::new(&agy_bin);
+    command
+        .env("HOME", tmp.path())
+        .env(DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE)
+        .arg("--version");
+    let output = match run_agy_bounded(&mut command, AGY_VERSION_TIMEOUT) {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            if require {
+                panic!(
+                    "BOSS_REQUIRE_AGY_CLI is set but `agy --version` failed (status {}): stdout={} stderr={}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr),
+                );
+            }
+            eprintln!(
+                "agy --version failed (status {}); skipping live version check \
+                 (set BOSS_REQUIRE_AGY_CLI=1 to require it). CI cannot authenticate agy.",
+                o.status
+            );
+            return;
+        }
+        Err(err) => {
+            if require {
+                panic!("BOSS_REQUIRE_AGY_CLI is set but agy could not be spawned: {err}");
+            }
+            eprintln!(
+                "agy not runnable ({err}); skipping live version check \
+                 (set BOSS_REQUIRE_AGY_CLI=1 to require it)"
+            );
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let version = parse_agy_version(&stdout)
+        .or_else(|_| parse_agy_version(&stderr))
+        .unwrap_or_else(|_| panic!("could not parse agy --version from stdout={stdout:?} stderr={stderr:?}"));
+    assert!(
+        version_at_least(&version, MIN_QUALIFIED_AGY_VERSION),
+        "installed agy is {version}, but the conformance harness requires \
+         {MIN_QUALIFIED_AGY_VERSION} or later (auto_approve was measured on 1.5.7+). \
+         Re-run the investigations, update fixtures, and bump MIN_QUALIFIED_AGY_VERSION \
+         deliberately — do not silently absorb drift."
+    );
+}
+
+#[test]
+fn agy_fixture_stream_carries_required_1_5_7_envelope_fields() {
+    // Removals of these fields would break the progress session: 1.1.12
+    // omitted hookEventName, and fullyIdle is the idle-boundary predicate.
+    let mut saw_session_start = false;
+    let mut saw_idle_stop = false;
+    for line in AGY_HOOK_SESSION_JSONL.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let name = value.get("hookEventName").and_then(|v| v.as_str());
+        assert!(
+            value.get("conversationId").and_then(|v| v.as_str()).is_some(),
+            "every agy envelope must carry conversationId; got {value}"
+        );
+        match name {
+            Some("SessionStart") => {
+                saw_session_start = true;
+                assert!(
+                    value.get("lastUserInput").is_some(),
+                    "1.5.5+ SessionStart repeats lastUserInput (stripped by the normaliser)"
+                );
+            }
+            Some("Stop") => {
+                assert!(
+                    value.get("fullyIdle").and_then(|v| v.as_bool()).is_some(),
+                    "Stop must carry boolean fullyIdle; got {value}"
+                );
+                assert!(
+                    value.get("terminationReason").and_then(|v| v.as_str()).is_some(),
+                    "Stop must carry terminationReason; got {value}"
+                );
+                if value.get("fullyIdle") == Some(&serde_json::Value::Bool(true)) {
+                    saw_idle_stop = true;
+                }
+            }
+            Some("PreToolUse" | "PostToolUse") => {
+                assert!(
+                    value.pointer("/toolCall/name").and_then(|v| v.as_str()).is_some(),
+                    "tool envelopes must carry toolCall.name; got {value}"
+                );
+            }
+            Some(_) => {}
+            None => panic!("agy fixture envelope missing hookEventName: {value}"),
+        }
+    }
+    assert!(saw_session_start, "fixture must include SessionStart");
+    assert!(saw_idle_stop, "fixture must include a fullyIdle=true Stop");
 }

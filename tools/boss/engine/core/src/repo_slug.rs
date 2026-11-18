@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use git_utils::repo_slug::is_bare_repo_slug;
 
-use crate::coordinator::{CubeClient, CubeRepoSummary};
+use boss_execution_contracts::CubeClient;
+use boss_host_execution::types::CubeRepoSummary;
 
 /// Build the argv tail for `cube repo ensure` from a repo reference that
 /// may be either a canonical origin URL or a bare cube slug.
@@ -45,13 +46,7 @@ use crate::coordinator::{CubeClient, CubeRepoSummary};
 /// is the dispatch-side counterpart to creation-time slug rewriting — it
 /// catches resolver-only slugs that had no pool to rewrite against. The
 /// returned slices borrow from `repo_ref`. See spinyfin/mono#1156.
-pub fn repo_ensure_args(repo_ref: &str) -> Vec<&str> {
-    if is_bare_repo_slug(repo_ref) {
-        vec!["--json", "repo", "ensure", repo_ref.trim()]
-    } else {
-        vec!["--json", "repo", "ensure", "--origin", repo_ref]
-    }
-}
+pub use boss_host_execution::cube::repo_ensure_args;
 
 /// Rewrite a single `repo_remote_url` field in place: when it holds a
 /// bare slug that matches a `repo_id` in `repos`, replace it with that

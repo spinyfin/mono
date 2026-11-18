@@ -77,12 +77,12 @@ async fn merge_cancel_workspace_preference_is_ignored_without_dirty_reuse() {
     };
 
     let lease = coordinator
-        .lease_workspace_with_fallback(
+        .lease_workspace_with_fallback_for_test(
             &execution,
             "worker-followup",
             &repo,
             "continue-review",
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
         )
         .await
         .expect("a merge-cancel preference is soft when its workspace is unavailable");
@@ -129,12 +129,12 @@ async fn revision_resume_uses_fresh_scratch_without_workspace_pinning() {
     };
 
     let result = coordinator
-        .lease_workspace_with_fallback(
+        .lease_workspace_with_fallback_for_test(
             &execution,
             "worker-resume",
             &repo,
             "resume-revision",
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
         )
         .await;
 
@@ -147,13 +147,23 @@ async fn revision_resume_uses_fresh_scratch_without_workspace_pinning() {
 }
 
 async fn record_recovery_work(db: &WorkDb, id: &str, workspace: &std::path::Path) {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::LocalJj;
+    use boss_engine_recovery_fixtures::create;
     let shared = boss_engine_recovery::execution_bookmark::Jj::shared_repo(&LocalJj, workspace)
         .await
         .unwrap();
     configure_recovery_origin(&shared);
     let record = create(&LocalJj, workspace, id, "local").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
+}
+
+pub(super) async fn preserve_work(db: &WorkDb, id: &str, workspace: &Path) {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, preserve};
+    let record = db.execution_bookmark(id).unwrap();
+    let saved = preserve(&LocalJj, &record, workspace, None, None).await.unwrap();
+    if let Some(tip) = saved.tip {
+        db.record_preserved_tip(id, &tip).unwrap();
+    }
 }
 
 fn lease_for(workspace_path: &std::path::Path, dirty_verified: Option<bool>) -> CubeWorkspaceLease {
@@ -175,22 +185,27 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
     record_recovery_work(&db, &dead_id, &repo.worker).await;
     std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
+    preserve_work(&db, &dead_id, &repo.worker).await;
     let patch = dir.path().join(format!("{dead_id}.patch"));
     std::fs::write(&patch, "obsolete patch, must never replay").unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &resume,
             &lease_for(&repo.replacement, Some(true)),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
+            None,
             None,
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id.clone(), true)));
+    assert_eq!(
+        restored.map(|r| (r.predecessor, r.has_work)),
+        Some((dead_id.clone(), true))
+    );
     let report = coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&resume.id)
         .unwrap()
         .unwrap();
@@ -207,14 +222,14 @@ async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
     // A pre-start failure after restoring can later be pruned. Its report
     // must follow the execution instead of preventing retention cleanup.
     coordinator
-        .work_db
+        .work_db()
         .connect()
         .unwrap()
         .execute("DELETE FROM work_executions WHERE id = ?1", [&resume.id])
         .unwrap();
     assert!(
         coordinator
-            .work_db
+            .work_db()
             .execution_restore_report(&resume.id)
             .unwrap()
             .is_none()
@@ -231,22 +246,27 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
     record_recovery_work(&db, &dead_id, &repo.worker).await;
     std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
+    preserve_work(&db, &dead_id, &repo.worker).await;
     JjRepo::run(&repo.worker, &["new", "root()", "-m", "Unrelated lease"]);
     std::fs::write(repo.worker.join("foreign.txt"), "foreign work").unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &resume,
             &lease_for(&repo.replacement, Some(false)),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
+            None,
             None,
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id.clone(), true)));
+    assert_eq!(
+        restored.map(|r| (r.predecessor, r.has_work)),
+        Some((dead_id.clone(), true))
+    );
     let report = coordinator
-        .work_db
+        .work_db()
         .execution_restore_report(&resume.id)
         .unwrap()
         .unwrap();
@@ -264,33 +284,62 @@ async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
 }
 
 #[tokio::test]
-async fn missing_baseline_recovery_is_loud_and_legacy_evidence_is_kept() {
+async fn an_unrecorded_baseline_commit_is_not_an_integrity_failure() {
     use boss_engine_test_git::jj::JjRepo;
-    let dir = tempdir().unwrap();
-    let repo = JjRepo::new(dir.path());
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let (dead_id, resume) = seed_resume_pair(&db);
-    record_recovery_work(&db, &dead_id, &repo.worker).await;
-    JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-base/{dead_id}")]);
-    let patch = dir.path().join(format!("{dead_id}.patch"));
-    std::fs::write(&patch, "legacy evidence").unwrap();
-    let coordinator = recovery_coordinator(db);
-    let error = coordinator
-        .recover_execution_bookmark(
-            &resume,
-            &lease_for(&repo.replacement, None),
-            &coordinator.host_adapter,
-            "mono",
-            None,
-        )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("exactly one"), "{error:#}");
-    assert!(boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(
-        &error
-    ));
-    assert!(patch.exists());
-    assert!(!repo.replacement.join("hello.txt").exists());
+    for recorded_commit in [true, false] {
+        let dir = tempdir().unwrap();
+        let repo = JjRepo::new(dir.path());
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (dead_id, resume) = seed_resume_pair(&db);
+        record_recovery_work(&db, &dead_id, &repo.worker).await;
+        std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        preserve_work(&db, &dead_id, &repo.worker).await;
+        if !recorded_commit {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE execution_bookmarks SET base_commit = NULL WHERE execution_id = ?1",
+                    [&dead_id],
+                )
+                .unwrap();
+        }
+        let patch = dir.path().join(format!("{dead_id}.patch"));
+        std::fs::write(&patch, "legacy evidence").unwrap();
+        let coordinator = recovery_coordinator(db.clone());
+        let restored = coordinator
+            .recover_execution_bookmark_for_test(
+                &resume,
+                &lease_for(&repo.replacement, None),
+                &coordinator.host_adapter(),
+                "mono",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(patch.exists(), "legacy evidence is never consumed");
+        let retired: Vec<_> = db
+            .list_attention_items_for_work_item(&resume.work_item_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == crate::execution_bookmark_recovery::RECOVERY_RETIRED)
+            .collect();
+        // A record with or without a baseline commit (trunk is the floor without
+        // one) is not an integrity failure: the work is recovered and nothing is
+        // retired.
+        assert_eq!(
+            restored.map(|r| (r.predecessor, r.has_work)),
+            Some((dead_id.clone(), true)),
+            "recorded_commit={recorded_commit}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
+            "recovered work\n"
+        );
+        assert!(retired.is_empty());
+        assert!(db.execution_bookmark_optional(&dead_id).unwrap().is_some());
+    }
 }
 
 #[tokio::test]
@@ -304,18 +353,20 @@ async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
     std::fs::create_dir(repo.worker.join(".boss")).unwrap();
     std::fs::write(repo.worker.join(".boss/events-pending.jsonl"), "bookkeeping").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
+    // No preserved tip was recorded for bookkeeping-only work.
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &resume,
             &lease_for(&repo.replacement, None),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
+            None,
             None,
         )
         .await
         .unwrap();
-    assert_eq!(restored, Some((dead_id, false)));
+    assert!(restored.is_none());
 }
 
 #[tokio::test]
@@ -332,11 +383,12 @@ async fn recovery_is_a_no_op_for_a_non_resume_dispatch() {
         .unwrap();
     let coordinator = recovery_coordinator(db);
     let restored = coordinator
-        .recover_execution_bookmark(
+        .recover_execution_bookmark_for_test(
             &fresh,
             &lease_for(dir.path(), None),
-            &coordinator.host_adapter,
+            &coordinator.host_adapter(),
             "mono",
+            None,
             None,
         )
         .await
@@ -405,7 +457,7 @@ async fn resume_does_not_reclaim_stale_lease_for_recovery() {
     };
 
     let result = coordinator
-        .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter)
+        .lease_workspace_with_fallback_for_test(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter())
         .await;
     assert!(result.is_ok(), "resume lease should succeed after reclaim");
 
@@ -461,7 +513,7 @@ async fn hard_prefer_resume_does_not_reclaim_unowned_lease() {
     };
 
     let _ = coordinator
-        .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter)
+        .lease_workspace_with_fallback_for_test(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter())
         .await;
 
     let releases = cube.force_release_calls.lock().await;
@@ -643,7 +695,7 @@ async fn lease_fallback_failure_transitions_execution_to_failed() {
 }
 
 #[tokio::test]
-async fn change_creation_failure_marks_execution_failed_and_releases_workspace() {
+async fn change_creation_failure_releases_workspace_before_any_recovery_bookmark() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -654,8 +706,7 @@ async fn change_creation_failure_marks_execution_failed_and_releases_workspace()
         fail_create: true,
         ..FakeCubeClient::default()
     });
-    // No retries: go straight to permanent failure to keep the
-    // release_calls assertion (exactly "lease-1") unambiguous.
+    // No retries: inspect the failed attempt and its retained lease.
     let coordinator = Arc::new(
         ExecutionCoordinator::new(
             db.clone(),
@@ -678,7 +729,14 @@ async fn change_creation_failure_marks_execution_failed_and_releases_workspace()
     let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
     assert_eq!(run.status, "failed");
     assert_eq!(run.error_text.as_deref(), Some("cube change create failed"));
-    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    assert!(!cube.release_calls.lock().await.is_empty());
+    assert_eq!(execution.cube_lease_id.as_deref(), None);
+    assert!(
+        !db.list_attention_items(&execution.id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+    );
     assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 }
 
@@ -698,7 +756,7 @@ async fn cancelled_during_spawn_releases_lease_and_skips_completion() {
     let chore = create_test_chore(&db, product.id.clone(), "Sort struct definitions");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         cancelled_during_spawn: true,
         work_db: Some(db.clone()),
@@ -714,6 +772,14 @@ async fn cancelled_during_spawn_releases_lease_and_skips_completion() {
     // The runner cancels the row inside the spawn; wait for that
     // terminal status to settle.
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Cancelled).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while db.get_execution(&execution_id).unwrap().cube_lease_id.is_some() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("confirmed mid-spawn teardown must release the lease");
 
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
@@ -794,8 +860,8 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
             .filter(|e| e.stage == crate::dispatch_events::Stage::WorkspaceRecovery.as_str()
                 && e.outcome == crate::dispatch_events::Outcome::Skipped.as_str())
             .count(),
-        1,
-        "a resume with no bookmark row must emit the skipped-recovery event once"
+        0,
+        "resuming a held workspace never enters recovery"
     );
 
     let mut saw_call = false;
@@ -819,7 +885,8 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
 
 #[tokio::test]
 async fn resume_pane_spawn_continues_when_the_recorded_heads_are_missing() {
-    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    use boss_engine_recovery::execution_bookmark::LocalJj;
+    use boss_engine_recovery_fixtures::create;
     use boss_engine_test_git::jj::JjRepo;
     let (_dir, db) = open_db_arc();
     seed_local_claude_driver(&db);
@@ -843,10 +910,6 @@ async fn resume_pane_spawn_continues_when_the_recorded_heads_are_missing() {
     let repo = JjRepo::new(root.path());
     let record = create(&LocalJj, &repo.worker, &exec.id, "local").await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
-    JjRepo::run(
-        &repo.repo,
-        &["bookmark", "delete", &record.head(), &record.publication()],
-    );
 
     let runner = Arc::new(FakeExecutionRunner {
         slot_id: Some(1),
@@ -924,6 +987,10 @@ async fn resume_pane_spawn_still_reenters_when_the_bookmark_is_present() {
 
 pub(super) fn configure_recovery_origin(shared: &std::path::Path) {
     use boss_engine_test_git::jj::JjRepo;
+    JjRepo::run(
+        shared,
+        &["config", "set", "--repo", "revset-aliases.\"trunk()\"", "main"],
+    );
     JjRepo::run(shared, &["bookmark", "set", "main", "-r", "@"]);
     JjRepo::run(shared, &["git", "export"]);
     JjRepo::run(

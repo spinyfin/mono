@@ -375,19 +375,6 @@ pub(super) fn reconcile_free_workspace_health(
                     skip_reason: None,
                 });
             }
-            WorkspaceHealthOutcome::ConflictedBookmarks(_) => {
-                if !dry_run {
-                    let _ =
-                        store.update_workspace_health(&record.repo, &record.workspace_id, WorkspaceHealth::Conflicted);
-                }
-                report.still_unhealthy.push(ReconcileHealthEntry {
-                    repo: record.repo,
-                    workspace_id: record.workspace_id,
-                    prior_health,
-                    new_health: Some("conflicted".to_string()),
-                    skip_reason: None,
-                });
-            }
             WorkspaceHealthOutcome::BrokenEmpty => {
                 // Don't re-classify broken-empty as dirty — leave the existing
                 // health marker intact and report as skipped. The broken-empty

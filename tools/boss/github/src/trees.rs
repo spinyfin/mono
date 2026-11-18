@@ -22,7 +22,7 @@
 //! must distinguish (missing auth, rate limit, missing repo, offline)
 //! need four different remedies.
 
-use crate::gh_runner::{gh_output, parse_http_status_from_stderr};
+use crate::gh_runner::gh_output;
 
 /// One blob in a repo's tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,15 +126,11 @@ type TreeResult<T> = std::result::Result<T, TreeApiError>;
 /// Pure (no I/O) so every branch is pinned by unit tests.
 fn classify_failure(stderr: &str) -> TreeApiError {
     let message = stderr.trim().to_owned();
-    let lower = message.to_lowercase();
-    let kind = if lower.contains("rate limit") || lower.contains("secondary rate") || lower.contains("http 429") {
-        TreeApiErrorKind::RateLimited
-    } else if lower.contains("http 401") || lower.contains("http 403") || lower.contains("bad credentials") {
-        TreeApiErrorKind::NotAuthorized
-    } else if parse_http_status_from_stderr(&message) == Some(404) || lower.contains("not found") {
-        TreeApiErrorKind::NotFound
-    } else {
-        TreeApiErrorKind::Unreachable
+    let kind = match git_utils::gh_cli::classify_failure(&message) {
+        git_utils::gh_cli::GhFailure::RateLimited => TreeApiErrorKind::RateLimited,
+        git_utils::gh_cli::GhFailure::NotAuthorized => TreeApiErrorKind::NotAuthorized,
+        git_utils::gh_cli::GhFailure::NotFound => TreeApiErrorKind::NotFound,
+        git_utils::gh_cli::GhFailure::Other => TreeApiErrorKind::Unreachable,
     };
     TreeApiError {
         kind,
@@ -434,6 +430,12 @@ mod tests {
         // `classify_failure` is load-bearing, not incidental.
         let err = classify_failure("gh: API rate limit exceeded (HTTP 403)");
         assert_eq!(err.kind, TreeApiErrorKind::RateLimited);
+    }
+
+    #[test]
+    fn non_rate_limit_403_classifies_as_not_authorized() {
+        let err = classify_failure("Resource not accessible by integration (HTTP 403)");
+        assert_eq!(err.kind, TreeApiErrorKind::NotAuthorized);
     }
 
     #[test]

@@ -30,6 +30,19 @@ final class PaneLayoutModelBoundaryTests: XCTestCase {
         ]
     }
 
+    // MARK: Waiting counts
+
+    func testJobWaitsCountSeparatelyFromNeedsInput() {
+        var model = F.model()
+        model.updateMembers([
+            PaneMember(runId: "a", startedAt: F.epoch, isWaitingOnJob: true),
+            PaneMember(runId: "b", startedAt: F.epoch.addingTimeInterval(1), isWaitingOnJob: true),
+            PaneMember(runId: "c", startedAt: F.epoch.addingTimeInterval(2), isWaiting: true),
+        ])
+        XCTAssertEqual(model.waitingOnJobCount, 2)
+        XCTAssertEqual(model.waitingCount, 1)
+    }
+
     // MARK: Filters
 
     func testTypeFilterNarrowsMembershipAndPacksTheFilteredRuns() throws {
@@ -89,6 +102,24 @@ final class PaneLayoutModelBoundaryTests: XCTestCase {
         XCTAssertTrue(model.isEmpty)
         XCTAssertEqual(model.hiddenCount, 6)
         XCTAssertTrue(model.filter.isActive)
+    }
+
+    func testToggleBuildsMultiSelectAndLastUncheckReturnsToAll() {
+        let alpha = AgentProject.project(id: "alpha")
+        var filter = PaneFilter.all
+        filter.toggle(project: alpha)
+        filter.toggle(project: .unfiled)
+        XCTAssertEqual(filter.projects, [alpha, .unfiled])
+        filter.toggle(project: alpha)
+        filter.toggle(project: .unfiled)
+        XCTAssertNil(filter.projects)
+        XCTAssertFalse(filter.isActive)
+
+        filter.toggle(type: .unknown)
+        XCTAssertEqual(filter.types, [.unknown])
+        XCTAssertTrue(filter.isActive)
+        filter.toggle(type: .unknown)
+        XCTAssertEqual(filter, .all)
     }
 
     func testPaginationFollowsTheFilteredSetNotTheTotal() {

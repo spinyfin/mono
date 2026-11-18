@@ -87,6 +87,80 @@ to explicit toolchain manifests, locale and SDK selection, and
 credential-variable inheritance. Those policies should be specified
 independently of this fix.
 
+## The progression agent: no workspace
+
+A `progression` run (the agent that diagnoses one stuck work item) holds no
+code checkout and no cube lease. It is spawned through the same local path as
+every other worker, but its working directory is an engine-owned scratch
+directory, `<system temp>/boss-progression-scratch/<execution id>`, outside every
+repository, created before the spawn and removed when the run is torn down.
+The spawn machinery needs a directory to write the agent-rules file, the settings
+pointer and the initial-input script, and nothing else lives there.
+
+What it can run is an allowlist under `--permission-mode dontAsk`, which the
+dispatcher forces so it cannot be downgraded: `Read`, `Grep` and `Glob`;
+`boss propose`, read-only `boss task show|list` and `boss pr status` (in both
+the bare `boss` and `"$BOSS_BIN"` spellings); and `gh pr view|checks`. Everything
+else is denied: file writes, all of `jj`, `git` and `cube`, mutating `gh` verbs
+and `gh api` with a mutating method or field flag. The ordinary worker denylist
+still applies on top. The confinement differs per driver, and none of them uses
+the Standard posture:
+
+- **Claude** relies on the allowlist and deny belt above under `dontAsk`.
+- **Codex** gets no `--sandbox` flag; its config renders a `progression`
+  permission profile instead: a read-only filesystem, the attributed engine
+  socket, and network access to `github.com` and `api.github.com` only. A host
+  allowlist cannot tell a GitHub read from an authenticated write, so a
+  deny-by-default `PreToolUse` guard (matcher `.*`) is installed as the second
+  layer. It admits only `boss propose`, `boss task show|list`, `boss pr status`,
+  `gh pr view|checks` and a few read-only file commands (`cat`, `ls`, `head`,
+  `tail`, `nl`, `wc`, `rg` without `--pre`), as a single command with no
+  chaining, redirection or substitution, and rejects mutating `gh`, `jj`, `git`,
+  `cube` and every file write.
+- **Grok** receives the same allow and deny rules as `--allow` / `--deny`
+  arguments under `--permission-mode dontAsk`. On local macOS it runs with
+  `--sandbox off` like every other local kind, so those rules are the only
+  confinement there; elsewhere it also gets the read-only sandbox profile.
+
+The PATH and launcher environment described above applies unchanged: the boss
+and cube launchers are materialized in the worker tool directory and the sealed
+`BOSS_WORKER_TOOL_PATH` is exported. Because the scratch directory has no
+`REPOBIN.toml`, it gets no checkleft launcher, and `BOSS_LEASE_ID` is empty.
+The pane's pid is registered at the confined progression tier of the worker RPC
+surface (with its neighbourhood captured first), on a fresh spawn and again when
+the pane is re-adopted after an engine restart.
+
+### Engine-side probes before the first turn
+
+The agent's confinement does not limit what the engine itself reads while
+composing the prompt. Before the agent's first turn, for an item with a PR, the
+engine (not the agent) runs a fixed set of bounded probes and renders each
+result, or its failure, under "Engine evidence probes". They run with the
+engine's own credentials, outside the worker allowlist:
+
+- `gh pr view <url> --json baseRefName,baseRefOid,headRefOid,statusCheckRollup`
+  for the current head and check rollup.
+- `gh api repos/<owner>/<repo>/git/ref/heads/<branch>` for the live tip of the
+  PR's base branch (the PR's recorded base commit is only its fork point).
+- A GraphQL `defaultBranchRef.target.history(first: 10)` query for recent
+  check outcomes on the default branch, run only when a check is failing.
+- For merge-conflict items, a blob-less scratch fetch of the two commits into a
+  temporary directory created beside (not inside)
+  `boss-progression-scratch/<execution id>` and removed when the probe ends.
+  It fetches from the product's configured remote, falling back to the PR's
+  repository over HTTPS, with `GIT_TERMINAL_PROMPT=0` so missing credentials
+  fail the probe instead of waiting on a prompt. SSH defaults to
+  `ssh -o BatchMode=yes` to prevent prompts through `/dev/tty`; a configured
+  `core.sshCommand` retains its key and connection options with BatchMode
+  appended. Existing `GIT_SSH_COMMAND` or `GIT_SSH` settings are preserved
+  unchanged and must themselves provide noninteractive behavior.
+- A CI log tail for each failing check whose stored attempt is not already for
+  the current head.
+
+Each probe has a finite time bound (120 seconds for `gh`, 300 seconds for the
+conflict fetch). A probe that fails or times out is rendered as such and the
+agent treats that evidence as unknown.
+
 ## Validation
 
 The worker-bin Bazel tests put a stale checkleft ahead of the composed PATH

@@ -162,17 +162,6 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
-        name: "toolbar_search_standard",
-        description: "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead \
-             of the custom WorkSearchToolbarItem. Requires the macOS app to be built with \
-             standard-search support (capability: toolbar_search_standard). DEFAULT OFF — \
-             flip ON to validate the standard search path; the capability-present badge in the \
-             debug pane confirms the implementation is compiled into this build.",
-        category: "ui",
-        default_enabled: false,
-        capability_id: Some("toolbar_search_standard"),
-    },
-    FeatureFlagSpec {
         name: "notification_dedup",
         description: "Run LLM near-duplicate detection when persisting an Attention item \
              (creation path) and on startup (sweep). Off by default — enable to \
@@ -199,17 +188,11 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     },
     FeatureFlagSpec {
         name: "conflict_ladder_mechanical_rebase",
-        description: "Run the rung-1 engine-direct mechanical rebase (`cube workspace rebase`) on the \
-             conflict_watch path before spawning a full-worker revision (design: \
-             merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md, T4). When a probe \
-             reports an in-review PR CONFLICTING, the engine leases a workspace, positions it on the \
-             PR, and rebases onto main with no agent: on REBASED_CLEAN it auto-retires the conflict \
-             (zero tokens); on conflicts it records the diagnosis and falls through to the existing \
-             worker spawn. DEFAULT OFF — the path leases a workspace and pushes to the PR branch \
-             engine-side; enable per operator once validated in staging. Kill switch: set false to \
-             make conflict detection fall straight through to the worker path.",
+        description: "Run engine-direct rebase and deterministic generated-lockfile regeneration before \
+             worker fallback. Enabled by default so lockfile-only conflicts use their owning tools. \
+             Set to false to disable all mechanical remediation, including lockfile regeneration.",
         category: "conflict",
-        default_enabled: false,
+        default_enabled: true,
         capability_id: None,
     },
     FeatureFlagSpec {
@@ -345,11 +328,11 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              is why revisions were being finalized 78s in with nothing pushed; without a declaration the \
              run is now held by run_done_backstop rather than terminalized. The merged / merge-queue / \
              conflict-cleared arms are untouched: each is a real delta or proof the deliverable has left \
-             the worker's hands. (2) The NO_CHANGES_NEEDED terminal reads `run_done --outcome \
-             no_changes_needed` first, with the transcript marker demoted to a counted fallback \
-             (worker_proposals.fallback_hit.run_done), so the declaration also covers the kinds that never \
-             open a PR. DEFAULT OFF: enable per operator once the proposal path is validated in staging. \
-             Kill switch: set false to restore today's inference exactly — the gate stops asking for a \
+             the worker's hands. (2) The no-op terminal reads the `run_done --outcome \
+             no_changes_needed` declaration (the only no-op channel; the legacy NO_CHANGES_NEEDED text \
+             marker is retired and not consulted, with or without this flag), so the declaration also \
+             covers the kinds that never open a PR. DEFAULT OFF: enable per operator once the proposal \
+             path is validated in staging. Kill switch: set false to restore today's inference exactly — the gate stops asking for a \
              declaration and the backstop never runs.",
         category: "completion",
         default_enabled: false,
@@ -413,13 +396,127 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              flag is on, the mediation policy is enforced only by prompt text — `boss task update` from a \
              worker shell executes at `RpcTier::User`, unconditionally allowed. DEFAULT OFF: enabling it \
              newly denies any script or human debugging session that runs a mutating verb from inside a \
-             worker pane. Kill switch: set false to return every connection to `RpcTier::User` without a \
-             rebuild.",
+             worker pane. Kill switch: set false to return ordinary worker connections to `RpcTier::User` \
+             without a rebuild. Progression connections always enforce their tier policy and sanitization, \
+             regardless of this flag.",
         category: "worker-isolation",
         default_enabled: false,
         capability_id: None,
     },
+    FeatureFlagSpec {
+        name: "progression_agents",
+        description: "Let the engine spend an administrative `progression` agent on any non-parked work item \
+             that is stuck, has no live work, and is not waiting on a human (design: \
+             task-persistence-parking-and-autonomous-progression.md, section 2). When on, the \
+             `progression_sweep` reads the `progression_candidates` view every \
+             `progression.sweep_interval` and mints one `progression` execution per candidate, oldest stuck \
+             first, into the progression pool (`progression.pool_size` slots, invisible to the interactive \
+             cap and to Lower Decks spillover, held by both the operator and the breaker pause). A \
+             progression agent never writes to a repository; it diagnoses, then creates work for coding \
+             agents or asks the owner one question. DEFAULT OFF, and inert until the progression worker \
+             kind lands: until then a minted row is held `ready` with wait reason `progression_unavailable` \
+             and cannot spawn. The stuck report and `bossctl dispatch diagnose` read the same candidate view \
+             whether or not this flag is on. Kill switch: set false to stop minting; rows already minted \
+             stay `ready` until they are cancelled.",
+        category: "progression",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: CONFLICT_RESOLUTION_DEFERRAL_FLAG,
+        description: "Resolve merge conflicts just in time (tools/boss/docs/conflict-resolution-deferral.md; \
+             investigation: docs/investigations/merge-conflict-sources-and-remedies.md, idea E4). When on, a \
+             conflict detected on a PR nobody has asked to merge is recorded in the `conflict_resolutions` ledger \
+             as `deferred` and shown on the card as conflicted with its resolution waiting for a merge request, \
+             but no rebase, resolver or agent runs for it. The deferred conflict is resolved through the normal \
+             ladder and push gate once a merge is requested for the PR or a human asks for it; it is never \
+             dropped and the PR is never reported clean while GitHub says it conflicts. Which PRs this applies to is decided \
+             by `conflict_resolution_deferral_ab_split`. DEFAULT OFF: every conflict is resolved on detection. \
+             Kill switch: set false and every deferred conflict is released to the normal resolution path on the \
+             next merge-poller pass.",
+        category: "conflict",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: CONFLICT_RESOLUTION_DEFERRAL_AB_SPLIT_FLAG,
+        description: "Run `conflict_resolution_deferral` as an A/B experiment split by PR-number parity \
+             (investigation: docs/investigations/merge-conflict-sources-and-remedies.md, experiment 5). When on, \
+             only odd-numbered PRs are deferred (treatment arm); even-numbered PRs, and PRs whose number cannot \
+             be read, are resolved on detection (control arm). Each ledger row records the arm it was assigned, \
+             so the arms can be compared on resolutions per merged PR, time from merge request to merge, and \
+             how often a deferred conflict needed a human. Has no effect while `conflict_resolution_deferral` \
+             is off. DEFAULT ON, so enabling deferral starts the experiment; set false to defer every PR.",
+        category: "conflict",
+        default_enabled: true,
+        capability_id: None,
+    },
 ];
+
+/// Master switch for just-in-time merge-conflict resolution. See the
+/// registry entry for the behaviour it gates.
+pub const CONFLICT_RESOLUTION_DEFERRAL_FLAG: &str = "conflict_resolution_deferral";
+
+/// Restricts [`CONFLICT_RESOLUTION_DEFERRAL_FLAG`] to the treatment arm of
+/// the PR-number-parity experiment. See the registry entry.
+pub const CONFLICT_RESOLUTION_DEFERRAL_AB_SPLIT_FLAG: &str = "conflict_resolution_deferral_ab_split";
+
+/// Which arm of the just-in-time conflict-resolution rollout a PR is in.
+///
+/// The arm is a pure function of the two deferral flags and the PR number,
+/// so every detection pass assigns the same PR to the same arm for as long
+/// as the flags stay put. It is also written onto each `conflict_resolutions`
+/// row at detection time, because the flags can change mid-experiment and
+/// the analysis must compare what was actually done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictDeferralArm {
+    /// Deferral is off: every conflict is resolved on detection and no
+    /// experiment is running.
+    Off,
+    /// Experiment control arm: resolved on detection, exactly as with
+    /// deferral off, but labelled so it can be compared with the treatment.
+    Control,
+    /// Treatment: the conflict is recorded and resolved only once the PR is
+    /// otherwise ready to merge or a human asks.
+    Deferred,
+}
+
+impl ConflictDeferralArm {
+    /// Assign an arm from the two flag values and the PR number.
+    ///
+    /// With the A/B split on, odd-numbered PRs are the treatment arm and
+    /// even-numbered PRs the control arm. A PR whose number is unknown is
+    /// put in the control arm: resolving on detection is the established
+    /// behaviour, so it is the safe side for a row the experiment cannot
+    /// classify.
+    pub fn assign(deferral_enabled: bool, ab_split_enabled: bool, pr_number: Option<u64>) -> Self {
+        if !deferral_enabled {
+            return Self::Off;
+        }
+        if !ab_split_enabled {
+            return Self::Deferred;
+        }
+        match pr_number {
+            Some(number) if number % 2 == 1 => Self::Deferred,
+            _ => Self::Control,
+        }
+    }
+
+    /// Whether a conflict in this arm waits for the PR to be ready.
+    pub fn defers(self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+
+    /// Stable value for the ledger's `deferral_arm` column. `None` while no
+    /// rollout is running, so rows written with deferral off stay unlabelled.
+    pub fn ledger_label(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Control => Some("control"),
+            Self::Deferred => Some("deferred"),
+        }
+    }
+}
 
 /// Snapshot of one flag's current state for the wire / debug pane.
 /// Mirrors the protocol type one-for-one so the engine can return the
@@ -584,6 +681,16 @@ impl FeatureFlagsStore {
     /// be a typo on the consumer side that wasn't caught by review.
     pub fn is_enabled(&self, name: &str) -> bool {
         self.get(name).unwrap_or(false)
+    }
+
+    /// The just-in-time conflict-resolution arm `pr_number` is in right
+    /// now, from the live values of the two deferral flags.
+    pub fn conflict_deferral_arm(&self, pr_number: Option<u64>) -> ConflictDeferralArm {
+        ConflictDeferralArm::assign(
+            self.is_enabled(CONFLICT_RESOLUTION_DEFERRAL_FLAG),
+            self.is_enabled(CONFLICT_RESOLUTION_DEFERRAL_AB_SPLIT_FLAG),
+            pr_number,
+        )
     }
 
     /// Override `name` to `enabled` and atomically persist the new
@@ -973,6 +1080,74 @@ mod tests {
     }
 
     #[test]
+    fn conflict_deferral_is_off_by_default_for_every_pr() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(!store.is_enabled(CONFLICT_RESOLUTION_DEFERRAL_FLAG));
+        // The split defaults on so that enabling deferral starts the experiment.
+        assert!(store.is_enabled(CONFLICT_RESOLUTION_DEFERRAL_AB_SPLIT_FLAG));
+        for pr_number in [None, Some(1), Some(2), Some(3559), Some(3560)] {
+            let arm = store.conflict_deferral_arm(pr_number);
+            assert_eq!(arm, ConflictDeferralArm::Off, "pr {pr_number:?}");
+            assert!(!arm.defers());
+            assert_eq!(arm.ledger_label(), None);
+        }
+    }
+
+    #[test]
+    fn conflict_deferral_splits_by_pr_number_parity() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        store.set(CONFLICT_RESOLUTION_DEFERRAL_FLAG, true).unwrap();
+
+        for odd in [1, 3559, 100_001] {
+            let arm = store.conflict_deferral_arm(Some(odd));
+            assert_eq!(arm, ConflictDeferralArm::Deferred, "pr {odd}");
+            assert!(arm.defers());
+            assert_eq!(arm.ledger_label(), Some("deferred"));
+        }
+        for even in [0, 2, 3560] {
+            let arm = store.conflict_deferral_arm(Some(even));
+            assert_eq!(arm, ConflictDeferralArm::Control, "pr {even}");
+            assert!(!arm.defers());
+            assert_eq!(arm.ledger_label(), Some("control"));
+        }
+        // A PR the experiment cannot classify keeps the established behaviour.
+        assert_eq!(store.conflict_deferral_arm(None), ConflictDeferralArm::Control);
+    }
+
+    #[test]
+    fn conflict_deferral_without_the_split_defers_every_pr() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        store.set(CONFLICT_RESOLUTION_DEFERRAL_FLAG, true).unwrap();
+        store.set(CONFLICT_RESOLUTION_DEFERRAL_AB_SPLIT_FLAG, false).unwrap();
+        for pr_number in [None, Some(2), Some(3559), Some(3560)] {
+            assert_eq!(
+                store.conflict_deferral_arm(pr_number),
+                ConflictDeferralArm::Deferred,
+                "pr {pr_number:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_deferral_split_alone_changes_nothing() {
+        // The split only chooses among PRs once deferral itself is on.
+        assert_eq!(
+            ConflictDeferralArm::assign(false, true, Some(3559)),
+            ConflictDeferralArm::Off
+        );
+        assert_eq!(
+            ConflictDeferralArm::assign(false, false, Some(3559)),
+            ConflictDeferralArm::Off
+        );
+    }
+
+    #[test]
     fn capability_registry_register_and_check() {
         let reg = CapabilityRegistry::new();
         assert!(!reg.is_present("my_feature"));
@@ -1028,10 +1203,10 @@ mod tests {
         // directly via the snapshot logic's building blocks.
         let reg = CapabilityRegistry::new();
         // A capability that is absent.
-        assert!(!reg.is_present("toolbar_search_standard"));
+        assert!(!reg.is_present("example_capability"));
         // Register it.
-        reg.register("toolbar_search_standard");
-        assert!(reg.is_present("toolbar_search_standard"));
+        reg.register("example_capability");
+        assert!(reg.is_present("example_capability"));
         // A different one is still absent.
         assert!(!reg.is_present("other_cap"));
     }

@@ -36,7 +36,8 @@
 //! The same GitHub path serves the per-product coordinator guidance file
 //! (`BOSS_COORDINATOR.md`, see [`DesignDocsService::fetch_coordinator_guidance`]):
 //! resolved at the default branch's HEAD sha and cached under that
-//! immutable key.
+//! immutable key. The per-repo worker file (`BOSS.md`) is read the same way
+//! through [`DesignDocsService::fetch_guidance_file`].
 
 mod body;
 mod cache;
@@ -53,7 +54,7 @@ use boss_protocol::{DesignDocContent, DesignDocEntry, DesignDocTree, DesignDocTr
 
 pub use body::is_immutable_git_ref;
 pub use cache::{BodyCache, CacheKey, DIR_NAME as BODY_CACHE_DIR_NAME, MAX_BYTES, MAX_ENTRIES};
-pub use coordinator_guidance::{CoordinatorGuidanceFetch, MAX_COORDINATOR_GUIDANCE_BYTES};
+pub use coordinator_guidance::{CoordinatorGuidanceFetch, MAX_COORDINATOR_GUIDANCE_BYTES, MAX_REPO_GUIDANCE_BYTES};
 
 /// The GitHub reads this service needs, behind a trait so tests can
 /// exercise the cache and classification logic without a network call

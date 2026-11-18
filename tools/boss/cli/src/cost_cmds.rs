@@ -7,6 +7,38 @@ use crate::*;
 pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
+        CostCommand::Sol => {
+            let response = client
+                .send_request(&FrontendRequest::GetSolComparisonReport)
+                .await
+                .map_err(CliError::internal)?;
+            let report = match response {
+                FrontendEvent::SolComparisonReport { report } => report,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("cost sol", &other)),
+            };
+            print_entity(ctx, &serde_json::json!({"report": report}), || {
+                for arm in &report.arms {
+                    println!(
+                        "{}: {} PRs, {} merged; first CI passes {}/{}; findings/PR {}; revisions/merged PR {}; tokens/merged PR {}; {} unmeasured runs",
+                        arm.arm,
+                        arm.prs,
+                        arm.merged_prs,
+                        arm.first_attempt_ci_passes,
+                        arm.ci_observed_prs,
+                        format_optional_average(arm.findings_per_pr),
+                        format_optional_average(arm.revisions_per_merged_pr),
+                        format_optional_average(arm.tokens_per_merged_pr),
+                        arm.merged_pr_cost.runs_unmeasured
+                    );
+                }
+                for note in &report.notes {
+                    println!("{note}");
+                }
+            })
+        }
         CostCommand::Task(args) => {
             let work_item = match parse_work_item_selector(&args.id) {
                 WorkItemSelector::ShortId(n) => resolve_short_id_item(&mut client, ctx, args.product, n).await?,
@@ -353,6 +385,12 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             report.limit
         );
     }
+}
+
+fn format_optional_average(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(test)]

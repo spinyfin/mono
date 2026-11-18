@@ -464,6 +464,37 @@ Selection should prefer:
 Cube does not need perfect cache prediction in v1. "Prefer a free existing
 workspace over creating a new one" is already a meaningful win.
 
+In practice a lease walks these doors in order and takes the first that
+opens. Shared-store bookmark conflicts do not make a workspace unhealthy;
+only conflicts in its working-copy tree do:
+
+1. a free workspace whose cached health is clean or unknown (probed, bounded
+   by a probe cap and a time budget);
+2. a quarantined workspace the reuse guard can verify holds nothing unpushed;
+3. a free workspace cached `dirty` or `conflicted` that the lease can
+   **salvage and reset**: any unpushed work is written to a salvage record
+   first (manifest plus per-commit patches, outside the workspace and the jj
+   store), and the non-empty `@` stays a visible head in the shared store —
+   in practice pinned by the Boss engine's `boss-recovery/exec_*` bookmark.
+   This is the retention GC's reclaim, run on demand instead of a day later;
+   a workspace that cannot be salvaged is left exactly as it was. Only rows
+   unhealthy for at least 15 minutes qualify (so an orphaned worker's
+   workspace survives long enough for the engine's resume-in-place
+   redispatch), a row whose lease expired in the same call never does, the
+   probes are bounded by a 10s budget and rotate across leases through a
+   persisted cursor so rows that always fail cannot starve the rest, and a
+   lease that fails after the claim restores the row's cached health and
+   discards the salvage record;
+4. only then a fresh workspace.
+
+Every mint through door 4 is audited as `workspace.provisioned_no_eligible_free`
+with every free workspace the lease did not use and the reason (excluded,
+skipped probe, filtered or failed reclaim, not reached because of the probe
+cap or deadline, guard refusal), the pool's cached-unhealthy set broken down by health and release reason, and the
+reclaim scan's own report. A pool that grows while `cube workspace list` shows
+free rows is diagnosed from that event, not reconstructed from creation
+timestamps.
+
 ### Create
 
 Creating a workspace must be atomic with respect to the pool: a directory that
@@ -563,6 +594,92 @@ holding anything no remote has is skipped and left to the retention pass, which
 salvages before it resets. A repo whose surplus is entirely unpushed work will
 therefore not reach its mark, which is correct.
 
+**Repo-declared cleanup is the relief valve for state cube cannot see.** Some
+of a workspace's build state lives outside its checkout (a build tool's output
+tree under a shared cache directory), where compaction never looks and nothing
+else gives it back. Cube does not know what any of that is. A repo declares a
+`cleanup:` command in `.cube/setup.yaml`, next to its setup steps:
+
+```yaml
+version: 1
+cleanup:
+  command: bash "$CUBE_CLEANUP_ROOT/.cube/cleanup-bazel-output-base.sh"
+```
+
+Cube decides **when** and **whether** a workspace may be cleaned; the command
+decides **what cleaning means**. It runs through `sh -c` with cwd and
+`CUBE_WORKSPACE` set to the workspace (`CUBE_BASE_REPO` too, when the repo has a
+canonical source). Exit 0 is cleaned, exit 75 is "busy, nothing done", anything
+else (including 126/127) is a failure that stays withheld and is retried.
+The command must be idempotent.
+
+`CUBE_CLEANUP_ROOT` names a temporary snapshot of fetched trunk's `.cube/`
+assets. Cube reads the registered repo's `<main_branch>@origin` revision in
+the shared store, independently of the source working copy. A missing trunk
+declaration never falls back to an unmerged branch; only repos without a
+registered source use the workspace declaration. Use it to find
+the script while keeping `CUBE_WORKSPACE` as the cleanup target. Cleanup alone
+runs in its own process group; its timeout covers output draining and kills
+the group. Both stdout and stderr are logged and audited on success or failure.
+
+- _When_: free space only. Below the low-water mark — the same floor the lease
+  path uses (`min-free-bytes` / `min-free-percent`) — cube cleans free
+  workspaces **least recently leased first**, one at a time, re-reading free
+  space after each, and stops as soon as free space is back above the
+  high-water mark (the floor plus `cleanup-headroom-bytes`, default 16 GiB —
+  about one fully built workspace). Above the floor nothing is cleaned, however
+  idle: warm workspaces are what the pool is for, so there is no retention
+  clock. A workspace is not cleaned again until it has been leased again.
+- _Safety_: only free workspaces. The cleaning workspace is marked in the
+  registry, and every lease claim query skips marked rows, so a lease that
+  arrives mid-cleanup takes a different workspace (or mints one) and never
+  sees a half-cleaned tree. Dirty, conflicted and quarantined workspaces are
+  skipped, because a recovery lease (`--allow-dirty`) must be able to claim
+  them. A busy workspace (exit 75) is released and skipped only if it had no
+  earlier cleanup failure. Retries that report busy or no longer have a declared
+  cleanup step remain failed and withheld until a successful cleanup or explicit
+  `--clear-failed-cleanup`. A failed cleanup,
+  or one whose process died, leaves the mark in place — the workspace is not
+  leased in a broken state — and is retried (at most every ten minutes, without
+  waiting for disk pressure) until it succeeds. Marked workspaces appear as
+  withheld in `cube workspace list`. Use `cube workspace gc --clear-failed-cleanup`
+  (optionally with `--workspace`) to return failed workspaces to the pool as
+  they are; `--dry-run` does not clear marks.
+- _Where it runs_: in an independent process launched by periodic pool GC after compaction, and
+  from `cube workspace gc` (`--dry-run` lists the workspaces it would clean, in
+  order, and why). Low free space also shortens the GC throttle from a day to
+  five minutes, but only while the previous pass managed to clean something.
+  A separate cleanup-pass lock serializes cleanup: manual gc waits for it,
+  while the periodic pass yields if another pass holds it. Detached pass output,
+  including startup failures and summaries, is appended to `periodic-cleanup.log`
+  beside the cube database.
+- _Accounting_: bytes freed is the change in the volume's free space across the
+  command. Every cleanup is logged and audited (`workspace.cleanup`: workspace,
+  outcome, reason, trigger, bytes freed, duration, the command's output).
+
+### Bazel cleanup and the existing reclaim command
+
+Mono's pressure hook discovers bases through workspace symlinks and verifies
+`DO_NOT_BUILD_HERE`. It atomically renames each base before removal, retaining
+an ownership record beside the renamed tree so an interrupted deletion can be
+finished without exposing a partial base to Bazel. Shutdown failure is busy,
+not a failed deletion. A legacy partial base without ownership evidence stays
+withheld and requires operator inspection.
+
+Cube also retains `bazel_output_base.rs` for explicit teardown (`workspace remove
+--expunge` and pool trimming) and `cube workspace reclaim-bazel-bases` for orphan
+sweeps. That older module derives workspace base names using path hashes; the
+pressure hook deliberately does not use that rule. These implementations coexist
+because the generic cleanup contract must not embed Bazel-specific discovery in
+Cube, while existing teardown and orphan-reclaim commands remain supported.
+The repo hook handles only bases linked from an existing workspace. Orphans are
+covered by `cube workspace reclaim-bazel-bases`, including interrupted
+`<hash>.cube-removing` trees and their ownership records. Both teardown and
+the sweep remove those leftovers, and the sweep preserves them for registered
+workspaces. There is no generic
+repo-level sweep hook yet. Neither path targets the shared download cache or
+the Bazel installation tree.
+
 Configure under `[pool]` in `cube.toml`:
 
 ```toml
@@ -572,6 +689,7 @@ build-artifact-dirs = ["target", ".build"]
 compact-idle-hours = 6
 min-free-bytes = 21474836480   # 20 GiB
 min-free-percent = 2           # floor = max(bytes, percent-of-total)
+cleanup-headroom-bytes = 17179869184   # 16 GiB: how far above the floor cleanup stops
 
 [pool.repos.flunge]
 max-free-workspaces = 6
@@ -582,6 +700,155 @@ orphan-held workspace is `leased`, so it is invisible to both passes and its
 disk stays held. That is deliberate — cube does not adjudicate liveness — and
 the `lease.heartbeat` audit event carries `lease_age_secs` so the population is
 greppable.
+
+### Shared-store upkeep (`cube repo gc`)
+
+The two passes above never touch `repos/<repo>`, but that store has its own
+growth: every workspace of a repo is a secondary jj workspace on it, and
+every operation any of them records — a `jj new` on lease, a worker's
+snapshot, a bookmark set, a fetch — writes one view file listing every
+bookmark in the store. jj never removes operations on its own, so the log
+grows until old operations are abandoned and their files collected.
+
+`cube repo gc <repo>` is the generic jj recipe, run in the store's primary
+checkout and not aware of anything above jj:
+
+1. `jj op abandon ..<cut>`, where the cut is the newest operation that ended
+   before the keep window (`--keep-hours`, default 72). Descendant operations
+   are reparented; views are content-addressed and untouched. The rewrite
+   gives every kept operation a new id, so a jj command that loaded the old
+   head and commits afterwards would leave a second operation head that
+   shares only the root with the new one, and jj would merge the two views
+   against an empty base. The abandon therefore runs only at an instant with
+   no `jj` process on the host (poll for up to five minutes outside the
+   exclusive gate, then re-probe under it, retrying that sequence within the budget; a persistently busy host
+   skips the abandon and collection until the next daily pass), and the pass stops before collecting if the store then holds
+   anything but exactly one operation head. Every `jj` command cube itself
+   starts holds a host-wide shared gate (`locks/jj-maintenance.lock`) for
+   its run, and the pass holds the gate exclusive from before the abandon
+   through the immediate head check, so no cube-started command
+   can load the pre-rewrite head. The rewrite has a two-minute safety deadline
+   to accommodate large kept-operation DAGs. Read-only index warm-up then runs
+   under a shared gate with a five-minute deadline. It is pinned to the checked
+   operation, so it cannot merge a second head that appears while rebuilding.
+   Warm-up failure is audited and non-fatal; the independent fresh-index checks
+   still gate collection. A timed-out child is killed and
+   reaped, and heads are checked before releasing the gate even on failure.
+   A durable, atomically published `locks/jj-maintenance.blocked` marker prevents cube readers
+   from resuming after an unverified rewrite. Readers immediately attempt recovery
+   under a nonblocking exclusive gate: only a quiet host with exactly one head
+   in the named store permits removal, including when that store is no longer
+   registered. Busy or unverifiable stores return retryable exit 75 with the
+   owning store and guidance to run `cube repo gc <repo>`. Multiple heads require
+   repair; an empty or unreadable owner requires explicit operator verification
+   before removing the marker. GC also reconciles its own marker at startup and
+   under each exclusive acquisition, but refuses another store's marker. Collection does not
+   follow a failed rewrite. Post-abandon quiet polling uses a shared gate,
+   and heads are checked again before collection. Cube commands wait at most two seconds
+   for the gate and return exit 75 with a message to retry if it stays busy.
+   Leases reserve the shared gate before taking the registry lock or claiming
+   a workspace, avoiding partially prepared leases and a queue behind that lock.
+   A `jj` command that does not go through cube cannot take the gate; only the
+   process probes and head checks cover those. Gate setup deliberately fails
+   closed: an unresolved data directory or an unreadable gate aborts cube
+   commands rather than allowing them to race an operation-head rewrite.
+2. `jj util gc`. By default jj deletes only unreferenced files older than
+   two weeks, and jj 0.26 accepts no other threshold than `--expire now`.
+   A command that loaded the store before the abandon still names the old
+   id of the head it started from, and deleting that file would leave its
+   operation with a missing parent. So the pass collects immediately
+   (`--expire now`) only after it has observed an instant with no `jj`
+   process on the host _after_ the abandon: every command that loaded the
+   store before the rewrite has then finished, and any later command loads
+   the rewritten head, whose files the collection keeps. If the host is
+   still busy after five minutes of post-abandon polling, the pass falls
+   back to the two-week threshold. Collection holds the gate shared, so leases can
+   proceed throughout it. Reports and audit events include `exclusive_ms`
+   and `collection_ms` to distinguish rewrite contention from collection cost.
+   Cube reconstructs a private commit index before abandoning operations and
+   again before collection, uses that index for GC, and verifies a fresh rebuild
+   afterward. This protects predecessor commits required by the active jj
+   version even when an inherited index omits them. A verification failure
+   returns an error and writes a failed `repo.store_gc` audit row; preflight
+   preserves the live cached index on an already-damaged store. See
+   [missing-predecessor recovery](store-gc-recovery.md) for the tested recovery
+   procedure and shared-client version requirements.
+   The pre-collection rebuild is pinned to the checked operation head, and the
+   quiet observation and single-head check follow it immediately before
+   `util gc`; a second head published during the rebuild stops the pass.
+   Pinned parent checks before and after collection accept concurrent merges
+   only when every branch reaches the previously checked head. A merge that
+   restores abandoned ancestry fails the pass and writes a failed audit row,
+   including when it appears during `util gc`. The ancestry walk is bounded
+   to 4,096 operations and 60 seconds and refuses unverified history; the
+   error says whether the bound was exhausted or the walk reached an operation
+   with no parents. A second head seen before any rewrite is ordinary
+   concurrency: heads are re-read three times, 250 ms apart. If multiple heads
+   persist, the pass records collection `concurrent` on the `repo.store_gc`
+   audit row and persists `StoreGcOutcome::Concurrent` ("skipped: a concurrent
+   jj operation was in flight"), leaving `store_gc_consecutive_failures`
+   unchanged so the next pass can retry. Before a rewrite, heads are checked
+   again under the exclusive gate; a second head releases the gate and returns
+   the same concurrent outcome before quarantine or `op abandon`. After the
+   collection, every head is checked rather than refused, and a failure says
+   the collection completed and fresh-index verification was not performed.
+   The collector
+   must also be the oldest client sharing the store: a newer `jj` omits legacy
+   predecessors from its index, prunes them, and still passes its own
+   verifications. The `jj` on `PATH` is therefore refused when newer than the
+   repo's declared oldest client (0.26 until `cube repo declare-oldest-jj <repo>
+<major.minor>` records otherwise once every client is upgraded; the declaration
+   is stored with the repo and audited as `repo.oldest_jj_declared`, never read
+   from a process environment), and its `jj --version` is recorded on the `repo.store_gc` and
+   `repo.store_gc.index_warmup` audit rows. Neither jj 0.26 nor 0.32's `util gc` prunes
+   the default index store, so skipping the live `.jj/repo/index` loses no
+   reclamation.
+   Working-copy health checks can also be expensive after the operation IDs
+   change: jj rebuilds its commit index by walking operation ancestry, so
+   maintenance warms that index without holding the host-wide exclusive gate.
+   Rebuilding an isolated copy of mono's 18 GiB operation store indexed 66,490
+   commits in 148 seconds, so the warm-up deadline is five minutes: roughly
+   twice that measured time, while
+   allowing readers of other stores to proceed. A reader of the same store
+   can still need to build its own index before warm-up finishes.
+   Lease health probes and stale recovery share a
+   two-second per-workspace deadline within the five-second scan budget.
+   A timeout never authorizes reuse; cube tries another candidate or provisions
+   fresh capacity, preserving the existing dirty-workspace checks.
+3. `refs/heads/pr/<n>` git refs whose `pr/<n>` bookmark is gone are deleted;
+   jj's next import drops them from the view.
+
+Each workspace's working copy records the id of the operation it last
+updated at, and the abandon rewrites that operation under a new id. Verified
+on jj 0.26.0 with a second workspace: after its recorded operation was
+abandoned and deleted by `--expire now`, and its `@` was rewritten from the
+first workspace, its next `jj status` ran normally and landed on the
+rewritten `@` without `jj workspace update-stale`.
+
+The periodic pool-GC pass starts this once a day per repo as a detached
+`cube repo gc` child, because the collection deletes one file per abandoned
+operation and view and cannot fit the lease call's twenty-second budget. The
+child comes from the injected command runner (`CommandRunner::cube_executable`
+and `spawn_detached`) and never from `std::env::current_exe()` in the pass
+itself: under `cube_lib_test` that executable is the test binary, and a test
+binary re-run with `repo gc mono` runs every test those words match as a
+name filter, each of which leases and spawns again — the fork bomb that
+took down the dev Mac on 2026-10-23. Test doubles record the request and
+start nothing, and a regression test proves the lease and gc paths create
+no child process of the test binary.
+
+Concurrency: the per-repo stamp (`last_store_gc_at:<repo>`) is written
+before the child starts, so repeated leases cannot pile up collections, and
+the child holds a dedicated `locks/<repo>.store-gc.lock` for its whole run
+(`try_acquire`; a second run is refused). It deliberately does not take the
+per-repo lease lock: a collection runs for minutes and every `cube workspace
+lease` waits on that lock, while jj itself tolerates the workspaces'
+concurrent commands. Listing, independent index verification, and collection
+have thirty-minute command deadlines. Completed passes record before/after
+operation, view and byte counts in `repo.store_gc`; failures record the error,
+source path, dry-run flag, and elapsed time. `repo.store_gc.index_warmup` records
+each warm-up's outcome, elapsed time, deadline, and error when it fails, even
+if a later head check supplies the terminal collection error.
 
 ## PR Model
 

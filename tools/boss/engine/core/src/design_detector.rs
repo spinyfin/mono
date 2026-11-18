@@ -358,6 +358,10 @@ pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id
         Some(s) => s,
         None => return,
     };
+    apply_task_doc_scan(work_db, task_id, product_id, pr_url, scan);
+}
+
+pub(crate) fn apply_task_doc_scan(work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str, scan: PrScanResult) {
     let Some(path) = scan.doc_path else {
         // doc_path could not be determined. The underlying WARN is
         // trace-only, so append an operator-visible note to the task's

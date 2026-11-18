@@ -56,7 +56,7 @@ pub fn seed_from_db<S: MetricsStore + ?Sized>(registry: &Registry, store: &S) ->
 /// returned `JoinHandle` is held by `ServerState` until shutdown so
 /// the task is bound to the engine's lifetime.
 pub fn spawn_flush_task<S: MetricsStore + 'static>(registry: Arc<Registry>, store: Arc<S>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         // `Skip` keeps the task from firing many catch-up flushes
         // after a stall (e.g. machine sleep) — a single fresh flush

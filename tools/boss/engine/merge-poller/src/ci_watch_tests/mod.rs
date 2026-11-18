@@ -1,0 +1,18 @@
+//! Tests for [`super`]'s CI-watch detection/remediation pipeline, grouped by
+//! the concern each module exercises. Shared fixtures live in [`helpers`].
+
+mod back_to_back;
+mod contract_capture;
+mod detection;
+mod helpers;
+mod log_excerpt;
+mod noop_validation;
+mod pre_triage;
+mod rebase_first;
+mod rebounce;
+mod revision;
+mod revision_description;
+mod stale_revision;
+mod trunk_eviction;
+
+mod failure_identity;

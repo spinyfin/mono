@@ -13,6 +13,19 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Internal worker; stdin carries the already-acquired sweep lock.
+    #[command(hide = true)]
+    ReleaseBookmarkGc {
+        repo: String,
+        #[arg(long)]
+        database: Option<std::path::PathBuf>,
+    },
+    /// Internal process entry point for periodic cleanup outside lease dispatch.
+    #[command(hide = true)]
+    PeriodicCleanup {
+        #[arg(long)]
+        database: Option<std::path::PathBuf>,
+    },
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
@@ -53,6 +66,18 @@ pub enum RepoCommand {
         #[arg(long, conflicts_with = "reponame")]
         origin: Option<String>,
     },
+    /// Replace a damaged shared store, keeping a backup and repo configuration.
+    ///
+    /// Release all workspaces and stop processes using the store first.
+    /// All cube jj operations on the host are blocked until recovery finishes.
+    /// Dirty or quarantined workspaces require explicit discard authorization.
+    /// Purges old workspaces; never deletes the old source store.
+    Reclone {
+        repo: String,
+        /// Delete dirty or quarantined free workspaces, losing unsaved files.
+        #[arg(long)]
+        discard_dirty: bool,
+    },
     /// List known repo pools.
     List,
     /// Show repo pool configuration.
@@ -74,6 +99,44 @@ pub enum RepoCommand {
         /// Also delete on-disk workspace directories under the pool's workspace_root.
         #[arg(long)]
         purge_workspaces: bool,
+    },
+    /// Record the oldest jj release that shares a repo's store.
+    ///
+    /// Store upkeep refuses to collect with a `jj` newer than this, because a
+    /// newer jj omits legacy predecessor commits from its index, prunes them,
+    /// and leaves older clients unable to rebuild the store. The default is
+    /// 0.26. Run this once, after every client sharing the store (workers,
+    /// the engine, human shells) has been upgraded. The declaration is kept
+    /// with the repo, so it applies to every collector however it is started.
+    DeclareOldestJj {
+        /// Stable repo identifier such as `mono`.
+        repo: String,
+        /// Oldest jj release still in use, as `major.minor` (for example `0.32`).
+        version: String,
+    },
+    /// Bound the shared jj store's operation log: abandon operations older
+    /// than the keep window and collect what no operation references.
+    ///
+    /// Every workspace of a repo shares one jj store, and every operation
+    /// any of them records writes a view listing every bookmark in it, so
+    /// an untended op log grows without bound. This runs `jj op abandon`
+    /// for operations that ended before the keep window, then `jj util gc`.
+    /// The collection is immediate (`--expire now`) once the host has had an
+    /// instant with no `jj` process — every command that loaded the store
+    /// before the abandon has then finished — and otherwise falls back to
+    /// jj's two-week threshold. It also drops `refs/heads/pr/<n>` git refs
+    /// whose `pr/<n>` bookmark is gone. The periodic pool GC pass starts
+    /// this in the background once a day per repo; one run per repo at a
+    /// time.
+    Gc {
+        /// Stable repo identifier such as `mono`.
+        repo: String,
+        /// Keep operations from the last this many hours (default 72).
+        #[arg(long)]
+        keep_hours: Option<u64>,
+        /// Report what would be abandoned and removed without doing it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -263,18 +326,34 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         workspace: Option<String>,
     },
-    /// Forget consumed boss/exec_* bookmarks from workspace pools.
+    /// Forget consumed boss/exec_* bookmarks from workspace pools, recycle
+    /// long-unhealthy workspaces, and clean workspaces under disk pressure.
     ///
     /// A bookmark is "consumed" when its tip is reachable from `main`
     /// (i.e. its PR has merged). Without `--workspace`, iterates every
     /// workspace in the pool; leased workspaces are skipped.
+    ///
+    /// Also runs the repo-declared workspace cleanup (the `cleanup:` command
+    /// in a repo's `.cube/setup.yaml`) when free space on a workspace's volume
+    /// is below the low-water mark (`[pool] min-free-bytes` /
+    /// `min-free-percent`): it cleans free workspaces least recently used
+    /// first, one at a time, until free space clears the high-water mark
+    /// (the floor plus `[pool] cleanup-headroom-bytes`). Nothing is cleaned
+    /// above the low-water mark. With `--dry-run` it lists the workspaces it
+    /// would clean, in order, and changes nothing.
     Gc {
         /// Only process this workspace id.
         #[arg(long)]
         workspace: Option<String>,
-        /// List what would be forgotten without doing it.
+        /// List what would be forgotten and cleaned without doing it.
         #[arg(long)]
         dry_run: bool,
+        /// Lift the `failed` cleanup mark from workspaces (all, or just
+        /// `--workspace`) before the cleanup pass, returning them to the pool.
+        /// Use it for a workspace whose cleanup keeps failing and should go
+        /// back to the pool as it is. Ignored with `--dry-run`.
+        #[arg(long)]
+        clear_failed_cleanup: bool,
     },
     /// Position the working copy on the head of a PR branch.
     ///
@@ -311,6 +390,17 @@ pub enum WorkspaceCommand {
         #[arg(long, conflicts_with_all = ["bookmark", "pr"])]
         revision: Option<String>,
     },
+    /// Fetch the PR's actual GitHub base (or an explicit base before PR creation)
+    /// and rebase preserved work locally.
+    /// Never publishes, collapses commits, or repositions the working copy.
+    LocalRebase {
+        /// PR whose current base branch is fetched from GitHub.
+        #[arg(long, required_unless_present = "base", conflicts_with = "base")]
+        pr: Option<u64>,
+        /// Intended PR base branch, for a branch that has no PR yet.
+        #[arg(long, required_unless_present = "pr", conflicts_with = "pr")]
+        base: Option<String>,
+    },
     /// Rebase the current workspace's boss branch onto the repo's integration branch.
     ///
     /// Fetches the latest integration branch (e.g. `main`, `master`, `trunk`)
@@ -339,7 +429,7 @@ pub enum WorkspaceCommand {
     ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts (and the boss
     ///     bookmark was advanced + pushed unless `--no-push`).
     ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them,
-    ///     then push with `jj git push -b <bookmark>`.
+    ///     then publish with `cube workspace push --bookmark <bookmark>` (or `--pr <n>`).
     ///
     /// Run from inside the leased cube workspace directory.
     Rebase {
@@ -568,7 +658,7 @@ pub enum PrCommand {
     Ensure(PrCreateArgs),
     /// Advance an existing PR by pushing the current commit to its head branch.
     ///
-    /// Advances both the remote head branch and the local `pr/<n>` bookmark to
+    /// Advances the local and remote head branch to
     /// `@` (fast-forward only by default) and pushes to GitHub. Idempotent: a
     /// re-run with nothing new to land is a no-op. Refuses non-descendants,
     /// merged/closed PRs, and empty commits (unless already pushed).
@@ -581,12 +671,12 @@ pub enum PrCommand {
 
 #[derive(Debug, Args)]
 pub struct PrPushArgs {
-    /// PR number to advance. If omitted, inferred from the nearest `pr/<n>`
-    /// bookmark in `@`'s ancestry.
+    /// PR number to advance. If omitted, looked up on GitHub using the supplied
+    /// branch or the nearest local branch bookmark in `@`'s ancestry.
     #[arg(long)]
     pub pr: Option<u64>,
-    /// Head branch name to push. If omitted, inferred from the co-located
-    /// non-`pr/*` bookmark on the same commit as the `pr/<n>` ancestor.
+    /// Head branch name to push. If omitted with --pr, uses GitHub's head.ref;
+    /// otherwise uses the nearest local branch bookmark in `@`'s ancestry.
     #[arg(long)]
     pub branch: Option<String>,
     /// Force-push with lease semantics: verifies that GitHub's head has not
@@ -1144,7 +1234,7 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "gc"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Gc { workspace, dry_run },
+                command: WorkspaceCommand::Gc { workspace, dry_run, .. },
             } => {
                 assert!(workspace.is_none());
                 assert!(!dry_run);
@@ -1158,7 +1248,7 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "gc", "--workspace", "mono-agent-001", "--dry-run"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Gc { workspace, dry_run },
+                command: WorkspaceCommand::Gc { workspace, dry_run, .. },
             } => {
                 assert_eq!(workspace.as_deref(), Some("mono-agent-001"));
                 assert!(dry_run);
@@ -1214,6 +1304,23 @@ mod tests {
             }
             _ => panic!("expected workspace reconcile command"),
         }
+    }
+
+    #[test]
+    fn workspace_local_rebase_requires_exactly_one_base_source() {
+        for (flag, value) in [("--pr", "77"), ("--base", "parent-pr")] {
+            let cli = Cli::try_parse_from(["cube", "workspace", "local-rebase", flag, value]).unwrap();
+            let Command::Workspace {
+                command: WorkspaceCommand::LocalRebase { pr, base },
+            } = cli.command
+            else {
+                panic!("expected local-rebase");
+            };
+            assert_eq!(pr, (flag == "--pr").then_some(77));
+            assert_eq!(base.as_deref(), (flag == "--base").then_some("parent-pr"));
+        }
+        assert!(Cli::try_parse_from(["cube", "workspace", "local-rebase"]).is_err());
+        assert!(Cli::try_parse_from(["cube", "workspace", "local-rebase", "--pr", "77", "--base", "main"]).is_err());
     }
 
     #[test]

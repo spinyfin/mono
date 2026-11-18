@@ -11,8 +11,12 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/dispatch:__pkg__",
         "//tools/boss/engine/dispatch-reader:__pkg__",
+        "//tools/boss/engine/execution-contracts:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/jsonl-append",

@@ -161,7 +161,7 @@ pub const SESSION_END_TRIGGER: &str = "session_end";
 /// explicitly on an allow-list, rather than inferred, so an unrecognized
 /// trigger added later defaults to withholding driver evidence and denying
 /// positive liveness, not asserting either. Shared by
-/// [`crate::app::readoption`]'s driver-evidence classification and its
+/// `boss_engine::app::readoption`'s driver-evidence classification and its
 /// positive-liveness gate — both decisions must agree about the same
 /// trigger, so there is exactly one list.
 pub const NON_HOOK_TRIGGERS: [&str; 3] = [

@@ -96,6 +96,7 @@ async fn stream_file_bytes(
         Arc::new(Mutex::new(StreamFileMap::default())),
         writer,
         halt,
+        StreamTelemetry::default(),
     )
     .await
 }
@@ -119,6 +120,7 @@ where
         Arc::new(Mutex::new(StreamFileMap::default())),
         writer,
         halt,
+        StreamTelemetry::default(),
         before_descriptor_read,
         after_rotation_validation,
     )
@@ -1322,4 +1324,76 @@ fn pruning_consumed_segments_preserves_the_live_answer() {
     map.record_bytes(0, 10, identity);
     map.prune_through(21);
     assert_eq!(map.file_position_for(21).unwrap().offset, 10);
+}
+
+/// The idle poll must not re-walk the sessions root: once the tail has
+/// published everything on the descriptor, each 50ms iteration is one
+/// fstat plus one lstat, and the root revalidation (lstat + canonicalize)
+/// happens only on iterations that publish. The per-poll telemetry is what
+/// makes that visible on a live engine, so this asserts through it.
+#[tokio::test]
+async fn idle_polls_publish_telemetry_without_revalidating_the_root() {
+    let fixture = tail_fixture("thread-telemetry");
+    let registry = Arc::new(crate::metrics::Registry::new());
+    crate::sweep_metrics::register_metrics(&registry);
+    let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
+    let (cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
+    let tail = tokio::spawn(super::stream_file_bytes_with_test_hooks(
+        fixture.prepared,
+        fixture.candidate,
+        0,
+        Arc::new(Mutex::new(StreamFileMap::default())),
+        writer,
+        cancel_rx,
+        StreamTelemetry::new(registry.clone()),
+        |_| Ok(()),
+        |_| Ok(()),
+    ));
+    let mut observed = Vec::new();
+    read_until_contains(&mut reader, &mut observed, b"initial-stream").await;
+    // Let the publishing iteration(s) drain, then measure a quiet window.
+    tokio::time::sleep(FILE_POLL * 4).await;
+    let passes_before = registry.counter_value("agent_jsonl_stream.passes").unwrap();
+    let revalidations_before = registry.counter_value("agent_jsonl_stream.root_revalidations").unwrap();
+    assert!(
+        revalidations_before > 0,
+        "publishing iterations must revalidate the root before bytes go out"
+    );
+    tokio::time::sleep(FILE_POLL * 8).await;
+    let passes_after = registry.counter_value("agent_jsonl_stream.passes").unwrap();
+    let revalidations_after = registry.counter_value("agent_jsonl_stream.root_revalidations").unwrap();
+    assert!(passes_after >= passes_before + 3, "{passes_before} -> {passes_after}");
+    assert_eq!(
+        revalidations_after, revalidations_before,
+        "an idle poll performed a root revalidation"
+    );
+    assert_eq!(registry.gauge_value("agent_jsonl_stream.items_per_pass"), Some(0));
+    assert_eq!(registry.gauge_value("agent_jsonl_stream.tick_interval_ms"), None);
+
+    cancel_tx.send(StreamHalt::Cancel).unwrap();
+    reader.read_to_end(&mut observed).await.unwrap();
+    tail.await.unwrap().unwrap();
+}
+
+#[test]
+fn interleaved_tail_polls_do_not_charge_other_streams_or_discovery() {
+    let first = tail_fixture("thread-first-count");
+    let second = tail_fixture("thread-second-count");
+    let mut root_a = first.prepared.root.clone();
+    let mut root_b = second.prepared.root.clone();
+    root_a.isolate_revalidation_count();
+    root_b.isolate_revalidation_count();
+    let registry = Arc::new(crate::metrics::Registry::new());
+    crate::sweep_metrics::register_metrics(&registry);
+    let telemetry = StreamTelemetry::new(registry.clone());
+    let idle = telemetry.begin_poll(&root_a);
+    let active = telemetry.begin_poll(&root_b);
+    root_b.revalidate().unwrap();
+    first.prepared.root.revalidate().unwrap();
+    telemetry.finish_poll(&root_b, active);
+    assert_eq!(registry.counter_value("agent_jsonl_stream.root_revalidations"), Some(1));
+    telemetry.finish_poll(&root_a, idle);
+    assert_eq!(registry.counter_value("agent_jsonl_stream.root_revalidations"), Some(1));
+    assert_eq!(registry.gauge_value("agent_jsonl_stream.items_per_pass"), Some(0));
+    assert_eq!(registry.counter_value("agent_jsonl_stream.passes"), Some(2));
 }

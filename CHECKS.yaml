@@ -4,6 +4,22 @@ check_definitions:
   allow_override_bundled: true
 
 checks:
+  - id: boss/explicit-work-transactions
+    check: text/forbidden-pattern
+    include:
+      - "tools/boss/engine/core/src/**/*.rs"
+      - "tools/boss/engine/app/src/**/*.rs"
+    policy:
+      severity: error
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: implicit-transaction-behavior
+          pattern: '\.\s*(?:unchecked_)?transaction\s*\(\s*\)'
+          message: "Choose transaction behavior explicitly: Deferred for reads, Immediate for writes, including free helpers."
+          severity: error
+
   - id: md/link-integrity
     policy:
       severity: warning
@@ -104,6 +120,23 @@ checks:
     include:
       - "tools/checkleft/checks/**/src/lib.rs"
       - "tools/checkleft/src/checks/**/*.rs"
+    policy:
+      severity: error
+
+  # Backward-compatibility gate for the hub/spoke wire schema. Compares each
+  # changed .proto file with the same file at the change's base revision (the
+  # base every other change-scoped check uses) and fails on a field number or
+  # type change, a removal without `reserved`, an enum renumbering, a
+  # message/service/RPC removal or rename, a package change, or a changed RPC
+  # request/response type — the evolution rules in
+  # tools/boss/protocol-spoke/README.md. Opt-in by scope: only the protocol
+  # directories that declare a compatibility contract are listed here. A file
+  # new in the change passes; a modified file with no reachable base is an
+  # error, not a skip. No-op under `checkleft run --all` (no base revision).
+  - id: proto/breaking
+    scope: files-including-removed
+    include:
+      - "tools/boss/protocol-spoke/proto/**/*.proto"
     policy:
       severity: error
 

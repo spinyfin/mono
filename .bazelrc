@@ -1,24 +1,52 @@
+# Local Bazel server idle timeout: 2 hours. Keeps a workspace's server warm
+# between runs but stops finished-run servers from holding several GB of RAM
+# for Bazel's default 3h. CI overrides this to 1800s by passing
+# --max_idle_secs on the command line (CI_BAZEL_STARTUP_FLAGS in
+# .buildkite/steps/ci-env.sh); a command-line startup flag takes precedence
+# over any rc file. See .ci.bazelrc.
+startup --max_idle_secs=7200
+
 build --jobs=200
-build --disk_cache=~/.cache/bazelcache
+# A `common` line, and above `common --enable_platform_specific_config`, on
+# purpose. `dev-remote` further down switches the disk cache off, and it is
+# reached through the platform config, which Bazel applies where that `common`
+# line stands: before every plain `build` line in this file. Written as
+# `build --disk_cache=...` this line would be applied after `dev-remote` and
+# switch the cache back on. tools/test-sandbox/dev_remote_source_test.sh pins
+# the order.
+common --disk_cache=~/.cache/bazelcache
 # Off-CI GC limits (coordinator laptop, cube worker workspaces). CI overrides
-# this to 3T/60d via .ci.bazelrc and keeps its cache on a dedicated
-# multi-TiB volume. 250G must match flunge exactly: both repos share
-# ~/.cache/bazelcache, and bazel GC applies the invoking build's own
-# max-size to that shared directory, so a smaller value here would evict
-# flunge's entries (and vice versa).
+# these via .ci.bazelrc (60d) and .buildkite/steps/ci-env.sh (a size cap
+# computed from each host's cache disk, passed via CI_BAZEL_FLAGS), and keeps
+# its cache on a dedicated volume. Only CI bazel invocations that carry
+# CI_BAZEL_FLAGS get that; a manual bazel call on a CI host uses these.
+# 250G must match flunge exactly: both repos share ~/.cache/bazelcache, and
+# bazel GC applies the invoking build's own max-size to that shared
+# directory, so a smaller value here would evict flunge's entries (and vice
+# versa).
 build --experimental_disk_cache_gc_max_size=250G
 build --experimental_disk_cache_gc_max_age=7d
 
-# Always stamp builds with the git-derived version so that dev builds show a
-# meaningful version string (e.g. "1.0.9-dev-a58a932") in the About panel
-# instead of the unstamped placeholder "0.0.0".  Only the version plist and
-# build_info_rs actions use ctx.info_file, so the cache impact is minimal —
-# Swift/Rust compilation targets are unaffected.
+# Always run the workspace-status script so the version plist, build_info_rs
+# and build_provenance_rs actions can read the git-derived version/sha from
+# ctx.info_file (stable-status.txt) and dev builds show a meaningful version
+# string (e.g. "1.0.9-dev-a58a932") in the About panel instead of "0.0.0".
+# Bazel runs the script and writes stable-status.txt on every build whether
+# or not --stamp is set, and those rules read ctx.info_file unconditionally.
+#
+# --stamp is deliberately OFF for ordinary builds. rules_rust's rust_binary
+# defaults to `stamp = -1` (follow --stamp), and a stamped Rustc action takes
+# stable-status.txt — which carries the commit sha — as an input, so with
+# --stamp on, every rust_binary in the repo recompiles on every commit,
+# docs-only commits included. Nothing here uses rules_rust's {STABLE_*}
+# substitutions, so stamping buys nothing outside release builds. See
+# tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
 build --workspace_status_command=tools/boss/installer/workspace-status.sh
-build --stamp
 
-# Release config: identical stamp flags; kept as a named config so release.sh
-# and CI can use --config=release to opt into additional release-only settings.
+# Release config: the same status script plus Bazel-level stamping, kept as a
+# named config so release.sh and CI can use --config=release to opt into
+# release-only settings. A release build is a one-off, so the per-binary
+# recompiles --stamp causes do not matter there.
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 
@@ -53,7 +81,93 @@ test --sandbox_default_allow_network=false
 # Bazel's macOS sandbox profile always permits writes to shared host temp and
 # cache directories. Run repository-owned test code under the stricter profile
 # in hermetic_test_wrapper instead.
-test:macos --strategy=TestRunner=local
+#
+# This is a `build:macos` line, not a `test:macos` one, because of where it has
+# to sit. Within one config Bazel applies every `build:` line before any
+# `test:` line, whatever their order in this file. `dev-remote` below replaces
+# this strategy and is reached from a `build:macos` line, so a `test:macos`
+# line here would always be applied after it and win. Only test actions have
+# the TestRunner mnemonic, so the line changes nothing for a plain build.
+build:macos --strategy=TestRunner=local
+
+# Remote execution from a developer's Mac.
+#
+# A Mac whose ~/.bazelrc names a remote endpoint builds and tests on the remote
+# macOS workers instead of on its own cores, with no flag on the command line
+# and no wrapper script. Bazel reads ~/.bazelrc after this file and adds up the
+# lines for one config across rc files, so the machine fills in the config that
+# the `build:macos` line below selects:
+#
+#   build:dev-remote-endpoint --remote_executor=grpc://<host>:<port>
+#   build:dev-remote-endpoint --remote_cache=grpc://<host>:<port>
+#   build:dev-remote-endpoint --config=dev-remote
+#
+# A fourth line, `build:dev-remote-endpoint --remote_cache_compression`, makes
+# blobs travel zstd-compressed. It belongs with the endpoint and not in
+# `dev-remote` below because only an endpoint that advertises zstd accepts it:
+# against any other, Bazel 9.1 fails the first action that touches the remote
+# cache.
+#
+# The endpoint is machine configuration and is deliberately not written here.
+# Without those lines `dev-remote-endpoint` is the two empty defaults below and
+# nothing changes. That is the case on every CI agent, where
+# .buildkite/steps/remote-execution.sh makes its own decision per step and
+# passes its flags on the command line, and on any Mac that has not opted in.
+# To take a machine back to local builds, comment the lines out of ~/.bazelrc.
+# See tools/test-sandbox/README.md, "Remote execution from a developer's Mac".
+build:macos --config=dev-remote-endpoint
+build:dev-remote-endpoint --remote_executor=
+build:dev-remote-endpoint --remote_cache=
+
+# What a machine that names an endpoint gets. `dev-remote` is selected only by
+# the third ~/.bazelrc line above, so none of it applies without an endpoint.
+# Never pass --config=dev-remote by hand, and never select it from a line that
+# is not reached through `build:macos`: see the test strategy below.
+#
+# A disk cache of its own, never the one at the top of this file. Bazel does
+# not download what a cache hit produced, and it assumes a remote action can be
+# given any such output from the remote cache. An output that a local build put
+# in the disk cache is not there, and the remote action fails with "Lost inputs
+# no longer available remotely". Bazel restarts the build, but the restart goes
+# back to the disk cache and loses a different input: with the shared directory
+# in front, `bazel test //...` on a laptop gave up after its five restarts.
+# Local builds keep writing to the shared directory (older checkouts,
+# --config=dev-local, other repositories), so emptying it would not last. This
+# directory only ever holds what a remote-mode build downloaded, which the
+# remote cache has too. It is used for little: Bazel stores only what it
+# downloads, and that is the final outputs. The one way a local-only entry gets
+# in is an action this machine ran itself in remote mode; a build that needs it
+# remotely restarts once and re-runs that action. The first remote build in a
+# checkout that has built locally also restarts once.
+build:dev-remote --disk_cache=~/.cache/bazelcache-remote
+# If the endpoint cannot be reached, build on this machine instead of failing.
+# A laptop is not always on the workers' network.
+build:dev-remote --remote_local_fallback
+# Results of actions this machine ran itself (after a fallback, or because the
+# action cannot run remotely) stay on this machine and are not uploaded. The
+# shared cache then only ever holds what the workers or CI produced.
+build:dev-remote --noremote_upload_local_results
+# Tests run on the workers too. Unlike `remote-tests` below, `local` is named
+# as a second choice, so a test that cannot run remotely still runs, the way it
+# does on a Mac without any of this: under the wrapper's Seatbelt profile. That
+# is acceptable only on macOS. On Linux `local` is no sandbox at all.
+test:dev-remote --strategy=TestRunner=remote,local
+# The same key as `remote-tests`, for the reason given there. A test that fell
+# back to this machine is recorded under it as well, but only on this machine:
+# --noremote_upload_local_results above keeps it out of the shared cache.
+test:dev-remote --test_env=MONO_TEST_REMOTE_EXECUTION=1
+
+# `bazel test --config=dev-local //...` runs one command on this machine when
+# its ~/.bazelrc has an endpoint, for example to see whether a test that fails
+# on a worker fails here too. It only undoes `dev-remote`: with no executor the
+# `remote,local` strategy above runs the test locally, the disk cache is the
+# one at the top of this file again, and removing the variable puts the result
+# under the key every other local run uses. It deliberately names no strategy,
+# so it is harmless on Linux and on a machine with no endpoint.
+build:dev-local --remote_executor=
+build:dev-local --remote_cache=
+build:dev-local --disk_cache=~/.cache/bazelcache
+test:dev-local --test_env==MONO_TEST_REMOTE_EXECUTION
 
 # Linux test actions must use the namespace-capable sandbox. Naming the
 # strategy explicitly prevents Bazel from silently falling back to
@@ -63,6 +177,41 @@ test:macos --strategy=TestRunner=local
 # agent cannot provide linux-sandbox, test execution fails closed.
 test:linux --strategy=TestRunner=linux-sandbox
 test:linux --sandbox_tmpfs_path=/tmp
+
+# Opt-in: `--config=remote-tests`, together with a --remote_executor, runs test
+# actions on remote workers instead of on this machine.
+#
+# On macOS the wrapper's Seatbelt profile is still the whole isolation
+# boundary; it is built on the worker, from the worker's own paths. Use it
+# only with macOS workers that have the audited runtime where this client
+# recorded it (the same system tool paths, and Xcode reachable at the same
+# DEVELOPER_DIR). Where a recorded tool is missing, the wrapper fails the
+# action closed.
+#
+# On Linux this takes the test out of Bazel's linux-sandbox, so the boundary
+# has to come from the worker: use it only with workers that run every action
+# inside tools/test-sandbox/linux_remote_action_sandbox.sh. CI selects it from
+# `ci-remote-linux` in .ci.bazelrc. See tools/test-sandbox/README.md, "Remote
+# execution on Linux workers".
+#
+# The strategy is `remote` alone on purpose. With a comma fallback
+# (`remote,local`) a test that cannot run remotely would run under a local
+# strategy instead, which on Linux is no sandbox at all, and its result would
+# say nothing about the workers. Named alone, a missing or unusable remote
+# executor stops the build.
+#
+# Tests that need tmux, claude or the Codex probe's login shell still receive
+# copies of this machine's binaries, and tests that use jj receive the pinned
+# download. See tools/test-sandbox/README.md, "Remote execution on macOS
+# workers" and "Remote execution on Linux workers".
+test:remote-tests --strategy=TestRunner=remote
+
+# Keep remote and local test results apart. Bazel's action key does not record
+# where an action ran, so without this a plain local `bazel test` after a
+# remote run reports "(cached) PASSED" for a result a worker produced, and a
+# remote run can be satisfied by a local result. Nothing reads the variable;
+# it only makes the two test actions different.
+test:remote-tests --test_env=MONO_TEST_REMOTE_EXECUTION=1
 
 # Bazel's own test/XML wrappers need the static host PATH before the test
 # binary starts. This run-under wrapper removes that PATH at the user-code

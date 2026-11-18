@@ -1,5 +1,18 @@
 import Foundation
 
+/// Captured at send time because authoritative refreshes prune closed groups.
+struct AttentionRequestGroup {
+    let id: String
+    let groupingKey: String
+    let generation: Int
+
+    init(_ group: AttentionGroup) {
+        id = group.id
+        groupingKey = group.groupingKey
+        generation = group.generation
+    }
+}
+
 extension ChatViewModel {
     // MARK: Attentions (attentions.md — Notifications toolbar + window)
 
@@ -36,6 +49,7 @@ extension ChatViewModel {
             attentionGroupsByProductID = groupsByProduct
         }
         refreshSelectedProductAttentionCaches()
+        syncNavigatorAttention()
     }
 
     /// Store group members in their display order so card body evaluation only
@@ -48,6 +62,9 @@ extension ChatViewModel {
     func upsertAttentionGroup(_ group: AttentionGroup) {
         var list = attentionGroupsByProductID[group.productID] ?? []
         if let idx = list.firstIndex(where: { $0.id == group.id }) {
+            if list[idx].generation != group.generation {
+                attentionAnswerErrorByGroupID.removeValue(forKey: group.id)
+            }
             list[idx] = group
         } else {
             list.append(group)
@@ -63,6 +80,7 @@ extension ChatViewModel {
             setAttentionMembers(members, forGroup: group.id)
         }
         refreshSelectedProductAttentionCaches()
+        syncNavigatorAttention()
     }
 
     /// Insert or replace one member within its group's row list.
@@ -78,20 +96,161 @@ extension ChatViewModel {
 
     /// Record an answer for a question member (`yes`/`no`, a chosen value, or
     /// free text). The engine replies with `attention_group_updated`.
-    func answerAttention(_ attentionID: String, answer: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: answer, skip: false, dismiss: false)
+    @discardableResult
+    func answerAttention(
+        _ attentionID: String,
+        answer: String
+    ) -> Bool {
+        submitAttentionAnswer(
+            attentionID,
+            answer: answer,
+            skip: false
+        )
     }
 
     /// Accept a followup member (mark it `answered` with no value) so it is
     /// included when the group is actioned.
-    func acceptFollowup(_ attentionID: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: false, dismiss: false)
+    @discardableResult
+    func acceptFollowup(_ attentionID: String) -> Bool {
+        submitAttentionAnswer(
+            attentionID,
+            answer: nil,
+            skip: false
+        )
     }
 
     /// Mark a member `skipped` — a rejected followup or a question the human
     /// chooses not to answer. Skipped members contribute nothing on action.
-    func skipAttention(_ attentionID: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: true, dismiss: false)
+    @discardableResult
+    func skipAttention(_ attentionID: String) -> Bool {
+        submitAttentionAnswer(
+            attentionID,
+            answer: nil,
+            skip: true
+        )
+    }
+
+    /// Inline refusal for the group currently shown in Navigator / Notifications.
+    func attentionAnswerError(forGroup groupID: String) -> String? {
+        attentionAnswerErrorByGroupID[groupID]
+    }
+
+    func attentionGroup(id: String) -> AttentionGroup? {
+        attentionGroupsByProductID.values.flatMap { $0 }.first { $0.id == id }
+    }
+
+    func attentionMember(id: String) -> Attention? {
+        attentionMembersByGroupID.values.flatMap { $0 }.first { $0.id == id }
+    }
+
+    /// Operator-question presentation for a family member, independent of
+    /// Kanban column. Navigator Attention uses this so a revision's question
+    /// is answerable on the original row.
+    func navigatorOperatorQuestion(for task: WorkTask) -> OperatorQuestionPresentation? {
+        guard let question = task.operatorQuestion else { return nil }
+        return OperatorQuestionPresentation(
+            question: question,
+            answerInFlight: operatorAnswerInFlightByTaskID[task.id] != nil,
+            errorMessage: operatorAnswerError(for: task)
+        )
+    }
+
+    /// Distinctive substrings of engine terminal-group refusals. Coupled with
+    /// the constants next to the `bail!` strings in
+    /// `tools/boss/engine/work-db/src/attentions.rs`: answer/member refusals
+    /// embed `(terminal)`; `action_attention_group` refusals use the actioned
+    /// and dismissed phrases. Unrelated failures (storage, member not found)
+    /// match none of these.
+    static let attentionTerminalRefusalMarkers = [
+        "(terminal)",
+        "an actioned group is terminal",
+        "a dismissed group cannot be actioned",
+    ]
+
+    /// Friendly copy when a click or refusal targets a replaced group.
+    static let attentionReplacedMessage = "This question was replaced. Review the current question."
+
+    static func isAttentionTerminalRefusal(_ message: String) -> Bool {
+        attentionTerminalRefusalMarkers.contains { message.contains($0) }
+    }
+
+    /// The engine mints a new group id for each generation. A later open
+    /// group with the same grouping key is the replacement of `group`.
+    func newerOpenAttentionGroup(replacing group: AttentionGroup) -> AttentionGroup? {
+        newerOpenAttentionGroup(replacing: AttentionRequestGroup(group))
+    }
+
+    private func newerOpenAttentionGroup(replacing group: AttentionRequestGroup) -> AttentionGroup? {
+        attentionGroupsByProductID.values
+            .flatMap { $0 }
+            .filter { candidate in
+                candidate.groupingKey == group.groupingKey
+                    && candidate.isOpen
+                    && candidate.generation > group.generation
+            }
+            .max { $0.generation < $1.generation }
+    }
+
+    /// True when this click should not reach the engine: a newer open group
+    /// already replaced `group` under a different id.
+    private func refuseReplacedAttentionGroup(
+        _ group: AttentionGroup
+    ) -> Bool {
+        if let replacement = newerOpenAttentionGroup(replacing: group) {
+            attentionAnswerErrorByGroupID[replacement.id] = Self.attentionReplacedMessage
+            return true
+        }
+        return false
+    }
+
+    private func submitAttentionAnswer(
+        _ attentionID: String,
+        answer: String?,
+        skip: Bool
+    ) -> Bool {
+        guard let member = attentionMember(id: attentionID),
+              let group = attentionGroup(id: member.groupID) else { return false }
+        attentionAnswerErrorByGroupID.removeValue(forKey: group.id)
+        if refuseReplacedAttentionGroup(group) {
+            return false
+        }
+        if !skip, let answer, member.isAnswered, member.answer == answer {
+            return false
+        }
+        let requestID = engine.sendAnswerAttention(
+            id: attentionID, answer: answer, skip: skip, dismiss: false
+        )
+        if let requestID { attentionRequestGroupByRequestID[requestID] = AttentionRequestGroup(group) }
+        return true
+    }
+
+    /// An engine refusal (`work_error`) carrying the request id of an
+    /// answer/action on a group — for example another client already
+    /// actioned it. Painted inline beside that group while it is still
+    /// open, or beside its replacement using the identity captured at send
+    /// time. Without either surface, use the work-error banner.
+    /// Returns whether the error belonged to an attention request.
+    func settleAttentionWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId,
+              let origin = attentionRequestGroupByRequestID.removeValue(forKey: requestId)
+        else { return false }
+        if let replacement = newerOpenAttentionGroup(replacing: origin) {
+            attentionAnswerErrorByGroupID[replacement.id] =
+                Self.isAttentionTerminalRefusal(message) ? Self.attentionReplacedMessage : message
+        } else if attentionGroup(id: origin.id)?.isOpen == true {
+            attentionAnswerErrorByGroupID[origin.id] = message
+        } else {
+            workErrorMessage = message
+        }
+        return true
+    }
+
+    /// Drop the mapping for one request when *that* request's reply arrives.
+    /// A snapshot or broadcast for the same group must not clear other
+    /// in-flight request ids (Submit sends an answer then an action).
+    func settleAttentionRequest(_ requestId: String?) {
+        guard let requestId else { return }
+        attentionRequestGroupByRequestID.removeValue(forKey: requestId)
     }
 
     /// Dismiss a single member (`atn_…`) without producing anything.
@@ -122,8 +281,17 @@ extension ChatViewModel {
     /// Action a group — produce its downstream artifact (one revision /
     /// design task, or a batch task-create) and close it. Open members are
     /// skipped first ("skip remaining") so the human needn't touch every row.
-    func actionAttentionGroup(_ groupID: String) {
-        engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true)
+    @discardableResult
+    func actionAttentionGroup(_ groupID: String) -> Bool {
+        guard let group = attentionGroup(id: groupID) else { return false }
+        attentionAnswerErrorByGroupID.removeValue(forKey: groupID)
+        if refuseReplacedAttentionGroup(group) {
+            return false
+        }
+        if let requestID = engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true) {
+            attentionRequestGroupByRequestID[requestID] = AttentionRequestGroup(group)
+        }
+        return true
     }
 
     /// Jump a group's association into view: a task association reveals its
@@ -155,8 +323,8 @@ extension ChatViewModel {
         return task(withID: taskID)
     }
 
-    /// Short display label for a group's association — `"T34"` / `"P12"` /
-    /// a project name / `"Open"` when neither resolves.
+    /// Short display label for a group's association: a task or project short label,
+    /// a project name, or Open when neither resolves.
     func attentionAssociationLabel(_ group: AttentionGroup) -> String {
         if let taskID = group.associationTaskID {
             if let task = task(withID: taskID), let shortID = task.shortID {
@@ -209,23 +377,11 @@ extension ChatViewModel {
         openProjectDesignDoc(project)
     }
 
-    /// Engine-tab entry point: ask the engine for the current attempt
-    /// list. Idempotent — the view-model just overwrites the array
-    /// when the reply lands.
-    func refreshConflictResolutions() {
-        engine.sendListConflictResolutions(limit: 200)
-    }
-
-    /// Mirror of [[refreshConflictResolutions]] for the CI subsystem
-    /// (design Phase 11 #37). Idempotent.
-    func refreshCiRemediations() {
-        engine.sendListCiRemediations(limit: 200)
-    }
-
     /// Refresh Activity's one authoritative engine-attempt list. The
     /// background-work snapshot shares this response so the app need not
     /// reconstruct either view from the source-specific attempt tables.
     func refreshEngineAttempts() {
+        guard activityIsVisible else { return }
         guard let requestId = engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true) else {
             return
         }

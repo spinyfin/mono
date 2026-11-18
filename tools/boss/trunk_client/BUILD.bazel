@@ -14,7 +14,9 @@ rust_library(
     # Minimal visibility: only the engine talks to Trunk's queue API, plus
     # the sibling token-storage crate that implements TrunkTokenProvider.
     visibility = [
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/merge-poller:__pkg__",
         "//tools/boss/trunk_auth:__pkg__",
     ],
     deps = all_crate_deps(normal = True) + [

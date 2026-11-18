@@ -51,7 +51,7 @@ where
     fn with_clock(dir: impl Into<PathBuf>, file_prefix: &'static str, clock: fn() -> u128) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(writer_task(dir.into(), file_prefix, rx, clock));
+            boss_task_scope::spawn(writer_task(dir.into(), file_prefix, rx, clock));
         }
         Self { tx }
     }

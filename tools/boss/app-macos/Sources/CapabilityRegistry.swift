@@ -13,7 +13,7 @@
 ///
 /// ```swift
 /// // At startup, in the code that provides the capability:
-/// CapabilityRegistry.shared.register("toolbar_search_standard")
+/// CapabilityRegistry.shared.register("example_capability")
 /// ```
 ///
 /// If the code path is conditionally compiled out of the build, the

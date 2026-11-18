@@ -86,7 +86,17 @@ MCP_BLOCK = (
     "GitHub app tool would push branches, open or merge PRs outside every one "
     "of those gates. Do the work through the shell instead, where the "
     "guardrails apply: `gh` for GitHub reads, `cube pr create` / "
-    "`cube pr update` for pull requests, `jj` for VCS."
+    "`cube pr update` for pull requests, `jj` for VCS. If you are a "
+    "revision: never open a new PR; push in-scope work with "
+    "`\"$CUBE_BIN\" pr update`. If another PR must land before this "
+    "revision can finish and your instructions enable completion declarations, run `\"$BOSS_BIN\" propose done --outcome blocked "
+    "--summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short "
+    "task name>\" --prerequisite-brief \"<self-contained description>\" "
+    "--explanation \"<Context, Yes, No, Recommendation, and optional "
+    "Details>\"`; otherwise report the dependency using the blocker channel in your instructions. `\"$BOSS_BIN\" propose followup-task --name \"<short "
+    "title>\" --description \"<one paragraph of scope>\" --rationale "
+    "\"<why a separate PR>\"` is only for non-blocking work that can happen "
+    "later; finish the in-scope work."
 )
 
 STDIN_CHANNEL_BLOCK = (
@@ -348,6 +358,13 @@ mod tests {
         assert!(
             reason.contains("cube pr create"),
             "reason must redirect to cube: {reason}"
+        );
+        assert!(
+            reason.contains("--summary \"<blocker>\" --answer-type create-prerequisite-task")
+                && reason.contains("instructions enable completion declarations")
+                && reason.contains("otherwise report the dependency")
+                && reason.contains("propose followup-task --name"),
+            "reason must name create-prerequisite-task for a PR that must land first: {reason}"
         );
     }
 

@@ -1,0 +1,19 @@
+[package]
+name = "boss-spoke-journal"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+boss-protocol-spoke = { path = "../../protocol-spoke" }
+fs4 = { workspace = true }
+libc = { workspace = true }
+prost = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -15,4 +15,5 @@ swift_library(
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/app-macos/Tests/UpdateCore:__pkg__",
     ],
+    deps = ["//tools/boss/app-macos/Sources/DiagnosticIO"],
 )

@@ -1,0 +1,153 @@
+Pane text markers, counted per poll and per phase (tools.py markers)
+====================================================================
+
+Phases come from hook timestamps, not from the screen: 'busy' runs from the PreInvocation that opens an execution
+to its Stop (or to the Escape keypress for an interrupted turn); 'bg_wait' runs from a Stop with fullyIdle=false
+until the agent is invoked again; 'starting' is everything before the session's first hook. Polls within 600 ms of
+a phase edge are dropped. Cells are hits/polls.
+
+## tmux capture-pane — agy 1.1.12 — 16 sessions
+polls per phase: starting=110, busy=542, bg_wait=55, idle=270
+kind   substring                                                    starting         busy      bg_wait         idle
+agent  'Antigravity CLI'                                          110/110      514/542       55/55       236/270   
+agent  '? for shortcuts'                                           51/110        0/542       55/55       264/270   
+agent  ' · low'                                                    64/110      542/542       55/55       270/270   
+agent  'Gemini 3.8 Flash'                                          64/110      542/542       55/55       270/270   
+busy   'esc to cancel'                                              0/110      513/542        0/55         0/270   
+busy   'Generating...'                                              0/110      409/542        0/55         0/270   
+busy   'Running command...'                                         0/110        0/542        0/55         0/270   
+busy   'Working...'                                                 0/110       17/542        0/55         0/270   
+busy   'task(s) · /tasks'                                           0/110       11/542       55/55         0/270   
+busy   'Press up to edit queued messages'                           0/110       29/542        0/55         0/270   
+other  'Interrupted · What should Antigravity CLI do instead?'      0/110        0/542        0/55        30/270   
+other  'esc to dismiss'                                             0/110        0/542        0/55         0/270   
+other  'Tip:'                                                       0/110       74/542        0/55         0/270   
+prompt line starting with >                                        68/110      542/542       55/55       269/270   
+sessions: bg-1.1.12 esc-gen-1.1.12 esc-tool-1.1.12 home-1.1.12 hookreply-allow-1.1.12 hookreply-empty-object-1.1.12 hookreply-exit-1-1.1.12 hookreply-exit-2-1.1.12 hookreply-malformed-1.1.12 hookreply-no-output-1.1.12 hookterm-1.1.12 iflag-tmux-1.1.12 launcher-big-1.1.12 launcher-small-1.1.12 midturn-1.1.12 submitkey-1.1.12
+
+## GhosttyKit viewport — agy 1.1.12 — 16 sessions
+polls per phase: starting=110, busy=519, bg_wait=50, idle=267
+kind   substring                                                    starting         busy      bg_wait         idle
+agent  'Antigravity CLI'                                          106/110      487/519       50/50       234/267   
+agent  '? for shortcuts'                                           50/110        0/519       50/50       258/267   
+agent  ' · low'                                                    64/110      519/519       50/50       267/267   
+agent  'Gemini 3.8 Flash'                                          64/110      519/519       50/50       267/267   
+busy   'esc to cancel'                                              0/110      492/519        0/50         0/267   
+busy   'Generating...'                                              0/110      395/519        0/50         0/267   
+busy   'Running command...'                                         0/110        0/519        0/50         0/267   
+busy   'Working...'                                                 0/110       18/519        0/50         0/267   
+busy   'task(s) · /tasks'                                           0/110        9/519       50/50         0/267   
+busy   'Press up to edit queued messages'                           0/110       27/519        0/50         0/267   
+other  'Interrupted · What should Antigravity CLI do instead?'      0/110        0/519        0/50        38/267   
+other  'esc to dismiss'                                             0/110        0/519        0/50         0/267   
+other  'Tip:'                                                       0/110       78/519        0/50         0/267   
+prompt line starting with >                                        68/110      519/519       50/50       267/267   
+sessions: bg-1.1.12 esc-gen-1.1.12 esc-tool-1.1.12 home-1.1.12 hookreply-allow-1.1.12 hookreply-empty-object-1.1.12 hookreply-exit-1-1.1.12 hookreply-exit-2-1.1.12 hookreply-malformed-1.1.12 hookreply-no-output-1.1.12 hookterm-1.1.12 iflag-tmux-1.1.12 launcher-big-1.1.12 launcher-small-1.1.12 midturn-1.1.12 submitkey-1.1.12
+
+
+## tmux capture-pane — agy 1.5.5 — 16 sessions
+polls per phase: starting=79, busy=235, bg_wait=52, idle=243
+kind   substring                                                    starting         busy      bg_wait         idle
+agent  'Antigravity CLI'                                           79/79       224/235       52/52       212/243   
+agent  '? for shortcuts'                                           25/79         0/235       52/52       243/243   
+agent  ' · low'                                                    36/79       235/235       52/52       243/243   
+agent  'Gemini 3.8 Flash'                                          36/79       235/235       52/52       243/243   
+busy   'esc to cancel'                                              5/79       205/235        0/52         0/243   
+busy   'Generating...'                                              5/79        87/235        0/52         0/243   
+busy   'Running command...'                                         0/79       143/235        0/52         0/243   
+busy   'Working...'                                                 0/79         2/235        0/52         0/243   
+busy   'task(s) · /tasks'                                           0/79        12/235       52/52         0/243   
+busy   'Press up to edit queued messages'                           0/79        30/235        0/52         0/243   
+other  'Interrupted · What should Antigravity CLI do instead?'      0/79         0/235        0/52        12/243   
+other  'esc to dismiss'                                            23/79         0/235        0/52         0/243   
+other  'Tip:'                                                       0/79        68/235        0/52         0/243   
+prompt line starting with >                                        48/79       235/235       52/52       242/243   
+sessions: bg-1.5.5 esc-gen-1.5.5 esc-tool-1.5.5 home-1.5.5 hookreply-allow-1.5.5 hookreply-empty-object-1.5.5 hookreply-exit-1-1.5.5 hookreply-exit-2-1.5.5 hookreply-malformed-1.5.5 hookreply-no-output-1.5.5 hookterm-1.5.5 iflag-tmux-1.5.5 launcher-big-1.5.5 launcher-small-1.5.5 midturn-1.5.5 submitkey-1.5.5
+
+## GhosttyKit viewport — agy 1.5.5 — 16 sessions
+polls per phase: starting=78, busy=226, bg_wait=47, idle=236
+kind   substring                                                    starting         busy      bg_wait         idle
+agent  'Antigravity CLI'                                           75/78       212/226       47/47       205/236   
+agent  '? for shortcuts'                                           24/78         0/226       47/47       235/236   
+agent  ' · low'                                                    33/78       226/226       47/47       236/236   
+agent  'Gemini 3.8 Flash'                                          33/78       226/226       47/47       236/236   
+busy   'esc to cancel'                                              4/78       199/226        0/47         0/236   
+busy   'Generating...'                                              4/78        93/226        0/47         0/236   
+busy   'Running command...'                                         0/78       129/226        0/47         0/236   
+busy   'Working...'                                                 0/78         2/226        0/47         0/236   
+busy   'task(s) · /tasks'                                           0/78        12/226       47/47         0/236   
+busy   'Press up to edit queued messages'                           0/78        27/226        0/47         0/236   
+other  'Interrupted · What should Antigravity CLI do instead?'      0/78         0/226        0/47        10/236   
+other  'esc to dismiss'                                            21/78         0/226        0/47         0/236   
+other  'Tip:'                                                       0/78        64/226        0/47         0/236   
+prompt line starting with >                                        45/78       226/226       47/47       236/236   
+sessions: bg-1.5.5 esc-gen-1.5.5 esc-tool-1.5.5 home-1.5.5 hookreply-allow-1.5.5 hookreply-empty-object-1.5.5 hookreply-exit-1-1.5.5 hookreply-exit-2-1.5.5 hookreply-malformed-1.5.5 hookreply-no-output-1.5.5 hookterm-1.5.5 iflag-tmux-1.5.5 launcher-big-1.5.5 launcher-small-1.5.5 midturn-1.5.5 submitkey-1.5.5
+
+
+Frames behind the numbers
+
+agy 1.1.12, busy on a shell command (tmux capture-pane):
+    | ⢿  Running...
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+agy 1.1.12, busy on generation:
+    | └ Tip: Use @ to mention files and give the model more context.
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+agy 1.1.12, yielded with a background task (Stop fullyIdle=false; the composer looks idle):
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ● [04:19:10] sleep 25 running
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                  Gemini 3.8 Flash · low · 1 task(s) · /tasks
+agy 1.1.12, idle:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+agy 1.5.5, busy on a shell command (tmux capture-pane):
+    | ⣷  Running command...
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+agy 1.5.5, busy on generation:
+    | └ Tip: Use /skills to browse and manage agent skills.
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+agy 1.5.5, yielded with a background task (Stop fullyIdle=false; the composer looks idle):
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ● [04:07:18] sleep 25 running
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                  Gemini 3.8 Flash · low · 1 task(s) · /tasks
+agy 1.5.5, idle:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+agy 1.1.12, idle with `/quit` typed but not yet submitted (the slash menu shows the busy footer):
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | > /quit
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | > /exit (quit)  Exit the CLI
+    |   ↑/↓ Navigate · enter Select · tab Complete
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low
+
+agy 1.5.5, idle with `/quit` typed but not yet submitted (the slash menu shows the busy footer):
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | > /quit
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | > /exit (quit)  Exit the CLI
+    |   ↑/↓ Navigate · enter Select · tab Complete
+    | esc to cancel                                                                                         Gemini 3.8 Flash · low

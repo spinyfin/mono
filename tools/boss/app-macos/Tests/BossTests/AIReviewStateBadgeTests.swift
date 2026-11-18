@@ -20,6 +20,7 @@ final class AIReviewStateBadgeTests: XCTestCase {
         let expectedCard = ["todo": "revision", "active": "revision", "in_review": "parent", "done": "parent"]
         for status in ["todo", "active", "in_review", "done"] {
             revision.status = status
+            revision.boardFoldedRevision = status == "in_review" || status == "done"
             model.choresByProductID = [parent.productID: [parent, revision]]
             model.openAIReviewFindings(revisionID: revision.id)
 

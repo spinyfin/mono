@@ -1,0 +1,202 @@
+diff --git a/src/trace.rs b/src/trace.rs
+--- a/src/trace.rs
++++ b/src/trace.rs
+@@ -328,12 +328,47 @@
+                 }
+             }),
+         );
+ 
+         db.one_column::<u32, _>("PRAGMA user_version", [])?;
+         drop(db);
+ 
+         let db = Connection::open_in_memory()?;
+         db.trace_v2(TraceEventCodes::empty(), None);
+         Ok(())
+     }
+ }
++
++/// One completed SQLite call. No SQL text or bound values are exposed.
++#[derive(Clone, Copy, Debug)]
++pub struct CallObservation {
++    /// Opaque connection identity, never dereferenced by observers.
++    pub connection: usize,
++    /// SQLITE_TXN_NONE, SQLITE_TXN_READ, or SQLITE_TXN_WRITE for main.
++    pub transaction_state: i32,
++    /// Time inside the SQLite call, excluding row processing.
++    pub elapsed: Duration,
++    /// SQLite result code; reset/finalize report OK to avoid recounting errors.
++    pub result: i32,
++}
++
++static CALL_OBSERVER: std::sync::OnceLock<fn(CallObservation)> = std::sync::OnceLock::new();
++
++/// Install a process-wide observer once. The callback must not call SQLite.
++/// This does not replace trace, busy, progress, commit, or rollback handlers.
++pub fn set_call_observer(observer: fn(CallObservation)) {
++    let _ = CALL_OBSERVER.set(observer);
++}
++
++pub(crate) fn observe_call(
++    db: *mut ffi::sqlite3,
++    start: std::time::Instant,
++    result: i32,
++) {
++    let elapsed = start.elapsed();
++    if db.is_null() { return; }
++    if let Some(observer) = CALL_OBSERVER.get() {
++        // SAFETY: called synchronously by the owner of the live connection.
++        let transaction_state = unsafe { ffi::sqlite3_txn_state(db, c"main".as_ptr()) };
++        observer(CallObservation { connection: db as usize, transaction_state, elapsed, result });
++    }
++}
+diff --git a/src/raw_statement.rs b/src/raw_statement.rs
+--- a/src/raw_statement.rs
++++ b/src/raw_statement.rs
+@@ -130,25 +130,30 @@
+             // meaningful we can do. Just assert instead of returning None.
+             assert!(
+                 !ptr.is_null(),
+                 "Null pointer from sqlite3_column_name: Out of memory?"
+             );
+             Some(CStr::from_ptr(ptr))
+         }
+     }
+ 
+     #[inline]
+     #[cfg(not(feature = "unlock_notify"))]
+     pub fn step(&self) -> c_int {
+-        unsafe { ffi::sqlite3_step(self.ptr) }
++        #[cfg(feature = "trace")]
++        let start = std::time::Instant::now();
++        let result = unsafe { ffi::sqlite3_step(self.ptr) };
++        #[cfg(feature = "trace")]
++        crate::trace::observe_call(unsafe { ffi::sqlite3_db_handle(self.ptr) }, start, result);
++        result
+     }
+ 
+     #[cfg(feature = "unlock_notify")]
+     pub fn step(&self) -> c_int {
+         use crate::unlock_notify;
+         let mut db = ptr::null_mut::<ffi::sqlite3>();
+         loop {
+             unsafe {
+                 let mut rc = ffi::sqlite3_step(self.ptr);
+                 // Bail out early for success and errors unrelated to locking. We
+                 // still need check `is_locked` after this, but checking now lets us
+                 // avoid one or two (admittedly cheap) calls into SQLite that we
+@@ -164,25 +169,30 @@
+                 }
+                 rc = unlock_notify::wait_for_unlock_notify(db);
+                 if rc != ffi::SQLITE_OK {
+                     break rc;
+                 }
+                 self.reset();
+             }
+         }
+     }
+ 
+     #[inline]
+     pub fn reset(&self) -> c_int {
+-        unsafe { ffi::sqlite3_reset(self.ptr) }
++        #[cfg(feature = "trace")]
++        let start = std::time::Instant::now();
++        let result = unsafe { ffi::sqlite3_reset(self.ptr) };
++        #[cfg(feature = "trace")]
++        crate::trace::observe_call(unsafe { ffi::sqlite3_db_handle(self.ptr) }, start, ffi::SQLITE_OK);
++        result
+     }
+ 
+     #[inline]
+     pub fn bind_parameter_count(&self) -> usize {
+         unsafe { ffi::sqlite3_bind_parameter_count(self.ptr) as usize }
+     }
+ 
+     #[inline]
+     pub fn bind_parameter_index(&self, name: &str) -> Option<usize> {
+         self.cache.get_or_insert_with(name, |param_cstr| {
+             let r = unsafe { ffi::sqlite3_bind_parameter_index(self.ptr, param_cstr.as_ptr()) };
+             match r {
+@@ -218,25 +228,33 @@
+         } else {
+             Some(unsafe { CStr::from_ptr(ffi::sqlite3_sql(self.ptr)) })
+         }
+     }
+ 
+     #[inline]
+     pub fn finalize(mut self) -> c_int {
+         self.finalize_()
+     }
+ 
+     #[inline]
+     fn finalize_(&mut self) -> c_int {
++        #[cfg(feature = "trace")]
++        let observation = if self.ptr.is_null() { None } else {
++            Some((unsafe { ffi::sqlite3_db_handle(self.ptr) }, std::time::Instant::now()))
++        };
+         let r = unsafe { ffi::sqlite3_finalize(self.ptr) };
++        #[cfg(feature = "trace")]
++        if let Some((db, start)) = observation {
++            crate::trace::observe_call(db, start, ffi::SQLITE_OK);
++        }
+         self.ptr = ptr::null_mut();
+         r
+     }
+ 
+     // does not work for PRAGMA
+     #[inline]
+     pub fn readonly(&self) -> bool {
+         unsafe { ffi::sqlite3_stmt_readonly(self.ptr) != 0 }
+     }
+ 
+     #[inline]
+     pub(crate) fn expanded_sql(&self) -> Option<SqliteMallocString> {
+diff --git a/src/inner_connection.rs b/src/inner_connection.rs
+--- a/src/inner_connection.rs
++++ b/src/inner_connection.rs
+@@ -204,42 +204,46 @@
+         unsafe { ffi::sqlite3_last_insert_rowid(self.db()) }
+     }
+ 
+     pub fn prepare<'a>(
+         &mut self,
+         conn: &'a Connection,
+         sql: &str,
+         flags: PrepFlags,
+     ) -> Result<(Statement<'a>, usize)> {
+         let mut c_stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
+         let (c_sql, len, _) = str_for_sqlite(sql.as_bytes())?;
+         let mut c_tail: *const c_char = ptr::null();
++        #[cfg(feature = "trace")]
++        let observation_start = std::time::Instant::now();
+         #[cfg(not(feature = "unlock_notify"))]
+         let r = unsafe { self.prepare_(c_sql, len, flags, &mut c_stmt, &mut c_tail) };
+         #[cfg(feature = "unlock_notify")]
+         let r = unsafe {
+             use crate::unlock_notify;
+             let mut rc;
+             loop {
+                 rc = self.prepare_(c_sql, len, flags, &mut c_stmt, &mut c_tail);
+                 if !unlock_notify::is_locked(self.db, rc) {
+                     break;
+                 }
+                 rc = unlock_notify::wait_for_unlock_notify(self.db);
+                 if rc != ffi::SQLITE_OK {
+                     break;
+                 }
+             }
+             rc
+         };
++        #[cfg(feature = "trace")]
++        crate::trace::observe_call(self.db, observation_start, r);
+         // If there is an error, *ppStmt is set to NULL.
+         if r != ffi::SQLITE_OK {
+             return Err(unsafe { error_with_offset(self.db, r, sql) });
+         }
+         // If the input text contains no SQL (if the input is an empty string or a
+         // comment) then *ppStmt is set to NULL.
+         let tail = if c_tail.is_null() {
+             0
+         } else {
+             let n = (c_tail as isize) - (c_sql as isize);
+             if n <= 0 || n >= len as isize {
+                 0

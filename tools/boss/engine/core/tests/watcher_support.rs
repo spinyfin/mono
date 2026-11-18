@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use boss_protocol::TopicEventPayload;
@@ -23,6 +23,9 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex;
 
 pub struct Invalidation {
+    /// When the watcher's reader task decoded this push off the socket —
+    /// stamped on arrival, not when a test later drains the queue.
+    pub received_at: Instant,
     pub topic: String,
     pub event: TopicEventPayload,
 }
@@ -106,6 +109,7 @@ pub async fn subscribe_watcher(socket_path: &str, topic: String) -> Result<Watch
             };
             if tx
                 .send(Invalidation {
+                    received_at: Instant::now(),
                     topic: topic_value.to_owned(),
                     event,
                 })

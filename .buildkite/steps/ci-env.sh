@@ -2,21 +2,81 @@
 
 OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
 
-export REPOBIN_BAZEL_FLAGS="--config=ci-${OS_TYPE}"
+# Size the disk-cache GC cap to this host's disk. .ci.bazelrc sets
+# `build:ci --experimental_disk_cache_gc_max_size=3T` fleet-wide; on any host
+# whose cache filesystem is smaller than that, size-based GC never fires and
+# the cache fills the disk. A full disk does not take the agent offline -- it
+# stays connected and keeps accepting jobs it never runs -- so the cap must fit
+# the disk the cache actually lives on. ci_disk_cache_* live in
+# disk-cache-gc-cap.sh (tested by //.buildkite/steps/tests). The computed value
+# is passed on the command line after --config=ci-<os>, which is where bazel
+# lets it override the rc file's value. Nothing here falls back to the 3T
+# value: if the cache's filesystem cannot be determined, the step fails.
+# shellcheck source=disk-cache-gc-cap.sh
+source "$(dirname "${BASH_SOURCE[0]}")/disk-cache-gc-cap.sh"
 
-# Per-pipeline bazel daemon idle TTL. Low-immediacy pipelines (checkleft-release,
-# integrity) run on a cron/manual cadence where a cold start doesn't matter;
-# give them a short TTL so their daemon frees its memory ~15min after the last
-# invocation instead of lingering for bazel's multi-hour default. The hot `mono`
-# PR pipeline keeps a long TTL so back-to-back PR builds stay warm.
-case "${BUILDKITE_PIPELINE_SLUG:-}" in
-  mono-checkleft-release | mono-changelog-release | mono-integrity | mono-release)
-    BAZEL_MAX_IDLE_SECS=900
-    ;;
-  *)
-    BAZEL_MAX_IDLE_SECS=7200
-    ;;
-esac
+CI_BAZELRC=".ci.bazelrc"
+if ! CI_DISK_CACHE_DIR="$(ci_disk_cache_path "$OS_TYPE" "$CI_BAZELRC")" \
+  || ! mkdir -p "$CI_DISK_CACHE_DIR" \
+  || ! CI_DISK_CACHE_FS_TOTAL_KB="$(ci_disk_cache_fs_total_kb "$CI_DISK_CACHE_DIR")" \
+  || ! CI_DISK_CACHE_GC_MAX_SIZE="$(ci_disk_cache_gc_cap_from_total_kb "$CI_DISK_CACHE_FS_TOTAL_KB")"; then
+  echo "^^^ +++"
+  echo "[ci-env] error: could not size the Bazel disk-cache GC cap for this host (see above). Refusing to run bazel with .ci.bazelrc's fleet-wide 3T cap: on a smaller disk it never fires and the cache fills the disk." >&2
+  exit 1
+fi
+echo "--- [ci-env] disk cache ${CI_DISK_CACHE_DIR}: filesystem is $((CI_DISK_CACHE_FS_TOTAL_KB / 1048576)) GB, GC cap ${CI_DISK_CACHE_GC_MAX_SIZE} (${CI_DISK_CACHE_GC_PERCENT}%)"
+
+# Decide whether this step's bazel actions execute on remote workers or on
+# this agent. The conditions (the step opted in with
+# CI_REMOTE_EXECUTION_ALLOWED=1, there are workers for this agent's platform,
+# its environment names an endpoint, and the endpoint answers), what executes
+# remotely on each platform, and the reasons are in remote-execution.sh, tested
+# by //.buildkite/steps/tests. A step that does not qualify runs exactly as
+# before.
+# shellcheck source=remote-execution.sh
+source "$(dirname "${BASH_SOURCE[0]}")/remote-execution.sh"
+if ! ci_remote_execution_decide "$OS_TYPE" "$(uname -m)"; then
+  echo "^^^ +++"
+  echo "[ci-env] error: could not decide where this step's bazel actions execute (see above). Fix or remove CI_BAZEL_REMOTE_EXECUTOR in this agent's environment hook." >&2
+  exit 1
+fi
+echo "--- [ci-env] remote execution ${CI_REMOTE_EXECUTION}: ${CI_REMOTE_EXECUTION_REASON}"
+if [[ "$CI_REMOTE_EXECUTION_FELL_BACK" == "1" ]] && command -v buildkite-agent > /dev/null 2>&1; then
+  # Building on the agent is correct but slow, and it puts the load back on a
+  # host that also serves as a worker. Make it visible on the build page.
+  buildkite-agent annotate --style warning --context "ci-remote-execution-${BUILDKITE_JOB_ID:-fallback}" \
+    "${BUILDKITE_LABEL:-A step} built on its agent: ${CI_REMOTE_EXECUTION_REASON}." || true
+fi
+
+# CI_BAZEL_FLAGS is the single source of truth for the per-command bazel flags
+# every CI invocation passes: the OS's CI config, the per-host disk-cache GC
+# cap computed above and, when this step executes remotely, the remote config
+# and endpoint. The config and the cap must travel together -- any invocation
+# that selects --config=ci-<os> without the cap puts the fleet-wide 3T cap back
+# in force for the GC pass that follows it. The remote flags add to the OS
+# config and replace none of it: the disk cache stays on in front of the remote
+# cache (see build:ci-remote in .ci.bazelrc for why). The bazel() wrapper below
+# and repobin (via REPOBIN_BAZEL_FLAGS) both read from here.
+export CI_BAZEL_FLAGS="--config=ci-${OS_TYPE} --experimental_disk_cache_gc_max_size=${CI_DISK_CACHE_GC_MAX_SIZE}${CI_REMOTE_BAZEL_FLAGS:+ ${CI_REMOTE_BAZEL_FLAGS}}"
+export REPOBIN_BAZEL_FLAGS="$CI_BAZEL_FLAGS"
+
+# CI_BAZEL_VERIFY_ONLY_FLAGS (set by ci_remote_execution_decide) is for a build
+# or test command that is run only for its result: nothing afterwards reads its
+# outputs from bazel-bin. When the step executes remotely it is
+# --remote_download_minimal, so the agent does not pull gigabytes of binaries
+# it will never open (test.log and test.xml still arrive, so the artifact
+# upload is unaffected). It is empty otherwise. It is deliberately not part of
+# CI_BAZEL_FLAGS: repobin, checkleft and the release steps build a target and
+# then run or upload the file, which needs the default of downloading
+# top-level outputs. Step scripts reach it through bazel_verify_only, below.
+
+# Bazel daemon idle TTL for every CI pipeline and OS: 30 minutes, so idle
+# servers on shared CI hosts (e.g. 16 GB Macs) release their memory. Local
+# builds default to 2 hours via `startup --max_idle_secs=7200` in the root
+# .bazelrc. CI passes this flag on the command line so it overrides that local
+# default; startup options can't be selected via --config. This is the single
+# source of truth for CI's value.
+BAZEL_MAX_IDLE_SECS=1800
 
 BAZEL_STARTUP_FLAGS="--max_idle_secs=${BAZEL_MAX_IDLE_SECS}"
 
@@ -54,7 +114,7 @@ if [[ "$OS_TYPE" == "darwin" ]]; then
   echo "$CURRENT_XCODE_VERSION" > "$XCODE_VERSION_FILE"
 fi
 
-# Wrap bazel and pass in ci configuration.
+# Wrap bazel and pass in ci configuration (CI_BAZEL_FLAGS, above).
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
 # cache after an Xcode upgrade) and recovers by running `bazel clean --expunge`
 # then retrying once.
@@ -68,7 +128,7 @@ bazel() {
   if command bazel \
     $BAZEL_STARTUP_FLAGS \
     "$subcommand" \
-    --config="ci-${OS_TYPE}" \
+    $CI_BAZEL_FLAGS \
     "$@" 2>&1 | tee "$tmplog"; then
     rm -f "$tmplog"
     return 0
@@ -82,13 +142,26 @@ bazel() {
     command bazel \
       $BAZEL_STARTUP_FLAGS \
       "$subcommand" \
-      --config="ci-${OS_TYPE}" \
+      $CI_BAZEL_FLAGS \
       "$@"
     return $?
   fi
 
   rm -f "$tmplog"
   return 1
+}
+
+# bazel_verify_only <build|test> <args...>
+#
+# The bazel() wrapper for a command whose outputs this step never reads from
+# disk afterwards: `bazel build //...` and `bazel test //...` run for their
+# pass/fail result. Adds CI_BAZEL_VERIFY_ONLY_FLAGS (see above) after the CI
+# flags. Do not use it for a build whose output is then executed, uploaded or
+# inspected -- on a remotely executing step that file will not be on the agent.
+bazel_verify_only() {
+  local subcommand="$1"
+  shift
+  bazel "$subcommand" $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
 }
 
 # Shared by the release step scripts (checkleft-release.sh, release-release.sh)
@@ -127,89 +200,3 @@ echo "+++ installing repobin tools into bin/"
 bazel build //tools/repobin:repobin
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
 
-# checkleft's npm-provisioned checks (`format/oxc`, `lint/oxc`, …) run
-# `npx --yes <package>@<pin>`. Node is not part of the Bazel toolchain;
-# hosts are expected to have Node >= 22 on PATH. The bazel-any fleet is
-# heterogeneous, and at least one Linux agent (greyarea-1) has neither
-# `npx` nor a PATH `oxfmt`, which fails those checks with ENOENT. Call
-# `ensure_npx` from steps that run checkleft so a missing host Node is
-# filled in with a pinned official tarball instead of failing closed.
-CI_NODE_VERSION="24.8.0"
-
-ensure_npx() {
-  if command -v npx >/dev/null 2>&1; then
-    return 0
-  fi
-  local extra
-  for extra in /usr/local/bin /opt/homebrew/bin; do
-    if [[ -x "${extra}/npx" ]]; then
-      export PATH="${extra}:${PATH}"
-      echo "--- [ci-env] found npx at ${extra}/npx; prepended to PATH"
-      return 0
-    fi
-  done
-
-  local os arch sha
-  case "$(uname -s)" in
-    Linux) os=linux ;;
-    Darwin) os=darwin ;;
-    *)
-      echo "error: npx is required for checkleft npm checks but is not on PATH (OS $(uname -s) has no CI Node bootstrap)" >&2
-      return 1
-      ;;
-  esac
-  case "$(uname -m)" in
-    x86_64) arch=x64 ;;
-    aarch64 | arm64) arch=arm64 ;;
-    *)
-      echo "error: npx is required for checkleft npm checks but is not on PATH (arch $(uname -m) has no CI Node bootstrap)" >&2
-      return 1
-      ;;
-  esac
-  case "${os}-${arch}" in
-    linux-x64) sha=daf68404b478b4c3616666580d02500a24148c0c8d88648372078c03655ec0f7 ;;
-    linux-arm64) sha=5eb16b14af5a5f494ed54770822144e847c744fe590f8df093ad4927cf3dd7fd ;;
-    darwin-arm64) sha=d81191a1866760eb918caa976c023036bc1fc7405ea31b148905211522045767 ;;
-    darwin-x64) sha=6fd8496b59baa8f86a24e3eb03308b763091716ffc6b6e1094d1a5e5697dd6dd ;;
-    *)
-      echo "error: no pinned Node tarball for ${os}-${arch}" >&2
-      return 1
-      ;;
-  esac
-
-  local tarball="node-v${CI_NODE_VERSION}-${os}-${arch}.tar.gz"
-  local cache_root="${HOME}/.cache/mono-ci-node"
-  if [[ -d /mnt/ssd && -w /mnt/ssd ]]; then
-    cache_root="/mnt/ssd/mono-ci-node"
-  fi
-  local prefix="${cache_root}/node-v${CI_NODE_VERSION}-${os}-${arch}"
-  if [[ -x "${prefix}/bin/npx" ]]; then
-    export PATH="${prefix}/bin:${PATH}"
-    echo "--- [ci-env] using cached Node ${CI_NODE_VERSION} at ${prefix}"
-    return 0
-  fi
-
-  echo "--- [ci-env] npx not on PATH; downloading Node ${CI_NODE_VERSION} (${os}-${arch})"
-  local tmp
-  tmp=$(mktemp -d)
-  # Cleanup even if curl/tar/sha fail; mktemp dirs otherwise leak on `return 1`.
-  # shellcheck disable=SC2064
-  trap "rm -rf '${tmp}'" RETURN
-  curl -fsSL "https://nodejs.org/dist/v${CI_NODE_VERSION}/${tarball}" -o "${tmp}/${tarball}"
-  local actual
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "${tmp}/${tarball}" | awk '{print $1}')
-  else
-    actual=$(shasum -a 256 "${tmp}/${tarball}" | awk '{print $1}')
-  fi
-  if [[ "${actual}" != "${sha}" ]]; then
-    echo "error: Node tarball sha256 mismatch (got ${actual}, expected ${sha})" >&2
-    return 1
-  fi
-  tar -xzf "${tmp}/${tarball}" -C "${tmp}"
-  mkdir -p "${cache_root}"
-  rm -rf "${prefix}"
-  mv "${tmp}/node-v${CI_NODE_VERSION}-${os}-${arch}" "${prefix}"
-  export PATH="${prefix}/bin:${PATH}"
-  command -v npx >/dev/null 2>&1
-}

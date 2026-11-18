@@ -152,6 +152,7 @@ impl CiLogReader for BuildkiteLogReader {
 #[derive(Debug, Clone)]
 pub struct GithubActionsLogReader {
     binary: String,
+    repository: Option<String>,
 }
 
 impl Default for GithubActionsLogReader {
@@ -164,11 +165,29 @@ impl GithubActionsLogReader {
     pub fn new() -> Self {
         Self {
             binary: "gh".to_owned(),
+            repository: None,
         }
     }
 
     pub fn with_binary(binary: impl Into<String>) -> Self {
-        Self { binary: binary.into() }
+        Self {
+            binary: binary.into(),
+            repository: None,
+        }
+    }
+
+    /// Pin repository discovery for engine probes that run outside a checkout.
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    async fn run(&self, args: &[&str]) -> Result<String> {
+        let mut args = args.to_vec();
+        if let Some(repository) = self.repository.as_deref() {
+            args.extend(["--repo", repository]);
+        }
+        run_capture(&self.binary, &args).await
     }
 }
 
@@ -180,19 +199,24 @@ impl CiLogReader for GithubActionsLogReader {
     }
 
     async fn read_log_full(&self, job_id: &str) -> Result<String> {
-        run_capture(&self.binary, &["run", "view", "--log-failed", "--job", job_id]).await
+        self.run(&["run", "view", "--log-failed", "--job", job_id]).await
     }
 
     async fn retrigger(&self, id: &str) -> Result<String> {
         // `gh run rerun <run-id> --failed` re-runs failed jobs of an
         // existing workflow run; GHA reuses the same run id, so we
         // surface it back to the caller as the new id.
-        run_capture(&self.binary, &["run", "rerun", id, "--failed"]).await?;
+        self.run(&["run", "rerun", id, "--failed"]).await?;
         Ok(id.to_owned())
     }
 
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
-        format!("{} run view --log-failed --job {job_id}", self.binary)
+        let suffix = self
+            .repository
+            .as_ref()
+            .map(|repo| format!(" --repo {repo}"))
+            .unwrap_or_default();
+        format!("{} run view --log-failed --job {job_id}{suffix}", self.binary)
     }
 }
 
@@ -381,7 +405,16 @@ pub fn reader_for_with_binaries(
                 "could not parse pipeline slug and build number from target_url {target_url:?}"
             ))),
         },
-        CiProvider::GithubActions => Box::new(GithubActionsLogReader::with_binary(gh_binary)),
+        CiProvider::GithubActions => {
+            let mut reader = GithubActionsLogReader::with_binary(gh_binary);
+            if let Some(path) = target_url.strip_prefix("https://github.com/") {
+                let mut parts = path.split('/');
+                if let (Some(owner), Some(repo)) = (parts.next(), parts.next()) {
+                    reader = reader.with_repository(format!("{owner}/{repo}"));
+                }
+            }
+            Box::new(reader)
+        }
         CiProvider::Other => Box::new(UnknownProviderReader),
     }
 }
@@ -468,6 +501,15 @@ pub struct TrunkEvictionBuild {
     /// parse, so callers can hand the result straight to those helpers.
     pub web_url: String,
     pub failed_job_ids: Vec<String>,
+    /// Display labels and stable identities, index-aligned with `failed_job_ids`.
+    pub failed_job_details: Vec<TrunkJobDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrunkJobDetails {
+    pub label: String,
+    /// A stable step key, never a display-name fallback.
+    pub step_key: Option<String>,
 }
 
 /// Pages of the org-wide failed-build search [`find_trunk_merge_eviction_build`]
@@ -478,6 +520,36 @@ pub struct TrunkEvictionBuild {
 /// build pushed past the first page against not hammering the API on a
 /// lookup that is already degrading gracefully to an empty result.
 const MAX_EVICTION_BUILD_SEARCH_PAGES: u32 = 3;
+
+/// Fetch every stable job identity in a build with one org-relative request.
+pub async fn fetch_buildkite_step_keys(binary: &str, url: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let url = url.split('#').next().unwrap_or(url);
+    let path = url
+        .strip_prefix("https://buildkite.com/")
+        .context("invalid Buildkite URL")?;
+    let parts: Vec<_> = path.split('/').collect();
+    anyhow::ensure!(parts.len() == 4 && parts[2] == "builds", "invalid Buildkite build URL");
+    let endpoint = format!("/pipelines/{}/builds/{}", parts[1], parts[3]);
+    let output = run_capture(binary, &["api", &endpoint]).await?;
+    parse_buildkite_step_keys(&output, url)
+}
+
+fn parse_buildkite_step_keys(output: &str, url: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let build: serde_json::Value = serde_json::from_str(output)?;
+    // bk scopes requests to its configured organization. Reject a different
+    // organization's response before using any job identities from it.
+    anyhow::ensure!(
+        build["web_url"].as_str() == Some(url),
+        "Buildkite build URL differs from configured organization's response"
+    );
+    Ok(build["jobs"]
+        .as_array()
+        .context("missing jobs")?
+        .iter()
+        .filter_map(|job| Some((job["id"].as_str()?.to_owned(), job["step_key"].as_str()?.to_owned())))
+        .filter(|(_, key)| !key.trim().is_empty())
+        .collect())
+}
 
 /// Discover the newest failed/failing Buildkite build whose branch is the
 /// gating `trunk-merge/pr-<pr_number>/*` construction branch for a Trunk
@@ -548,18 +620,36 @@ fn parse_trunk_eviction_build(builds: &serde_json::Value, branch_prefix: &str) -
         let pipeline_slug = build.get("pipeline")?.get("slug")?.as_str()?.to_owned();
         let build_number = build.get("number")?.as_u64()?.to_string();
         let web_url = build.get("web_url")?.as_str()?.to_owned();
-        let failed_job_ids = build
+        let (failed_job_ids, failed_job_details) = build
             .get("jobs")?
             .as_array()?
             .iter()
             .filter(|job| job.get("state").and_then(|s| s.as_str()) == Some("failed"))
-            .filter_map(|job| job.get("id")?.as_str().map(str::to_owned))
-            .collect();
+            .filter_map(|job| {
+                let id = job.get("id")?.as_str()?.to_owned();
+                let label = ["step_key", "name"]
+                    .iter()
+                    .find_map(|k| job.get(*k)?.as_str().filter(|s| !s.trim().is_empty()))
+                    .unwrap_or_default()
+                    .to_owned();
+                Some((
+                    id,
+                    TrunkJobDetails {
+                        label,
+                        step_key: job["step_key"]
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_owned),
+                    },
+                ))
+            })
+            .unzip();
         Some(TrunkEvictionBuild {
             pipeline_slug,
             build_number,
             web_url,
             failed_job_ids,
+            failed_job_details,
         })
     })
 }
@@ -743,7 +833,7 @@ mod tests {
             "pipeline": { "slug": pipeline },
             "number": number,
             "web_url": web_url,
-            "jobs": job_states.iter().map(|(id, state)| serde_json::json!({"id": id, "state": state})).collect::<Vec<_>>(),
+            "jobs": job_states.iter().map(|(id, state)| serde_json::json!({"id": id, "state": state, "step_key": format!("{id}-key")})).collect::<Vec<_>>(),
         })
     }
 
@@ -761,6 +851,13 @@ mod tests {
         assert_eq!(found.build_number, "2364");
         assert_eq!(found.web_url, "https://buildkite.com/flunge/flunge-ci/builds/2364");
         assert_eq!(found.failed_job_ids, vec!["job-abc".to_owned()]);
+        assert_eq!(
+            found.failed_job_details,
+            vec![TrunkJobDetails {
+                label: "job-abc-key".into(),
+                step_key: Some("job-abc-key".into())
+            }]
+        );
     }
 
     #[test]
@@ -840,6 +937,29 @@ exit 2
         assert_eq!(found.pipeline_slug, "flunge-ci");
         assert_eq!(found.build_number, "2364");
         assert_eq!(found.failed_job_ids, vec!["job-uuid-1".to_owned()]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn step_keys_use_org_relative_endpoint_and_reject_other_orgs() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+[ "$1" = "api" ] && [ "$2" = "/pipelines/mono/builds/7" ] || exit 2
+printf '%s\n' '{"web_url":"https://buildkite.com/expected/mono/builds/7","jobs":[{"id":"one","step_key":"tests"},{"id":"two","step_key":"lint"},{"id":"three","name":"display only"}]}'
+"#;
+        let path = write_script(dir.path(), "bk", script);
+        let binary = path.to_str().unwrap();
+        let keys = fetch_buildkite_step_keys(binary, "https://buildkite.com/expected/mono/builds/7#one")
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys["one"], "tests");
+        assert_eq!(keys["two"], "lint");
+        assert!(
+            fetch_buildkite_step_keys(binary, "https://buildkite.com/other/mono/builds/7")
+                .await
+                .is_err()
+        );
     }
 
     /// A full first page (100 results) with no branch-prefix match must
@@ -949,6 +1069,21 @@ exit 2
     fn gha_invocation_hint_embeds_job_id() {
         let r = GithubActionsLogReader::new();
         assert_eq!(r.worker_cli_invocation_hint("99"), "gh run view --log-failed --job 99");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn gha_log_probe_pins_repo_outside_a_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(dir.path(), "gh", "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let reader = reader_for_with_binaries(
+            CiProvider::GithubActions,
+            "https://github.com/owner/repo/actions/runs/1/job/2",
+            "bk",
+            script.to_str().unwrap(),
+        );
+        let output = reader.read_log_full("2").await.unwrap();
+        assert_eq!(output, "run\nview\n--log-failed\n--job\n2\n--repo\nowner/repo\n");
     }
 
     #[test]
@@ -1293,5 +1428,17 @@ exit 2
             let msg = format!("{err:#}");
             assert!(msg.contains("auth required"), "stderr missing: {msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod verification_identity_tests {
+    #[test]
+    fn step_key_is_resolved_by_job_id_never_by_display_label() {
+        let build = r#"{"web_url":"url","jobs":[{"id":"other","step_key":"frontend"},{"id":"failed","name":"Friendly label","step_key":"mac-app-build"},{"id":"unkeyed","name":"label-only"}]}"#;
+        let keys = super::parse_buildkite_step_keys(build, "url").unwrap();
+        assert_eq!(keys["failed"], "mac-app-build");
+        assert!(!keys.contains_key("absent"));
+        assert!(!keys.contains_key("unkeyed"));
     }
 }

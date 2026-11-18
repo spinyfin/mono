@@ -1,0 +1,2347 @@
+use super::dispatch_admission::{
+    primary_pr_awaits_review, revision_implementation_completed, work_item_is_deliberately_parked,
+};
+use super::queued_wait::ReviewNaming;
+use super::*;
+
+/// Shared per-product short-id read-modify-write. Reads the current
+/// `next_value` from `table` for `product_id` (defaulting to 1 when no
+/// row exists yet), writes back `next_value + 1`, and returns the value
+/// just claimed. Must be called inside the same SQLite transaction as
+/// the row insert; SQLite serialises writers in WAL mode, so two
+/// concurrent inserts against the same product receive distinct ids.
+///
+/// `table` is a compile-time literal supplied by the three
+/// `pub` wrappers below (never caller/user input), so
+/// formatting it into the two SQL statements is not an injection
+/// surface.
+fn allocate_next_short_id(conn: &Connection, table: &str, product_id: &str) -> Result<i64> {
+    let current: i64 = conn
+        .query_row(
+            &format!("SELECT next_value FROM {table} WHERE product_id = ?1"),
+            [product_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1);
+    conn.execute(
+        &format!(
+            "INSERT INTO {table}(product_id, next_value) VALUES(?1, ?2)
+             ON CONFLICT(product_id) DO UPDATE SET next_value = excluded.next_value"
+        ),
+        params![product_id, current + 1],
+    )?;
+    Ok(current)
+}
+
+/// Allocate the next per-product `short_id` for a new `tasks` or
+/// `projects` row. Reads the current `next_value` from
+/// `short_id_sequences` for `product_id`, defaulting to 1 if no row
+/// exists yet, writes back `next_value + 1`, and returns the value
+/// just claimed. Must be called inside the same SQLite transaction as
+/// the row insert; SQLite serialises writers in WAL mode, so two
+/// concurrent inserts against the same product receive distinct ids.
+///
+/// See `tools/boss/docs/designs/friendly-numeric-ids-for-work-items.md`
+/// (Q3) for the reasoning behind the per-product scope and the
+/// in-transaction read-modify-write pattern.
+pub(crate) fn allocate_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    allocate_next_short_id(conn, "short_id_sequences", product_id)
+}
+
+/// Parallel to [`allocate_short_id`] for the `A<n>` automation namespace.
+/// Reads and advances `automation_short_id_sequences` for `product_id`.
+/// Must be called inside the same transaction as the `automations` row insert.
+/// See `tools/boss/docs/designs/maintenance-tasks.md` §"Short-id namespace".
+pub(crate) fn allocate_automation_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    allocate_next_short_id(conn, "automation_short_id_sequences", product_id)
+}
+
+/// Parallel to [`allocate_short_id`] for the attention-group `A<n>`
+/// namespace. Reads and advances `attention_group_short_id_sequences`
+/// for `product_id`. Must be called inside the same transaction as the
+/// `attention_groups` row insert. Attention groups get their own dense
+/// per-product counter (rather than sharing the tasks/projects sequence)
+/// so the first group in a busy product is `A1`, not `A<large>`.
+/// See `tools/boss/docs/designs/attentions.md` §"Schema and wire summary".
+pub(crate) fn allocate_attention_group_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    allocate_next_short_id(conn, "attention_group_short_id_sequences", product_id)
+}
+
+/// Parallel to [`allocate_short_id`] for the product-decision `D<n>`
+/// namespace. Reads and advances `decision_short_id_sequences` for
+/// `product_id`. Must be called inside the same transaction as the
+/// `product_decisions` row insert.
+pub(crate) fn allocate_decision_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    allocate_next_short_id(conn, "decision_short_id_sequences", product_id)
+}
+
+/// Parallel to [`allocate_short_id`] for the idea `I<n>` namespace. Reads
+/// and advances `idea_short_id_sequences` for `product_id`. Must be called
+/// inside the same transaction as the `ideas` row insert (own dense
+/// per-product counter, not the shared `short_id_sequences` tasks/chores/
+/// projects use).
+pub(crate) fn allocate_idea_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    allocate_next_short_id(conn, "idea_short_id_sequences", product_id)
+}
+
+/// Validate the `(execution_id, work_item_id)` discriminant on a
+/// `CreateAttentionItemInput` and return the canonical pair to write.
+/// Exactly one of the two must be set; both-set or neither-set is a
+/// caller bug. Also confirms the referenced row actually exists so
+/// the CHECK constraint and FK don't blow up on insert.
+pub(crate) fn attention_target_from_input(
+    conn: &Connection,
+    input: &CreateAttentionItemInput,
+) -> Result<(Option<String>, Option<String>)> {
+    let exec = input.execution_id.as_deref().filter(|s| !s.is_empty());
+    let work = input.work_item_id.as_deref().filter(|s| !s.is_empty());
+    match (exec, work) {
+        (Some(execution_id), None) => {
+            ensure_execution_exists(conn, execution_id)?;
+            Ok((Some(execution_id.to_owned()), None))
+        }
+        (None, Some(work_item_id)) => {
+            if let Err(task_err) = product_id_for_work_item(conn, work_item_id) {
+                let is_comment: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM work_comments WHERE id = ?1)",
+                    [work_item_id],
+                    |row| row.get(0),
+                )?;
+                if !is_comment {
+                    return Err(task_err);
+                }
+            }
+            Ok((None, Some(work_item_id.to_owned())))
+        }
+        (Some(_), Some(_)) => {
+            bail!("attention item must reference either execution_id or work_item_id, not both")
+        }
+        (None, None) => bail!("attention item must reference either execution_id or work_item_id"),
+    }
+}
+
+/// Emit a sticky [`REPO_UNRESOLVED_ATTENTION_KIND`] attention item against
+/// `work_item_id`, unless one is already open (in which case the open row's
+/// re-raise is stamped). Idempotent: repeated reconcile passes against the
+/// same work item don't pile up rows. Caller supplies the kind label
+/// (`task`, `chore`, `project`) so the message names the right CLI verb.
+///
+/// Binds the registry constant rather than re-spelling the kind string:
+/// `repo_unresolved` is a `ClearedBy::WorkResumed` kind, so a producer-side
+/// typo would silently take it out of reconciliation — the exact class of
+/// un-lowerable signal [`boss_engine_storage_values::attention_lifecycle`] exists to prevent.
+///
+/// [`REPO_UNRESOLVED_ATTENTION_KIND`]: boss_engine_storage_values::attention_kinds::REPO_UNRESOLVED_ATTENTION_KIND
+pub fn record_repo_unresolved_attention(conn: &Connection, work_item_id: &str, kind_label: &str) -> Result<()> {
+    let kind = boss_engine_storage_values::attention_kinds::REPO_UNRESOLVED_ATTENTION_KIND;
+    warn_if_lifecycle_undeclared(kind);
+    if reraise_open_work_item_attention(conn, work_item_id, kind)?.is_some() {
+        return Ok(());
+    }
+    let id = next_id("attn");
+    let now = now_string();
+    let title = format!("Work item {work_item_id} has no repo resolution");
+    let body = repo_unresolved_attention_body(work_item_id, kind_label);
+    conn.execute(
+        "INSERT INTO work_attention_items (
+            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at,
+            last_raised_at
+         ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
+        params![id, work_item_id, kind, title, body, now],
+    )?;
+    Ok(())
+}
+
+/// True while cube's positioning refusal holds `work_item_id`. Items in
+/// `todo`/`active` carry it on the task row (`blocked_reason`); review-phase
+/// items (`in_review`, `blocked:merge_conflict`, `blocked:ci_failure`) keep their
+/// own status, so the open attention item is the hold for them.
+pub(crate) fn positioning_hold_active(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    if query_task(conn, work_item_id)?
+        .is_some_and(|task| task.blocked_reason.as_deref() == Some(WORKSPACE_POSITIONING_REFUSED))
+    {
+        return Ok(true);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_attention_items
+                       WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open')",
+        params![work_item_id, WORKSPACE_POSITIONING_REFUSED],
+        |row| row.get(0),
+    )?)
+}
+
+/// SQL predicate (over task alias `a`) that is true while the positioning hold is
+/// NOT in force. Recovery sweeps that mint executions outside `request_execution`
+/// add it to their candidate queries so a refused start is not replaced behind
+/// the hold's back.
+pub(crate) fn not_positioning_held_sql(a: &str) -> String {
+    format!(
+        "(COALESCE({a}.blocked_reason, '') <> '{WORKSPACE_POSITIONING_REFUSED}'
+          AND NOT EXISTS (SELECT 1 FROM work_attention_items ph
+                          WHERE ph.work_item_id = {a}.id AND ph.kind = '{WORKSPACE_POSITIONING_REFUSED}'
+                            AND ph.status = 'open'))"
+    )
+}
+
+/// Lower the positioning hold: resolve its attention and return a row that was
+/// blocked only by the hold to `todo`. Review-phase rows never had their status
+/// rewritten, so they are left exactly as they were.
+///
+/// `done` / `archived` rows keep their status; any leftover `blocked_reason`
+/// is still cleared so they leave the hold listing. Deleted rows keep both
+/// status and reason so a restore returns a coherent hold. Returns
+/// whether attention was resolved or a row was rewritten.
+pub(crate) fn clear_positioning_hold_in_tx(conn: &Connection, work_item_id: &str, actor: &str) -> Result<bool> {
+    let now = now_string();
+    let attention = resolve_attention_kind_in_tx(conn, work_item_id, WORKSPACE_POSITIONING_REFUSED)?;
+    let rewritten = crate::task_status_audit::execute(
+        conn,
+        "workspace_positioning_hold_cleared",
+        actor,
+        &format!(
+            "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
+                 last_status_actor = ?3, updated_at = ?2
+             WHERE id = ?1 AND deleted_at IS NULL
+               AND status = 'blocked' AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
+        ),
+        params![work_item_id, now, actor],
+    )?;
+    // Terminal rows fail the status rewrite above (status is no longer
+    // `blocked`). Drop the leftover reason without touching status so the
+    // hold listing converges. Tombstones keep their reason: a restore must
+    // bring back the coherent hold, which the recheck sweep then lists again.
+    let leftover = crate::task_status_audit::execute(
+        conn,
+        "workspace_positioning_hold_cleared",
+        actor,
+        &format!(
+            "UPDATE tasks SET blocked_reason = NULL, blocked_detail = NULL,
+                 last_status_actor = ?3, updated_at = ?2
+             WHERE id = ?1 AND deleted_at IS NULL AND blocked_reason = '{WORKSPACE_POSITIONING_REFUSED}'"
+        ),
+        params![work_item_id, now, actor],
+    )?;
+    Ok(attention > 0 || rewritten > 0 || leftover > 0)
+}
+
+/// Mark every open attention item of `kind` for `work_item_id` as
+/// resolved, against an already-open connection/transaction. Shared by
+/// [`super::workitems::WorkDb::resolve_external_tracker_attention`]
+/// (opens its own connection) and
+/// [`request_execution_in_tx_with_live_check`] (already inside a
+/// transaction, so it can't call back through a `WorkDb` method that
+/// opens a second connection). Returns the number of rows resolved; a
+/// no-op (`0`) when none were open is expected and not an error.
+pub fn resolve_attention_kind_in_tx(conn: &Connection, work_item_id: &str, kind: &str) -> Result<usize> {
+    let now = now_string();
+    let rows = conn.execute(
+        "UPDATE work_attention_items
+         SET status = 'resolved', resolved_at = ?1
+         WHERE work_item_id = ?2
+           AND kind = ?3
+           AND status = 'open'",
+        params![now, work_item_id, kind],
+    )?;
+    Ok(rows)
+}
+
+/// Shared precheck for any dispatch trigger (request-execution,
+/// kanban drag-to-Doing). Returns `Ok(())` when the work item
+/// resolves to a repo URL. When it doesn't, writes a sticky
+/// `repo_unresolved` attention item via a short-lived transaction
+/// (so the row commits before the caller's bail unwinds anything
+/// else) and bails with the same human-facing message
+/// `repo_unresolved_attention_body` produces. Callers MUST resolve
+/// friendly short ids before passing `work_item_id` here.
+pub fn ensure_dispatch_repo_resolvable(conn: &mut Connection, work_item_id: &str) -> Result<()> {
+    if resolve_repo_for_work_item(conn, work_item_id)?.is_some() {
+        return Ok(());
+    }
+    let label = repo_unresolved_kind_label(conn, work_item_id)?;
+    let attn_tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    record_repo_unresolved_attention(&attn_tx, work_item_id, label)?;
+    attn_tx.commit()?;
+    bail!("{}", repo_unresolved_attention_body(work_item_id, label));
+}
+
+/// The exact message text both the attention item and the
+/// `request_execution` bail path use. Single source so the two
+/// surfaces never drift, per the design doc's R1 mitigation.
+pub(crate) fn repo_unresolved_attention_body(work_item_id: &str, kind_label: &str) -> String {
+    format!(
+        "work item {work_item_id} has no repo resolution; set one with `boss {kind_label} update --repo <url>` or set a product default."
+    )
+}
+
+/// Kind label for the `boss <kind> update` hint in the
+/// `repo_unresolved` message. Tasks under a project use `task`;
+/// project-less rows are `chore`. Projects don't dispatch directly,
+/// so the message there falls back to the safe generic.
+pub(crate) fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) -> Result<&'static str> {
+    Ok(match classify_id(work_item_id)? {
+        ItemKind::Task => {
+            let task = query_task(conn, work_item_id)?
+                .filter(|task| task.deleted_at.is_none())
+                .with_context(|| format!("unknown task: {work_item_id}"))?;
+            match task.kind {
+                TaskKind::Chore | TaskKind::Followup => "chore",
+                TaskKind::Design
+                | TaskKind::Investigation
+                | TaskKind::DesignPostmortem
+                | TaskKind::ProjectTask
+                | TaskKind::Revision
+                | TaskKind::Task => "task",
+            }
+        }
+        ItemKind::Project => "project",
+        ItemKind::Product => "product",
+        ItemKind::Comment => "comment",
+        ItemKind::Comparison => "comparison",
+    })
+}
+
+pub(crate) fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
+    if !row_exists(
+        conn,
+        "SELECT EXISTS(SELECT 1 FROM work_executions WHERE id = ?1)",
+        &[&execution_id],
+    )? {
+        bail!("unknown execution: {execution_id}");
+    }
+    Ok(())
+}
+
+/// Edges where the dependent belongs to `product_id`. Joins
+/// `work_item_dependencies` against `tasks` (live rows only) and
+/// `projects` so cross-product or stale-by-deletion edges never leak
+/// into a kanban payload. Sorted to match `prerequisites_of` /
+/// `dependents_of` so consumers see a stable order.
+pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) -> Result<Vec<WorkItemDependency>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.dependent_id, d.prerequisite_id, d.relation, d.created_at
+         FROM work_item_dependencies d
+         WHERE EXISTS (
+             SELECT 1 FROM tasks t
+             WHERE t.id = d.dependent_id
+               AND t.product_id = ?1
+               AND t.deleted_at IS NULL
+         )
+         OR EXISTS (
+             SELECT 1 FROM projects p
+             WHERE p.id = d.dependent_id
+               AND p.product_id = ?1
+         )
+         ORDER BY d.created_at ASC, d.dependent_id ASC, d.prerequisite_id ASC",
+    )?;
+    let rows = stmt.query_map([product_id], |row| {
+        Ok(WorkItemDependency {
+            dependent_id: row.get(0)?,
+            prerequisite_id: row.get(1)?,
+            relation: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+/// Where one board assembly's runtime pass spent its statements and time.
+/// The phases partition `statements`: the epoch read, the execution point
+/// queries each computed card reports (1-4, see [`compute_task_runtime`]),
+/// and every statement of the annotation.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimePassCost {
+    pub statements: u64,
+    /// The epoch read and the cache probe; absent on the uncached path.
+    pub cache: Option<RuntimeCacheCost>,
+    /// The execution projection of every card the cache could not serve.
+    pub computed: RuntimePhaseCost,
+    /// Naming the wait of every card with nothing pending, by branch.
+    pub annotation: super::unscheduled_wait::ClassifyCost,
+}
+
+impl RuntimePassCost {
+    /// Record each phase as a sub-segment of `db.task_runtimes`, so a slow
+    /// runtime pass names the phase and the annotation branch that took it.
+    pub(crate) fn record(&self, trace: &mut boss_metrics::population_timing::PopulationTrace) {
+        use boss_metrics::population_timing::segment;
+        if let Some(cache) = &self.cache {
+            trace.record_cache_probe(
+                segment::DB_TASK_RUNTIMES_CACHE,
+                cache.millis,
+                cache.statements,
+                cache.hits,
+                cache.misses,
+            );
+        }
+        trace.record_nplus1(
+            segment::DB_TASK_RUNTIMES_COMPUTE,
+            self.computed.millis,
+            self.computed.cards,
+            self.computed.statements,
+        );
+        let annotation = &self.annotation;
+        trace.record_nplus1(
+            segment::DB_TASK_RUNTIMES_ANNOTATION,
+            annotation.millis(),
+            annotation.cards(),
+            annotation.statements(),
+        );
+        for (name, branch) in [
+            (segment::DB_TASK_RUNTIMES_ANNOTATION_QUEUED, &annotation.queued),
+            (
+                segment::DB_TASK_RUNTIMES_ANNOTATION_IDLE_ACTIVE,
+                &annotation.idle_active,
+            ),
+            (segment::DB_TASK_RUNTIMES_ANNOTATION_REVIEW, &annotation.review),
+            (segment::DB_TASK_RUNTIMES_ANNOTATION_HOLDS, &annotation.holds),
+        ] {
+            trace.record_nplus1(name, branch.millis, branch.cards, branch.statements);
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimeCacheCost {
+    pub hits: usize,
+    pub misses: usize,
+    pub statements: u64,
+    pub millis: f64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimePhaseCost {
+    pub cards: usize,
+    pub statements: u64,
+    pub millis: f64,
+}
+
+/// Hydrate the per-item runtime for every task and chore. This is the
+/// primary N+1 on the `get_work_tree` path: one call per work item, each
+/// running execution point queries. The wait of every card with nothing
+/// pending is then named for all of them together, with statements that do
+/// not grow with the board. Returns the runtimes alongside what the pass
+/// cost, so `boss_engine::population_timing` can attribute the per-row
+/// subquery fan-out.
+pub(crate) fn collect_task_runtimes(
+    conn: &Connection,
+    tasks: &[Task],
+    chores: &[Task],
+    now: i64,
+) -> Result<(Vec<TaskRuntime>, RuntimePassCost)> {
+    let started = std::time::Instant::now();
+    let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
+    let mut queries = 0u64;
+    for task in tasks.iter().chain(chores.iter()) {
+        runtimes.push(compute_task_runtime(conn, &task.id, &mut queries, now, ReviewNaming::Deferred)?.runtime);
+    }
+    let computed = RuntimePhaseCost {
+        cards: runtimes.len(),
+        statements: queries,
+        millis: started.elapsed().as_secs_f64() * 1000.0,
+    };
+    let annotation = {
+        let counter = super::db_diagnostics::StatementCounter::install(conn);
+        super::queued_wait::annotate_unscheduled_many(
+            conn,
+            tasks.iter().chain(chores.iter()).zip(runtimes.iter_mut()),
+            Some(&counter),
+        )?
+    };
+    let cost = RuntimePassCost {
+        statements: computed.statements + annotation.statements(),
+        cache: None,
+        computed,
+        annotation,
+    };
+    Ok((runtimes, cost))
+}
+
+/// Runtime snapshot for a single work item. `queries` is incremented by the
+/// number of execution point queries (1-4, depending on
+/// whether a live-execution fallback, a non-abandoned-execution fallback for
+/// an all-abandoned work item, and a latest-run lookup are needed) so N+1
+/// callers can report an aggregate subquery count. Task lookup and wait
+/// annotation statements are counted as well.
+pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let mut runtime = compute_task_runtime(conn, work_item_id, queries, now, ReviewNaming::Inline)?.runtime;
+    // A card queued with no execution is explained from its task row, which
+    // the execution-keyed projection above never reads.
+    if runtime.dispatch_wait_reason.is_none() {
+        let (annotation, statements) = super::db_diagnostics::count_statements(conn, || -> Result<()> {
+            if let Some(task) = query_task(conn, work_item_id)? {
+                super::queued_wait::annotate_unscheduled(conn, &task, &mut runtime)?;
+            }
+            Ok(())
+        });
+        *queries += statements;
+        annotation?;
+    }
+    Ok(runtime)
+}
+
+/// A freshly computed runtime plus what the board runtime cache needs to know
+/// about how far it may be reused.
+pub struct ComputedRuntime {
+    pub runtime: TaskRuntime,
+    /// False when the projection consulted another work item's state (see
+    /// [`queued_wait::DispatchWait::reads_other_items`]); the item's own epoch
+    /// does not version that, so the result must be recomputed every time.
+    pub cacheable: bool,
+    /// Epoch seconds from which the result changes without any write: the
+    /// moment a future `dispatch_not_before` elapses. `None` when the result
+    /// is not time-dependent.
+    pub expires_at: Option<i64>,
+}
+
+/// The one implementation of the per-item runtime projection. `now` is read
+/// once by the caller and used for every time comparison so the result and its
+/// `expires_at` agree. The inputs it reads, and what versions each one for the
+/// board runtime cache (`board_runtime_epoch`, schema 49):
+/// - the item's `work_executions` rows: any insert, update or delete;
+/// - the chosen execution's latest `work_runs` row: insert, delete, or an
+///   update of `status`, `execution_id` or `created_at`;
+/// - `dispatch_not_before` against `now`: `expires_at`;
+/// - failure history (start events, run errors and attention bodies): not cached;
+/// - dependency gating, project order and chain-hold blockers: not
+///   versioned, `cacheable` is false.
+///
+/// The item's own task row is not an input here. A card queued with no
+/// execution is explained from that row by
+/// `queued_wait::annotate_unscheduled_many`, which callers holding the rows
+/// apply after this projection (and after any cache hit). Such a caller
+/// passes [`ReviewNaming::Deferred`], because that pass also names a run
+/// parked waiting for review.
+///
+/// A new input must be added to one of those four mechanisms, or the cache
+/// will serve it stale; `every_runtime_input_write_invalidates_exactly_its_item`
+/// in `work/tests/board_runtime_cache_tests.rs` is the net that catches a
+/// missed one, so a new runtime input needs a step added there.
+pub(crate) fn compute_task_runtime(
+    conn: &Connection,
+    work_item_id: &str,
+    queries: &mut u64,
+    now: i64,
+    review: ReviewNaming,
+) -> Result<ComputedRuntime> {
+    let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
+    *queries += 1;
+    // `current_execution_id` (the operator-facing label for
+    // `TaskRuntime.execution_id`) and the kanban card must follow the
+    // execution a worker is actually attached to. A re-dispatch storm
+    // leaves a newer *terminal* execution (the stalled duplicate)
+    // shadowing the live run — keying off the plain latest row then
+    // detaches the card from the live worker (R693 showed up idle under
+    // "No Project" while La Forge was actively working it). When the
+    // latest row is not itself live, prefer a live (running /
+    // waiting_human) execution. Steady state — the latest row IS the
+    // live run — skips the extra lookup.
+    let latest_is_live = latest.as_ref().map(|e| e.status.is_live()).unwrap_or(false);
+    let latest_is_abandoned = latest
+        .as_ref()
+        .map(|e| e.status == ExecutionStatus::Abandoned)
+        .unwrap_or(false);
+    let execution = if latest_is_live {
+        latest
+    } else {
+        *queries += 1;
+        match query_live_execution_for_work_item(conn, work_item_id)? {
+            Some(live) => Some(live),
+            // No live execution. If the latest row is an `abandoned`
+            // redundant/superseded duplicate it never did the work and must
+            // not shadow a genuinely-worked sibling — a successfully
+            // completed revision would otherwise surface as `abandoned`
+            // (broken) in `agents status`. Prefer the most recent
+            // non-abandoned execution; keep `latest` only when every
+            // execution for the item is abandoned. Steady state (latest is a
+            // normal terminal / ready row) skips this extra lookup.
+            None if latest_is_abandoned => {
+                *queries += 1;
+                query_last_non_abandoned_execution_for_work_item(conn, work_item_id)?.or(latest)
+            }
+            None => latest,
+        }
+    };
+    let wait = super::queued_wait::for_execution_naming(conn, execution.as_ref(), now, review)?;
+    let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at, dispatch_wait_since) =
+        if let Some(execution) = execution {
+            *queries += 1;
+            let latest_run = query_latest_run(conn, &execution.id)?;
+            let (run_status, run_id) = match latest_run {
+                Some((id, status)) => (Some(status), Some(id)),
+                None => (None, None),
+            };
+            // Only a failure backoff is a "retry"; a host-lease park or scheduled
+            // delay keeps its own wording even when an earlier start failed.
+            let dispatch_retry_at = if wait.reason.as_deref()
+                == Some(boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
+            {
+                dispatch_retry_at_for_execution(&execution, now)
+            } else {
+                None
+            };
+            let dispatch_wait_since = if wait.reason.is_some()
+                && wait.reason == execution.dispatch_wait_reason
+                && execution.status == ExecutionStatus::Ready
+            {
+                execution.dispatch_wait_since.clone()
+            } else {
+                None
+            };
+            (
+                Some(execution.status),
+                run_status,
+                Some(execution.id),
+                run_id,
+                dispatch_retry_at,
+                dispatch_wait_since,
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+    // Both time-dependent fields are set only while their deadline is still in
+    // the future at `now`, so the earlier of them is when the result changes.
+    let expires_at = [&dispatch_retry_at, &wait.not_before]
+        .into_iter()
+        .filter_map(|deadline| deadline.as_deref()?.parse::<i64>().ok())
+        .min();
+    let runtime = TaskRuntime::builder()
+        .work_item_id(work_item_id)
+        .maybe_execution_status(execution_status)
+        .maybe_run_status(run_status)
+        .maybe_execution_id(execution_id)
+        .maybe_current_run_id(current_run_id)
+        .maybe_dispatch_retry_at(dispatch_retry_at)
+        .maybe_dispatch_wait_reason(wait.reason)
+        .maybe_dispatch_wait_label(wait.label)
+        .maybe_dispatch_wait_since(dispatch_wait_since)
+        .maybe_dispatch_not_before(wait.not_before)
+        .maybe_dispatch_wait_blocker(wait.blocker)
+        .dispatch_failures(wait.failures)
+        .build();
+    Ok(ComputedRuntime {
+        runtime,
+        cacheable: !wait.reads_other_items,
+        expires_at,
+    })
+}
+
+/// `TaskRuntime.dispatch_retry_at` for one execution: `Some(epoch_secs)`
+/// only while the execution is `ready` but withheld by
+/// `record_pre_start_failure`'s in-process backoff after a pre-spawn
+/// failure — i.e. it has failed at least once and `dispatch_not_before`
+/// is still in the future. `None` for a fresh `ready` execution (no
+/// failure yet — a genuine capacity wait) and once the backoff window
+/// has elapsed (the execution is a normal dispatch candidate again).
+///
+/// `now_secs` is the instant the backoff window is judged against; the
+/// caller passes the live clock so tests can pin it.
+fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> Option<String> {
+    if execution.status != ExecutionStatus::Ready || execution.pre_start_failure_count <= 0 {
+        return None;
+    }
+    let dispatch_not_before: i64 = execution.dispatch_not_before.as_deref()?.parse().ok()?;
+    if dispatch_not_before > now_secs {
+        Some(dispatch_not_before.to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
+    conn.prepare_cached(
+        "SELECT id, status
+         FROM work_runs
+         WHERE execution_id = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )?
+    .query_row([execution_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
+/// A `progression` run is bound to the stuck item it is unsticking, but it is
+/// not an attempt at the item's work. It is skipped here so that a finished
+/// progression run is never the "latest execution" the reconcile and request
+/// paths compare against: left in, it would read as an execution of a different
+/// kind and stop them minting the item's next implementation execution.
+pub(crate) fn query_latest_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    conn.prepare_cached(
+        "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at,
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+         FROM work_executions
+         WHERE work_item_id = ?1 AND kind <> 'progression'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )?
+    .query_row([work_item_id], map_execution)
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Most-recent non-progression execution for `work_item_id` whose DB status is *live* —
+/// a worker may currently be attached. Unlike
+/// [`query_latest_execution_for_work_item`], the result is NOT shadowed
+/// by a newer terminal row: a re-dispatch storm produces stalled
+/// duplicates that get abandoned/orphaned (terminal) ON TOP of the one
+/// genuinely-live run, so "latest by created_at" points at the phantom
+/// while the live execution sits one row down. Callers that need to
+/// answer "is this work item already being worked?" must key off this,
+/// not the latest row. Mirrors the status set of the method
+/// [`WorkDb::get_live_execution_for_work_item`].
+pub(crate) fn query_live_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    conn.prepare_cached(
+        "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at,
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+         FROM work_executions
+         WHERE work_item_id = ?1
+           AND kind != 'progression'
+           AND status IN ('running', 'waiting_human')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )?
+    .query_row([work_item_id], map_execution)
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Most-recent execution for `work_item_id` whose status is NOT
+/// `abandoned`. Used as a display fallback in [`query_task_runtime`]: an
+/// `abandoned` execution is a superseded/redundant duplicate
+/// (`mark_execution_redundant`) or a dropped pending row
+/// (`abandon_pending_executions`) — it never did the work, so it must not
+/// shadow a genuinely-worked sibling (a completed revision would otherwise
+/// render as `abandoned`/"broken" in `agents status`). Returns `None` only
+/// when every execution for the work item is abandoned (or there are none),
+/// in which case the caller keeps the latest row.
+pub(crate) fn query_last_non_abandoned_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    conn.prepare_cached(
+        "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at,
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+         FROM work_executions
+         WHERE work_item_id = ?1
+           AND status != 'abandoned'
+           AND kind <> 'progression'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )?
+    .query_row([work_item_id], map_execution)
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn reconcile_work_item_execution(
+    conn: &Connection,
+    result: &mut ExecutionReconcileResult,
+    work_item_id: &str,
+    kind: ExecutionKind,
+    desired_status: ExecutionStatus,
+) -> Result<()> {
+    // Dispatcher gate (Q8): if the work item has any unmet `blocks`
+    // prereq, downgrade its desired execution status to
+    // `waiting_dependency` regardless of what the caller asked for.
+    // This keeps gated dependents out of `ready` and therefore out
+    // of the dispatcher's pickup pool.
+    // Dependency cascades can enter here without task_accepts_execution.
+    if query_task(conn, work_item_id)?.is_some_and(|task| {
+        matches!(
+            task.blocked_reason.as_deref(),
+            Some("worker_failed" | "awaiting_operator_answer" | "question_dismissed")
+        )
+    }) || positioning_hold_active(conn, work_item_id)?
+    {
+        return Ok(());
+    }
+    let gated = !deps::gating_prereqs_for(conn, work_item_id)?.is_empty();
+    let effective_status = if gated && desired_status == ExecutionStatus::Ready {
+        ExecutionStatus::WaitingDependency
+    } else {
+        desired_status
+    };
+    // Human-driven items never get an agent execution — they occupy a
+    // lane for a human and close only via `boss task complete --summary`.
+    if work_item_is_human_driven(conn, work_item_id)? {
+        tracing::debug!(
+            work_item_id,
+            "reconcile: item is human-driven — never minting an agent execution",
+        );
+        return Ok(());
+    }
+    // Deferred/future-scope items are auto-unblocked and left schedulable,
+    // but never auto-dispatched: skip minting or promoting any execution
+    // until a human explicitly approves the item (which clears `deferred`).
+    // The dependency auto-unblock cascade calls this function directly, so
+    // gating here — rather than in `task_accepts_execution`, which the
+    // cascade bypasses — is what suppresses execution on every automatic
+    // path (normal reconcile, cascade, project chain) without touching
+    // `dep_helpers.rs`. The unblock (row → `todo`) itself is never
+    // suppressed; only the mint is.
+    if work_item_is_deferred(conn, work_item_id)? {
+        tracing::debug!(
+            work_item_id,
+            "reconcile: item is deferred/future-scope — suppressing execution mint until explicit approval",
+        );
+        return Ok(());
+    }
+    // Parked items are never minted an execution on any automatic path. Gated
+    // here for the same reason as `deferred` above: the dependency cascade
+    // calls this function directly and bypasses `task_accepts_execution`, and
+    // a row can be parked through its project without carrying its own stamp.
+    if !parking::upkeep_eligible(conn, work_item_id)? {
+        tracing::debug!(
+            work_item_id,
+            "reconcile: item is parked — suppressing execution mint until it is un-parked",
+        );
+        return Ok(());
+    }
+    let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
+        if primary_pr_awaits_review(conn, work_item_id)? {
+            return Ok(());
+        }
+        if work_item_is_deliberately_parked(conn, work_item_id)? {
+            tracing::info!(
+                work_item_id,
+                "reconcile: skipping execution mint — this row's run ended in a deliberate park \
+                 (`bossctl work start` resumes it)",
+            );
+            return Ok(());
+        }
+        // Resolve through the single helper so per-row overrides beat the
+        // product default (multi-repo design Q5). On a `None` we don't create
+        // an execution row — instead a sticky `repo_unresolved` attention
+        // item surfaces the problem in the kanban Attention lane.
+        let Some(repo_remote_url) = resolve_repo_for_work_item(conn, work_item_id)? else {
+            let label = repo_unresolved_kind_label(conn, work_item_id)?;
+            record_repo_unresolved_attention(conn, work_item_id, label)?;
+            return Ok(());
+        };
+        // A merge-cancelled PR-review revision is converted to a followup in
+        // place. Its exact prior workspace was persisted before teardown;
+        // carry that pointer into the new execution with `allow_dirty` so
+        // cube preserves its uncommitted edits. `prefer_is_soft` permits the
+        // explicitly-required fresh-workspace fallback when that workspace
+        // is no longer available. This combination is scoped to the exact
+        // revision_implementation -> chore_implementation transition.
+        let merge_cancelled_workspace = predecessor
+            .filter(|execution| {
+                execution.kind == ExecutionKind::RevisionImplementation
+                    && execution.status == ExecutionStatus::Cancelled
+                    && kind == ExecutionKind::ChoreImplementation
+            })
+            .and_then(|execution| execution.preferred_workspace_id.clone());
+        let recovering_merge_cancel = merge_cancelled_workspace.is_some();
+        let created = insert_execution(
+            conn,
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(kind.clone())
+                .status(effective_status.clone())
+                .repo_remote_url(repo_remote_url)
+                .maybe_preferred_workspace_id(merge_cancelled_workspace)
+                .allow_dirty(recovering_merge_cancel)
+                .prefer_is_soft(recovering_merge_cancel)
+                .build(),
+        )?;
+        result.created.push(created);
+        Ok(())
+    };
+
+    match query_latest_execution_for_work_item(conn, work_item_id)? {
+        Some(execution) => {
+            if execution.kind == kind
+                && execution.status.can_reconcile()
+                && execution.status != effective_status
+                && let Some(updated) = update_execution_status(conn, &execution.id, effective_status.clone())?
+            {
+                result.updated.push(updated);
+            } else if execution.kind == ExecutionKind::RevisionImplementation
+                && execution.status.is_terminal()
+                && kind == ExecutionKind::ChoreImplementation
+                && query_live_execution_for_work_item(conn, work_item_id)?.is_none()
+            {
+                // A work item may legitimately change execution families in
+                // place in one narrowly-defined case: a live PR-review
+                // revision becomes a followup when its parent PR merges. Its
+                // now-terminal revision_implementation row permits conversion
+                // unless deliberately parked, as checked by `insert_fresh`.
+                // Otherwise, mint the required
+                // chore_implementation — this covers not just the ordinary
+                // cancel outcome but also the race where the worker's own
+                // completion (or a dead-PID sweep) terminalizes the row as
+                // completed/failed/orphaned between the merge-cancel
+                // transaction and this reconcile. The live-execution query
+                // covers every row, rather than only this latest one, and
+                // preserves the single-in-flight guarantee. Workspace
+                // inheritance (`merge_cancelled_workspace` above) stays
+                // scoped to the `Cancelled` case only — a completed or
+                // failed revision has no uncommitted edits worth reclaiming.
+                insert_fresh(result, Some(&execution))?;
+            } else if execution.kind == kind && parking_reconcile::cancelled_by_park(conn, &execution)? {
+                // A park cancelled this row's never-started execution and the
+                // owner has since un-parked it: that cancel was the park's
+                // doing, not a decision about the work, so the row is minted
+                // afresh exactly as one that had never had an execution.
+                insert_fresh(result, Some(&execution))?;
+            } else if execution.kind == kind
+                && abandoned_never_started(conn, &execution)?
+                && !work_item_has_in_flight_execution(conn, work_item_id)?
+            {
+                // Deferral (and other pending-withdrawals) abandon a
+                // never-started execution. Once the item is runnable again
+                // that row is as good as absent, same as a park's cancelled
+                // never-started execution. An execution that actually ran
+                // and then ended keeps the "start it again" behaviour.
+                //
+                // The in-flight check covers every row, not only this latest
+                // one: `mark_execution_redundant` leaves exactly this
+                // abandoned never-started shape on top of a genuinely live
+                // (or claimed) run, and minting beside that worker is the
+                // same churn loop the revision-to-chore arm already guards.
+                insert_fresh(result, Some(&execution))?;
+            }
+        }
+        None => insert_fresh(result, None)?,
+    }
+
+    Ok(())
+}
+
+/// True when a worker is already attached or cube setup is in flight for
+/// `work_item_id`. Matches [`query_live_execution_for_work_item`] (`running`,
+/// `waiting_human`) and also treats `claimed` as in-flight, as
+/// `reconcile_revision_execution` does: there is no pane yet, but minting
+/// a duplicate ready row beside the spawn is the same abandon-churn loop.
+fn work_item_has_in_flight_execution(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM work_executions
+             WHERE work_item_id = ?1
+               AND kind != 'progression'
+               AND status IN ('running', 'waiting_human', 'claimed')
+         )",
+        [work_item_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// True when this execution was withdrawn before a worker ever started:
+/// status `abandoned`, no `started_at`, and no `work_runs` row. Deferral
+/// abandons pending executions this way; they count as absent for remint
+/// once the work item is runnable again.
+///
+/// The predicate is the abandoned-never-started *shape*, not a deferral
+/// flag: `heal_ghost_active_chores`, `mark_execution_redundant`, and the
+/// pending-withdrawal paths share it. A subsequent reconcile remints when
+/// the item is still runnable (autostart on, not parked, no in-flight
+/// sibling). That includes a ghost-active heal of an autostart item — the
+/// heal demotes the card so the next reconcile can queue it again, rather
+/// than leaving a never-started abandon as a finished run. An execution
+/// that actually started, or that sits beneath a live/claimed sibling, is
+/// still not reminted.
+pub(crate) fn abandoned_never_started(conn: &Connection, execution: &WorkExecution) -> Result<bool> {
+    if execution.status != ExecutionStatus::Abandoned || execution.started_at.is_some() {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM work_runs WHERE execution_id = ?1)",
+        params![execution.id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Look up the chain root's task for a revision (the first non-revision
+/// ancestor) and return it. Returns `None` if the chain root can't be
+/// resolved (broken parent link or missing task).
+pub(crate) fn get_chain_root_task(conn: &Connection, revision_id: &str) -> Result<Option<Task>> {
+    let root_id = chain_root(conn, revision_id)?;
+    if root_id == revision_id {
+        // chain_root didn't walk anywhere — either the task itself is the
+        // chain root (non-revision) or the parent link is missing. In
+        // both cases, there is no real parent PR to revise; skip.
+        return Ok(None);
+    }
+    query_task(conn, &root_id)
+}
+
+/// Return the `cube_workspace_id` from the most recent non-failed
+/// execution of `chain_root_id`. Used as the soft preferred workspace
+/// for revision dispatch — warmth only, never a hard requirement.
+pub(crate) fn preferred_workspace_for_chain_root(conn: &Connection, chain_root_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT cube_workspace_id
+         FROM work_executions
+         WHERE work_item_id = ?1
+           AND status NOT IN ('failed', 'cancelled', 'orphaned', 'abandoned')
+           AND cube_workspace_id IS NOT NULL
+           AND cube_workspace_id != ''
+         ORDER BY created_at DESC
+         LIMIT 1",
+        [chain_root_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|opt| opt.flatten())
+    .map_err(Into::into)
+}
+
+/// The attempt ledger that spawned an engine-triggered revision, keyed off
+/// its `created_via` prefix: `merge-conflict:<crz_id>` →
+/// `conflict_resolutions`, `ci-fix:<id>` → `ci_remediations`. `None` for a
+/// human/reviewer-filed revision or an empty attempt id. The table name is
+/// selected from this fixed prefix→table map (never from caller data), so
+/// queries formatted with it are not an injection surface.
+pub(crate) fn spawning_attempt_ref(task: &Task) -> Option<(&'static str, &str)> {
+    let created_via = task.created_via.as_str();
+    let (table, attempt_id) = created_via
+        .strip_prefix(CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        .map(|id| ("conflict_resolutions", id))
+        .or_else(|| {
+            created_via
+                .strip_prefix(CREATED_VIA_CI_FIX_PREFIX)
+                .map(|id| ("ci_remediations", id))
+        })?;
+    (!attempt_id.is_empty()).then_some((table, attempt_id))
+}
+
+/// A spawning attempt that has already retired (see
+/// [`retired_spawning_attempt`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredSpawningAttempt {
+    /// `conflict_resolutions` or `ci_remediations`.
+    pub table: &'static str,
+    pub attempt_id: String,
+    /// The terminal status the attempt retired with (`succeeded`, `failed`,
+    /// `abandoned`, `retriggered`, …).
+    pub status: String,
+    /// The ledger's `failure_reason`, when the retirement recorded one.
+    pub failure_reason: Option<String>,
+}
+
+impl RetiredSpawningAttempt {
+    /// Human-readable name of the attempt kind for operator-facing text.
+    pub fn kind_label(&self) -> &'static str {
+        if self.table == "conflict_resolutions" {
+            "merge-conflict"
+        } else {
+            "CI-fix"
+        }
+    }
+
+    /// `succeeded` / `failed: <reason>` — how the attempt ended, for
+    /// operator-facing text.
+    pub fn outcome_label(&self) -> String {
+        match self.failure_reason.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            Some(reason) => format!("{}: {reason}", self.status),
+            None => self.status.clone(),
+        }
+    }
+}
+
+/// For a revision spawned by an engine-triggered conflict / CI-fix
+/// attempt (`created_via` = `merge-conflict:<crz_id>` or `ci-fix:<id>`),
+/// return that attempt *iff* it has already retired — i.e. it reached a
+/// terminal status and is no longer `pending` / `running`.
+///
+/// Returns `Ok(None)` when the revision was not engine-spawned, the
+/// `created_via` id is empty, the attempt row can't be found, or the
+/// attempt is still active. The dispatcher uses a `Some(_)` answer as the
+/// signal that the revision's fix vehicle is spent and must stop being
+/// re-dispatched — until an explicit start re-opens it via
+/// [`reopen_retired_spawning_attempt`].
+pub(crate) fn retired_spawning_attempt(conn: &Connection, task: &Task) -> Result<Option<RetiredSpawningAttempt>> {
+    let Some((table, attempt_id)) = spawning_attempt_ref(task) else {
+        return Ok(None);
+    };
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            &format!("SELECT status, failure_reason FROM {table} WHERE id = ?1"),
+            [attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row
+        .filter(|(status, _)| status.as_str() != "pending" && status.as_str() != "running")
+        .map(|(status, failure_reason)| RetiredSpawningAttempt {
+            table,
+            attempt_id: attempt_id.to_owned(),
+            status,
+            failure_reason,
+        }))
+}
+
+/// Stable `blocked_reason` the revision reconciler settles an engine-spawned
+/// revision to once its spawning attempt retired without success.
+pub const BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED: &str = "spawning_attempt_retired_unsuccessfully";
+
+/// Re-open the retired attempt that spawned `task`, flipping the ledger row
+/// back to `pending` (the status a revision-backed attempt rests in while
+/// its revision is dispatchable) and clearing its retirement stamps.
+///
+/// Called only for an explicit start — kanban drag-to-Doing, `bossctl work
+/// start`, an affirmative answer to the revision's question. The
+/// reconciler's retired-attempt gate abandons every pending execution of a
+/// revision whose spawning attempt retired, so an explicit start must
+/// re-open the attempt for the run to survive that gate. Automatic recovery
+/// sweeps never re-open: a retired attempt stays retired for them.
+///
+/// Returns the attempt as it was *before* re-opening (for logging), or
+/// `Ok(None)` when there was nothing to re-open — not engine-spawned, the
+/// attempt row is missing, or it is still active. Only `status`,
+/// `failure_reason` and `finished_at` are touched; the attempt's provenance
+/// (trigger SHA, failed checks, budget accounting) and the revision's
+/// `created_via` link are preserved, so this is a resume of the same
+/// attempt, not a new one.
+pub(crate) fn reopen_retired_spawning_attempt(
+    conn: &Connection,
+    task: &Task,
+) -> Result<Option<RetiredSpawningAttempt>> {
+    let Some(retired) = retired_spawning_attempt(conn, task)? else {
+        return Ok(None);
+    };
+    let table = retired.table;
+    let rows = conn.execute(
+        &format!(
+            "UPDATE {table}
+                SET status         = 'pending',
+                    failure_reason = NULL,
+                    finished_at    = NULL
+              WHERE id = ?1
+                AND status NOT IN ('pending', 'running')"
+        ),
+        [retired.attempt_id.as_str()],
+    )?;
+    Ok((rows > 0).then_some(retired))
+}
+
+/// The `blocked_detail` the revision reconciler writes when it settles an
+/// engine-spawned revision to [`BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED`]:
+/// what ended, and exactly how to resume it.
+pub(crate) fn spawning_attempt_retired_blocked_detail(attempt: &RetiredSpawningAttempt) -> String {
+    format!(
+        "The engine's {} attempt that spawned this revision ended ({}) before a fix landed, so the \
+         engine will not dispatch it on its own. Start it explicitly — drag the card to Doing, run \
+         `bossctl work start`, or answer its open question with Yes — to re-open the attempt and \
+         retry on the same branch.",
+        attempt.kind_label(),
+        attempt.outcome_label(),
+    )
+}
+
+/// Dispatch arm for `kind = 'revision'` tasks.
+///
+/// Dispatch-time cached gate: if the chain root is already `done` (PR
+/// merged or closed before this reconcile tick), move the revision to
+/// `blocked` with a clear reason and surface a `WorkAttentionItem`.
+/// This catches the common case; the coordinator adds a live probe
+/// for the race window between poller ticks.
+///
+/// If the gate passes, create a `revision_implementation` execution
+/// with `prefer_is_soft = true` (soft cube-workspace preference) and
+/// `pr_url` set to the chain root's PR URL (so the SHA-delta gate can
+/// snapshot the parent PR's HEAD and detect when the revision worker
+/// contributes).
+pub fn reconcile_revision_execution(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    result: &mut ExecutionReconcileResult,
+    task: &Task,
+) -> Result<()> {
+    if task.blocked_reason.as_deref() == Some("question_dismissed") || positioning_hold_active(conn, &task.id)? {
+        return Ok(());
+    }
+    // Walk to the chain root.
+    let chain_root_task = match get_chain_root_task(conn, &task.id)? {
+        Some(t) => t,
+        None => {
+            // Broken parent link — the revision has no resolvable chain
+            // root.  Skip dispatch; this is surfaced elsewhere as a data
+            // integrity problem.
+            tracing::warn!(
+                task_id = %task.id,
+                "reconcile_revision: cannot resolve chain root; skipping dispatch",
+            );
+            return Ok(());
+        }
+    };
+
+    // Chain root must have an open PR for the revision to push to.
+    let parent_pr_url = match chain_root_task.pr_url.as_deref().filter(|u| !u.is_empty()) {
+        Some(u) => u.to_owned(),
+        None => {
+            // No PR yet — the parent hasn't been dispatched or hasn't
+            // opened a PR.  Stay in `todo` until the parent creates one.
+            tracing::debug!(
+                task_id = %task.id,
+                chain_root_id = %chain_root_task.id,
+                "reconcile_revision: chain root has no pr_url yet; deferring revision dispatch",
+            );
+            return Ok(());
+        }
+    };
+
+    // Dispatch-time catch-up gate: if the chain root is already `done` or
+    // `archived` the parent PR has merged.  Revisions that slipped past the
+    // merge-poller sweep (engine restart, creation-after-merge edge cases)
+    // are resolved here through the same shared
+    // `resolve_revision_on_parent_close` the sweep itself uses, so both paths
+    // reach an identical verdict.
+    if chain_root_task.status == TaskStatus::Done || chain_root_task.status == TaskStatus::Archived {
+        // Skip revisions already in a terminal state.  `block_pending_revisions_on_parent_close`
+        // may have processed this revision already; the task struct we hold here was
+        // snapshot before that ran, so guard with a fresh status read.
+        let fresh_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![task.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let is_terminal = fresh_status
+            .as_deref()
+            .is_none_or(|s| matches!(s, "done" | "archived" | "in_review"));
+        let already_closed =
+            fresh_status.as_deref() == Some("blocked") && task.blocked_reason.as_deref() == Some("parent_pr_closed");
+        if is_terminal || already_closed {
+            return Ok(());
+        }
+
+        let now = now_string();
+        // Drop any not-yet-live execution row before archiving the task.
+        abandon_pending_executions(pending, conn, &task.id, &now)?;
+        resolve_revision_on_parent_close(
+            pending,
+            conn,
+            task,
+            &chain_root_task.id,
+            &now,
+            "reconcile_revision",
+            ARCHIVE_MECHANISM_PARENT_CLOSE_DISPATCH_RECONCILIATION,
+        )?;
+        return Ok(());
+    }
+
+    // Engine-spawned conflict / CI-fix revisions self-terminate once the
+    // attempt that spawned them has retired. The gates above only consult
+    // the chain root's `pr_url` / `status`, neither of which reflects a
+    // *resolved* conflict (or *cleared* CI) on a still-open PR — so a CLEAN,
+    // already-rebased PR keeps minting fresh `revision_implementation`
+    // executions on every reconcile tick (observed in PR #970: a
+    // `conflict_resolutions` attempt that had already `succeeded` still
+    // left its revision re-dispatched indefinitely). The retire paths
+    // (`conflict_watch::on_resolved`, `try_retire_cleared_blocking_signal`)
+    // mark the attempt terminal and clear the *chore's* signal but never
+    // settle the revision task, leaving it dispatchable here.
+    //
+    // Once the spawning attempt is terminal the fix vehicle is spent: drop
+    // any queued execution (a `ready` row would otherwise get picked up and
+    // `start_execution_run` would flip the revision straight back to
+    // `active`, since its guard does not protect `in_review` / `blocked`).
+    //
+    // incident-004 AI-3: only a *successful* attempt may settle to
+    // `in_review` (the same resting state a clean-stop leave a successful
+    // revision in). A failed / abandoned / otherwise non-success retirement
+    // must NOT manufacture the same false-success terminal — that was the
+    // 62-occurrence side door (`attempt_status=failed` → `in_review`).
+    // Those land on `blocked` with a stable reason so re-dispatch halts
+    // without claiming review-ready. A live worker is left alone; it
+    // self-retires on Stop.
+    //
+    // The explicit-start half of this contract lives in
+    // `request_execution_in_tx_with_live_check`: a kanban drag, `bossctl
+    // work start` or an affirmative answer re-opens the retired attempt
+    // (`reopen_retired_spawning_attempt`) before minting its execution, so
+    // this gate does not fire for a run a human deliberately started. The
+    // `blocked_detail` written below names that path.
+    if let Some(attempt) = retired_spawning_attempt(conn, task)? {
+        let now = now_string();
+        abandon_pending_item_work_executions(pending, conn, &task.id, &now)?;
+        if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
+            let attempt_status = attempt.status.clone();
+            let attempt_succeeded = attempt_status.as_str() == "succeeded";
+            let settled = if attempt_succeeded {
+                crate::task_status_audit::execute(
+                    conn,
+                    "reconcile_revision_execution",
+                    "engine",
+                    "UPDATE tasks
+                     SET status = 'in_review',
+                         last_status_actor = 'engine',
+                         updated_at = ?2
+                     WHERE id = ?1
+                       AND status NOT IN ('in_review', 'done', 'archived', 'blocked')
+                       AND deleted_at IS NULL",
+                    params![task.id, now],
+                )?
+            } else {
+                let detail = spawning_attempt_retired_blocked_detail(&attempt);
+                crate::task_status_audit::execute(
+                    conn,
+                    "reconcile_revision_execution",
+                    "engine",
+                    "UPDATE tasks
+                     SET status = 'blocked',
+                         blocked_reason = ?3,
+                         blocked_detail = ?4,
+                         last_status_actor = 'engine',
+                         updated_at = ?2
+                     WHERE id = ?1
+                       AND status NOT IN ('in_review', 'done', 'archived', 'blocked')
+                       AND deleted_at IS NULL",
+                    params![task.id, now, BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED, detail],
+                )?
+            };
+            if settled > 0 {
+                stage_task_board_change(pending, conn, &task.id)?;
+                if attempt_succeeded {
+                    tracing::info!(
+                        task_id = %task.id,
+                        chain_root_id = %chain_root_task.id,
+                        attempt_status = %attempt_status,
+                        "reconcile_revision: spawning conflict/CI attempt retired successfully; \
+                         settled revision to in_review (halting re-dispatch loop)",
+                    );
+                } else {
+                    tracing::info!(
+                        task_id = %task.id,
+                        chain_root_id = %chain_root_task.id,
+                        attempt_status = %attempt_status,
+                        "reconcile_revision: spawning conflict/CI attempt retired unsuccessfully; \
+                         settled revision to blocked (halting re-dispatch without false in_review; \
+                         incident-004 AI-3)",
+                    );
+                    cascade_dependents_after_prereq_status_change(pending, conn, &task.id, "blocked", &now)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Gate passed.  Create or refresh the execution row.
+    let gated = !deps::gating_prereqs_for(conn, &task.id)?.is_empty();
+    let effective_status = if gated {
+        ExecutionStatus::WaitingDependency
+    } else {
+        ExecutionStatus::Ready
+    };
+
+    // Human-driven revisions (unlikely, but the gate is kind-agnostic)
+    // never get an agent execution.
+    if work_item_is_human_driven(conn, &task.id)? {
+        tracing::debug!(
+            task_id = %task.id,
+            "reconcile_revision: item is human-driven — never minting an agent execution",
+        );
+        return Ok(());
+    }
+    // Same future-scope suppression as `reconcile_work_item_execution`: a
+    // deferred revision is left settled/unblocked but never auto-dispatched
+    // until a human approves it (clearing `deferred`). Placed after the
+    // chain-root-done archival and spawning-attempt-retired settle logic
+    // above so those still run — only the ready/waiting_dependency mint is
+    // skipped.
+    if work_item_is_deferred(conn, &task.id)? {
+        tracing::debug!(
+            task_id = %task.id,
+            "reconcile_revision: item is deferred/future-scope — suppressing execution mint until explicit approval",
+        );
+        return Ok(());
+    }
+    // A revision follows its parent PR: parked when the chain root (or its
+    // project) is parked, with or without a stamp of its own.
+    if !parking::upkeep_eligible(conn, &task.id)? {
+        tracing::debug!(
+            task_id = %task.id,
+            "reconcile_revision: item is parked — suppressing execution mint until it is un-parked",
+        );
+        return Ok(());
+    }
+    if revision_implementation_completed(conn, &task.id)? {
+        return Ok(());
+    }
+    match query_latest_execution_for_work_item(conn, &task.id)? {
+        Some(existing)
+            if existing.kind == ExecutionKind::RevisionImplementation
+                && existing.status.can_reconcile()
+                && existing.status != effective_status =>
+        {
+            let Some(updated) = update_execution_status(conn, &existing.id, effective_status)? else {
+                return Ok(());
+            };
+            // Back-fill pr_url if missing: the execution may have been created by
+            // reconcile_active_dispatch before the parent chore opened its PR (a
+            // race that leaves pr_url = NULL, causing --resume-pr to be skipped
+            // and the workspace to be reset to main instead of the PR head).
+            if existing.pr_url.is_none() {
+                conn.execute(
+                    "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+                    params![existing.id, parent_pr_url],
+                )?;
+            }
+            result.updated.push(updated);
+        }
+        Some(existing) if existing.kind == ExecutionKind::RevisionImplementation && existing.status.can_reconcile() => {
+            // Same status — nothing to do except back-fill pr_url when missing
+            // (same race as the status-update arm above).
+            if existing.pr_url.is_none() {
+                conn.execute(
+                    "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+                    params![existing.id, parent_pr_url],
+                )?;
+            }
+        }
+        Some(existing)
+            if existing.kind == ExecutionKind::RevisionImplementation
+                && (existing.status.is_live() || existing.status == ExecutionStatus::Claimed) =>
+        {
+            // A live execution (running or waiting_human) or a `claimed`
+            // spawn still in cube setup is already in progress — do not
+            // mint a duplicate. `Claimed` is neither `is_live()` (no pane
+            // yet) nor `can_reconcile()` (the reconciler must not clobber
+            // the CAS), so without this arm the `_ =>` branch would create
+            // a fresh `ready` row that the redundant-spawn guard later
+            // abandons, shadowing the in-flight spawn.
+        }
+        _ => {
+            // Deliberate park is blocking on this automatic mint, same as
+            // `rescan_active_dispatch` / `reconcile_active_dispatch` /
+            // `orphan_sweep`. A blocked declaration leaves the row `active`
+            // by design, so `task_accepts_execution`'s todo-only `autostart`
+            // check cannot hold it — without this gate a product-wide
+            // reconcile remints a replacement onto the work a human was
+            // asked to adjudicate. Placed here, guarding only the mint,
+            // rather than as an early return ahead of the match: the arms
+            // above are a status refresh and a `pr_url` back-fill on an
+            // EXISTING row, not a mint, and must keep running even while a
+            // row stays parked, or a resumed row's `waiting_dependency` ->
+            // `ready` promotion and its `--resume-pr` back-fill never
+            // happen.
+            match work_item_is_deliberately_parked(conn, &task.id) {
+                Ok(true) => {
+                    tracing::info!(
+                        work_item_id = %task.id,
+                        "reconcile_revision: skipping execution mint — this row's run ended in a \
+                         deliberate park (`bossctl work start` resumes it)",
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %task.id,
+                        ?err,
+                        "reconcile_revision: skipping execution mint — could not read the row's park \
+                         state; refusing to remint on an unknown admission state",
+                    );
+                    return Ok(());
+                }
+            }
+            // Cross-kind live-execution guard. The `RevisionImplementation`
+            // arms above only suppress a duplicate when the task's *latest*
+            // row is itself a live revision_implementation. But the latest
+            // row may be a live execution of a DIFFERENT kind — most
+            // commonly a `pr_review` reviewing the revision's contribution
+            // to the parent PR. In that case none of the arms above match and
+            // we fall here and mint a fresh revision_implementation that the
+            // redundant-spawn guard abandons seconds later — leaving an
+            // `abandoned` duplicate as the task's newest row, which then
+            // shadows the genuinely-completed revision in `agents status`
+            // Defer instead: if any live execution is attached to this task,
+            // do not create a duplicate.
+            if let Some(live) = query_live_execution_for_work_item(conn, &task.id)? {
+                tracing::info!(
+                    work_item_id = %task.id,
+                    live_execution_id = %live.id,
+                    live_execution_kind = %live.kind.as_str(),
+                    live_execution_status = %live.status,
+                    decision = "defer_live_execution",
+                    "dispatch_decision: reconcile_revision skipped creating a \
+                     revision_implementation — a live execution (possibly a different \
+                     kind, e.g. pr_review) is already attached to this revision task; \
+                     deferring to avoid a redundant duplicate that would be abandoned \
+                     and then shadow the real execution",
+                );
+                return Ok(());
+            }
+            // No matching execution yet (or previous is terminal) — create one.
+            let Some(repo_remote_url) = resolve_repo_for_work_item(conn, &task.id)? else {
+                let label = repo_unresolved_kind_label(conn, &task.id)?;
+                record_repo_unresolved_attention(conn, &task.id, label)?;
+                return Ok(());
+            };
+            let blocked_workspace = blocked_workspace::blocked_workspace_predecessor(conn, &task.id, "")?
+                .and_then(|prior| prior.preferred_workspace_id);
+            let recovering_blocked = blocked_workspace.is_some();
+            let preferred_workspace_id =
+                blocked_workspace.or(preferred_workspace_for_chain_root(conn, &chain_root_task.id)?);
+            let created = insert_execution(
+                conn,
+                CreateExecutionInput::builder()
+                    .work_item_id(task.id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(effective_status)
+                    .repo_remote_url(repo_remote_url)
+                    .maybe_preferred_workspace_id(preferred_workspace_id)
+                    .prefer_is_soft(true)
+                    .allow_dirty(recovering_blocked)
+                    .pr_url(parent_pr_url)
+                    .build(),
+            )?;
+            // Per-item decision line for the reconcile create path — the
+            // "reconciled product executions" summary only carries counts, so
+            // without this a reconcile-minted revision execution has no
+            // attributable `dispatch_decision` in the trace.
+            tracing::info!(
+                work_item_id = %task.id,
+                execution_id = %created.id,
+                status = %created.status,
+                decision = "create_revision_implementation",
+                "dispatch_decision: reconcile_revision created a revision_implementation \
+                 execution (no live or reconcilable execution existed for this task)",
+            );
+            result.created.push(created);
+        }
+    }
+    Ok(())
+}
+
+/// Status-based reasons a task/chore cannot be dispatched right now,
+/// independent of gating prereqs, repo resolution, human-driven-ness, or
+/// the dispatch pause. Shared by the mutating
+/// `request_execution_in_tx_with_live_check` (below) and the read-only
+/// `WorkDb::dispatch_admission_facts` (`work/dispatch_admission.rs`) via
+/// [`status_ineligibility`], so a new status-based refusal condition
+/// can't be added to one without the other seeing it — see the design
+/// doc's "one reason-producing function" invariant
+/// (`docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`).
+///
+/// Deliberately does NOT include `in_review`: re-dispatching an
+/// `in_review` revision whose spawning attempt retired without ever
+/// pushing (e.g. `bossctl work start` after a stuck CI/conflict attempt)
+/// is a real, intentionally supported flow — see
+/// `work::tests::t20::redispatching_in_review_revision_advances_to_active`
+/// — so it must remain eligible on both the ordinary and the forced path.
+pub enum StatusIneligibility {
+    Deleted,
+    Terminal {
+        status: TaskStatus,
+        archived_reason: Option<String>,
+    },
+}
+
+/// Pure classification — no DB access — so both callers can run it
+/// against whatever row shape their own query already fetched. `None`
+/// means the status itself does not block dispatch (the caller still
+/// owes its own human-driven / gating / repo-resolution checks).
+pub(crate) fn status_ineligibility(
+    status: &TaskStatus,
+    archived_reason: Option<&str>,
+    deleted: bool,
+) -> Option<StatusIneligibility> {
+    if deleted {
+        return Some(StatusIneligibility::Deleted);
+    }
+    if status.is_terminal() {
+        return Some(StatusIneligibility::Terminal {
+            status: status.clone(),
+            archived_reason: archived_reason.map(str::to_owned),
+        });
+    }
+    None
+}
+
+pub fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    input: RequestExecutionInput,
+    is_live: F,
+) -> Result<WorkExecution> {
+    let actor = input
+        .audit_actor
+        .clone()
+        .unwrap_or_else(|| boss_protocol::LAST_STATUS_ACTOR_ENGINE.to_owned());
+    request_execution_in_tx_as_actor(pending, conn, input, is_live, &actor)
+}
+
+pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    input: RequestExecutionInput,
+    is_live: F,
+    actor: &str,
+) -> Result<WorkExecution> {
+    super::local_worker_quarantine_store::ensure_work_item_not_quarantined_in(conn, &input.work_item_id)?;
+    let RequestExecutionInput {
+        work_item_id,
+        priority,
+        preferred_workspace_id,
+        // Explicit launch grants durable focus admission to this work item
+        // and its descendants; pool growth remains a dispatcher concern.
+        force,
+        // The pause-only override intent, its provenance, and the
+        // observed pause generation are all resolved entirely above this
+        // layer, by `ExecutionCoordinator::dispatch_with_pause_bypass`
+        // (see `coordinator/dispatch_admission.rs`) before it ever calls
+        // down into `request_execution_with_live_check`. By the time a
+        // request reaches here it has already been admitted (or refused
+        // and never reached this far) — this DB layer creates / refreshes
+        // a `ready` row identically regardless of how it was admitted.
+        bypass_dispatch_pause: _,
+        entry_point: _,
+        observed_pause_since_epoch_s: _,
+        allow_dirty,
+        explicit_start,
+        audit_actor: _,
+        audit_basis,
+        // Placement is a coordinator concern. The coordinator validates and
+        // installs this onto the one execution after this transaction has
+        // created or refreshed it; it must never become a work-item field.
+        requested_host_id: _,
+    } = input;
+
+    let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
+    // An explicit start does not override a park: the row stays skipped by every
+    // automatic path until it is un-parked, so a `ready` execution minted here
+    // would only strand. Typed so a caller can tell the owner what to do next.
+    if work_item_id.starts_with("task_")
+        && let Some(refusal) = parking::unpark_first_refusal(conn, &work_item_id)?
+    {
+        return Err(refusal.into());
+    }
+    let kind = execution_kind_for_work_item(conn, &work_item_id)?;
+
+    // Every successful request can clear blocks or change revision readiness.
+    // Failed transactions drop this event together with their writes.
+    stage_task_board_change(pending, conn, &work_item_id)?;
+
+    // Refuse explicit dispatch against a status that can't accept one
+    // (terminal or deleted) instead of silently creating a `ready`
+    // execution that can never run — a terminal row is closed, so nothing
+    // will ever pick it up, and the next reconcile tick that revisits a
+    // terminal revision archives it straight back out from under the
+    // stranded execution (see proj_18be59fc8d8b2440_363's incident
+    // writeup: `bossctl work start` on an auto-archived revision minted
+    // exactly such an orphan). Only tasks carry executions; projects are
+    // exempt. Shares [`status_ineligibility`] with `dispatch_admission_facts`
+    // so `bossctl work start --force` can never be more permissive — or
+    // more restrictive — than an ordinary start on the status axis; only
+    // the dispatch pause is allowed to differ. `in_review` is
+    // deliberately not covered here — see `status_ineligibility`'s doc.
+    if work_item_id.starts_with("task_") {
+        let row: Option<(String, Option<String>, i64)> = conn
+            .query_row(
+                "SELECT status, archived_reason, deleted_at IS NOT NULL FROM tasks WHERE id = ?1",
+                params![work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((status, archived_reason, deleted)) = row {
+            let parsed: TaskStatus = status.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            if let Some(ineligibility) = status_ineligibility(&parsed, archived_reason.as_deref(), deleted != 0) {
+                match ineligibility {
+                    StatusIneligibility::Deleted => {
+                        bail!("cannot start {work_item_id}: item is deleted");
+                    }
+                    StatusIneligibility::Terminal {
+                        status,
+                        archived_reason,
+                    } => {
+                        let reason_suffix = archived_reason.map(|r| format!(" — {r}")).unwrap_or_default();
+                        bail!(
+                            "cannot start {work_item_id}: item is `{status}`{reason_suffix} — terminal work \
+                             items cannot be dispatched; if this was archived by mistake, reopen it first \
+                             with `boss task move {work_item_id} --to todo`"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Human-driven rows never spawn an agent worker — explicit start is
+    // refused so `bossctl work start` / kanban drag cannot accidentally
+    // dispatch. Entering Doing is still allowed via UpdateWorkItem status
+    // flip without a follow-on RequestExecution.
+    if work_item_is_human_driven(conn, &work_item_id)? {
+        bail!(
+            "cannot start {work_item_id}: item is human-driven — no agent worker will run. \
+             Move it to Doing to mark the human work in-flight, then close it with \
+             `boss task complete {work_item_id} --summary \"…\"` when finished."
+        );
+    }
+
+    if !explicit_start
+        && query_task(conn, &work_item_id)?
+            .is_some_and(|task| task.blocked_reason.as_deref() == Some("question_dismissed"))
+    {
+        bail!("question dismissed: only an explicit start or status change can resume this item");
+    }
+    if !explicit_start && positioning_hold_active(conn, &work_item_id)? {
+        bail!("Workspace blocked: resolve the positioning refusal and launch manually");
+    }
+
+    // Q8: explicit `RequestExecution` against a gated work item is
+    // refused with a clear error rather than silently overridden. A
+    // future `--force` may relax this; for v1, the user removes the
+    // edge or waits for the prereq to land.
+    let gating = deps::gating_prereqs_for(conn, &work_item_id)?;
+    if !gating.is_empty() {
+        let names = gating.join(", ");
+        bail!(
+            "cannot start {work_item_id}: gated by [{names}] — use `boss <kind> depend rm` to remove the edge or wait for the prereq to complete"
+        );
+    }
+
+    // Prereqs are all satisfied. If the task is stuck in `blocked` with
+    // blocked_reason='dependency' (stale state from a failed auto-unblock
+    // cascade — e.g. last_status_actor was reset to 'human' by a
+    // subsequent update, so the cascade skipped it), clear the block here
+    // so start_execution_run can advance kanban status to `active`.
+    // Only applies to task_ ids; projects don't carry blocked_reason.
+    if work_item_id.starts_with("task_") {
+        let now = now_string();
+        let rows_cleared = crate::task_status_audit::execute(
+            conn,
+            "explicit_start_dependency_clear",
+            actor,
+            "UPDATE tasks
+             SET status            = 'todo',
+                 blocked_reason    = NULL,
+                 last_status_actor = ?3,
+                 updated_at        = ?2
+             WHERE id              = ?1
+               AND deleted_at      IS NULL
+               AND status          = 'blocked'
+               AND (blocked_reason = 'dependency' OR blocked_reason IS NULL)",
+            params![work_item_id, now, actor],
+        )?;
+        if rows_cleared > 0 {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                "RequestExecution: cleared stale dependency block — all prereqs satisfied",
+            );
+        }
+
+        // Every call into this function represents a deliberate fresh
+        // dispatch attempt (a kanban drag-to-Doing, `bossctl work start`, or
+        // a recovery sweep giving a bounced row another shot). The ordinary
+        // reconcile/rescan sweeps still never reach a work item bounced by
+        // `bounce_dispatch_failed_to_backlog` — those only scan `status =
+        // 'active'` rows, and a bounced row is `todo` with `autostart = 0`
+        // — but `crate::dispatch_failure_recovery_sweep` exists precisely to
+        // reach such rows on a cooldown (and, for a `churn_guard`-reason
+        // row, applies `orphan_sweep`'s own tighter threshold rather than
+        // its own looser one — see that sweep's module doc). Either way,
+        // it's safe to clear the stale error here unconditionally: this
+        // attempt gets to prove itself again, and `record_start_failure`
+        // will re-stamp the fields if it fails the same way.
+        crate::task_status_audit::execute(
+            conn,
+            "explicit_start_dispatch_failure_clear",
+            actor,
+            "UPDATE tasks
+             SET dispatch_failed_reason = NULL,
+                 dispatch_failed_error  = NULL,
+                 dispatch_failed_at     = NULL
+             WHERE id = ?1
+               AND dispatch_failed_reason IS NOT NULL",
+            params![work_item_id],
+        )?;
+
+        // Same reasoning as the dispatch_failed_reason clear just above:
+        // every call into this function is a deliberate fresh dispatch
+        // attempt, so a stale `churn_guard_parked` attention (filed by
+        // `pr_review_recovery` the last time this item's terminal-execution
+        // count tripped the shared churn guard — `orphan_sweep` now uses
+        // the `dispatch_failed_reason` representation cleared above instead
+        // of this attention kind) is resolved here unconditionally. This is
+        // what makes the park clear automatically once a sweep's trailing
+        // window drains enough to redispatch again, and immediately when an
+        // operator runs `bossctl work start` to bypass the guard — that
+        // path reaches this same function, and the guard itself only ever
+        // lives in the sweeps, so
+        // there is nothing here to bypass. If the fresh attempt fails again,
+        // the next sweep pass re-files the attention.
+        resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
+        super::dispatch_admission::resolve_deliberate_park_attention(conn, &work_item_id)?;
+
+        // An explicit retry acknowledges the failed attempt. Its run history
+        // retains the explanation, while the new attempt starts without a stale
+        // failure blocker. Automatic reconciliation cannot reach this clear.
+        super::pr_flow::withdraw_questions(conn, &work_item_id, "restarted_without_answer")?;
+        let _ = clear_positioning_hold_in_tx(conn, &work_item_id, actor)?;
+        crate::task_status_audit::execute(
+            conn,
+            "explicit_start_failure_clear",
+            actor,
+            "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
+                 last_status_actor = ?3, updated_at = ?2
+             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer', 'question_dismissed')",
+            params![work_item_id, now, actor],
+        )?;
+
+        // Explicit dispatch is the human-approval signal for a deferred
+        // (future-scope) item: clear the classification so the reconciler
+        // and dependency cascade will mint `ready` executions for it again.
+        // Mirrors `autostart`'s single-shot clear on start — deliberately
+        // starting an item means it is no longer future scope. Guarded on
+        // `deferred = 1` so it is a no-op for ordinary items.
+        let deferred_basis =
+            crate::task_status_audit::compose_basis("explicit_start_clears_deferred", audit_basis.as_deref());
+        let approved = crate::task_status_audit::execute(
+            conn,
+            &deferred_basis,
+            actor,
+            "UPDATE tasks SET deferred = 0 WHERE id = ?1 AND deferred = 1 AND deleted_at IS NULL",
+            params![work_item_id],
+        )?;
+        if approved > 0 {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                "RequestExecution: approved deferred/future-scope item — cleared `deferred` on explicit start",
+            );
+        }
+
+        // Engine-spawned revisions: an explicit start must agree with
+        // `reconcile_revision_execution`'s verdicts. Automatic recovery
+        // callers skip this block, so only a human can revive a settled
+        // revision.
+        if let Some(task) =
+            query_task(conn, &work_item_id)?.filter(|task| explicit_start && task.kind == TaskKind::Revision)
+        {
+            // The reconciler's first gate: a chain root that is `done` /
+            // `archived` means the parent PR merged or closed, and the
+            // reconciler archives or converts the revision on its next
+            // tick. Refuse now with the reason, rather than minting an
+            // execution that tick would strand.
+            if let Some(root) = get_chain_root_task(conn, &task.id)?
+                && matches!(root.status, TaskStatus::Done | TaskStatus::Archived)
+            {
+                bail!(
+                    "cannot start {work_item_id}: its parent PR (chain root {} is `{}`) has already merged \
+                     or closed, so there is nothing left to revise — the engine settles this revision on \
+                     its next reconcile; file a new chore for further work",
+                    root.id,
+                    root.status,
+                );
+            }
+            // The reconciler's second gate: a retired spawning attempt. An
+            // explicit start is the human saying "try again on this
+            // branch", so re-open the attempt — then the reconciler sees a
+            // live attempt and lets the run proceed — and lift the block
+            // that gate left behind so `start_execution_run` can advance
+            // the row to `active`.
+            let reopened = reopen_retired_spawning_attempt(conn, &task)?;
+            let unblocked = crate::task_status_audit::execute(
+                conn,
+                "explicit_start_retired_attempt_clear",
+                actor,
+                "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
+                     last_status_actor = ?4, updated_at = ?2
+                 WHERE id = ?1 AND status = 'blocked' AND blocked_reason = ?3 AND deleted_at IS NULL",
+                params![work_item_id, now, BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED, actor],
+            )?;
+            if let Some(attempt) = reopened {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    attempt_table = attempt.table,
+                    attempt_id = %attempt.attempt_id,
+                    prior_status = %attempt.status,
+                    prior_failure_reason = ?attempt.failure_reason,
+                    unblocked = unblocked > 0,
+                    "RequestExecution: explicit start of an engine-spawned revision re-opened its retired \
+                     spawning attempt (back to `pending`) so the revision reconciler will not abandon the run",
+                );
+            } else if unblocked > 0 {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    "RequestExecution: cleared stale retired-attempt block on explicit start \
+                     (the attempt is no longer retired or no longer exists)",
+                );
+            }
+        }
+    }
+
+    // Multi-repo Q5: route through the single resolver so the
+    // explicit `bossctl work start` path refuses with the same
+    // message the reconciler would have surfaced. The matching
+    // sticky attention item is written by the public
+    // `request_execution_with_live_check` wrapper from a separate
+    // transaction — doing it here would let the bail's rollback
+    // erase the kanban surface alongside the dispatch attempt.
+    let resolved_repo = resolve_repo_for_work_item(conn, &work_item_id)?;
+    if resolved_repo.is_none() {
+        let label = repo_unresolved_kind_label(conn, &work_item_id)?;
+        bail!("{}", repo_unresolved_attention_body(&work_item_id, label));
+    }
+
+    // Keep the owner's launch intent for the lifetime of this item, including
+    // review and repair work after its implementation execution completes.
+    // This write shares the request transaction, so refusals roll it back.
+    if force {
+        super::dispatch_focus::record_explicit_launch_on(conn, &work_item_id)?;
+    }
+
+    // Idempotency / re-dispatch-storm guard.
+    //
+    // The execution that governs whether this work item needs a *new*
+    // dispatch is the one a worker may actually be attached to — i.e.
+    // the most recent execution in a *live* DB status (`running` /
+    // `waiting_human`). Keying off the plain "latest execution" is the
+    // defect behind the R693 storm (`task_18b347260cd7da80_e`): once an
+    // earlier re-dispatch stalled and was abandoned/orphaned, that
+    // *terminal* row is newer than the genuinely-live run and shadows
+    // it. `query_latest_execution_for_work_item` then returns the
+    // terminal phantom, `execution_status_is_terminal` short-circuits
+    // the guard below, and we insert yet another `ready` row that claims
+    // a worker and stalls — the loop repeats every sweep.
+    //
+    // Preferring the live execution closes that loop: a work item with a
+    // live execution is evaluated against THAT execution (and the
+    // caller's runtime `is_live` oracle), not the phantom. When no live
+    // execution exists we fall back to the latest row, preserving the
+    // prior behaviour for `ready` / `waiting_dependency` / terminal-only
+    // histories.
+    let latest = query_latest_execution_for_work_item(conn, &work_item_id)?;
+    let live = query_live_execution_for_work_item(conn, &work_item_id)?;
+    let governing = live.clone().or_else(|| latest.clone());
+
+    if let Some(existing) = governing {
+        if !existing.status.is_terminal() {
+            // Existing non-terminal row. Three cases:
+            //   - never dispatched (no `work_runs` row yet): the `is_live`
+            //     oracle is meaningless here — it answers "is a worker
+            //     attached to this execution", and a row no worker has
+            //     ever claimed is trivially "not live" regardless of
+            //     whether it is genuinely fresh or actually stale. Reuse
+            //     it unconditionally instead of liveness-testing it. This
+            //     is what closes the re-dispatch race: two
+            //     `dispatch_decision` evaluations landing within the
+            //     scheduler pickup window (e.g. the product-executions
+            //     reconciler racing the normal RequestExecution path)
+            //     must not abandon-and-recreate a `ready` or `claimed`
+            //     row the scheduler simply hasn't picked up yet (or
+            //     has claimed and is still inside cube setup).
+            //   - is_live=true: a worker is genuinely attached to the
+            //     slot. Keep the row, refresh priority / preferred
+            //     workspace, return the same execution. (Idempotent —
+            //     this is what bossctl `work start` and a kanban
+            //     drag both depend on for "don't double-spawn.")
+            //   - is_live=false (and a run has started): the row is stale
+            //     (worker gone). Two sub-cases:
+            //       * ci_remediation kind: re-queue it instead of abandoning.
+            //         The branch/PR already exists; the human dragging to Doing
+            //         (or calling `bossctl work start`) means "retry the CI fix
+            //         on the existing branch," not "redo the whole chore." See
+            //         the ci_failure retry design for the full invariant set.
+            //       * any other kind: abandon and fall through to insert a
+            //         fresh ready row, which is the normal re-dispatch path.
+            //
+            // Decision-point instrumentation (re-dispatch storm
+            // visibility): every dispatch trigger funnels through here,
+            // so a structured log at each branch makes "why did the
+            // scheduler conclude this work item needs dispatch?"
+            // diagnosable for ALL loops (orphan sweep, startup
+            // reconcile, worker-release rescan, kanban drag) without
+            // each having to instrument itself.
+            let latest_id = latest.as_ref().map(|e| e.id.clone());
+            let live_id = live.as_ref().map(|e| e.id.clone());
+            // Scoped to pre-run statuses (queued/ready/waiting_dependency/claimed):
+            // those are the only statuses a row can sit in before any worker
+            // has ever attached. `can_reconcile()` is the subset the product
+            // reconciler may rewrite; `is_pre_run()` also covers `claimed`,
+            // which is the scheduler's cube-setup CAS and must not be
+            // abandoned-and-recreated. Once a worker actually attaches,
+            // status flips to running/waiting_human and a `work_runs` row
+            // exists — so this never masks a genuinely dead live-status row
+            // (see `request_execution_marks_existing_stale_when_no_live_worker`).
+            let never_dispatched = existing.status.is_pre_run() && query_latest_run(conn, &existing.id)?.is_none();
+            if never_dispatched || is_live(&existing.id) {
+                let (decision, message) = if never_dispatched {
+                    (
+                        "reuse_never_dispatched",
+                        "dispatch_decision: governing execution has never been dispatched \
+                         (no work_runs row) — reusing it without a liveness test, no new dispatch",
+                    )
+                } else {
+                    (
+                        "reuse_live",
+                        "dispatch_decision: work item already has a live execution — \
+                         returning it, no new dispatch",
+                    )
+                };
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    governing_execution_id = %existing.id,
+                    governing_status = %existing.status,
+                    latest_execution_id = ?latest_id,
+                    live_execution_id = ?live_id,
+                    decision = decision,
+                    "{}", message,
+                );
+                let next_status = if existing.status == ExecutionStatus::WaitingDependency {
+                    ExecutionStatus::Ready
+                } else {
+                    existing.status.clone()
+                };
+                let next_priority = priority.unwrap_or(existing.priority);
+                let next_preferred = preferred_workspace_id.clone().or(existing.preferred_workspace_id);
+                conn.execute(
+                    "UPDATE work_executions
+                     SET status = ?2,
+                         priority = ?3,
+                         preferred_workspace_id = ?4
+                     WHERE id = ?1",
+                    params![existing.id, next_status.as_str(), next_priority, next_preferred],
+                )?;
+                return query_execution(conn, &existing.id).require("execution", &existing.id);
+            } else if existing.kind == ExecutionKind::CiRemediation {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    governing_execution_id = %existing.id,
+                    governing_status = %existing.status,
+                    latest_execution_id = ?latest_id,
+                    live_execution_id = ?live_id,
+                    decision = "requeue_ci_remediation",
+                    "dispatch_decision: governing ci_remediation execution not live — \
+                     re-queuing the existing branch instead of redoing the chore",
+                );
+                // Stale ci_remediation — re-queue it for retry.
+                //
+                // For the `bossctl work start` path the task may still be
+                // `status='blocked'` when request_execution is called (the
+                // CLI does not flip the kanban status first, unlike the UI
+                // drag). Clear the ci_failure block so start_execution_run
+                // can advance the task to `active` when the worker picks up.
+                // For the drag-to-Doing path the task is already `active`
+                // (the UI set it before firing RequestExecution), so the
+                // WHERE guard is a no-op.
+                let now = now_string();
+                let rows_cleared = crate::task_status_audit::execute(
+                    conn,
+                    "explicit_start_ci_failure_clear",
+                    actor,
+                    "UPDATE tasks
+                     SET status             = 'todo',
+                         blocked_reason     = NULL,
+                         blocked_attempt_id = NULL,
+                         last_status_actor  = ?3,
+                         updated_at         = ?2
+                     WHERE id               = ?1
+                       AND deleted_at       IS NULL
+                       AND status           = 'blocked'
+                       AND blocked_reason   IN ('ci_failure', 'ci_failure_exhausted')",
+                    params![work_item_id, now, actor],
+                )?;
+                if rows_cleared > 0 {
+                    // Clear matching task_blocked_signals rows and insert a
+                    // ci_failure_suppression so the CI watch does not
+                    // immediately re-flip the task before the worker pushes
+                    // a fix. Mirrors what update_work_item_as_actor does when
+                    // a human drags the card out of the Blocked column.
+                    conn.execute(
+                        "UPDATE task_blocked_signals
+                         SET cleared_at = ?2
+                         WHERE work_item_id = ?1
+                           AND reason IN ('ci_failure', 'ci_failure_exhausted')
+                           AND cleared_at IS NULL",
+                        params![work_item_id, now],
+                    )?;
+                    record_ci_failure_suppression_in_tx(conn, &work_item_id, &now)?;
+                    tracing::info!(
+                        work_item_id = %work_item_id,
+                        "RequestExecution: cleared ci_failure block for bossctl retry path",
+                    );
+                }
+                // Re-queue: move the stale cube_workspace_id into
+                // preferred_workspace_id so the dispatcher can attempt to
+                // re-claim the same workspace (and therefore the same
+                // in-progress branch). Clearing cube_lease_id is required
+                // because start_execution_run stamps fresh lease info; the
+                // old lease was released by the worker on clean exit. If the
+                // worker crashed, the orphan reaper eventually reconciles.
+                let preferred = preferred_workspace_id
+                    .clone()
+                    .or_else(|| existing.cube_workspace_id.clone());
+                conn.execute(
+                    "UPDATE work_executions
+                     SET status                 = 'ready',
+                         cube_lease_id          = NULL,
+                         cube_workspace_id      = NULL,
+                         workspace_path         = NULL,
+                         preferred_workspace_id = ?2,
+                         finished_at            = NULL
+                     WHERE id = ?1",
+                    params![existing.id, preferred],
+                )?;
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    execution_id = %existing.id,
+                    "RequestExecution: re-queued stale ci_remediation for retry",
+                );
+                return query_execution(conn, &existing.id).require("execution", &existing.id);
+            } else {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    governing_execution_id = %existing.id,
+                    governing_status = %existing.status,
+                    latest_execution_id = ?latest_id,
+                    live_execution_id = ?live_id,
+                    decision = "abandon_stale_and_redispatch",
+                    "dispatch_decision: governing execution not live (worker gone) — \
+                     abandoning it and creating a fresh ready execution",
+                );
+                let now = now_string();
+                conn.execute(
+                    "UPDATE work_executions
+                     SET status = 'abandoned',
+                         finished_at = COALESCE(finished_at, ?2)
+                     WHERE id = ?1",
+                    params![existing.id, now],
+                )?;
+                stage_execution_terminal(pending, conn, &existing.id, &work_item_id)?;
+            }
+        } else {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                governing_execution_id = %existing.id,
+                governing_status = %existing.status,
+                decision = "create_fresh_after_terminal",
+                "dispatch_decision: most recent execution is terminal and no live \
+                 execution exists — creating a fresh ready execution",
+            );
+        }
+    } else {
+        tracing::info!(
+            work_item_id = %work_item_id,
+            decision = "create_fresh_no_history",
+            "dispatch_decision: no prior execution — creating the first ready execution",
+        );
+    }
+
+    // Existing live work, queued reviews and CI-remediation retries above
+    // remain reusable. Only minting a fresh primary implementation is wrong.
+    if primary_pr_awaits_review(conn, &work_item_id)? {
+        bail!("Work already has a bound PR; use a revision to change it");
+    }
+    let _ = product_id_for_work_item(conn, &work_item_id)?;
+
+    // For revision tasks, look up the chain root's PR URL so the worker
+    // knows which existing PR branch to push commits to.  Without this the
+    // revision prelude in the worker prompt has no PR URL to reference and
+    // the worker would have to guess — or, worse, open a new orphan PR.
+    //
+    // The orphan-sweep re-dispatch path is the primary caller here: when a
+    // revision task was already `active` and its worker crashed, we need to
+    // re-create the execution with the same `pr_url` the original dispatch
+    // carried.  The chain root's `pr_url` is the authoritative source
+    // because revision tasks themselves never own a `pr_url` column value.
+    let revision_pr_url: Option<String> = if kind == ExecutionKind::RevisionImplementation {
+        get_chain_root_task(conn, &work_item_id)?
+            .and_then(|t| t.pr_url)
+            .filter(|u| !u.is_empty())
+    } else {
+        None
+    };
+
+    let blocked_workspace = blocked_workspace::blocked_workspace_predecessor(conn, &work_item_id, "")?
+        .and_then(|prior| prior.preferred_workspace_id);
+    // Explicit input wins; never mark an unrelated user pin as recovery.
+    let recovering_blocked = blocked_workspace.is_some()
+        && (preferred_workspace_id.is_none() || preferred_workspace_id == blocked_workspace);
+    let preferred_workspace_id = preferred_workspace_id.or(blocked_workspace);
+
+    insert_execution(
+        conn,
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id)
+            .kind(kind)
+            .status(ExecutionStatus::Ready)
+            .maybe_repo_remote_url(resolved_repo)
+            .maybe_priority(priority)
+            .maybe_preferred_workspace_id(preferred_workspace_id)
+            .maybe_pr_url(revision_pr_url)
+            .allow_dirty(allow_dirty || recovering_blocked)
+            .prefer_is_soft(recovering_blocked)
+            .build(),
+    )
+}
+
+/// Legacy admission was refused because the batch retains the review hold.
+#[derive(Debug)]
+pub struct LiveReviewBatchOwnsCycle(pub String);
+
+impl std::fmt::Display for LiveReviewBatchOwnsCycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a live pre_merge review batch owns cycle {}", self.0)
+    }
+}
+
+impl std::error::Error for LiveReviewBatchOwnsCycle {}
+
+/// Legacy admission must check batch ownership under the same write lock as
+/// insertion. Sweep-level checks alone race a concurrent batch admission.
+pub(crate) fn ensure_no_live_review_batch(conn: &Connection, work_item_id: &str) -> Result<()> {
+    let cycle_root = super::chain_helpers::chain_root(conn, work_item_id)?;
+    if super::review_batches::has_live_pre_merge_review_batch_in(conn, &cycle_root)? {
+        return Err(LiveReviewBatchOwnsCycle(cycle_root).into());
+    }
+    Ok(())
+}
+
+/// Re-fire the automated review pipeline for `work_item_id` by enqueuing a
+/// fresh `pr_review` execution. Shared by two callers:
+///
+/// - `boss_engine::pr_review_recovery`'s dead-review sweep, which calls this
+///   when a prior `pr_review` execution died (host failure, cube-lease
+///   reap, crash) without ever reaching `finalize_pr_review_pass` — a
+///   review that silently vanished must not leave the PR unreviewed.
+/// - the operator-facing `bossctl review start --pr <n>` verb, for a
+///   deliberate re-review after an incident or significant new commits.
+///
+/// Unlike [`request_execution_in_tx_with_live_check`], this does NOT go
+/// through [`execution_kind_for_work_item`] — that resolver only knows
+/// about the task-kind-derived implementation kinds and has no notion of
+/// `pr_review`, so a generic redispatch would wrongly spawn a fresh
+/// implementer on top of an already-open PR instead of re-running the
+/// reviewer. This function always creates `ExecutionKind::PrReview`.
+///
+/// Refuses (returns `Err`) when:
+/// - the work item is unknown or soft-deleted,
+/// - the work item's status is terminal (`done`/`archived`) —
+///   nothing left to review,
+/// - `pr_url` is unset — the item has no PR yet,
+/// - the live PR-state probe reports the PR merged or closed — nothing to
+///   review; the human enqueue path and the sweep both want this to fail
+///   loudly rather than dispatch a reviewer at a dead PR,
+/// - a live execution (`running`/`waiting_human`) of ANY kind already
+///   claims the item — re-triggering would race that worker.
+///
+/// Idempotent when a non-terminal `pr_review` execution (`ready` /
+/// `waiting_dependency`) is already the item's latest execution: returns
+/// that row instead of creating a duplicate.
+pub(crate) fn request_pr_review_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_checker: &dyn PrStateChecker,
+) -> Result<WorkExecution> {
+    let task = query_task(conn, work_item_id)?
+        .filter(|t| t.deleted_at.is_none())
+        .with_context(|| format!("unknown task: {work_item_id}"))?;
+
+    if crate::parking::is_parked(conn, work_item_id)? {
+        bail!("cannot review {work_item_id}: item is parked; un-park it first");
+    }
+
+    if task.status.is_terminal() {
+        bail!(
+            "cannot review {work_item_id}: task is `{}` — terminal work items have no open PR to review",
+            task.status
+        );
+    }
+
+    ensure_no_live_review_batch(conn, work_item_id)?;
+
+    let pr_url = task
+        .pr_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("cannot review {work_item_id}: task has no open PR (pr_url unset)"))?
+        .to_owned();
+
+    match pr_checker.check(&pr_url)? {
+        PrOpenState::Merged => bail!("cannot review {work_item_id}: PR {pr_url} is already merged"),
+        PrOpenState::ClosedUnmerged => bail!("cannot review {work_item_id}: PR {pr_url} is closed (not merged)"),
+        PrOpenState::Open => {}
+    }
+
+    if let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? {
+        bail!(
+            "cannot review {work_item_id}: execution {} ({}) is already live for this item — \
+             wait for it to finish or cancel it first",
+            live.id,
+            live.kind,
+        );
+    }
+
+    let execution = if let Some(existing) = existing_nonterminal_pr_review_execution(conn, work_item_id)? {
+        // Same reasoning as the analogous clear in
+        // `request_execution_in_tx_with_live_check`: reaching this point
+        // means a review is (still) live for this item, so any stale
+        // `churn_guard_parked` attention filed by `pr_review_recovery`
+        // is resolved unconditionally — this is what makes the park
+        // clear automatically once the recovery sweep's trailing window
+        // drains enough to re-fire the review.
+        existing
+    } else {
+        insert_execution(
+            conn,
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id.to_owned())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )?
+    };
+
+    // A row that has already reached `in_review` stays there for as long as
+    // work continues against its PR, including while this fresh review pass
+    // runs — per `tools/boss/docs/designs/work-kanban.md`'s cycle-root
+    // status contract. There is deliberately no `tasks.status` write here:
+    // "the Doing lane never appears workerless" was the old rationale for
+    // pulling the row back to `active`, but that is a rendering concern,
+    // solved by the Review-lane card reading `ai_reviewing`/`ai_review_state`
+    // (`attach_ai_reviewing_flag` / `attach_ai_review_state` in
+    // `revision_helpers.rs`), not by rewriting the canonical status.
+    resolve_attention_kind_in_tx(conn, work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
+    Ok(execution)
+}
+
+/// Returns the work item's latest execution when it is a non-terminal
+/// `pr_review` (`ready` / `waiting_dependency` / `running` / etc.) — the
+/// shared idempotency check for every path that enqueues an automated
+/// review, so a caller never inserts a second `pr_review` execution on top
+/// of one that is already enqueued or in flight for the same item.
+///
+/// Used by [`request_pr_review_in_tx`] (operator/recovery re-review) and by
+/// [`WorkDb::create_pr_review_execution_dedup`] (the automatic
+/// reviewer-enqueue path in `finalize_pr_transition`). The latter closes a
+/// race where two independent PR-completion triggers (the Stop-hook path
+/// and the merge-poller's `pr_recheck` sweep) could each observe the
+/// producing execution as not-yet-terminal and independently enqueue a
+/// `pr_review` execution for the same unchanged head sha, minting two
+/// findings revisions from two redundant reviews. Callers MUST run this check and
+/// the subsequent insert inside the same `Immediate` transaction — sqlite
+/// then serialises concurrent callers on the write lock, closing the
+/// check-then-insert race instead of merely narrowing it.
+pub(crate) fn existing_nonterminal_pr_review_execution(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    match query_latest_execution_for_work_item(conn, work_item_id)? {
+        Some(latest) if latest.kind == ExecutionKind::PrReview && !latest.status.is_terminal() => Ok(Some(latest)),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+#[path = "dispatch_helpers_tests.rs"]
+mod tests;

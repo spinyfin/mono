@@ -21,6 +21,10 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Engine", systemImage: "gearshape")
                 }
+            BackupSettingsPane()
+                .tabItem {
+                    Label("Backups", systemImage: "externaldrive.badge.icloud")
+                }
             HostRegistryPane()
                 .tabItem {
                     Label("Hosts", systemImage: "server.rack")
@@ -41,6 +45,7 @@ struct SettingsView: View {
         .environmentObject(chatModel)
         .onAppear {
             chatModel.refreshSettings()
+            chatModel.refreshOffsiteBackup()
             // Engine health is fetched on every reconnect, but the
             // user may open Settings against a long-lived session
             // where the API-key state changed (a restart with a new
@@ -160,6 +165,15 @@ private struct EngineConfigPane: View {
 
             Section {
                 DriverTrafficSplitRow()
+                Stepper(value: Binding(
+                    get: { chatModel.codexSolPercentage },
+                    set: { chatModel.setCodexSolPercentage($0) }
+                ), in: 0...100, step: 5) {
+                    Text("Sol for eligible Codex work: \(chatModel.codexSolPercentage)%")
+                }
+                Text("Sol is the standard model for eligible Codex work: standard small work and automated revisions. Lower this to send a share of that work to Astra instead; failed Sol work always retries on Astra.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text("Driver Traffic")
             } footer: {
@@ -177,7 +191,9 @@ private struct EngineConfigPane: View {
 
             if !chatModel.engineHealthIssues.isEmpty {
                 Section {
-                    ForEach(chatModel.engineHealthIssues) { issue in
+                    // Keyed by position: several issues can share a kind
+                    // (one spawn-failure streak alert per combination).
+                    ForEach(Array(chatModel.engineHealthIssues.enumerated()), id: \.offset) { _, issue in
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
                                 Image(systemName: issue.severity == "error"
@@ -263,20 +279,19 @@ private struct EngineConfigPane: View {
 /// The driver traffic split control in the "Engine" Settings tab: a
 /// proportional bar plus one stepper per driver.
 ///
-/// Three interdependent values that must total 100 do not decompose into
-/// three independent steppers — the operator would spend their time fighting
-/// a sum constraint. They are not modelled as independent here either: each
-/// stepper moves ONE share and `DriverTrafficSplit.adjusting(_:to:)` makes
-/// the other two absorb the difference (Claude gives way first — it is the
-/// engine's default driver, so it holds the traffic nobody has deliberately
-/// claimed). The sum invariant therefore holds at every intermediate step,
-/// which means:
+/// Four interdependent values that must total 100 do not decompose into
+/// four independent steppers: independent steppers would require manual
+/// enforcement of the sum constraint. They are not modelled as independent
+/// here either: each stepper moves ONE share and
+/// `DriverTrafficSplit.adjusting(_:to:)` makes the other three absorb the
+/// difference (Claude gives way first — it is the engine's default driver,
+/// so it holds the traffic nobody has deliberately claimed). The sum
+/// invariant therefore holds at every intermediate step, which means:
 ///
 /// - there is no "apply" button and no rejected intermediate state;
 /// - every valid split is reachable by repeated single-share edits,
-///   including any one or two drivers at 0 — raising a driver to 100 drains
-///   the other two to zero in donor order, and raising one to 20 then
-///   another to 80 zeroes the third;
+///   including up to three drivers at 0 — raising a driver to 100 drains
+///   the other three to zero in donor order;
 /// - the engine's hard "shares must sum to exactly 100" rejection is a
 ///   backstop against a hand-written RPC, not something this UI can trip.
 ///
@@ -303,7 +318,7 @@ private struct DriverTrafficSplitRow: View {
                             .fill(driver.tint)
                             .frame(width: 8, height: 8)
                         Text(driver.displayName)
-                            .frame(minWidth: 64, alignment: .leading)
+                            .frame(minWidth: 88, alignment: .leading)
                         Text("\(chatModel.driverTrafficSplit.share(for: driver))%")
                             .font(.body.monospacedDigit())
                             .frame(minWidth: 48, alignment: .leading)
@@ -317,7 +332,7 @@ private struct DriverTrafficSplitRow: View {
 }
 
 /// The split rendered as one 100%-wide bar, segments in the same
-/// `codex | claude | grok` order the engine lays its bucket line out in, so
+/// `codex | claude | grok | agy` order the engine lays its bucket line out in, so
 /// the picture matches the mechanism. A driver at 0 has a zero-width segment
 /// — visibly absent, which is the point.
 private struct DriverTrafficSplitBar: View {
@@ -354,6 +369,7 @@ extension DriverSlug {
         case .codex: return .purple
         case .claude: return .accentColor
         case .grok: return .orange
+        case .agy: return .green
         }
     }
 }
@@ -418,11 +434,12 @@ private struct WorkerSettingsPane: View {
                         }
                     }
                     Button(role: .destructive) {
+                        chatModel.logCoordinatorReset("gesture", source: "settings")
                         showCoordinatorResetConfirm = true
                     } label: {
                         Text("Reset Coordinator Session…")
                     }
-                    .disabled(chatModel.attachedCoordinatorSpawnToken == nil)
+                    .disabled(chatModel.attachedCoordinatorSpawnToken == nil || chatModel.coordinatorResetWaiting)
                 } header: {
                     Text("Coordinator")
                 } footer: {
@@ -449,6 +466,7 @@ private struct WorkerSettingsPane: View {
         } message: {
             Text(CoordinatorResetCopy.message)
         }
+        .modifier(CoordinatorResetStatus(model: chatModel))
     }
 }
 
@@ -458,9 +476,9 @@ private struct WorkerSettingsPane: View {
 enum CoordinatorResetCopy {
     static let title = "Reset the coordinator?"
     static let message =
-        "This permanently ends the coordinator's current conversation and discards its context — " +
-        "this cannot be undone. A fresh session starts immediately with the current claude binary " +
-        "and instructions."
+        "Boss will ask the coordinator to write a fresh handoff and wait up to 30 seconds after delivery. " +
+        "Then its current conversation permanently ends and a new session starts with that handoff, " +
+        "the current claude binary, and instructions. If no handoff arrives, Boss warns that context may be missing and restarts anyway."
 }
 
 private struct SettingToggleRow: View {

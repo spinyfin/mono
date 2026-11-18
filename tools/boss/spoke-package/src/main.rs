@@ -1,0 +1,623 @@
+//! `boss-spoke-package`: build, sign, verify and install signed spoke packages,
+//! and check a host's readiness as its service user.
+
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::{Context, Result, bail};
+use boss_spoke_package::archive::INSTALLER_BINARY;
+use boss_spoke_package::bootstrap::{self, Failure};
+use boss_spoke_package::install::{self, Host, InstallRecord, Layout, Request};
+use boss_spoke_package::manifest::{self, Platform, SigningKey, TrustedKey};
+use boss_spoke_package::system::{Staged, System};
+use boss_spoke_package::update::{self, AlwaysReady, Apply, FileProbe, HttpFetcher, MapFetcher};
+use boss_spoke_package::{build, read_owner_only};
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(about = "Build, sign, verify and install signed Boss spoke packages")]
+enum Cli {
+    /// Generate the release owner's Ed25519 key pair.
+    Keygen {
+        #[arg(long)]
+        private_out: PathBuf,
+        #[arg(long)]
+        public_out: PathBuf,
+    },
+    /// Package the spoke daemon and this installer, and write the unsigned manifest.
+    Build {
+        #[arg(long)]
+        spoke_bin: PathBuf,
+        #[arg(long)]
+        release_id: String,
+        /// Defaults to the platform this tool is running on.
+        #[arg(long)]
+        platform: Option<String>,
+        /// Where the package will be published, as an https URL prefix.
+        #[arg(long)]
+        url_base: String,
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Sign a manifest with the release owner's key (an owner-only file).
+    Sign {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Print a public key fingerprint before trusting it.
+    Fingerprint {
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Check a release without installing it.
+    Verify {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long)]
+        trusted_key: PathBuf,
+    },
+    /// Verify a release and install it, as root. Enrolls nothing.
+    Install(InstallArgs),
+    /// Apply a request dropped by the service user. Root-only; installed as the
+    /// path-activated helper at provisioning.
+    ApplyUpdate {
+        #[arg(long, default_value = "/etc/boss-spoke/install.json")]
+        config: PathBuf,
+        /// Stage against this directory instead of `/`. Test and inspect only.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// JSON object of URL → file path, used by isolated crash tests.
+        #[arg(long, hide = true)]
+        fixture_files: Option<PathBuf>,
+    },
+    /// Enroll this host with the hub using a single-use token, start its service
+    /// and check it as the service user. Run as root, after `install`.
+    ///
+    /// The token comes from an owner-only file or stdin, never from the command
+    /// line. Exits non-zero with a typed failure (`failure: <code>`) unless the
+    /// host enrolled, its service stayed up, and every as-user check passed.
+    Enroll {
+        #[arg(long, default_value = "/etc/boss-spoke/install.json")]
+        config: PathBuf,
+        /// Read the token from this owner-only file. It is deleted once spent.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_file: Option<PathBuf>,
+        /// Read the token from standard input.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Enroll again over an existing identity, for a lost or expired one.
+        #[arg(long)]
+        replace_identity: bool,
+        /// Repositories (URLs) the preflight must be able to read.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Stage against this directory instead of `/`. Test and inspect only.
+        #[arg(long, hide = true)]
+        root: Option<PathBuf>,
+        /// Run the as-user step in this process. The root side launches it.
+        #[arg(long, hide = true)]
+        inline: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        hub_url: Option<String>,
+        #[arg(long, hide = true)]
+        host_id: Option<String>,
+    },
+    /// Print a journal's SQLite `user_version`. Run by the update helper as the
+    /// service user so root never opens the service user's database.
+    JournalVersion {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Check this host as the service user, in the installed service environment.
+    Preflight {
+        #[arg(long, default_value = "/etc/boss-spoke/install.json")]
+        config: PathBuf,
+        /// Only the storage checks.
+        #[arg(long)]
+        storage_only: bool,
+        /// Repositories (URLs) the host must be able to read.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Run the checks in this process instead of as the service user.
+        #[arg(long, hide = true)]
+        inline: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        hub_url: Option<String>,
+    },
+}
+
+#[derive(clap::Args)]
+struct InstallArgs {
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    signature: PathBuf,
+    #[arg(long)]
+    package: PathBuf,
+    /// The release owner's public key. Required the first time; afterwards the
+    /// key this host pinned is used.
+    #[arg(long)]
+    trusted_key: Option<PathBuf>,
+    #[arg(long)]
+    host_id: String,
+    #[arg(long)]
+    hub_url: String,
+    /// The hub's CA certificate (PEM).
+    #[arg(long)]
+    hub_ca: PathBuf,
+    #[arg(long, default_value = install::DEFAULT_USER)]
+    user: String,
+    /// Stage everything under this directory instead of `/`, without creating
+    /// the account or touching systemd or launchd (no root needed). For
+    /// inspecting a release.
+    #[arg(long)]
+    root: Option<PathBuf>,
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<ExitCode> {
+    match cli {
+        Cli::Keygen {
+            private_out,
+            public_out,
+        } => {
+            let (seed, public) = SigningKey::generate()?;
+            let mut private = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&private_out)
+                .with_context(|| format!("{} must not already exist", private_out.display()))?;
+            private.write_all(format!("{seed}\n").as_bytes())?;
+            fs::write(&public_out, public.to_text())?;
+            println!("public key fingerprint: {}", public.fingerprint());
+        }
+        Cli::Build {
+            spoke_bin,
+            release_id,
+            platform,
+            url_base,
+            out_dir,
+        } => {
+            let platform = match platform {
+                Some(name) => Platform::parse(&name)?,
+                None => Platform::host()?,
+            };
+            let installer = fs::read(std::env::current_exe()?)?;
+            let built = build(fs::read(&spoke_bin)?, installer, &release_id, platform, &url_base)?;
+            fs::create_dir_all(&out_dir)?;
+            fs::write(out_dir.join(&built.file_name), &built.package)?;
+            let manifest = out_dir.join(manifest_name(platform));
+            fs::write(&manifest, built.manifest.to_bytes())?;
+            println!("{}\n{}", out_dir.join(&built.file_name).display(), manifest.display());
+        }
+        Cli::Sign { manifest, key, out } => {
+            let key = SigningKey::from_text(&read_owner_only(&key)?)?;
+            fs::write(out, key.sign(&fs::read(manifest)?))?;
+            // The release log records which key signed, never the key.
+            println!("signed with key {}", key.public().fingerprint());
+        }
+        Cli::Fingerprint { key } => println!("{}", read_key(&key)?.fingerprint()),
+        Cli::Verify {
+            manifest,
+            signature,
+            package,
+            trusted_key,
+        } => {
+            let key = read_key(&trusted_key)?;
+            println!("release key fingerprint: {}", key.fingerprint());
+            let verified = manifest::verify_release(
+                &key,
+                &fs::read(manifest)?,
+                &fs::read_to_string(signature)?,
+                &fs::read(package)?,
+                Platform::host()?,
+            )?;
+            println!(
+                "verified release {} for {}",
+                verified.manifest.release_id,
+                verified.platform.as_str()
+            );
+        }
+        Cli::Install(args) => return install_command(args),
+        Cli::ApplyUpdate {
+            config,
+            root,
+            fixture_files,
+        } => return apply_update_command(&config, root, fixture_files),
+        Cli::Enroll {
+            config,
+            token_file,
+            token_stdin,
+            replace_identity,
+            repo,
+            root,
+            inline,
+            state_dir,
+            hub_url,
+            host_id,
+        } => {
+            if inline {
+                return Ok(inline_enroll(
+                    state_dir.context("--inline needs --state-dir")?,
+                    hub_url.context("--inline needs --hub-url")?,
+                    host_id.context("--inline needs --host-id")?,
+                    replace_identity,
+                ));
+            }
+            return enroll_command(&config, root, token_file, token_stdin, replace_identity, &repo);
+        }
+        Cli::JournalVersion { path } => {
+            println!("user_version={}", update::read_user_version(&path)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cli::Preflight {
+            config,
+            storage_only,
+            repo,
+            inline,
+            state_dir,
+            hub_url,
+        } => {
+            return if inline {
+                inline_preflight(
+                    state_dir.context("--inline needs --state-dir")?,
+                    storage_only,
+                    hub_url,
+                    repo,
+                )
+            } else {
+                service_user_preflight(&config, storage_only, &repo)
+            };
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn read_key(path: &Path) -> Result<TrustedKey> {
+    Ok(TrustedKey::parse(
+        &fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?,
+    )?)
+}
+
+fn manifest_name(platform: Platform) -> String {
+    format!("boss-spoke-{}.manifest.json", platform.as_str())
+}
+
+fn load_fixture_fetcher(path: &Path) -> Result<MapFetcher> {
+    let spec: HashMap<String, String> = serde_json::from_slice(&fs::read(path)?)?;
+    let mut files = HashMap::new();
+    for (url, file) in spec {
+        files.insert(url, fs::read(file)?);
+    }
+    Ok(MapFetcher { files })
+}
+
+extern "C" fn handle_sigterm(_: i32) {
+    update::request_terminate();
+}
+
+fn install_terminate_handler() {
+    // SAFETY: the handler only stores an atomic flag; it is installed once
+    // before the helper does any work.
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::sighandler_t);
+    }
+}
+
+fn apply_update_command(config: &Path, root: Option<PathBuf>, fixture_files: Option<PathBuf>) -> Result<ExitCode> {
+    // The fixture fetcher, the stub probe and crash injection replace the
+    // network, the daemon's health and the helper's crash safety. They exist
+    // for isolated staging runs and are refused on a real host.
+    let hooks = [
+        fixture_files.is_some().then_some("--fixture-files"),
+        std::env::var_os("BOSS_SPOKE_UPDATE_PROBE").map(|_| "BOSS_SPOKE_UPDATE_PROBE"),
+        std::env::var_os("BOSS_SPOKE_UPDATE_CRASH").map(|_| "BOSS_SPOKE_UPDATE_CRASH"),
+    ];
+    if root.is_none()
+        && let Some(hook) = hooks.into_iter().flatten().next()
+    {
+        bail!("{hook} is a test hook and is only accepted with --root");
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if root.is_none() && unsafe { libc::geteuid() } != 0 {
+        bail!("apply-update rewrites the root-owned release layout; run it as root");
+    }
+    let record = InstallRecord::read(config)?;
+    let mut layout = record.layout()?;
+    layout.root = root;
+    let platform = layout.platform;
+    let staged = layout.root.is_some();
+    let staged_host = Staged::default();
+    let host: &dyn Host = if staged { &staged_host } else { &System { platform } };
+    let account = host
+        .lookup_user(&record.user)?
+        .with_context(|| format!("service user {} is missing", record.user))?;
+    let crash = std::env::var("BOSS_SPOKE_UPDATE_CRASH").ok();
+    let file_probe = FileProbe {
+        layout: &layout,
+        account,
+        require_handshake: true,
+    };
+    let only_installed = update::OnlyReady(record.release_id.clone());
+    let always = AlwaysReady;
+    let never = update::NeverReady;
+    let probe: &dyn update::HealthProbe = match std::env::var("BOSS_SPOKE_UPDATE_PROBE").as_deref() {
+        Ok("never") => &never,
+        Ok("only_installed") => &only_installed,
+        _ if staged => &always,
+        _ => &file_probe,
+    };
+    let http = HttpFetcher::new(record.package_origin.clone())?;
+    let mapped = fixture_files
+        .as_ref()
+        .map(|path| load_fixture_fetcher(path))
+        .transpose()?;
+    let fetcher: &dyn update::Fetcher = match &mapped {
+        Some(map) => map,
+        None => &http,
+    };
+    let inspector = std::env::current_exe().context("cannot locate the installer binary")?;
+    install_terminate_handler();
+    let status = update::apply(&Apply {
+        host,
+        layout: &layout,
+        fetcher,
+        probe,
+        health: if staged {
+            install::Health {
+                deadline: std::time::Duration::from_millis(50),
+                poll: std::time::Duration::from_millis(1),
+                stable: std::time::Duration::ZERO,
+            }
+        } else {
+            install::Health::default()
+        },
+        inspector: &inspector,
+        crash,
+        unwind_crash: false,
+        fail: None,
+    })?;
+    println!(
+        "upgrade {} {} {}",
+        status.result,
+        status.release_id,
+        if status.error.is_empty() {
+            status.running_release_id.as_str()
+        } else {
+            status.error.as_str()
+        }
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn install_command(args: InstallArgs) -> Result<ExitCode> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if args.root.is_none() && unsafe { libc::geteuid() } != 0 {
+        bail!("install writes system directories and a service definition; run it as root");
+    }
+    let platform = Platform::host()?;
+    let staged = args.root.is_some();
+    let key = args.trusted_key.as_deref().map(read_key).transpose()?;
+    let manifest = fs::read(args.manifest)?;
+    let signature = fs::read_to_string(args.signature)?;
+    let package = fs::read(args.package)?;
+    let hub_ca = fs::read(args.hub_ca)?;
+    let request = Request::builder()
+        .manifest(&manifest)
+        .signature(&signature)
+        .package(&package)
+        .maybe_trusted_key(key)
+        .host_id(&args.host_id)
+        .hub_url(&args.hub_url)
+        .hub_ca(&hub_ca)
+        .platform(platform)
+        .layout(Layout {
+            platform,
+            user: args.user,
+            root: args.root,
+        })
+        .build();
+    let installed_binary = request.layout.on_disk(&request.layout.current()).join(INSTALLER_BINARY);
+    let staged_host = Staged::default();
+    let host: &dyn Host = if staged { &staged_host } else { &System { platform } };
+    let report = install::install(host, &request)?;
+    println!("release {} for {}", report.release_id, platform.as_str());
+    println!("release key fingerprint: {}", report.key_fingerprint);
+    if report.changed.is_empty() {
+        println!("nothing changed: this host already matches");
+    } else {
+        println!("changed: {}", report.changed.join(", "));
+    }
+    if report.restarted {
+        println!("service restarted; running workers and the journal were kept");
+    } else if !report.enrolled {
+        println!(
+            "service not started: this host is not enrolled. Run `{} enroll` as root with a token from the hub.",
+            installed_binary.display()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Re-runs this command as the service user with the installed service
+/// environment, so the checks see what the service will see.
+fn service_user_preflight(config: &Path, storage_only: bool, repos: &[String]) -> Result<ExitCode> {
+    let record = InstallRecord::read(config)?;
+    let layout = record.layout()?;
+    let run = bootstrap::preflight_as_service_user(
+        &System {
+            platform: layout.platform,
+        },
+        &record,
+        &layout,
+        storage_only,
+        repos,
+        &std::env::current_exe()?,
+    )?;
+    print!("{}", run.output);
+    Ok(if run.success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// The as-user half of `enroll`: prints one line, `enrolled …` or `failure: …`.
+fn inline_enroll(state_dir: PathBuf, hub_url: String, host_id: String, replace_identity: bool) -> ExitCode {
+    let args = bootstrap::InlineEnroll {
+        state_dir: &state_dir,
+        hub_url: &hub_url,
+        host_id: &host_id,
+        replace_identity,
+    };
+    match bootstrap::enroll_inline(&args) {
+        Ok(enrolled) => {
+            println!("{}", enrolled.to_line());
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            println!("{}", failure.to_line());
+            ExitCode::from(failure.exit_code())
+        }
+    }
+}
+
+fn enroll_command(
+    config: &Path,
+    root: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    token_stdin: bool,
+    replace_identity: bool,
+    repos: &[String],
+) -> Result<ExitCode> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if root.is_none() && unsafe { libc::geteuid() } != 0 {
+        bail!("enroll starts the service and hands the token to the service user; run it as root");
+    }
+    let token = match (&token_file, token_stdin) {
+        (Some(path), false) => read_owner_only(path)?,
+        (None, true) => {
+            use std::io::Read as _;
+            let mut text = String::new();
+            std::io::stdin()
+                .take(bootstrap::MAX_TOKEN_TEXT)
+                .read_to_string(&mut text)
+                .context("cannot read the token from standard input")?;
+            text
+        }
+        _ => bail!("give the token with --token-file <owner-only file> or --token-stdin"),
+    };
+    let fail = |failure: &Failure| {
+        println!("enrollment failed: {}", failure.code());
+        println!("{}", failure.detail());
+        if let Failure::PreflightFailed { failed, output } = failure {
+            print!("{output}");
+            println!("failed_preflights: {}", failed.join(", "));
+            println!(
+                "The host is enrolled and its service runs; enrollment does not enable dispatch. Fix the \
+                 host as the service user, then run the installed package binary with `preflight` again."
+            );
+        }
+        ExitCode::from(failure.exit_code())
+    };
+    let record = match bootstrap::load_record(config) {
+        Ok(record) => record,
+        Err(failure) => return Ok(fail(&failure)),
+    };
+    let platform = Platform::parse(&record.platform)?;
+    let staged_host = Staged::default();
+    let system = System { platform };
+    let host: &dyn Host = if root.is_some() { &staged_host } else { &system };
+    let fallback = std::env::current_exe()?;
+    let options = bootstrap::Options::builder()
+        .config(config)
+        .maybe_root(root)
+        .token(&token)
+        .replace_identity(replace_identity)
+        .repos(repos)
+        .fallback_installer(&fallback)
+        .build();
+    let result = bootstrap::bootstrap(host, &options);
+    // A spent token is no use to anyone; do not leave it lying around. After a
+    // failure that left it unspent the person needs it to try again.
+    let spent = result.as_ref().map_or_else(Failure::token_spent, |_| true);
+    if spent && let Some(path) = &token_file {
+        let _ = fs::remove_file(path);
+    }
+    match result {
+        Ok(report) => {
+            print!("{}", report.preflight_output);
+            println!(
+                "enrolled host {} (certificate serial {})",
+                report.host_id, report.serial
+            );
+            println!("service started; as-user preflight passed");
+            println!(
+                "Enrollment establishes identity and management connectivity only; hub registration and dispatch are not enabled. Inspect credentials on the hub \
+                 with `bossctl enrollment list`."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(failure) => Ok(fail(&failure)),
+    }
+}
+
+fn inline_preflight(
+    state_dir: PathBuf,
+    storage_only: bool,
+    hub_url: Option<String>,
+    repos: Vec<String>,
+) -> Result<ExitCode> {
+    let config = boss_spoke_preflight::Config::builder()
+        .state_dir(state_dir)
+        .maybe_homes_root(std::env::var_os(boss_spoke_preflight::HOMES_ENV).map(PathBuf::from))
+        .maybe_hub(hub_url.as_deref().and_then(boss_spoke_preflight::hub_authority))
+        .repos(repos)
+        .build();
+    let outcomes = if storage_only {
+        boss_spoke_preflight::run_storage(&config)
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(boss_spoke_preflight::run(&config))
+    };
+    for outcome in &outcomes {
+        match &outcome.result {
+            Ok(detail) => println!("PASS {}: {detail}", outcome.name),
+            Err(reason) => println!("FAIL {}: {reason}", outcome.name),
+        }
+    }
+    let failed = boss_spoke_preflight::failed(&outcomes);
+    if failed.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("failed_preflights: {}", failed.join(", "));
+    Ok(ExitCode::FAILURE)
+}

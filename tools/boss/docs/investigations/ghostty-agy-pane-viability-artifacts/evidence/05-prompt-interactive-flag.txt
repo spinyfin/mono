@@ -1,0 +1,114 @@
+`agy -i "<prompt>"` in a pty
+============================
+
+agy 1.1.12, tmux session + GhosttyKit viewer
+  command: export HOME=<run:iflag-tmux-1.1.12>/home; export AGY_CLI_DISABLE_AUTO_UPDATE=true; exec <spike>/bin-1.1.12/agy --log-file <run:iflag-tmux-1.1.12>/cli.log --model gemini-3.8-flash-low -i Reply\ with\ exactly\ the\ single\ token\ IFLAG_OK_TMUX.\ Do\ not\ use\ tools.
+    04:14:03.961  script  new-session (direct)
+    04:14:04.410  script  viewer attached
+    04:14:04.705  agy log terminal_info_manager.go: Terminal detection: TERM="tmux-256color" altScreen=true ssh=false osc8=false
+    04:14:05.671  hook    SessionStart
+    04:14:05.791  hook    PreInvocation invocationNum=0
+    04:14:09.202  hook    PostInvocation invocationNum=0
+    04:14:09.370  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:14:09.681  script  hook Stop count>=1
+    04:14:10.850  script  submit: Reply with exactly the single token IFLAG_FOLLOWUP_OK. Do not use tools.
+    04:14:11.239  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token IFLAG_FOLL…
+    04:14:11.335  hook    PreInvocation invocationNum=0
+    04:14:13.009  hook    PostInvocation invocationNum=0
+    04:14:13.233  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:14:13.530  script  hook Stop count>=2
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+
+  pane after the -i turn:
+    | > Reply with exactly the single token IFLAG_OK_TMUX. Do not use tools.
+    |   IFLAG_OK_TMUX
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+agy 1.1.12, GhosttyKit surface's own pty, no tmux
+  command: cd <run:iflag-direct-1.1.12>/ws/repo && export HOME=<run:iflag-direct-1.1.12>/home AGY_CLI_DISABLE_AUTO_UPDATE=true && exec <spike>/bin-1.1.12/agy --log-file <run:iflag-direct-1.1.12>/cli.log --model gemini-3.8-flash-low -i Reply\ with\ exactly\ the\ single\ token\ IFLAG_OK_DIRECT.\ Do\ not\ use\ tools.
+    04:14:19.390  script  surface created (direct pty)
+    04:14:23.901  agy log terminal_info_manager.go: Terminal detection: TERM="xterm-256color" altScreen=true ssh=false osc8=true
+    04:14:25.199  hook    SessionStart
+    04:14:25.305  hook    PreInvocation invocationNum=0
+    04:14:28.238  hook    PostInvocation invocationNum=0
+    04:14:28.338  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:14:28.401  script  hook Stop count>=1
+    04:14:29.470  script  submit via surface: IFLAG_FOLLOWUP_OK
+    04:14:29.611  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token IFLAG_FOLL…
+    04:14:29.719  hook    PreInvocation invocationNum=0
+    04:14:31.412  hook    PostInvocation invocationNum=0
+    04:14:31.505  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:14:31.590  script  hook Stop count>=2
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+
+  GhosttyKit viewport after the -i turn:
+    | > Reply with exactly the single token IFLAG_OK_DIRECT. Do not use tools.
+    |   IFLAG_OK_DIRECT
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+  GhosttyKit viewport after /quit:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | Resume with -c (or command below):
+    | agy --conversation=40343eb3-d112-4f6c-86ea-4359d5e94ca0
+    | Process exited. Press any key to close the terminal.
+
+agy 1.5.5, tmux session + GhosttyKit viewer
+  command: export HOME=<run:iflag-tmux-1.5.5>/home; export AGY_CLI_DISABLE_AUTO_UPDATE=true; exec <spike>/bin-1.5.5/agy --log-file <run:iflag-tmux-1.5.5>/cli.log --model gemini-3.8-flash-low -i Reply\ with\ exactly\ the\ single\ token\ IFLAG_OK_TMUX.\ Do\ not\ use\ tools.
+    03:59:31.350  script  new-session (direct)
+    03:59:33.534  script  viewer attached
+    03:59:34.370  agy log terminal_info_manager.go: Terminal detection: TERM="tmux-256color" altScreen=true ssh=false osc8=false osc52=true appleTerminalSSH=false
+    03:59:37.427  hook    SessionStart
+    03:59:37.628  hook    PreInvocation invocationNum=0
+    03:59:39.852  hook    PostInvocation invocationNum=0
+    03:59:40.260  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    03:59:40.780  script  hook Stop count>=1
+    03:59:42.532  script  submit: Reply with exactly the single token IFLAG_FOLLOWUP_OK. Do not use tools.
+    03:59:43.138  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token IFLAG_FOLL…
+    03:59:43.439  hook    PreInvocation invocationNum=0
+    03:59:45.542  hook    PostInvocation invocationNum=0
+    03:59:45.906  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    03:59:46.134  script  hook Stop count>=2
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+
+  pane after the -i turn:
+    | > Reply with exactly the single token IFLAG_OK_TMUX. Do not use tools.
+    |   IFLAG_OK_TMUX
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+
+agy 1.5.5, GhosttyKit surface's own pty, no tmux
+  command: cd <run:iflag-direct-1.5.5>/ws/repo && export HOME=<run:iflag-direct-1.5.5>/home AGY_CLI_DISABLE_AUTO_UPDATE=true && exec <spike>/bin-1.5.5/agy --log-file <run:iflag-direct-1.5.5>/cli.log --model gemini-3.8-flash-low -i Reply\ with\ exactly\ the\ single\ token\ IFLAG_OK_DIRECT.\ Do\ not\ use\ tools.
+    04:00:00.884  script  surface created (direct pty)
+    04:00:03.752  agy log terminal_info_manager.go: Terminal detection: TERM="xterm-256color" altScreen=true ssh=false osc8=true osc52=true appleTerminalSSH=false
+    04:00:05.682  hook    SessionStart
+    04:00:05.866  hook    PreInvocation invocationNum=0
+    04:00:07.306  hook    PostInvocation invocationNum=0
+    04:00:07.383  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:00:07.503  script  hook Stop count>=1
+    04:00:08.572  script  submit via surface: IFLAG_FOLLOWUP_OK
+    04:00:08.668  agy log input_loop.go: HandleUserInput called with text: "Reply with exactly the single token IFLAG_FOLL…
+    04:00:08.733  hook    PreInvocation invocationNum=0
+    04:00:10.029  hook    PostInvocation invocationNum=0
+    04:00:10.123  hook    Stop terminationReason=NO_TOOL_CALL fullyIdle=True
+    04:00:10.179  script  hook Stop count>=2
+  hooks: SessionStart PreInvocation PostInvocation Stop PreInvocation PostInvocation Stop
+
+  GhosttyKit viewport after the -i turn:
+    | > Reply with exactly the single token IFLAG_OK_DIRECT. Do not use tools.
+    |   IFLAG_OK_DIRECT
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | >
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | ? for shortcuts                                                                                       Gemini 3.8 Flash · low
+  GhosttyKit viewport after /quit:
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    | Resume with -c (or command below):
+    | agy --conversation=d01192ac-4865-4841-8fb9-2a9f96dc9f2e
+    | Process exited. Press any key to close the terminal.

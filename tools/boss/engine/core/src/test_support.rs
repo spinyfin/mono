@@ -6,548 +6,67 @@
 //! here means a new field on [`CreateProductInput`] touches one site
 //! instead of ~250, and keeps the setup readable at each call site.
 
+pub use crate::lifecycle_adapter::CoreCoordinatorConstructors;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tempfile::TempDir;
 
-use tokio::sync::Mutex;
-
-use crate::coordinator::{
-    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    ExecutionCoordinator, ExecutionPublisher, WorkerPool,
+use crate::coordinator::ExecutionCoordinator;
+use crate::work::WorkDb;
+use boss_execution_contracts::WorkerPool;
+use boss_execution_contracts::{ExecutionRunner, RunOutcome, RunWaitState};
+use boss_host_execution::types::{
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
-use crate::review_guide_capture::SourcePacketCollector;
-use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
-use crate::work::{
-    CreateChoreInput, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, PublishReviewGuideOutcome, WorkDb,
-    WorkItemPatch,
-};
-use boss_pr_review_sources::SourcePacket;
-use boss_protocol::{
-    Automation, AutomationTrigger, CommentAnchor, CreateAutomationInput, CreateCommentInput, CreateExecutionInput,
-    CreateProductInput, ExecutionKind, ExecutionStatus, FinishExecutionRunInput, FrontendEvent, Product,
-    RequestExecutionInput, Task, WorkComment, WorkExecution,
+use boss_protocol::WorkExecution;
+
+pub use crate::work::test_support::{
+    TEST_REPO_REMOTE_URL, create_active_chore, create_execution_started_now, create_execution_started_secs_ago,
+    create_old_execution, create_product, create_ready_chore_execution, create_spawned_execution, create_test_chore,
+    create_test_chore_manual, create_test_product, create_test_product_named, create_test_product_with_repo,
+    finish_run_worker_pane_alive, insert_host_capability, log_capture, review_guide_source_packet,
+    seed_daily_automation, seed_published_guide, seed_review_guide_series, seed_review_guide_series_for_pr,
+    start_tmux_run,
 };
 
-/// Direct-DB fixtures must model the bookmark that dispatch creates before spawn.
-/// Retain the returned directory for the duration of the test.
-pub async fn seed_empty_execution_bookmark(db: &WorkDb, execution_id: &str) -> TempDir {
-    let root = tempfile::tempdir().unwrap();
-    let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
-    let record = boss_engine_recovery::execution_bookmark::create(
-        &boss_engine_recovery::execution_bookmark::LocalJj,
-        &repo.worker,
-        execution_id,
-        "local",
-    )
-    .await
-    .unwrap();
-    db.record_execution_bookmark(&record).unwrap();
-    root
-}
-
-/// The mono repo remote used by the overwhelming majority of tests.
-pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
-
-/// Open a fresh file-backed [`WorkDb`] under a throwaway [`TempDir`].
+/// Open a fresh file-backed [`WorkDb`] under a throwaway [`TempDir`], stamped
+/// with the engine's build identity.
 ///
 /// The returned `TempDir` must be kept alive for the lifetime of the
-/// `WorkDb` — dropping it deletes the backing `state.db`. The sweep and
-/// scheduler test modules all open a DB this exact way, so this replaces
-/// the byte-identical local `open_db()` each used to hand-roll.
+/// `WorkDb` — dropping it deletes the backing `state.db`. Storage-only tests
+/// use the unstamped `crate::work::test_support::open_db`.
 pub fn open_db() -> (TempDir, WorkDb) {
-    let dir = TempDir::new().unwrap();
-    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-    (dir, db)
+    let (dir, db) = crate::work::test_support::open_db();
+    (dir, db.with_engine_build_identity(crate::build_info::build_identity()))
 }
 
 /// Like [`open_db`], but returns the [`WorkDb`] wrapped in an [`Arc`] for
 /// the modules that share the DB across coordinator/sweep tasks.
-///
-/// The remote-reattach, remote-lease-reconcile, and cube-lease-heartbeat
-/// test modules all hand-rolled this exact `Arc`-returning `open_db()`, so
-/// this replaces the byte-identical local copy each used. Implemented on top
-/// of [`open_db`] so the two stay in sync.
 pub fn open_db_arc() -> (TempDir, Arc<WorkDb>) {
     let (dir, db) = open_db();
     (dir, Arc::new(db))
 }
 
-/// Create the standard test product: name `Boss`, the mono repo
-/// remote, all other fields defaulted to `None`.
-pub fn create_test_product(db: &WorkDb) -> Product {
-    create_test_product_named(db, "Boss")
-}
+pub use boss_engine_completion::test_support::{
+    confirm_remote_test_recovery, counting_source_collector, declare_no_changes_needed, preserve_test_workspace,
+    record_remote_test_recovery, seed_empty_execution_bookmark, seed_published_guide_comment, source_capture_packet,
+    spawn_group_leader_sleeper, wait_for_source_capture,
+};
+pub use boss_execution_contracts::test_doubles::{NoopCube, RecordingPublisher};
 
-/// Like [`create_test_product`], but with a caller-chosen product name.
-/// The repo remote is still the standard mono URL.
-pub fn create_test_product_named(db: &WorkDb, name: &str) -> Product {
-    create_test_product_with_repo(db, name, Some(TEST_REPO_REMOTE_URL))
-}
-
-/// Like [`create_test_product`], but with a caller-chosen name and repo
-/// remote (`None` for a repo-less product). All other fields default to
-/// `None`.
-pub fn create_test_product_with_repo(db: &WorkDb, name: &str, repo_remote_url: Option<&str>) -> Product {
-    // Hermetic coordinator fixtures exercise dispatch without installed agent
-    // CLIs. Seed discovery explicitly in their common fixture, never in the
-    // production scheduling path.
-    insert_host_capability(db, "local", "driver=claude", "auto");
-    db.create_product(
-        CreateProductInput::builder()
-            .name(name)
-            .maybe_repo_remote_url(repo_remote_url.map(str::to_owned))
-            .build(),
-    )
-    .unwrap()
-}
-
-/// Create the standard sweep-test product — name `test-product`, repo
-/// remote `https://github.com/test/repo` — and return its id.
-///
-/// The sweep and scheduler test modules all create this exact product
-/// and keep only the id, so this replaces the byte-identical local
-/// `create_product()` each used to hand-roll.
-pub fn create_product(db: &WorkDb) -> String {
-    create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-}
-
-/// Create a chore named `name` under `product_id`, mark it `active`, and
-/// return its id. This is the general form of the per-module
-/// `create_active_chore` helpers; call sites that hardcoded the name
-/// pass `"test chore"`.
-pub fn create_active_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
-    let chore = db
-        .create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
-        .unwrap();
-    db.update_work_item(
-        &chore.id,
-        WorkItemPatch {
-            status: Some("active".to_owned()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    chore.id
-}
-
-/// Canonical `SourcePacket` used by review-guide job and projection tests.
-/// Shared so a schema bump or new required field cannot drift between
-/// those modules.
-pub(crate) fn review_guide_source_packet(base: &str, head: &str) -> SourcePacket {
-    SourcePacket {
-        schema_version: 2,
-        canonical_pr_url: "https://github.com/acme/widget/pull/9".to_owned(),
-        pr_number: 9,
-        title: "Fix retry".to_owned(),
-        body: None,
-        base_repository: "acme/widget".to_owned(),
-        head_repository: "acme/widget".to_owned(),
-        observed_base_sha: base.to_owned(),
-        probe_base_sha: None,
-        merge_base_sha: base.to_owned(),
-        head_sha: head.to_owned(),
-        files: Vec::new(),
-        omissions: Vec::new(),
-    }
-}
-
-/// Persist the first source capture for `root` on `pr_url` (its trailing
-/// `/pull/<n>` number is mirrored into `pr_number`) and return
-/// `(series_id, comparison_id)`.
-pub(crate) fn seed_review_guide_series_for_pr(
-    db: &WorkDb,
-    root: &str,
-    pr_url: &str,
-    base: &str,
-    head: &str,
-) -> (String, String) {
-    let mut packet = review_guide_source_packet(base, head);
-    packet.canonical_pr_url = pr_url.to_owned();
-    packet.pr_number = pr_url
-        .rsplit('/')
-        .next()
-        .and_then(|n| n.parse().ok())
-        .expect("pr_url must end in /<number>");
-    let stored = db
-        .persist_pr_review_guide_source_capture(root, 1, PrSourceCaptureTrigger::Creation, &packet)
-        .unwrap();
-    let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
-        panic!("capture must persist")
-    };
-    (capture.series_id, capture.comparison_id)
-}
-
-/// Persist the first source capture for `root` (on `pull/9`) and return
-/// `(series_id, comparison_id)`.
-pub(crate) fn seed_review_guide_series(db: &WorkDb, root: &str) -> (String, String) {
-    seed_review_guide_series_for_pr(db, root, "https://github.com/acme/widget/pull/9", "base", "head")
-}
-
-/// Create an `in_review` chore on `pull/<pr_number>` with a published
-/// review guide (`"# Guide\n\nOriginal quote"`). Returns `(root, series)`.
-pub(crate) fn seed_published_guide(db: &WorkDb, pr_number: u32) -> (String, String) {
-    let root = create_active_chore(db, &create_product(db), "impl");
-    let pr_url = format!("https://github.com/acme/widget/pull/{pr_number}");
-    db.update_work_item(
-        &root,
-        WorkItemPatch {
-            status: Some("in_review".to_owned()),
-            pr_url: Some(pr_url.clone()),
-            ..WorkItemPatch::default()
-        },
-    )
-    .unwrap();
-    let (series, comparison) = seed_review_guide_series_for_pr(db, &root, &pr_url, "base", "head");
-    let attempt = db
-        .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
-        .unwrap();
-    let PublishReviewGuideOutcome::Published(_) = db
-        .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
-        .unwrap()
-    else {
-        panic!("expected published guide")
-    };
-    (root, series)
-}
-
-/// Add a comment anchored on `"Original quote"` to the published guide of
-/// `series` (see [`seed_published_guide`]).
-pub(crate) fn add_guide_comment(db: &WorkDb, series: &str, body: &str) -> WorkComment {
-    let root = db
-        .root_task_id_for_review_guide_series(series)
-        .unwrap()
-        .expect("series root");
-    let version_id = db
-        .get_pr_review_guide_summary_for_root(&root)
-        .unwrap()
-        .expect("summary")
-        .readable_version_id
-        .expect("readable version");
-    db.create_comment_with_guide_version(
-        CreateCommentInput::builder()
-            .artifact_kind("pr_review_guide")
-            .artifact_id(series)
-            .anchor(CommentAnchor {
-                exact: "Original quote".into(),
-                ..Default::default()
-            })
-            .body(body)
-            .author("user:test")
-            .doc_version("hash")
-            .plain_text_projection_version(1)
-            .build(),
-        Some(&version_id),
-    )
-    .unwrap()
-}
-
-/// [`seed_published_guide`] plus one anchored comment. Returns
-/// `(root, series, comment)`.
-pub(crate) fn seed_published_guide_comment(db: &WorkDb, pr_number: u32, body: &str) -> (String, String, WorkComment) {
-    let (root, series) = seed_published_guide(db, pr_number);
-    let comment = add_guide_comment(db, &series, body);
-    (root, series, comment)
-}
-
-/// Create a plain chore named `name` under `product_id` and return it.
-///
-/// Unlike [`create_active_chore`], the chore keeps its default status —
-/// this is the bare
-/// `create_chore(CreateChoreInput::builder().product_id(..).name(..).build())`
-/// that the coordinator, completion, runner, and `work` test modules
-/// hand-roll dozens of times. Centralising it means a new field on
-/// [`CreateChoreInput`] touches one site instead of ~50. Args take
-/// `impl Into<String>` so existing call sites lift their expressions
-/// (`product.id.clone()`, `"Cleanup"`, `format!(...)`) verbatim.
-pub fn create_test_chore(db: &WorkDb, product_id: impl Into<String>, name: impl Into<String>) -> Task {
-    insert_host_capability(db, "local", "driver=claude", "auto");
-    db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
-        .unwrap()
-}
-
-/// Like [`create_test_chore`], but creates the chore with `autostart`
-/// disabled (`.autostart(false)`).
-///
-/// This is the manual-start counterpart the completion, runner,
-/// coordinator, merge-poller, `work`, and app test modules hand-roll
-/// dozens of times as
-/// `create_chore(CreateChoreInput::builder().product_id(..).name(..).autostart(false).build())`.
-/// Centralising it means a new field on [`CreateChoreInput`] touches one
-/// site instead of ~120. As with [`create_test_chore`], args take
-/// `impl Into<String>` so existing call sites lift their expressions
-/// (`product.id.clone()`, `"Parent chore"`, `format!(...)`) verbatim.
-pub fn create_test_chore_manual(db: &WorkDb, product_id: impl Into<String>, name: impl Into<String>) -> Task {
-    insert_host_capability(db, "local", "driver=claude", "auto");
-    db.create_chore(
-        CreateChoreInput::builder()
-            .product_id(product_id)
-            .name(name)
-            .autostart(false)
-            .build(),
-    )
-    .unwrap()
-}
-
-/// Create a `ready` [`ExecutionKind::ChoreImplementation`] execution for
-/// `work_item_id` and return it.
-///
-/// Replaces the byte-identical
-/// `create_execution(CreateExecutionInput::builder().work_item_id(..)
-/// .kind(ChoreImplementation).status(Ready).build())` that the
-/// completion, runner, and coordinator test modules hand-roll ~33
-/// times, so a new field on [`CreateExecutionInput`] touches one site.
-pub fn create_ready_chore_execution(db: &WorkDb, work_item_id: impl Into<String>) -> WorkExecution {
-    db.create_execution(
-        CreateExecutionInput::builder()
-            .work_item_id(work_item_id)
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build(),
-    )
-    .unwrap()
-}
-
-/// Seed a product/chore/execution, start its first run, and durably record a
-/// completed tmux spawn (intent `"tok-1"` confirmed with pane pid `4242` on
-/// session `"boss-worker-1"`). Returns `(execution_id, spawn_token)`.
-///
-/// Shared by [`crate::tmux_adoption::persist`]'s and
-/// [`crate::work::tests::tmux_pane_observation_tests`]'s pane-observation
-/// tests, which both need the same "started tmux run" seeding contract —
-/// keeping one copy means a change to `start_execution_run`'s arity or to
-/// the token value only has to land once.
-pub fn start_tmux_run(db: &WorkDb) -> (String, String) {
-    let product = create_test_product(db);
-    let chore = create_test_chore(db, product.id.clone(), "Cleanup");
-    let execution = create_ready_chore_execution(db, chore.id.clone());
-    db.start_execution_run(
-        &execution.id,
-        "worker-1",
-        "mono",
-        "lease-1",
-        "mono-agent-001",
-        "/tmp/mono-agent-001",
-    )
-    .unwrap();
-    assert!(
-        db.record_tmux_spawn_intent_for_execution(&execution.id, "boss", "boss-worker-1", "tok-1")
-            .unwrap()
-    );
-    assert!(
-        db.record_tmux_session_created_for_execution(&execution.id, "tok-1", 4242)
-            .unwrap()
-    );
-    (execution.id, "tok-1".to_owned())
-}
-
-/// Request an execution for `work_item_id`, then stamp its `started_at`
-/// to `secs_ago` seconds in the past. Returns the execution id.
-///
-/// The sweep test modules use this to age an execution past a
-/// grace-period guard so the sweep under test considers it. `secs_ago`
-/// is saturated against the epoch, so an implausibly large value simply
-/// clamps to `0` rather than underflowing.
-pub fn create_execution_started_secs_ago(db: &WorkDb, work_item_id: &str, secs_ago: u64) -> String {
-    let execution = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
-        .unwrap();
-    let started_at = boss_engine_utils::epoch_time::now_epoch_secs()
-        .saturating_sub(secs_ago as i64)
-        .max(0);
-    db.force_started_at_for_test(&execution.id, started_at).unwrap();
-    execution.id
-}
-
-/// Request an execution for `work_item_id` and stamp its `started_at` to
-/// now. Returns the execution id.
-///
-/// The counterpart to [`create_execution_started_secs_ago`] for the sweep
-/// tests that assert a grace-period guard *skips* a freshly-started
-/// execution: the `started_at` must be inside the grace window.
-pub fn create_execution_started_now(db: &WorkDb, work_item_id: &str) -> String {
-    create_execution_started_secs_ago(db, work_item_id, 0)
-}
-
-/// Create a `ready` execution for `work_item_id` and stamp its
-/// `started_at` to 5 minutes ago so a grace-period guard passes.
-///
-/// Thin wrapper over [`create_execution_started_secs_ago`] with the
-/// 300-second offset the sweep tests share.
-pub fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
-    create_execution_started_secs_ago(db, work_item_id, 300)
-}
-
-/// Build the full **post-spawn** shape a healthy pane-hosted worker leaves in
-/// the DB: an execution aged past the sweep grace windows, a started
-/// `work_runs` row on the local host, `shell_pid` recorded on that row, and
-/// the execution parked in `waiting_human` with its run `completed` — exactly
-/// the sequence `PaneSpawnRunner` drives (`start_execution_run` →
-/// persisting tmux shell identity → `finish_execution_run`).
-///
-/// Returns the execution id.
-///
-/// [`create_old_execution`] deliberately stops short of this: it creates a
-/// `ready` execution with NO run row, which is the pre-dispatch shape. Any
-/// test about a worker *process* needs the run row, because
-/// `work_runs.shell_pid` is where the durable pid lives — see
-/// [`crate::durable_liveness`].
-pub fn create_spawned_execution(db: &WorkDb, work_item_id: &str, shell_pid: i64) -> String {
-    let execution_id = create_old_execution(db, work_item_id);
-    let (_exec, run) = db
-        .start_execution_run(&execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
-        .unwrap();
-    assert!(
-        db.set_run_shell_pid_for_execution(&execution_id, shell_pid).unwrap(),
-        "the run row must exist before a shell pid can be recorded against it",
-    );
-    finish_run_worker_pane_alive(db, &execution_id, &run.id, Some("Spawned worker pane in slot 1."));
-    execution_id
-}
-
-/// Spawn a long-lived `sleep` in its OWN process group and return the
-/// child handle. A reap signals the process *group*, so a test exercising
-/// a REAL kill (durable-state teardown, `release_worker_pane`,
-/// `retire_pane`'s durable-evidence auto-teardown) must target a process
-/// in its own group — never `std::process::id()` — or the signal lands on
-/// the test runner's own group and kills the test process itself.
-pub fn spawn_group_leader_sleeper() -> std::process::Child {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    unsafe {
-        Command::new("sleep")
-            .arg("300")
-            .pre_exec(|| {
-                // setpgid(0, 0): become our own process group leader.
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            })
-            .spawn()
-            .expect("spawn sleep child")
-    }
-}
-
-/// Finish an execution's active run the way `PaneSpawnRunner` does: record
-/// the run as `completed` while the execution stays `running` — its pane is
-/// up and its agent is working — with its workspace lease still held. This
-/// is the post-spawn state the coordinator observes, and the `completion`
-/// test module hand-rolled the same `finish_execution_run(...)` builder
-/// block at a dozen-odd sites.
-///
-/// Named for `RunWaitState::WorkerPaneAlive`. Parks the execution in
-/// `running`, the status `PaneSpawnRunner` leaves behind once the pane is up.
-///
-/// Pass the per-site `result_summary` (or `None` where the test omits it).
-pub fn finish_run_worker_pane_alive(db: &WorkDb, execution_id: &str, run_id: &str, result_summary: Option<&str>) {
-    db.finish_execution_run(
-        FinishExecutionRunInput::builder()
-            .execution_id(execution_id)
-            .run_id(run_id)
-            .execution_status(ExecutionStatus::Running)
-            .run_status("completed")
-            .maybe_result_summary(result_summary)
-            .build(),
-    )
-    .unwrap();
-}
-
-/// Seed the standard "daily automation" fixture under `product_id`:
-/// name `daily`, a `0 14 * * *` UTC [`AutomationTrigger::Schedule`],
-/// standing instruction `"do the thing"`, every other field defaulted.
-///
-/// Returns the whole [`Automation`] record; call sites that only need
-/// the id take `.id`. The automation-scheduler and sweep test modules
-/// (`automation_scheduler`, `cube_lease_heartbeat`, `dead_pane_sweep`,
-/// `execution_liveness`, `lost_workspace_sweep`) all hand-rolled this
-/// exact block, so centralising it means a new field on
-/// [`CreateAutomationInput`] touches one site instead of all of them.
-pub fn seed_daily_automation(db: &WorkDb, product_id: &str) -> Automation {
-    db.create_automation(
-        CreateAutomationInput::builder()
-            .product_id(product_id.to_owned())
-            .name("daily")
-            .trigger(AutomationTrigger::Schedule {
-                cron: "0 14 * * *".to_owned(),
-                timezone: "UTC".to_owned(),
-            })
-            .standing_instruction("do the thing")
-            .build(),
-    )
-    .unwrap()
-}
-
-/// Plant a `host_capabilities` row directly with an explicit `source`.
-///
-/// `auto`-sourced rows are discovered by the engine's own heartbeat and
-/// have no public insert path, so a test that needs one — to contrast
-/// against a user tag, or to check the refresh replaces it — has to seed
-/// it. Shared by the `host_registry` and `app::tests` modules, which
-/// otherwise hand-roll the same statement.
-pub fn insert_host_capability(db: &WorkDb, host_id: &str, capability: &str, source: &str) {
-    let conn = db.connect().unwrap();
-    conn.execute(
-        "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![host_id, capability, source],
-    )
-    .unwrap();
-}
-
-/// A [`CubeClient`] test double that never touches cube. Every method
-/// panics with `unimplemented!()` except `list_workspaces`/`list_repos`,
-/// which return an empty vector.
-///
-/// The sweep test modules (`dead_pid_sweep`, `orphan_sweep`,
-/// `pool_claim_sweep`, `stale_worker_sweep`) drive coordinators whose
-/// cube interactions are never exercised, so this single stub replaces
-/// the byte-identical copy each used to hand-roll.
-pub struct NoopCube;
-
-#[async_trait]
-impl CubeClient for NoopCube {
-    async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-        unimplemented!()
-    }
-    async fn lease_workspace(
-        &self,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: bool,
-        _: &[&str],
-    ) -> Result<CubeWorkspaceLease> {
-        unimplemented!()
-    }
-    async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
-        unimplemented!()
-    }
-    async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
-        unimplemented!()
-    }
-    async fn release_workspace(&self, _: &str) -> Result<()> {
-        unimplemented!()
-    }
-    async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
-        unimplemented!()
-    }
-    async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
-        unimplemented!()
-    }
-    async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
-        unimplemented!()
-    }
-    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-        Ok(vec![])
-    }
-    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-        Ok(vec![])
+/// Leave `execution_id` as teardown leaves a finished run once it has
+/// preserved the run's work: its cube workspace lease returned and the lease
+/// columns cleared. Dispatch holds a successor while its recovery predecessor
+/// still records a lease, so a fixture that models a finished predecessor
+/// must not leave one behind. A no-op for a row that holds no lease.
+pub fn release_finished_execution_lease(db: &WorkDb, execution_id: &str) {
+    let execution = db.get_execution(execution_id).unwrap();
+    if let Some(lease_id) = execution.cube_lease_id.clone() {
+        assert!(db.claim_execution_workspace_release(execution_id, &lease_id).unwrap());
+        db.finish_execution_workspace_release(&execution).unwrap();
     }
 }
 
@@ -613,6 +132,12 @@ crate::stub_cube_client! { AlwaysSucceedsCube {
     async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
         Ok(CubeChangeHandle { change_id: "test-change-1".to_owned() })
     }
+    async fn goto_workspace(&self, _workspace_path: &Path, _pr: u64) -> Result<()> {
+        Ok(())
+    }
+    async fn goto_workspace_revision(&self, _workspace_path: &Path, _sha: &str) -> Result<()> {
+        Ok(())
+    }
     async fn release_workspace(&self, _lease_id: &str) -> Result<()> {
         Ok(())
     }
@@ -667,411 +192,6 @@ impl ExecutionRunner for AlwaysSucceedsRunner {
     }
 }
 
-/// Implement [`CubeClient`](crate::coordinator::CubeClient) for a test
-/// double, spelling out only the methods a given test actually drives.
-/// Every trait method left unlisted is filled in with `unimplemented!()`,
-/// which is exactly what a double wants for the paths it never exercises.
-///
-/// Overrides are written as ordinary `async fn`s with their real bodies
-/// and **must appear in the trait's declaration order** (the order the
-/// arms below enumerate: `ensure_repo`, `lease_workspace`, `create_change`,
-/// `goto_workspace`, `goto_workspace_revision`, `rebase_workspace`,
-/// `rebase_workspace_no_push`, `push_resolution`, `release_workspace`,
-/// `workspace_status`, `heartbeat_lease`, `force_release_lease`,
-/// `list_workspaces`, `list_repos`).
-/// `goto_workspace_revision`, `rebase_workspace`, `rebase_workspace_no_push`,
-/// and `push_resolution` all have trait defaults (erroring), so leaving any
-/// unlisted keeps that default rather than an
-/// `unimplemented!()`. The macro emits the `#[async_trait]` impl for you.
-///
-/// ```ignore
-/// stub_cube_client! { RecordingCube {
-///     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
-///         self.releases.lock().await.push(lease_id.to_owned());
-///         Ok(())
-///     }
-/// } }
-/// ```
-#[macro_export]
-macro_rules! stub_cube_client {
-    ($ty:ty { $($body:tt)* }) => {
-        $crate::stub_cube_client!(@munch $ty [] @ensure_repo $($body)*);
-    };
-
-    // ── ensure_repo ─────────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @ensure_repo async fn ensure_repo $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn ensure_repo $a -> $r $b] @lease_workspace $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @ensure_repo $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn ensure_repo(&self, _origin: &str) -> ::anyhow::Result<$crate::coordinator::CubeRepoHandle> { ::core::unimplemented!() }
-        ] @lease_workspace $($rest)*);
-    };
-
-    // ── lease_workspace ─────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @lease_workspace async fn lease_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn lease_workspace $a -> $r $b] @create_change $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @lease_workspace $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn lease_workspace(&self, _repo_id: &str, _task: &str, _prefer: ::core::option::Option<&str>, _allow_dirty: bool, _exclude: &[&str]) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceLease> { ::core::unimplemented!() }
-        ] @create_change $($rest)*);
-    };
-
-    // ── create_change ───────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @create_change async fn create_change $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn create_change $a -> $r $b] @goto_workspace $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @create_change $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn create_change(&self, _workspace_path: &::std::path::Path, _title: &str) -> ::anyhow::Result<$crate::coordinator::CubeChangeHandle> { ::core::unimplemented!() }
-        ] @goto_workspace $($rest)*);
-    };
-
-    // ── goto_workspace ──────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @goto_workspace async fn goto_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @goto_workspace_revision $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @goto_workspace $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn goto_workspace(&self, _workspace_path: &::std::path::Path, _pr: u64) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @goto_workspace_revision $($rest)*);
-    };
-
-    // ── goto_workspace_revision ──────────────────────────────────────────────
-    // Has a trait default (erroring) — same "unlisted keeps the default"
-    // convention as rebase_workspace, since most doubles never exercise the
-    // post-merge-review positioning path.
-    (@munch $ty:ty [$($acc:tt)*] @goto_workspace_revision async fn goto_workspace_revision $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace_revision $a -> $r $b] @rebase_workspace $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @goto_workspace_revision $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*] @rebase_workspace $($rest)*);
-    };
-
-    // ── rebase_workspace ────────────────────────────────────────────────────
-    // Has a trait default (erroring), so when a double doesn't override it the
-    // macro emits nothing and the default applies — matching how the many
-    // pre-ladder stubs behave (they never drive rung 1).
-    (@munch $ty:ty [$($acc:tt)*] @rebase_workspace async fn rebase_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn rebase_workspace $a -> $r $b] @rebase_workspace_no_push $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @rebase_workspace $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*] @rebase_workspace_no_push $($rest)*);
-    };
-
-    // ── rebase_workspace_no_push ────────────────────────────────────────────
-    // Also has a trait default (erroring) — same "unlisted keeps the default"
-    // behaviour as `rebase_workspace`, used by the speculative-conflict
-    // prediction sweep.
-    (@munch $ty:ty [$($acc:tt)*] @rebase_workspace_no_push async fn rebase_workspace_no_push $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn rebase_workspace_no_push $a -> $r $b] @push_resolution $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @rebase_workspace_no_push $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*] @push_resolution $($rest)*);
-    };
-
-    // ── push_resolution ─────────────────────────────────────────────────────
-    // Has a trait default (erroring), same convention as rebase_workspace.
-    (@munch $ty:ty [$($acc:tt)*] @push_resolution async fn push_resolution $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn push_resolution $a -> $r $b] @verify_deletion_tripwire $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @push_resolution $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*] @verify_deletion_tripwire $($rest)*);
-    };
-
-    // ── verify_deletion_tripwire ────────────────────────────────────────────
-    // Has a trait default (fails open, empty findings) — same "unlisted keeps
-    // the default" convention as rebase_workspace/push_resolution: a double
-    // that doesn't script this never makes a network call.
-    (@munch $ty:ty [$($acc:tt)*] @verify_deletion_tripwire async fn verify_deletion_tripwire $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn verify_deletion_tripwire $a -> $r $b] @release_workspace $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @verify_deletion_tripwire $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*] @release_workspace $($rest)*);
-    };
-
-    // ── release_workspace ───────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @workspace_status $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @workspace_status $($rest)*);
-    };
-
-    // ── workspace_status ────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @workspace_status async fn workspace_status $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn workspace_status $a -> $r $b] @heartbeat_lease $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @workspace_status $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn workspace_status(&self, _workspace_path: &::std::path::Path) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceStatus> { ::core::unimplemented!() }
-        ] @heartbeat_lease $($rest)*);
-    };
-
-    // ── heartbeat_lease ─────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease async fn heartbeat_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn heartbeat_lease $a -> $r $b] @force_release_lease $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn heartbeat_lease(&self, _lease_id: &str, _ttl_seconds: ::core::option::Option<u64>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @force_release_lease $($rest)*);
-    };
-
-    // ── force_release_lease ─────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @force_release_lease async fn force_release_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn force_release_lease $a -> $r $b] @list_workspaces $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @force_release_lease $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn force_release_lease(&self, _lease_id: &str, _reason: ::core::option::Option<&str>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @list_workspaces $($rest)*);
-    };
-
-    // ── list_workspaces ─────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @list_workspaces async fn list_workspaces $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn list_workspaces $a -> $r $b] @list_repos $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @list_workspaces $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeWorkspaceStatus>> { ::core::unimplemented!() }
-        ] @list_repos $($rest)*);
-    };
-
-    // ── list_repos ──────────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @list_repos async fn list_repos $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn list_repos $a -> $r $b] @done $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @list_repos $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)*
-            async fn list_repos(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeRepoSummary>> { ::core::unimplemented!() }
-        ] @done $($rest)*);
-    };
-
-    (@munch $ty:ty [$($acc:tt)*] @done async fn recovery_pr_base $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn recovery_pr_base $a -> $r $b] @done $($rest)*);
-    };
-
-    // ── emit ────────────────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @done) => {
-        #[::async_trait::async_trait]
-        impl $crate::coordinator::CubeClient for $ty {
-            $($acc)*
-            async fn create_execution_bookmark(&self, workspace: &::std::path::Path, execution_id: &str, _predecessor: Option<&::boss_engine_recovery::execution_bookmark::ExecutionBookmark>, _inherited_base: Option<&str>) -> ::anyhow::Result<::boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
-                Ok(::boss_engine_recovery::execution_bookmark::ExecutionBookmark {
-                    execution_id: execution_id.to_owned(),
-                    repo_path: workspace.to_path_buf(),
-                    host_id: "local".to_owned(),
-                })
-            }
-        }
-    };
-    (@munch $ty:ty [$($acc:tt)*] @done async fn create_execution_bookmark $a:tt -> $r:ty $b:block) => {
-        #[::async_trait::async_trait]
-        impl $crate::coordinator::CubeClient for $ty {
-            $($acc)*
-            async fn create_execution_bookmark $a -> $r $b
-        }
-    };
-}
-
-/// Implement [`HostAdapter`](crate::host_adapter::HostAdapter) for a test
-/// double, spelling out only the methods a given test drives. Every
-/// workspace-lifecycle method and `spawn_worker` left unlisted is filled
-/// in with `unimplemented!()`; `command_repr` defaults to `None`; and the
-/// four trait-defaulted methods (`read_transcript_tail_bytes`,
-/// `reattach_events_forward`, `probe_remote_worker_alive`,
-/// `read_worker_log_tail`) fall through to their trait defaults unless
-/// overridden.
-///
-/// `host_id` has no universal default and **must be listed first**;
-/// remaining overrides follow in the trait's declaration order.
-#[macro_export]
-macro_rules! stub_host_adapter {
-    ($ty:ty { $($body:tt)* }) => {
-        $crate::stub_host_adapter!(@munch $ty [] @host_id $($body)*);
-    };
-
-    // ── host_id (required) ──────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @host_id fn host_id $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* fn host_id $a -> $r $b] @ensure_repo $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @host_id $($rest:tt)*) => {
-        ::core::compile_error!("stub_host_adapter! requires `fn host_id(&self) -> &str` as the first method");
-    };
-
-    // ── ensure_repo ─────────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @ensure_repo async fn ensure_repo $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn ensure_repo $a -> $r $b] @lease_workspace $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @ensure_repo $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn ensure_repo(&self, _origin: &str) -> ::anyhow::Result<$crate::coordinator::CubeRepoHandle> { ::core::unimplemented!() }
-        ] @lease_workspace $($rest)*);
-    };
-
-    // ── lease_workspace ─────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @lease_workspace async fn lease_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn lease_workspace $a -> $r $b] @release_workspace $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @lease_workspace $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn lease_workspace(&self, _repo_id: &str, _task: &str, _prefer: ::core::option::Option<&str>, _allow_dirty: bool, _exclude: &[&str]) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceLease> { ::core::unimplemented!() }
-        ] @release_workspace $($rest)*);
-    };
-
-    // ── release_workspace ───────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @heartbeat_lease $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @heartbeat_lease $($rest)*);
-    };
-
-    // ── heartbeat_lease ─────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease async fn heartbeat_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn heartbeat_lease $a -> $r $b] @force_release_lease $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn heartbeat_lease(&self, _lease_id: &str, _ttl_seconds: ::core::option::Option<u64>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @force_release_lease $($rest)*);
-    };
-
-    // ── force_release_lease ─────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @force_release_lease async fn force_release_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn force_release_lease $a -> $r $b] @create_change $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @force_release_lease $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn force_release_lease(&self, _lease_id: &str, _reason: ::core::option::Option<&str>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @create_change $($rest)*);
-    };
-
-    // ── create_change ───────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @create_change async fn create_change $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn create_change $a -> $r $b] @goto_workspace $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @create_change $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn create_change(&self, _workspace_path: &::std::path::Path, _title: &str) -> ::anyhow::Result<$crate::coordinator::CubeChangeHandle> { ::core::unimplemented!() }
-        ] @goto_workspace $($rest)*);
-    };
-
-    // ── goto_workspace ──────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @goto_workspace async fn goto_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @workspace_status $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @goto_workspace $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn goto_workspace(&self, _workspace_path: &::std::path::Path, _pr: u64) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @workspace_status $($rest)*);
-    };
-
-    // ── workspace_status ────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @workspace_status async fn workspace_status $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn workspace_status $a -> $r $b] @list_workspaces $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @workspace_status $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn workspace_status(&self, _workspace_path: &::std::path::Path) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceStatus> { ::core::unimplemented!() }
-        ] @list_workspaces $($rest)*);
-    };
-
-    // ── list_workspaces ─────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @list_workspaces async fn list_workspaces $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn list_workspaces $a -> $r $b] @list_repos $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @list_workspaces $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeWorkspaceStatus>> { ::core::unimplemented!() }
-        ] @list_repos $($rest)*);
-    };
-
-    // ── list_repos ──────────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @list_repos async fn list_repos $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn list_repos $a -> $r $b] @command_repr $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @list_repos $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn list_repos(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeRepoSummary>> { ::core::unimplemented!() }
-        ] @command_repr $($rest)*);
-    };
-
-    // ── command_repr (defaults to None) ─────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @command_repr fn command_repr $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* fn command_repr $a -> $r $b] @spawn_worker $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @command_repr $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            fn command_repr(&self, _args: &[&str]) -> ::core::option::Option<(::std::string::String, ::std::string::String)> { ::core::option::Option::None }
-        ] @spawn_worker $($rest)*);
-    };
-
-    // ── spawn_worker ────────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @spawn_worker async fn spawn_worker $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn spawn_worker $a -> $r $b] @read_transcript_tail_bytes $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @spawn_worker $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*
-            async fn spawn_worker(&self, _worker_id: &str, _execution: &$crate::work::WorkExecution, _work_item: &$crate::work::WorkItem, _workspace_path: &::std::path::Path, _cube_change_id: ::core::option::Option<&str>) -> ::anyhow::Result<$crate::runner::RunOutcome> { ::core::unimplemented!() }
-        ] @read_transcript_tail_bytes $($rest)*);
-    };
-
-    // ── read_transcript_tail_bytes (trait default unless overridden) ─────────
-    (@munch $ty:ty [$($acc:tt)*] @read_transcript_tail_bytes async fn read_transcript_tail_bytes $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn read_transcript_tail_bytes $a -> $r $b] @reattach_events_forward $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @read_transcript_tail_bytes $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @reattach_events_forward $($rest)*);
-    };
-
-    // ── reattach_events_forward (trait default unless overridden) ────────────
-    (@munch $ty:ty [$($acc:tt)*] @reattach_events_forward async fn reattach_events_forward $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn reattach_events_forward $a -> $r $b] @probe_remote_worker_alive $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @reattach_events_forward $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @probe_remote_worker_alive $($rest)*);
-    };
-
-    // ── probe_remote_worker_alive (trait default unless overridden) ──────────
-    (@munch $ty:ty [$($acc:tt)*] @probe_remote_worker_alive async fn probe_remote_worker_alive $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn probe_remote_worker_alive $a -> $r $b] @read_worker_log_tail $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @probe_remote_worker_alive $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @read_worker_log_tail $($rest)*);
-    };
-
-    // ── read_worker_log_tail (trait default unless overridden) ───────────────
-    (@munch $ty:ty [$($acc:tt)*] @read_worker_log_tail async fn read_worker_log_tail $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn read_worker_log_tail $a -> $r $b] @collect_structured_output $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @read_worker_log_tail $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @collect_structured_output $($rest)*);
-    };
-
-    // ── collect_structured_output (trait default unless overridden) ──────────
-    (@munch $ty:ty [$($acc:tt)*] @collect_structured_output async fn collect_structured_output $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn collect_structured_output $a -> $r $b] @done $($rest)*);
-    };
-    (@munch $ty:ty [$($acc:tt)*] @collect_structured_output $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
-    };
-
-    // ── emit ────────────────────────────────────────────────────────────────
-    (@munch $ty:ty [$($acc:tt)*] @done) => {
-        #[::async_trait::async_trait]
-        impl $crate::host_adapter::HostAdapter for $ty {
-            $($acc)*
-        }
-    };
-}
-
 /// Construct an [`ExecutionCoordinator`] wired to a `pool_size`-worker
 /// [`WorkerPool`] and the [`NoopCube`]/[`NoopRunner`] test doubles.
 ///
@@ -1105,237 +225,43 @@ pub fn make_dispatchable_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<E
     ))
 }
 
-/// Test-only [`ExecutionPublisher`] that records every call it receives.
-///
-/// All three [`ExecutionPublisher`] call kinds are captured behind public
-/// fields, so a single recorder serves every module that needs to assert on
-/// publisher activity:
-///
-/// - `publish_calls` — `(execution_id, work_item_id, status, reason)` 4-tuples
-///   from [`publish`](ExecutionPublisher::publish).
-/// - `events` — `(product_id, work_item_id, reason)` triples from
-///   [`publish_work_item_changed`](ExecutionPublisher::publish_work_item_changed).
-/// - `typed_events` — `(product_id, event)` pairs from
-///   [`publish_frontend_event_on_product`](ExecutionPublisher::publish_frontend_event_on_product).
-///
-/// The `conflict_watch`, `ci_watch`, `completion`, `coordinator`,
-/// `merge_poller`, and `populator` test modules all previously hand-rolled a
-/// near-duplicate recorder over some subset of these fields; this canonical
-/// copy is a superset of every one, so it replaces all of them. Module-specific
-/// query helpers live in the `impl` block below.
-#[derive(Default)]
-pub struct RecordingPublisher {
-    pub publish_calls: Mutex<Vec<(String, String, String, String)>>,
-    pub events: Mutex<Vec<(String, String, String)>>,
-    pub typed_events: Mutex<Vec<(String, FrontendEvent)>>,
+/// Running guide in the crash window before the execution launch stamp.
+pub fn unstamped_codex_guide(db: &WorkDb) -> crate::work::WorkExecution {
+    let root = create_active_chore(db, &create_product(db), "guide restart");
+    let (series, comparison) = seed_review_guide_series(db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+        .unwrap();
+    let execution = db.create_pr_review_guide_execution(&comparison, "acme/widget").unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.record_pr_review_guide_attempt_spawn_config(&attempt.id, "codex", "gpt-6-astra", "high")
+        .unwrap();
+    db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+        .unwrap();
+    db.set_run_shell_pid_for_execution(&execution.id, i64::from(std::process::id()))
+        .unwrap();
+    let execution = db.get_execution(&execution.id).unwrap();
+    assert!(execution.model.is_none());
+    assert!(db.launched_driver_slug(&execution.id).unwrap().is_none());
+    execution
 }
 
-impl RecordingPublisher {
-    /// `publish_work_item_changed` reasons with poll-state housekeeping
-    /// (`pr_poll_state_updated`) filtered out, so lifecycle-focused assertions
-    /// don't have to account for the background sweep's bookkeeping writes.
-    pub async fn lifecycle_reasons(&self) -> Vec<String> {
-        self.events
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, _, reason)| reason != "pr_poll_state_updated")
-            .map(|(_, _, reason)| reason.clone())
-            .collect()
-    }
-
-    /// Count of `CiFailureCleared` frontend events broadcast for `pr_url`.
-    pub async fn ci_failure_cleared_count(&self, pr_url: &str) -> usize {
-        self.typed_events
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, e)| {
-                matches!(
-                    e,
-                    FrontendEvent::CiFailureCleared { pr_url: p, .. } if p == pr_url
-                )
-            })
-            .count()
-    }
-
-    /// Count of `AttentionCreated` frontend events published.
-    pub async fn attentions_created(&self) -> usize {
-        self.typed_events
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, e)| matches!(e, FrontendEvent::AttentionCreated { .. }))
-            .count()
-    }
-
-    /// Count of legacy `AttentionItemCreated` frontend events published.
-    /// `FrontendEvent::AttentionItemCreated` is still a live wire variant
-    /// published from several production sites outside the populator (e.g.
-    /// `completion.rs`, `conflict_ladder.rs`) — this counter stays
-    /// alongside `attentions_created` rather than replacing it.
-    pub async fn attention_items_created(&self) -> usize {
-        self.typed_events
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, e)| matches!(e, FrontendEvent::AttentionItemCreated { .. }))
-            .count()
-    }
-
-    /// `Some(n)` — a `WorkItemsCreated` event was published carrying `n`
-    /// items. `None` if no such event was published.
-    pub async fn work_items_created_len(&self) -> Option<usize> {
-        self.typed_events.lock().await.iter().find_map(|(_, e)| match e {
-            FrontendEvent::WorkItemsCreated { items } => Some(items.len()),
-            _ => None,
-        })
-    }
+pub fn apply_review_verdict(
+    db: &WorkDb,
+    id: &str,
+    checker: &dyn crate::work::PrStateChecker,
+) -> anyhow::Result<Option<String>> {
+    crate::review_verdict_apply_sweep::apply_review_verdict_proposal(db, id, checker, &|input| {
+        checker.merged_parent_deletions(&input.repo_slug, &input.head_before, &input.base_sha, &input.head_after)
+    })
 }
 
-#[async_trait]
-impl ExecutionPublisher for RecordingPublisher {
-    async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str) {
-        self.publish_calls.lock().await.push((
-            execution_id.to_owned(),
-            work_item_id.to_owned(),
-            status.to_owned(),
-            reason.to_owned(),
-        ));
-    }
-    async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
-        self.events
-            .lock()
-            .await
-            .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
-    }
-    async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
-        self.typed_events.lock().await.push((product_id.to_owned(), event));
-    }
-}
-
-/// Shared per-process tracing capture used by tests that need to assert on
-/// log output.
-///
-/// A per-test subscriber is not possible: libtest runs this crate's tests in
-/// parallel threads of one process and `set_global_default` rejects a second
-/// installer. That is also why this lives here rather than in any one test
-/// module — two modules each owning their own `OnceLock` would race, and the
-/// loser would silently capture nothing. Tests that opt in slice the shared
-/// buffer from a starting offset and filter by a string unique to themselves
-/// (an execution id, a run id) to isolate their own events.
-pub(crate) mod log_capture {
-    use std::io;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    pub(crate) struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl SharedBuffer {
-        pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
-            self.0.lock().expect("shared log buffer poisoned")
-        }
-    }
-
-    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for SharedWriter {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .expect("shared log buffer poisoned")
-                .extend_from_slice(data);
-            Ok(data.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct SharedMakeWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> MakeWriter<'a> for SharedMakeWriter {
-        type Writer = SharedWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            SharedWriter(self.0.clone())
-        }
-    }
-
-    pub(crate) fn install() -> SharedBuffer {
-        static BUFFER: OnceLock<SharedBuffer> = OnceLock::new();
-        BUFFER
-            .get_or_init(|| {
-                let buffer = SharedBuffer(Arc::new(Mutex::new(Vec::new())));
-                let subscriber = tracing_subscriber::fmt()
-                    .with_writer(SharedMakeWriter(buffer.0.clone()))
-                    .with_ansi(false)
-                    .with_target(false)
-                    .with_max_level(tracing::Level::TRACE)
-                    .finish();
-                // Tolerate the "already set" race: a stray init elsewhere in
-                // the process shouldn't sink the suite. The capture only
-                // works if our subscriber wins, but if it doesn't, callers'
-                // assertions fail loudly with a clear "no captured lines"
-                // message.
-                let _ = tracing::subscriber::set_global_default(subscriber);
-                buffer
-            })
-            .clone()
-    }
-}
-
-/// Shared source-capture packet fixture. Callers pass the PR URL and the
-/// base/head SHAs so creation, completion, and poller tests assert against
-/// the same packet shape.
-pub fn source_capture_packet(pr_url: &str, base_sha: &str, head_sha: &str) -> SourcePacket {
-    let (owner, repo, pr_number) = boss_github::pr_url::parse_pr_url_parts(pr_url).unwrap_or(("spinyfin", "mono", 25));
-    let repository = format!("{owner}/{repo}");
-    SourcePacket {
-        schema_version: 3,
-        canonical_pr_url: pr_url.to_owned(),
-        pr_number,
-        title: "Captured".to_owned(),
-        body: None,
-        base_repository: repository.clone(),
-        head_repository: repository,
-        observed_base_sha: base_sha.to_owned(),
-        probe_base_sha: None,
-        merge_base_sha: "merge-base".to_owned(),
-        head_sha: head_sha.to_owned(),
-        files: Vec::new(),
-        omissions: Vec::new(),
-    }
-}
-
-/// Collector that returns `packet` and counts how many times it was invoked.
-pub fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> SourcePacketCollector {
-    let fixture_packet = packet.clone();
-    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
-        let packet = packet.clone();
-        let calls = calls.clone();
-        Box::pin(async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(url, packet.canonical_pr_url);
-            Ok(packet)
-        })
-    });
-    SourcePacketCollector::fixture(collect, fixture_packet)
-}
-
-/// Poll until a source-capture row exists for `root`, or panic after 2s.
-pub async fn wait_for_source_capture(db: &WorkDb, root: &str) {
-    let started = std::time::Instant::now();
-    loop {
-        if db.get_latest_pr_review_guide_source_capture(root).unwrap().is_some() {
-            return;
-        }
-        if started.elapsed() > std::time::Duration::from_secs(2) {
-            panic!("timed out waiting for review-guide source capture");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+pub fn apply_pending_review_verdicts(
+    db: &WorkDb,
+    checker: &dyn crate::work::PrStateChecker,
+) -> anyhow::Result<crate::work::ReviewVerdictApplyStats> {
+    crate::review_verdict_apply_sweep::apply_pending_review_verdicts(db, checker, &|input| {
+        checker.merged_parent_deletions(&input.repo_slug, &input.head_before, &input.base_sha, &input.head_after)
+    })
 }

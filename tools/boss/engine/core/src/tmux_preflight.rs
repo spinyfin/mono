@@ -12,6 +12,7 @@ const TMUX_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TmuxPreflight {
     Ready { program: PathBuf, version: TmuxVersion },
+    ReadyUnknown { program: PathBuf },
     Unavailable { reason: String },
 }
 
@@ -32,19 +33,40 @@ impl TmuxPreflight {
             }
         };
         let program = tmux.program().to_path_buf();
-        match tokio::time::timeout(TMUX_VERSION_PROBE_TIMEOUT, tmux.version()).await {
-            Ok(version) => classify(program, version),
+        match tokio::time::timeout(TMUX_VERSION_PROBE_TIMEOUT, tmux.version_output()).await {
+            Ok(Ok(output)) => classify_output(program, &output),
+            Ok(Err(error)) => classify(program, Err(error)),
             Err(_) => Self::Unavailable {
                 reason: timeout_reason(&program),
             },
         }
     }
 
+    /// Probe the original version label using the engine health warning policy.
+    pub async fn crash_warning(&self) -> Option<boss_protocol::EngineHealthIssue> {
+        let program = match self {
+            Self::Ready { program, .. } | Self::ReadyUnknown { program } => program,
+            Self::Unavailable { .. } => return None,
+        };
+        match Tmux::from_path_with_socket(program, "/unused-version-probe.sock") {
+            Ok(tmux) => crate::tmux_health::installed_warning(&tmux).await,
+            Err(error) => crate::tmux_health::version_warning("Installed tmux", &error.to_string()),
+        }
+    }
+
     pub fn unavailable_reason(&self) -> Option<&str> {
         match self {
-            Self::Ready { .. } => None,
+            Self::Ready { .. } | Self::ReadyUnknown { .. } => None,
             Self::Unavailable { reason } => Some(reason),
         }
+    }
+}
+
+fn classify_output(program: PathBuf, output: &str) -> TmuxPreflight {
+    match TmuxVersion::parse(output) {
+        Ok(version) => classify(program, Ok(version)),
+        // Development builds remain usable; health reports explain the unknown risk.
+        Err(_) => TmuxPreflight::ReadyUnknown { program },
     }
 }
 
@@ -88,6 +110,26 @@ fn missing_tmux_reason(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_affected_and_unknown_versions_do_not_block_startup() {
+        for output in [
+            "tmux 3.3",
+            "tmux 3.6a",
+            "tmux 3.7c",
+            "tmux 3.8",
+            "tmux next-3.9",
+            "tmux master",
+            "unknown",
+        ] {
+            assert!(
+                classify_output(PathBuf::from("/usr/local/bin/tmux"), output)
+                    .unavailable_reason()
+                    .is_none(),
+                "{output}"
+            );
+        }
+    }
 
     #[test]
     fn unavailable_reason_names_the_version_and_install_command() {

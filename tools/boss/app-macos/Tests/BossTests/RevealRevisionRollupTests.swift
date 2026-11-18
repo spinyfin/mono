@@ -116,6 +116,26 @@ final class RevealRevisionRollupTests: XCTestCase {
         XCTAssertEqual(model.revealCardTarget(for: "task_never_seen"), .deferred)
     }
 
+    func testBlockedEngineFoldPayloadRollsUpAndRevealsParent() throws {
+        let model = makeModel()
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let revision = try XCTUnwrap(client.parseTask([
+            "id": "task_revision", "product_id": "prod_test", "project_id": "proj_test",
+            "kind": "revision", "name": "CI fix", "description": "", "status": "blocked",
+            "blocked_reason": "ci_failure", "parent_task_id": "task_parent",
+            "created_at": "0", "updated_at": "0", "board_folded_revision": true
+        ]))
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeTask(id: "task_parent", name: "Parent", status: "in_review"), revision
+        ]))
+        for column in [WorkBoardColumnKey.backlog, .doing, .review, .done] {
+            XCTAssertFalse(model.workItems(in: column).contains { $0.id == revision.id })
+        }
+        XCTAssertEqual(model.inReviewRevisions(forParentTaskID: "task_parent").map(\.id), [revision.id])
+        XCTAssertEqual(WorkCardRevisionRollup(revision: revision).blockedReason, "ci_failure")
+        XCTAssertEqual(model.revealCardTarget(for: revision.id), .revealed(cardID: "task_parent"))
+    }
+
     // MARK: - Helpers
 
     private func makeTask(
@@ -142,7 +162,8 @@ final class RevealRevisionRollupTests: XCTestCase {
             createdAt: "2026-05-26T00:00:00Z",
             updatedAt: "2026-05-26T00:00:00Z",
             blockedReason: blockedReason,
-            parentTaskId: parentTaskId
+            parentTaskId: parentTaskId,
+            boardFoldedRevision: kind == "revision" && (status == "in_review" || status == "done")
         )
     }
 

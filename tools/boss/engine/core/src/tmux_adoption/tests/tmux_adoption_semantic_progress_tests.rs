@@ -154,3 +154,40 @@ async fn restart_after_session_start_only_stays_unknown() {
         SemanticToolCondition::Unknown,
     );
 }
+
+/// The periodic husk sweep re-runs adoption for every live session. A run
+/// this process already holds must not have its ingress re-established (and
+/// so must not repeat its failures) on the second pass.
+#[tokio::test]
+async fn a_second_adoption_pass_does_not_reestablish_ingress_for_an_already_observed_run() {
+    let (_dir, db) = open_db_arc();
+    let execution_id = start_local_run(&db, "worker-1");
+    stamp_tmux_identity(&db, &execution_id);
+    let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
+        sessions: vec!["boss-worker-1".to_owned()],
+        tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-1".to_owned())]),
+        schemas: supported_schema("boss-worker-1"),
+        pane_pids: HashMap::from([("boss-worker-1".to_owned(), "4321".to_owned())]),
+        ..Default::default()
+    });
+    let coordinator = coordinator_with_one_slot(db.clone());
+    let spawner = RecordingSpawner::default();
+    let sink = RecordingDispatchEventSink::new();
+
+    for _ in 0..2 {
+        run_adoption_pass(&db, &tmux, &coordinator, &spawner, &NoopLiveWorkerConvergence, &sink).await;
+    }
+
+    assert_eq!(
+        spawner.ingress_calls.lock().unwrap().as_slice(),
+        std::slice::from_ref(&execution_id),
+        "only the pass that first adopts the run re-establishes its ingress",
+    );
+    let outcomes: Vec<_> = sink
+        .events_for(&execution_id)
+        .await
+        .iter()
+        .map(|event| event.details["progress_ingress"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(outcomes, ["reestablished", "already_observed"]);
+}

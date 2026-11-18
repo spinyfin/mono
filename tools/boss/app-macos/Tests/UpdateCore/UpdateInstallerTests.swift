@@ -272,11 +272,75 @@ final class UpdateInstallerTests: XCTestCase {
         try "1.0.28\n".write(to: installer.rolledBackMarkerURL, atomically: true, encoding: .utf8)
 
         let outcome = installer.reconcileAfterLaunch(currentVersion: v("1.0.27"))
-        XCTAssertEqual(outcome, .rolledBack(v("1.0.28")))
+        guard case .rolledBack(let record) = outcome else { return XCTFail("expected .rolledBack, got \(outcome)") }
+        XCTAssertEqual(record.version, "1.0.28")
+        XCTAssertEqual(record.reason, .unknown, "legacy bare-version marker carries no reason")
+        XCTAssertEqual(record.restoredVersion, "1.0.27", "falls back to the pending record's from-version")
+        XCTAssertEqual(record.attemptID, plan.attemptID, "falls back to the pending record's attempt id")
+        XCTAssertEqual(installer.lastRollback(), record, "rollback persisted in install-state.json")
         XCTAssertTrue(installer.isBlocked(v("1.0.28")), "failed version blocklisted")
         XCTAssertNil(installer.pendingSwap(), "pending cleared")
         XCTAssertFalse(exists(updatesDir.appendingPathComponent("1.0.28")), "failed staged dir reaped")
         XCTAssertFalse(exists(installer.rolledBackMarkerURL), "marker consumed")
+    }
+
+    func testReconcileStructuredMarkerRecordsReasonAndDetail() throws {
+        plantInstalledBundle(marker: "old")
+        let installer = makeInstaller()
+        let marker = """
+        version=1.0.28
+        reason=process-exited
+        detail=pid 4242 exited 1s after starting without writing /x/launch-ok-1.0.28.flag
+        attempt=upd-1760200000000-cafe
+        from=1.0.27
+        restored=1.0.27
+        at=2026-10-11T19:08:31Z
+
+        """
+        try marker.write(to: installer.rolledBackMarkerURL, atomically: true, encoding: .utf8)
+
+        guard case .rolledBack(let record) = installer.reconcileAfterLaunch(currentVersion: v("1.0.27")) else {
+            return XCTFail("expected .rolledBack")
+        }
+        XCTAssertEqual(record.reason, .processExited)
+        XCTAssertEqual(record.detail, "pid 4242 exited 1s after starting without writing /x/launch-ok-1.0.28.flag")
+        XCTAssertEqual(record.attemptID, "upd-1760200000000-cafe")
+        XCTAssertEqual(record.restoredVersion, "1.0.27")
+        XCTAssertEqual(record.noticeText,
+                       "Update to 1.0.28 failed: the new version exited before finishing its launch; rolled back to 1.0.27")
+        XCTAssertEqual(installer.rollbackRecord(for: v("1.0.28")), record)
+        XCTAssertFalse(record.acknowledged)
+
+        installer.acknowledgeRollbacks()
+        XCTAssertEqual(installer.lastRollback()?.acknowledged, true)
+        XCTAssertTrue(installer.isBlocked(v("1.0.28")), "acknowledging the notice does not unblock")
+    }
+
+    func testRolledBackMarkerParsesUnknownReasonAndLegacyFormat() {
+        let structured = RolledBackMarker.parse("version=1.0.5\nreason=not-a-real-reason\ndetail=x\n")
+        XCTAssertEqual(structured?.version, v("1.0.5"))
+        XCTAssertEqual(structured?.reason, .unknown, "unrecognised reasons degrade to .unknown, never drop the marker")
+        XCTAssertEqual(structured?.detail, "x")
+        XCTAssertNil(structured?.attemptID)
+
+        let legacy = RolledBackMarker.parse("1.0.5\n")
+        XCTAssertEqual(legacy?.version, v("1.0.5"))
+        XCTAssertEqual(legacy?.reason, .unknown)
+        XCTAssertNil(RolledBackMarker.parse("garbage"))
+        XCTAssertNil(RolledBackMarker.parse(""))
+    }
+
+    func testLegacyInstallStateWithoutRollbacksStillLoads() throws {
+        // install-state.json written before `rollbacks` existed: blocklist only.
+        let state = "{\"blocklist\": [\"1.0.177\", \"1.0.736\"]}"
+        try state.write(to: updatesDir.appendingPathComponent("install-state.json"), atomically: true, encoding: .utf8)
+        let installer = makeInstaller()
+        XCTAssertTrue(installer.isBlocked(v("1.0.736")))
+        XCTAssertNil(installer.lastRollback())
+        XCTAssertNil(installer.pendingSwap())
+        // Mutating state preserves the legacy entries.
+        installer.unblockVersion(v("1.0.736"))
+        XCTAssertEqual(installer.blockedVersions(), [v("1.0.177")])
     }
 
     func testReconcileNoChangeWhenNothingPending() {
@@ -367,6 +431,28 @@ final class UpdateInstallerTests: XCTestCase {
             "--rolled-back-marker", installer.rolledBackMarkerURL.path,
             "--version", "1.0.28",
             "--watchdog", "30",
+            "--attempt", "",
+            "--from", "",
+            "--log", updatesDir.appendingPathComponent("log/update-log.jsonl").path,
+        ])
+    }
+
+    func testHelperInvocationCarriesAttemptAndVersions() {
+        let installer = makeInstaller()
+        let plan = SwapPlan(
+            version: v("1.0.28"),
+            stagedBundleURL: updatesDir.appendingPathComponent("1.0.28/Boss.app"),
+            installBundleURL: installBundle,
+            backupURL: installer.backupURL,
+            relaunch: true,
+            fromVersion: v("1.0.27"),
+            attemptID: "upd-1760200000000-f00d")
+        let invocation = installer.helperInvocation(
+            scriptURL: URL(fileURLWithPath: "/x/relaunch-helper.sh"), plan: plan, bossPID: 1, watchdogSeconds: 30)
+        XCTAssertEqual(Array(invocation.arguments.suffix(6)), [
+            "--attempt", "upd-1760200000000-f00d",
+            "--from", "1.0.27",
+            "--log", updatesDir.appendingPathComponent("log/update-log.jsonl").path,
         ])
     }
 }

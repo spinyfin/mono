@@ -1,9 +1,10 @@
 import SwiftUI
 
 // ===========================================================================
-// The inline question on a Doing ▸ Needs Attention card: what a blocked
+// The inline question on a Doing ▸ Queued card: what a blocked
 // worker asked the user, a "Why?" disclosure with the full detail, and
-// Yes / No buttons.
+// two buttons — Yes / No, or the names the engine gave the two actions — or
+// one button per option for a multiple-choice question.
 //
 // Equatable over its own [[OperatorQuestionPresentation]] so a live-status
 // flip elsewhere on the card does not re-lay-out the block. The answer
@@ -30,48 +31,48 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
     /// Invoked with the user's answer. The card never applies it
     /// locally: the engine's `work_item_updated` reply moves the card.
     var onAnswer: ((OperatorAnswer) -> Void)? = nil
-
-    @State private var showingDetail = false
+    var onDismiss: (() -> Void)? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
     }
 
     var body: some View {
-        let question = slice.presentation
-        VStack(alignment: .leading, spacing: 6) {
-            // Three lines inline; the whole text is in the tooltip and the
-            // "Why?" popover. Validation caps a question at 500 characters
-            // so the inline rendering is the common case.
-            Text(question.text)
-                .font(.callout.weight(.medium))
-                .foregroundStyle(.primary)
-                .multilineTextAlignment(.leading)
-                .lineLimit(OperatorQuestionPresentation.inlineLineLimit)
-                .truncationMode(.tail)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(question.text)
-                .accessibilityIdentifier("operator-question-text")
+        OperatorQuestionBody(question: slice.presentation, onAnswer: onAnswer, onDismiss: onDismiss)
+    }
+}
 
-            HStack(spacing: 8) {
-                Button("Why?") { showingDetail.toggle() }
-                    .buttonStyle(.link)
-                    .controlSize(.small)
-                    .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
-                        OperatorQuestionDetailPopover(question: question)
-                    }
-                    .accessibilityIdentifier("operator-question-why")
-                Spacer(minLength: 0)
-                // No default action on either button: a stray Return must not
-                // authorize a bypass.
-                Button("Yes") { onAnswer?(.yesNo(true)) }
-                    .accessibilityIdentifier("operator-question-yes")
-                Button("No") { onAnswer?(.yesNo(false)) }
-                    .accessibilityIdentifier("operator-question-no")
+/// Shared question controls for the kanban card and Navigator Attention slot.
+/// Closures stay outside any Equatable wrapper so a live-status flip does
+/// not rebuild the buttons.
+struct OperatorQuestionBody: View {
+    let question: OperatorQuestionPresentation
+    var onAnswer: ((OperatorAnswer) -> Void)? = nil
+    var onDismiss: (() -> Void)? = nil
+
+    @State private var showingDetail = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let explanation = OperatorQuestionExplanation(question.explanation, optionLabels: question.optionLabels) {
+                OperatorQuestionDecisionContent(question: question.text, explanation: explanation)
+            } else {
+                // Three lines inline; the whole text is in the tooltip and the
+                // "Why?" popover. Validation caps a question at 500 characters
+                // so the inline rendering is the common case.
+                Text(question.text)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(OperatorQuestionPresentation.inlineLineLimit)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(question.text)
+                    .accessibilityIdentifier("operator-question-text")
             }
-            .controlSize(.small)
-            .disabled(question.answerInFlight)
+
+            answerControls
 
             if let error = question.errorMessage {
                 Text(error)
@@ -82,26 +83,109 @@ struct WorkBoardCardOperatorQuestion: View, @MainActor Equatable {
             }
         }
     }
+
+    @ViewBuilder
+    private var answerControls: some View {
+        if question.choices.isEmpty {
+            HStack(spacing: 8) {
+                whyButton
+                dismissButton
+                Spacer(minLength: 0)
+                // No default action on either button: a stray Return must not
+                // authorize a bypass. A question whose answers are distinct
+                // actions shows the engine's names for them; the answer sent
+                // is still the yes/no the position stands for.
+                Button(question.optionLabels?.yes ?? "Yes") { onAnswer?(.yesNo(true)) }
+                    .accessibilityIdentifier("operator-question-yes")
+                Button(question.optionLabels?.no ?? "No") { onAnswer?(.yesNo(false)) }
+                    .accessibilityIdentifier("operator-question-no")
+            }
+            .controlSize(.small)
+            .disabled(question.answerInFlight)
+        } else {
+            // One button per option, in the worker's order. The label is the
+            // string the engine records, so the click is the answer.
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    whyButton
+                    dismissButton
+                }
+                ForEach(Array(question.choices.enumerated()), id: \.offset) { index, choice in
+                    Button {
+                        onAnswer?(.multipleChoice(choice))
+                    } label: {
+                        Text(choice)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .help(choice)
+                    .accessibilityIdentifier("operator-question-choice-\(index)")
+                }
+            }
+            .controlSize(.small)
+            .disabled(question.answerInFlight)
+        }
+    }
+
+    private var dismissButton: some View {
+        Button("Dismiss") { onDismiss?() }
+            .help("Close this question without answering. Work stays blocked until explicitly started.")
+            .accessibilityIdentifier("operator-question-dismiss")
+    }
+
+    private var whyButton: some View {
+        Button("Why?") { showingDetail.toggle() }
+            .buttonStyle(.link)
+            .controlSize(.small)
+            .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
+                OperatorQuestionDetailPopover(question: question)
+            }
+            .accessibilityIdentifier("operator-question-why")
+    }
 }
 
-/// "Why?" popover: the whole question, the proposed task (for a prerequisite
-/// question), why the worker asked, the run summary, and when — scrollable and
-/// never truncated.
+/// Plain context and answer meanings precede all technical evidence. Legacy
+/// explanations remain readable in full; details are expandable, never truncated.
 struct OperatorQuestionDetailPopover: View {
     let question: OperatorQuestionPresentation
+    @State private var showingTechnicalDetails = false
+
+    init(question: OperatorQuestionPresentation, detailsExpanded: Bool = false) {
+        self.question = question
+        _showingTechnicalDetails = State(initialValue: detailsExpanded)
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                section("Question", question.text)
-                if let proposed = question.prerequisiteTask {
-                    section("Proposed task", proposed.name)
-                    section("Proposed brief", proposed.brief)
+                if let explanation = OperatorQuestionExplanation(question.explanation, optionLabels: question.optionLabels) {
+                    OperatorQuestionDecisionContent(question: question.text, explanation: explanation)
+                } else {
+                    section("Question", question.text)
+                    if !question.explanation.isEmpty {
+                        section("Why the worker is asking", question.explanation)
+                    }
                 }
-                if !question.explanation.isEmpty {
-                    section("Why the worker is asking", question.explanation)
+                DisclosureGroup("Details", isExpanded: $showingTechnicalDetails) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let details = OperatorQuestionExplanation(question.explanation, optionLabels: question.optionLabels)?.details {
+                            section("Technical details", details)
+                        }
+                        if let proposed = question.prerequisiteTask {
+                            if proposed.existing {
+                                section("Existing task", proposed.name)
+                                if let pullRequest = proposed.pullRequest, !pullRequest.isEmpty {
+                                    section("Pull request", pullRequest)
+                                }
+                            } else {
+                                section("Proposed task", proposed.name)
+                                section("Proposed brief", proposed.brief)
+                            }
+                        }
+                        section("Run summary", question.runSummary ?? "No run summary recorded.")
+                    }
                 }
-                section("Run summary", question.runSummary ?? "No run summary recorded.")
                 if let asked = Self.askedLabel(question.askedAt) {
                     section("Asked", asked)
                 }
@@ -110,7 +194,7 @@ struct OperatorQuestionDetailPopover: View {
             .padding(12)
         }
         .frame(width: 340)
-        .frame(maxHeight: 360)
+        .frame(maxHeight: 520)
     }
 
     static func askedLabel(_ raw: String) -> String? {

@@ -2267,3 +2267,96 @@ async fn worker_failure_never_cycles_replacement_workers() {
     assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
     assert!(task.blocked_detail.unwrap().contains("Required credential unavailable"));
 }
+
+/// The sweep is automatic recovery: it must never re-open a spawning
+/// attempt that retired underneath an `active` CI-fix revision whose worker
+/// died, whether the attempt failed or succeeded. Only an explicit start
+/// (kanban drag, `bossctl work start`, an affirmative answer) may.
+#[tokio::test]
+async fn does_not_reopen_a_retired_spawning_attempt() {
+    for succeeded in [false, true] {
+        let name = if succeeded { "succeeded" } else { "failed" };
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let pr_url = "https://github.com/test/repo/pull/3150";
+        let chore = create_test_chore_manual(&db, product_id.clone(), "Chore for revision");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![chore.id, pr_url],
+            )
+            .unwrap();
+        }
+        let rem = db
+            .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+                product_id: product_id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr_url.to_owned(),
+                pr_number: 3150,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "head-1".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .unwrap();
+        let revision_id = format!("task_ci_fix_rev_{name}");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, created_via, parent_task_id)
+                 VALUES (?1, ?2, 'revision', 'Fix failing CI on PR', '', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 1, ?3, ?4)",
+                rusqlite::params![
+                    revision_id,
+                    product_id,
+                    format!("{}{}", crate::work::CREATED_VIA_CI_FIX_PREFIX, rem.id),
+                    chore.id
+                ],
+            )
+            .unwrap();
+        }
+        db.set_ci_remediation_revision_task_id(&rem.id, &revision_id).unwrap();
+
+        // The worker is alive, then dies; the attempt retires underneath it.
+        let execution_id = create_spawned_execution(&db, &revision_id, dead_pid());
+        if succeeded {
+            db.mark_ci_remediation_succeeded(&rem.id, Some("sha-after")).unwrap();
+        } else {
+            db.mark_ci_remediation_failed(&rem.id, "ran out of attempts").unwrap();
+        }
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &revision_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        run_one_pass(db.as_ref(), coordinator, sink.as_ref(), &NoopLiveWorkerConvergence).await;
+
+        let attempt = db.get_ci_remediation(&rem.id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status,
+            if succeeded { "succeeded" } else { "failed" },
+            "{name}: the orphan sweep must not re-open a retired attempt",
+        );
+        assert!(attempt.finished_at.is_some(), "{name}");
+
+        // The revision reconciler then settles the row instead of running it.
+        db.reconcile_product_executions(&product_id).unwrap();
+        let after = db.get_ci_remediation(&rem.id).unwrap().unwrap();
+        assert_eq!(after.status, attempt.status, "{name}");
+        let runnable = db
+            .list_executions(Some(&revision_id))
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e.status, ExecutionStatus::Ready | ExecutionStatus::Running))
+            .count();
+        assert_eq!(
+            runnable, 0,
+            "{name}: no runnable execution may survive for a retired attempt"
+        );
+    }
+}

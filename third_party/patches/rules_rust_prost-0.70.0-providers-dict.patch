@@ -1,0 +1,23 @@
+diff --git a/private/prost.bzl b/private/prost.bzl
+--- a/private/prost.bzl
++++ b/private/prost.bzl
+@@ -199,6 +199,10 @@
+         rustc_rmeta_output = generate_output_diagnostics(ctx, rmeta)
+         metadata_supports_pipelining = can_use_metadata_for_pipelining(toolchain, "rlib")
+ 
++    # The mono rules_rust patch (rules_rust-0.70.0-test-wrapper.patch) makes
++    # rustc_compile_action return a dict of providers keyed by name, where
++    # stock 0.70.0 returned a list. The lookups below scan a list of provider
++    # instances, so normalise either shape to that list.
+     providers = rustc_compile_action(
+         ctx = ctx,
+         attr = attr,
+@@ -224,6 +233,8 @@
+         ),
+         output_hash = output_hash,
+     )
++    if type(providers) == "dict":
++        providers = list(providers.values())
+ 
+     crate_info = _get_crate_info(providers)
+     dep_info = _get_dep_info(providers)

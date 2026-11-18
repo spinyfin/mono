@@ -19,6 +19,7 @@ pub(crate) async fn regenerate_lockfile(
     manifest_filename: &str,
     program: &str,
     args: &[&str],
+    base_revision: Option<&str>,
 ) -> ResolveOutcome {
     let lock_path = workspace_path.join(&file.path);
     let Some(dir) = lock_path.parent() else {
@@ -34,17 +35,39 @@ pub(crate) async fn regenerate_lockfile(
         };
     }
 
-    // The conflicted lockfile still has merge markers in it; discard it so
-    // the regeneration tool writes fresh content instead of tripping over
-    // invalid syntax (or, worse, silently trusting stale entries). Rung 1's
-    // engine-direct rebase may have already removed it, so a missing file
-    // isn't itself an error.
-    if let Err(e) = std::fs::remove_file(&lock_path)
-        && e.kind() != std::io::ErrorKind::NotFound
+    if let Ok(manifest) = std::fs::read_to_string(&manifest_path)
+        && manifest
+            .lines()
+            .any(|line| line.starts_with("<<<<<<<") || line.starts_with("%%%%%%%"))
     {
         return ResolveOutcome::Declined {
-            reason: format!("failed to remove conflicted {}: {e}", file.path),
+            reason: format!("manifest {} still has merge conflicts", manifest_path.display()),
         };
+    }
+
+    let seed = match base_revision {
+        Some(revision) => match base_lockfile(runner, workspace_path, file, revision).await {
+            Ok(seed) => seed,
+            Err(outcome) => return outcome,
+        },
+        None => None,
+    };
+    if let Some(seed) = seed {
+        if let Err(err) = std::fs::write(&lock_path, seed) {
+            return ResolveOutcome::Failed {
+                reason: format!("cannot seed {} from PR base: {err}", file.path),
+            };
+        }
+    } else {
+        // No base lockfile (or no base supplied): regenerate from the merged
+        // manifest. This is not a resolution until the owner command succeeds.
+        if let Err(e) = std::fs::remove_file(&lock_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return ResolveOutcome::Failed {
+                reason: format!("failed to remove conflicted {}: {e}", file.path),
+            };
+        }
     }
 
     if let Err(outcome) = run_or_fail(runner, dir, program, args, "").await {
@@ -64,6 +87,42 @@ pub(crate) async fn regenerate_lockfile(
     ResolveOutcome::Resolved {
         summary: format!("regenerated {} via `{program} {}`", file.path, args.join(" ")),
     }
+}
+
+/// A failed read does not prove absence: verify it against the same base
+/// revision before removing the conflicted file. Missing revisions, transport
+/// failures and unreadable existing files remain failures, with their evidence.
+async fn base_lockfile(
+    runner: &dyn CommandRunner,
+    workspace: &Path,
+    file: &ConflictedFile,
+    revision: &str,
+) -> Result<Option<String>, ResolveOutcome> {
+    let jj = std::env::var_os("BOSS_JJ_BIN")
+        .map(std::path::PathBuf::from)
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .unwrap_or_else(|| "jj".into());
+    let args = ["file", "show", "-r", revision, "--", file.path.as_str()].map(std::ffi::OsString::from);
+    let read = runner.run(&jj, &args, Some(workspace)).await;
+    if let Ok(output) = &read
+        && output.success
+    {
+        return Ok(Some(output.stdout.clone()));
+    }
+    let args = ["file", "list", "-r", revision, "--", file.path.as_str()].map(std::ffi::OsString::from);
+    let listing = runner.run(&jj, &args, Some(workspace)).await;
+    if let Ok(output) = &listing
+        && output.success
+        && output.stdout.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    Err(ResolveOutcome::Failed {
+        reason: format!(
+            "cannot read {} from PR base {revision}: {read:?}; absence check: {listing:?}",
+            file.path
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -90,6 +149,7 @@ mod tests {
             "Cargo.toml",
             "cargo",
             &["generate-lockfile"],
+            None,
         )
         .await;
         assert!(matches!(outcome, ResolveOutcome::Declined { reason } if reason.contains("Cargo.toml")));
@@ -113,6 +173,7 @@ mod tests {
             "Cargo.toml",
             "cargo",
             &["generate-lockfile"],
+            None,
         )
         .await;
 
@@ -145,6 +206,7 @@ mod tests {
             "Cargo.toml",
             "cargo",
             &["generate-lockfile"],
+            None,
         )
         .await;
 
@@ -175,6 +237,7 @@ mod tests {
             "Cargo.toml",
             "cargo",
             &["generate-lockfile"],
+            None,
         )
         .await;
 
@@ -197,6 +260,7 @@ mod tests {
             "Cargo.toml",
             "cargo",
             &["generate-lockfile"],
+            None,
         )
         .await;
 
@@ -219,6 +283,7 @@ mod tests {
             "Cargo.toml",
             "cargo",
             &["generate-lockfile"],
+            None,
         )
         .await;
 

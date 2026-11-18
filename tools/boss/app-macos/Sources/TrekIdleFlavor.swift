@@ -1,13 +1,14 @@
 import Foundation
 
-/// In-character recreational flavor lines, one set per crew member.
+/// Recreational flavor lines: bespoke sets for a few crew members,
+/// generic downtime lines (naming the character) for the rest.
 /// Picked deterministically per (slot, idle-cycle) so an idle pane
 /// keeps the same line until it transitions out of idle — the cycle
 /// id is whatever the caller bumps on enter-idle.
 enum TrekIdleFlavor {
-    static func lines(for character: TrekCharacter) -> [String] {
-        switch character {
-        case .riker:
+    static func lines(for name: String) -> [String] {
+        switch name {
+        case "Riker":
             return [
                 "Riker is vacationing on Risa.",
                 "Riker is playing trombone in Ten Forward.",
@@ -18,7 +19,7 @@ enum TrekIdleFlavor {
                 "Riker is challenging anyone to a game of poker.",
                 "Riker is teaching the holodeck how to mix a Saurian brandy.",
             ]
-        case .data:
+        case "Data":
             return [
                 "Data is practicing his violin.",
                 "Data is painting Spot.",
@@ -29,7 +30,7 @@ enum TrekIdleFlavor {
                 "Data is calculating pi to a few extra decimal places.",
                 "Data is contemplating the works of Sherlock Holmes.",
             ]
-        case .worf:
+        case "Worf":
             return [
                 "Worf is in the holodeck on calisthenics program four.",
                 "Worf is brewing prune juice for Guinan.",
@@ -39,7 +40,7 @@ enum TrekIdleFlavor {
                 "Worf is grumbling about the lack of glory in administrative work.",
                 "Worf is recounting the Battle of HarOs to anyone who will listen.",
             ]
-        case .laforge:
+        case "La Forge":
             return [
                 "La Forge is recalibrating the dilithium matrix for fun.",
                 "La Forge is in Engineering, talking to the warp core.",
@@ -49,7 +50,7 @@ enum TrekIdleFlavor {
                 "La Forge is tuning his VISOR.",
                 "La Forge is running a tabletop holo-program with Reg Barclay.",
             ]
-        case .troi:
+        case "Troi":
             return [
                 "Troi is having a chocolate sundae in Ten Forward.",
                 "Troi is leading a counseling session on Deck 7.",
@@ -58,7 +59,7 @@ enum TrekIdleFlavor {
                 "Troi is teaching beginning meditation in the arboretum.",
                 "Troi is sparring with Worf on the holodeck.",
             ]
-        case .crusher:
+        case "Crusher":
             return [
                 "Crusher is rehearsing for the next ship's theatrical.",
                 "Crusher is dancing in Sickbay between shifts.",
@@ -67,7 +68,7 @@ enum TrekIdleFlavor {
                 "Crusher is teaching Wesley not to touch that.",
                 "Crusher is reading up on Trill symbiont biology.",
             ]
-        case .yar:
+        case "Yar":
             return [
                 "Yar is running a security drill in the cargo bay.",
                 "Yar is sparring with the Aikido program on the holodeck.",
@@ -75,7 +76,7 @@ enum TrekIdleFlavor {
                 "Yar is reviewing tactical scans from the last shift.",
                 "Yar is teaching hand-to-hand to the new ensigns.",
             ]
-        case .obrien:
+        case "O'Brien":
             return [
                 "O'Brien is reassembling the transporter buffer on a hunch.",
                 "O'Brien is at Quark's, nursing a synthale.",
@@ -84,25 +85,35 @@ enum TrekIdleFlavor {
                 "O'Brien is muttering at a Cardassian conduit.",
                 "O'Brien is calling Keiko back, eventually.",
             ]
-        case .picard:
-            // Picard is the Boss pane and not part of the worker
-            // roster, so these lines aren't surfaced via `forSlot`
-            // today — the case exists only for exhaustiveness.
+        case "Picard":
+            // Picard is the coordinator, never a worker, so the idle
+            // pane doesn't show these lines today.
             return [
                 "Picard is in his ready room with Earl Grey, hot.",
                 "Picard is rereading The Inner Light for the fourth time.",
                 "Picard is studying an obscure archaeological dig report.",
                 "Picard is on the bridge, making it so.",
             ]
+        default:
+            // Everyone without a bespoke set gets generic downtime
+            // lines, so every portrait pane still has a flavor line.
+            return [
+                "\(name) is taking a quiet moment on the observation deck.",
+                "\(name) is catching up on Starfleet correspondence.",
+                "\(name) is enjoying a replicated tea in Ten Forward.",
+                "\(name) is running a low-priority diagnostic, unhurried.",
+                "\(name) is reading the latest Starfleet bulletin.",
+                "\(name) is waiting for the next assignment.",
+            ]
         }
     }
 
-    /// Pick a stable line for `(character, cycle)`. Same cycle id →
+    /// Pick a stable line for `(name, cycle)`. Same cycle id →
     /// same line, so the idle pane doesn't flicker on every render.
     /// Different cycles (e.g. after a run completes and the slot goes
     /// idle again) pick a fresh line from the same pool.
-    static func line(for character: TrekCharacter, cycle: Int) -> String {
-        let pool = lines(for: character)
+    static func line(for name: String, cycle: Int) -> String {
+        let pool = lines(for: name)
         guard !pool.isEmpty else { return "" }
         let index = abs(cycle) % pool.count
         return pool[index]

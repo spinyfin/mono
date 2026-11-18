@@ -43,13 +43,13 @@ async fn revision_with_pr_url_positions_via_goto_not_create_change() {
     ));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
@@ -117,13 +117,13 @@ async fn revision_without_pr_url_falls_back_to_chain_root_for_goto() {
     ));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
@@ -183,13 +183,13 @@ async fn revision_lease_failure_records_start_failure() {
     );
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "schedule_execution must fail when the lease fails");
 
@@ -251,13 +251,13 @@ async fn revision_clean_lease_positions_via_goto() {
     ));
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_ok(),
@@ -332,7 +332,7 @@ async fn schedule_execution_rejects_gated_ready_execution() {
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "gated execution must be refused by schedule_execution");
 
@@ -428,7 +428,7 @@ async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&revision_exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_err(),
@@ -467,7 +467,7 @@ async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
         .await
         .expect("worker pool slot available after release");
     let result_after = coordinator
-        .schedule_execution(&revision_exec, &worker_id2, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&revision_exec, &worker_id2, DispatchAdmission::Queued)
         .await;
     assert!(
         result_after.is_ok(),
@@ -549,7 +549,7 @@ async fn schedule_execution_bypasses_live_review_sibling_for_merge_conflict_revi
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&revision_exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_ok(),
@@ -593,9 +593,10 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
                 rusqlite::params![root_id],
             )
             .unwrap();
+        // Task ids encode creation order; the second fix is the newer one.
         conn.execute(
                 "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id, created_via)
-                 SELECT 'task_rev_conflict_second', product_id, 'revision', 'Resolve conflicts B', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_b'
+                 SELECT 'task_rev_conflict_zsecond', product_id, 'revision', 'Resolve conflicts B', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_b'
                  FROM tasks WHERE id = ?1",
                 rusqlite::params![root_id],
             )
@@ -630,7 +631,7 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
     let revision_exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
-                .work_item_id("task_rev_conflict_second".to_owned())
+                .work_item_id("task_rev_conflict_zsecond".to_owned())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
                 .pr_url(pr_url.to_owned())
@@ -655,7 +656,7 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&revision_exec_b, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&revision_exec_b, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_err(),
@@ -743,7 +744,7 @@ async fn schedule_execution_bypasses_live_review_sibling_for_non_conflict_revisi
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&revision_exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_ok(),
@@ -830,7 +831,7 @@ async fn schedule_execution_defers_non_conflict_revision_behind_live_writer_desp
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&revision_exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_err(),
@@ -1074,7 +1075,7 @@ async fn redundant_spawn_guard_emits_terminal_host_selected_error() {
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&redundant_exec, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&redundant_exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "redundant spawn must be rejected: {result:?}");
 
@@ -1190,7 +1191,7 @@ async fn redundant_spawn_guard_reconciles_lost_workspace_zombie_and_proceeds() {
         .expect("worker pool slot available");
 
     let _ = coordinator
-        .schedule_execution(&fresh, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&fresh, &worker_id, DispatchAdmission::Queued)
         .await;
 
     // The zombie was reconciled to a terminal status (orphaned) with a
@@ -1619,7 +1620,7 @@ async fn gating_prereqs_guard_emits_terminal_host_selected_error() {
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&gated_exec, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&gated_exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(result.is_err(), "gated execution must be refused: {result:?}");
 
@@ -1764,7 +1765,7 @@ async fn merge_conflict_already_resolved_guard_short_circuits_dispatch() {
         .expect("worker pool slot available");
 
     let result = coordinator
-        .schedule_execution(&exec, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&exec, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_err(),
@@ -1905,6 +1906,16 @@ async fn occupancy_refusal_excludes_workspace_on_retry() {
         calls[1].4
     );
     drop(calls);
+
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "occupied refusal must never reset the checkout"
+    );
+    assert_eq!(
+        cube.force_release_calls.lock().await.len(),
+        1,
+        "only the refused registry lease is released"
+    );
 
     // The execution must have landed on mono-agent-014, not 037.
     let execution = db.get_execution(&our_execution_id).unwrap();

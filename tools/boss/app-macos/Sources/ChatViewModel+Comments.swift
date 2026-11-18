@@ -33,9 +33,14 @@ protocol CommentBackend: AnyObject {
     /// The `[Revise]`-banner action: batch-address every unaddressed
     /// `revision` comment on the artifact.
     func reviseDoc(artifactKind: String, artifactId: String)
+    /// Whether a user-authored submission (`action` names it for the
+    /// "not saved" notice) can be accepted now. Composers keep their draft
+    /// when this returns false.
+    func canAcceptUserSubmission(describing action: String) -> Bool
 }
 
 extension CommentBackend {
+    func canAcceptUserSubmission(describing action: String) -> Bool { true }
     var guideCommentDrafts: GuideCommentDrafts? { nil }
 }
 
@@ -57,6 +62,10 @@ final class CommentEngineBridge: CommentBackend {
     let author: String
     let draftStore: GuideCommentDrafts
     var guideCommentDrafts: GuideCommentDrafts? { draftStore }
+    /// Told when the retry queue is full so the owner can surface the notice.
+    var onSubmissionRejected: ((String) -> Void)?
+    /// Told when a submission is accepted, so a stale "not saved" notice clears.
+    var onSubmissionAccepted: (() -> Void)?
 
     /// Active registrations keyed by the layer's identity. Weak layer refs so a
     /// closed viewer deallocates; stale entries are pruned lazily on routing.
@@ -66,6 +75,7 @@ final class CommentEngineBridge: CommentBackend {
         let artifactId: String
     }
     private var registrations: [ObjectIdentifier: Registration] = [:]
+    var registeredLayersForTesting: [CommentLayer] { registrations.values.compactMap(\.layer) }
 
     /// FIFO queue of artifacts with an in-flight `comments_revise_doc` call.
     /// `CommentsReviseDocResult` carries no artifact identity on the wire
@@ -165,6 +175,15 @@ final class CommentEngineBridge: CommentBackend {
 
     func fetchBannerState(artifactKind: String, artifactId: String) {
         engine.sendCommentsBannerState(artifactKind: artifactKind, artifactId: artifactId)
+    }
+
+    func canAcceptUserSubmission(describing action: String) -> Bool {
+        guard engine.hasRoomForDisconnectedActions() else {
+            onSubmissionRejected?(action)
+            return false
+        }
+        onSubmissionAccepted?()
+        return true
     }
 
     func postFollowup(commentId: String, body: String) {

@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod paths;
 pub(crate) mod reuse_guard;
 pub mod setup;
+mod setup_cleanup;
 pub mod store;
 
 pub use app::{RunResult, run};

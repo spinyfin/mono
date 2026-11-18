@@ -47,6 +47,11 @@ enum InstallOutcome {
 /// lifecycle side-effects the installer deliberately avoids — spawning a detached
 /// `Process` and exiting the app.
 ///
+/// Every decision here is also appended to the durable update log
+/// (`Updates/log/update-log.jsonl`, mirrored to the unified log under
+/// `dev.spinyfin.bossmacapp` / `update-lifecycle`), so a swap-and-relaunch that goes
+/// wrong leaves a trail across the old app, the helper, and the new app.
+///
 /// Boundary cases handled here so callers stay simple:
 /// - **Mode gating.** Auto-swap only runs in `automatic` mode (read straight from
 ///   the `@AppStorage` key `boss.update.mode`, matching `UpdateModel`'s storage).
@@ -65,8 +70,9 @@ enum UpdateLifecycle {
 
     /// Matches `UpdateModel.StorageKeys.mode`.
     private static let modeKey = "boss.update.mode"
-    /// Seconds the relaunch helper waits for the new version to report a clean launch
-    /// before rolling back. Generous: a cold engine-coordinating launch is slow.
+    /// Seconds the relaunch helper waits — measured from the moment the new process is
+    /// observed running, not from `open` — for the new version to write its
+    /// first-launch-OK flag before rolling back. Generous: a cold launch is slow.
     private static let watchdogSeconds = 30
 
     /// A swap applied by a user-initiated "Install & Relaunch" whose relaunch helper
@@ -75,6 +81,26 @@ enum UpdateLifecycle {
     /// vetoed quit therefore leaves nothing running; the plan simply waits here for the
     /// next confirmed quit. Consumed (cleared) by `consumePendingRelaunch()`.
     static var pendingRelaunch: SwapPlan?
+
+    /// Captured on the first startup record — the earliest point of the process
+    /// (`AppDelegate.init`) — before reconcile clears the pending swap or consumes the
+    /// rolled-back marker, so every later record of this launch carries the same
+    /// attempt id and from/to versions.
+    private static var startupTrail: UpdateStartupTrail?
+
+    /// Append one lifecycle record for this process to the durable update log (and its
+    /// unified-log mirror): `startup.*` steps from `AppDelegate.init` up to the
+    /// first-launch flag, `engine.decision` handoff lines, and `quit.*` steps. Runs on
+    /// every launch, not only update launches, so a version that hangs or dies before
+    /// reconcile still leaves the steps it reached. Skipped for isolated/capture
+    /// instances and tests, which must never touch the production Updates directory.
+    static func recordStartup(_ event: String, stage: String = "startup", detail: [String: String] = [:]) {
+        guard !BossEnginePaths.isIsolatedInstance, !BossEnginePaths.isRunningInTestContext else { return }
+        if startupTrail == nil {
+            startupTrail = UpdateStartupTrail(installer: installer(), running: runningVersion)
+        }
+        startupTrail?.record(event, stage: stage, detail: detail)
+    }
 
     /// Returns and clears any `pendingRelaunch` plan. Called from
     /// `applicationWillTerminate` — a confirmed quit — so the relaunch helper is armed
@@ -92,6 +118,8 @@ enum UpdateLifecycle {
         applyQuitSwap: () -> Void = { UpdateLifecycle.applyQuitSwapIfNeeded() }
     ) {
         if let plan = consumePendingRelaunch() {
+            log?.record(stage: "relaunch", event: "quit-confirmed", attempt: plan.attemptID,
+                        from: plan.fromVersion, to: plan.version, detail: ["pid": String(getpid())])
             armRelaunch(plan)
         } else {
             applyQuitSwap()
@@ -121,6 +149,10 @@ enum UpdateLifecycle {
         UpdateInstaller.live(installBundleURL: Bundle.main.bundleURL)
     }
 
+    /// The shared durable update log (same file the installer, downloader and
+    /// relaunch helper append to).
+    private static var log: UpdateLog? { installer().log }
+
     private static func helperScriptURL() -> URL? {
         Bundle.main.url(forResource: "relaunch-helper", withExtension: "sh")
     }
@@ -132,20 +164,59 @@ enum UpdateLifecycle {
     /// flag, which the relaunch watchdog polls for. Always safe; runs regardless of
     /// mode or build type because a swap staged by a release build must still settle
     /// even if the user has since switched to manual mode.
-    static func reconcileAtLaunch() {
-        guard let running = runningVersion else { return }
+    ///
+    /// Returns the rollback record when this launch is the *old* version coming back
+    /// after a failed update, so the caller can surface it.
+    @discardableResult
+    static func reconcileAtLaunch() -> RollbackRecord? {
+        guard let running = runningVersion else { return nil }
+        recordStartup("reconcile-begin")
         let installer = installer()
+        var rollback: RollbackRecord?
         switch installer.reconcileAfterLaunch(currentVersion: running) {
         case .installed(let version):
             NSLog("[update] now running freshly-installed version \(version)")
-        case .rolledBack(let version):
-            NSLog("[update] update \(version) failed to launch and was rolled back + blocklisted")
+            logNewAppLaunched(outcome: "installed")
+        case .rolledBack(let record):
+            NSLog("[update] update \(record.version) failed to launch (\(record.reason.rawValue)) and was rolled back + blocklisted")
+            rollback = record
+            logNewAppLaunched(outcome: "rolled-back", rollback: record)
         case .noChange:
             break
         }
         // Always (re)assert the flag last so a relaunch watchdog from the swap that
         // brought us here sees a healthy first launch even on the `.noChange` path.
         installer.markLaunchSucceeded(version: running)
+        recordStartup("flag-written", stage: "handshake", detail: ["runningVersion": running.description, "flag": installer.firstLaunchFlagURL(for: running).path])
+        return rollback
+    }
+
+    /// The new (or restored) app's own account of the launch an update produced. Its
+    /// attempt and from/to come from the startup trail; for a rollback the record's
+    /// `to` stays the failed target and `runningVersion` is the restored version.
+    private static func logNewAppLaunched(outcome: String, rollback: RollbackRecord? = nil) {
+        var detail = [
+            "outcome": outcome,
+            "pid": String(getpid()),
+            "bundle": Bundle.main.bundleURL.path,
+            "executable": Bundle.main.executableURL?.path ?? "",
+            "fullVersion": Bundle.main.object(forInfoDictionaryKey: "BossFullVersion") as? String ?? "",
+        ]
+        if let rollback {
+            detail["failedVersion"] = rollback.version
+            detail["reason"] = rollback.reason.rawValue
+            detail["rollbackAttempt"] = rollback.attemptID ?? ""
+        }
+        recordStartup("new-app-launched", stage: "relaunch", detail: detail)
+    }
+
+    /// Append an engine-controller decision line (`[engine version-check …]`,
+    /// `[engine upgrade]`, `[engine launch]`, `[engine stop] …`) to the update log as
+    /// `engine.decision`, under this launch's attempt when an update produced it.
+    /// Lines that are not engine-controller decisions are ignored.
+    static func recordEngineLine(_ line: String) {
+        guard line.hasPrefix("[engine") else { return }
+        recordStartup("decision", stage: "engine", detail: ["line": line])
     }
 
     /// Run at the startup chokepoint, *before* the engine launches (design §4
@@ -163,7 +234,12 @@ enum UpdateLifecycle {
             return false
         case .applied(let plan):
             // Arm now: startup is followed immediately by an un-vetoable `exit(0)`.
-            return armRelaunchHelper(for: plan)
+            let armed = armRelaunchHelper(for: plan)
+            if armed {
+                log?.record(stage: "relaunch", event: "startup-swap-exiting", attempt: plan.attemptID,
+                            from: plan.fromVersion, to: plan.version, detail: ["pid": String(getpid())])
+            }
+            return armed
         }
     }
 
@@ -202,6 +278,8 @@ enum UpdateLifecycle {
                 // to quit to finish; this is not a failure.
                 lifecycleLog.error(
                     "update: swapped in \(plan.version, privacy: .public) but relaunch-helper.sh is missing; will run on next launch")
+                log?.record(stage: "relaunch", event: "helper-missing", level: "error", attempt: plan.attemptID,
+                            from: plan.fromVersion, to: plan.version)
                 return .installedNoRelaunch
             }
             // Park the plan; the helper is armed at `applicationWillTerminate`, i.e.
@@ -209,6 +287,8 @@ enum UpdateLifecycle {
             pendingRelaunch = plan
             lifecycleLog.info(
                 "update: swapped in \(plan.version, privacy: .public); relaunch armed for confirmed quit")
+            log?.record(stage: "relaunch", event: "parked-for-confirmed-quit", attempt: plan.attemptID,
+                        from: plan.fromVersion, to: plan.version)
             return .relaunchPending
         }
     }
@@ -245,6 +325,10 @@ enum UpdateLifecycle {
         }
 
         let installer = installer()
+        let context: [String: String] = [
+            "userInitiated": String(userInitiated), "relaunch": String(relaunch),
+            "mode": isAutomaticMode ? "automatic" : "other",
+        ]
 
         var ready = installer.newestReadyUpdate(currentVersion: running)
         if ready == nil && userInitiated {
@@ -255,6 +339,8 @@ enum UpdateLifecycle {
             if let applied = installer.appliedPendingAwaitingRelaunch(currentVersion: running) {
                 lifecycleLog.info(
                     "update install: swap for \(applied.version, privacy: .public) already applied on a prior press; awaiting relaunch (idempotent)")
+                installer.log?.record(stage: "swap", event: "already-applied", attempt: applied.attemptID,
+                                      from: running, to: applied.version, detail: context)
                 return .applied(applied)
             }
             // Otherwise, also consider versions that were previously blocklisted (failed
@@ -277,6 +363,8 @@ enum UpdateLifecycle {
 
         switch installer.planSwap(for: ready, currentVersion: running, relaunch: relaunch) {
         case .swap(let plan):
+            installer.log?.record(stage: "swap", event: "requested", attempt: plan.attemptID,
+                                  from: running, to: plan.version, detail: context)
             do {
                 try installer.applySwap(plan)
             } catch {
@@ -286,6 +374,8 @@ enum UpdateLifecycle {
             }
             if !relaunch {
                 lifecycleLog.info("update: swapped in \(plan.version, privacy: .public) on quit; will run on next launch")
+                installer.log?.record(stage: "swap", event: "applied-on-quit", attempt: plan.attemptID,
+                                      from: running, to: plan.version)
             }
             return .applied(plan)
 
@@ -294,12 +384,17 @@ enum UpdateLifecycle {
             // surfaces (the update sheet and chrome popover) reveal the staged bundle in Finder; here we only log.
             lifecycleLog.warning(
                 "update swap skipped: \(ready.version, privacy: .public) is staged but \(installURL.path, privacy: .sensitive) is not writable; staged at \(stagedURL.path, privacy: .sensitive)")
+            installer.log?.record(stage: "swap", event: "skipped-not-writable", level: "warning",
+                                  attempt: ready.attemptID, from: running, to: ready.version,
+                                  detail: ["install": installURL.path, "staged": stagedURL.path])
             return .notApplied
 
         case .blocked(let version):
             // Should only be reached if the plan's version was blocklisted between the
             // `ready` discovery above and the `planSwap` call (extremely unlikely).
             lifecycleLog.warning("update swap skipped: \(version, privacy: .public) is blocklisted (failed a prior launch)")
+            installer.log?.record(stage: "swap", event: "skipped-blocklisted", level: "warning",
+                                  attempt: ready.attemptID, from: running, to: version)
             return .notApplied
 
         case .upToDate:
@@ -317,6 +412,8 @@ enum UpdateLifecycle {
         guard let script = helperScriptURL() else {
             lifecycleLog.error(
                 "update: swapped in \(plan.version, privacy: .public) but relaunch-helper.sh is missing; will run on next launch")
+            log?.record(stage: "relaunch", event: "helper-missing", level: "error", attempt: plan.attemptID,
+                        from: plan.fromVersion, to: plan.version)
             return false
         }
         let invocation = installer().helperInvocation(
@@ -328,9 +425,21 @@ enum UpdateLifecycle {
             try proc.run()
         } catch {
             lifecycleLog.error("update: failed to spawn relaunch helper: \(error, privacy: .public)")
+            log?.record(stage: "relaunch", event: "helper-spawn-failed", level: "error", attempt: plan.attemptID,
+                        from: plan.fromVersion, to: plan.version,
+                        detail: ["script": script.path, "error": String(describing: error)])
             return false
         }
         lifecycleLog.info("update: relaunch helper armed for \(plan.version, privacy: .public) (pid=\(getpid(), privacy: .public))")
+        log?.record(stage: "relaunch", event: "helper-armed", attempt: plan.attemptID,
+                    from: plan.fromVersion, to: plan.version,
+                    detail: [
+                        "helperPid": String(proc.processIdentifier),
+                        "oldAppPid": String(getpid()),
+                        "script": script.path,
+                        "watchdogSeconds": String(watchdogSeconds),
+                        "arguments": invocation.arguments.joined(separator: " "),
+                    ])
         return true
     }
 }

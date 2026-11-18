@@ -996,19 +996,25 @@ fn free_workspaces(store: &Store, repo: &str) -> Vec<WorkspaceRecord> {
         .collect()
 }
 
-/// Re-read one row and confirm it is still free, immediately before acting on
-/// it. Any read failure answers "no" — losing a reclamation is free, acting on
-/// a workspace someone just leased is not.
+/// Re-read one row and confirm it is still free and not being cleaned,
+/// immediately before acting on it. Any read failure answers "no" — losing a
+/// reclamation is free, acting on a workspace someone just leased is not.
 fn still_free(store: &Store, record: &WorkspaceRecord) -> bool {
-    store
-        .list_workspaces_filtered(&WorkspaceListFilter {
-            repo: Some(&record.repo),
-            workspace_id: Some(&record.workspace_id),
-            ..Default::default()
-        })
-        .ok()
-        .and_then(|mut v| v.pop())
-        .is_some_and(|r| r.state == WorkspaceState::Free)
+    // A workspace a repo-declared cleanup is working on (or has failed on and
+    // is withheld for) is not this pass's to remove or compact either.
+    let cleanup_mark_free = store
+        .get_workspace_cleanup_status(&record.repo, &record.workspace_id)
+        .is_ok_and(|status| status.is_none());
+    cleanup_mark_free
+        && store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some(&record.repo),
+                workspace_id: Some(&record.workspace_id),
+                ..Default::default()
+            })
+            .ok()
+            .and_then(|mut v| v.pop())
+            .is_some_and(|r| r.state == WorkspaceState::Free)
 }
 
 fn is_idle_enough(record: &WorkspaceRecord, idle_threshold_epoch_s: i64) -> bool {

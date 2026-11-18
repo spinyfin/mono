@@ -6,6 +6,16 @@ load(":macos_direct_test_runner.bzl", "macos_direct_test_runner")
 
 exports_files(["macos_direct_test_runner.template.sh"])
 
+# Run by the packages that may use a single-tool host repository, against
+# their own label; see the script.
+exports_files(
+    ["host_tool_symlink_guard_test.sh"],
+    visibility = [
+        "//tools/boss/engine/worker-bin:__pkg__",
+        "//tools/cube:__pkg__",
+    ],
+)
+
 macos_direct_test_runner(
     name = "macos_direct_test_runner",
     visibility = ["//visibility:public"],
@@ -45,6 +55,15 @@ network_enabled_rust_test(
     srcs = ["network_opt_in_test.rs"],
 )
 
+# Fails if any bin/<tool> of the audited runtime is not a symlink straight to
+# the host path its manifest records. It inspects the runtime every test gets
+# from the run_under wrapper's runfiles, so it needs no data of its own.
+sh_test(
+    name = "runtime_symlink_guard_test",
+    size = "small",
+    srcs = ["runtime_symlink_guard_test.sh"],
+)
+
 sh_binary(
     name = "cleanup_child",
     srcs = ["cleanup_child.sh"],
@@ -81,6 +100,20 @@ sh_test(
     data = [":test_filter_fixture"],
 )
 
+# Scale regression for the same wrapper's sharding path. Drives the wrapper
+# *template* against a fake libtest binary that enumerates 20,000 tests,
+# asserts the exact `index % shards` partition, and bounds the CPU the wrapper
+# spends before exec'ing the shard: the bash-loop partition it replaced cost
+# ~0.2 ms per enumerated test per shard on macOS bash 3.2 (~1.2 s per shard
+# for the engine's 6,400-test suite, paid on every run).
+sh_test(
+    name = "test_wrapper_scale_test",
+    size = "small",
+    srcs = ["test_wrapper_scale_test.sh"],
+    data = ["@rules_rust//rust/private:test_wrapper.sh"],
+    env = {"WRAPPER_TEMPLATE": "$(rlocationpath @rules_rust//rust/private:test_wrapper.sh)"},
+)
+
 sh_test(
     name = "linux_policy_source_test",
     size = "small",
@@ -88,6 +121,17 @@ sh_test(
     data = [
         ":defs.bzl",
         ":hermetic_test_wrapper.sh",
+        ":linux_remote_action_sandbox.sh",
         "//:.bazelrc",
+    ],
+)
+
+sh_test(
+    name = "dev_remote_source_test",
+    size = "small",
+    srcs = ["dev_remote_source_test.sh"],
+    data = [
+        "//:.bazelrc",
+        "//:.ci.bazelrc",
     ],
 )

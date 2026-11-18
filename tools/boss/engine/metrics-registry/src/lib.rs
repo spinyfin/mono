@@ -198,6 +198,16 @@ impl Registry {
     /// invalid name (lowercase ASCII letters, digits, dots,
     /// underscores only).
     pub fn register_counter(&self, handle: &CounterHandle) {
+        self.register_counter_inner(handle, false);
+    }
+
+    /// Register an absent counter or adopt a stale one, preserving live counters.
+    /// The check and registration share one write lock, so concurrent callers are safe.
+    pub fn ensure_counter(&self, handle: &CounterHandle) {
+        self.register_counter_inner(handle, true);
+    }
+
+    fn register_counter_inner(&self, handle: &CounterHandle, idempotent: bool) {
         validate_name(handle.name);
         let mut counters = self.counters.write().expect("metrics counters lock poisoned");
         match counters.get(handle.name) {
@@ -222,6 +232,7 @@ impl Registry {
                     }),
                 );
             }
+            Some(_) if idempotent => {}
             Some(_existing) => {
                 panic!("duplicate counter registration: {} already registered", handle.name);
             }
@@ -551,6 +562,37 @@ mod tests {
     register_counter!(TEST_COUNTER_A, "test.counter_a", "Phase 1 unit-test counter A.");
     register_counter!(TEST_COUNTER_B, "test.counter_b", "Phase 1 unit-test counter B.");
     register_gauge!(TEST_GAUGE_A, "test.gauge_a", "Phase 1 unit-test gauge A.");
+
+    #[test]
+    fn concurrent_ensure_preserves_live_and_adopts_stale_counters() {
+        let registry = Registry::new();
+        registry.insert_stale_counter(TEST_COUNTER_A.name(), "old description", 17, 100);
+        {
+            let barrier = std::sync::Barrier::new(8);
+            let barrier = &barrier;
+            let registry = &registry;
+            std::thread::scope(|workers| {
+                for _ in 0..8 {
+                    workers.spawn(move || {
+                        barrier.wait();
+                        registry.ensure_counter(&TEST_COUNTER_A);
+                        registry.ensure_counter(&TEST_COUNTER_B);
+                        TEST_COUNTER_A.inc(registry);
+                        TEST_COUNTER_B.inc(registry);
+                    });
+                }
+            });
+        }
+        for (handle, value) in [(&TEST_COUNTER_A, 25), (&TEST_COUNTER_B, 8)] {
+            let before = registry.counter_snapshot_one(handle.name()).unwrap();
+            registry.ensure_counter(handle);
+            let after = registry.counter_snapshot_one(handle.name()).unwrap();
+            assert_eq!(after.value, value);
+            assert_eq!(after.updated_at_ms, before.updated_at_ms);
+            assert_eq!(after.description, handle.description);
+            assert!(!after.stale);
+        }
+    }
 
     #[test]
     fn register_and_increment_counter() {

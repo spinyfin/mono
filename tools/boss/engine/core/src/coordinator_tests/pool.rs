@@ -1,187 +1,11 @@
-//! Worker-pool mechanics and scheduler basics: slot claiming/affinity,
-//! worker-id round-trips, priority ordering, capacity, pool exhaustion and
-//! recovery, force-dispatch, and heartbeat/kick behavior.
+//! Scheduler priority ordering, capacity, pool exhaustion and recovery,
+//! force-dispatch, heartbeat/kick behavior, and slot-busy handling.
+//! Pure pool and worker-id tests live in the execution-contracts crate.
 //!
 //! Shared fixtures live in [`super::helpers`].
 
 use super::helpers::*;
 use boss_protocol::{CommentAnchor, CreateCommentInput, CreateInvestigationInput};
-
-#[tokio::test]
-async fn worker_pool_clamps_size_to_hard_cap() {
-    let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE + 4);
-    assert_eq!(pool.capacity().await, MAX_WORKER_POOL_SIZE);
-}
-
-#[tokio::test]
-async fn worker_pool_prefers_workspace_affinity_over_lowest_index() {
-    let pool = WorkerPool::new(2);
-
-    // Deterministic selection fills the lowest free slot first, so the
-    // two claims land on worker-1 then worker-2.
-    let w_a = pool.claim_worker("exec-a", None).await.unwrap();
-    let w_b = pool.claim_worker("exec-b", None).await.unwrap();
-    assert_eq!(w_a, "worker-1");
-    assert_eq!(w_b, "worker-2");
-    pool.release_worker(&w_a, Some("ws-a")).await;
-    pool.release_worker(&w_b, Some("ws-b")).await;
-
-    // Preferring ws-b must pick the worker that recorded ws-b affinity
-    // (worker-2), even though the lowest-index default would otherwise
-    // pick worker-1.
-    let claimed = pool.claim_worker("exec-c", Some("ws-b")).await.unwrap();
-    assert_eq!(claimed, w_b);
-    pool.release_worker(&claimed, Some("ws-b")).await;
-
-    // Preferring an unknown workspace has no affinity match, so it falls
-    // through to the deterministic lowest-index slot (worker-1).
-    let fallback = pool.claim_worker("exec-d", Some("ws-unknown")).await.unwrap();
-    assert_eq!(fallback, w_a);
-}
-
-/// `worker-{N}` and slot N must round-trip 1:1. The
-/// engine-owns-slots refactor depends on this — the runner
-/// derives the pane slot it sends to the app from the worker
-/// id the coordinator handed it. A regression in either format
-/// or parse would silently re-introduce two independent
-/// numbering systems.
-#[test]
-fn worker_id_and_slot_id_round_trip() {
-    // Covers the full interactive pool — Bridge Crew (1..=8) and Lower
-    // Decks (9..=16) — so the second page round-trips 1:1 too.
-    for slot in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
-        let worker_id = WorkerPool::worker_id_for_slot(slot);
-        assert_eq!(worker_id, format!("worker-{slot}"));
-        assert_eq!(slot_id_from_worker_id(&worker_id), Some(slot));
-    }
-}
-
-#[test]
-fn slot_id_from_worker_id_accepts_automation_pool_format() {
-    // Automation-pool ordinals are offset by MAX_WORKER_POOL_SIZE (16) so the
-    // two pools occupy disjoint slot ranges: interactive 1..=16, automation 17..=24.
-    for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
-        let auto_worker_id = format!("auto-worker-{ordinal}");
-        let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8;
-        assert_eq!(
-            slot_id_from_worker_id(&auto_worker_id),
-            Some(expected_slot),
-            "expected Some({expected_slot}) for {auto_worker_id:?}"
-        );
-    }
-    assert_eq!(slot_id_from_worker_id("auto-worker-0"), None);
-    assert_eq!(slot_id_from_worker_id("auto-worker-"), None);
-    assert_eq!(slot_id_from_worker_id("auto-worker-abc"), None);
-}
-
-#[test]
-fn worker_id_for_slot_round_trips_with_slot_id_from_worker_id() {
-    // Interactive pool: slots 1..=16 → "worker-N" → back to the same slot.
-    for slot in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
-        let wid = worker_id_for_slot(slot);
-        assert_eq!(wid, format!("worker-{slot}"));
-        assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
-    }
-    // Automation pool: slots 17..=24 → "auto-worker-M" → back to the same slot.
-    let automation_end = MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
-    for slot in (MAX_WORKER_POOL_SIZE as u8 + 1)..=automation_end {
-        let wid = worker_id_for_slot(slot);
-        let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE;
-        assert_eq!(wid, format!("auto-worker-{expected_ordinal}"));
-        assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
-    }
-    // Review pool: slots 25..=40 → "review-M" → back to the same slot.
-    for slot in (automation_end + 1)..=(automation_end + MAX_REVIEW_POOL_SIZE as u8) {
-        let wid = worker_id_for_slot(slot);
-        let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
-        assert_eq!(wid, format!("review-{expected_ordinal}"));
-        assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
-    }
-}
-
-#[test]
-fn slot_id_from_worker_id_accepts_review_pool_format() {
-    // Review-pool ordinals are offset past both the interactive (16) and
-    // automation (8) ranges, so they occupy slots 25..=40 — disjoint
-    // from every other pool.
-    for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
-        let review_worker_id = format!("review-{ordinal}");
-        let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
-        assert_eq!(
-            slot_id_from_worker_id(&review_worker_id),
-            Some(expected_slot),
-            "expected Some({expected_slot}) for {review_worker_id:?}"
-        );
-    }
-    assert_eq!(slot_id_from_worker_id("review-0"), None);
-    assert_eq!(slot_id_from_worker_id("review-"), None);
-    assert_eq!(slot_id_from_worker_id("review-abc"), None);
-}
-
-#[test]
-fn review_pool_slots_are_disjoint_from_other_pools() {
-    // The slot IDs produced by review-N (25..=40) must not overlap
-    // with any interactive-pool (1..=16) or automation-pool (17..=24) slot.
-    let automation_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE;
-    for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
-        let review_wid = format!("review-{ordinal}");
-        let slot = slot_id_from_worker_id(&review_wid).unwrap();
-        assert!(
-            slot as usize > automation_ceiling,
-            "review-{ordinal} must map to slot > {automation_ceiling}, got {slot}"
-        );
-        // Verify the reverse also works: the slot maps back to a review- id.
-        let back = worker_id_for_slot(slot);
-        assert!(
-            back.starts_with(REVIEW_WORKER_ID_PREFIX),
-            "slot {slot} must produce a review-pool worker_id, got {back:?}"
-        );
-    }
-}
-
-#[test]
-fn worker_page_label_partitions_interactive_pool_only() {
-    // Bridge Crew is page 0 (slots 1..=8), Lower Decks is page 1
-    // (slots 9..=16). Non-interactive slots (automation/review/remote)
-    // have no page label.
-    for slot in 1u8..=WORKER_PAGE_SIZE as u8 {
-        assert_eq!(worker_page_label(slot).as_deref(), Some("Bridge Crew"), "slot {slot}");
-    }
-    for slot in (WORKER_PAGE_SIZE as u8 + 1)..=MAX_WORKER_POOL_SIZE as u8 {
-        assert_eq!(worker_page_label(slot).as_deref(), Some("Lower Decks"), "slot {slot}");
-    }
-    assert_eq!(worker_page_label(0), None);
-    assert_eq!(
-        worker_page_label(MAX_WORKER_POOL_SIZE as u8 + 1),
-        None,
-        "first automation slot has no page"
-    );
-    assert_eq!(
-        worker_page_label(crate::worker_registry::REMOTE_SLOT_BASE),
-        None,
-        "remote virtual slot has no page"
-    );
-}
-
-#[test]
-fn automation_pool_slots_are_disjoint_from_regular_pool() {
-    // The slot IDs produced by auto-worker-N (17..=24) must not
-    // overlap with any interactive-pool slot (1..=16).
-    for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
-        let auto_wid = format!("auto-worker-{ordinal}");
-        let slot = slot_id_from_worker_id(&auto_wid).unwrap();
-        assert!(
-            slot as usize > MAX_WORKER_POOL_SIZE,
-            "auto-worker-{ordinal} must map to slot > {MAX_WORKER_POOL_SIZE}, got {slot}"
-        );
-        // Verify the reverse also works: the slot maps back to an auto-worker- id.
-        let back = worker_id_for_slot(slot);
-        assert!(
-            back.starts_with(AUTOMATION_WORKER_ID_PREFIX),
-            "slot {slot} must produce an automation-pool worker_id, got {back:?}"
-        );
-    }
-}
 
 #[test]
 fn slot_busy_occupant_walks_the_with_context_wrapped_chain() {
@@ -220,150 +44,6 @@ fn slot_busy_occupant_is_none_for_other_start_worker_errors() {
 fn slot_busy_occupant_is_none_for_unrelated_errors() {
     let wrapped = anyhow::anyhow!("workspace lease failed");
     assert_eq!(slot_busy_occupant(&wrapped), None);
-}
-
-#[test]
-fn slot_id_from_worker_id_rejects_garbage() {
-    assert_eq!(slot_id_from_worker_id(""), None);
-    assert_eq!(slot_id_from_worker_id("worker"), None);
-    assert_eq!(slot_id_from_worker_id("worker-"), None);
-    assert_eq!(slot_id_from_worker_id("worker-0"), None);
-    assert_eq!(slot_id_from_worker_id("worker-abc"), None);
-    assert_eq!(slot_id_from_worker_id("agent-1"), None);
-}
-
-#[test]
-fn pool_dispatch_policy_for_worker_id_pins_review_and_automation_to_claude_opus() {
-    // Review and automation pools always dispatch on Claude at the strong
-    // tier (Opus) per the automated-reviewer design §5 — independent of
-    // whatever driver the reviewed/automated row itself carries. Main-pool
-    // workers have no policy and fall through to the row's own driver /
-    // the effort-driven default.
-    let expected = PoolDispatchPolicy {
-        driver: "claude",
-        model_tier: PoolModelTier::Strong,
-    };
-    for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
-        let wid = format!("review-{ordinal}");
-        assert_eq!(
-            pool_dispatch_policy_for_worker_id(&wid),
-            Some(expected),
-            "review pool worker {wid:?} must dispatch on Claude/Opus"
-        );
-    }
-    for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
-        let wid = format!("auto-worker-{ordinal}");
-        assert_eq!(
-            pool_dispatch_policy_for_worker_id(&wid),
-            Some(expected),
-            "automation pool worker {wid:?} must dispatch on Claude/Opus"
-        );
-    }
-    for ordinal in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
-        let wid = format!("worker-{ordinal}");
-        assert_eq!(
-            pool_dispatch_policy_for_worker_id(&wid),
-            None,
-            "main pool worker {wid:?} must have no pool dispatch policy"
-        );
-    }
-}
-
-/// The kind-side companion of the policy above must agree with it: a kind
-/// this reports as pool-pinned really does land on a pool whose worker ids
-/// carry a dispatch policy, and an ordinary implementation kind does not.
-/// Traffic allocation declines the former on the strength of this claim
-/// (`work::driver_allocation::decide_execution_driver`), so the two must not
-/// drift apart.
-#[test]
-fn kind_always_dispatches_on_pool_driver_matches_the_pinned_pools() {
-    for (kind, worker_id) in [
-        (boss_protocol::ExecutionKind::PrReview, "review-1"),
-        (boss_protocol::ExecutionKind::AutomationTriage, "auto-worker-1"),
-    ] {
-        assert!(
-            kind_always_dispatches_on_pool_driver(&kind),
-            "{kind} runs on {worker_id}, whose driver is pinned"
-        );
-        assert!(
-            pool_dispatch_policy_for_worker_id(worker_id).is_some(),
-            "{worker_id} must carry a pinned dispatch policy"
-        );
-    }
-    for kind in [
-        boss_protocol::ExecutionKind::TaskImplementation,
-        boss_protocol::ExecutionKind::ChoreImplementation,
-        boss_protocol::ExecutionKind::RevisionImplementation,
-        boss_protocol::ExecutionKind::InvestigationImplementation,
-        boss_protocol::ExecutionKind::CiRemediation,
-        boss_protocol::ExecutionKind::ConflictResolution,
-    ] {
-        assert!(
-            !kind_always_dispatches_on_pool_driver(&kind),
-            "{kind} dispatches on the main pool, which has no pinned driver"
-        );
-    }
-    assert_eq!(pool_dispatch_policy_for_worker_id("worker-1"), None);
-}
-
-#[tokio::test]
-async fn worker_pool_claims_lowest_free_slot_deterministically() {
-    // Claim-release-claim must always return to the lowest free slot —
-    // the deterministic replacement for the old random spread. Every
-    // claim after a release lands back on worker-1, never a higher slot.
-    let pool = WorkerPool::new(4);
-    for i in 0..50 {
-        let claimed = pool.claim_worker(&format!("exec-{i}"), None).await.unwrap();
-        assert_eq!(
-            claimed, "worker-1",
-            "deterministic claim must always pick the lowest free slot"
-        );
-        pool.release_worker(&claimed, None).await;
-    }
-    // Held claims fill strictly in ascending slot order.
-    let mut held = Vec::new();
-    for i in 0..4 {
-        held.push(pool.claim_worker(&format!("hold-{i}"), None).await.unwrap());
-    }
-    assert_eq!(held, vec!["worker-1", "worker-2", "worker-3", "worker-4"]);
-}
-
-#[tokio::test]
-async fn worker_pool_strict_spillover_fills_bridge_crew_before_lower_decks() {
-    // The interactive pool is two pages of WORKER_PAGE_SIZE. Bridge Crew
-    // (page 0) must be fully occupied before any Lower Decks (page 1) slot
-    // is claimed, and a freed Bridge Crew slot must be preferred over an
-    // idle Lower Decks slot at the next claim (preference is claim-time
-    // only — running Lower Decks workers are never migrated).
-    let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE);
-
-    // The first WORKER_PAGE_SIZE claims all land on Bridge Crew, in order.
-    for n in 1..=WORKER_PAGE_SIZE {
-        let claimed = pool.claim_worker(&format!("bc-{n}"), None).await.unwrap();
-        assert_eq!(claimed, format!("worker-{n}"), "claim {n} must stay on Bridge Crew");
-        assert_eq!(
-            worker_page_label(slot_id_from_worker_id(&claimed).unwrap()).as_deref(),
-            Some("Bridge Crew")
-        );
-    }
-
-    // With all 8 Bridge Crew slots occupied, the 9th concurrent claim is
-    // the first to spill into Lower Decks — worker-9, slot 9, page 1.
-    let spill = pool.claim_worker("ld-1", None).await.unwrap();
-    assert_eq!(spill, format!("worker-{}", WORKER_PAGE_SIZE + 1));
-    let spill_slot = slot_id_from_worker_id(&spill).unwrap();
-    assert_eq!(spill_slot, WORKER_PAGE_SIZE as u8 + 1);
-    assert_eq!(worker_page_label(spill_slot).as_deref(), Some("Lower Decks"));
-
-    // Free a Bridge Crew slot (worker-3). The next claim must reclaim it
-    // rather than continuing to grow Lower Decks — strict spillover applies
-    // at claim time, so a free page-0 slot always beats an idle page-1 one.
-    pool.release_worker("worker-3", None).await;
-    let reclaim = pool.claim_worker("bc-again", None).await.unwrap();
-    assert_eq!(
-        reclaim, "worker-3",
-        "a freed Bridge Crew slot must be preferred over Lower Decks"
-    );
 }
 
 #[tokio::test]
@@ -1027,7 +707,9 @@ async fn pool_exhaustion_recovers_automatically_when_slot_frees_without_manual_i
         .find(|claim| claim.execution_id == winner_execution.id)
         .map(|claim| claim.worker_id)
         .expect("winner's execution should hold a claimed worker slot");
-    coordinator.release_worker_and_kick(&claimed_worker_id, None).await;
+    coordinator
+        .release_worker_and_kick(&claimed_worker_id, &winner_execution.id, None)
+        .await;
 
     // No manual intervention: the waiter must pick up the freed slot on
     // its own, driven purely by the release's kick.
@@ -1874,13 +1556,13 @@ async fn kick_during_active_scheduler_latches_pending_wakeup() {
     ));
 
     // Simulate "another scheduler is already running".
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     coordinator.kick();
 
     assert!(
-        coordinator.scheduling_pending.load(Ordering::Acquire),
+        coordinator.scheduling_pending().load(Ordering::Acquire),
         "kick that lost the active-flag race must still latch pending so the alive \
              scheduler re-enters its drain loop instead of exiting on stale state",
     );
@@ -1918,17 +1600,17 @@ async fn ready_row_added_during_active_window_still_dispatches() {
     //      returns, and the (now-exiting) scheduler drops the
     //      guard without re-checking. New row stranded.
     //   3. With the fix: kick latches pending=true.
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
     coordinator.kick(); // noop on `active`, but latches pending
 
     // Now simulate the previous scheduler exiting: it must
     // honour the pending bit. Drop `active` and re-enter
     // `run_scheduler` exactly as the lossless-wakeup logic
     // would on the post-drain re-check path.
-    coordinator.scheduling_active.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(false, Ordering::Release);
     assert!(
-        coordinator.scheduling_pending.load(Ordering::Acquire),
+        coordinator.scheduling_pending().load(Ordering::Acquire),
         "post-drain re-check must see pending=true so the new row is not lost",
     );
 
@@ -1972,16 +1654,16 @@ async fn dispatch_ready_event_during_active_scheduler_latches_pending_wakeup() {
     // `scheduling_active`/`scheduling_pending` state this test hand-sets
     // below. This is the same filter that method installs.
     let mut subscription = coordinator
-        .event_bus
+        .event_bus()
         .subscribe(TopicFilter::kind(EventKind::DispatchReady));
 
     // Simulate "another scheduler is already running".
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     coordinator.kick();
     assert!(
-        !coordinator.scheduling_pending.load(Ordering::Acquire),
+        !coordinator.scheduling_pending().load(Ordering::Acquire),
         "a bus-routed kick() must not latch scheduling_pending directly — only the \
          subscriber's reaction to the event may, otherwise the flag changes nothing \
          observable and there is nothing to roll back",
@@ -1994,10 +1676,10 @@ async fn dispatch_ready_event_during_active_scheduler_latches_pending_wakeup() {
     assert_eq!(event, Event::DispatchReady);
 
     // The subscriber's reaction to the event it just received.
-    coordinator.note_dispatch_ready();
+    coordinator.note_dispatch_ready_for_test();
 
     assert!(
-        coordinator.scheduling_pending.load(Ordering::Acquire),
+        coordinator.scheduling_pending().load(Ordering::Acquire),
         "a DispatchReady event delivered while scheduling_active is true must still latch \
          scheduling_pending so the alive scheduler re-enters its drain loop instead of \
          exiting on stale state — same TOCTOU contract as \
@@ -2053,8 +1735,8 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
     // `spawn_dispatch_ready_subscriber`'s doc) finds a scheduler already
     // "active" and only latches `scheduling_pending`, rather than racing
     // a real `run_scheduler` task to completion on an empty queue.
-    coordinator.scheduling_active.store(true, Ordering::Release);
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     let handle = coordinator
         .spawn_dispatch_ready_subscriber()
@@ -2066,7 +1748,7 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
     // below must re-latch.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if coordinator.scheduling_pending.load(Ordering::Acquire) {
+            if coordinator.scheduling_pending().load(Ordering::Acquire) {
                 break;
             }
             sleep(Duration::from_millis(2)).await;
@@ -2074,14 +1756,14 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
     })
     .await
     .expect("subscriber's reconcile-on-start pass must latch scheduling_pending");
-    coordinator.scheduling_pending.store(false, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
 
     // The real path under test — no hand-call to note_dispatch_ready.
     coordinator.kick();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if coordinator.scheduling_pending.load(Ordering::Acquire) {
+            if coordinator.scheduling_pending().load(Ordering::Acquire) {
                 break;
             }
             sleep(Duration::from_millis(2)).await;
@@ -2115,7 +1797,7 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
 #[tokio::test]
 async fn heartbeat_guard_renews_lease_until_dropped() {
     use super::helpers::{HeartbeatGuard, LocalHostAdapter};
-    use crate::host_adapter::HostAdapter;
+    use boss_execution_contracts::HostAdapter;
 
     let cube = Arc::new(FakeCubeClient::default());
     // Thin shim: wrap the FakeCubeClient in a LocalHostAdapter so the
@@ -2240,7 +1922,7 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
     // Threshold far in the future: the freshly-inserted row is too
     // young to count as stranded.
     let ready = db.list_ready_executions().unwrap();
-    let fresh = coordinator.stranded_ready_executions(&ready, 60_000);
+    let fresh = coordinator.stranded_ready_executions_for_test(&ready, 60_000);
     assert!(
         fresh.is_empty(),
         "row younger than the threshold must not be flagged as stranded: {fresh:?}",
@@ -2248,7 +1930,7 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
 
     // Threshold of zero: any ready row should appear. The
     // execution we just inserted is in the queue with age >= 0.
-    let any = coordinator.stranded_ready_executions(&ready, 0);
+    let any = coordinator.stranded_ready_executions_for_test(&ready, 0);
     assert!(
         any.iter().any(|(id, _)| id == &execution_id),
         "with min_age_ms=0 the helper must surface the freshly-inserted ready row; \
@@ -2297,8 +1979,8 @@ fn overdue_ready_answer_agent_files_one_question_specific_attention() {
         Arc::new(FakeExecutionRunner::default()),
     );
     let ready = db.list_ready_executions().unwrap();
-    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
-    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
+    coordinator.raise_ready_answer_agent_alarms_for_test(&ready, Duration::ZERO);
+    coordinator.raise_ready_answer_agent_alarms_for_test(&ready, Duration::ZERO);
 
     // Read the item back through the same public API a real surface
     // (e.g. `handle_list_attention_items_for_work_item`) would use — not a
@@ -2410,7 +2092,9 @@ async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
     db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
 
     let metrics = Arc::new(crate::metrics::Registry::new());
-    crate::metrics_init::init_all(&metrics);
+    crate::answer_agent_observability::register_metrics(&metrics);
+    crate::coordinator::register_metrics(&metrics);
+    crate::dispatch_metrics::register_metrics(&metrics);
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
     let mut coordinator = ExecutionCoordinator::new(
         db.clone(),
@@ -2428,7 +2112,7 @@ async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
         .expect("worker should be available");
 
     coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await
         .unwrap();
 

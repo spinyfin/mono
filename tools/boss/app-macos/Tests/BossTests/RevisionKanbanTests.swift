@@ -133,18 +133,18 @@ final class RevisionKanbanTests: XCTestCase {
     // MARK: project grouping
 
     /// Chore-parented revisions (nil projectID) must appear under the "No
-    /// Project" section in project-grouped mode, alongside other
+    /// Project" section in project-grouped Backlog, alongside other
     /// un-projected work — kind is not a grouping axis.
     func testChoreParentedRevisionGroupsUnderNoProject() {
         let model = makeModel()
         model.workBoardGrouping = .project
-        let chore = makeChore(id: "chore_c19", status: "active")
+        let chore = makeChore(id: "chore_c19", status: "todo")
         let revision = makeChoreParentedRevision(
-            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: true
+            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: false
         )
         model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
 
-        let sections = model.workSections(in: .doing)
+        let sections = model.workSections(in: .backlog)
         let titles = sections.map(\.title)
         XCTAssertTrue(titles.contains("No Project"),
                       "chore-parented revision must appear in the 'No Project' section")
@@ -153,6 +153,163 @@ final class RevisionKanbanTests: XCTestCase {
             noProjectSection?.items.contains { $0.id == revision.id } ?? false,
             "revision must be in the No Project section"
         )
+    }
+
+    func testChoreParentedRevisionInDoingFollowsEngineMembershipInProjectMode() {
+        let model = makeModel()
+        model.workBoardGrouping = .project
+        let chore = makeChore(id: "chore_c19", status: "active")
+        let revision = makeChoreParentedRevision(
+            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: true
+        )
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+
+        let queued = model.workSections(in: .doing)
+        XCTAssertEqual(queued.map(\.title), ["Queued"])
+        XCTAssertEqual(Set(queued.flatMap(\.items).map(\.id)), [chore.id, revision.id])
+        XCTAssertEqual(queued.flatMap(\.items).count, 2)
+
+        model.applyEventForTest(.workerLiveStatesList(states: [], doingSections: [revision.id: .coding]))
+        let started = model.workSections(in: .doing)
+        XCTAssertEqual(started.map(\.title), ["Coding", "Queued"])
+        XCTAssertEqual(started[0].items.map(\.id), [revision.id])
+        XCTAssertEqual(started[1].items.map(\.id), [chore.id])
+    }
+
+    // MARK: AI review of a revision stays in Doing, then folds into the parent
+
+    /// A revision whose own run finished while its PR's automated review runs
+    /// is still `active`: it stays a Doing card, in the engine's Reviewing
+    /// group rather than Queued, and has no Review card.
+    func testRevisionUnderAIReviewStaysInDoingReviewingGroupAndNeverInReview() {
+        let model = makeModel()
+        let chore = makeChore(id: "chore_c20", status: "in_review")
+        var revision = makeChoreParentedRevision(id: "task_t30", status: "active", seq: 1, parentID: chore.id)
+        revision.aiReviewing = true
+        revision.aiReviewStage = "reviewers"
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+        model.applyEventForTest(.workerLiveStatesList(states: [], doingSections: [revision.id: .reviewing]))
+
+        let doing = model.workSections(in: .doing)
+        XCTAssertEqual(doing.map(\.title), ["Reviewing"], "not Queued: the review is running")
+        XCTAssertEqual(doing.flatMap(\.items).map(\.id), [revision.id])
+        XCTAssertFalse(model.workItems(in: .review).contains { $0.id == revision.id },
+                       "a revision must never be a standalone Review card")
+        XCTAssertEqual(model.workItems(in: .review).map(\.id), [chore.id])
+    }
+
+    /// The card shows the review as the engine reports it, not "Queued".
+    func testRevisionUnderAIReviewShowsAIReviewInProgress() {
+        var revision = makeChoreParentedRevision(id: "task_t31", status: "active", seq: 1, parentID: "chore_c21")
+        revision.aiReviewing = true
+        revision.aiReviewStage = "reviewers"
+        XCTAssertEqual(
+            AgentActivityState.forDoingCard(
+                runtime: nil, liveState: nil, isDispatchPending: false,
+                isResolvingConflicts: false, isRemediatingCI: false,
+                isAIReviewing: revision.aiReviewing, aiReviewStage: revision.aiReviewStage
+            ),
+            .waiting(reason: "AI review in progress")
+        )
+    }
+
+    /// The reviewers are bound to the PR, so the revision card finds them by
+    /// the PR they review, and only while the engine reports the review live.
+    func testRevisionUnderAIReviewLinksTheLiveReviewersOfItsPR() {
+        func reviewer(_ name: String, slot: Int, pr: String) -> WorkerLiveState {
+            WorkerLiveState(
+                name: name, slotId: slot, runId: "review-\(slot)", model: "fixture", shellPid: 0,
+                lastEventAt: nil, currentTool: nil, lastToolEndedAt: nil, activity: .working,
+                liveStatus: nil, liveStatusAt: nil, recoveryStatus: nil, tmuxHosted: true,
+                agentType: "review", reviewStage: slot == 2 ? "consolidation" : "reviewers", executionKind: "pr_review",
+                workItemId: "chore_c22", prURL: pr
+            )
+        }
+        let pr = "https://github.com/org/repo/pull/250"
+        let index = WorkBoardSectionItemsView.reviewerIndex(states: [
+            reviewer("B", slot: 2, pr: pr),
+            reviewer("A", slot: 1, pr: "https://github.com/Org/Repo/pull/250"),
+            reviewer("Other", slot: 3, pr: "https://github.com/org/repo/pull/999"),
+        ])
+        var revision = makeChoreParentedRevision(id: "task_t32", status: "active", seq: 1, parentID: "chore_c22")
+        XCTAssertTrue(WorkBoardSectionItemsView.reviewWorkers(for: revision, index: index).isEmpty,
+                      "no reviewers shown until the engine reports the review as running")
+        revision.aiReviewing = true
+        XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: revision, index: index).map(\.slotId), [1, 2])
+        var primary = makeChore(id: "chore_c22", status: "in_review")
+        primary.prURL = pr
+        XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: primary, index: index).map(\.slotId), [1, 2])
+        XCTAssertEqual(WorkBoardSectionItemsView.reviewWorkers(for: primary, index: index).map(\.reviewStage), ["reviewers", "consolidation"])
+        XCTAssertEqual(ReviewPRIdentity(pr), ReviewPRIdentity("https://github.com/Org/Repo/pull/250"))
+        XCTAssertEqual(AgentActivityState.aiReviewCaption(stage: "applying"), "Applying AI review verdict")
+    }
+
+    /// Once the review is consolidated the revision reaches `in_review` and
+    /// has no card in any column; the parent's card carries it inline.
+    func testConsolidatedRevisionFoldsIntoParentWithNoCardInAnyColumn() {
+        let model = makeModel()
+        let chore = makeChore(id: "chore_c23", status: "in_review")
+        let revision = makeChoreParentedRevision(id: "task_t33", status: "in_review", seq: 1, parentID: chore.id)
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+        model.applyEventForTest(.workerLiveStatesList(states: [], doingSections: [:]))
+
+        XCTAssertTrue(revision.isFoldedRevision)
+        for column in [WorkBoardColumnKey.backlog, .doing, .review, .done] {
+            XCTAssertFalse(model.workItems(in: column).contains { $0.id == revision.id },
+                           "folded revision must not be a card in \(column)")
+        }
+        XCTAssertEqual(model.inReviewRevisions(forParentTaskID: chore.id).map(\.id), [revision.id])
+    }
+
+    func testParserPreservesEngineFoldDecision() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload: [String: Any] = [
+            "id": "revision", "product_id": "product", "kind": "revision", "name": "Revision",
+            "description": "", "status": "blocked", "blocked_reason": "ci_failure",
+            "created_at": "0", "updated_at": "0", "board_folded_revision": true
+        ]
+        XCTAssertTrue(try XCTUnwrap(client.parseTask(payload)).isFoldedRevision)
+        payload["board_folded_revision"] = false
+        XCTAssertFalse(try XCTUnwrap(client.parseTask(payload)).isFoldedRevision)
+    }
+
+    func testFoldedProjectionControlsBoardMembershipIncludingBlockedRevisions() {
+        for reason in ["merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback"] {
+            assertFoldedBlockedRevision(reason: reason)
+        }
+    }
+
+    private func assertFoldedBlockedRevision(reason: String) {
+        let model = makeModel()
+        let parent = makeParent(status: "in_review")
+        var revision = makeRevision(status: "blocked", seq: 2, parentID: parent.id)
+        revision.blockedReason = reason
+        revision.boardFoldedRevision = true
+        let reviewing = makeRevision(status: "in_review", seq: 1, parentID: parent.id)
+        let done = makeRevision(status: "done", seq: 3, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, revision, done, reviewing]]
+        for column in [WorkBoardColumnKey.backlog, .doing, .review, .done] {
+            XCTAssertFalse(model.workItems(in: column).contains { $0.id == revision.id }, reason)
+        }
+        XCTAssertEqual(model.inReviewRevisions(forParentTaskID: parent.id).map(\.id),
+                       [reviewing.id, revision.id], reason)
+        XCTAssertEqual(model.doneRevisions(forParentTaskID: parent.id).map(\.id), [done.id], reason)
+        XCTAssertEqual(WorkCardRevisionRollup(revision: revision).blockedReason, reason)
+        XCTAssertEqual(model.revealCardTarget(for: revision.id), .revealed(cardID: parent.id), reason)
+        revision.boardFoldedRevision = false
+        model.applyIncrementalTaskUpdate(revision, isChore: false)
+        XCTAssertTrue(model.workItems(in: .review).contains { $0.id == revision.id },
+                      "the engine projection, rather than a client status predicate, owns folding")
+        XCTAssertEqual(model.inReviewRevisions(forParentTaskID: parent.id).map(\.id), [reviewing.id])
+        XCTAssertEqual(model.revealCardTarget(for: revision.id), .revealed(cardID: revision.id))
+    }
+
+    func testRevisionInDoingIsNotFolded() {
+        for status in ["todo", "active", "blocked"] {
+            XCTAssertFalse(makeRevision(status: status, seq: 1).isFoldedRevision, status)
+        }
+        XCTAssertTrue(makeRevision(status: "in_review", seq: 1).isFoldedRevision)
+        XCTAssertTrue(makeRevision(status: "done", seq: 1).isFoldedRevision)
     }
 
     /// Project-task-parented revisions (with a projectID) must appear under
@@ -391,7 +548,8 @@ final class RevisionKanbanTests: XCTestCase {
             updatedAt: "2026-05-26T00:00:00Z",
             parentTaskId: parentID,
             revisionSeq: seq,
-            revisionParentPrUrl: parentPrUrl
+            revisionParentPrUrl: parentPrUrl,
+            boardFoldedRevision: status == "in_review" || status == "done"
         )
     }
 
@@ -442,7 +600,8 @@ final class RevisionKanbanTests: XCTestCase {
             autostart: autostart,
             parentTaskId: parentID,
             revisionSeq: seq,
-            revisionParentPrUrl: "https://github.com/org/repo/pull/250"
+            revisionParentPrUrl: "https://github.com/org/repo/pull/250",
+            boardFoldedRevision: status == "in_review" || status == "done"
         )
     }
 

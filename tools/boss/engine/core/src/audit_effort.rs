@@ -18,30 +18,21 @@ use crate::effort::{
     marker_matches_text, original_level_for_marker,
 };
 
-/// One chore as the audit sees it: just enough to run the marker
-/// matcher. The engine layer projects rows out of the `tasks` table
-/// into this shape; tests construct it directly.
-#[derive(Debug, Clone)]
-pub struct ChoreForAudit {
-    pub name: String,
-    pub description: String,
-}
+pub use boss_engine_storage_values::ChoreForAudit;
 
-impl ChoreForAudit {
-    /// The combined haystack used for marker matching. The design's
-    /// §Q4 rule 5 is title-only; rule 2 / rule 4 are title-OR-
-    /// description. The audit widens to title + description for
-    /// every marker so the denominator is consistent across rules,
-    /// and so a description that mentions `cursor` but has it
-    /// removed from the title still counts for the audit's "are we
-    /// matching this marker often enough to learn from it" check.
-    fn haystack(&self) -> String {
-        let mut s = String::with_capacity(self.name.len() + self.description.len() + 1);
-        s.push_str(&self.name);
-        s.push(' ');
-        s.push_str(&self.description);
-        s
-    }
+/// The combined haystack used for marker matching. The design's
+/// §Q4 rule 5 is title-only; rule 2 / rule 4 are title-OR-
+/// description. The audit widens to title + description for
+/// every marker so the denominator is consistent across rules,
+/// and so a description that mentions `cursor` but has it
+/// removed from the title still counts for the audit's "are we
+/// matching this marker often enough to learn from it" check.
+fn haystack(chore: &ChoreForAudit) -> String {
+    let mut s = String::with_capacity(chore.name.len() + chore.description.len() + 1);
+    s.push_str(&chore.name);
+    s.push(' ');
+    s.push_str(&chore.description);
+    s
 }
 
 /// True iff `new_level` is strictly higher than `original_level` on
@@ -87,7 +78,7 @@ pub fn build_report(
     // count is in the hundreds per product, so this is cheap.
     let mut matches_per_marker: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for chore in chores {
-        let haystack = chore.haystack();
+        let haystack = haystack(chore);
         for marker in all_markers() {
             if marker_matches_text(marker, &haystack) {
                 *matches_per_marker.entry(marker.to_ascii_lowercase()).or_insert(0) += 1;

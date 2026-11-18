@@ -1,0 +1,613 @@
+//! Periodic reclaim of Boss-owned per-run Antigravity (`agy`) home
+//! containers past retention policy. Mirrors
+//! `tools/boss/engine/core/src/grok_home_retention_sweep.rs`.
+//!
+//! Loads recorded roots exclusively from
+//! `work_executions.driver_runtime_state` (see
+//! [`boss_engine_driver::agy::AgyRuntimeState`]), classifies live vs
+//! terminal from **execution status**, and hands the candidate list to
+//! [`boss_engine_agy_home_retention`]. Never:
+//!
+//! - infers a home from the engine environment / `$HOME` / `~/.gemini`
+//! - deletes a path that is not recorded on an execution row
+//! - judges liveness from file mtime
+//!
+//! Cleanup is best-effort and non-fatal: a reclaim error is logged and the
+//! next pass retries. Idempotent when a home is already gone.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use boss_engine_agy_home_retention as retention;
+use boss_engine_driver::agy::{AgyRuntimeState, assert_agy_home_safe_to_delete, contains_agy_transcripts};
+
+use crate::work::WorkDb;
+
+/// How often the retention pass runs. Same cadence as the Grok-home sweep:
+/// reclaim is not time-critical once the policy window has elapsed.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Counts from one pass; logged when anything was reclaimed or errored.
+#[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
+pub struct AgyHomeRetentionSweepOutcome {
+    #[builder(default)]
+    pub scanned: u64,
+    #[builder(default)]
+    pub deleted: u64,
+    #[builder(default)]
+    pub already_absent: u64,
+    #[builder(default)]
+    pub deleted_bytes: u64,
+    #[builder(default)]
+    pub skipped_live: u64,
+    #[builder(default)]
+    pub kept_in_policy: u64,
+    #[builder(default)]
+    pub errors: u64,
+    #[builder(default)]
+    pub kept_for_transcripts: u64,
+    #[builder(default)]
+    pub kept_for_transcripts_bytes: u64,
+}
+
+impl crate::sweep_loop::SweepOutcome for AgyHomeRetentionSweepOutcome {
+    fn has_activity(&self) -> bool {
+        self.deleted > 0 || self.errors > 0 || self.kept_for_transcripts > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            scanned = self.scanned,
+            deleted = self.deleted,
+            already_absent = self.already_absent,
+            deleted_bytes = self.deleted_bytes,
+            skipped_live = self.skipped_live,
+            kept_in_policy = self.kept_in_policy,
+            errors = self.errors,
+            kept_for_transcripts = self.kept_for_transcripts,
+            kept_for_transcripts_bytes = self.kept_for_transcripts_bytes,
+            "agy-home retention sweep: reclaimed Boss-owned agy run containers past policy",
+        );
+    }
+}
+
+/// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
+pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        async move { run_one_pass(work_db.as_ref(), false).await }
+    })
+}
+
+/// Run a single reclaim pass with the default policy.
+pub async fn run_one_pass(work_db: &WorkDb, dry_run: bool) -> AgyHomeRetentionSweepOutcome {
+    run_one_pass_with_policy(work_db, &retention::AgyHomeRetentionPolicy::default(), dry_run).await
+}
+
+/// Run a single reclaim pass with an explicit policy (bossctl / tests).
+pub async fn run_one_pass_with_policy(
+    work_db: &WorkDb,
+    policy: &retention::AgyHomeRetentionPolicy,
+    dry_run: bool,
+) -> AgyHomeRetentionSweepOutcome {
+    // Rewrite pointers into per-run homes before those homes are deleted.
+    // This also runs from `bossctl agy-homes`, outside engine startup.
+    work_db.apply_durable_transcript_path_backfill();
+
+    let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+
+    let executions = match work_db.list_executions_with_driver_runtime_state() {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "agy-home retention sweep: failed to list executions with runtime state; skipping"
+            );
+            return AgyHomeRetentionSweepOutcome::default();
+        }
+    };
+
+    let mut homes = Vec::new();
+    for execution in &executions {
+        let Some(state) = execution.driver_runtime_state.as_ref() else {
+            continue;
+        };
+        let runtime = match AgyRuntimeState::from_driver_runtime_state(state) {
+            Ok(r) => r,
+            Err(_) => {
+                // Not an agy payload (or corrupt) — other drivers store
+                // their own shape here. Skip silently.
+                continue;
+            }
+        };
+        if runtime.process_home.as_os_str().is_empty() {
+            continue;
+        }
+        // Reclaim the whole run container (`process-home/` + `control/` +
+        // `rules-root/`), not the process HOME alone, so the control
+        // directory and rules tree are never left as permanent orphans.
+        let container = runtime
+            .process_home
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| runtime.process_home.clone());
+        let age_anchor_epoch = execution
+            .finished_epoch()
+            .or_else(|| execution.created_epoch())
+            .unwrap_or(now_epoch);
+        // Live = non-terminal. Ready/queued rows that somehow hold a
+        // recorded home (e.g. re-dispatch after partial provision) stay
+        // protected until they finish.
+        let is_live = !execution.status.is_terminal();
+        let size_bytes = retention::directory_size_bytes(&container);
+        homes.push(retention::OwnedAgyHome {
+            path: container,
+            execution_id: execution.id.clone(),
+            is_live,
+            age_anchor_epoch,
+            size_bytes,
+        });
+    }
+
+    if homes.is_empty() {
+        return AgyHomeRetentionSweepOutcome::default();
+    }
+
+    match retention::execute_reclaim(
+        &homes,
+        now_epoch,
+        policy,
+        dry_run,
+        &assert_agy_home_safe_to_delete,
+        &contains_agy_transcripts,
+    ) {
+        Ok(report) => {
+            for error in &report.errors {
+                tracing::warn!(%error, "agy-home retention sweep: failed to reclaim a recorded root");
+            }
+            AgyHomeRetentionSweepOutcome {
+                scanned: report.scanned as u64,
+                deleted: report.deleted.len() as u64,
+                already_absent: report.already_absent.len() as u64,
+                deleted_bytes: report.deleted_bytes,
+                skipped_live: report.skipped_live as u64,
+                kept_in_policy: report.kept_in_policy as u64,
+                errors: report.errors.len() as u64,
+                kept_for_transcripts: report.kept_for_transcripts as u64,
+                kept_for_transcripts_bytes: report.kept_for_transcripts_bytes,
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "agy-home retention sweep: execute_reclaim failed; skipping this pass"
+            );
+            AgyHomeRetentionSweepOutcome::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use crate::work::CreateChoreInput;
+    use boss_engine_driver::agy::AgyRuntimeState;
+    use boss_protocol::DriverRuntimeState;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_epoch() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn seed_execution_with_home(
+        db: &WorkDb,
+        work_item_id: &str,
+        status: &str,
+        finished_at: i64,
+        process_home: &Path,
+    ) -> String {
+        let execution = db
+            .request_execution(
+                boss_protocol::RequestExecutionInput::builder()
+                    .work_item_id(work_item_id)
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = ?2, finished_at = ?3, created_at = ?3 WHERE id = ?1",
+                rusqlite::params![execution.id, status, finished_at.to_string()],
+            )
+            .unwrap();
+        }
+        let container = process_home.parent().unwrap_or(process_home);
+        let state = AgyRuntimeState::builder()
+            .process_home(process_home.to_path_buf())
+            .control_dir(container.join("control"))
+            .session_settings_path(container.join("control/session-settings.json"))
+            .log_file(container.join("control/agy.log"))
+            .workspace_path(PathBuf::from("/tmp/ws"))
+            .agy_binary(PathBuf::from("/tmp/agy"))
+            .build()
+            .to_driver_runtime_state();
+        db.set_driver_runtime_state(&execution.id, Some(&state)).unwrap();
+        execution.id
+    }
+
+    fn write_agy_container(container: &Path) {
+        std::fs::create_dir_all(container.join("process-home/.gemini/antigravity-cli/brain")).unwrap();
+        std::fs::create_dir_all(container.join("process-home/.gemini/antigravity-cli/conversations")).unwrap();
+        std::fs::create_dir_all(container.join("control")).unwrap();
+        std::fs::create_dir_all(container.join("rules-root/.agents/rules")).unwrap();
+        std::fs::write(
+            container.join("process-home/.gemini/antigravity-cli/conversation_summaries.db"),
+            "sqlite",
+        )
+        .unwrap();
+        std::fs::write(container.join("process-home/.gemini/antigravity-cli/marker"), "x").unwrap();
+    }
+
+    #[test]
+    fn retention_preserves_transcripts_under_age_and_byte_pressure() {
+        let tmp = tempfile::tempdir().unwrap();
+        for components in boss_engine_driver::agy::AGY_TRANSCRIPT_PATHS {
+            let subtree = components.last().unwrap();
+            for policy in [
+                retention::AgyHomeRetentionPolicy::new(Duration::ZERO, u64::MAX),
+                retention::AgyHomeRetentionPolicy::new(Duration::from_secs(u64::MAX), 0),
+            ] {
+                let container = tmp.path().join(subtree);
+                write_agy_container(&container);
+                let transcript = components
+                    .iter()
+                    .fold(container.clone(), |path, part| path.join(part))
+                    .join("conversation.jsonl");
+                std::fs::write(&transcript, "conversation evidence").unwrap();
+                let homes = [retention::OwnedAgyHome {
+                    path: container.clone(),
+                    execution_id: "terminal-run".into(),
+                    is_live: false,
+                    age_anchor_epoch: 0,
+                    size_bytes: retention::directory_size_bytes(&container),
+                }];
+                let plan = retention::plan_reclaim(&homes, now_epoch(), &policy, &contains_agy_transcripts);
+                assert!(plan.to_delete.is_empty(), "{plan:?}");
+                for dry_run in [true, false] {
+                    let report = retention::execute_reclaim(
+                        &homes,
+                        now_epoch(),
+                        &policy,
+                        dry_run,
+                        &|_| Ok(()),
+                        &contains_agy_transcripts,
+                    )
+                    .unwrap();
+                    assert!(report.deleted.is_empty(), "{report:?}");
+                    assert!(report.errors.is_empty(), "{report:?}");
+                    assert_eq!(report.scanned, 1);
+                    assert_eq!(report.kept_in_policy, 0);
+                    assert_eq!(report.kept_for_transcripts, 1);
+                    assert_eq!(report.kept_for_transcripts_bytes, homes[0].size_bytes);
+                    assert_eq!(report.deleted_bytes, 0);
+                    assert_eq!(std::fs::read_to_string(&transcript).unwrap(), "conversation evidence");
+                }
+                std::fs::remove_dir_all(&container).unwrap();
+            }
+        }
+    }
+
+    /// Driven by a test-owned current-thread runtime rather than
+    /// `#[tokio::test]` so the homes-root override can be held for the
+    /// whole sweep instead of only around the `set_var` — mirrors the
+    /// equivalent Grok sweep test's rationale.
+    #[test]
+    fn sweep_reclaims_only_recorded_terminal_containers_past_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-agy-homes");
+        std::fs::create_dir_all(&homes_root).unwrap();
+
+        let _env_guard = boss_engine_driver::test_support::agy_homes_override(&homes_root);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(sweep_reclaims_only_recorded_terminal_containers_past_age_body(
+                &homes_root,
+            ));
+    }
+
+    async fn sweep_reclaims_only_recorded_terminal_containers_past_age_body(homes_root: &Path) {
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let chore = |name: &str| {
+            db.create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id.clone())
+                    .name(name.to_owned())
+                    .build(),
+            )
+            .unwrap()
+            .id
+        };
+        let old_item = chore("agy-retention-old");
+        let live_item = chore("agy-retention-live");
+        let recent_item = chore("agy-retention-recent");
+        let protected_item = chore("agy-retention-transcripts");
+
+        let now = now_epoch();
+        let old_container = homes_root.join("old-run");
+        let live_container = homes_root.join("live-run");
+        let recent_container = homes_root.join("recent-run");
+        for c in [&old_container, &live_container, &recent_container] {
+            write_agy_container(c);
+        }
+
+        seed_execution_with_home(
+            &db,
+            &old_item,
+            "completed",
+            now - 40 * 24 * 60 * 60,
+            &old_container.join("process-home"),
+        );
+        seed_execution_with_home(
+            &db,
+            &live_item,
+            "running",
+            now - 40 * 24 * 60 * 60,
+            &live_container.join("process-home"),
+        );
+        seed_execution_with_home(
+            &db,
+            &recent_item,
+            "completed",
+            now - 60,
+            &recent_container.join("process-home"),
+        );
+
+        let protected_container = homes_root.join("transcript-run");
+        write_agy_container(&protected_container);
+        let transcript_dir = boss_engine_driver::agy::AGY_TRANSCRIPT_PATHS[0]
+            .iter()
+            .fold(protected_container.clone(), |path, part| path.join(part));
+        let transcript = transcript_dir.join("conversation.jsonl");
+        std::fs::write(&transcript, "conversation evidence").unwrap();
+        let protected_bytes = retention::directory_size_bytes(&protected_container);
+        seed_execution_with_home(
+            &db,
+            &protected_item,
+            "completed",
+            0,
+            &protected_container.join("process-home"),
+        );
+
+        // An unrecorded container under the root must never be touched.
+        let orphan = homes_root.join("orphan-unrecorded");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("marker"), "y").unwrap();
+
+        // Sanity: safety accepts the old terminal container under the env root.
+        assert_agy_home_safe_to_delete(&old_container)
+            .unwrap_or_else(|e| panic!("old_container must be safe to delete under homes root: {e:#}"));
+
+        let listed = db.list_executions_with_driver_runtime_state().unwrap();
+        assert_eq!(
+            listed.len(),
+            4,
+            "four executions should carry recorded runtime state; got {listed:?}"
+        );
+
+        let policy = retention::AgyHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
+        let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+        assert_eq!(outcome.errors, 0, "reclaim errors should be empty: {outcome:?}");
+        assert_eq!(
+            outcome.deleted, 1,
+            "only the old terminal container is reclaimed: {outcome:?}"
+        );
+        assert_eq!(outcome.skipped_live, 1, "{outcome:?}");
+        assert_eq!(outcome.kept_for_transcripts, 1);
+        assert_eq!(outcome.kept_for_transcripts_bytes, protected_bytes);
+        assert!(crate::sweep_loop::SweepOutcome::has_activity(
+            &AgyHomeRetentionSweepOutcome::builder().kept_for_transcripts(1).build()
+        ));
+        assert!(transcript.is_file());
+        assert!(!old_container.exists(), "old terminal container must be gone");
+        assert!(
+            live_container
+                .join("process-home/.gemini/antigravity-cli/marker")
+                .is_file(),
+            "live container must survive"
+        );
+        assert!(
+            recent_container
+                .join("process-home/.gemini/antigravity-cli/marker")
+                .is_file(),
+            "recent terminal container kept"
+        );
+        assert!(orphan.join("marker").is_file(), "unrecorded root must never be deleted");
+
+        // Idempotent second pass.
+        let outcome2 = run_one_pass_with_policy(&db, &policy, false).await;
+        assert_eq!(outcome2.errors, 0, "{outcome2:?}");
+        assert_eq!(
+            outcome2.already_absent, 1,
+            "the missing container is reported separately"
+        );
+        assert!(crate::sweep_loop::SweepOutcome::has_activity(&outcome2));
+        assert_eq!(outcome2.kept_for_transcripts, 1);
+        assert_eq!(outcome2.kept_for_transcripts_bytes, protected_bytes);
+        assert_eq!(outcome2.kept_in_policy, 1);
+        assert_eq!(
+            outcome2.deleted, 0,
+            "already-gone paths are not fresh reclaim: {outcome2:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_refuses_recorded_container_outside_homes_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-agy-homes");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let _env_guard = boss_engine_driver::test_support::agy_homes_override(&homes_root);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(sweep_refuses_recorded_container_outside_homes_root_body(outside.path()));
+    }
+
+    async fn sweep_refuses_recorded_container_outside_homes_root_body(outside_root: &Path) {
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let item = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("agy-outside-root".to_owned())
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let now = now_epoch();
+        let rogue = outside_root.join("rogue-run");
+        write_agy_container(&rogue);
+        let marker = rogue.join("marker");
+        std::fs::write(&marker, "must-survive").unwrap();
+        seed_execution_with_home(
+            &db,
+            &item,
+            "completed",
+            now - 40 * 24 * 60 * 60,
+            &rogue.join("process-home"),
+        );
+
+        let policy = retention::AgyHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
+        let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+        assert_eq!(outcome.errors, 1, "out-of-root container must be refused: {outcome:?}");
+        assert_eq!(
+            outcome.deleted, 0,
+            "out-of-root container must not be deleted: {outcome:?}"
+        );
+        assert!(marker.is_file(), "marker outside the homes root must survive");
+        assert!(rogue.is_dir(), "out-of-root container must still exist");
+    }
+
+    #[test]
+    fn prune_keeps_agy_pointers_until_containers_are_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = boss_engine_driver::test_support::agy_homes_override(&root);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (_dir, db) = open_db();
+                let product = create_test_product_with_repo(&db, "retention", Some("https://github.com/test/repo")).id;
+                let now = now_epoch();
+                let day = 86400;
+                let prune_policy = crate::work::ExecutionRetentionPolicy {
+                    max_age_secs: 14 * day,
+                    keep_per_work_item: 0,
+                };
+                for scenario in ["long-window", "recent-finish", "failed-delete"] {
+                    let item = db
+                        .create_chore(
+                            CreateChoreInput::builder()
+                                .product_id(product.clone())
+                                .name(scenario)
+                                .build(),
+                        )
+                        .unwrap()
+                        .id;
+                    let container = root.join(scenario);
+                    if scenario == "failed-delete" {
+                        // remove_dir_all cannot remove a regular file.
+                        std::fs::write(&container, "not a directory").unwrap();
+                    } else {
+                        write_agy_container(&container);
+                    }
+                    let finished = if scenario == "recent-finish" {
+                        now - 60
+                    } else {
+                        now - 30 * day
+                    };
+                    let id = seed_execution_with_home(&db, &item, "failed", finished, &container.join("process-home"));
+                    db.connect()
+                        .unwrap()
+                        .execute(
+                            "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+                            rusqlite::params![id, (now - 30 * day).to_string()],
+                        )
+                        .unwrap();
+                    let days = if scenario == "long-window" { 90 } else { 14 };
+                    let policy = retention::AgyHomeRetentionPolicy::new(Duration::from_secs(days * 86400), u64::MAX);
+                    let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+                    assert_eq!(outcome.deleted, 0, "{scenario}");
+                    if scenario == "failed-delete" {
+                        assert_eq!(outcome.errors, 1);
+                    }
+                    // Both CLI dry-run and real prune must preserve the last pointer.
+                    assert_eq!(
+                        db.prune_terminal_executions(prune_policy, now, true).unwrap().deleted,
+                        0,
+                        "{scenario}"
+                    );
+                    assert_eq!(
+                        db.prune_terminal_executions(prune_policy, now, false).unwrap().deleted,
+                        0,
+                        "{scenario}"
+                    );
+                    assert!(db.get_execution(&id).is_ok());
+                    if scenario == "failed-delete" {
+                        std::fs::remove_file(&container).unwrap();
+                        write_agy_container(&container);
+                    }
+                    let expired = retention::AgyHomeRetentionPolicy::new(Duration::ZERO, u64::MAX);
+                    assert_eq!(
+                        run_one_pass_with_policy(&db, &expired, false).await.deleted,
+                        1,
+                        "{scenario}"
+                    );
+                    assert_eq!(
+                        db.prune_terminal_executions(prune_policy, now, false).unwrap().deleted,
+                        1,
+                        "{scenario}"
+                    );
+                    assert!(db.get_execution(&id).is_err());
+                }
+            });
+    }
+
+    #[tokio::test]
+    async fn sweep_is_noop_without_runtime_state() {
+        let (_dir, db) = open_db();
+        let outcome = run_one_pass(&db, false).await;
+        assert_eq!(outcome, AgyHomeRetentionSweepOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_non_agy_runtime_payloads() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "c");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.set_driver_runtime_state(
+            &execution.id,
+            Some(&DriverRuntimeState::new(serde_json::json!({"other": true}))),
+        )
+        .unwrap();
+        let outcome = run_one_pass(&db, false).await;
+        assert_eq!(outcome.scanned, 0);
+        assert_eq!(outcome.deleted, 0);
+    }
+}

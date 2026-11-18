@@ -10,6 +10,134 @@ use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
 
 use boss_engine_driver::DriverRegistry;
 
+pub mod sol {
+    //! Codex's automatic Sol selection: the standard model for eligible work. Explicit model and pool policies remain separate.
+
+    use boss_protocol::{EffortLevel, ExecutionKind, ReasoningMode, TaskKind};
+
+    pub use boss_engine_driver::codex::{ASTRA_MODEL, SOL_MODEL};
+    pub const DEFAULT_SOL_PERCENTAGE: u8 = 100;
+
+    /// Investigation and design always win over revision provenance.
+    pub fn eligible(
+        effort: Option<EffortLevel>,
+        reasoning: Option<ReasoningMode>,
+        kind: Option<TaskKind>,
+        execution_kind: &ExecutionKind,
+        created_via: &str,
+    ) -> bool {
+        if reasoning != Some(ReasoningMode::Standard)
+            || matches!(
+                kind,
+                Some(TaskKind::Design | TaskKind::DesignPostmortem | TaskKind::Investigation)
+            )
+            || !matches!(
+                execution_kind,
+                ExecutionKind::TaskImplementation
+                    | ExecutionKind::ChoreImplementation
+                    | ExecutionKind::RevisionImplementation
+                    | ExecutionKind::CiRemediation
+                    | ExecutionKind::ConflictResolution
+            )
+        {
+            return false;
+        }
+        let engine_revision = kind == Some(TaskKind::Revision)
+            && [
+                boss_protocol::CREATED_VIA_CI_FIX_PREFIX,
+                boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX,
+                boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX,
+            ]
+            .iter()
+            .any(|prefix| created_via.starts_with(prefix));
+        engine_revision || matches!(effort, Some(EffortLevel::Trivial | EffortLevel::Small))
+    }
+
+    pub fn use_sol(eligible: bool, prior_sol_failure: bool, bucket: u8, percentage: u8) -> bool {
+        eligible && !prior_sol_failure && bucket < percentage
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn routing_table_covers_every_effort_reasoning_and_kind() {
+            for effort in [
+                EffortLevel::Trivial,
+                EffortLevel::Small,
+                EffortLevel::Medium,
+                EffortLevel::Large,
+                EffortLevel::Max,
+            ] {
+                for reasoning in [ReasoningMode::Standard, ReasoningMode::Investigation] {
+                    for kind in TaskKind::ALL {
+                        let expected = reasoning == ReasoningMode::Standard
+                            && matches!(effort, EffortLevel::Trivial | EffortLevel::Small)
+                            && !matches!(
+                                kind,
+                                TaskKind::Design | TaskKind::DesignPostmortem | TaskKind::Investigation
+                            );
+                        assert_eq!(
+                            eligible(
+                                Some(effort),
+                                Some(reasoning),
+                                Some(kind.clone()),
+                                &ExecutionKind::TaskImplementation,
+                                "human"
+                            ),
+                            expected,
+                            "{effort:?}/{reasoning:?}/{kind:?}"
+                        );
+                        for provenance in ["ci-fix:check", "merge-conflict:head", "pr_review:verdict"] {
+                            assert_eq!(
+                                eligible(
+                                    Some(effort),
+                                    Some(reasoning),
+                                    Some(TaskKind::Revision),
+                                    &ExecutionKind::RevisionImplementation,
+                                    provenance
+                                ),
+                                reasoning == ReasoningMode::Standard
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(!eligible(None, None, None, &ExecutionKind::TaskImplementation, "human"));
+            for kind in [
+                ExecutionKind::PrReview,
+                ExecutionKind::PrReviewGuide,
+                ExecutionKind::ProductDesign,
+                ExecutionKind::ProjectDesign,
+                ExecutionKind::InvestigationImplementation,
+                ExecutionKind::AnswerAgent,
+                ExecutionKind::AutomationTriage,
+            ] {
+                assert!(!eligible(
+                    Some(EffortLevel::Small),
+                    Some(ReasoningMode::Standard),
+                    Some(TaskKind::Task),
+                    &kind,
+                    "human"
+                ));
+            }
+        }
+
+        #[test]
+        fn percentage_endpoints_and_failure_override() {
+            for bucket in 0..100 {
+                assert!(!use_sol(true, false, bucket, 0));
+                assert!(use_sol(true, false, bucket, 100));
+                assert!(!use_sol(true, true, bucket, 100));
+                assert!(!use_sol(false, false, bucket, 100));
+                assert_eq!(use_sol(true, false, bucket, 50), bucket < 50);
+                assert!(use_sol(true, false, bucket, DEFAULT_SOL_PERCENTAGE));
+            }
+        }
+    }
+}
+
 /// Engine default driver used when neither `tasks.driver` nor
 /// `products.default_driver` is set (agent-driver design §Mix-and-match).
 pub const ENGINE_DEFAULT_DRIVER: &str = "claude";
@@ -65,6 +193,9 @@ impl DriverResolutionSource {
 /// Provenance for the model half of a resolved spawn pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelResolutionSource {
+    /// Recorded as `sol_experiment` in dispatch events (`spawn_config.model_source`);
+    /// the string is kept so earlier and later events stay comparable.
+    SolExperiment,
     TaskOverride,
     DesignInvestigationTier,
     PoolStrongTier,
@@ -79,6 +210,7 @@ pub enum ModelResolutionSource {
 impl ModelResolutionSource {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::SolExperiment => "sol_experiment",
             Self::TaskOverride => "task_override",
             Self::DesignInvestigationTier => "design_investigation_tier",
             Self::PoolStrongTier => "pool_strong_tier",
@@ -164,7 +296,8 @@ pub struct SpawnConfig {
     pub reasoning: Option<ReasoningMode>,
     /// Driver-specific effort knob value (e.g. `claude --effort`'s
     /// `"low"`/`"medium"`/…), resolved from the selected driver's
-    /// [`boss_engine_driver::ModelMenu`]. `None` when the row has no
+    /// [`boss_engine_driver::ModelMenu`], including design/investigation tiers.
+    /// The explicit design xhigh override takes precedence. Otherwise `None` when the row has no
     /// `effort_level` — per design §Q2 the dispatcher omits the flag
     /// entirely in that case and lets the driver fall through to its own
     /// default.
@@ -323,6 +456,8 @@ pub fn is_design_or_investigation_tier(kind: Option<&TaskKind>, reasoning: Optio
 /// Resolve dispatch knobs. The dedicated design/investigation tier is
 /// evaluated after explicit task and pool overrides and resolves through the
 /// selected driver's menu. `DesignPostmortem` is excluded by its distinct task kind.
+/// Tier selection preserves the row's effort mapping; the explicit design
+/// xhigh override still takes precedence over that mapping.
 ///
 /// Ordinary rows use this precedence:
 /// 1. `tasks.model_override` (when non-empty after trim).
@@ -542,19 +677,23 @@ pub fn resolve_spawn_config_in(
         });
     }
 
+    let effort_value = if input.design_reasoning_effort_xhigh
+        && matches!(input.kind, Some(TaskKind::Design))
+        && input.pool_model_override.is_none()
+    {
+        Some("xhigh")
+    } else {
+        effort_level.and_then(|l| (menu.effort_value_for_level)(l))
+    };
+    let (model, effort_value) = match menu.resolve_model_effort {
+        Some(resolve) => resolve(&model, effort_value),
+        None => (model, effort_value),
+    };
+
     Ok(SpawnConfig {
         effort_level,
         reasoning: input.reasoning,
-        effort_value: if input.design_reasoning_effort_xhigh
-            && matches!(input.kind, Some(TaskKind::Design))
-            && input.pool_model_override.is_none()
-        {
-            Some("xhigh")
-        } else if tier_applies {
-            None
-        } else {
-            effort_level.and_then(|l| (menu.effort_value_for_level)(l))
-        },
+        effort_value,
         model,
         model_source,
         driver,
@@ -933,6 +1072,7 @@ mod tests {
             agent_rules_filename: "AGENTS.md",
             initial_prompt_filename: "initial-prompt.txt",
             model_menu: DriverModelMenu {
+                resolve_model_effort: None,
                 engine_default: "stub-model",
                 effort_value_for_level: stub_effort_value_for_level,
                 default_model_for_level: stub_default_model_for_level,
@@ -999,7 +1139,7 @@ mod tests {
         .unwrap();
         let claude_cmd = claude_cfg.spawn_command_in(&registry, false, None).unwrap();
         assert!(
-            claude_cmd.starts_with("claude"),
+            claude_cmd.starts_with("python3 -I .claude/initial-prompt.py claude "),
             "claude slug still routes to ClaudeDriver, got {claude_cmd:?}",
         );
     }
@@ -1252,7 +1392,7 @@ mod tests {
         let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+            "python3 -I .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto\n",
         );
     }
 
@@ -1270,10 +1410,10 @@ mod tests {
             "expected single-quoted --settings flag, got: {inv:?}",
         );
         let settings_at = inv.find("--settings").expect("--settings present");
-        let prompt_at = inv.find("\"$(cat").expect("prompt arg present");
+        let launcher_at = inv.find("initial-prompt.py").expect("private input launcher present");
         assert!(
-            settings_at < prompt_at,
-            "--settings must come before the positional prompt arg: {inv:?}",
+            settings_at > launcher_at && !inv.contains("$(cat"),
+            "--settings must reach the driver without expanding the brief: {inv:?}",
         );
     }
 
@@ -1289,7 +1429,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+            "python3 -I .claude/initial-prompt.py claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions\n",
         );
     }
 
@@ -1305,7 +1445,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+            "python3 -I .claude/initial-prompt.py claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto\n",
         );
     }
 
@@ -1736,7 +1876,7 @@ mod tests {
     #[test]
     fn codex_standard_and_investigation_both_select_astra() {
         // Both reasoning modes resolve to astra; Small still maps effort
-        // to medium, and Investigation still omits the effort override.
+        // to medium for both Standard and Investigation.
         let standard = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .task_driver("codex")
@@ -1763,28 +1903,58 @@ mod tests {
             investigation.model_source,
             ModelResolutionSource::DesignInvestigationTier
         );
-        assert_eq!(investigation.effort_value, None);
+        assert_eq!(investigation.effort_value, Some("medium"));
     }
 
     #[test]
-    fn design_and_investigation_tier_use_fable_or_astra_at_default_effort() {
+    fn design_and_investigation_tier_use_fable_or_astra_with_mapped_effort() {
         for (driver, expected_model) in [("claude", "fable"), ("codex", "gpt-6-astra")] {
             for (kind, reasoning) in [
                 (TaskKind::Design, ReasoningMode::Standard),
                 (TaskKind::Chore, ReasoningMode::Investigation),
             ] {
+                for (level, expected_effort) in [
+                    (None, None),
+                    (Some(EffortLevel::Trivial), Some("low")),
+                    (Some(EffortLevel::Small), Some("medium")),
+                    (Some(EffortLevel::Medium), Some("high")),
+                    (Some(EffortLevel::Large), Some("xhigh")),
+                    (Some(EffortLevel::Max), Some("max")),
+                ] {
+                    let cfg = resolve_spawn_config(
+                        &SpawnResolutionInput::builder()
+                            .allocated_driver(driver)
+                            .maybe_effort_level(level)
+                            .kind(&kind)
+                            .reasoning(reasoning)
+                            .build(),
+                    )
+                    .unwrap();
+                    assert_eq!(cfg.model, expected_model, "{driver} {kind:?} {reasoning:?}");
+                    assert_eq!(cfg.effort_value, expected_effort);
+                    assert_eq!(cfg.model_source, ModelResolutionSource::DesignInvestigationTier);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn design_xhigh_override_yields_to_review_and_automation_pool_policy() {
+        for (driver, tier_model, pool_model) in [("claude", "fable", "opus"), ("codex", "gpt-6-astra", "gpt-6-astra")] {
+            // Both pools select Strong, which must keep the ordinary effort mapping.
+            for pool in [None, Some(PoolModelTier::Strong)] {
                 let cfg = resolve_spawn_config(
                     &SpawnResolutionInput::builder()
-                        .allocated_driver(driver)
-                        .effort_level(EffortLevel::Large)
-                        .kind(&kind)
-                        .reasoning(reasoning)
+                        .task_driver(driver)
+                        .kind(&TaskKind::Design)
+                        .effort_level(EffortLevel::Max)
+                        .design_reasoning_effort_xhigh(true)
+                        .maybe_pool_model_override(pool)
                         .build(),
                 )
                 .unwrap();
-                assert_eq!(cfg.model, expected_model, "{driver} {kind:?} {reasoning:?}");
-                assert_eq!(cfg.effort_value, None, "strong tier omits the effort override");
-                assert_eq!(cfg.model_source, ModelResolutionSource::DesignInvestigationTier);
+                assert_eq!(cfg.model, if pool.is_some() { pool_model } else { tier_model });
+                assert_eq!(cfg.effort_value, Some(if pool.is_some() { "max" } else { "xhigh" }));
             }
         }
     }
@@ -2042,7 +2212,82 @@ mod tests {
     // --- reasoning: the capability lever, independent of effort ---
 
     #[test]
-    fn investigation_reasoning_reaches_fable_at_default_effort_at_every_effort_level() {
+    fn agy_spawn_model_and_effort_agree() {
+        let mut cases = Vec::new();
+        for reasoning in [ReasoningMode::Standard, ReasoningMode::Investigation] {
+            for (level, rung) in [
+                (EffortLevel::Trivial, "low"),
+                (EffortLevel::Small, "medium"),
+                (EffortLevel::Medium, "high"),
+                (EffortLevel::Large, "xhigh"),
+                (EffortLevel::Max, "xhigh"),
+            ] {
+                let menu = menu_for_driver_in(&DriverRegistry::default(), "agy").unwrap();
+                let family = (menu.model_for_reasoning)(reasoning);
+                let rung = if rung == "xhigh" && family != "gemini-4-hydrogen" {
+                    "high"
+                } else {
+                    rung
+                };
+                cases.push((reasoning, Some(level), None, false, format!("{family}-{rung}"), rung));
+            }
+        }
+        cases.extend([
+            (
+                ReasoningMode::Standard,
+                None,
+                Some("gemini-4-hydrogen"),
+                false,
+                "gemini-4-hydrogen-medium".into(),
+                "medium",
+            ),
+            (
+                ReasoningMode::Investigation,
+                None,
+                Some("gemini-4-carbon"),
+                false,
+                "gemini-4-carbon-medium".into(),
+                "medium",
+            ),
+            (
+                ReasoningMode::Standard,
+                Some(EffortLevel::Large),
+                Some("gemini-4-carbon-low"),
+                false,
+                "gemini-4-carbon-low".into(),
+                "low",
+            ),
+            (
+                ReasoningMode::Investigation,
+                Some(EffortLevel::Small),
+                Some("gemini-4-carbon"),
+                true,
+                "gemini-4-carbon-high".into(),
+                "high",
+            ),
+        ]);
+        for (reasoning, level, model, design, expected_model, expected_effort) in cases {
+            let cfg = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .task_driver("agy")
+                    .maybe_effort_level(level)
+                    .maybe_model_override(model)
+                    .kind(if design { &TaskKind::Design } else { &TaskKind::Chore })
+                    .reasoning(reasoning)
+                    .design_reasoning_effort_xhigh(design)
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(
+                (cfg.model.as_str(), cfg.effort_value),
+                (expected_model.as_str(), Some(expected_effort)),
+                "{reasoning:?} {level:?} pin={model:?} design={design}"
+            );
+        }
+    }
+
+    #[test]
+    fn investigation_reasoning_reaches_fable_with_mapped_effort_at_every_effort_level() {
         // The headline requirement: a `small` or `medium` row must be able to
         // dispatch to Opus WITHOUT changing its effort level. Before the
         // `reasoning` column, the only way to reach Opus on one of these rows
@@ -2067,7 +2312,8 @@ mod tests {
                 cfg.model, "fable",
                 "investigation reasoning at effort {level:?} must reach fable"
             );
-            assert_eq!(cfg.effort_value, None);
+            let menu = menu_for_driver_in(&DriverRegistry::default(), "claude").unwrap();
+            assert_eq!(cfg.effort_value, (menu.effort_value_for_level)(level));
         }
     }
 
@@ -2100,7 +2346,7 @@ mod tests {
     }
 
     #[test]
-    fn investigation_reasoning_uses_the_strong_tier_and_default_effort() {
+    fn investigation_reasoning_uses_the_strong_tier_and_mapped_effort() {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Small)
@@ -2110,7 +2356,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.model, "fable");
-        assert_eq!(cfg.effort_value, None, "strong tier omits the effort override");
+        assert_eq!(cfg.effort_value, Some("medium"));
         assert_eq!(
             cfg.prompt_addendum, None,
             "small has no addendum, reasoning must not add one"

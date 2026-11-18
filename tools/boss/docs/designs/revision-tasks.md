@@ -253,11 +253,11 @@ The inversion honours the design's actual goal — never spawn against a merged 
 
 A revision worker pushes a commit to the parent's branch and prints the **parent's** PR URL. The completion detector (`PrDetector`-family) must handle this:
 
-- For a `revision_implementation` execution, the detector does **not** look for a _new_ PR. **As built (PR #778)**, the chain root's `pr_url` is stamped onto the _execution row_ at dispatch time (`work_executions.pr_url` — an addition relative to the original schema plan, back-filled if the execution was minted before the parent PR opened), `on_execution_started` snapshots the parent PR's HEAD SHA, and the existing **sha-delta gate** in `completion.rs` detects head advancement when the execution stops. On success the revision row flips to `in_review`; the parent's status is untouched. This snapshot-and-compare is exactly the higher-fidelity mechanism Risk R7 sketched as a follow-up — it shipped in v1.
-- The revision row's own `pr_url` stays `NULL` (`record_worker_pr_completion` explicitly preserves this). The chain root remains the PR's owner; the execution row carries the pointer.
+- For a `revision_implementation` execution, the detector does **not** look for a _new_ PR. **As built (PR #778)**, the chain root's `pr_url` is stamped onto the _execution row_ at dispatch time (`work_executions.pr_url` — an addition relative to the original schema plan, back-filled if the execution was minted before the parent PR opened), `on_execution_started` snapshots the parent PR's HEAD SHA, and the existing **sha-delta gate** in `completion.rs` detects head advancement when the execution stops. On a successful push, `record_worker_pr_completion` preserves the revision's current status under the `PendingReview` hold (normally `active`), while the parent's status is untouched. The revision remains in Doing, grouped as Reviewing once AI review starts, until the consolidated verdict releases it to `in_review`. This snapshot-and-compare is exactly the higher-fidelity mechanism Risk R7 sketched as a follow-up — it shipped in v1.
+- The revision row's own `pr_url` normally stays `NULL`, except under the `PendingReview` and `BlockedDeletionSignoff` holds: `record_worker_pr_completion` stamps the parent's PR URL onto the revision so the review or deletion-signoff gate can find it. The chain root remains the PR's owner; the execution row also carries the pointer.
 - **`done`** (Decisions § OQ7): a revision has **no independent doneness gate** — it rides the parent's lifecycle. A revision transitions to `done` exactly when its parent (chain root) task transitions to `done`, i.e. when the parent PR **merges or is closed**. It does _not_ go `done` when its own commit is pushed, and it does _not_ go `done` when the parent PR returns to `in_review` after the push. **As built (PR #778):** `mark_chore_pr_merged` calls `flip_in_review_revisions_to_done`, a BFS over `parent_task_id` links (`collect_chain_revision_ids`) that flips every `in_review` revision in the chain to `done` alongside the root. A revision that is still in Backlog/Doing when the parent merges/closes hits the auto-block policy (Decisions § OQ1) instead.
 
-This keeps the revision's lifecycle entirely engine-driven off existing signals: spawn → push commit → `in_review` (detector) → `done` (parent reaches `done` via the merge poller). No new poller, no new status column, no independent doneness gate.
+This keeps the revision's lifecycle entirely engine-driven off existing signals: spawn → push commit → `active` hold (Doing/Reviewing during AI review) → `in_review` (consolidated verdict) → `done` (parent reaches `done` via the merge poller). No new poller, no new status column, no independent doneness gate.
 
 ### Permission hard-guard
 
@@ -306,7 +306,7 @@ A revision in `in_review` does **not** render its own card. Instead the **chain 
 
 ```
 ┌──────────────────────────────────────────┐
-│ T651  Wire up --plan flag        #1234 ↗   │   ← parent card, unchanged header
+│ Task  Wire up --plan flag        #1234 ↗   │   ← parent card, unchanged header
 │ ✓ CI · ◷ review                            │   ← existing CI/review chips
 │ ──────────────────────────────────────    │
 │ ⟳ R1  addressing review comments      ↗    │   ← one line per in-review revision
@@ -320,9 +320,15 @@ A revision in `in_review` does **not** render its own card. Instead the **chain 
 
 A revision that has reached `done` (parent merged) drops off the Review affordance with the parent — the whole card moves to Done together.
 
+### Doing while the PR's AI review runs
+
+Anything agents are actively working on is in Doing. For a revision that is its implementation run **and** the automated review of the commit it pushed. When the implementation execution completes, the revision stays `active` (the `PendingReview` hold stamps the PR URL on it) until the consolidated verdict for that exact push releases it to `in_review`. While that review is running — a started pre-merge review batch on the chain root that has not finished (reviewers, consolidation, verdict apply), or a running `pr_review` execution on the revision or chain root — the card stays in Doing, in the **Reviewing** group (`WorkDb::list_revisions_under_ai_review`, consumed by `classify_doing_sections`), not **Queued**. It carries the engine's `ai_reviewing` / `ai_review_stage` state ("AI review in progress" / "Consolidating review findings") and links the live review workers of its PR (the reviewers are bound to the chain root, so the card finds them by PR URL). A reviewer merely waiting for its first pool slot remains Queued. Once a batch starts, a reaped reviewer awaiting re-admission stays Reviewing, as do consolidation and verdict-apply waits; the caption uses that same engine projection, including “Applying AI review verdict”. A live implementation worker still wins and puts the revision in Coding.
+
+A revision is **never** a Review card. The engine gives a revision no `review_section`, the engine projects `board_folded_revision` for consolidated, done, and review-phase blocked revisions, and both the board drop path and the app consume that decision to give them no standalone card. When the review is consolidated the revision flips to `in_review` and appears only as its `⟳ R<n>` line on the parent's card, with the parent's own review state and indicators reflecting the outcome.
+
 ### Edge: parent in Review, revision still in Doing
 
-Common case: the operator files R1 while T651 sits in review; R1 is in Backlog/Doing (its own card) while T651 is in Review (its card, no R1 line yet). Once R1's worker pushes and R1 flips to `in_review`, R1's standalone card disappears and the `⟳ R1` line appears under T651. The transition is purely status-driven and needs no special handling.
+Common case: the operator files R1 while the parent sits in review; R1 is in Backlog/Doing (its own card) while the parent is in Review (its card, no R1 line yet). Once R1's worker pushes and R1 flips to `in_review`, R1's standalone card disappears and the `⟳ R1` line appears under the parent. The transition is purely status-driven and needs no special handling.
 
 **As built (PR #775):** shipped as specified. `WorkTask` gained `parentTaskId`/`revisionSeq`/`revisionParentPrUrl`, decoded leniently (nil against pre-revision engines, which is why this phase could merge before Phases 3–4 did); `workItems(in: .review)` suppresses `kind == "revision" && status == "in_review"` rows; the rollup lines render one `RevisionRollupLine` per in-review revision ordered by `revisionSeq`; the Backlog/Doing card carries a `RevisionBadge` chip plus "revises T\<n\>" and a parent-PR link row; no "Friendly ID" strings anywhere. A later addition projects `has_in_progress_revision` onto chain roots so the parent's Review card can also hint at revisions still in Backlog/Doing.
 
@@ -379,6 +385,16 @@ The seven questions this design originally raised have been resolved by the oper
 **Decision: flat continuation, no nested numbering.** A revision can itself have a revision (second-pass feedback on R1 — yes, this is allowed). The sequence is **chain-root-scoped and creation-ordered**: if a parent already has R1 and R2 and a revision is spawned on R1, the new one is **R3**, counted from the chain root — never `R1.1` or any `R<n>.<m>` sub-sequence.
 
 **As built:** `parent_task_id` is **always the chain root**, not the immediate revision the caller named. Filing `create-revision --parent <R2>` (or an automatic PR-review / CI / conflict producer against a revision work item) still resolves the gate against the root's PR, but the new row stores `parent_task_id = root`. Sequencing of back-to-back revisions is via dependency edges on the chain tail, not nested parents. Nested parentage hid later revisions from the UI rollup (which only surfaces direct children of the root). A startup migration flattens any pre-existing nested rows.
+
+**Live writer for the chain-tail gate.** The tail query (`find_latest_active_revision_in_chain` in `engine/core/src/work/revision_helpers.rs`) picks the latest _live writer_ on the chain, not merely the latest `todo` / `active` / `blocked` row. A live writer is:
+
+- `todo` or `active`, or
+- `blocked` for a reason other than `worker_failed` / `spawning_attempt_retired_unsuccessfully`, or
+- those two halt reasons while a non-terminal execution is still attached.
+
+A `blocked: worker_failed` or `blocked: spawning_attempt_retired_unsuccessfully` revision with no live execution is skipped, so a later revision is not gated on a sibling that will never finish, and the parent does not sit in Review ▸ Blocked waiting on it. `in_review` / `done` / `archived` remain non-live, as before. The same live-writer predicate is what `has_in_flight_ci_fix_revision` uses so a dead CI-fix does not block a new one, and what `gating_prereqs_for` uses for a same-chain revision prerequisite so a persisted `blocks` edge onto a dead sibling does not keep the later revision in `blocked: dependency`. `maybe_engine_unblock_dependent` and the dep-unblock sweep re-evaluate that predicate.
+
+Parent PR CI is not part of the live-writer predicate. A dead halt has already released the branch: there is no live worker to finish, whether the head is green, red, or unknown. Requiring a green head would leave later revisions queued behind a corpse while CI is red, which is the case that most needs a new writer. When CI is red the parent still sits in Review ▸ Blocked because of the CI failure itself (`classify_review_section`), not because of this gate.
 
 ### OQ3 — Permission scope / `gh pr create` guard
 

@@ -20,10 +20,10 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AttachmentMediaType, AutomationTrigger, COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState, Decision,
-    DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree, DispatchAdmissionBlocker, DispatchPauseSnapshot,
-    EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError,
-    TaskKind, TaskStatus, WorkerTierDenialReason,
+    AttachmentMediaType, AutomationTrigger, COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState,
+    CoordinatorHandoffAuthorizationDelivery, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
+    DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput,
+    ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -417,16 +417,44 @@ fn top_cost_report() -> crate::TopCostReport {
 fn tag_cases() -> Vec<TagCase> {
     vec![
         TagCase {
-            label: "operator_questions",
+            label: "OperatorDecisionSnapshot",
+            event: FrontendEvent::OperatorDecisionSnapshot { questions: vec![] },
+            expected_tag: "operator_decision_snapshot",
+        },
+        TagCase {
+            label: "OperatorQuestionsList",
             event: FrontendEvent::OperatorQuestionsList { questions: vec![] },
             expected_tag: "operator_questions_list",
         },
         TagCase {
-            label: "operator_question_error",
+            label: "TaskFieldAuditList",
+            event: FrontendEvent::TaskFieldAuditList {
+                work_item_id: "task_1".into(),
+                rows: vec![],
+            },
+            expected_tag: "task_field_audit_list",
+        },
+        TagCase {
+            label: "OperatorQuestionError",
             event: FrontendEvent::OperatorQuestionError {
                 error: crate::OperatorQuestionError::NotFound,
             },
             expected_tag: "operator_question_error",
+        },
+        TagCase {
+            label: "CriticalPriorityRequests",
+            event: FrontendEvent::CriticalPriorityRequests { requests: vec![] },
+            expected_tag: "critical_priority_requests",
+        },
+        TagCase {
+            label: "CriticalPriorityRequested",
+            event: FrontendEvent::CriticalPriorityRequested { id: "request".into() },
+            expected_tag: "critical_priority_requested",
+        },
+        TagCase {
+            label: "CriticalPriorityResolved",
+            event: FrontendEvent::CriticalPriorityResolved { id: "request".into() },
+            expected_tag: "critical_priority_resolved",
         },
         // --- Connection lifecycle ---
         TagCase {
@@ -462,6 +490,7 @@ fn tag_cases() -> Vec<TagCase> {
                     reason: "created".into(),
                     product_id: Some("prod_1".into()),
                     item_ids: vec!["task_1".into()],
+                    class: InvalidationClass::Structural,
                 },
             },
             expected_tag: "topic_event",
@@ -506,6 +535,39 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "revisions_list",
         },
         TagCase {
+            label: "WorkRuntimePatch",
+            event: FrontendEvent::WorkRuntimePatch {
+                product_id: "prod_1".into(),
+                items: vec![],
+                absent: vec![],
+            },
+            expected_tag: "work_runtime_patch",
+        },
+        TagCase {
+            label: "BoardPopulationProgress",
+            event: FrontendEvent::BoardPopulationProgress {
+                product_id: "prod_1".into(),
+                phase: crate::BoardPopulationPhase::Stage,
+                stage: Some("db.tasks".into()),
+                elapsed_ms: 1500,
+                items: Some(1949),
+                bytes: None,
+            },
+            expected_tag: "board_population_progress",
+        },
+        TagCase {
+            label: "WorkTreeUpdate",
+            event: FrontendEvent::WorkTreeUpdate {
+                update: crate::work_tree_delta::WorkTreeUpdate {
+                    product_id: "prod_1".into(),
+                    sequence: 2,
+                    base_sequence: Some(1),
+                    changes: serde_json::json!({}),
+                },
+            },
+            expected_tag: "work_tree_update",
+        },
+        TagCase {
             label: "WorkTree",
             event: FrontendEvent::WorkTree {
                 product: product(),
@@ -515,6 +577,10 @@ fn tag_cases() -> Vec<TagCase> {
                 task_runtimes: vec![],
                 dependencies: vec![],
                 ideas: vec![],
+                attention_items: vec![],
+                attention_groups: vec![],
+                attention_members: vec![],
+                planner_runs: vec![],
             },
             expected_tag: "work_tree",
         },
@@ -603,13 +669,16 @@ fn tag_cases() -> Vec<TagCase> {
                 admission: DispatchAdmission::builder()
                     .work_item_id("task_1")
                     .would_dispatch(false)
-                    .pause(DispatchPauseSnapshot {
-                        active: true,
-                        origin: Some("operator".into()),
-                        reason: Some("investigating worker failures".into()),
-                        paused_since_epoch_s: Some(1_700_000_000),
-                        overridable: true,
-                    })
+                    .pause(
+                        DispatchPauseSnapshot::builder()
+                            .active(true)
+                            .origin("operator")
+                            .reason("investigating worker failures")
+                            .paused_since_epoch_s(1_700_000_000)
+                            .scope(DispatchPauseScope::NewWork)
+                            .overridable(true)
+                            .build(),
+                    )
                     .blockers(vec![DispatchAdmissionBlocker {
                         code: "interactive_concurrency_cap".into(),
                         message: "interactive concurrency cap reached (12/12 workers live)".into(),
@@ -823,6 +892,8 @@ fn tag_cases() -> Vec<TagCase> {
                 state: ProbeDeliveryState::Buffered,
                 urgent: true,
                 detail: None,
+                submitted: None,
+                resumed: None,
             },
             expected_tag: "probe_status_result",
         },
@@ -889,6 +960,7 @@ fn tag_cases() -> Vec<TagCase> {
             event: FrontendEvent::WorkerInputSent {
                 run_id: "run_1".into(),
                 slot_id: 3,
+                probe_id: Some("probe-1".into()),
             },
             expected_tag: "worker_input_sent",
         },
@@ -910,7 +982,11 @@ fn tag_cases() -> Vec<TagCase> {
         },
         TagCase {
             label: "WorkerLiveStatesList",
-            event: FrontendEvent::WorkerLiveStatesList { states: vec![] },
+            event: FrontendEvent::WorkerLiveStatesList {
+                states: vec![],
+                doing_sections: Default::default(),
+                queued_dispatch: Default::default(),
+            },
             expected_tag: "worker_live_states_list",
         },
         TagCase {
@@ -1054,6 +1130,19 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "project_design_doc_resolved",
         },
         TagCase {
+            label: "ExecutionLabelsResolved",
+            event: FrontendEvent::ExecutionLabelsResolved {
+                labels: vec![
+                    crate::ExecutionWorkLabel::builder()
+                        .execution_id("exec_1")
+                        .status(crate::ExecutionLabelStatus::Resolved)
+                        .work_item_title("Fix fencer scraping")
+                        .build(),
+                ],
+            },
+            expected_tag: "execution_labels_resolved",
+        },
+        TagCase {
             label: "ProductDesignDocsList",
             event: FrontendEvent::ProductDesignDocsList {
                 product_id: "prod_1".into(),
@@ -1191,6 +1280,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionStarted",
             event: FrontendEvent::ConflictResolutionStarted {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1201,6 +1291,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionSucceeded",
             event: FrontendEvent::ConflictResolutionSucceeded {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1211,6 +1302,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionFailed",
             event: FrontendEvent::ConflictResolutionFailed {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1222,6 +1314,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ConflictResolutionAbandoned",
             event: FrontendEvent::ConflictResolutionAbandoned {
+                attempt: conflict_resolution().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "crz_1".into(),
@@ -1246,6 +1339,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationStarted",
             event: FrontendEvent::CiRemediationStarted {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -1257,6 +1351,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationSucceeded",
             event: FrontendEvent::CiRemediationSucceeded {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -1276,6 +1371,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationFailed",
             event: FrontendEvent::CiRemediationFailed {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -1287,6 +1383,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "CiRemediationAbandoned",
             event: FrontendEvent::CiRemediationAbandoned {
+                attempt: ci_remediation().list_entry(),
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 attempt_id: "cir_1".into(),
@@ -1418,6 +1515,14 @@ fn tag_cases() -> Vec<TagCase> {
         },
         // --- Worker proposals ---
         TagCase {
+            label: "WorkerGatewayResult",
+            event: FrontendEvent::WorkerGatewayResult {
+                status: "queued".into(),
+                value: serde_json::json!({"id": "receipt"}),
+            },
+            expected_tag: "worker_gateway_result",
+        },
+        TagCase {
             label: "ProposalSubmitted",
             event: FrontendEvent::ProposalSubmitted {
                 proposal: worker_proposal(),
@@ -1496,6 +1601,12 @@ fn tag_cases() -> Vec<TagCase> {
             label: "CoordinatorHandoffResult",
             event: FrontendEvent::CoordinatorHandoffResult {
                 handoff: Some(coordinator_handoff()),
+                authorization_delivery: Some(
+                    CoordinatorHandoffAuthorizationDelivery::builder()
+                        .requested(true)
+                        .detail("accepted by the main session's inbox")
+                        .build(),
+                ),
             },
             expected_tag: "coordinator_handoff_result",
         },
@@ -1581,6 +1692,7 @@ fn tag_cases() -> Vec<TagCase> {
                     automation_paused: false,
                     review_guide_reenqueue: None,
                     issues: vec![],
+                    spawn_failure_streaks: vec![],
                 },
             },
             expected_tag: "engine_health_result",
@@ -1589,6 +1701,19 @@ fn tag_cases() -> Vec<TagCase> {
             label: "SettingsList",
             event: FrontendEvent::SettingsList { settings: vec![] },
             expected_tag: "settings_list",
+        },
+        TagCase {
+            label: "OffsiteBackupSettings",
+            event: FrontendEvent::OffsiteBackupSettings {
+                settings: OffsiteBackupSettings {
+                    enabled: true,
+                    destination: Some("/mnt/sync".into()),
+                    keep_hourly: 24,
+                    keep_daily: 14,
+                    load_error: None,
+                },
+            },
+            expected_tag: "offsite_backup_settings",
         },
         TagCase {
             label: "SettingSet",
@@ -1664,6 +1789,8 @@ fn tag_cases() -> Vec<TagCase> {
                 paused_since_epoch_s: None,
                 reviews_exempt: false,
                 reason: None,
+                scope: None,
+                origin: None,
             },
             expected_tag: "dispatch_state_result",
         },
@@ -1738,6 +1865,11 @@ fn tag_cases() -> Vec<TagCase> {
             label: "ShutdownAccepted",
             event: FrontendEvent::ShutdownAccepted,
             expected_tag: "shutdown_accepted",
+        },
+        TagCase {
+            label: "CoordinatorRecreated",
+            event: FrontendEvent::CoordinatorRecreated,
+            expected_tag: "coordinator_recreated",
         },
         TagCase {
             label: "ShutdownRejected",
@@ -1917,6 +2049,8 @@ fn tag_cases() -> Vec<TagCase> {
             label: "AutomationCreated",
             event: FrontendEvent::AutomationCreated {
                 automation: automation(),
+                open_task_count: None,
+                last_run: None,
             },
             expected_tag: "automation_created",
         },
@@ -1926,6 +2060,7 @@ fn tag_cases() -> Vec<TagCase> {
                 product_id: "prod_1".into(),
                 automations: vec![],
                 open_task_counts: std::collections::HashMap::new(),
+                last_runs: std::collections::HashMap::new(),
             },
             expected_tag: "automations_list",
         },
@@ -1933,6 +2068,8 @@ fn tag_cases() -> Vec<TagCase> {
             label: "AutomationResult",
             event: FrontendEvent::AutomationResult {
                 automation: automation(),
+                open_task_count: None,
+                last_run: None,
             },
             expected_tag: "automation_result",
         },
@@ -1940,6 +2077,8 @@ fn tag_cases() -> Vec<TagCase> {
             label: "AutomationUpdated",
             event: FrontendEvent::AutomationUpdated {
                 automation: automation(),
+                open_task_count: None,
+                last_run: None,
             },
             expected_tag: "automation_updated",
         },
@@ -2089,7 +2228,7 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "idea_graduated",
         },
         TagCase {
-            label: "IdeaGraduatedWithChore",
+            label: "IdeaGraduated",
             event: FrontendEvent::IdeaGraduated {
                 idea: idea(),
                 chore: Some(Box::new(task())),
@@ -2109,9 +2248,36 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "DriverTrafficSplitResult",
             event: FrontendEvent::DriverTrafficSplitResult {
-                split: DriverTrafficSplit::new(10, 60, 30),
+                split: DriverTrafficSplit::new(10, 60, 30, 0),
             },
             expected_tag: "driver_traffic_split_result",
+        },
+        TagCase {
+            label: "CodexSolPercentage",
+            event: FrontendEvent::CodexSolPercentage { percentage: 50 },
+            expected_tag: "codex_sol_percentage",
+        },
+        TagCase {
+            label: "SolComparisonReport",
+            event: FrontendEvent::SolComparisonReport {
+                report: crate::SolComparisonReport {
+                    arms: vec![],
+                    notes: vec![],
+                },
+            },
+            expected_tag: "sol_comparison_report",
+        },
+        TagCase {
+            label: "DispatchFocusResult",
+            event: FrontendEvent::DispatchFocusResult {
+                focus: crate::DispatchFocusState {
+                    active: false,
+                    targets: vec![],
+                    held_count: 0,
+                    restore_error: None,
+                },
+            },
+            expected_tag: "dispatch_focus_result",
         },
         TagCase {
             label: "DriverQuotaUsageResult",
@@ -2133,7 +2299,10 @@ fn tag_cases() -> Vec<TagCase> {
 #[allow(dead_code)]
 fn every_variant_is_pinned(e: &FrontendEvent) {
     match e {
-        FrontendEvent::Hello { .. }
+        FrontendEvent::CriticalPriorityRequested { .. }
+        | FrontendEvent::CriticalPriorityResolved { .. }
+        | FrontendEvent::CriticalPriorityRequests { .. }
+        | FrontendEvent::Hello { .. }
         | FrontendEvent::Subscribed { .. }
         | FrontendEvent::Unsubscribed { .. }
         | FrontendEvent::TopicEvent { .. }
@@ -2142,6 +2311,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::TasksList { .. }
         | FrontendEvent::ChoresList { .. }
         | FrontendEvent::RevisionsList { .. }
+        | FrontendEvent::WorkRuntimePatch { .. }
+        | FrontendEvent::BoardPopulationProgress { .. }
+        | FrontendEvent::WorkTreeUpdate { .. }
         | FrontendEvent::WorkTree { .. }
         | FrontendEvent::WorkItemResult { .. }
         | FrontendEvent::WorkItemsByPrResult { .. }
@@ -2209,6 +2381,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::LiveStatusDisabledSlotsList { .. }
         | FrontendEvent::LiveStatusDebugReportEvent { .. }
         | FrontendEvent::ProjectDesignDocResolved { .. }
+        | FrontendEvent::ExecutionLabelsResolved { .. }
         | FrontendEvent::ProductDesignDocsList { .. }
         | FrontendEvent::ProductDesignDocContent { .. }
         | FrontendEvent::ConflictResolutionMarkedFailed { .. }
@@ -2239,6 +2412,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::CiNeverStartsAlert { .. }
         | FrontendEvent::EffortAuditReport { .. }
         | FrontendEvent::EffortEscalationRecorded { .. }
+        | FrontendEvent::StuckReport { .. }
         | FrontendEvent::WorkItemCostReport { .. }
         | FrontendEvent::CostWindowReport { .. }
         | FrontendEvent::TopCostConsumers { .. }
@@ -2246,6 +2420,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }
         | FrontendEvent::ProjectPostmortemResult { .. }
+        | FrontendEvent::WorkerGatewayResult { .. }
         | FrontendEvent::ProposalSubmitted { .. }
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::ProposalsList { .. }
@@ -2263,6 +2438,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::EngineHealthResult { .. }
         | FrontendEvent::SettingsList { .. }
         | FrontendEvent::SettingSet { .. }
+        | FrontendEvent::OffsiteBackupSettings { .. }
         | FrontendEvent::HostsList { .. }
         | FrontendEvent::HostResult { .. }
         | FrontendEvent::HostUpdated { .. }
@@ -2272,7 +2448,10 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
         | FrontendEvent::DispatchConcurrencyResult { .. }
+        | FrontendEvent::DispatchFocusResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
+        | FrontendEvent::CodexSolPercentage { .. }
+        | FrontendEvent::SolComparisonReport { .. }
         | FrontendEvent::DriverQuotaUsageResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
@@ -2286,6 +2465,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemRevealed { .. }
         | FrontendEvent::DocumentOpened { .. }
         | FrontendEvent::ShutdownAccepted
+        | FrontendEvent::CoordinatorRecreated
         | FrontendEvent::ShutdownRejected { .. }
         | FrontendEvent::GitHubAuthState { .. }
         | FrontendEvent::TrunkStatus { .. }
@@ -2333,7 +2513,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::SelectedProductReported { .. }
         | FrontendEvent::AttachmentStored { .. }
         | FrontendEvent::AttachmentsList { .. }
+        | FrontendEvent::OperatorDecisionSnapshot { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
+        | FrontendEvent::TaskFieldAuditList { .. }
         | FrontendEvent::OperatorQuestionError { .. } => {}
     }
 }
@@ -2341,6 +2523,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
 #[test]
 fn variants_serialize_under_their_snake_case_type_tag() {
     for case in tag_cases() {
+        assert_eq!(case.event.variant_label(), case.label);
         let v = serde_json::to_value(&case.event).unwrap();
         assert_eq!(
             v["type"], case.expected_tag,
@@ -2382,18 +2565,19 @@ fn hello_pins_session_id_field() {
     assert_eq!(v["session_id"], "sess_1");
 }
 
-/// The macOS app hand-decodes the nested split object, so its three share
+/// The macOS app hand-decodes the nested split object, so its four share
 /// keys are wire contract, not internals.
 #[test]
 fn driver_traffic_split_result_pins_nested_share_field_names() {
     let v = serde_json::to_value(FrontendEvent::DriverTrafficSplitResult {
-        split: DriverTrafficSplit::new(10, 60, 30),
+        split: DriverTrafficSplit::new(10, 20, 30, 40),
     })
     .unwrap();
     assert_eq!(v["type"], "driver_traffic_split_result");
     assert_eq!(v["split"]["grok"], 10);
-    assert_eq!(v["split"]["claude"], 60);
+    assert_eq!(v["split"]["claude"], 20);
     assert_eq!(v["split"]["codex"], 30);
+    assert_eq!(v["split"]["agy"], 40);
 }
 
 #[test]
@@ -2419,6 +2603,7 @@ fn topic_event_pins_field_names_and_nested_payload_tag() {
             reason: "updated".into(),
             product_id: Some("prod_1".into()),
             item_ids: vec!["task_1".into(), "task_2".into()],
+            class: InvalidationClass::Runtime,
         },
     })
     .unwrap();
@@ -2433,6 +2618,68 @@ fn topic_event_pins_field_names_and_nested_payload_tag() {
     assert_eq!(v["event"]["reason"], "updated");
     assert_eq!(v["event"]["product_id"], "prod_1");
     assert_eq!(v["event"]["item_ids"], serde_json::json!(["task_1", "task_2"]));
+    assert_eq!(v["event"]["class"], "runtime");
+}
+
+#[test]
+fn work_invalidated_without_a_class_decodes_as_structural() {
+    // An engine that predates the field sends no `class`. The app must treat
+    // that push as a full-board invalidation, exactly as it always did.
+    let payload: TopicEventPayload = serde_json::from_value(serde_json::json!({
+        "type": "work_invalidated",
+        "reason": "work_item_updated",
+        "product_id": "prod_1",
+        "item_ids": ["task_1"],
+    }))
+    .unwrap();
+    let TopicEventPayload::WorkInvalidated { class, .. } = payload else {
+        panic!("expected work_invalidated");
+    };
+    assert_eq!(class, InvalidationClass::Structural);
+    assert_eq!(InvalidationClass::default(), InvalidationClass::Structural);
+    assert_eq!(serde_json::to_value(InvalidationClass::Runtime).unwrap(), "runtime");
+    assert_eq!(
+        serde_json::to_value(InvalidationClass::Structural).unwrap(),
+        "structural"
+    );
+}
+
+#[test]
+fn merging_invalidation_classes_lets_structural_win() {
+    use InvalidationClass::{Runtime, Structural};
+    assert_eq!(Runtime.merge(Runtime), Runtime);
+    assert_eq!(Runtime.merge(Structural), Structural);
+    assert_eq!(Structural.merge(Runtime), Structural);
+    assert_eq!(Structural.merge(Structural), Structural);
+}
+
+#[test]
+fn get_work_runtime_patch_request_pins_wire_names() {
+    let v = serde_json::to_value(FrontendRequest::GetWorkRuntimePatch {
+        product_id: "prod_1".into(),
+        item_ids: vec!["task_1".into()],
+    })
+    .unwrap();
+    assert_eq!(v["type"], "get_work_runtime_patch");
+    assert_eq!(v["product_id"], "prod_1");
+    assert_eq!(v["item_ids"], serde_json::json!(["task_1"]));
+}
+
+#[test]
+fn work_runtime_patch_event_pins_wire_names_and_tolerates_missing_absent() {
+    let v = serde_json::to_value(FrontendEvent::WorkRuntimePatch {
+        product_id: "prod_1".into(),
+        items: vec![],
+        absent: vec!["task_9".into()],
+    })
+    .unwrap();
+    assert_eq!(v["type"], "work_runtime_patch");
+    assert_eq!(v["product_id"], "prod_1");
+    assert_eq!(v["items"], serde_json::json!([]));
+    assert_eq!(v["absent"], serde_json::json!(["task_9"]));
+    let back: FrontendEvent =
+        serde_json::from_value(serde_json::json!({"type":"work_runtime_patch","product_id":"p","items":[]})).unwrap();
+    assert!(matches!(back, FrontendEvent::WorkRuntimePatch { absent, .. } if absent.is_empty()));
 }
 
 // --- Option omission grammar (skip_serializing_if) -------------------------
@@ -2476,4 +2723,76 @@ fn skipped_option_field_is_present_when_some() {
     })
     .unwrap();
     assert_eq!(v["live_sha"], "deadbeef");
+}
+
+#[test]
+fn every_remediation_lifecycle_push_carries_a_compact_row() {
+    let mut count = 0;
+    for case in tag_cases() {
+        if ["conflict_resolution", "ci_remediation"].iter().any(|prefix| {
+            ["started", "succeeded", "failed", "abandoned"]
+                .iter()
+                .any(|suffix| case.expected_tag == format!("{prefix}_{suffix}"))
+        }) {
+            let json = serde_json::to_value(&case.event).unwrap();
+            let row = &json["attempt"];
+            assert!(row["id"].is_string(), "{}", case.expected_tag);
+            assert!(row["status"].is_string());
+            assert!(row["created_at"].is_string());
+            assert!(row["work_item_id"].is_string());
+            assert_eq!(row["pr_url"], json["pr_url"]);
+            for blob in ["conflict_diagnosis", "log_excerpt", "failed_checks"] {
+                assert!(row.get(blob).is_none());
+            }
+            count += 1;
+        }
+    }
+    assert_eq!(count, 8);
+}
+
+#[test]
+fn unknown_invalidation_class_is_structural() {
+    let payload: TopicEventPayload = serde_json::from_value(serde_json::json!({
+        "type": "work_invalidated", "reason": "future_writer",
+        "product_id": "prod", "item_ids": [], "class": "something_new"
+    }))
+    .unwrap();
+    assert!(matches!(
+        payload,
+        TopicEventPayload::WorkInvalidated {
+            class: InvalidationClass::Structural,
+            ..
+        }
+    ));
+}
+
+/// The app hand-decodes this shape: pin the documented field names and the
+/// snake_case status values.
+#[test]
+fn execution_label_wire_shape_is_pinned() {
+    let label = crate::ExecutionWorkLabel::builder()
+        .execution_id("exec_1")
+        .status(crate::ExecutionLabelStatus::WorkItemDeleted)
+        .kind("pr_review")
+        .purpose("Review")
+        .build();
+    let json = serde_json::to_value(&label).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "execution_id": "exec_1",
+            "status": "work_item_deleted",
+            "kind": "pr_review",
+            "purpose": "Review",
+        })
+    );
+
+    let request = serde_json::to_value(FrontendRequest::ResolveExecutionLabels {
+        execution_ids: vec!["exec_1".into()],
+    })
+    .unwrap();
+    assert_eq!(
+        request,
+        serde_json::json!({"type": "resolve_execution_labels", "execution_ids": ["exec_1"]})
+    );
 }

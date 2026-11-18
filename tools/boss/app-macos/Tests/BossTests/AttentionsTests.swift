@@ -133,6 +133,7 @@ final class AttentionsTests: XCTestCase {
         XCTAssertEqual(member.confidenceSource, "structured")
         XCTAssertFalse(member.isResolved)
         XCTAssertTrue(member.choices.isEmpty)
+        XCTAssertNil(member.optionLabels)
     }
 
     func testDecodesMultipleChoiceMemberChoices() throws {
@@ -155,6 +156,34 @@ final class AttentionsTests: XCTestCase {
          "created_at":"2026-05-31T00:00:00Z","question_type":"multiple_choice",
          "choice_options":"not-json","confidence_source":"structured","score":1}
         """)
+        XCTAssertTrue(member.choices.isEmpty)
+        XCTAssertNil(member.optionLabels)
+    }
+
+    func testMalformedAttentionLabelsFallBackToYesNo() throws {
+        var member = try decodeAttention("""
+        {"id":"atn_bad","group_id":"atg_review","ordinal":1,
+         "answer_state":"open","created_at":"123","question_type":"yes_no",
+         "confidence_source":"structured","score":1}
+        """)
+        for labels in ["{}", #"{"yes":"Split"}"#,
+                       #"{"yes":"","no":"Bypass limit"}"#,
+                       #"{"yes":"Split","no":"Split"}"#] {
+            member.choiceOptions = labels
+            XCTAssertNil(member.optionLabels)
+        }
+    }
+
+    func testDecodesSplitQuestionLabelsWithCanonicalAnswer() throws {
+        let wire: [String: Any] = [
+            "id": "atn_split", "group_id": "atg_review", "ordinal": 1,
+            "answer_state": "answered", "created_at": "123", "question_type": "yes_no",
+            "choice_options": "{\"yes\":\"Split\",\"no\":\"Bypass limit\"}",
+            "answer": "no", "confidence_source": "structured", "score": 1
+        ]
+        let member = try JSONDecoder().decode(Attention.self, from: JSONSerialization.data(withJSONObject: wire))
+        XCTAssertEqual(member.optionLabels, AnswerOptionLabels(yes: "Split", no: "Bypass limit"))
+        XCTAssertEqual(member.answer, "no")
         XCTAssertTrue(member.choices.isEmpty)
     }
 

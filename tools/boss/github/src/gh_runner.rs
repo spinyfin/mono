@@ -231,17 +231,52 @@ pub struct MergeQueueEntry {
 /// under-attributing exactly the path under investigation.
 pub async fn pr_merge_queue_entry(pr_url: &str) -> Option<MergeQueueEntry> {
     let (owner, repo, number) = crate::pr_url::parse_pr_url_parts(pr_url)?;
+    pr_merge_queue_snapshot(owner, repo, number).await.ok()?.entry
+}
+
+/// A PR's state, head, and live merge-queue entry read in one GraphQL call.
+/// `entry` is `None` when the PR is not queued; `pr_state` (GitHub's
+/// `PullRequestState`: `OPEN`, `MERGED`, `CLOSED`) distinguishes "never
+/// requeued" from "left the queue because it merged or closed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMergeQueueSnapshot {
+    pub pr_state: String,
+    pub head_oid: String,
+    /// The queue entry's node id, when the PR is queued.
+    pub entry_id: Option<String>,
+    pub entry: Option<MergeQueueEntry>,
+}
+
+/// Typed, error-reporting counterpart of [`pr_merge_queue_entry`]: callers
+/// that must distinguish "not queued" from "couldn't tell" use this one.
+pub async fn pr_merge_queue_snapshot(owner: &str, repo: &str, number: u64) -> Result<PrMergeQueueSnapshot> {
     let rate_limit = boss_gh_telemetry::RATE_LIMIT_SELECTION;
     let query = format!(
-        r#"{{ {rate_limit} repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state position enqueuedAt }} }} }} }}"#
+        r#"{{ {rate_limit} repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ state headRefOid mergeQueueEntry {{ id state position enqueuedAt }} }} }} }}"#
     );
-    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
-    let out = output.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let body: Value = serde_json::from_slice(&out.stdout).ok()?;
-    parse_merge_queue_entry(&body)
+    let out = gh_output(&["api", "graphql", "-f", &format!("query={query}")])
+        .await
+        .with_context(|| format!("gh api graphql mergeQueueEntry {owner}/{repo}#{number}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "gh api graphql mergeQueueEntry {owner}/{repo}#{number} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let body: Value = serde_json::from_slice(&out.stdout).context("unparseable mergeQueueEntry response")?;
+    parse_merge_queue_snapshot(&body)
+}
+
+/// Pure mapping of the [`pr_merge_queue_snapshot`] response. A body with no
+/// pull request node is an error; a null `mergeQueueEntry` is `entry: None`.
+fn parse_merge_queue_snapshot(body: &Value) -> Result<PrMergeQueueSnapshot> {
+    let pr = &body["data"]["repository"]["pullRequest"];
+    anyhow::ensure!(pr.is_object(), "mergeQueueEntry response has no pullRequest node");
+    Ok(PrMergeQueueSnapshot {
+        pr_state: pr["state"].as_str().unwrap_or("").to_owned(),
+        head_oid: pr["headRefOid"].as_str().unwrap_or("").to_owned(),
+        entry_id: pr["mergeQueueEntry"]["id"].as_str().map(str::to_owned),
+        entry: parse_merge_queue_entry(body),
+    })
 }
 
 /// Map a GraphQL response `body` into an optional [`MergeQueueEntry`].
@@ -277,15 +312,7 @@ pub struct CommandGhRunner;
 /// `trees` reuse it for their 404 branches rather than re-deriving the
 /// pattern with ad-hoc `contains("404")` / `contains("http 404")` checks.
 pub(crate) fn parse_http_status_from_stderr(stderr: &str) -> Option<u16> {
-    let lower = stderr.to_lowercase();
-    if let Some(pos) = lower.find("http ") {
-        let after = &stderr[pos + 5..];
-        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(code) = digits.parse::<u16>() {
-            return Some(code);
-        }
-    }
-    None
+    git_utils::gh_cli::parse_http_status(stderr)
 }
 
 /// Map a non-success `gh` exit into a status-carrying [`GhRunnerError`],
@@ -544,6 +571,35 @@ mod tests {
                 enqueued_at: Some("2026-07-14T12:00:00Z".to_owned()),
             })
         );
+    }
+
+    #[test]
+    fn snapshot_carries_state_head_and_entry_id() {
+        let body = serde_json::json!({"data": {"repository": {"pullRequest": {
+            "state": "OPEN", "headRefOid": "abc",
+            "mergeQueueEntry": {"id": "MQE_1", "state": "QUEUED", "position": 1, "enqueuedAt": "2026-07-14T12:00:00Z"}
+        }}}});
+        let snapshot = parse_merge_queue_snapshot(&body).unwrap();
+        assert_eq!(snapshot.pr_state, "OPEN");
+        assert_eq!(snapshot.head_oid, "abc");
+        assert_eq!(snapshot.entry_id.as_deref(), Some("MQE_1"));
+        assert_eq!(
+            snapshot.entry.unwrap().enqueued_at.as_deref(),
+            Some("2026-07-14T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn snapshot_with_null_entry_is_not_queued_and_missing_pr_is_an_error() {
+        let body = serde_json::json!({"data": {"repository": {"pullRequest": {
+            "state": "MERGED", "headRefOid": "abc", "mergeQueueEntry": null
+        }}}});
+        let snapshot = parse_merge_queue_snapshot(&body).unwrap();
+        assert_eq!(
+            (snapshot.pr_state.as_str(), snapshot.entry_id, snapshot.entry),
+            ("MERGED", None, None)
+        );
+        assert!(parse_merge_queue_snapshot(&serde_json::json!({"data": {"repository": null}})).is_err());
     }
 
     #[test]

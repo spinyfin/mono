@@ -3,6 +3,7 @@ module(
 )
 
 bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
 bazel_dep(name = "rules_rust", version = "0.70.0")
 
@@ -32,6 +33,25 @@ single_version_override(
     version = "0.70.0",
 )
 
+bazel_dep(name = "rules_rust_prost", version = "0.70.0")
+
+# rules_rust_prost 0.70.0 assumes rustc_compile_action returns a list of
+# providers, but the rules_rust patch above (the test-wrapper backport) makes
+# it return a dict, so every proto aspect failed analysis with "Couldn't find
+# a CrateInfo in the list of providers". The patch normalises both shapes.
+single_version_override(
+    module_name = "rules_rust_prost",
+    patch_strip = 1,
+    patches = ["//third_party/patches:rules_rust_prost-0.70.0-providers-dict.patch"],
+    version = "0.70.0",
+)
+
+# Protobuf toolchain for //tools/boss/protocol-spoke. protobuf was already in
+# the resolved graph transitively at this version; declare it so the protoc
+# the spoke schema is compiled with is pinned here and not by whichever
+# dependency happens to request the highest version.
+bazel_dep(name = "protobuf", version = "34.0.bcr.1")
+bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "apple_support", version = "2.2.0", repo_name = "build_bazel_apple_support")
 bazel_dep(name = "rules_swift", version = "3.5.0", repo_name = "build_bazel_rules_swift")
@@ -52,12 +72,36 @@ test_runtime_repository = use_repo_rule(
 
 test_runtime_repository(name = "test_runtime_tools")
 
+# The driver signature contract test reads an Apple-signed fixture with codesign.
+# Keep this tool out of the shared runtime and declare it only for driver tests.
+test_runtime_repository(
+    name = "driver_signature_test_tools",
+    required = ["true"],
+    runtime_visibility = ["@@//tools/boss/engine/driver:__pkg__"],
+    tools = ["true"],
+    tools_by_os = {"mac os x": ["codesign"]},
+)
+
 host_tmux_repository = use_repo_rule(
     "//tools/test-sandbox:repositories.bzl",
     "host_tmux_repository",
 )
 
 host_tmux_repository(name = "host_tmux")
+
+host_lsof_repository = use_repo_rule(
+    "//tools/test-sandbox:repositories.bzl",
+    "host_lsof_repository",
+)
+
+host_lsof_repository(name = "host_lsof")
+
+host_claude_repository = use_repo_rule(
+    "//tools/test-sandbox:repositories.bzl",
+    "host_claude_repository",
+)
+
+host_claude_repository(name = "host_claude")
 
 codex_probe_runtime_repository = use_repo_rule(
     "//tools/test-sandbox:repositories.bzl",
@@ -68,7 +112,24 @@ codex_probe_runtime_repository(name = "codex_probe_runtime")
 
 jj_test_repository = use_repo_rule("//tools/boss/engine/recovery:jj_repository.bzl", "jj_test_repository")
 
-jj_test_repository(name = "jj_test_tools")
+jj_test_repository(
+    name = "jj_test_tools",
+    visible_to = [
+        "@@//tools/boss/engine/recovery:__pkg__",
+        "@@//tools/boss/engine/test-git:__pkg__",
+        "@@//tools/boss/engine/app:__pkg__",
+        "@@//tools/boss/engine/core:__pkg__",
+        "@@//tools/boss/engine/work-db:__pkg__",
+        "@@//tools/cube:__pkg__",
+    ],
+)
+
+# A newer jj, used only by cube's GC tests.
+jj_test_repository(
+    name = "cube_jj_newer",
+    version = "0.32.0",
+    visible_to = ["@@//tools/cube:__pkg__"],
+)
 
 worker_zsh_repository = use_repo_rule(
     "//tools/boss/engine/worker-bin:host_shell.bzl",
@@ -222,6 +283,11 @@ register_toolchains(
 
 register_toolchains("@rust_toolchains//:all")
 
+# prost/tonic codegen toolchain for //tools/boss/protocol-spoke: generator plugins
+# and runtime crates both come from mono_crates (see that package's README).
+# Registered by the root module, so it wins over rules_rust_prost's default.
+register_toolchains("//third_party/prost:prost_toolchain")
+
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.annotation(
     # SQLITE_DEFAULT_MEMSTATUS=0 removes SQLite's process-global malloc
@@ -229,15 +295,54 @@ crate.annotation(
     # connections/threads in the process — under parallel `cargo test`/`bazel
     # test` load with many WorkDb instances this mutex, not the underlying
     # work, was most of the wall time (see
-    # tools/boss/docs/investigations, WorkDb reconnect profiling). OPT_LEVEL=3
-    # optimizes the bundled sqlite3.c even in a fastbuild/dbg Rust compile,
-    # since `cc`'s build-script probe (libsqlite3-sys build.rs) otherwise
-    # infers -O0 from Bazel's compilation mode.
+    # tools/boss/docs/investigations, WorkDb reconnect profiling).
+    #
+    # -USQLITE_ENABLE_MEMORY_MANAGEMENT undoes a define libsqlite3-sys's
+    # build.rs always passes for the bundled build. With it, SQLite keeps one
+    # page cache for the whole process behind one static mutex, so every page
+    # fetch and unpin on every connection, to any database, takes the same
+    # lock: a sampled `work_db_test` run spent over half of all thread time
+    # waiting on it, and a preempted holder stalls every other connection.
+    # Without it each connection owns its cache and the page path takes no
+    # process-wide lock. The only thing given up is `sqlite3_release_memory()`
+    # and the soft-heap-limit retry, which nothing here calls (and which
+    # MEMSTATUS=0 already disables). SQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
+    # removes the other static mutex on that path, taken on every page
+    # allocation and free only to maintain `sqlite3_status()` counters.
+    # `sqlite_build_has_no_process_wide_page_cache_lock` in work-db pins all
+    # three options against the compiled library.
+    #
+    # OPT_LEVEL=3 optimizes the bundled sqlite3.c even in a fastbuild/dbg Rust
+    # compile, since `cc`'s build-script probe (libsqlite3-sys build.rs)
+    # otherwise infers -O0 from Bazel's compilation mode.
     build_script_env = {
-        "LIBSQLITE3_FLAGS": "SQLITE_DEFAULT_MEMSTATUS=0",
+        "LIBSQLITE3_FLAGS": "SQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT SQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS",
         "OPT_LEVEL": "3",
     },
     crate = "libsqlite3-sys",
+    repositories = ["mono_crates"],
+)
+
+# Observe SQLite call duration/result without changing busy handling or trace hooks.
+crate.annotation(
+    crate = "rusqlite",
+    patch_args = ["-p1"],
+    patches = ["//third_party/patches:rusqlite-0.37.0-call-observer.patch"],
+    repositories = ["mono_crates"],
+)
+
+# protoc plugins that generate the boss.spoke.v1 Rust types and tonic services
+# (//tools/boss/protocol-spoke). They are resolved from the same Cargo.lock as
+# the prost/tonic runtime crates so the generator and the runtime cannot drift
+# apart; see tools/boss/protocol-spoke/README.md.
+crate.annotation(
+    crate = "protoc-gen-prost",
+    gen_binaries = ["protoc-gen-prost"],
+    repositories = ["mono_crates"],
+)
+crate.annotation(
+    crate = "protoc-gen-tonic",
+    gen_binaries = ["protoc-gen-tonic"],
     repositories = ["mono_crates"],
 )
 crate.from_cargo(
@@ -276,9 +381,27 @@ use_repo(
     "swiftpkg_textual",
 )
 
+# Utilities declared by the Node archive integration tests.
+test_runtime_repository(
+    name = "checkleft_node_test_tools",
+    required = [
+        "gzip",
+        "tar",
+    ],
+    runtime_visibility = ["@@//tools/checkleft:__pkg__"],
+    tools = [
+        "gzip",
+        "tar",
+    ],
+    tools_by_os = {"linux": ["getconf"]},
+)
+
 # Prebuilt GhosttyKit.xcframework for the Bazel installer.
 # Rebuild procedure: tools/boss/docs/runbooks/update-ghostty-prebuilt.md
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+gc_store_repositories = use_extension("//tools/cube:testdata/gc_store_repository.bzl", "gc_store_repositories")
+use_repo(gc_store_repositories, "cube_gc_store_tree")
 
 # Codex runtime compatibility tests must use the deployed CLI version, not
 # whatever happens to be installed on the CI host. Keep all platforms in

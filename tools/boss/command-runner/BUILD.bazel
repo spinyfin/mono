@@ -12,12 +12,14 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/bossctl:__pkg__",
+        "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/deterministic-resolvers:__pkg__",
+        "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/github:__pkg__",
         "//tools/boss/tmux:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = ["//lib/rust/process_runner"] + all_crate_deps(normal = True),
 )
 
 rust_test(

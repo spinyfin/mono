@@ -423,6 +423,88 @@ fn sig_d_wire_reasons_only() {
     assert_eq!(sigd[0].execution_id.as_deref(), Some("exec_sigd_indet"));
 }
 
+fn pre_start_failure_json(exec: &str, ts: u64, error: &str) -> String {
+    format!(
+        r#"{{"ts_epoch_ms":{ts},"stage":"pre_start_failure","outcome":"error","execution_id":"{exec}","error_message":"{error}","details":{{"reason":"execution_bookmark_create_failed","pre_start_failure_count":1,"will_retry":true}}}}"#
+    )
+}
+
+#[test]
+fn sig_i_flags_the_same_pre_start_failure_repeating() {
+    let same = "jj bookmark create failed";
+    let events = [
+        ev_from_json(&pre_start_failure_json("exec_sigi", 1_784_900_000_000, same)),
+        ev_from_json(&pre_start_failure_json("exec_sigi", 1_784_900_060_000, same)),
+        ev_from_json(
+            r#"{"ts_epoch_ms":1784900120000,"stage":"pre_start_retries_exhausted","outcome":"error","execution_id":"exec_sigi","details":{"reason":"execution_bookmark_create_failed","pre_start_failure_count":3,"bounced_to_backlog":true}}"#,
+        ),
+        // A different execution failing once, and one failing with a
+        // different error each time, must not match.
+        ev_from_json(&pre_start_failure_json("exec_once", 1_784_900_000_000, same)),
+        ev_from_json(&pre_start_failure_json("exec_varied", 1_784_900_000_000, "a")),
+        ev_from_json(&pre_start_failure_json("exec_varied", 1_784_900_060_000, "b")),
+    ];
+    let findings = match_dispatch_signatures(
+        &events,
+        0,
+        None,
+        None,
+        &scope(&["exec_sigi", "exec_once", "exec_varied"]),
+    );
+    let sig_i: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-I").collect();
+    assert_eq!(sig_i.len(), 1, "{sig_i:?}");
+    assert_eq!(sig_i[0].execution_id.as_deref(), Some("exec_sigi"));
+    assert_eq!(sig_i[0].count, 2);
+    assert_eq!(sig_i[0].severity, Severity::P1);
+    assert_eq!(sig_i[0].details["error"], same);
+    assert_eq!(sig_i[0].details["retries_exhausted"], true);
+}
+
+/// A pre-start failure in the stream shows up in `diagnose` output: both in
+/// the rendered timeline and as a SIG-I finding once it repeats.
+#[test]
+fn a_pre_start_failure_appears_in_the_diagnose_timeline_and_findings() {
+    let events = [
+        ev_from_json(
+            r#"{"ts_epoch_ms":1784900000000,"stage":"cube_change_created","outcome":"ok","execution_id":"exec_diag"}"#,
+        ),
+        ev_from_json(&pre_start_failure_json(
+            "exec_diag",
+            1_784_900_001_000,
+            "jj bookmark create failed",
+        )),
+        ev_from_json(&pre_start_failure_json(
+            "exec_diag",
+            1_784_900_061_000,
+            "jj bookmark create failed",
+        )),
+    ];
+    let rendered = render_timeline(&events, &[], 1_784_900_100_000);
+    assert!(rendered.contains("pre_start_failure"), "{rendered}");
+    assert!(rendered.contains("jj bookmark create failed"), "{rendered}");
+    let findings = match_dispatch_signatures(&events, 1_784_900_100_000, None, None, &scope(&["exec_diag"]));
+    assert!(findings.iter().any(|f| f.sig_id == "SIG-I"), "{findings:?}");
+}
+
+#[test]
+fn sig_i_groups_successive_executions_of_one_work_item_but_respects_scope() {
+    let mut first = ev_from_json(&pre_start_failure_json("exec_first", 1000, "bookmark failed"));
+    first.work_item_id = Some("work_repeated".into());
+    let mut second = ev_from_json(&pre_start_failure_json("exec_second", 2000, "bookmark failed"));
+    second.work_item_id = first.work_item_id.clone();
+    let mut unrelated = ev_from_json(&pre_start_failure_json("exec_other", 3000, "bookmark failed"));
+    unrelated.work_item_id = Some("work_other".into());
+    let events = [first, second, unrelated];
+    let findings = match_dispatch_signatures(&events, 0, None, None, &scope(&[]));
+    let repeated: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-I").collect();
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(repeated[0].count, 2);
+    assert_eq!(repeated[0].work_item_id.as_deref(), Some("work_repeated"));
+    assert_eq!(repeated[0].execution_id, None);
+    let scoped = match_dispatch_signatures(&events, 0, None, None, &scope(&["exec_first"]));
+    assert!(scoped.iter().all(|f| f.sig_id != "SIG-I"));
+}
+
 #[test]
 fn sig_e_and_f() {
     let nack = ev_from_json(
@@ -942,4 +1024,186 @@ fn the_trace_scan_keeps_in_scope_records_and_skips_unreadable_lines() {
 
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["fields"]["execution_id"], Value::String("exec_trace".into()));
+}
+
+/// `dispatch diagnose` prints the engine's own wait classification for the
+/// item: the reason and phrase the board card shows, what it is waiting
+/// behind, and an explicit marker when the engine could not name the wait.
+#[test]
+fn diagnose_wait_line_reports_the_engines_reason() {
+    use boss_protocol::{CreateChoreInput, CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus};
+
+    let db = boss_engine::work::WorkDb::open(":memory:".into()).unwrap();
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("Diagnose wait")
+                .repo_remote_url("git@example.com:diagnose/wait.git")
+                .build(),
+        )
+        .unwrap();
+    let chore = |name: &str| {
+        db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(name)
+                .build(),
+        )
+        .unwrap()
+    };
+    let execution = |work_item_id: &str, status| {
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(status)
+                .build(),
+        )
+        .unwrap()
+    };
+    let root = trace_root("wait-pipeline", "");
+    let line = |work_item_id: &str| {
+        let runtime = db.get_task_runtime(work_item_id).unwrap();
+        let report = diagnose_report(&root, work_item_id, true, false, 1000, Some(&db))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["wait"], dispatch_wait_json(&runtime));
+        dispatch_wait_line(&runtime)
+    };
+    for (status, reason) in [
+        (ExecutionStatus::WaitingReview, "review_reservation"),
+        (ExecutionStatus::WaitingMerge, "awaiting_merge"),
+    ] {
+        let item = chore(reason);
+        if status == ExecutionStatus::WaitingReview {
+            db.update_work_item(
+                &item.id,
+                boss_protocol::WorkItemPatch {
+                    status: Some("active".into()),
+                    pr_url: Some("https://github.com/test/repo/pull/7".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+                work_item_id: Some(item.id.clone()),
+                kind: "pr_review_admission_deferred".into(),
+                title: "Review admission deferred".into(),
+                body_markdown: "Waiting for reviewer capacity".into(),
+                execution_id: None,
+                status: None,
+                resolved_at: None,
+            })
+            .unwrap();
+        }
+        execution(&item.id, status);
+        assert!(line(&item.id).starts_with(&format!("waiting: {reason} — ")));
+    }
+
+    // A hold the scheduler recorded.
+    let held = chore("held by a full pool");
+    let held_execution = execution(&held.id, ExecutionStatus::Ready);
+    db.set_dispatch_wait_reason(&held_execution.id, "pool_exhausted")
+        .unwrap();
+    assert_eq!(
+        line(&held.id),
+        format!(
+            "waiting: pool_exhausted — worker pool full (execution {}, ready)",
+            held_execution.id
+        )
+    );
+
+    // A wait behind another item names it.
+    let prerequisite = chore("prerequisite");
+    let gated = chore("gated");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES (?1, ?2, 'blocks', '1')",
+            [&gated.id, &prerequisite.id],
+        )
+        .unwrap();
+    let gated_execution = execution(&gated.id, ExecutionStatus::WaitingDependency);
+    assert_eq!(
+        line(&gated.id),
+        format!(
+            "waiting: waiting_dependency — waiting for T{} (execution {}, waiting_dependency); behind task {}",
+            prerequisite.short_id.unwrap(),
+            gated_execution.id,
+            prerequisite.id
+        )
+    );
+
+    // Queued on the board with nothing pending.
+    let finished = chore("its run was cancelled before it started");
+    execution(&finished.id, ExecutionStatus::Cancelled);
+    assert_eq!(
+        line(&finished.id),
+        "waiting: run_ended — its last run ended; start it again to queue a new run (no execution queued)"
+    );
+
+    // A wait the engine cannot name is called out, never given a reason.
+    let stranded = chore("active with an ungated waiting_dependency row");
+    db.update_work_item(
+        &stranded.id,
+        boss_protocol::WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    execution(&stranded.id, ExecutionStatus::WaitingDependency);
+    let unexpected = line(&stranded.id);
+    assert!(
+        unexpected.starts_with("waiting: unclassified — the engine has no reason recorded for this wait"),
+        "{unexpected}"
+    );
+    assert!(unexpected.contains("UNEXPECTED"), "{unexpected}");
+    assert!(!unexpected.to_lowercase().contains("unknown"), "{unexpected}");
+
+    let json = dispatch_wait_json(&db.get_task_runtime(&gated.id).unwrap());
+    assert_eq!(json["reason"], "waiting_dependency");
+    assert_eq!(json["blocker"]["work_item_id"], prerequisite.id.as_str());
+}
+
+#[test]
+fn diagnose_resolves_items_without_execution_or_event_history() {
+    use boss_protocol::{CreateChoreInput, CreateProductInput};
+    let db = boss_engine::work::WorkDb::open(":memory:".into()).unwrap();
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("No history")
+                .repo_remote_url("https://github.com/test/repo")
+                .build(),
+        )
+        .unwrap();
+    let root = trace_root("no-history", "");
+    for (status, deferred, expected) in [
+        ("todo", 1, "deferred"),
+        ("active", 0, "awaiting_redispatch"),
+        ("in_review", 0, "unclassified"),
+    ] {
+        let item = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name(expected)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2, deferred = ?3 WHERE id = ?1",
+                (&item.id, status, deferred),
+            )
+            .unwrap();
+        let report = diagnose_report(&root, &item.id, true, false, 1000, Some(&db))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["wait"]["reason"], expected, "{report}");
+        assert!(report["timelines"].as_object().unwrap().is_empty(), "{report}");
+    }
 }

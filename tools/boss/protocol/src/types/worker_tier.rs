@@ -42,6 +42,10 @@ pub enum WorkerTierDenialReason {
     /// surfaces, planner control, automation management, GitHub/trunk auth.
     /// The worker answers to the coordinator, it does not drive it.
     CoordinatorOnly,
+    /// A progression session reached outside its scope: either a verb or
+    /// proposal kind that is not enabled for progression, or a target
+    /// outside the neighbourhood captured when the session started.
+    ProgressionScope,
 }
 
 impl WorkerTierDenialReason {
@@ -49,6 +53,7 @@ impl WorkerTierDenialReason {
         WorkerTierDenialReason::MutatingTaxonomy,
         WorkerTierDenialReason::RuntimeIsolation,
         WorkerTierDenialReason::CoordinatorOnly,
+        WorkerTierDenialReason::ProgressionScope,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -56,6 +61,7 @@ impl WorkerTierDenialReason {
             WorkerTierDenialReason::MutatingTaxonomy => "mutating_taxonomy",
             WorkerTierDenialReason::RuntimeIsolation => "runtime_isolation",
             WorkerTierDenialReason::CoordinatorOnly => "coordinator_only",
+            WorkerTierDenialReason::ProgressionScope => "progression_scope",
         }
     }
 }
@@ -116,6 +122,31 @@ impl WorkerTierDenial {
             use_instead: None,
         }
     }
+
+    /// A refusal for a progression session. Never carries worker guidance
+    /// (`boss propose blocked` is itself closed to progression): the message
+    /// states the progression boundary, and `use_instead` names the verb a
+    /// progression session may use for the same intent, when one exists.
+    pub fn progression(
+        verb: impl Into<String>,
+        reason: WorkerTierDenialReason,
+        detail: impl AsRef<str>,
+        use_instead: Option<String>,
+    ) -> Self {
+        let verb = verb.into();
+        let mut message = format!("`{verb}` is not available to progression sessions: {}", detail.as_ref());
+        match &use_instead {
+            Some(alt) => message.push_str(&format!(" Use `{alt}` instead.")),
+            None => message
+                .push_str(" Progression sessions can read the work taxonomy and submit enabled proposal kinds only."),
+        }
+        Self {
+            verb,
+            reason,
+            message,
+            use_instead,
+        }
+    }
 }
 
 impl WorkerTierDenialReason {
@@ -127,6 +158,7 @@ impl WorkerTierDenialReason {
                 "engine runtime state (dispatch, panes, transcripts, other executions) is off-limits to workers"
             }
             WorkerTierDenialReason::CoordinatorOnly => "this is a coordinator/app verb",
+            WorkerTierDenialReason::ProgressionScope => "outside what a progression session is permitted to do",
         }
     }
 }

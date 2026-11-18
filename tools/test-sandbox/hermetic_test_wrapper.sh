@@ -29,9 +29,6 @@ xcode_bin="${main_runfiles}/tools/test-sandbox"
 host_home="${HOME:?}"
 host_tmpdir="${TMPDIR:-}"
 host_tmpdir_alias=""
-if [[ "${host_tmpdir}" == /var/* ]]; then
-  host_tmpdir_alias="/private${host_tmpdir}"
-fi
 host_user_home=""
 if [[ -n "${USER:-}" && -d "/Users/${USER}" ]]; then
   host_user_home="/Users/${USER}"
@@ -150,6 +147,44 @@ profile="${TEST_TMPDIR:?}/mono-test.sb"
 test_command="$("${runtime_bin}/python3" -c \
   'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1")"
 
+# The manifest records where each audited tool lived on the machine that
+# configured the runtime repository, which under remote execution is not the
+# machine running this action. Seatbelt matches the final physical path, so
+# resolve every entry here, on the executing host. bin/<name> is a declared
+# symlink to the recorded path; it must reach the same file as the recorded
+# path does (a shipped copy of the tool, or a host without it, does not), and
+# that file is what the profile allows. A *-tree entry names a directory of
+# helpers and is allowed at its resolved location. Anything missing or
+# mismatched fails the action closed. On the machine that configured the
+# repository the recorded paths are already final, so this yields exactly the
+# manifest's own paths.
+runtime_grants="${TEST_TMPDIR}/runtime-grants"
+if ! "${runtime_bin}/python3" -c \
+  'import os, sys
+runtime_bin, manifest = sys.argv[1:3]
+for line in open(manifest):
+    name, _, recorded = line.rstrip("\n").partition("=")
+    if not name or not os.path.isabs(recorded):
+        sys.exit("malformed runtime manifest entry: " + line.rstrip("\n"))
+    resolved = os.path.realpath(recorded)
+    if "\n" in resolved or "\t" in resolved:
+        sys.exit(name + ": unsupported path " + repr(resolved))
+    if name.endswith("-tree"):
+        if not os.path.isdir(resolved):
+            sys.exit(name + ": " + recorded + " is not a directory on this host")
+        print("subpath\t" + resolved)
+        continue
+    if not os.path.isfile(resolved):
+        sys.exit(name + ": " + recorded + " does not exist on this host")
+    tool = os.path.join(runtime_bin, name)
+    if os.path.realpath(tool) != resolved:
+        sys.exit(name + ": " + tool + " does not resolve to " + recorded)
+    print("literal\t" + resolved)' \
+  "${runtime_bin}" "${runtime_manifest}" >"${runtime_grants}"; then
+  printf '%s\n' "audited Bazel test runtime does not match this host" >&2
+  exit 126
+fi
+
 escape_profile_path() {
   local escaped="$1"
   escaped="${escaped//\\/\\\\}"
@@ -179,11 +214,34 @@ emit_protected_root() {
 }
 
 developer_dir=""
+developer_dir_grant=""
 if [[ "${MONO_TEST_XCODE_TOOLCHAIN:-}" == "1" ]]; then
   IFS= read -r developer_dir <"${developer_dir_file}" || true
   if [[ -z "${developer_dir}" || ! -d "${developer_dir}" ]]; then
     printf '%s\n' "configured Xcode developer root is unavailable" >&2
     exit 126
+  fi
+  # As with the manifest: the recorded root may be a symlink on this host.
+  developer_dir_grant="$("${runtime_bin}/python3" -c \
+    'import os, sys; print(os.path.realpath(sys.argv[1]))' "${developer_dir}")"
+  # Foundation stages atomic writes in the per-user temp directory, wherever
+  # TMPDIR points, and the write exception below is built from that directory.
+  # Bazel gives a local action the invoking user's TMPDIR, which names it. A
+  # remote action has only the environment it declares: no TMPDIR, or for an
+  # Apple test target the unexpanded XCODE_TEST_ENV placeholder. Neither is a
+  # path, so ask the host that is running the action. 65537 is
+  # _CS_DARWIN_USER_TEMP_DIR in <unistd.h>, the value `getconf
+  # DARWIN_USER_TEMP_DIR` prints; os.confstr accepts the number, not the name.
+  if [[ "${host_tmpdir}" != /* ]]; then
+    if ! host_tmpdir="$("${runtime_bin}/python3" -c \
+      'import os; print(os.confstr(65537) or "")')" ||
+      [[ "${host_tmpdir}" != /* || ! -d "${host_tmpdir}" ]]; then
+      printf '%s\n' "the per-user temp directory of this host is unavailable" >&2
+      exit 126
+    fi
+  fi
+  if [[ "${host_tmpdir}" == /var/* ]]; then
+    host_tmpdir_alias="/private${host_tmpdir}"
   fi
   export MONO_TEST_XCODE_DEVELOPER_DIR="${developer_dir}"
   export MONO_TEST_HOST_TMPDIR="${host_tmpdir}"
@@ -265,27 +323,38 @@ fi
     "  (allow process-exec (subpath \"$(escape_profile_path "${test_tmpdir_alias}")\"))" \
     "  (allow process-exec (literal \"$(escape_profile_path "${test_command}")\"))"
 
-  while IFS='=' read -r runtime_name runtime_path; do
-    if [[ "${runtime_name}" == *-tree ]]; then
-      printf '  (allow process-exec (subpath "%s"))\n' \
-        "$(escape_profile_path "${runtime_path}")"
-    else
-      printf '  (allow process-exec (literal "%s"))\n' \
-        "$(escape_profile_path "${runtime_path}")"
-    fi
-  done <"${runtime_manifest}"
+  while IFS=$'\t' read -r grant_kind grant_path; do
+    printf '  (allow process-exec (%s "%s"))\n' \
+      "${grant_kind}" "$(escape_profile_path "${grant_path}")"
+  done <"${runtime_grants}"
 
   # The runfiles tree and Bazel output tree both use symlinks on macOS, while
   # Seatbelt evaluates the final physical executable. Resolve every executable
   # from the current target's manifest to its final path before granting it.
+  # A remote executor stages the runfiles tree itself and no manifest (whose
+  # paths would name the client anyway), so there the staged tree is read
+  # instead: the same declared inputs, resolved on the host that runs them.
+  # Files staged inside the tree are already covered by the TEST_SRCDIR grant
+  # above; what is left is a declared symlink that leaves the tree.
   canonical_runfile_execs="${TEST_TMPDIR}/runfile-executables"
   "${runtime_bin}/python3" -c \
     'import os, sys
-for line in open(sys.argv[1]):
-    fields = line.rstrip("\n").split(" ", 1)
-    if len(fields) == 2 and os.access(fields[1], os.X_OK):
-        print(os.path.realpath(fields[1]))' \
+manifest, runfiles = sys.argv[1:3]
+if os.path.isfile(manifest):
+    for line in open(manifest):
+        fields = line.rstrip("\n").split(" ", 1)
+        if len(fields) == 2 and os.access(fields[1], os.X_OK):
+            print(os.path.realpath(fields[1]))
+else:
+    for root, dirs, files in os.walk(runfiles):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            resolved = os.path.realpath(path)
+            if os.access(path, os.X_OK) and not resolved.startswith(runfiles + os.sep):
+                print(resolved)' \
     "${RUNFILES_MANIFEST_FILE:-${TEST_SRCDIR}/MANIFEST}" \
+    "${TEST_SRCDIR}" \
     >"${canonical_runfile_execs}"
   while IFS= read -r runfile_path; do
     printf '  (allow process-exec (literal "%s"))\n' \
@@ -296,7 +365,7 @@ for line in open(sys.argv[1]):
     printf '%s\n' \
       '  (allow process-exec (literal "/usr/bin/xcodebuild"))' \
       '  (allow process-exec (literal "/usr/bin/xcrun"))' \
-      "  (allow process-exec (subpath \"$(escape_profile_path "${developer_dir}")\"))"
+      "  (allow process-exec (subpath \"$(escape_profile_path "${developer_dir_grant}")\"))"
   fi
 
   if [[ "${MONO_TEST_ALLOW_NETWORK:-}" != "1" ]]; then

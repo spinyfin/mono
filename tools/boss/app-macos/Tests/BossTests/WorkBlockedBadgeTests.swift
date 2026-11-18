@@ -92,6 +92,10 @@ final class WorkBlockedBadgeTests: XCTestCase {
         XCTAssertEqual(WorkBlockedBadge.label(forReason: "ci_failure"), "CI Failure")
         XCTAssertEqual(WorkBlockedBadge.label(forReason: "ci_failure_exhausted"), "CI Failed")
         XCTAssertEqual(WorkBlockedBadge.label(forReason: "review_feedback"), "Review")
+        XCTAssertEqual(
+            WorkBlockedBadge.label(forReason: "spawning_attempt_retired_unsuccessfully"),
+            "Fix Attempt Ended"
+        )
     }
 
     // MARK: badgeTooltip — verbatim detail, falling back to raw reason

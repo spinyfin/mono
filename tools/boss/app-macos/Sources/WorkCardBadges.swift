@@ -3,6 +3,17 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+/// Capsule chip surfacing a repo's short name on a kanban card or
+/// product header. Hover tooltip carries the full URL plus the
+/// provenance string ("Inherited from product" vs "Repo set on this
+/// card") so the reader can tell where the URL came from without
+/// digging into the popover. Pure view — all the mode/provenance
+/// logic lives on `RepoChipPresentation` so tests don't need a
+/// SwiftUI host.
+///
+/// The chip uses a neutral style matching `WorkStatusBadge`. Per-card
+/// chips appear only on rows with their own repo, so their presence
+/// conveys the override without an accent color.
 struct RepoChipView: View {
     let presentation: RepoChipPresentation
     var emphasized: Bool = false
@@ -16,7 +27,7 @@ struct RepoChipView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(Color(nsColor: .labelColor))
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
@@ -69,7 +80,7 @@ struct ExternalRefLinkView: View {
                 ? "Upstream issue (stale): \(presentation.label)"
                 : "Open upstream issue: \(presentation.label)")
             .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -90,7 +101,7 @@ struct ConflictClearedBadge: View {
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(Color.green)
         .help("The engine cleared a merge conflict on this PR within the last 24 hours.")
         .accessibilityLabel("Conflict cleared by the engine")
@@ -111,7 +122,7 @@ struct CIAutoFixedBadge: View {
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(Color.green)
         .help("The engine auto-fixed a CI failure on this PR within the last 24 hours.")
         .accessibilityLabel("CI auto-fixed by the engine")
@@ -171,7 +182,7 @@ struct CIFailureChip: View {
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundStyle(color)
         .help(tooltip)
         .accessibilityLabel(tooltip)
@@ -629,7 +640,7 @@ struct PrInRevisionIndicator: View {
         .padding(.vertical, 3)
         .background(isBlocked ? Color.red : Color.orange)
         .clipShape(Capsule())
-        .fixedSize()
+        .fixedSize(horizontal: false, vertical: true)
 
         Group {
             if let onTap {
@@ -819,6 +830,8 @@ struct AIReviewStateBadge: View {
         let label = Label(presentation.label, systemImage: presentation.systemImage)
             .font(.caption2.weight(.semibold))
             .foregroundStyle(tint)
+            .lineLimit(1)
+            .truncationMode(.tail)
 
         Group {
             if state == "reviewed_with_findings", let onRevealFindings {
@@ -1001,7 +1014,9 @@ struct ProjectTaskCountChip: View {
 /// priority (medium included) rather than hiding the default so the
 /// field is always visible — invisible defaults are exactly what
 /// pushed authors to stuff `[MEDIUM]` into the name in the first
-/// place.
+/// place. `critical` is deliberately not another letter: it is the
+/// one level that changes dispatch behaviour, so it reads as a solid
+/// red `CRIT` capsule that cannot be mistaken for the tinted `H`.
 
 struct PriorityChip: View {
     let priority: WorkPriority
@@ -1021,6 +1036,7 @@ struct PriorityChip: View {
 
     private var letter: String {
         switch priority {
+        case .critical: return "CRIT"
         case .high: return "H"
         case .medium: return "M"
         case .low: return "L"
@@ -1029,6 +1045,7 @@ struct PriorityChip: View {
 
     private var backgroundColor: Color {
         switch priority {
+        case .critical: return Color.red
         case .high: return Color.red.opacity(0.18)
         case .medium: return Color.gray.opacity(0.18)
         case .low: return Color.blue.opacity(0.14)
@@ -1037,6 +1054,7 @@ struct PriorityChip: View {
 
     private var foregroundColor: Color {
         switch priority {
+        case .critical: return .white
         case .high: return .red
         case .medium: return Color(nsColor: .secondaryLabelColor)
         case .low: return .blue

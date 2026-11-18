@@ -1,0 +1,14 @@
+[package]
+name = "checkleft-proto-breaking"
+version = "0.1.0"
+edition.workspace = true
+description = "checkleft check (proto/breaking): fail a change whose .proto files are not backward compatible with the change's base revision"
+
+# An ordinary rlib. The component ABI is wired once in the aggregating
+# `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
+# the single multiplexed preinstalled component. No `wit-bindgen` dependency is
+# needed here: `export_checks!` is called by the aggregating bundle, not here.
+[dependencies]
+checkleft-check-sdk = { path = "../../../sdk" }
+prost-types = { workspace = true }
+protox-parse = { workspace = true }

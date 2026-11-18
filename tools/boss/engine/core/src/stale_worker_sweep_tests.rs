@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use boss_protocol::{WorkItemBinding, WorkerActivity, WorkerEvent};
@@ -13,6 +14,12 @@ use crate::semantic_progress::SemanticProgressCheckpoint;
 use crate::sweep_loop::SweepOutcome;
 use crate::test_support::*;
 use crate::work::ExecutionStatus;
+
+#[path = "worker_death_regression_tests.rs"]
+mod worker_death_regression_tests;
+
+#[path = "stale_worker_progression_timeout_tests.rs"]
+mod progression_timeout_tests;
 
 // A staleness threshold whose cutoff lands in the *future*, so any
 // `last_event_at` stamped "now" by `apply_event` compares as stale.
@@ -39,6 +46,21 @@ fn in_flight_tool_is_healthy_however_old_the_checkpoint() {
             ProgressFidelity::Rich,
             now,
             1_000,
+        ),
+        SemanticStaleness::Healthy,
+    );
+}
+
+#[test]
+fn yielded_command_remains_protected_from_destructive_reaping() {
+    assert_eq!(
+        classify_semantic_staleness(
+            SemanticToolCondition::Yielded,
+            Some(&iso8601_utc(0)),
+            &iso8601_utc(0),
+            ProgressFidelity::Rich,
+            10_000,
+            1_000
         ),
         SemanticStaleness::Healthy,
     );
@@ -284,9 +306,36 @@ impl StaleWorkerReaper for ReleasingReaper {
     async fn reap_worker(&self, execution_id: &str) {
         self.live_states.release_slot(self.slot_id);
         self.coordinator
-            .release_worker_and_kick(&worker_id_for_slot(self.slot_id), None)
+            .release_worker_and_kick(&worker_id_for_slot(self.slot_id), execution_id, None)
             .await;
         self.reaped.lock().unwrap().push(execution_id.to_owned());
+    }
+}
+
+/// Mirrors a production pane reaper whose awaited release hands slot 1 to a
+/// new run that registers live state before the sweep's own tail runs.
+struct ReplacingReaper {
+    coordinator: Arc<ExecutionCoordinator>,
+    live_states: Arc<LiveWorkerStateRegistry>,
+}
+
+#[async_trait]
+impl StaleWorkerReaper for ReplacingReaper {
+    async fn reap_worker(&self, execution_id: &str) {
+        self.live_states.release_slot_for_run(execution_id);
+        self.coordinator
+            .release_worker_and_kick(&worker_id_for_slot(1), execution_id, None)
+            .await;
+        assert!(
+            self.coordinator
+                .worker_pool()
+                .claim_worker("replacement", None)
+                .await
+                .is_some()
+        );
+        register_slot(&self.live_states, 1, "replacement", "replacement-item");
+        self.coordinator.scheduling_active().store(true, Ordering::Release);
+        self.coordinator.scheduling_pending().store(false, Ordering::Release);
     }
 }
 
@@ -420,6 +469,49 @@ async fn stale_idle_worker_is_reaped() {
         _ => panic!("expected chore"),
     };
     assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
+}
+
+/// The cadence fallback's guarded release must leave a replacement that the
+/// reaper's own release admitted into the same slot untouched.
+#[tokio::test]
+async fn cadence_reap_leaves_a_replacement_claim_and_live_state_in_place() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+    let reaper = ReplacingReaper {
+        coordinator: coordinator.clone(),
+        live_states: live_states.clone(),
+    };
+    let sink = RecordingDispatchEventSink::new();
+    let outcome = run_one_pass(
+        db.as_ref(),
+        &live_states,
+        coordinator.clone(),
+        &sink,
+        &reaper,
+        &HoldRegistry::new(),
+        ALWAYS_STALE,
+    )
+    .await;
+
+    assert_eq!(outcome.reaped, 1);
+    assert_eq!(
+        coordinator.claim_holder(&worker_id_for_slot(1)).await.as_deref(),
+        Some("replacement")
+    );
+    assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+    assert!(
+        !coordinator.scheduling_pending().load(Ordering::Acquire),
+        "a no-op ownership miss must not kick dispatch or rescan active work"
+    );
 }
 
 #[tokio::test]
@@ -1581,7 +1673,18 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
         "a successful auto-reap must not also count as a stuck attention"
     );
     assert_eq!(outcome.auto_reap_aborted, 0);
-    assert_eq!(cube.force_release_calls(), vec!["lease-1"]);
+    // Teardown is proven, but this fixture has no recovery pointer or
+    // inspectable workspace: nothing can be preserved, which is reported, and
+    // the lease is still returned by the inferred-death reap.
+    assert_eq!(cube.force_release_calls(), ["lease-1"]);
+    assert_eq!(db.get_execution(&execution_id).unwrap().cube_lease_id.as_deref(), None);
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(items.iter().any(|item| item.kind == "preserved_work_needs_inspection"));
+    assert!(
+        items
+            .iter()
+            .all(|item| item.kind != crate::workspace_lease_release::LEASE_UNRELEASED_ATTENTION_KIND)
+    );
 
     let exec = db.get_execution(&execution_id).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Orphaned);
@@ -1998,6 +2101,7 @@ impl<'a> WorkerTerminalInspector for RefreshesProgressOnRecheckInspector<'a> {
                 self.slot_id,
                 &SemanticProgressCheckpoint {
                     tool_condition: SemanticToolCondition::Idle,
+                    turn_condition: crate::semantic_progress::SemanticTurnCondition::Unknown,
                     progress_at: iso8601_utc(boss_engine_utils::epoch_time::now_epoch_secs()),
                 },
             );
@@ -2030,6 +2134,7 @@ async fn auto_reap_recheck_new_driver_event_blocks_the_reap() {
         1,
         &SemanticProgressCheckpoint {
             tool_condition: SemanticToolCondition::Idle,
+            turn_condition: crate::semantic_progress::SemanticTurnCondition::Unknown,
             progress_at: iso8601_utc(now - 10_000),
         },
     );

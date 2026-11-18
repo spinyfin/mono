@@ -10,6 +10,7 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
 
     func testQueuedHistoryReplySurvivesRepeatedDisconnectsAndReconnect() throws {
         let model = makeModel()
+        model.activityIsVisible = true
         model.refreshEngineAttempts()
         let requestId = try XCTUnwrap(model.backgroundWorkPending.keys.first)
         XCTAssertTrue(model.engine.isReadQueued(requestId: requestId))
@@ -45,21 +46,40 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         XCTAssertTrue(model.backgroundWork.isEmpty)
     }
 
+    /// Waits for the polls themselves and for the poll loop to return, not
+    /// for an interval in which a number of ticks should fit, so a host whose
+    /// timers fire late makes this slower and nothing else.
     func testTimerKeepsPollingWhileConnectedAndStopsOnDisconnect() async throws {
         let model = makeModel(pollInterval: 0.05)
-        let recorder = installRecorder(on: model)
+        let recorder = PayloadRecorder()
+        // The connect poll is the first; the timer has to fire, and fire
+        // again, to send the third.
+        let thirdPoll = expectation(description: "the timer polled twice after the connect poll")
+        model.outboundRecorder = { [self] payload in
+            recorder.value.append(payload)
+            if isBackgroundPoll(payload), backgroundPolls(in: recorder).count == 3 { thirdPoll.fulfill() }
+        }
 
         model.applyEventForTest(.connected)
         XCTAssertEqual(backgroundPolls(in: recorder).count, 1)
 
-        try await Task.sleep(for: .milliseconds(250))
+        await fulfillment(of: [thirdPoll], timeout: 10)
         let whileConnected = backgroundPolls(in: recorder).count
         XCTAssertGreaterThanOrEqual(whileConnected, 3, "the five-second timer (shortened in tests) must keep polling")
         XCTAssertTrue(model.isBackgroundWorkPolling)
 
+        let pollLoop = try XCTUnwrap(model.backgroundWorkPollTask)
         model.applyEventForTest(.disconnected)
         XCTAssertFalse(model.isBackgroundWorkPolling)
-        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(pollLoop.isCancelled, "disconnect must cancel the timer, not only forget it")
+        // Once the loop has returned no later tick can send, so there is no
+        // interval to wait out and hope nothing arrives in.
+        let loopReturned = expectation(description: "the poll loop returned")
+        Task {
+            await pollLoop.value
+            loopReturned.fulfill()
+        }
+        await fulfillment(of: [loopReturned], timeout: 10)
         XCTAssertEqual(
             backgroundPolls(in: recorder).count,
             whileConnected,
@@ -242,32 +262,34 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         model.applyEventForTest(.disconnected)
     }
 
-    func testWorkInvalidationTriggersAnEarlyBackgroundPoll() {
+    func testWorkInvalidationTriggersAnEarlyBackgroundPoll() async {
         let model = makeModel()
         let recorder = installRecorder(on: model)
         model.applyEventForTest(.connected)
         recorder.value.removeAll()
 
         model.applyEventForTest(.workInvalidated(topic: "work.product.prod_1", productId: "prod_1", itemIds: []))
+        await waitForRefetchBursts(model)
 
         XCTAssertEqual(backgroundPolls(in: recorder).count, 1)
         XCTAssertTrue(model.isBackgroundWorkPolling, "an early refresh must not cancel the timer")
         model.applyEventForTest(.disconnected)
     }
 
-    func testResyncRequiredTriggersAnEarlyBackgroundPoll() {
+    func testResyncRequiredTriggersAnEarlyBackgroundPoll() async {
         let model = makeModel()
         let recorder = installRecorder(on: model)
         model.applyEventForTest(.connected)
         recorder.value.removeAll()
 
         model.applyEventForTest(.resyncRequired)
+        await waitForRefetchBursts(model)
 
         XCTAssertEqual(backgroundPolls(in: recorder).count, 1)
         model.applyEventForTest(.disconnected)
     }
 
-    func testEventTriggeredRefreshCoalescesWhileBackgroundPollIsPending() {
+    func testEventTriggeredRefreshCoalescesWhileBackgroundPollIsPending() async {
         let model = makeModel()
         let recorder = installRecorder(on: model)
         model.applyEventForTest(.connected)
@@ -277,6 +299,7 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         model.applyEventForTest(.workInvalidated(topic: "work.product.prod_1", productId: "prod_1", itemIds: []))
         model.applyEventForTest(.workInvalidated(topic: "comments.artifact.x", productId: nil, itemIds: []))
         model.applyEventForTest(.resyncRequired)
+        await waitForRefetchBursts(model)
 
         XCTAssertEqual(
             backgroundPolls(in: recorder).count,
@@ -392,6 +415,14 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         return model
     }
 
+    /// The event-triggered background poll is sent by the coalesced refetch
+    /// burst, not by the event handler, so an assertion about it must run
+    /// after the burst has fired.
+    private func waitForRefetchBursts(_ model: ChatViewModel) async {
+        let settled = await model.waitForRefetchBurstsForTest()
+        XCTAssertTrue(settled, "the refetch burst never fired")
+    }
+
     private func installRecorder(on model: ChatViewModel) -> PayloadRecorder {
         let recorder = PayloadRecorder()
         model.outboundRecorder = { payload in recorder.value.append(payload) }
@@ -399,11 +430,13 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
     }
 
     private func backgroundPolls(in recorder: PayloadRecorder) -> [[String: Any]] {
-        recorder.value.filter { payload in
-            payload["type"] as? String == "list_engine_attempts"
-                && intValue(payload, "limit") == 0
-                && payload["include_background_work"] as? Bool == true
-        }
+        recorder.value.filter(isBackgroundPoll)
+    }
+
+    private func isBackgroundPoll(_ payload: [String: Any]) -> Bool {
+        payload["type"] as? String == "list_engine_attempts"
+            && intValue(payload, "limit") == 0
+            && payload["include_background_work"] as? Bool == true
     }
 
     private func intValue(_ payload: [String: Any], _ key: String) -> Int? {

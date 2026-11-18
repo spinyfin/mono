@@ -41,14 +41,14 @@ pub struct PrReviewContext {
     /// module tree spread across a diff's unchanged and changed hunks).
     pub last_reviewed_sha: Option<String>,
     /// Deterministic supersession-language hits found in the PR body, commit
-    /// messages, or comments (incident-002 P3). Each entry is a rendered
+    /// messages, or comments. Each entry is a rendered
     /// `term — snippet` line. When non-empty the reviewer prompt carries an
     /// authoritative block requiring a verified design-doc citation for each
     /// flagged claim. Populated by the caller (the spawn path scans the PR
     /// narrative); empty here by default.
     #[builder(default)]
     pub supersession_flags: Vec<String>,
-    /// Deterministic both-parents deletion-tripwire result (incident-002 P2):
+    /// Deterministic both-parents deletion-tripwire result:
     /// files a merged parent added and this forward-port/merge resolution
     /// removed, rename/move-aware. Each entry is a rendered description line.
     /// When non-empty the reviewer prompt carries an authoritative,
@@ -119,7 +119,7 @@ pub enum ReviewFindingCategory {
     /// Logic error, broken invariant, race condition, mishandled error.
     Correctness,
     /// Inadvertent deletion/regression — code dropped that was not the
-    /// purpose of the PR (the T793 check class).
+    /// purpose of the PR (a live feature silently removed during a forward-port).
     Regression,
     /// Wrong layer, missed reuse, abstraction fights codebase conventions.
     Architecture,
@@ -159,7 +159,7 @@ pub enum ReviewFindingCategory {
     /// lineage of a change ("we used to do X, but removed it because Y")
     /// instead of describing the current state of the code, references a
     /// Boss construct (a work item id, phase, chore, brief, or effort level
-    /// — e.g. "implements T234 phase 7"), or refers to the human directing
+    /// — e.g. "implements phase 7 of the rollout"), or refers to the human directing
     /// Boss as "the operator" or to actors in general instead of stating the
     /// underlying reason directly. In a PR title/description: references a
     /// Boss construct or "the operator"/actor framing, same as above —
@@ -478,7 +478,7 @@ mod tests {
     /// that used the old `deletion_check` key) must still parse successfully.
     /// The `findings`/`revision_warranted` fields carry all the information the
     /// engine needs; silently discarding the whole review for a missing optional
-    /// field is the T1359 failure mode.
+    /// field is the failure mode where the field is omitted.
     #[test]
     fn review_result_parses_without_regression_check_field() {
         let json = serde_json::json!({
@@ -496,10 +496,10 @@ mod tests {
                     "confidence": "high"
                 }
             ]
-            // regression_check intentionally omitted — T1359 failure mode
+            // regression_check intentionally omitted — the omitted-field failure mode
         });
-        let result = ReviewResult::from_json(&json.to_string())
-            .expect("ReviewResult must parse even without regression_check (T1359 robustness)");
+        let result =
+            ReviewResult::from_json(&json.to_string()).expect("ReviewResult must parse even without regression_check");
         assert!(result.revision_warranted, "revision_warranted must be preserved");
         assert_eq!(result.findings.len(), 1, "findings must be preserved");
         assert!(
@@ -525,7 +525,7 @@ mod tests {
         assert!(result.regression_check.performed);
     }
 
-    /// Regression fixture for T1687/PR#1497: reviewer correctly identifies a
+    /// Regression fixture for PR#1497: reviewer correctly identifies a
     /// regression but fills `suspected_deletions` with descriptive strings
     /// instead of `ReviewFinding` objects (because the prompt schema never
     /// showed the element shape). Previously `serde_json::from_str` rejected
@@ -554,7 +554,7 @@ mod tests {
             ],
             "regression_check": {
                 "performed": true,
-                // Reviewer emitted a string array — the T1687 shape that
+                // Reviewer emitted a string array — the string-array shape that
                 // previously caused a serde type-mismatch rejection.
                 "suspected_deletions": [
                     "config_dir-scoped exclude_files matching removed without replacement"
@@ -563,8 +563,8 @@ mod tests {
         })
         .to_string();
 
-        let result = ReviewResult::from_json(&json)
-            .expect("ReviewResult with string-array suspected_deletions must parse (T1687 fix)");
+        let result =
+            ReviewResult::from_json(&json).expect("ReviewResult with string-array suspected_deletions must parse");
         assert!(result.revision_warranted, "revision_warranted must be preserved");
         assert_eq!(result.findings.len(), 1, "finding must be preserved");
         assert!(

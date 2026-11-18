@@ -1,0 +1,2974 @@
+//! The dispatch scheduler loop: kick/heartbeat wakeups, the ready-queue
+//! drain, chain-serialization holds, and automation preemption. Part of the
+//! `coordinator` module split; see [`super`] for the struct and shared types.
+use super::predecessor_hold::PredecessorHold;
+use super::spoke_in_doubt::waitable_spoke_lease;
+use super::*;
+
+/// A queued answer agent older than this is unusual enough to require an
+/// operator-visible signal. This observes the existing queue only; it does
+/// not alter pool selection, dispatch class, priority, or concurrency.
+pub const ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD: Duration = Duration::from_secs(15 * 60);
+
+pub use boss_engine_storage_values::attention_kinds::ANSWER_AGENT_READY_AGE_ATTENTION_KIND;
+
+impl ExecutionCoordinator {
+    /// Wake the scheduler. Every call site that just enqueued a `ready`
+    /// execution — a kanban drag, a reconciler sweep, the heartbeat, an
+    /// automation dispatch, … — calls this.
+    ///
+    /// Routes through [`Self::event_bus`] as `Event::DispatchReady` when
+    /// [`Self::enable_dispatch_ready_bus`] is on; otherwise calls
+    /// [`Self::note_dispatch_ready`] directly, exactly as this function did
+    /// before the bus existed. The flag is the rollback switch: flip it off
+    /// and every call site is back on the direct path with no other change,
+    /// no redeploy of anything but config.
+    pub fn kick(self: &Arc<Self>) {
+        if self.enable_dispatch_ready_bus {
+            tracing::debug!("scheduler_kick outcome=bus_publish — routing through DispatchReady");
+            self.event_bus.publish(Event::DispatchReady);
+            return;
+        }
+        self.note_dispatch_ready();
+    }
+
+    /// The double-latch wakeup itself, extracted from [`Self::kick`] so both
+    /// `kick()`'s direct (flag-off) path and
+    /// [`Self::spawn_dispatch_ready_subscriber`]'s bus-driven (flag-on) path
+    /// share one implementation. Latching `scheduling_pending` before
+    /// contending on `scheduling_active` is what closes the kick/drain TOCTOU
+    /// fixed in PR #345 — see `run_scheduler` for the full
+    /// account of the three race classes this pattern handles, and
+    /// `kick_during_active_scheduler_latches_pending_wakeup` /
+    /// `dispatch_ready_event_during_active_scheduler_latches_pending_wakeup`
+    /// for the pinning regression tests on each path.
+    pub(crate) fn note_dispatch_ready(self: &Arc<Self>) {
+        // Order matters: `scheduling_pending` must be written BEFORE we
+        // contend on `scheduling_active`. If we lose the swap race
+        // (another scheduler is already running) the alive scheduler
+        // will read `scheduling_pending` after it drains and notice
+        // the wakeup; if we win, the fresh scheduler will reset
+        // pending on its way into the drain loop.
+        self.scheduling_pending.store(true, Ordering::Release);
+        if self.scheduling_active.swap(true, Ordering::AcqRel) {
+            tracing::debug!(
+                "scheduler_kick outcome=noop reason=already_running — wakeup latched via scheduling_pending"
+            );
+            return;
+        }
+        tracing::debug!("scheduler_kick outcome=spawn — starting new run_scheduler task");
+        let coordinator = self.clone();
+        boss_task_scope::spawn(async move {
+            coordinator.run_scheduler().await;
+        });
+    }
+
+    /// Subscribe to `Event::DispatchReady` and re-enter the double-latch
+    /// (via [`Self::note_dispatch_ready`]) on every event, so a `kick()`
+    /// that [`Self::enable_dispatch_ready_bus`] routed onto the bus still
+    /// reaches the scheduler. Returns `None` — spawning nothing — when the
+    /// flag is off, so an installation that never opts in never pays for a
+    /// subscriber loop.
+    ///
+    /// Supervised: a panic inside the subscriber loop is logged and the
+    /// loop restarted (with a fresh subscription) rather than silently
+    /// dying and leaving `kick()` publishing into a bus nobody reads. Even
+    /// so, the bus is best-effort and this is not the sole path to
+    /// dispatch — [`Self::spawn_scheduler_heartbeat`] keeps re-kicking on
+    /// its own interval regardless of this flag, so a dropped
+    /// `DispatchReady` (a full mailbox, a mid-restart gap) self-heals
+    /// within one heartbeat rather than stranding a `ready` row forever.
+    pub fn spawn_dispatch_ready_subscriber(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.enable_dispatch_ready_bus {
+            return None;
+        }
+        let coordinator = Arc::clone(self);
+        Some(boss_event_bus::spawn_supervised(
+            "coordinator_dispatch_ready",
+            move || {
+                let coordinator = Arc::clone(&coordinator);
+                async move {
+                    let mut subscription = coordinator
+                        .event_bus
+                        .subscribe(TopicFilter::kind(EventKind::DispatchReady));
+                    // Reconcile pass: catch up on anything a dropped event (or a
+                    // gap while a prior attempt was restarting after a panic)
+                    // might have missed, exactly like every other bus subscriber
+                    // reconciles on start — see `spawn_supervised`'s contract.
+                    coordinator.note_dispatch_ready();
+                    while subscription.recv().await.is_some() {
+                        coordinator.note_dispatch_ready();
+                    }
+                    // `recv()` only returns `None` once the bus itself is
+                    // dropped; `spawn_supervised` treats that as a clean,
+                    // deliberate exit and does NOT restart this loop. The
+                    // coordinator owns the bus for its own lifetime, so this
+                    // is currently unreachable — but `warn!` here rather than
+                    // falling out silently, so a future change that makes it
+                    // reachable is observable instead of quietly ending
+                    // dispatch-ready subscription forever.
+                    tracing::warn!(
+                        "dispatch_ready subscriber: event bus dropped, subscription ended; \
+                         no more DispatchReady events will be delivered via the bus",
+                    );
+                }
+            },
+        ))
+    }
+
+    /// Spawn a background task that periodically wakes the scheduler and
+    /// surfaces a warning when a `ready` execution has been sitting in
+    /// the queue for longer than one heartbeat interval.
+    ///
+    /// Rationale. The dispatch happy path is: kanban drag → insert
+    /// `ready` execution → [`kick`] → `run_scheduler` picks the row up
+    /// and emits `request_recorded` within milliseconds. PR #345 closed
+    /// the canonical kick/drain TOCTOU by latching every kick into
+    /// [`scheduling_pending`], but a `ready` row that stalls at
+    /// `status_transition` (no follow-up `request_recorded`) was seen
+    /// in the wild — see `exec_18af3ba5259d32a8_12` (2026-05-13), which
+    /// sat for 131s before the 90s-age orphan-active reconciler
+    /// (PR #429) abandoned it and inserted a fresh redispatch.
+    ///
+    /// The heartbeat is a second line of defence, not a replacement for
+    /// either mechanism:
+    ///
+    /// * It calls [`Self::note_dispatch_ready`] directly — NOT [`kick`] —
+    ///   regardless of the in-memory active flag or
+    ///   [`Self::enable_dispatch_ready_bus`], so this is the one wakeup path
+    ///   that never depends on the event bus having a live subscriber. Any
+    ///   kick that was lost to a race the existing latching can't cover, or
+    ///   a `DispatchReady` the bus dropped, is re-issued within one
+    ///   interval. The scheduler still serializes drains through
+    ///   `scheduling_active`, so two schedulers can never run concurrently.
+    /// * When the heartbeat actually observes a stranded `ready` row
+    ///   (anything older than the interval), it logs a `warn!` line
+    ///   carrying the execution id so an operator sees the failure on
+    ///   the first occurrence instead of waiting for the orphan
+    ///   reconciler. "Fail loudly" was an explicit constraint of the
+    ///   reporting work item.
+    /// * PR #429's orphan-active reconciler stays intact: that path
+    ///   handles the harder case where the execution row itself is
+    ///   stale (worker dead, row claimed but not `ready`), which this
+    ///   heartbeat does NOT address.
+    pub fn spawn_scheduler_heartbeat(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let coordinator = self.clone();
+        boss_task_scope::spawn(async move {
+            // Stagger startup so the first beat doesn't race the
+            // engine's own boot-time `kick()` (see `app.rs`).
+            tokio::time::sleep(interval).await;
+            let interval_ms = interval.as_millis() as u64;
+            let mut unexplained_waits = UnexplainedWaitWatch::default();
+            loop {
+                coordinator.spawn_in_doubt_reconcile();
+                let ready = match coordinator.work_db.list_ready_executions() {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "scheduler heartbeat: failed to list ready executions; skipping pass"
+                        );
+                        coordinator.note_dispatch_ready();
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                };
+                let mut stranded = coordinator.stranded_ready_executions(&ready, interval_ms);
+                // A row the focus set is holding is queued on purpose, not
+                // stranded; reporting it would warn every beat for as long as
+                // focus mode stays on.
+                let focus = coordinator.dispatch_focus();
+                if focus.is_active() && !stranded.is_empty() {
+                    let held = coordinator
+                        .work_db
+                        .executions_outside_dispatch_focus(&ready, &focus)
+                        .unwrap_or_default();
+                    stranded.retain(|(id, _)| !held.contains(id));
+                }
+                if !stranded.is_empty() {
+                    tracing::warn!(
+                        count = stranded.len(),
+                        oldest_age_ms = stranded
+                            .iter()
+                            .map(|(_, age_ms)| *age_ms)
+                            .max()
+                            .unwrap_or(0),
+                        execution_ids = ?stranded
+                            .iter()
+                            .map(|(id, _)| id.as_str())
+                            .collect::<Vec<_>>(),
+                        "scheduler heartbeat: ready execution(s) older than \
+                         the heartbeat interval found — kick/drain handoff \
+                         may have dropped a wakeup; re-kicking now",
+                    );
+                }
+                coordinator.raise_ready_answer_agent_alarms(&ready, ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD);
+                // A wait the engine cannot name is reported here, never repaired.
+                coordinator.flag_unexplained_waits(&mut unexplained_waits).await;
+                // NOT `kick()`: when `enable_dispatch_ready_bus` is on,
+                // `kick()` only publishes to the event bus and returns —
+                // routing the heartbeat through it would make the bus the
+                // sole path to `run_scheduler`, defeating the entire point
+                // of a bus-independent backstop. Call the double-latch
+                // directly so this wakeup always reaches the scheduler.
+                coordinator.note_dispatch_ready();
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+
+    /// Return every `ready` execution whose `created_at` is older than
+    /// `min_age_ms` milliseconds ago, paired with its age in
+    /// milliseconds. Used by [`spawn_scheduler_heartbeat`] to surface
+    /// stranded rows; kept as a separate method so the heartbeat path
+    /// is testable without involving any timers.
+    pub(crate) fn stranded_ready_executions(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
+        let cutoff_ms = min_age_ms;
+        ready
+            .iter()
+            .filter_map(|exec| {
+                let created_at_secs: u64 = exec.created_at.parse().ok()?;
+                let age_ms = now_secs.saturating_sub(created_at_secs).saturating_mul(1000);
+                if age_ms < cutoff_ms {
+                    return None;
+                }
+                // A `ready` row that the per-PR single-writer guard is
+                // deliberately holding behind a live chain sibling is NOT
+                // stranded — it is correctly queued and will dispatch when
+                // the sibling reaps. Excluding it keeps the heartbeat's
+                // "kick/drain handoff may have dropped a wakeup" warning
+                // honest (it would otherwise fire every interval for the
+                // entire lifetime of the live sibling). Fail open: if the
+                // chain query errors, treat the row as stranded as before.
+                if matches!(
+                    self.work_db.live_execution_elsewhere_in_chain(&exec.work_item_id),
+                    Ok(Some(_))
+                ) {
+                    return None;
+                }
+                Some((exec.id.clone(), age_ms))
+            })
+            .collect()
+    }
+
+    /// Emit a question-specific queue-age warning and file one durable
+    /// attention per overdue answer-agent execution. This deliberately does
+    /// not reuse or filter the generic heartbeat warning: generic stuck-row
+    /// telemetry has a distinct diagnostic purpose and must remain intact.
+    pub(crate) fn raise_ready_answer_agent_alarms(&self, ready: &[WorkExecution], threshold: Duration) {
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
+        let threshold_ms = threshold.as_millis() as u64;
+        for execution in ready
+            .iter()
+            .filter(|execution| execution.kind == ExecutionKind::AnswerAgent)
+        {
+            let Some(created_at_secs) = execution.created_at.parse::<u64>().ok() else {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    created_at = %execution.created_at,
+                    "answer-agent ready-age alarm: execution has an invalid creation time",
+                );
+                continue;
+            };
+            let ready_age_ms = now_secs.saturating_sub(created_at_secs).saturating_mul(1_000);
+            if ready_age_ms < threshold_ms {
+                continue;
+            }
+
+            let (artifact_kind, artifact_id) = match self.work_db.get_comment(&execution.work_item_id) {
+                Ok(Some(comment)) => (comment.artifact_kind, comment.artifact_id),
+                Ok(None) => ("unknown".to_owned(), "unknown".to_owned()),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        ?err,
+                        "answer-agent ready-age alarm: failed to load the bound question",
+                    );
+                    ("unknown".to_owned(), "unknown".to_owned())
+                }
+            };
+            let document = format!("{artifact_kind}:{artifact_id}");
+            match self
+                .work_db
+                .reraise_open_work_item_attention(&execution.work_item_id, ANSWER_AGENT_READY_AGE_ATTENTION_KIND)
+            {
+                Ok(Some(attention_id)) => tracing::debug!(
+                    attention_id,
+                    execution_id = %execution.id,
+                    "answer-agent ready-age alarm: refreshed existing attention",
+                ),
+                Ok(None) => match self.work_db.create_attention_item(CreateAttentionItemInput {
+                    execution_id: None,
+                    work_item_id: Some(execution.work_item_id.clone()),
+                    kind: ANSWER_AGENT_READY_AGE_ATTENTION_KIND.to_owned(),
+                    status: None,
+                    title: "Answer agent has waited in the dispatch queue".to_owned(),
+                    body_markdown: format!(
+                        "Question comment `{}` on document `{document}` was first seen waiting more than {} without starting. See the engine log for the current age.\n\nUse `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
+                        execution.work_item_id, format_duration_ms(ready_age_ms), execution.id,
+                    ),
+                    resolved_at: None,
+                }) {
+                    Ok(attention) => tracing::warn!(
+                        attention_id = %attention.id,
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        document = %document,
+                        ready_age_ms,
+                        threshold_ms,
+                        "answer-agent ready-age alarm: question is awaiting dispatch",
+                    ),
+                    Err(err) => tracing::warn!(
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        ?err,
+                        "answer-agent ready-age alarm: failed to persist attention",
+                    ),
+                },
+                Err(err) => tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    ?err,
+                    "answer-agent ready-age alarm: failed to check existing attention",
+                ),
+            }
+        }
+    }
+
+    /// Skip-the-queue dispatch for `bossctl agents launch` and the
+    /// spawn-capability breaker's half-open recovery probe
+    /// (`spawn_health::maybe_admit_recovery_probe`). Looks the execution up
+    /// directly, classifies which pool it belongs to exactly as
+    /// `drain_ready_queue` does (via [`Self::pool_for_execution`]), claims a
+    /// worker from THAT pool via `WorkerPool::claim_worker_force` (which
+    /// grows the pool by one slot up to ITS OWN hard cap when every
+    /// configured slot is busy), and runs the same `schedule_execution` path
+    /// the auto-dispatcher uses. Returns the worker id we landed on so
+    /// callers can echo it back to the human.
+    ///
+    /// "Force" bypasses the interactive-pool concurrency cap outright, and
+    /// the dispatch pause only as far as the caller's [`DispatchAdmission`]
+    /// allows — it is NOT a blanket pause bypass. `bossctl agents launch`
+    /// passes [`DispatchAdmission::OperatorForced`] and does override the
+    /// pause; the breaker's recovery canary passes
+    /// [`DispatchAdmission::BreakerRecoveryProbe`], which
+    /// [`Self::dispatch_hold_for`] admits only under a Breaker-origin pause
+    /// and never for a `pr_review` row. Passing the admission down rather
+    /// than assuming one is what stopped this function from being a hole in
+    /// the pause. It never bypasses *pool
+    /// correctness*: a `pr_review` still claims a `review-` worker id (so it
+    /// resolves the pinned Opus reviewer policy via
+    /// [`pool_dispatch_policy_for_worker_id`] and never counts against the
+    /// interactive pool's `busy_count`), and an automation-sourced row still
+    /// claims an `auto-worker-` id, exactly as the normal path would.
+    ///
+    /// When the execution's home pool has no free slot, force-dispatch grows
+    /// THAT pool by one slot (bounded by its own hard cap) rather than
+    /// falling back to a different pool — the same policy the main pool
+    /// already used for `bossctl agents launch`, now applied uniformly so
+    /// the forced worker always keeps its pool's dispatch policy.
+    ///
+    /// Errors when the execution is not in `ready` (already claimed by
+    /// the auto-dispatcher in a race, terminal, or unknown), when the
+    /// active pause does not admit `admission`, or when the target pool is
+    /// already at its hard cap with no idle slot.
+    pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str, admission: DispatchAdmission) -> Result<String> {
+        if let Some(reason) = self.dispatch_preflight_block_reason() {
+            return Err(anyhow!("local dispatch is unavailable: {reason}"));
+        }
+        let execution = self
+            .work_db
+            .get_execution(execution_id)
+            .with_context(|| format!("failed to look up execution {execution_id}"))?;
+        if execution.status != ExecutionStatus::Ready {
+            return Err(anyhow!(
+                "execution {execution_id} is in status {status:?}, not ready — cannot force-dispatch",
+                status = execution.status,
+            ));
+        }
+        // Refuse before claiming a slot, so a held force-dispatch never has
+        // to hand a worker back. `schedule_execution` re-checks — it is the
+        // chokepoint and owns the guarantee — but answering here keeps the
+        // error the caller sees precise and costs nothing.
+        if let Some(hold) = self.dispatch_hold_for(&execution, admission) {
+            return Err(anyhow!("{hold}"));
+        }
+        // `ready` is necessary but not sufficient: the auto-dispatcher may
+        // already have handed this row (or a duplicate of it) off, and it
+        // sits in `claimed` until its run starts. Force-dispatching over
+        // the top would claim a second slot and spawn a second worker for
+        // one work item. A non-`ready` status (including `claimed`) is
+        // refused above.
+        //
+        // Claimed BEFORE the worker, and via the atomic `try_reserve` rather
+        // than a check-then-reserve pair: a concurrent `drain_ready_queue`
+        // could otherwise slip in during the `claim_worker_force` await, and
+        // both paths would believe they own the dispatch.
+        let Some(_reservation) = self.inflight_dispatches.try_reserve(&execution, &self.work_db) else {
+            return Err(anyhow!(
+                "execution {execution_id} (or another execution for its work item) is already \
+                 being dispatched — cannot force-dispatch"
+            ));
+        };
+        // A forced launch overrides the interactive cap, not the per-repo
+        // lease bound: extra concurrent leases on one repo only queue on
+        // cube's per-repo lock, so a forced launch during a lease storm
+        // would add timeouts rather than start sooner. A spoke lease the
+        // host has not answered is a retry of a stored command, not a new
+        // cube lease, and must not occupy that bound.
+        let _lease_attempt = if self.spoke_lease_retry_skips_repo_bound(&execution) {
+            None
+        } else {
+            let Some(guard) = self
+                .repo_lease_limiter
+                .try_begin(&execution.repo_remote_url, &execution.id)
+                .map(|guard| guard.with_kick(Arc::clone(self)))
+            else {
+                return Err(anyhow!(
+                    "{bound} cube workspace leases are already in flight for {repo}; \
+                     cannot force-dispatch {execution_id} until one finishes",
+                    bound = self.repo_lease_limiter_bound(),
+                    repo = execution.repo_remote_url,
+                ));
+            };
+            Some(guard)
+        };
+        let preferred_workspace_id = execution.preferred_workspace_id.clone();
+        let pool = self.pool_for_execution(&execution);
+        let pool_label = self.attributed_pool_label(&execution);
+        let worker_id = pool
+            .claim_worker_force(&execution.id, preferred_workspace_id.as_deref())
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "{pool_label} pool already at hard cap ({cap}); cannot force-dispatch {execution_id}",
+                    cap = pool.hard_cap(),
+                )
+            })?;
+        let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
+        if let Err(err) = self.schedule_execution(&execution, &worker_id, admission).await {
+            pool.release_worker_if_execution(&worker_id, &execution.id, preferred_workspace_id.as_deref())
+                .await;
+            self.recover_failed_dispatch(&execution, &worker_id, &err).await;
+            return Err(err);
+        }
+        spawn_claim.disarm();
+        self.consume_operator_forced_if_admitted(execution_id, admission);
+        Ok(worker_id)
+    }
+
+    /// Launch the ready execution an operator's answer just created for
+    /// `work_item_id`, the way `bossctl agents launch` would.
+    ///
+    /// Answering is an explicit human decision, so the work it creates must not
+    /// be re-queued behind the global dispatch pause or the focus set. The
+    /// answer transaction already marked the latest non-terminal execution
+    /// operator-forced, so a writer wait, pool cap, preflight, or drain race
+    /// keeps the admission until the work is admitted or cancelled. This path
+    /// does not re-mark: a post-commit re-mark can flag an execution the drain
+    /// has already admitted. A `ready` execution is handed to
+    /// [`Self::force_dispatch`] as [`DispatchAdmission::OperatorForced`].
+    /// An execution gated behind another writer stays `waiting_dependency` for
+    /// the dependency cascade, which then drains it as operator-forced. The
+    /// dispatch claim and per-repo lease bound are respected. Returns the
+    /// worker id, or `None` when there is no ready execution to launch.
+    pub async fn launch_answered_work(self: &Arc<Self>, work_item_id: &str) -> Result<Option<String>> {
+        let ready = self
+            .work_db
+            .list_executions(Some(work_item_id))?
+            .into_iter()
+            .filter(|execution| execution.work_item_id == work_item_id && execution.status == ExecutionStatus::Ready)
+            .max_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        match ready {
+            Some(execution) => {
+                // A breaker pause is never overridable for this path. Keep
+                // the flag so the drain can admit the row after resume
+                // instead of spending the human's answer against a broken
+                // spawn path. Explicit `bossctl agents launch` still uses
+                // `force_dispatch` directly and can probe the breaker.
+                if self
+                    .dispatch_pause()
+                    .is_some_and(|pause| pause.origin == DispatchPauseOrigin::Breaker)
+                {
+                    return Ok(None);
+                }
+                self.force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
+                    .await
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn consume_operator_forced_if_admitted(&self, execution_id: &str, admission: DispatchAdmission) {
+        if admission != DispatchAdmission::OperatorForced {
+            return;
+        }
+        if let Err(err) = self.work_db.clear_operator_forced_admission(execution_id) {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "failed to clear operator-forced admission after dispatch",
+            );
+        }
+    }
+
+    /// Persisted operator-forced admission bypasses an operator-origin pause
+    /// (including all-spawns). A breaker-origin pause is never overridable:
+    /// the spawn path is broken, so a deferred answer must not spend itself
+    /// against it.
+    fn forced_admissible(is_operator_forced: bool, pause: Option<&DispatchPause>) -> bool {
+        is_operator_forced && pause.is_none_or(|p| p.origin == DispatchPauseOrigin::Operator)
+    }
+
+    fn drain_row_admission(forced_admissible: bool, is_critical: bool, pause_bypass: bool) -> DispatchAdmission {
+        if forced_admissible {
+            DispatchAdmission::OperatorForced
+        } else if is_critical {
+            DispatchAdmission::Critical
+        } else if pause_bypass {
+            DispatchAdmission::PauseBypassOverride
+        } else {
+            DispatchAdmission::Queued
+        }
+    }
+
+    async fn run_scheduler(self: Arc<Self>) {
+        // Lossless-wakeup loop. The `scheduling_pending` flag is reset
+        // at the top of each iteration so we have a clean "have we
+        // seen any new kicks since this drain started?" reading at
+        // the bottom. The pattern handles three race classes:
+        //
+        //   1. Kick during drain: caught by the post-drain
+        //      `scheduling_pending.load()` and re-enters the inner
+        //      loop without releasing `scheduling_active`.
+        //   2. Kick after we declared no-pending but before we set
+        //      `scheduling_active=false`: the kicker observed active=true
+        //      and noop'd, but our second `scheduling_pending.load()`
+        //      (after active=false) picks it up and we re-acquire
+        //      active to resume draining.
+        //   3. Kick after we set `scheduling_active=false`: the kicker
+        //      spawns a fresh scheduler; we observe that via the
+        //      swap returning `true` and exit cleanly.
+        //
+        // Without this, the original `_guard`/`break` pattern lost
+        // wakeups in the narrow window between "queue empty" and
+        // "guard drops" — kicks landing in that window noop'd against
+        // `scheduling_active=true` and the new `ready` row sat
+        // forever with no scheduler running to pick it up. That is
+        // the symptom motivating this fix (see PR #345).
+        loop {
+            self.scheduling_pending.store(false, Ordering::Release);
+            let drain_started_at = std::time::Instant::now();
+            let drain_outcome = self.drain_ready_queue().await;
+            crate::dispatch_metrics::record_drain_pass_duration_ms(
+                &self.metrics,
+                drain_started_at.elapsed().as_millis() as i64,
+            );
+
+            // Pool-exhaustion exits don't re-loop here: another
+            // scheduler will spawn from the post-`release_worker`
+            // `kick()`, and re-looping immediately would just hit the
+            // same exhaustion. Fall through to the same active-release
+            // logic — `scheduling_pending` may still have been set,
+            // and respecting it lets a "fresh row arrived while we
+            // were blocked on the pool" case re-attempt once a worker
+            // is free without waiting for the next external event.
+            let _ = drain_outcome;
+
+            if self.scheduling_pending.load(Ordering::Acquire) {
+                // A kick raced us during drain. Reset and re-drain
+                // without giving up `scheduling_active`.
+                continue;
+            }
+
+            // Relinquish the active flag. Any kick that lands from
+            // here on will see `scheduling_active=false` on its swap
+            // and spawn its own scheduler — but a kick that races
+            // between this store and the post-store load below still
+            // needs to be caught, hence the second check.
+            self.scheduling_active.store(false, Ordering::Release);
+            if !self.scheduling_pending.load(Ordering::Acquire) {
+                return;
+            }
+            // A kick landed in the gap. Try to re-claim active; if
+            // someone else (a freshly spawned scheduler) already has
+            // it, they'll handle the drain.
+            if self.scheduling_active.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // We re-acquired; loop back to drain.
+        }
+    }
+
+    /// Resolve `WorkDb::live_execution_elsewhere_in_chain` the way every
+    /// caller actually needs it: as "is another execution on this PR/chain
+    /// genuinely still alive", not "does a row exist whose `status` column
+    /// says `running`/`waiting_human`".
+    ///
+    /// `status IN ('running', 'waiting_human')` is a *paper* liveness
+    /// signal — a row can sit `waiting_human` forever after its worker died
+    /// without a `Stop` hook (the 2026-06-14 incident this exact gap
+    /// re-created for chain-serialization — the chain-serialization re-defer
+    /// stall incident, `exec_18af40745c552070_26`,
+    /// a 56-day-old `waiting_human` zombie with no live pane, wedged every
+    /// subsequent execution on its PR/chain behind `chain_serialized` in a
+    /// ~10s dispatcher loop until a human noticed and ran `bossctl agents
+    /// reap` by hand). `schedule_execution`'s double-spawn guard already
+    /// runs the sibling through the same-work-item zombie reconcilers before
+    /// treating it as blocking (see the "Liveness gate" comment there); this
+    /// applies the identical reconciliation to the *cross-work-item* chain
+    /// sibling this guard inspects, using the same two positive-evidence
+    /// checks: `boss_engine::lost_workspace_sweep::reconcile_if_execution_dead`
+    /// (cube workspace directory gone, pane pid dead, or pane never attached) and
+    /// `boss_engine::dead_pane_sweep::reconcile_if_pane_dead` (durable shell pid
+    /// is `ESRCH`). Both only ever act on positive evidence of death, so
+    /// this can only ever *unblock* a wrongly-serialized dispatch — it can
+    /// never falsely treat a genuinely live sibling as dead.
+    ///
+    /// Reconciling one dead sibling can reveal a second, older live sibling
+    /// earlier in the chain (a further `waiting_human` execution masked
+    /// behind the one just reaped), so the check re-queries in a small
+    /// bounded loop rather than returning after a single reconciliation.
+    /// Returns EVERY live chain sibling of `work_item_id`, reconciling
+    /// zombies along the way. `resolve_chain_hold`'s
+    /// review-bypass decision must be made against the full set: the
+    /// underlying `member_ids` walk is chain-root-first
+    /// ([`crate::work::dispatch::WorkDb::live_executions_elsewhere_in_chain`]),
+    /// so trusting only the first live sibling lets a root `pr_review` mask
+    /// a live descendant *writer* — reintroducing the exact
+    /// two-concurrent-writers-to-one-PR hazard this guard exists to prevent.
+    ///
+    /// "Live" spans two sources, and needs both. `work_executions.status`
+    /// covers siblings whose run has started; [`Self::inflight_dispatches`]
+    /// covers siblings that `drain_ready_queue` has handed off but which have
+    /// not yet reached `start_execution_run_on_host`, so the DB still shows
+    /// them `ready`. Consulting only the DB was sound while the drain loop
+    /// awaited each dispatch inline — a sibling was always either finished or
+    /// `running` by the time the next row was examined — but concurrent
+    /// hand-off means two rows on one chain can both find a DB with no live
+    /// sibling and both dispatch. See [`crate::dispatch_inflight`].
+    ///
+    /// In-flight reservations are exempt from the zombie reconciliation
+    /// below: the engine created them moments ago in this process and holds
+    /// the guard, so they are live by construction — there is no pane or
+    /// workspace to probe yet.
+    async fn live_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        let work_item_id = execution.work_item_id.as_str();
+        let inflight = self.inflight_chain_siblings(execution)?;
+        let union_with_inflight = |db_siblings: Vec<WorkExecution>| union_with_inflight(db_siblings, &inflight);
+        const MAX_RECONCILE_ATTEMPTS: u8 = 4;
+        for _ in 0..MAX_RECONCILE_ATTEMPTS {
+            let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
+            if siblings.is_empty() {
+                return Ok(union_with_inflight(siblings));
+            }
+            let mut any_reconciled = false;
+            for sibling in &siblings {
+                let reconciled_lost_workspace = self
+                    .lifecycle
+                    .reconcile_if_execution_dead(sibling, self.dispatch_events.as_ref())
+                    .await;
+                let reconciled_dead_pane = !reconciled_lost_workspace
+                    && self
+                        .lifecycle
+                        .reconcile_if_pane_dead(
+                            sibling,
+                            self.dispatch_events.as_ref(),
+                            boss_engine_utils::epoch_time::now_epoch_secs(),
+                            self.live_worker_states.as_deref(),
+                        )
+                        .await;
+                if reconciled_lost_workspace || reconciled_dead_pane {
+                    any_reconciled = true;
+                    tracing::warn!(
+                        work_item_id,
+                        reconciled_execution_id = %sibling.id,
+                        reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
+                        "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
+                         reconciled it and re-checking for still-live siblings",
+                    );
+                    self.release_lease_after_reconcile(sibling, reconciled_dead_pane).await;
+                }
+            }
+            if !any_reconciled {
+                return Ok(union_with_inflight(siblings));
+            }
+        }
+        // Exhausted retries without converging on a stable answer (e.g. a
+        // pathological chain with many zombies reconciling one per pass).
+        // Fail closed: treat whatever is there now as live rather than risk
+        // co-dispatching two workers onto the same shared jj backing store.
+        let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
+        Ok(union_with_inflight(siblings))
+    }
+
+    /// Dispatches currently handed off for OTHER work items in `execution`'s
+    /// revision chain.
+    ///
+    /// Propagates a chain-walk error to [`Self::live_chain_siblings`], whose
+    /// callers all fail OPEN — they log and dispatch without the defer rather
+    /// than wedge the queue on a DB error. That is the pre-existing policy for
+    /// the DB-backed chain query and this shares it; the widened blast radius
+    /// is one extra error source, mitigated by the early return below (no
+    /// query at all unless something is actually in flight).
+    ///
+    /// Skips the chain-membership query entirely when nothing is in flight,
+    /// which is the overwhelmingly common case (a quiet queue, or a backlog
+    /// draining faster than any single dispatch takes).
+    fn inflight_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        let mut siblings = Vec::new();
+        // An engine rebase of the chain (conflict ladder, speculative probe)
+        // rewrites the PR branch in the shared jj store, so no worker may
+        // start on the chain until it finishes. The engine holds the chain
+        // for the whole rebase, which a database-liveness check cannot see.
+        if let Some(rebased_item_id) = self.work_db.engine_rebase_in_progress(&execution.work_item_id)? {
+            siblings.push(engine_rebase_pseudo_sibling(execution, &rebased_item_id));
+        }
+        if self.inflight_dispatches.is_empty() {
+            return Ok(siblings);
+        }
+        let member_ids = self.work_db.chain_member_ids(&execution.work_item_id)?;
+        siblings.extend(
+            self.inflight_dispatches
+                .chain_siblings(&member_ids, &execution.work_item_id, &execution.id),
+        );
+        Ok(siblings)
+    }
+
+    /// Resolve the per-PR single-writer chain check for `execution`,
+    /// applying the review-yields-to-revision carve-out: a live read-only
+    /// review sibling (`pr_review` / `pr_review_guide`) never blocks a
+    /// *revision* (any [`DispatchClass`] other than `OtherWork`).
+    ///
+    /// Rationale: a review execution is strictly read-only — never writes,
+    /// commits, or pushes (enforced by the reviewer CLAUDE.md, its tool
+    /// denylist, and its prompt mandate; see `boss_engine::pr_review` module
+    /// docs) — so it cannot participate in the writer-vs-writer
+    /// two-concurrent-writers-to-one-PR hazard this guard exists to prevent
+    /// (two *writers* rebasing/rewriting each other's commits on the shared
+    /// jj backing store). Serializing a writer behind a reader adds no
+    /// safety, only waits (and deadlocks when the review is itself stuck:
+    /// mono#3123, where a review-finding revision showed "blocked by" its own
+    /// originating task for two days). A review that lands after the revision
+    /// pushes is a stale-head verdict, which has to be handled at verdict
+    /// time regardless, and the completion path's revision-triggered-review
+    /// re-fire (`enable_revision_triggered_reviews`) already spawns a fresh
+    /// pass against the new head. Writer-vs-writer pairings (implementation,
+    /// revision, CI-fix, conflict-fix on one PR branch) keep serializing
+    /// exactly as before, as does non-revision work waiting behind a review.
+    ///
+    /// The decision is made against **every** live chain sibling, not just
+    /// the first one a naive single-sibling lookup would return. The chain
+    /// walk is root-first, so trusting a single sibling meant a live review
+    /// on the chain root could mask a live *writer* further down the chain —
+    /// bypassing would then co-dispatch a second writer alongside that
+    /// still-live one, the exact two-concurrent-writers-to-one-PR hazard.
+    /// So read-only siblings are dropped from consideration and the hold is
+    /// computed over the remaining (writer) siblings; if even one writer
+    /// remains, this is `Blocked` on that writer.
+    ///
+    /// Shared by all three chain-guard call sites (`drain_ready_queue`'s
+    /// pre-claim check, `schedule_execution`'s pre-lease backstop, and its
+    /// post-lease TOCTOU assertion) so the bypass decision is identical at
+    /// every checkpoint. Without that consistency a checkpoint later in the
+    /// pipeline could re-defer what an earlier one just bypassed, wedging
+    /// the row in a defer loop instead of actually dispatching it.
+    pub(super) async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
+        let siblings = self.live_chain_siblings(execution).await?;
+        Ok(self.chain_hold_from_siblings(execution, siblings))
+    }
+
+    /// The hold policy of [`Self::resolve_chain_hold`], applied to an
+    /// already-gathered set of live chain siblings. Kept separate so the
+    /// read-only [`Self::is_chain_blocked`] projection cannot drift from the
+    /// decision the drain makes.
+    fn chain_hold_from_siblings(&self, execution: &WorkExecution, siblings: Vec<WorkExecution>) -> ChainHold {
+        let Some(first_sibling) = siblings.first().cloned() else {
+            return ChainHold::Clear;
+        };
+        let is_revision = !matches!(
+            self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
+            Ok(DispatchClass::OtherWork) | Err(_)
+        );
+        let all_review_siblings = siblings.iter().all(|s| s.kind.never_writes_pr_branch());
+        if is_revision {
+            // Reviews are read-only: drop them from the hold entirely so a
+            // revision is neither blocked by one nor shown as "blocked by"
+            // its parent task on the card because of one.
+            let writers: Vec<WorkExecution> = siblings
+                .iter()
+                .filter(|s| !s.kind.never_writes_pr_branch())
+                .cloned()
+                .collect();
+            return match writers.first().cloned() {
+                None => ChainHold::ReviewBypassed(first_sibling),
+                Some(sibling) => ChainHold::Blocked {
+                    sibling,
+                    review_held: false,
+                    queue_len: writers.len(),
+                },
+            };
+        }
+        // Non-revision work keeps serializing behind a review. Prefer
+        // surfacing a non-review (writer) sibling in the `Blocked` outcome
+        // when one is present, since that is the actually-blocking reason — a
+        // mix of a review and a writer sibling should report the writer, not
+        // the review, in trace output and wait-reason labeling.
+        let queue_len = siblings.len();
+        let sibling = siblings
+            .iter()
+            .find(|s| !s.kind.never_writes_pr_branch())
+            .cloned()
+            .unwrap_or(first_sibling);
+        ChainHold::Blocked {
+            sibling,
+            review_held: all_review_siblings,
+            queue_len,
+        }
+    }
+
+    /// `true` when [`Self::resolve_chain_hold`] would currently defer
+    /// `execution` behind a live chain sibling. Read-only: unlike the drain it
+    /// does not reconcile zombie siblings or write a wait reason, so a board
+    /// projection can ask it on every refresh. A query error reads as "not
+    /// blocked", the same fail-open policy the drain applies.
+    pub fn is_chain_blocked(&self, execution: &WorkExecution) -> bool {
+        let Ok(siblings) = self.chain_siblings_snapshot(execution) else {
+            return false;
+        };
+        matches!(
+            self.chain_hold_from_siblings(execution, siblings),
+            ChainHold::Blocked { .. }
+        )
+    }
+
+    /// Read-only snapshot of `execution`'s live chain siblings: the DB-live
+    /// ones unioned with in-flight hand-offs, exactly the set
+    /// [`Self::live_chain_siblings`] judges, minus its zombie reconciliation.
+    /// Either source failing is an error, so a projection built on this fails
+    /// open just as the drain does.
+    fn chain_siblings_snapshot(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        let inflight = self.inflight_chain_siblings(execution)?;
+        let db_siblings = self
+            .work_db
+            .live_executions_elsewhere_in_chain(&execution.work_item_id)?;
+        Ok(union_with_inflight(db_siblings, &inflight))
+    }
+
+    /// Build the operator-facing string persisted into
+    /// `dispatch_wait_reason` (and rendered verbatim on the kanban card)
+    /// for a `ChainHold::Blocked` outcome. Names the concrete blocking
+    /// task and PR instead of the opaque engine-internal "sibling"
+    /// vocabulary — see the opaque-sibling-wording incident (mono#1901) where the card read
+    /// "Waiting — blocked behind a live PR sibling" with no way to tell
+    /// what a "sibling" was, which task was blocking, or which PR was
+    /// involved. When more than one sibling is queued, names the count and
+    /// the currently-live one.
+    /// Persist the operator-facing `dispatch_wait_reason` for an execution,
+    /// logging a warning (rather than failing dispatch) if the DB write errors.
+    pub(super) fn record_dispatch_wait_reason(
+        &self,
+        execution: &WorkExecution,
+        reason: &str,
+        blocker_id: Option<&str>,
+    ) -> Option<WorkExecution> {
+        match self
+            .work_db
+            .set_dispatch_wait_with_blocker(&execution.id, reason, blocker_id)
+        {
+            Ok(true) => Some(execution.clone()),
+            Ok(false) => None,
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch wait");
+                None
+            }
+        }
+    }
+
+    pub(super) async fn publish_dispatch_runtime_changed(&self, executions: &[WorkExecution], reason: &str) {
+        for execution in executions {
+            if let Ok(item) = self.resolve_execution_work_item(execution) {
+                // The drain only rewrites this execution's wait reason or claims
+                // it: the card's runtime changes, nothing about the board's shape.
+                self.publisher
+                    .publish_work_item_runtime_changed(item.product_id(), item.primary_id(), reason)
+                    .await;
+            }
+        }
+    }
+
+    fn chain_serialized_wait_reason(&self, sibling: &WorkExecution, review_held: bool, queue_len: usize) -> String {
+        // A narrow label read, not the full `get_work_item` projection: this
+        // runs for every chain-serialized execution on every drain pass and
+        // needs three columns (see `work/sweep_reads.rs`). A chain sibling
+        // always binds a task/chore row — the synthetic automation / answer-
+        // agent / review-guide kinds never share a PR chain.
+        let sibling_task = match self.work_db.task_wait_label(&sibling.work_item_id) {
+            Ok(label) => label,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %sibling.id,
+                    work_item_id = %sibling.work_item_id,
+                    ?err,
+                    "chain-serialized wait reason: sibling label lookup failed; naming the id instead"
+                );
+                None
+            }
+        };
+        let sibling_label = sibling_task
+            .as_ref()
+            .map(|task| format!("{} '{}'", task.short_label(), task.name))
+            .unwrap_or_else(|| sibling.work_item_id.clone());
+        // The chain-root task's `pr_url` (set once the PR exists) is the
+        // reliable source — a root `chore_implementation`/`task_implementation`
+        // execution never carries its own `pr_url` (the PR doesn't exist yet
+        // when it was dispatched), only revision executions do. Fall back to
+        // the execution's own `pr_url` for the revision-sibling case.
+        let pr_ref = sibling_task
+            .as_ref()
+            .and_then(|task| task.pr_url.as_deref())
+            .or(sibling.pr_url.as_deref())
+            .and_then(pr_short_reference)
+            .map(|r| format!(" on {r}"))
+            .unwrap_or_default();
+        let queue_prefix = if queue_len > 1 {
+            format!("{queue_len} revisions queued; currently running: ")
+        } else {
+            String::new()
+        };
+        let cause = if review_held {
+            "an automated PR review runs at a time"
+        } else {
+            "revisions on the same PR run one at a time"
+        };
+        format!("blocked by {queue_prefix}{sibling_label}{pr_ref} ({cause})")
+    }
+
+    /// After `execution` has sat `ready` and chain-serialized for at least
+    /// [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`], file a durable
+    /// [`CHAIN_SERIALIZED_STALL_ATTENTION_KIND`] attention on its work item
+    /// so a human notices without grepping `engine-trace.jsonl` — the
+    /// chain-serialization re-defer stall incident sat in this exact state, re-deferred every ~10s, for ~20
+    /// silent minutes before a human found it by hand.
+    ///
+    /// Uses `execution.created_at` as the "stuck since" clock: a `ready`
+    /// row is re-evaluated every drain pass, so its age is a reasonable
+    /// proxy for how long it has been waiting (a row that spent time in
+    /// `waiting_dependency` before promotion only makes this an
+    /// under-estimate, never a false alarm). Idempotent — repeated calls
+    /// while the stall persists are a no-op after the first.
+    fn surface_chain_serialized_stall_if_overdue(&self, execution: &WorkExecution, sibling: &WorkExecution) {
+        let Some(created_at) = execution.created_epoch() else {
+            return;
+        };
+        let elapsed = boss_engine_utils::epoch_time::now_epoch_secs() - created_at;
+        if elapsed < CHAIN_SERIALIZED_STALL_THRESHOLD_SECS {
+            return;
+        }
+        let title = "Execution stuck behind a chain-serialized sibling".to_owned();
+        let body = format!(
+            "Execution `{}` (work item `{}`) has been deferred for ~{} minutes with \
+             `reason=chain_serialized`, waiting behind live sibling execution `{}` \
+             (work item `{}`).\n\n\
+             If that sibling is actually still working, this will clear on its own once \
+             it finishes. If it is actually a dead worker (its pane exited without a `Stop` \
+             hook), the engine's periodic zombie sweeps (`lost_workspace_sweep` / \
+             `dead_pane_sweep`) reconcile it automatically on their next pass; if it \
+             persists, `bossctl agents reap {}` clears it by hand.",
+            execution.id,
+            execution.work_item_id,
+            elapsed / 60,
+            sibling.id,
+            sibling.work_item_id,
+            sibling.id,
+        );
+        if let Err(err) = self.work_db.upsert_work_item_attention(
+            &execution.work_item_id,
+            CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
+            &title,
+            &body,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                ?err,
+                "drain: failed to raise chain_serialized_stall attention",
+            );
+        }
+    }
+
+    /// Drain every currently-`ready` execution. Returns the reason the
+    /// drain stopped so the caller can decide whether to re-enter
+    /// immediately (queue empty + pending wakeup) or yield (pool
+    /// exhausted).
+    /// Drain the `ready` execution queue, routing each execution to the
+    /// correct pool (main, automation, review, or progression). Per-pool exhaustion is
+    /// handled independently: a full pool does not block dispatch on the
+    /// other pools.
+    ///
+    /// All `ready` rows are fetched once at the top of each drain pass.
+    /// Executions whose pool is already known to be exhausted are skipped
+    /// for this pass; they remain `ready` and will be picked up on the
+    /// next `kick()` triggered by `release_worker_and_kick`.
+    ///
+    /// # Priority order: mainline > review > spilled automation
+    ///
+    /// Each drain runs in **two passes** over one `ready` snapshot:
+    ///
+    /// 1. **Home pools.** Every row attempts a claim on the pool
+    ///    [`Self::pool_for_execution`] routes it to. Mainline and review
+    ///    rows that miss are deferred (`pool_exhausted`) as always. An
+    ///    automation row that misses its full automation pool is instead
+    ///    collected as a *spill candidate*.
+    /// 2. **Spillover.** Each spill candidate tries to claim a free
+    ///    **Lower Decks** slot (page 1 of the interactive pool, never
+    ///    Bridge Crew — see [`WorkerPool::claim_worker_spill`]).
+    ///
+    /// The pass boundary is the whole point: by the time any automation
+    /// row can touch an interactive slot, every ready mainline row in the
+    /// snapshot has already claimed or been rejected. So **any ready
+    /// mainline item beats any ready automation item for a
+    /// non-automation slot regardless of arrival order** — the guarantee
+    /// does not depend on `list_ready_executions`' sort order, which
+    /// interleaves the pools by dispatch class and can rank an automation
+    /// row ahead of a mainline one.
+    ///
+    /// # Preemption: mainline's last resort
+    ///
+    /// When a *mainline* row misses its claim and the interactive pool is
+    /// full on both pages, the drain may stop one in-progress spilled
+    /// automation run and requeue its work to free a slot — see
+    /// [`Self::try_preempt_automation_for`]. Never for a review or
+    /// automation row, never against a mainline or review victim, and at
+    /// most **one per drain pass** (`preempted_this_pass`), so a burst of
+    /// mainline arrivals cannot cascade into wiping out every spilled
+    /// automation run at once. See [`crate::dispatch_spillover`] for the
+    /// policy and its rationale.
+    pub(crate) async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
+        if let Some(reason) = self.dispatch_preflight_block_reason() {
+            // A probe still in flight is the expected first seconds of every
+            // boot, not a failure; a failed runtime preflight is.
+            if self.local_capability_discovery_pending() || self.startup_recovery_pending() {
+                tracing::info!(%reason, "local dispatch held by startup preflight");
+            } else {
+                tracing::error!(%reason, "local dispatch held by startup preflight");
+            }
+            self.record_preflight_hold();
+            return DrainOutcome::QueueEmpty;
+        }
+        // Global pause gate, read once as a snapshot so "are we paused" and
+        // "what does this pause hold" cannot disagree mid-pass. The scope
+        // itself is decided by `dispatch_hold_for` (the single authority) —
+        // this is the cheap early exit that keeps a paused engine from
+        // walking the queue and claiming slots it would only hand back.
+        // `pr_review` executions are the lifecycle of a change already in
+        // flight, not new work, so a pause with the default `new_work`
+        // scope exempts them — they keep draining into the review pool while
+        // main/automation rows are held. An `all_spawns` pause exempts
+        // nothing, since dispatching a review would just burn another spawn
+        // attempt against a spawn path that is suspect: the breaker's pause
+        // always has that scope (the engine's tmux spawn path itself is broken — see
+        // `spawn_health.rs`), and an operator may choose it too.
+        let pause = self.dispatch_pause();
+        let paused = pause.is_some();
+        let reviews_exempt_from_pause = pause.as_ref().is_some_and(|p| !p.reviews_held());
+        // Automation-pause gate — independent of `paused` above (see
+        // `FrontendRequest::SetAutomationPaused`). Checked per-row below
+        // alongside `paused`, rather than short-circuiting the whole drain
+        // here, because an automation-only pause must still let main/review
+        // rows dispatch normally.
+        let automation_paused = self.automation_paused.load(Ordering::Acquire);
+
+        let executions = match self.work_db.list_ready_executions() {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::error!(?err, "failed to list ready executions");
+                return DrainOutcome::QueueEmpty;
+            }
+        };
+        // Rows whose work item is at the human-only `critical` priority.
+        // `list_ready_executions` already sorted them first; this set is
+        // what exempts them from the operator-pause gate and the
+        // interactive concurrency cap below (`work/critical_priority.rs`).
+        // Read once per pass, from the task's *current* level, so a raise
+        // on a row that was already queued takes effect on the next pass.
+        let critical_ids: HashSet<String> = match self.work_db.list_critical_ready_execution_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                // Fail closed to ordinary queue semantics: a critical row
+                // still sorts first, it just loses its cap/pause exemption
+                // for this one pass.
+                tracing::warn!(
+                    ?err,
+                    "failed to list critical ready executions — treating none as critical"
+                );
+                HashSet::new()
+            }
+        };
+        // Answer-created work keeps operator-forced admission until it is
+        // admitted or cancelled. Under an operator-origin pause the drain
+        // honours that the way `bossctl agents launch` would: through that
+        // pause and outside the focus set, still subject to writer exclusion,
+        // the claim, and the lease bound. A breaker-origin pause is never
+        // overridable: flagged rows stay `ready` with `dispatch_paused` and
+        // keep the flag until resume.
+        let operator_forced_ids: HashSet<String> = match self.work_db.operator_forced_ready_execution_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to list operator-forced ready executions — treating none as forced"
+                );
+                HashSet::new()
+            }
+        };
+
+        // Queue-level depth/oldest-wait gauges, sampled here (before the
+        // pause gate and any filtering below) so they reflect the true
+        // ready-queue state on every pass — including an all-zero
+        // snapshot on an empty queue, and the real backlog while dispatch
+        // sits paused. See `dispatch_metrics.rs`.
+        {
+            let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+            let mut snapshot = crate::dispatch_metrics::QueueSnapshot::default();
+            for execution in &executions {
+                let is_progression = self.execution_targets_progression_pool(execution);
+                let is_review = self.execution_targets_review_pool(execution);
+                let is_automation = !is_review && self.execution_targets_automation_pool(execution);
+                let sample = if is_progression {
+                    &mut snapshot.progression
+                } else if is_review {
+                    &mut snapshot.review
+                } else if is_automation {
+                    &mut snapshot.automation
+                } else {
+                    &mut snapshot.main
+                };
+                sample.depth += 1;
+                if let Some(created_secs) = execution.created_epoch() {
+                    let age_secs = (now_secs - created_secs).max(0);
+                    sample.oldest_wait_secs = sample.oldest_wait_secs.max(age_secs);
+                }
+            }
+            crate::dispatch_metrics::record_queue_snapshot(&self.metrics, snapshot);
+        }
+
+        // Drop rows blocked by a previous drain's reservation, except for
+        // compatible members of the same persisted review batch. A
+        // dispatched row is CAS'd to `claimed` at pickup so
+        // `list_ready_executions` no longer returns it, but overlapping drains
+        // can still see a snapshot taken before that write — and the 15s
+        // heartbeat spawns a fresh scheduler as soon as the previous (now fast)
+        // one relinquishes `scheduling_active`.
+        // Without this, such a re-drain would claim a SECOND worker for a row
+        // already dispatching and spawn it twice; neither the chain guard nor
+        // the double-spawn guard would stop it, because both exclude the
+        // execution's own id and so cannot see a row racing itself.
+        //
+        // Filtering here (rather than only at the reservation below) also
+        // keeps `pool_ready_counts` honest — an in-flight row is not a
+        // candidate this pass, so it must not inflate the "beaten N
+        // candidates" the surviving rows report.
+        let executions: Vec<WorkExecution> = executions
+            .into_iter()
+            .filter(|e| !self.inflight_dispatches.blocks_execution(e, &self.work_db))
+            .collect();
+
+        if executions.is_empty() {
+            return DrainOutcome::QueueEmpty;
+        }
+
+        let mut changed_waits = Vec::new();
+        if paused {
+            let review_count = executions
+                .iter()
+                .filter(|e| self.execution_targets_review_pool(e))
+                .count();
+            let held_count = executions.len() - review_count;
+            if reviews_exempt_from_pause {
+                tracing::debug!(
+                    held_count,
+                    review_exempt_count = review_count,
+                    "drain_ready_queue: dispatch is globally paused — holding non-review rows, \
+                     draining review-pool exemptions",
+                );
+            } else {
+                let any_forced_admissible = executions
+                    .iter()
+                    .any(|e| Self::forced_admissible(operator_forced_ids.contains(&e.id), pause.as_ref()));
+                if !any_forced_admissible {
+                    for execution in &executions {
+                        changed_waits.extend(self.record_dispatch_wait_reason(
+                            execution,
+                            DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+                            None,
+                        ));
+                    }
+                    tracing::debug!(
+                        held_count,
+                        review_exempt_count = 0,
+                        "drain_ready_queue: dispatch is globally paused — skipping (all-spawns scope, no exemptions)",
+                    );
+                    self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
+                        .await;
+                    return DrainOutcome::QueueEmpty;
+                }
+                tracing::debug!(
+                    held_count,
+                    review_exempt_count = 0,
+                    forced_count = executions
+                        .iter()
+                        .filter(|e| Self::forced_admissible(operator_forced_ids.contains(&e.id), pause.as_ref()))
+                        .count(),
+                    "drain_ready_queue: dispatch is globally paused (operator all-spawns) — draining operator-forced rows",
+                );
+            }
+        }
+
+        // Dispatch focus gate (`bossctl dispatch focus`): while the focus set
+        // is non-empty, only rows whose work is in scope may be admitted;
+        // the rest stay `ready` with the `focus_mode` wait reason, exactly as
+        // they would under the pause or the concurrency cap. Resolved once
+        // per pass so "which rows are held" cannot change mid-pass.
+        //
+        // This runs AFTER the pause gate above and only ever holds more. An
+        // all-spawns pause with no operator-forced-admissible rows already
+        // returned (a breaker pause always does). Operator-forced rows that
+        // remain skip the focus hold the way `bossctl agents launch` bypasses
+        // focus. `bossctl agents launch` (`force_dispatch`) never passes
+        // through here, so it bypasses focus exactly as it bypasses an
+        // operator pause.
+        // Failing to resolve scope holds everything: admitting a row we could
+        // not prove in scope would break the one promise focus makes.
+        let focus = self.dispatch_focus();
+        let out_of_focus: HashSet<String> = if focus.is_active() {
+            match self.work_db.executions_outside_dispatch_focus(&executions, &focus) {
+                Ok(ids) => ids,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "drain_ready_queue: failed to resolve dispatch focus scope — holding every ready row"
+                    );
+                    executions.iter().map(|e| e.id.clone()).collect()
+                }
+            }
+        } else {
+            HashSet::new()
+        };
+
+        let mut main_pool_exhausted = false;
+        let mut auto_pool_exhausted = false;
+        let mut review_pool_exhausted = false;
+        let mut progression_pool_exhausted = false;
+        // Automation rows whose home pool was full. Placed onto free Lower
+        // Decks slots in pass 2, after every mainline/review row has had
+        // its claim attempt. Queue order is preserved.
+        let mut spill_candidates: Vec<WorkExecution> = Vec::new();
+        // Execution ids that cleared the pause gate below via a consumed
+        // `dispatch_pause_bypass_execution_ids` marker rather than an
+        // unpaused pass. `schedule_execution`'s own admission gate
+        // (`dispatch_hold_for`) has no visibility into that marker — it was
+        // already consumed here — so a bypassed row must carry
+        // `DispatchAdmission::PauseBypassOverride` the rest of the way to
+        // `schedule_execution`, in both Pass 1 and Pass 2, or the chokepoint
+        // would refuse the very row the bypass just admitted.
+        // `PauseBypassOverride` is admitted only under an operator-origin
+        // pause; a breaker pause still refuses it at the chokepoint. The
+        // same is true of persisted `OperatorForced`: it bypasses an
+        // operator pause and is held under a breaker pause.
+        let mut pause_bypass_admitted: HashSet<String> = HashSet::new();
+        // At most one automation run may be preempted per drain pass, so a
+        // burst of mainline arrivals never cascades into tearing down every
+        // spilled automation run at once. The next mainline item waits for
+        // the next pass, by which point the freed slot may already have
+        // absorbed it.
+        let mut preempted_this_pass = false;
+
+        // Per-pool candidate counts for this drain pass, computed up front
+        // so the `request_recorded` event below can report "how many other
+        // eligible rows this execution's dispatch class beat" without a
+        // second query per row. `executions` is already sorted by
+        // `(DispatchClass, priority, created_at, id)` (see
+        // `WorkDb::list_ready_executions`), so within a pool the row order
+        // below IS the priority order — a class=1 row that appears first is
+        // winning against every other row counted for its pool here.
+        let pool_ready_counts: HashMap<&'static str, usize> = {
+            let mut counts: HashMap<&'static str, usize> = HashMap::new();
+            for execution in executions.iter().filter(|e| !out_of_focus.contains(&e.id)) {
+                let is_review = self.execution_targets_review_pool(execution);
+                let is_automation = !is_review && self.execution_targets_automation_pool(execution);
+                let label = if self.execution_targets_progression_pool(execution) {
+                    "progression"
+                } else if is_review {
+                    "review"
+                } else if is_automation {
+                    "automation"
+                } else {
+                    "main"
+                };
+                *counts.entry(label).or_insert(0) += 1;
+            }
+            counts
+        };
+
+        for execution in executions {
+            let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            // Classify the target pool. Review is checked first (and excludes
+            // the others) so a reviewer of an automation-produced task is
+            // counted against the review pool, not the automation pool.
+            let is_progression = self.execution_targets_progression_pool(&execution);
+            let is_review = self.execution_targets_review_pool(&execution);
+            let is_automation = !is_review && self.execution_targets_automation_pool(&execution);
+            // A progression run is none of main, review, or automation: it
+            // never counts against the interactive cap, never spills into
+            // Lower Decks, and nothing spills into its pool.
+            let is_main = !is_review && !is_automation && !is_progression;
+            // The `critical` exemptions apply to interactive (main-pool)
+            // work only: review, automation and progression rows are governed
+            // by their own pools and are never held by the cap this bypasses.
+            let is_critical = is_main && critical_ids.contains(&execution.id);
+            let pool_label = if is_progression {
+                "progression"
+            } else if is_review {
+                "review"
+            } else if is_automation {
+                "automation"
+            } else {
+                "main"
+            };
+
+            // Dispatch is paused and this row isn't exempt: leave it `ready`
+            // for the next drain after resume. An all-spawns pause with no
+            // operator-forced-admissible rows already returned above (a
+            // breaker pause always does). An operator all-spawns pause with
+            // forced rows reaches this loop so those rows can drain; a
+            // new-work pause holds every non-review non-critical row while
+            // review rows fall through.
+            //
+            // The ONE exception is a row `ExecutionCoordinator::
+            // dispatch_with_pause_bypass` marked via
+            // `dispatch_pause_bypass_execution_ids` — the pause-only
+            // forced-dispatch override (`RequestExecutionInput::
+            // bypass_dispatch_pause`; see
+            // `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`).
+            // Consuming the marker here (not just checking it) makes the
+            // bypass single-shot: whether this row goes on to dispatch or
+            // is held by a later gate in this same pass (the interactive
+            // cap, a chain hold, …), it never remains bypass-eligible on a
+            // future pass while the pause is still active — a later
+            // dispatch would be exactly the "dispatches later by
+            // surprise" residue the design forbids. Every other `ready`
+            // row in this pass is completely unaffected: this consumes at
+            // most one id, for the one execution the caller is
+            // synchronously awaiting the outcome of.
+            //
+            // The OTHER exception is a `critical` row: the human owner's
+            // escape hatch dispatches through an operator pause by
+            // design, every pass, with no marker to consume — it carries
+            // `DispatchAdmission::Critical` to the chokepoint instead.
+            // A breaker pause still holds critical rows at `dispatch_hold_for`.
+            // Operator-forced rows skip an *operator-origin* pause, including
+            // all-spawns. A breaker-origin pause holds them as
+            // `dispatch_paused` and keeps the flag — that pause is never
+            // overridable.
+            let is_operator_forced = operator_forced_ids.contains(&execution.id);
+            let forced_admissible = Self::forced_admissible(is_operator_forced, pause.as_ref());
+            // Rows without admissible operator-forced admission: an all-spawns
+            // pause holds every row; a new-work pause holds non-review,
+            // non-critical rows unless a pause-bypass marker is consumed.
+            if paused && !forced_admissible {
+                if !reviews_exempt_from_pause {
+                    changed_waits.extend(self.record_dispatch_wait_reason(
+                        &execution,
+                        DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+                        None,
+                    ));
+                    continue;
+                }
+                if !is_review && !is_critical {
+                    if self.take_dispatch_pause_bypass(&execution.id) {
+                        pause_bypass_admitted.insert(execution.id.clone());
+                    } else {
+                        changed_waits.extend(self.record_dispatch_wait_reason(
+                            &execution,
+                            DISPATCH_WAIT_REASON_DISPATCH_PAUSED,
+                            None,
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            // Automation is paused: hold this row regardless of the global
+            // dispatch-pause state above. Unlike the dispatch-pause hold,
+            // this also prevents the row from ever reaching the spill-
+            // candidate queue below — an automation-paused row must not
+            // claim ANY slot, home or spilled.
+            if automation_paused && is_automation {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_AUTOMATION_PAUSED,
+                    None,
+                ));
+                continue;
+            }
+
+            // Outside the dispatch focus set: hold, never drop. The row keeps
+            // its `ready` execution untouched and dispatches on a later pass
+            // once focus is cleared or its project/product is added.
+            if out_of_focus.contains(&execution.id) && !forced_admissible {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_FOCUS_MODE,
+                    None,
+                ));
+                continue;
+            }
+
+            // The run this row recovers from has not released its cube lease,
+            // so its unpublished work may not be preserved yet: hold, never
+            // start from trunk. Operator-forced rows get no exemption, since
+            // this is not a scheduling policy but a guard against silently
+            // abandoning work. Checked before any slot, lease or pane is
+            // touched; `schedule_execution` repeats it for `force_dispatch`.
+            let refreshing = self.refresh_predecessor_lease(&execution);
+            let hold = self.predecessor_lease_hold(&execution).map(|hold| {
+                if refreshing {
+                    PredecessorHold::Waiting("recovery predecessor lease re-check is in flight".to_owned())
+                } else {
+                    hold
+                }
+            });
+            match hold {
+                None => {}
+                Some(PredecessorHold::Failed(error)) => {
+                    self.fail_predecessor_hold(&execution, &error);
+                    continue;
+                }
+                Some(PredecessorHold::Waiting(detail)) => {
+                    if let Some(held) = self.record_dispatch_wait_reason(
+                        &execution,
+                        DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
+                        None,
+                    ) {
+                        // Logged when the hold begins, not on every pass it persists.
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            reason = DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
+                            detail = %detail,
+                            "spawn_attempt status=ready -> held reason=awaiting_predecessor_preservation"
+                        );
+                        changed_waits.push(held);
+                    }
+                    continue;
+                }
+            }
+
+            // Production enables progression spawning at server setup. Hold rows
+            // ready in coordinators that have not opted in, before claiming a
+            // slot. The progression_agents flag separately guards row minting.
+            if is_progression && !self.progression_spawn_enabled {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE,
+                    None,
+                ));
+                continue;
+            }
+
+            // Skip executions for pools we already know are full.
+            // They remain `ready` and will be retried on the next kick.
+            //
+            // Automation is deliberately NOT short-circuited on
+            // `auto_pool_exhausted`: a full automation pool is now the
+            // precondition for spilling, not a dead end, so every
+            // automation row must still flow through the pipeline below
+            // and attempt its home claim in order to be queued as a spill
+            // candidate. Short-circuiting here would let only the FIRST
+            // automation row of the pass ever reach the spill queue and
+            // leave the rest of Lower Decks idle. The redundant home claim
+            // this costs is one in-memory mutex acquisition per row.
+            if is_review && review_pool_exhausted {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
+                continue;
+            }
+            if is_progression && progression_pool_exhausted {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
+                continue;
+            }
+            if is_main && main_pool_exhausted {
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
+                continue;
+            }
+
+            // Interactive-pool concurrency cap (operator-settable — see
+            // `bossctl dispatch concurrency`, default [`MAX_CONCURRENT_INTERACTIVE_WORKERS`]):
+            // main-pool rows are held once the interactive pool's live
+            // workers reach the configured cap, even though the pool has 16
+            // slots. Automation and review rows dispatched from their OWN
+            // home pools are never held by this gate — their pools' own
+            // sizes govern them. Spilled automation is a different story: it
+            // claims an interactive-pool slot (see `claim_worker_spill`), so
+            // it DOES count toward the live number this cap compares against
+            // — see the constant's doc for why that's intentional.
+            //
+            // Checked BEFORE `request_recorded` (same invariant the earlier,
+            // pre-preemption gate carried): a capped row must never enter
+            // the dispatch pipeline — no `RequestRecorded` emission, no
+            // `picked_up` log, no chain-hold check, no merge_order stagger —
+            // since none of that reflects what actually happened to it. The
+            // ONE exception is the once-per-pass automation-preemption
+            // fallback: a preemption is a trade (one live worker for
+            // another), not growth in the live-worker count, so it can
+            // never itself push the pool over the cap, and capped rows must
+            // still get a chance at it or they'd starve permanently whenever
+            // every interactive slot is full — exactly the case preemption
+            // exists to resolve. A capped row that wins via preemption falls
+            // straight through to `dispatch_claimed_execution` (which does
+            // its own `WorkerClaimed` emit); a capped row that doesn't is
+            // deferred here with the `interactive_concurrency_cap` reason
+            // and never touches the pipeline below. See the constant's doc
+            // for rationale.
+            //
+            // A `critical` row is never capped: it may take any idle slot
+            // up to the pool's own capacity (the hard ceiling), which is
+            // the whole point of the level — `high` could not get past
+            // this gate. If no slot is idle it falls through to
+            // `pool_exhausted` below and, being sorted first, is next in
+            // line on the following pass. Running workers are never
+            // preempted for it.
+            let occupancy_at_cap_check = if is_main {
+                Some(self.worker_pool.occupancy().await)
+            } else {
+                None
+            };
+            let capped = !is_critical
+                && !is_operator_forced
+                && occupancy_at_cap_check.is_some_and(|occ| occ.working >= self.max_concurrent_interactive_workers());
+
+            if capped {
+                // The lease permit is taken BEFORE a preemption: tearing
+                // down a live spilled automation worker for a row that then
+                // cannot start a lease would lose the worker and leave the
+                // mainline row waiting. A permit dropped on the cap-hold
+                // path below frees immediately and kicks nothing.
+                //
+                // A permit miss still reports the cap: the row is also at
+                // the cap, and which constraint binds must not flip when a
+                // permit frees.
+                let cap_hold_reason =
+                    occupancy_at_cap_check.map(|occ| interactive_cap_wait_reason(occ.working, occ.lease_pending));
+                let Some(lease_attempt) = self
+                    .begin_repo_lease_or_wait(&execution, &mut changed_waits, cap_hold_reason.as_deref())
+                    .await
+                else {
+                    continue;
+                };
+                let claimed = if preempted_this_pass {
+                    None
+                } else {
+                    match self.try_preempt_automation_for(&execution).await {
+                        // Latch on the teardown having happened, NOT on
+                        // having won the slot — see `PreemptionAttempt`.
+                        PreemptionAttempt::Preempted { claimed } => {
+                            preempted_this_pass = true;
+                            claimed
+                        }
+                        PreemptionAttempt::NotPreempted => None,
+                    }
+                };
+                let Some(worker_id) = claimed else {
+                    let occupancy = occupancy_at_cap_check.unwrap_or_default();
+                    let cap = self.max_concurrent_interactive_workers();
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        pool = pool_label,
+                        live_workers = occupancy.working,
+                        lease_pending = occupancy.lease_pending,
+                        cap,
+                        "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_details(serde_json::json!({
+                                    "reason": "interactive_concurrency_cap",
+                                    "pool": pool_label,
+                                    "execution_kind": execution.kind.as_str(),
+                                    "live_workers": occupancy.working,
+                                    "lease_pending": occupancy.lease_pending,
+                                    "cap": cap,
+                                })),
+                        )
+                        .await;
+                    changed_waits.extend(self.record_dispatch_wait_reason(
+                        &execution,
+                        &interactive_cap_wait_reason(occupancy.working, occupancy.lease_pending),
+                        None,
+                    ));
+                    continue;
+                };
+                let admission = Self::drain_row_admission(
+                    forced_admissible,
+                    is_critical,
+                    pause_bypass_admitted.contains(&execution.id),
+                );
+                self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission, lease_attempt)
+                    .await;
+                continue;
+            }
+
+            // A duplicate `ready` row for a work item THIS pass already handed
+            // off (the orphan-sweep race that the double-spawn guard exists
+            // for). The pre-loop filter above cannot catch it — that snapshot
+            // predates the reservation an earlier iteration just took — so it
+            // is re-checked per row.
+            // Compatible same-batch members must pass both filters so all
+            // three can be handed off without waiting for another heartbeat.
+            //
+            // Skipped before `request_recorded` so the row emits no dispatch
+            // timeline at all: it is not a dispatch attempt, and a second
+            // `request_recorded` for a work item already dispatching would
+            // corrupt the per-execution event stream. Left `ready`; once the
+            // winner is `running`, `schedule_execution`'s DB double-spawn
+            // guard resolves this row as redundant on a later pass.
+            if self.inflight_dispatches.blocks_execution(&execution, &self.work_db) {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool = pool_label,
+                    "spawn_attempt status=ready -> skipped reason=work_item_dispatch_in_flight"
+                );
+                continue;
+            }
+
+            // Durable claim before any subsequent await. The product reconciler
+            // runs on every work-item-mutating RPC and will rewrite a still-
+            // `ready` row to `waiting_dependency` (ordinal-chain rule) while
+            // this drain is in cube setup. The Drop guard reverts the claim if
+            // we defer without spawning.
+            let mut dispatch_claim = match DrainDispatchClaim::try_acquire(&self.work_db, &execution.id) {
+                Ok(Some(claim)) => claim,
+                Ok(None) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        pool = pool_label,
+                        "spawn_attempt status=ready -> skipped reason=claim_lost"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "spawn_attempt status=ready -> skipped reason=claim_error"
+                    );
+                    continue;
+                }
+            };
+
+            // Dispatch-class + "why it won" bookkeeping (operator directive:
+            // revisions before tasks/chores, ordered by revision kind).
+            // Recomputed here (rather than threaded through from
+            // `list_ready_executions`) because it's only needed for the
+            // trace, not the hot dispatch path. See `DispatchClass`.
+            let dispatch_class = self
+                .work_db
+                .classify_work_item_for_dispatch(&execution.work_item_id)
+                .unwrap_or(DispatchClass::OtherWork);
+            let pool_ready_count = pool_ready_counts.get(pool_label).copied().unwrap_or(1);
+
+            // Stage 1: request_recorded
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::RequestRecorded, DispatchOutcome::Ok, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_details(serde_json::json!({
+                            "preferred_workspace_id": preferred_workspace_id,
+                            "pool": pool_label,
+                            "execution_kind": execution.kind.as_str(),
+                            "dispatch_class": dispatch_class.as_ordinal(),
+                            "dispatch_class_label": dispatch_class.label(),
+                            "pool_ready_count": pool_ready_count,
+                            "beaten_candidates": pool_ready_count.saturating_sub(1),
+                            "critical": is_critical,
+                        })),
+                )
+                .await;
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                preferred_workspace_id = ?preferred_workspace_id,
+                pool = pool_label,
+                dispatch_class = dispatch_class.as_ordinal(),
+                dispatch_class_label = dispatch_class.label(),
+                beaten_candidates = pool_ready_count.saturating_sub(1),
+                "spawn_attempt status=ready -> picked_up"
+            );
+
+            // Per-PR single-writer guard (guards against the two-concurrent-writers-to-one-PR incident): defer this
+            // execution if ANOTHER work item on the same PR/revision chain is
+            // already live. Checked BEFORE claiming a worker so a serialized
+            // row never burns a slot or pollutes its dispatch timeline. The
+            // row stays `ready` and re-attempts on the next kick (which fires
+            // when the live sibling reaps), so it runs strictly after it.
+            // `schedule_execution` re-checks this as the chokepoint backstop
+            // for the `force_dispatch` path. Goes through `resolve_chain_hold`
+            // (not the raw `WorkDb` query) so a `waiting_human` sibling whose
+            // worker pane is actually dead doesn't wedge this row forever —
+            // see `live_chain_siblings`'s docs for the chain-serialization
+            // re-defer stall incident this
+            // closes — and so a revision never waits
+            // behind a read-only review (see `resolve_chain_hold`'s docs for
+            // the mono#3123 stall this closes).
+            match self.resolve_chain_hold(&execution).await {
+                Ok(ChainHold::Blocked {
+                    sibling,
+                    review_held,
+                    queue_len,
+                }) => {
+                    let event_reason = if review_held {
+                        "chain_serialized_review_held"
+                    } else {
+                        "chain_serialized"
+                    };
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        live_sibling_execution_id = %sibling.id,
+                        live_sibling_work_item_id = %sibling.work_item_id,
+                        pool = pool_label,
+                        review_held,
+                        "spawn_attempt status=ready -> deferred reason={event_reason}"
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_details(serde_json::json!({
+                                    "reason": event_reason,
+                                    "pool": pool_label,
+                                    "execution_kind": execution.kind.as_str(),
+                                    "review_held": review_held,
+                                    "live_sibling_execution_id": sibling.id,
+                                    "live_sibling_work_item_id": sibling.work_item_id,
+                                })),
+                        )
+                        .await;
+                    // Operator-facing wait reason: names the concrete blocking
+                    // task/PR instead of the opaque "PR sibling" wording (the
+                    // opaque-sibling-wording incident — the card read "blocked behind a live PR
+                    // sibling" with no way to tell what a sibling was or which
+                    // task/PR was involved). `dispatch_events`/tracing above
+                    // keep the terse `event_reason` code for stats grouping;
+                    // this is the string persisted into `dispatch_wait_reason`
+                    // and rendered verbatim on the kanban card.
+                    let wait_reason = self.chain_serialized_wait_reason(&sibling, review_held, queue_len);
+                    changed_waits.extend(self.record_dispatch_wait_reason(
+                        &execution,
+                        &wait_reason,
+                        Some(&sibling.work_item_id),
+                    ));
+                    self.surface_chain_serialized_stall_if_overdue(&execution, &sibling);
+                    // Leave the row `ready`; do NOT mark any pool exhausted —
+                    // other executions in this pass may still dispatch.
+                    continue;
+                }
+                Ok(ChainHold::ReviewBypassed(sibling)) => {
+                    // Reviews are read-only — a pending revision must not
+                    // wait the length of a review run behind one.
+                    // Fall through and dispatch this pass; the review keeps
+                    // running (it will self-terminate normally, and its
+                    // findings will already be stale against the fix's
+                    // upcoming push — `enable_revision_triggered_reviews`
+                    // fires a fresh pass once it lands).
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        live_sibling_execution_id = %sibling.id,
+                        live_sibling_work_item_id = %sibling.work_item_id,
+                        pool = pool_label,
+                        "spawn_attempt status=ready -> chain_hold_bypassed reason=review_yields_to_revision"
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_details(serde_json::json!({
+                                    "chain_hold_bypassed": "review_yields_to_revision",
+                                    "pool": pool_label,
+                                    "execution_kind": execution.kind.as_str(),
+                                    "review_held": true,
+                                    "live_sibling_execution_id": sibling.id,
+                                    "live_sibling_work_item_id": sibling.work_item_id,
+                                })),
+                        )
+                        .await;
+                    if let Err(err) = self.work_db.resolve_external_tracker_attention(
+                        &execution.work_item_id,
+                        CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
+                    ) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "drain: failed to resolve chain_serialized_stall attention on bypass",
+                        );
+                    }
+                    // Fall through to normal dispatch below.
+                }
+                Ok(ChainHold::Clear) => {
+                    // No longer (or never) chain-serialized — clear any stall
+                    // attention a prior pass raised for this work item so it
+                    // doesn't linger `open` once dispatch actually proceeds.
+                    if let Err(err) = self.work_db.resolve_external_tracker_attention(
+                        &execution.work_item_id,
+                        CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
+                    ) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "drain: failed to resolve chain_serialized_stall attention on unblock",
+                        );
+                    }
+                }
+                Err(err) => {
+                    // Fail open: a DB error must not wedge the queue. The
+                    // `schedule_execution` backstop still guards the spawn.
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "drain: chain single-writer check failed — proceeding without pre-claim defer",
+                    );
+                }
+            }
+
+            // merge_order dispatch stagger (direction 2, optional, default off):
+            // when configured, the "later" side of a high-overlap merge_order
+            // pair whose "first" side is still in flight gets a one-shot bounded
+            // dispatch offset so the two workers' diffs interleave less. This is
+            // NOT a block and never waits for a merge — the row simply becomes
+            // dispatchable again after the window via the `dispatch_not_before`
+            // gate + the scheduler heartbeat. It runs after the drain-loop
+            // `ready → claimed` CAS and the chain-hold gate (so a serialized
+            // row is never double-handled). A stagger `continue` relies on
+            // `DrainDispatchClaim`'s Drop to revert `claimed → ready` so the
+            // row never burns a worker. Fail open on any DB error — a stagger
+            // check must never wedge the queue.
+            if self.merge_order_stagger_secs > 0 {
+                match self.work_db.maybe_stagger_merge_order_dispatch(
+                    &execution.id,
+                    &execution.work_item_id,
+                    self.merge_order_stagger_secs,
+                ) {
+                    Ok(Some(not_before)) => {
+                        changed_waits.push(execution.clone());
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            not_before,
+                            stagger_secs = self.merge_order_stagger_secs,
+                            pool = pool_label,
+                            "spawn_attempt status=ready -> deferred reason=merge_order_stagger"
+                        );
+                        self.dispatch_events
+                            .emit(
+                                DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                                    .with_work_item(&execution.work_item_id)
+                                    .with_details(serde_json::json!({
+                                        "reason": "merge_order_stagger",
+                                        "pool": pool_label,
+                                        "execution_kind": execution.kind.as_str(),
+                                        "not_before": not_before,
+                                        "stagger_secs": self.merge_order_stagger_secs,
+                                    })),
+                            )
+                            .await;
+                        // Drop reverts `claimed → ready` (now with a future
+                        // `dispatch_not_before`); do NOT mark any pool exhausted.
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "drain: merge_order stagger check failed — dispatching without offset",
+                        );
+                    }
+                }
+            }
+
+            let pool = self.pool_for_execution(&execution);
+
+            // Bound concurrent cube leases per repo BEFORE claiming a slot
+            // so a timeout storm cannot occupy the interactive pool. Rows
+            // that miss stay `ready` with a workspace wait reason; the
+            // attempt guard kicks the scheduler when an in-flight lease
+            // ends so they retry.
+            let Some(lease_attempt) = self
+                .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
+                .await
+            else {
+                continue;
+            };
+
+            // Not capped (capped mainline rows already `continue`d above,
+            // either dispatched via preemption or deferred with
+            // `interactive_concurrency_cap`), so a genuinely idle slot is
+            // fair game.
+            let calibrated_size = if self.execution_targets_progression_pool(&execution) {
+                self.work_db
+                    .get_metadata(boss_engine_storage_values::progression::METADATA_KEY_POOL_SIZE)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(?error, "failed to read progression pool size");
+                        None
+                    })
+                    .and_then(|size| size.parse::<usize>().ok())
+            } else {
+                None
+            };
+            let claimed = if let Some(size) = calibrated_size {
+                pool.claim_progression_worker(&execution.id, size).await
+            } else {
+                pool.claim_worker(&execution.id, preferred_workspace_id.as_deref())
+                    .await
+            };
+
+            // A mainline row that missed its slot gets ONE chance to
+            // reclaim interactive capacity from a spilled automation run
+            // before it settles for waiting. Gated on `is_main` (never
+            // review, never automation — see `dispatch_spillover`) and on
+            // the once-per-pass latch, which is what bounds a single
+            // mainline arrival to at most one preemption.
+            let claimed = match claimed {
+                Some(worker_id) => Some(worker_id),
+                None if is_main && !is_critical && !preempted_this_pass => {
+                    match self.try_preempt_automation_for(&execution).await {
+                        // Latch on the teardown having happened, NOT on
+                        // having won the slot — see `PreemptionAttempt`.
+                        PreemptionAttempt::Preempted { claimed } => {
+                            preempted_this_pass = true;
+                            claimed
+                        }
+                        PreemptionAttempt::NotPreempted => None,
+                    }
+                }
+                None => None,
+            };
+
+            let Some(worker_id) = claimed else {
+                // This pool is fully claimed. Record exhaustion and continue
+                // so executions for the other pools can still be dispatched.
+                let pool_capacity = pool.capacity().await;
+
+                // An automation row that missed its home pool is NOT
+                // finished yet: it becomes a spill candidate, and pass 2
+                // below tries to place it on a free Lower Decks slot once
+                // every mainline/review row in this snapshot has already
+                // had its claim attempt. Deferring it that way — rather
+                // than spilling inline here — is what makes "mainline
+                // beats automation for an interactive slot regardless of
+                // arrival order" structural instead of a property of the
+                // `list_ready_executions` sort order.
+                //
+                // `auto_pool_exhausted` is still latched: the automation
+                // pool genuinely is full, so later automation rows in this
+                // pass skip their (certain to fail) home claim and join
+                // the spill queue via the same path.
+                if is_automation {
+                    auto_pool_exhausted = true;
+                    tracing::debug!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        pool_capacity,
+                        "automation pool exhausted — queued as a Lower Decks spill candidate"
+                    );
+                    spill_candidates.push(execution);
+                    continue;
+                }
+
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool_capacity,
+                    pool = pool_label,
+                    "spawn_attempt status=ready -> deferred reason=pool_exhausted"
+                );
+
+                // Ghost-active invariant check (main pool only; automation and
+                // review executions are excluded from the normal kanban).
+                if is_main {
+                    let orphans = self.work_db.list_active_chores_without_live_run().unwrap_or_default();
+                    if !orphans.is_empty() {
+                        tracing::warn!(
+                            ghost_active = ?orphans,
+                            pool_capacity,
+                            "active chores without a running execution after pool exhaustion \
+                             — `boss chore list --status active` and `bossctl agents list` will \
+                             diverge until a slot frees up"
+                        );
+                    }
+                }
+
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "pool_exhausted",
+                                "pool": pool_label,
+                                "execution_kind": execution.kind.as_str(),
+                                "pool_capacity": pool_capacity,
+                                "critical": is_critical,
+                            })),
+                    )
+                    .await;
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
+
+                if is_progression {
+                    progression_pool_exhausted = true;
+                } else if is_review {
+                    review_pool_exhausted = true;
+                } else {
+                    main_pool_exhausted = true;
+                }
+                continue;
+            };
+
+            let admission = Self::drain_row_admission(
+                forced_admissible,
+                is_critical,
+                pause_bypass_admitted.contains(&execution.id),
+            );
+            dispatch_claim.disarm();
+            self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission, lease_attempt)
+                .await;
+        }
+
+        // ---- Pass 2: automation spillover into Lower Decks ----
+        //
+        // Reached only after every mainline and review row above has
+        // already claimed or been rejected, so any interactive slot still
+        // free here is capacity no mainline work in this snapshot wanted.
+        // Candidates keep their queue order, so automation priority among
+        // themselves is unchanged — they are simply all ranked below all
+        // mainline work.
+        for execution in spill_candidates {
+            let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            let Some(lease_attempt) = self
+                .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
+                .await
+            else {
+                continue;
+            };
+            // Re-read the cap per candidate so a runtime change to it is
+            // seen mid-pass. A spill claim is lease-pending until its
+            // lease returns, so it raises the working count only later;
+            // see `MAX_CONCURRENT_INTERACTIVE_WORKERS` for the bounded
+            // overshoot that allows, and `claim_worker_spill`'s doc for why
+            // spilled automation counts toward this cap at all.
+            let Some(worker_id) = self
+                .worker_pool
+                .claim_worker_spill(
+                    &execution.id,
+                    preferred_workspace_id.as_deref(),
+                    self.max_concurrent_interactive_workers(),
+                )
+                .await
+            else {
+                // No free Lower Decks slot either, or the interactive
+                // concurrency cap is already saturated: this automation
+                // row waits, exactly as it did before spillover existed.
+                let pool_capacity = self.automation_pool.capacity().await;
+                let live_workers = self.worker_pool.busy_count().await;
+                let cap = self.max_concurrent_interactive_workers();
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool_capacity,
+                    live_workers,
+                    cap,
+                    pool = "automation",
+                    "spawn_attempt status=ready -> deferred reason=pool_exhausted (no Lower Decks slot to spill into, or interactive_concurrency_cap reached)"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "pool_exhausted",
+                                "pool": "automation",
+                                "execution_kind": execution.kind.as_str(),
+                                "pool_capacity": pool_capacity,
+                                "spill_attempted": true,
+                            })),
+                    )
+                    .await;
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    &execution,
+                    DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
+                    None,
+                ));
+
+                // Keep the Automations tab honest: "Queued", not a failure
+                // badge. Same treatment the pre-spillover exhaustion path
+                // gave this row.
+                if execution.kind == ExecutionKind::AutomationTriage {
+                    let detail = format!(
+                        "automation pool exhausted ({pool_capacity}/{pool_capacity} busy) and no free \
+                         Lower Decks slot to spill into; triage queued, will dispatch when a slot frees"
+                    );
+                    if let Err(err) = self
+                        .work_db
+                        .update_automation_run_for_pool_throttle(&execution.id, &detail)
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "failed to record pool_throttled outcome on automation_runs row",
+                        );
+                    }
+                }
+                continue;
+            };
+
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                "automation spilled into Lower Decks — automation pool full, no mainline work wanted this slot"
+            );
+            let admission = Self::drain_row_admission(
+                Self::forced_admissible(operator_forced_ids.contains(&execution.id), pause.as_ref()),
+                false,
+                pause_bypass_admitted.contains(&execution.id),
+            );
+            self.dispatch_claimed_execution(&execution, &worker_id, "automation", true, admission, lease_attempt)
+                .await;
+        }
+
+        // All deferred pickup claims have dropped before clients refetch their runtime.
+        self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
+            .await;
+        if main_pool_exhausted || auto_pool_exhausted || review_pool_exhausted || progression_pool_exhausted {
+            DrainOutcome::PoolExhausted
+        } else {
+            DrainOutcome::QueueEmpty
+        }
+    }
+
+    /// Last-resort attempt to free an interactive slot for a starved
+    /// mainline `execution` by preempting one in-progress **spilled**
+    /// automation run. See [`PreemptionAttempt`] for the return contract.
+    /// When nothing is preempted the caller falls through to the ordinary
+    /// `pool_exhausted` deferral and the mainline item waits for the next
+    /// drain — the pre-spillover behaviour.
+    ///
+    /// # Why only spilled runs are victims
+    ///
+    /// A victim must be occupying a slot the mainline item could actually
+    /// use. The automation pool is a *physically separate* slot range
+    /// (`auto-worker-N` → slots 17..=22); mainline work never runs there,
+    /// so preempting an automation run in its home pool would tear down a
+    /// worker and free a slot the starved item still cannot claim — all
+    /// cost, no benefit. Only automation that has spilled into an
+    /// interactive slot is a useful victim, so the candidate set is drawn
+    /// from the interactive pool's claims alone. That also makes "never
+    /// preempt mainline or review work" hold structurally: a review run
+    /// is in the review pool's own range and is never enumerated here,
+    /// and each interactive claim is classified before it is eligible.
+    ///
+    /// # Ordering: tear down, then requeue
+    ///
+    /// The teardown runs BEFORE any DB mutation. If it reports
+    /// [`PreemptOutcome::MidSpawn`] or [`PreemptOutcome::Failed`] we
+    /// abandon the whole preemption having changed nothing, leaving the
+    /// victim to run to completion normally. Cancelling first and
+    /// releasing second (the shape `boss_engine::completion::WorkerCompletionHandler::cancel_and_release`
+    /// uses, where teardown failure is recoverable) would instead strand
+    /// a cancelled-but-still-alive worker here.
+    async fn try_preempt_automation_for(self: &Arc<Self>, execution: &WorkExecution) -> PreemptionAttempt {
+        // Re-check fullness under the current pool state. The claim that
+        // just failed is strong evidence, but a slot may have freed in
+        // between — and preemption is destructive enough to be worth
+        // proving the precondition rather than inferring it.
+        let views = self.worker_pool.slot_views().await;
+        if !crate::dispatch_spillover::interactive_pool_is_full(&views) {
+            return PreemptionAttempt::NotPreempted;
+        }
+
+        // Build the victim set: interactive-pool claims whose execution is
+        // automation-classified and still non-terminal.
+        let mut candidates: Vec<crate::dispatch_spillover::PreemptionCandidate> = Vec::new();
+        for claim in self.worker_pool.claims().await {
+            let Ok(claimed) = self.work_db.get_execution(&claim.execution_id) else {
+                continue;
+            };
+            if claimed.status.is_terminal() {
+                continue;
+            }
+            if self.execution_targets_review_pool(&claimed) || !self.execution_targets_automation_pool(&claimed) {
+                continue;
+            }
+            candidates.push(crate::dispatch_spillover::PreemptionCandidate {
+                execution_id: claimed.id.clone(),
+                work_item_id: claimed.work_item_id.clone(),
+                worker_id: claim.worker_id.clone(),
+                started_epoch: claimed.started_epoch(),
+            });
+        }
+
+        let Some(victim) = crate::dispatch_spillover::select_preemption_victim(&candidates) else {
+            // Every interactive slot holds mainline or review work (or a
+            // mid-spawn automation run with no start time). Nothing to
+            // preempt — mainline waits, as it did before this feature.
+            tracing::debug!(
+                execution_id = %execution.id,
+                interactive_claims = candidates.len(),
+                "preemption declined: no eligible spilled automation victim"
+            );
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Skipped, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_details(serde_json::json!({
+                            "reason": "no_eligible_victim",
+                            "automation_candidates": candidates.len(),
+                        })),
+                )
+                .await;
+            return PreemptionAttempt::NotPreempted;
+        };
+        let victim = victim.clone();
+
+        tracing::warn!(
+            preempting_execution_id = %execution.id,
+            preempting_work_item_id = %execution.work_item_id,
+            victim_execution_id = %victim.execution_id,
+            victim_work_item_id = %victim.work_item_id,
+            victim_worker_id = %victim.worker_id,
+            "preempting spilled automation run: mainline work is ready and every \
+             Bridge Crew and Lower Decks slot is occupied"
+        );
+
+        // Graceful teardown: pane reap (full process-tree SIGTERM/SIGKILL
+        // ladder), pool-slot release, cube lease release.
+        match self.automation_preemptor.preempt_worker(&victim.execution_id).await {
+            PreemptOutcome::Released => {}
+            PreemptOutcome::MidSpawn => {
+                // Mid-spawn cancel: the victim is still spawning and its lease is
+                // deliberately held. Nothing was torn down and nothing was
+                // requeued — abandon cleanly.
+                tracing::info!(
+                    victim_execution_id = %victim.execution_id,
+                    "preemption abandoned: victim is mid-spawn; leaving it to complete"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "victim_mid_spawn",
+                                "candidate_execution_id": victim.execution_id,
+                            })),
+                    )
+                    .await;
+                return PreemptionAttempt::NotPreempted;
+            }
+            PreemptOutcome::Failed => {
+                tracing::warn!(
+                    victim_execution_id = %victim.execution_id,
+                    "preemption abandoned: victim teardown failed"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "teardown_failed",
+                                "candidate_execution_id": victim.execution_id,
+                            })),
+                    )
+                    .await;
+                return PreemptionAttempt::NotPreempted;
+            }
+        }
+
+        // The victim's worker is gone. Retire its execution row and queue
+        // a fresh one for the same work, so the automation redispatches
+        // later exactly like a new arrival.
+        let requeued_as = self.requeue_preempted_automation(&victim).await;
+
+        // Both sides of the story, so `bossctl dispatch diagnose` reads
+        // correctly from either execution's timeline.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Ok, &victim.execution_id)
+                    .with_work_item(&victim.work_item_id)
+                    .with_worker(&victim.worker_id)
+                    .with_details(serde_json::json!({
+                        "reason": "mainline_starved_no_free_interactive_slot",
+                        "preempting_execution_id": execution.id,
+                        "preempting_work_item_id": execution.work_item_id,
+                        "requeued_as": requeued_as,
+                        "victim_selection": "most_recently_started",
+                    })),
+            )
+            .await;
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_details(serde_json::json!({
+                        "reason": "mainline_starved_no_free_interactive_slot",
+                        "preempted_execution_id": victim.execution_id,
+                        "preempted_work_item_id": victim.work_item_id,
+                        "requeued_as": requeued_as,
+                        "victim_selection": "most_recently_started",
+                    })),
+            )
+            .await;
+
+        // Take the slot the teardown just freed. `release_worker_and_kick`
+        // inside the teardown also kicks the scheduler, but drains are
+        // serialized by `scheduling_active`, so that kick only latches
+        // `scheduling_pending` — this drain keeps the slot.
+        let worker_id = self
+            .worker_pool
+            .claim_worker(&execution.id, execution.preferred_workspace_id.as_deref())
+            .await;
+        if worker_id.is_none() {
+            // Lost the freed slot to a concurrent out-of-band claimer
+            // (`bossctl agents launch`'s `claim_worker_force`). Nothing is
+            // lost — the automation work is already safely requeued — but
+            // the preemption bought this item nothing, so say so plainly
+            // rather than leaving an unexplained teardown in the log.
+            tracing::warn!(
+                execution_id = %execution.id,
+                victim_execution_id = %victim.execution_id,
+                "preempted an automation run but the freed slot was taken before this \
+                 execution could claim it; the automation work is requeued and this item \
+                 waits for the next drain"
+            );
+        }
+        PreemptionAttempt::Preempted { claimed: worker_id }
+    }
+
+    /// Retire a preempted automation execution and queue a fresh one for
+    /// the same work. Returns the new execution id when one was created.
+    ///
+    /// Losslessness is the whole contract here: the work item must not be
+    /// lost, must not land in a terminal `failed` state, and must not
+    /// leak its pool claim. The victim row is marked `cancelled` (not
+    /// `failed`: it did nothing wrong, and a failure badge would be a lie
+    /// on the Automations tab), which also stops the orphan sweep and
+    /// reconciler from trying to resurrect it, and lets
+    /// `request_execution`'s live-execution guard see the item as free.
+    ///
+    /// The two requeue shapes mirror the ones the slot-busy path
+    /// established for the slot-busy requeue fix (#2030):
+    ///
+    /// - `automation_triage` binds to an `automations.id` and has no
+    ///   `tasks` row, so it needs its own fresh triage execution and its
+    ///   `automation_runs` row re-pointed at the retry — which also flips
+    ///   the occurrence to `failed_will_retry` ("Queued") rather than
+    ///   leaving it reading as a terminal failure.
+    /// - An automation-*produced* task/chore goes through
+    ///   `request_execution` directly rather than
+    ///   `rescan_active_dispatch`, because that path honors `autostart`,
+    ///   which `start_execution_run_on_host` has already consumed by the
+    ///   time a run is in progress. Preemption is the engine deciding on
+    ///   the item's behalf that this attempt must be retried, so the
+    ///   autostart gate does not apply.
+    async fn requeue_preempted_automation(
+        self: &Arc<Self>,
+        victim: &crate::dispatch_spillover::PreemptionCandidate,
+    ) -> Option<String> {
+        let victim_execution = match self.work_db.get_execution(&victim.execution_id) {
+            Ok(execution) => execution,
+            Err(err) => {
+                tracing::error!(
+                    victim_execution_id = %victim.execution_id,
+                    ?err,
+                    "preemption: failed to re-read victim execution; cannot requeue its work",
+                );
+                return None;
+            }
+        };
+
+        if let Err(err) = self.work_db.cancel_running_execution(&victim.execution_id) {
+            tracing::warn!(
+                victim_execution_id = %victim.execution_id,
+                ?err,
+                "preemption: failed to cancel victim execution; requeueing anyway",
+            );
+        }
+
+        if victim_execution.kind == ExecutionKind::AutomationTriage {
+            match self
+                .work_db
+                .create_automation_triage_execution(&victim_execution.work_item_id, &victim_execution.repo_remote_url)
+            {
+                Ok(retry) => {
+                    let detail = format!(
+                        "preempted to free a Lower Decks slot for mainline work; requeued as {}",
+                        retry.id
+                    );
+                    if let Err(err) = self.work_db.requeue_automation_run_after_transient_spawn_failure(
+                        &victim.execution_id,
+                        &retry.id,
+                        &detail,
+                    ) {
+                        tracing::warn!(
+                            victim_execution_id = %victim.execution_id,
+                            retry_execution_id = %retry.id,
+                            ?err,
+                            "preemption: failed to re-point automation_runs row at the retry execution",
+                        );
+                    }
+                    tracing::info!(
+                        victim_execution_id = %victim.execution_id,
+                        retry_execution_id = %retry.id,
+                        "preemption: automation triage requeued",
+                    );
+                    return Some(retry.id);
+                }
+                Err(err) => {
+                    tracing::error!(
+                        victim_execution_id = %victim.execution_id,
+                        ?err,
+                        "preemption: failed to create a replacement triage execution — automation \
+                         occurrence will wait for its next scheduled fire",
+                    );
+                    return None;
+                }
+            }
+        }
+
+        match self.work_db.request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(victim_execution.work_item_id.clone())
+                .audit_basis("preemption_requeue")
+                .build(),
+        ) {
+            Ok(fresh) => {
+                tracing::info!(
+                    victim_execution_id = %victim.execution_id,
+                    work_item_id = %victim_execution.work_item_id,
+                    requeued_execution_id = %fresh.id,
+                    "preemption: automation-produced work requeued",
+                );
+                Some(fresh.id)
+            }
+            Err(err) => {
+                tracing::error!(
+                    victim_execution_id = %victim.execution_id,
+                    work_item_id = %victim_execution.work_item_id,
+                    ?err,
+                    "preemption: failed to requeue automation work after teardown",
+                );
+                None
+            }
+        }
+    }
+
+    /// Take a per-repo lease-attempt permit, or record a workspace wait
+    /// and return `None`. The permit covers a new cube lease only; it is
+    /// released as soon as `schedule_execution`'s lease call returns.
+    /// A spoke lease the host has not answered is a retry of the stored
+    /// command, so it proceeds without a permit (`Some(None)`) and does
+    /// not pin the bound while the host is silent. `miss_reason` overrides
+    /// the recorded wait text when another constraint (the interactive
+    /// cap) is also holding the row.
+    async fn begin_repo_lease_or_wait(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        changed_waits: &mut Vec<WorkExecution>,
+        miss_reason: Option<&str>,
+    ) -> Option<Option<super::lease_limiter::LeaseAttemptGuard>> {
+        if self.spoke_lease_retry_skips_repo_bound(execution) {
+            return Some(None);
+        }
+        match self
+            .repo_lease_limiter
+            .try_begin(&execution.repo_remote_url, &execution.id)
+        {
+            // The kick is attached only in `dispatch_claimed_execution`,
+            // once a slot is claimed. A permit dropped here without a
+            // claimed slot must not kick: that would re-enter the drain for
+            // rows that cannot dispatch.
+            Some(guard) => Some(Some(guard)),
+            None => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    repo = %execution.repo_remote_url,
+                    bound = MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO,
+                    "spawn_attempt status=ready -> held reason=repo_lease_bound"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "repo_lease_bound",
+                                "repo": execution.repo_remote_url,
+                                "bound": self.repo_lease_limiter_bound(),
+                            })),
+                    )
+                    .await;
+                changed_waits.extend(self.record_dispatch_wait_reason(
+                    execution,
+                    miss_reason.unwrap_or(WAITING_FOR_WORKSPACE_REASON),
+                    None,
+                ));
+                None
+            }
+        }
+    }
+
+    /// Retries of a stored spoke lease the host has not answered are not
+    /// new cube leases, so they must not occupy the per-repo bound. A spawn
+    /// that is in doubt already holds a lease; that wait is not a lease retry.
+    fn spoke_lease_retry_skips_repo_bound(&self, execution: &WorkExecution) -> bool {
+        match self.work_db.spoke_assignment_for_execution(&execution.id) {
+            Ok(Some(assignment)) if assignment.lease_id.is_none() && !assignment.resolved => {
+                match self.work_db.spoke_execution_in_doubt(&execution.id) {
+                    Ok(in_doubt) => in_doubt,
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %format!("{error:#}"),
+                            "could not read whether the spoke assignment is in doubt; taking a lease permit"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(_) => false,
+            Err(error) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{error:#}"),
+                    "could not read the spoke assignment; taking a lease permit"
+                );
+                false
+            }
+        }
+    }
+
+    fn repo_lease_limiter_bound(&self) -> usize {
+        self.repo_lease_limiter.max()
+    }
+
+    /// Shared tail of a successful claim: record the landing slot, clear
+    /// the wait reason, reserve the dispatch, and hand `schedule_execution`
+    /// off to a concurrent task so a slow row cannot stall the rest of the
+    /// drain — releasing the slot again if the reservation or the handoff
+    /// fails.
+    ///
+    /// `spilled` marks an automation execution that claimed an
+    /// interactive (Lower Decks) slot because its own pool was full. It
+    /// is threaded into the `worker_claimed` event rather than inferred
+    /// downstream, because a spilled run's `worker_id` is an ordinary
+    /// `worker-N` — indistinguishable by prefix from mainline work — and
+    /// per-pool dispatch diagnostics must not silently reattribute
+    /// automation load to the main pool.
+    pub(crate) async fn dispatch_claimed_execution(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        pool_label: &str,
+        spilled: bool,
+        admission: DispatchAdmission,
+        lease_attempt: Option<super::lease_limiter::LeaseAttemptGuard>,
+    ) {
+        // Kick bound-waiters when this permit frees (lease returned, or an
+        // early return below). Attached here rather than at try_begin so a
+        // drain that took a permit and then missed a slot does not
+        // re-enter the scheduler from Drop.
+        let lease_attempt = lease_attempt.map(|guard| guard.with_kick(Arc::clone(self)));
+        // Cover paths that skip the drain-loop pickup claim (preemption,
+        // automation spill, force_dispatch's sibling). AlreadyHeld is the
+        // drain-loop case that claimed earlier and disarmed its Drop guard.
+        match self.work_db.claim_execution_for_dispatch(&execution.id) {
+            Ok(DispatchClaimOutcome::Won | DispatchClaimOutcome::AlreadyHeld) => {}
+            Ok(DispatchClaimOutcome::Rejected) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    "spawn_attempt status=ready -> skipped reason=claim_lost"
+                );
+                self.pool_for_worker_id(worker_id)
+                    .release_worker_if_execution(worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
+                    .await;
+                return;
+            }
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    worker_id,
+                    ?err,
+                    "spawn_attempt status=ready -> skipped reason=claim_error"
+                );
+                self.pool_for_worker_id(worker_id)
+                    .release_worker_if_execution(worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
+                    .await;
+                return;
+            }
+        }
+        // RAII over the DB claim for the detached spawn. The drain loop
+        // disarms its own guard before calling us; without this, a panic
+        // or abort inside `schedule_execution` would leave the row
+        // `claimed` until the next engine boot.
+        let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
+        // Record the physical slot + page the claim landed on so a later
+        // spawn failure on this slot is attributable to Bridge Crew vs
+        // Lower Decks in `bossctl dispatch diagnose` (the page is `null`
+        // for automation/review pools, which are single-page).
+        let claimed_slot = slot_id_from_worker_id(worker_id);
+        let claimed_page = claimed_slot.and_then(worker_page_label);
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_details(serde_json::json!({
+                        "pool": pool_label,
+                        "execution_kind": execution.kind.as_str(),
+                        "slot_id": claimed_slot,
+                        "page": claimed_page,
+                        "spilled": spilled,
+                    })),
+            )
+            .await;
+        crate::dispatch_metrics::record_dispatch_completed(&self.metrics);
+        // Clear any `dispatch_stage_stalled` attention item this execution
+        // may have accumulated while it sat stuck pre-dispatch — it just
+        // claimed a slot, so whatever was blocking it is resolved. Mirrors
+        // how the churn-guard `parked` attention item resolves on the work
+        // item's next successful dispatch attempt rather than being
+        // proactively cleared by the sweep that raised it.
+        if let Err(err) = self.work_db.resolve_external_tracker_attention(
+            &execution.work_item_id,
+            crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                ?err,
+                "failed to resolve dispatch_stage_stalled attention item on successful claim",
+            );
+        }
+        if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
+            tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
+        }
+
+        self.publish_dispatch_runtime_changed(std::slice::from_ref(execution), "dispatch_claimed")
+            .await;
+
+        // Hand the slow tail off and return to the caller's loop.
+        //
+        // Everything above this point is the serial decision section, and
+        // stays serial: the chain hold, the stagger gate and above all
+        // `claim_worker` are what keep slot accounting race-free, and one
+        // loop deciding them in priority order is what makes "this row beat
+        // those N candidates" true. What must NOT be serial is what follows
+        // — `schedule_execution` inlines `cube repo ensure` (<=60s), the
+        // workspace lease and its fallback (<=30s each) and `cube change
+        // create` before the run starts. Awaiting that here meant one row
+        // hitting a timeout budget stalled every row behind it for 30-60s,
+        // draining a resumed backlog at roughly one item per minute while
+        // slots sat free.
+        //
+        // The reservation is taken HERE, synchronously, before the caller's
+        // loop advances — the next iteration's chain guard must be able to
+        // see this dispatch, which the DB cannot show until the run
+        // actually starts. See `crate::dispatch_inflight`.
+        //
+        // It can still be refused: `force_dispatch` runs outside this loop
+        // and may have reserved this work item during one of the awaits
+        // above. `try_reserve` is atomic, so exactly one of the two wins;
+        // the loser hands its slot back rather than dispatching a second
+        // worker for the same work item.
+        let Some(reservation) = self.inflight_dispatches.try_reserve(execution, &self.work_db) else {
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                "spawn_attempt status=ready -> deferred reason=dispatch_already_in_flight"
+            );
+            // `spawn_claim` is still armed: Drop reverts `claimed → ready`.
+            self.pool_for_worker_id(worker_id)
+                .release_worker_if_execution(worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
+                .await;
+            return;
+        };
+        let coordinator = Arc::clone(self);
+        let dispatch_slots = Arc::clone(&self.dispatch_slots);
+        let execution = execution.clone();
+        let worker_id = worker_id.to_string();
+        boss_task_scope::spawn(async move {
+            // Held for the whole dispatch: the guard de-registers the
+            // reservation on drop, on every path including a panic.
+            let _reservation = reservation;
+            // Per-repo lease-attempt permit, taken before the slot was
+            // claimed. `schedule_execution` frees it as soon as the lease
+            // returns; the drop here covers every path that never reaches
+            // the lease (early return, failure, panic).
+            let _lease_attempt = lease_attempt;
+            // Bounds concurrent cube subprocesses. Acquired inside the
+            // task, never in the caller's loop, so a saturated cap would
+            // delay only this dispatch rather than re-serializing the
+            // drain. The pools already bound in-flight dispatches below
+            // this cap, so it should never actually bind.
+            let _permit = match dispatch_slots.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // Unreachable — nothing closes the semaphore. Drop of
+                    // `spawn_claim` reverts `claimed → ready`; bailing out
+                    // silently would strand this worker slot forever, since
+                    // `pool_claim_sweep` only reclaims slots whose execution
+                    // went terminal and this row is still `claimed`.
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        worker_id = %worker_id,
+                        "dispatch semaphore closed; releasing the claim instead of stranding the slot"
+                    );
+                    coordinator
+                        .pool_for_worker_id(&worker_id)
+                        .release_worker_if_execution(
+                            &worker_id,
+                            &execution.id,
+                            execution.preferred_workspace_id.as_deref(),
+                        )
+                        .await;
+                    return;
+                }
+            };
+            match coordinator.schedule_execution(&execution, &worker_id, admission).await {
+                Ok(()) => {
+                    spawn_claim.disarm();
+                    coordinator.consume_operator_forced_if_admitted(&execution.id, admission);
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        spilled,
+                        "spawn_attempt status=ready -> spawned"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        "spawn_attempt status=ready -> failed reason=schedule_execution_error"
+                    );
+                    coordinator
+                        .pool_for_worker_id(&worker_id)
+                        .release_worker_if_execution(
+                            &worker_id,
+                            &execution.id,
+                            execution.preferred_workspace_id.as_deref(),
+                        )
+                        .await;
+                    coordinator.recover_failed_dispatch(&execution, &worker_id, &err).await;
+                }
+            }
+        });
+    }
+
+    /// Self-clean a spawn that returned `Err` after the row was claimed.
+    /// Inner `schedule_execution` paths already record a pre-start failure
+    /// (and release the cube lease) when they can; this covers the case
+    /// where they could not — historically because the reconciler had
+    /// flipped the row to `waiting_dependency` and the Ready guard
+    /// rejected the write, leaving the orphan sweeper as the only recovery.
+    pub(crate) async fn recover_failed_dispatch(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        err: &anyhow::Error,
+    ) {
+        let current = match self.work_db.get_execution(&execution.id) {
+            Ok(exec) => exec,
+            Err(lookup_err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?lookup_err,
+                    "schedule_execution_error: could not re-read execution for recovery"
+                );
+                return;
+            }
+        };
+        if let Some(lease_id) = current.cube_lease_id.clone() {
+            self.lifecycle
+                .release_lease_after_proven_never_started(&current, &lease_id, self.host_adapter().as_ref())
+                .await;
+        }
+        // Park already returned the row to ready without spending the retry
+        // budget. A drain that re-claims before this runs must not count the
+        // same unanswered lease as a start failure.
+        if waitable_spoke_lease(err).is_some() {
+            return;
+        }
+        if current.status != ExecutionStatus::Claimed {
+            return;
+        }
+        // Do not record the same attempt again when its event was already emitted.
+        let recovery = if err.is::<super::execution::PreStartFailureReported>() {
+            Err(anyhow::anyhow!("pre-start failure already reported: {err:#}"))
+        } else {
+            self.record_start_failure(
+                Arc::clone(self),
+                &current,
+                worker_id,
+                current.cube_repo_id.as_deref(),
+                ("schedule_execution_error", "spawn failed after claim"),
+                err,
+            )
+            .await
+        };
+        if let Err(record_err) = recovery {
+            tracing::error!(
+                execution_id = %current.id,
+                error = %record_err,
+                "schedule_execution_error: claimed execution could not record pre-start failure"
+            );
+            if let Err(unclaim_err) = self.work_db.release_dispatch_claim(&current.id) {
+                tracing::error!(
+                    execution_id = %current.id,
+                    ?unclaim_err,
+                    "schedule_execution_error: failed to unclaim after unrecordable failure"
+                );
+            }
+        }
+    }
+}
+
+/// Union DB-live chain siblings with in-flight ones, without double-counting
+/// a sibling that is momentarily both: a dispatch that has just committed
+/// `start_execution_run_on_host` is already `running` in the DB while its task
+/// still holds the reservation for the instant before the guard drops.
+/// `resolve_chain_hold` reports `siblings.len()` to the operator as "N
+/// revisions queued", so a duplicate would inflate the count on the card.
+fn union_with_inflight(mut db_siblings: Vec<WorkExecution>, inflight: &[WorkExecution]) -> Vec<WorkExecution> {
+    let extra: Vec<WorkExecution> = inflight
+        .iter()
+        .filter(|i| !db_siblings.iter().any(|d| d.id == i.id))
+        .cloned()
+        .collect();
+    db_siblings.extend(extra);
+    db_siblings
+}
+
+/// Stands in for the live sibling an engine rebase would otherwise be: it is
+/// not a worker, but it blocks the chain the same way and names the work item
+/// whose PR is being rebased in the wait reason.
+fn engine_rebase_pseudo_sibling(execution: &WorkExecution, rebased_item_id: &str) -> WorkExecution {
+    WorkExecution::builder()
+        .id(format!("engine-rebase:{rebased_item_id}"))
+        .work_item_id(rebased_item_id)
+        .kind(ExecutionKind::ConflictResolution)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url(execution.repo_remote_url.clone())
+        .created_at(execution.created_at.clone())
+        .build()
+}
+
+/// RAII claim on a `ready` execution for the duration of one drain-loop
+/// consideration. Dropping while still armed reverts `claimed → ready` so a
+/// defer (chain hold, stagger, pool miss) does not leave the row stuck.
+struct DrainDispatchClaim {
+    work_db: Arc<WorkDb>,
+    execution_id: String,
+    armed: bool,
+}
+
+impl DrainDispatchClaim {
+    fn try_acquire(work_db: &Arc<WorkDb>, execution_id: &str) -> Result<Option<Self>> {
+        match work_db.claim_execution_for_dispatch(execution_id)? {
+            DispatchClaimOutcome::Won => Ok(Some(Self {
+                work_db: Arc::clone(work_db),
+                execution_id: execution_id.to_owned(),
+                armed: true,
+            })),
+            DispatchClaimOutcome::AlreadyHeld | DispatchClaimOutcome::Rejected => Ok(None),
+        }
+    }
+
+    /// Wrap an already-won `claimed` row so Drop still reverts it. Used
+    /// inside the detached spawn after the drain loop has disarmed its
+    /// pickup guard.
+    fn already_held(work_db: Arc<WorkDb>, execution_id: String) -> Self {
+        Self {
+            work_db,
+            execution_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DrainDispatchClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(err) = self.work_db.release_dispatch_claim(&self.execution_id) {
+            tracing::error!(
+                execution_id = %self.execution_id,
+                ?err,
+                "failed to release dispatch claim on drain defer"
+            );
+        }
+    }
+}
+
+fn format_duration_ms(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h", seconds / (60 * 60))
+    } else {
+        format!("{}d", seconds / (24 * 60 * 60))
+    }
+}

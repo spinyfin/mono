@@ -1,0 +1,23 @@
+[package]
+name = "boss-engine-live-worker-state"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[features]
+# Exposes the registry's test hooks to the engine's and completion's fixtures.
+test-support = []
+
+[dependencies]
+bon = { workspace = true }
+boss-engine-driver = { path = "../driver" }
+boss-engine-storage-values = { path = "../storage-values" }
+boss-engine-utils = { path = "../utils" }
+boss-execution-contracts = { path = "../execution-contracts" }
+boss-protocol = { path = "../../protocol" }
+boss-work-db = { path = "../work-db" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+serde_json = { workspace = true }

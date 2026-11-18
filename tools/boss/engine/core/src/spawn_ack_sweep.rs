@@ -161,7 +161,7 @@ use std::time::Duration;
 use boss_protocol::{CreateAttentionItemInput, WorkExecution, WorkerActivity};
 
 use crate::agent_jsonl_progress::{DiscoveryVerdict, IngressCheckpoint, IngressCheckpointStore};
-use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{
     DriverSignalKind, DriverStartExpectation, LiveWorkerStateRegistry, NeverStartedReapCommit,
@@ -171,16 +171,11 @@ use crate::spawn_health::{
 };
 use crate::transcript_liveness::{TranscriptLiveness, probe_transcript_liveness};
 use crate::work::WorkDb;
+use boss_execution_contracts::{CubeClient, worker_id_for_slot};
 
-/// Kind string for the attention item raised when a spawn produced a
-/// pane but no driver. Stable — operator tooling pins it.
-pub const DRIVER_START_ATTENTION_KIND: &str = "worker_driver_never_started";
+pub use boss_engine_storage_values::attention_kinds::DRIVER_START_ATTENTION_KIND;
 
-/// Kind string for the attention item raised when the liveness veto's
-/// answer has stayed [`crate::transcript_liveness::TranscriptLiveness::Undeterminable`]
-/// for [`UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD`] consecutive passes.
-/// Stable — operator tooling pins it.
-pub const LIVENESS_UNDETERMINABLE_ATTENTION_KIND: &str = "worker_liveness_undeterminable";
+pub use boss_engine_storage_values::attention_kinds::LIVENESS_UNDETERMINABLE_ATTENTION_KIND;
 
 /// Consecutive `LivenessUndeterminable` reap outcomes for the same
 /// execution before [`raise_liveness_undeterminable_attention`] fires.
@@ -206,6 +201,10 @@ pub trait SpawnAckReaper: Send + Sync {
     /// `execution_id`. Idempotent: a slot with no real pane at all is a
     /// no-op.
     async fn reap_worker(&self, execution_id: &str);
+    /// Return alone, addressed to the recorded session and verified spawn token.
+    async fn resubmit_prompt(&self, _execution_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("prompt resubmission is unavailable")
+    }
 }
 
 /// Counts from one pass of the sweep; logged at `info` when a reap
@@ -263,7 +262,20 @@ pub fn spawn_loop(
     interval: Duration,
     driver_start_grace_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
+    let services = Arc::new(
+        crate::adopted_prompt_confirmation::ConfirmationServices::builder()
+            .work_db(work_db.clone())
+            .live_states(live_states.clone())
+            .coordinator(coordinator.clone())
+            .dispatch_events(dispatch_events.clone())
+            .reaper(reaper.clone())
+            .spawn_health(spawn_health.clone())
+            .cube_client(cube_client.clone())
+            .build(),
+    );
+    let mut confirmations = crate::adopted_prompt_confirmation::Confirmations::default();
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        confirmations.schedule(services.clone());
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let coordinator = Arc::clone(&coordinator);
@@ -483,6 +495,9 @@ pub(crate) struct SpawnReapCtx<'a> {
 /// Why a never-started spawn is being reaped. Selects the orphan reason text,
 /// the `[engine-reconcile]` audit note, and the dispatch stage emitted.
 pub(crate) enum ReapCause {
+    PromptNotAccepted {
+        reason: String,
+    },
     /// A pane came up — possibly with a live shell pid — and no
     /// driver-originated signal was observed within the window. That is
     /// what was seen; whether the driver never executed or its signal never
@@ -596,6 +611,7 @@ impl ReapCause {
     /// purely on the variant: a pid-less driver-start timeout is `NoShell`.
     pub(crate) fn failure_class(&self, shell_pid: i32) -> SpawnFailureClass {
         match self {
+            ReapCause::PromptNotAccepted { .. } => SpawnFailureClass::PromptNotAccepted,
             ReapCause::DriverStartTimeout { .. } => {
                 if shell_pid > 0 {
                     SpawnFailureClass::ShellWithoutDriverSignal
@@ -646,14 +662,9 @@ fn pane_observation(shell_pid: i32) -> &'static str {
     }
 }
 
-fn reap_narrative(
-    cause: &ReapCause,
-    execution_id: &str,
-    liveness: &TranscriptLiveness,
-    shell_pid: i32,
-) -> (String, String, Stage) {
+fn reap_narrative(cause: &ReapCause, execution_id: &str, liveness: &str, shell_pid: i32) -> (String, String, Stage) {
     let (reason, audit, stage) = reap_narrative_for_cause(cause, execution_id, shell_pid);
-    let summary = liveness.to_string();
+    let summary = liveness;
     (
         format!("{reason}; liveness probe: {summary}"),
         format!("{audit} Liveness probe before the reap: {summary}."),
@@ -663,6 +674,11 @@ fn reap_narrative(
 
 fn reap_narrative_for_cause(cause: &ReapCause, execution_id: &str, shell_pid: i32) -> (String, String, Stage) {
     match &cause {
+        ReapCause::PromptNotAccepted { reason } => (
+            reason.clone(),
+            format!("prompt confirmation failed after engine restart (exec {execution_id}): {reason}"),
+            Stage::SpawnFailed,
+        ),
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -889,9 +905,48 @@ pub(crate) async fn reap_never_started_spawn(
         }
     };
 
-    let liveness_summary = liveness.to_string();
+    finish_reap(
+        ctx,
+        execution,
+        slot_id,
+        shell_pid,
+        cause,
+        now_epoch_secs,
+        &liveness.to_string(),
+    )
+    .await
+}
 
-    let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id, &liveness, shell_pid);
+/// Occupancy probe for spawn-reap lease release. Production scans the host.
+/// Tests skip that scan: confirmation fixtures keep a live tempdir, and Linux
+/// CI's process table is incomplete (`Occupancy::Unknown`), which would keep
+/// the lease. Occupancy policy is covered by `workspace_lease_release` tests.
+fn spawn_reap_occupancy_probe() -> Option<&'static dyn crate::workspace_lease_release::WorkspaceOccupancy> {
+    #[cfg(test)]
+    {
+        static EMPTY: crate::workspace_lease_release::EmptyOccupancy = crate::workspace_lease_release::EmptyOccupancy;
+        Some(&EMPTY)
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+/// Shared terminalization and resource release after a confirmation-specific
+/// evidence fence has committed.
+pub(crate) async fn finish_reap(
+    ctx: &SpawnReapCtx<'_>,
+    execution: &WorkExecution,
+    slot_id: u8,
+    shell_pid: i32,
+    cause: ReapCause,
+    now_epoch_secs: i64,
+    liveness_summary: &str,
+) -> ReapOutcome {
+    let execution_id = execution.id.as_str();
+    let work_item_id = execution.work_item_id.as_str();
+    let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id, liveness_summary, shell_pid);
 
     let orphan_result = {
         #[cfg(test)]
@@ -931,19 +986,11 @@ pub(crate) async fn reap_never_started_spawn(
     )
     .await;
 
-    // Export the dispatch-created reference. An empty run yields no patch;
-    // a missing or unreadable reference raises recovery attention.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(ctx.work_db, execution).await;
-
     // Append an [engine-reconcile] audit line to the work item's description
     // so a human inspecting the chore can see why it was reset.
-    if let Err(err) = crate::reconcile_audit::append_reconcile_audit(
-        ctx.work_db,
-        work_item_id,
-        now_epoch_secs,
-        &audit_note,
-        recovery_patch.as_deref(),
-    ) {
+    if let Err(err) =
+        crate::reconcile_audit::append_reconcile_audit(ctx.work_db, work_item_id, now_epoch_secs, &audit_note)
+    {
         tracing::warn!(
             work_item_id,
             ?err,
@@ -958,46 +1005,54 @@ pub(crate) async fn reap_never_started_spawn(
     ctx.reaper.reap_worker(execution_id).await;
 
     // Release the worker pool slot so the orphan sweep detects the chore and
-    // creates a fresh ready execution for redispatch. Idempotent with the
-    // pool-slot release production's `release_worker_pane` already performs.
+    // creates a fresh ready execution for redispatch. The reaper may already
+    // have released and dispatched a replacement into this slot, so only
+    // release the execution whose reap just completed.
     let worker_id = worker_id_for_slot(slot_id);
-    ctx.coordinator.release_worker_and_kick(&worker_id, None).await;
+    ctx.coordinator
+        .release_worker_and_kick(&worker_id, execution_id, None)
+        .await;
 
     // Release the cube workspace lease. `mark_execution_orphaned`
     // deliberately leaves the lease columns intact (a live workspace may
     // hold in-flight commits a resume should reclaim) and nothing above
     // this line talks to cube — so before this call the lease survived
-    // every reap on this path and stayed `leased` until TTL, kept warm by
-    // the engine's own DB-fallback heartbeat.
+    // every reap on this path.
     //
     // An overdue or failed ingress does not prove the workspace was
-    // unoccupied: a driver may have run unobserved. Release relies on the
-    // pane teardown above preventing further pane-hosted worker progress,
-    // not on missing signals. Keeping the lease after teardown would leave
-    // it warmed by DB heartbeats until TTL, as in the 2026-07-30 incident. Mirrors
+    // unoccupied: a driver may have run unobserved. Release goes through
+    // the inferred-death gates: a process whose cwd is in the workspace
+    // keeps the lease, and a started run with no preservation source keeps
+    // it too. A kept lease is retried by the leftover-lease sweep and
+    // otherwise bounded by cube's TTL. The row is already `orphaned`
+    // (terminal), so the DB-fallback heartbeat does not refresh it. Mirrors
     // `lost_workspace_sweep::run_one_pass`. Best-effort: a lease already
     // gone is the common benign case, so failure is `debug`, not `warn`.
-    if let Some(lease_id) = execution.cube_lease_id.as_deref()
-        && let Err(err) = ctx
-            .cube_client
-            .force_release_lease(lease_id, Some(orphan_reason.as_str()))
-            .await
-    {
-        tracing::debug!(
-            execution_id,
-            lease_id,
-            error = %format!("{err:#}"),
-            "reap-never-started-spawn: best-effort cube lease force-release failed (likely already released)",
-        );
+    if execution.cube_lease_id.is_some() {
+        crate::workspace_lease_release::release_lease_after_inferred_death_with(
+            ctx.work_db,
+            execution,
+            crate::workspace_lease_release::PaneStatus::Gone,
+            None,
+            spawn_reap_occupancy_probe(),
+            Some(ctx.cube_client),
+            ctx.cube_client.force_release_lease(
+                execution.cube_lease_id.as_deref().expect("lease checked"),
+                Some(orphan_reason.as_str()),
+            ),
+        )
+        .await;
     }
 
     // Structured event for bossctl dispatch tail.
     let mut details = serde_json::json!({
         "slot_id": slot_id,
         "shell_pid": shell_pid,
-        "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
     });
     match &cause {
+        ReapCause::PromptNotAccepted { reason } => {
+            details["prompt_failure"] = serde_json::json!(reason);
+        }
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -1019,7 +1074,7 @@ pub(crate) async fn reap_never_started_spawn(
                 *silent_secs,
                 DriverStartEvidence {
                     file_ingress: file_ingress.as_ref(),
-                    liveness: &liveness_summary,
+                    liveness: liveness_summary,
                 },
             );
         }
@@ -1289,6 +1344,7 @@ pub(crate) mod probe_hold;
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
@@ -1346,6 +1402,18 @@ mod tests {
         async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
             self.released.lock().unwrap().push((lease_id.to_owned(), reason.map(str::to_owned)));
             Ok(())
+        }
+        async fn list_workspaces(&self) -> anyhow::Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> {
+            // The registry still shows the spawned execution's workspace leased
+            // under its own lease, as cube does when the spawn is reaped.
+            Ok(vec![
+                boss_execution_contracts::CubeWorkspaceStatus::builder()
+                    .workspace_id("ws-1")
+                    .workspace_path(std::path::PathBuf::from("/tmp/ws"))
+                    .state("leased")
+                    .lease_id("lease-1")
+                    .build(),
+            ])
         }
     } }
 
@@ -1420,6 +1488,86 @@ mod tests {
 
     // ─── tests ───────────────────────────────────────────────────────────────
 
+    /// Mirrors a production pane reaper whose awaited release hands the slot to
+    /// a new run that registers live state before the sweep's tail runs.
+    struct ReplacingReaper {
+        coordinator: Arc<ExecutionCoordinator>,
+        live_states: Arc<LiveWorkerStateRegistry>,
+    }
+
+    #[async_trait]
+    impl SpawnAckReaper for ReplacingReaper {
+        async fn reap_worker(&self, execution_id: &str) {
+            self.live_states.release_slot_for_run(execution_id);
+            self.coordinator
+                .release_worker_and_kick(&worker_id_for_slot(1), execution_id, None)
+                .await;
+            assert!(
+                self.coordinator
+                    .worker_pool()
+                    .claim_worker("replacement", None)
+                    .await
+                    .is_some()
+            );
+            register_slot_zero_pid(&self.live_states, 1, "replacement", "replacement-item");
+            latch_scheduler_so_a_stale_kick_is_visible(&self.coordinator);
+        }
+    }
+
+    fn latch_scheduler_so_a_stale_kick_is_visible(coordinator: &ExecutionCoordinator) {
+        coordinator.scheduling_active().store(true, Ordering::Release);
+        coordinator.scheduling_pending().store(false, Ordering::Release);
+    }
+
+    fn assert_stale_release_did_not_kick(coordinator: &ExecutionCoordinator) {
+        assert!(
+            !coordinator.scheduling_pending().load(Ordering::Acquire),
+            "a no-op ownership miss must not kick dispatch or rescan active work"
+        );
+    }
+
+    /// The reap's guarded release must not free a slot the reaper's own release
+    /// already handed to a replacement run.
+    #[tokio::test]
+    async fn reaped_spawn_tail_leaves_a_replacement_claim_in_place() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &execution_id).await;
+
+        let reaper = ReplacingReaper {
+            coordinator: coordinator.clone(),
+            live_states: live_states.clone(),
+        };
+        let sink = RecordingDispatchEventSink::new();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            &sink,
+            &reaper,
+            &SpawnHealthTracker::new(),
+            &RecordingCube::default(),
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+
+        assert_eq!(outcome.driver_start_reaped, 1);
+        assert_eq!(
+            coordinator.claim_holder(&worker_id_for_slot(1)).await.as_deref(),
+            Some("replacement"),
+            "the replacement keeps its claim",
+        );
+        assert!(live_states.snapshot().iter().any(|s| s.run_id == "replacement"));
+        assert_stale_release_did_not_kick(&coordinator);
+    }
+
     /// A driver-start timeout must not assert "the binary never started"
     /// when the run's file ingress says otherwise. In the 2026-09-13 breaker
     /// incident five Codex workers were reaped with exactly that text while
@@ -1442,7 +1590,7 @@ mod tests {
                 file_ingress: Some(ingress),
             },
             "exec-1",
-            &TranscriptLiveness::Absent { checked: vec![] },
+            &TranscriptLiveness::Absent { checked: vec![] }.to_string(),
             4242,
         );
         assert_eq!(stage, Stage::DriverStartTimeout);
@@ -1467,7 +1615,7 @@ mod tests {
                 file_ingress: None,
             },
             "exec-2",
-            &TranscriptLiveness::Absent { checked: vec![] },
+            &TranscriptLiveness::Absent { checked: vec![] }.to_string(),
             4242,
         );
         assert!(reason.contains("most likely never started"), "{reason}");
@@ -1489,13 +1637,13 @@ mod tests {
         let absent = TranscriptLiveness::Absent {
             checked: vec!["probe stub".to_owned()],
         };
-        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent, 4242);
+        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent.to_string(), 4242);
         assert!(
             reason.contains("a pane and shell came up") && audit.contains("a pane and shell came up"),
             "a reported pid must still be narrated as a pane and shell coming up; got: {reason} / {audit}",
         );
 
-        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent, 0);
+        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent.to_string(), 0);
         assert!(
             !reason.contains("a pane and shell came up") && !audit.contains("a pane and shell came up"),
             "a zero pid must not be narrated as a shell coming up; got: {reason} / {audit}",
@@ -1840,7 +1988,7 @@ mod tests {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         coordinator.pause_dispatch(
             now.max(0) as u64,
-            crate::coordinator::DispatchPauseOrigin::Operator,
+            boss_execution_contracts::DispatchPauseOrigin::Operator,
             boss_protocol::PauseReason::new("test: operator pause").unwrap(),
         );
         assert!(
@@ -1972,7 +2120,13 @@ mod tests {
         );
 
         let attentions = db.list_attention_items(&execution_id).unwrap();
-        assert_eq!(attentions.len(), 1, "the reap must raise exactly one attention item");
+        assert_eq!(attentions.len(), 1, "only the reap raises attention");
+        let attentions: Vec<_> = attentions
+            .iter()
+            .filter(|item| item.kind == DRIVER_START_ATTENTION_KIND)
+            .collect();
+        assert_eq!(attentions.len(), 1);
+
         assert_eq!(attentions[0].kind, DRIVER_START_ATTENTION_KIND);
         assert!(
             attentions[0].body_markdown.contains("92697"),
@@ -1987,6 +2141,60 @@ mod tests {
         assert_eq!(
             reaps[0].details["threshold_secs"],
             serde_json::json!(DRIVER_START_GRACE_SECS),
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_start_timeout_releases_a_never_positioned_lease() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET started_at = NULL WHERE id = ?1",
+                [&execution_id],
+            )
+            .unwrap();
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let cube = RecordingCube::default();
+        let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
+        assert_eq!(outcome.driver_start_reaped, 1);
+        assert_eq!(cube.released_lease_ids(), vec!["lease-1".to_owned()]);
+        assert!(db.get_execution(&execution_id).unwrap().cube_lease_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn driver_start_timeout_releases_a_started_lease_and_reports_the_missing_preservation_source() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let cube = RecordingCube::default();
+        let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
+        assert_eq!(outcome.driver_start_reaped, 1);
+        assert_eq!(
+            cube.released_lease_ids(),
+            vec!["lease-1".to_owned()],
+            "a missing preservation source never keeps the lease"
+        );
+        assert!(db.get_execution(&execution_id).unwrap().cube_lease_id.is_none());
+        assert!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind == "preserved_work_needs_inspection"),
+            "a started run that could not be preserved is reported"
         );
     }
 

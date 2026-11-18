@@ -1,0 +1,9 @@
+# The step libraries are exported only to their own tests; the step scripts
+# themselves are run by Buildkite straight from the checkout, not by bazel.
+exports_files(
+    [
+        "disk-cache-gc-cap.sh",
+        "remote-execution.sh",
+    ],
+    visibility = ["//.buildkite/steps/tests:__pkg__"],
+)

@@ -1,0 +1,1270 @@
+//! `ExecutionCoordinator` construction, configuration, and pool-selection
+//! accessors. Part of the `coordinator` module split; the struct itself and
+//! the shared types live in [`super`].
+use super::*;
+
+/// Hold reason reported while the local host's startup capability probe
+/// is still in flight. See
+/// [`ExecutionCoordinator::set_local_capability_discovery_pending`].
+pub const LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON: &str =
+    "local host capability discovery has not completed yet (runs in the background at engine startup)";
+
+/// Hold reason reported while boot-only startup recovery (tmux adoption,
+/// stale-claim revert, in-flight reconcile) is still in flight. Independent
+/// of [`LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON`] so a finished probe
+/// cannot kick the scheduler before those sweeps have run.
+pub const STARTUP_RECOVERY_PENDING_REASON: &str =
+    "engine startup recovery has not completed yet (tmux adoption and boot-only reconcile)";
+
+/// Check out a leased cube workspace to the head commit of a PR, so a reviewer
+/// worker can read full source at the PR head rather than working from a stale
+/// or arbitrary baseline.
+///
+/// Steps:
+/// 1. Fetch the current head OID from GitHub via `gh pr view`.
+/// 2. `jj git fetch` — pull the remote refs into the local jj store.
+/// 3. `jj new <sha>` — position the working copy on a fresh empty child of the
+///    PR head. (`jj new`, not `jj edit`: a pushed PR head is immutable, so
+///    `jj edit` fails deterministically; the empty child's tree equals the
+///    head's, so the read-only reviewer still sees the PR-head files.)
+///
+/// Returns the head SHA on success. Any subprocess failure is returned as an
+/// `Err` so the dispatcher can record a start failure and retry.
+///
+/// The caller is responsible for releasing the workspace on error.
+impl ExecutionCoordinator {
+    /// Primary constructor for Phase 3+. Callers that need to dispatch
+    /// to a non-local host (e.g. `SshHostAdapter`) build the adapter
+    /// themselves and pass it here directly.
+    pub fn with_host_adapter_and_publisher(
+        work_db: Arc<WorkDb>,
+        worker_pool: WorkerPool,
+        host_adapter: Arc<dyn HostAdapter>,
+        publisher: Arc<dyn ExecutionPublisher>,
+        lifecycle: Arc<dyn LifecycleServices>,
+    ) -> Self {
+        // Build a local registry for callers that never call `set_metrics`.
+        // Pre-register the lease counter handles so `.inc()` never panics
+        // on "counter not registered" in a test context.
+        let local_metrics = default_coordinator_metrics(lifecycle.as_ref());
+        let host_adapter_provider: Arc<dyn HostAdapterProvider> =
+            Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
+        Self {
+            work_db,
+            worker_pool,
+            automation_pool: WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE),
+            review_pool: WorkerPool::new_review(DEFAULT_REVIEW_POOL_SIZE),
+            progression_pool: WorkerPool::new_progression(boss_engine_storage_values::progression::DEFAULT_POOL_SIZE),
+            progression_spawn_enabled: false,
+            host_adapter,
+            host_adapter_provider,
+            remote_pane_releaser: None,
+            lifecycle,
+            publisher,
+            dispatch_events: Arc::new(NoopDispatchEventSink),
+            inflight_dispatches: InflightDispatches::new(),
+            dispatch_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)),
+            scheduling_active: AtomicBool::new(false),
+            predecessor_rechecks: Default::default(),
+            predecessor_recheck_done: Default::default(),
+            scheduling_pending: AtomicBool::new(false),
+            event_bus: Arc::new(EventBus::new()),
+            enable_dispatch_ready_bus: false,
+            repo_cold_probe_seen: Mutex::new(HashSet::new()),
+            pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
+            spoke_in_doubt_timing: SpokeInDoubtTiming::default(),
+            merge_order_stagger_secs: 0,
+            metrics: local_metrics,
+            execution_started_hook: Arc::new(NoopExecutionStartedHook),
+            automation_preemptor: Arc::new(NoopAutomationPreemptor),
+            dispatch_pause: std::sync::Mutex::new(None),
+            dispatch_focus: std::sync::Mutex::new(boss_protocol::DispatchFocus::default()),
+            dispatch_focus_restore_error: std::sync::Mutex::new(None),
+            dispatch_pause_bypass_execution_ids: std::sync::Mutex::new(HashSet::new()),
+            requested_host_ids: std::sync::Mutex::new(HashMap::new()),
+            dispatch_preflight_block_reason: std::sync::Mutex::new(None),
+            local_capability_discovery_pending: AtomicBool::new(false),
+            startup_recovery_pending: AtomicBool::new(false),
+            automation_paused: AtomicBool::new(false),
+            automation_paused_since_epoch_s: AtomicU64::new(0),
+            automation_paused_reason: std::sync::Mutex::new(None),
+            live_worker_states: None,
+            refused_workspaces: Mutex::new(HashMap::new()),
+            max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
+            pause_state_changed: tokio::sync::watch::channel(0).0,
+            pre_start_streaks: Arc::default(),
+            repo_lease_limiter: super::lease_limiter::RepoLeaseLimiter::new(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO),
+            cube_lease_timeout: CUBE_LEASE_TIMEOUT,
+            driving_runs: std::sync::Mutex::new(DrivingRuns::default()),
+            in_doubt_sweep_active: AtomicBool::new(false),
+        }
+    }
+
+    /// Seed the bounded `merge_order` dispatch-stagger window (seconds).
+    /// `app.rs` calls this with the (already-clamped)
+    /// `boss_engine::config::WorkConfig::merge_order_stagger_secs`; `0` disables
+    /// the stagger. Tests set it directly to exercise the deferral.
+    pub fn set_merge_order_stagger_secs(&mut self, secs: u64) {
+        self.merge_order_stagger_secs = secs;
+    }
+
+    /// Override the automation pool. `app.rs` calls this with a pool sized
+    /// from `BOSS_AUTOMATION_POOL_SIZE`; tests may supply a smaller pool.
+    pub fn set_automation_pool(&mut self, pool: WorkerPool) {
+        self.automation_pool = pool;
+    }
+
+    /// Override the progression pool. `app.rs` calls this with a pool sized from
+    /// `progression.pool_size`; tests may supply a smaller one.
+    pub fn set_progression_pool(&mut self, pool: WorkerPool) {
+        self.progression_pool = pool;
+    }
+
+    /// Enable spawning the dedicated progression worker. Production enables this
+    /// during server setup; coordinators that do not opt in hold rows ready.
+    /// The default-off `progression_agents` flag controls minting rows.
+    pub fn set_progression_spawn_enabled(&mut self, enabled: bool) {
+        self.progression_spawn_enabled = enabled;
+    }
+
+    /// Whether a minted `progression` execution may be spawned at all.
+    pub fn progression_spawn_enabled(&self) -> bool {
+        self.progression_spawn_enabled
+    }
+
+    /// Test-only views of coordinator internals the integration suite drives
+    /// directly. Gated so production code cannot reach the scheduler latches
+    /// or the other state they guard.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn work_db(&self) -> &Arc<WorkDb> {
+        &self.work_db
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inflight_dispatches(&self) -> &InflightDispatches {
+        &self.inflight_dispatches
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduling_active(&self) -> &AtomicBool {
+        &self.scheduling_active
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduling_pending(&self) -> &AtomicBool {
+        &self.scheduling_pending
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn requested_host_ids(&self) -> &std::sync::Mutex<HashMap<String, String>> {
+        &self.requested_host_ids
+    }
+
+    pub fn repo_lease_limiter(&self) -> &lease_limiter::RepoLeaseLimiter {
+        &self.repo_lease_limiter
+    }
+
+    // Test-only entry points onto crate-internal coordinator operations.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn drain_ready_queue_for_test(self: &Arc<Self>) -> DrainOutcome {
+        self.drain_ready_queue().await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn wait_predecessor_rechecks_for_test(&self) {
+        loop {
+            let notified = self.predecessor_recheck_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .predecessor_rechecks
+                .lock()
+                .unwrap()
+                .values()
+                .all(|check| check.completed.is_some())
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pool_for_execution_for_test<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+        self.pool_for_execution(execution)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn schedule_execution_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        admission: DispatchAdmission,
+    ) -> Result<()> {
+        self.schedule_execution(execution, worker_id, admission).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn dispatch_claimed_execution_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        pool_label: &str,
+        spilled: bool,
+        admission: DispatchAdmission,
+    ) {
+        self.dispatch_claimed_execution(execution, worker_id, pool_label, spilled, admission, None)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn recover_failed_dispatch_for_test(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        err: &anyhow::Error,
+    ) {
+        self.recover_failed_dispatch(execution, worker_id, err).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resolve_spawn_driver_for_test(&self, execution: &WorkExecution, worker_id: &str) -> Result<Option<String>> {
+        self.resolve_spawn_driver(execution, worker_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn validate_requested_host_for_test(&self, work_item_id: &str, host_id: &str) -> Result<()> {
+        self.validate_requested_host(work_item_id, host_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_requested_host_for_test(&self, execution_id: &str, host_id: String) {
+        self.mark_requested_host(execution_id, host_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_dispatch_ready_for_test(self: &Arc<Self>) {
+        self.note_dispatch_ready()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stranded_ready_executions_for_test(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
+        self.stranded_ready_executions(ready, min_age_ms)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn raise_ready_answer_agent_alarms_for_test(&self, ready: &[WorkExecution], threshold: Duration) {
+        self.raise_ready_answer_agent_alarms(ready, threshold)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn record_start_failure_for_test(
+        &self,
+        coordinator: Arc<ExecutionCoordinator>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        cube_repo_id: Option<&str>,
+        attention: (&str, &str),
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        self.record_start_failure(coordinator, execution, worker_id, cube_repo_id, attention, error)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn lease_workspace_with_fallback_for_test(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        repo: &CubeRepoHandle,
+        task: &str,
+        adapter: &Arc<dyn HostAdapter>,
+    ) -> Result<CubeWorkspaceLease> {
+        self.lease_workspace_with_fallback(execution, worker_id, repo, task, adapter)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn recover_execution_bookmark_for_test(
+        &self,
+        execution: &WorkExecution,
+        lease: &CubeWorkspaceLease,
+        adapter: &Arc<dyn HostAdapter>,
+        repo_id: &str,
+        pr_for_goto: Option<u64>,
+        pr_for_reconcile: Option<u64>,
+    ) -> Result<Option<blocked_workspace::Recovered>> {
+        self.recover_execution_bookmark(execution, lease, adapter, repo_id, pr_for_goto, pr_for_reconcile)
+            .await
+    }
+
+    /// The local-host adapter. `app.rs` reads this to seed the production
+    /// `boss_engine::host_adapter::SshHostAdapterProvider` (which returns it
+    /// verbatim for `host_id = "local"`).
+    pub fn host_adapter(&self) -> Arc<dyn HostAdapter> {
+        Arc::clone(&self.host_adapter)
+    }
+
+    /// Best-effort release after an inline liveness reconcile terminalized an
+    /// execution. A dead-pane reconcile is DB-only, so a live registry entry
+    /// means the worker may still be writing its leased workspace; retain the
+    /// lease in that case rather than handing the checkout to another worker.
+    pub(crate) async fn release_lease_after_reconcile(&self, execution: &WorkExecution, reconciled_dead_pane: bool) {
+        if execution.cube_lease_id.is_none() {
+            return;
+        }
+
+        let registry_still_live = reconciled_dead_pane
+            && self
+                .live_worker_states()
+                .is_some_and(|registry| registry.is_run_live(&execution.id));
+        if registry_still_live {
+            return;
+        }
+
+        let reason = if reconciled_dead_pane {
+            "pane-death reconcile: worker pane gone"
+        } else {
+            "execution-liveness reconcile: worker pane gone"
+        };
+        self.lifecycle
+            .release_lease_after_inferred_death(
+                execution,
+                boss_execution_contracts::PaneStatus::Gone,
+                self.host_adapter().as_ref(),
+                reason,
+            )
+            .await;
+    }
+
+    /// Install the host-adapter provider used to build per-host adapters
+    /// in the dispatch loop. `app.rs` wires the SSH-capable provider so
+    /// the coordinator can route to registered remote hosts; tests inject
+    /// recording/fake providers to assert routing.
+    pub fn set_host_adapter_provider(&mut self, provider: Arc<dyn HostAdapterProvider>) {
+        self.host_adapter_provider = provider;
+    }
+
+    /// The installed host-adapter provider.
+    ///
+    /// Exposed so lease bookkeeping that runs OUTSIDE the dispatch loop can
+    /// reach the same per-host cube the dispatch loop leased with — notably
+    /// `boss_engine::cube_lease_heartbeat::HostRoutedCubes`, which must beat a
+    /// remote lease against the remote cube that issued it rather than the
+    /// engine's own. Read only after `app.rs` has installed the SSH-capable
+    /// provider; a caller that reads it earlier gets the local-only default,
+    /// which is correct for a local-only deployment.
+    pub fn host_adapter_provider(&self) -> Arc<dyn HostAdapterProvider> {
+        Arc::clone(&self.host_adapter_provider)
+    }
+
+    /// Read the tail of a run's transcript that lives on host `host_id`.
+    ///
+    /// Returns `Ok(None)` for `host_id = "local"` — the transcript is on
+    /// the engine's own filesystem, so the caller reads the recorded
+    /// path directly. For a remote host, resolves the host + adapter and
+    /// pulls the last `max_bytes` of `path` over SSH (the design's Q7
+    /// readback, done on demand rather than via a streaming socket).
+    /// `app.rs`'s `TailRunTranscript` handler routes remote runs through
+    /// here so `bossctl agents transcript` / the transcript viewer work
+    /// identically against a remote worker.
+    pub async fn read_remote_transcript_tail(
+        &self,
+        host_id: &str,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        if host_id == "local" {
+            return Ok(None);
+        }
+        let host = self
+            .work_db
+            .get_host(host_id)?
+            .ok_or_else(|| anyhow!("unknown host '{host_id}' for remote transcript read"))?;
+        let adapter = self.host_adapter_provider.adapter_for(&host).await?;
+        adapter.read_transcript_tail_bytes(path, max_bytes).await
+    }
+
+    /// Re-establish reverse events forwards for every detached remote run
+    /// after an engine restart. Thin binding of the coordinator's
+    /// `work_db` + host-adapter provider to
+    /// `boss_engine::remote_reattach::reattach_remote_runs`; `app.rs` calls
+    /// this once at startup so a remote worker that outlived the previous
+    /// engine has its hook stream (and eventual completion) routed back.
+    pub async fn reattach_remote_runs(&self, engine_events_socket: &str) -> boss_execution_contracts::ReattachSummary {
+        self.lifecycle
+            .reattach_remote_runs(self.host_adapter_provider.as_ref(), engine_events_socket)
+            .await
+    }
+
+    /// Share the app's terminal-remote slot and live-state cleanup with the reaper.
+    pub fn set_remote_pane_releaser(&mut self, releaser: Arc<dyn WorkerPaneReleaser>) {
+        self.remote_pane_releaser = Some(releaser);
+    }
+
+    /// Run one cross-host remote-lease reconcile pass and kick the
+    /// scheduler if anything was reaped (a cleared remote zombie unblocks
+    /// the redundant-spawn guard for its work item). Thin binding of the
+    /// coordinator's `work_db` + host-adapter provider + dispatch-event
+    /// sink to `boss_engine::remote_lease_reconcile::reconcile_remote_leases`;
+    /// the periodic sweep in `app.rs` drives it.
+    pub async fn reconcile_remote_leases_once(
+        self: &Arc<Self>,
+    ) -> boss_execution_contracts::RemoteLeaseReconcileOutcome {
+        let outcome = self
+            .lifecycle
+            .reconcile_remote_leases(
+                self.host_adapter_provider.as_ref(),
+                self.dispatch_events.as_ref(),
+                self.remote_pane_releaser.as_deref(),
+            )
+            .await;
+        if outcome.reaped > 0 {
+            self.kick();
+        }
+        outcome
+    }
+
+    /// Return a clone of the automation worker pool handle. Used by
+    /// `app.rs` to expose the pool's live state to the Agents-tab UI.
+    pub fn automation_worker_pool(&self) -> WorkerPool {
+        self.automation_pool.clone()
+    }
+
+    /// Override the review pool. `app.rs` calls this with a pool sized
+    /// from `BOSS_REVIEW_POOL_SIZE`; tests may supply a smaller pool.
+    pub fn set_review_pool(&mut self, pool: WorkerPool) {
+        self.review_pool = pool;
+    }
+
+    /// Return a clone of the review worker pool handle. Used by `app.rs`
+    /// to expose the pool's live state to the Agents-tab UI and by the
+    /// pool-claim reconciler to sweep leaked review claims.
+    pub fn review_worker_pool(&self) -> WorkerPool {
+        self.review_pool.clone()
+    }
+
+    /// Return a clone of the progression worker pool handle, for the
+    /// Agents-tab pool state and the pool-claim reconciler.
+    pub fn progression_worker_pool(&self) -> WorkerPool {
+        self.progression_pool.clone()
+    }
+
+    /// Return the union of execution ids currently claimed across ALL
+    /// worker pools (main, automation, review, and progression).
+    ///
+    /// The orphan-active sweep uses this as its liveness oracle so that
+    /// executions claimed in the review or automation pools are correctly
+    /// treated as live — not abandoned and re-dispatched.  Using only
+    /// `worker_pool().claimed_execution_ids()` (the main pool) would miss
+    /// review-pool claims and cause the sweep to abandon live reviewer
+    /// executions ~90 s after they start.
+    pub async fn all_claimed_execution_ids(&self) -> std::collections::HashSet<String> {
+        let mut claimed = self.worker_pool.claimed_execution_ids().await;
+        claimed.extend(self.automation_pool.claimed_execution_ids().await);
+        claimed.extend(self.review_pool.claimed_execution_ids().await);
+        claimed.extend(self.progression_pool.claimed_execution_ids().await);
+        claimed
+    }
+
+    /// Re-claim `worker_id` for `execution_id` in whichever pool owns that
+    /// slot — the union-of-pools counterpart to
+    /// [`Self::all_claimed_execution_ids`], used by the re-adoption path.
+    ///
+    /// A slot id names a physical pane workspace slot, and any of the three
+    /// pools may be the one holding it (an automation run that spilled into
+    /// the interactive pool, a reviewer in the review pool). Restoring the
+    /// claim in only the main pool would leave a re-adopted reviewer still
+    /// reading as unclaimed to `all_claimed_execution_ids` — the exact
+    /// main-pool-only blind spot that made the orphan sweep abandon live
+    /// reviewers before the union fix.
+    ///
+    /// Returns `true` as soon as some pool holds the claim for
+    /// `execution_id`; `false` when no pool has that slot free (or it belongs
+    /// to a different execution), which the caller treats as "the row's status
+    /// is the only re-dispatch protection".
+    pub async fn reclaim_slot(&self, worker_id: &str, execution_id: &str) -> bool {
+        for pool in [
+            &self.worker_pool,
+            &self.automation_pool,
+            &self.review_pool,
+            &self.progression_pool,
+        ] {
+            if pool.reclaim_slot(worker_id, execution_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Execution currently claiming `worker_id` in the pool that owns that
+    /// id (main, automation, review, or progression), or `None` if the slot is free.
+    ///
+    /// Routes through [`Self::pool_for_worker_id`] so a `review-N` or
+    /// `auto-worker-N` id is not silently treated as unclaimed just because
+    /// the main interactive pool has no matching slot.
+    pub async fn claim_holder(&self, worker_id: &str) -> Option<String> {
+        self.pool_for_worker_id(worker_id)
+            .claims()
+            .await
+            .into_iter()
+            .find(|claim| claim.worker_id == worker_id)
+            .map(|claim| claim.execution_id)
+    }
+
+    /// Wire the execution-started hook. Production installs the
+    /// `WorkerCompletionHandler` here so it can snapshot the bound
+    /// chore PR's head SHA into `work_executions.pr_head_before`
+    /// when an execution transitions to `running`.
+    pub fn set_execution_started_hook(&mut self, hook: Arc<dyn ExecutionStartedHook>) {
+        self.execution_started_hook = hook;
+    }
+
+    /// Wire the automation-preemption teardown. Production installs the
+    /// `WorkerCompletionHandler` here so a starved mainline item can
+    /// reclaim an interactive slot from a spilled automation run through
+    /// the same pane-reap + lease-release path `bossctl agents stop`
+    /// uses. Left unset (the [`NoopAutomationPreemptor`] default),
+    /// preemption is disabled and mainline simply waits for a slot.
+    pub fn set_automation_preemptor(&mut self, preemptor: Arc<dyn AutomationPreemptor>) {
+        self.automation_preemptor = preemptor;
+    }
+
+    /// Wire the engine-global metrics registry into this coordinator.
+    /// `app.rs` calls this once after `init_all` has registered the
+    /// lease counter handles. Tests that omit this call use a pre-seeded
+    /// local registry (created in `with_publisher`) so counter increments
+    /// never panic.
+    pub fn set_metrics(&mut self, metrics: Arc<Registry>) {
+        self.metrics = metrics;
+    }
+
+    /// Seed the `kick()`-routes-through-the-bus kill-switch. `app.rs` calls
+    /// this once at construction with `cfg.work.enable_dispatch_ready_bus`
+    /// (default off). A boot-time setting, not a live toggle: nothing flips
+    /// this after the coordinator is wrapped in its `Arc`. See
+    /// [`Self::enable_dispatch_ready_bus`] and
+    /// [`Self::spawn_dispatch_ready_subscriber`].
+    pub fn set_enable_dispatch_ready_bus(&mut self, enabled: bool) {
+        self.enable_dispatch_ready_bus = enabled;
+    }
+
+    /// Wire the engine-wide event bus into this coordinator. Per the design
+    /// doc ("One engine process, one bus" —
+    /// `engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`),
+    /// there must be exactly one `EventBus` per engine process so every
+    /// producer and subscriber — this coordinator's `kick()`/
+    /// `spawn_dispatch_ready_subscriber`, and any future producer wired
+    /// through `boss_engine::event_publish::commit_and_publish` — reaches the same
+    /// fan-out. `app.rs` calls this once at construction with the single
+    /// `Arc<EventBus>` it also hands to `ServerState`. Left unset, the
+    /// coordinator keeps its private `EventBus::new()` default, which is
+    /// correct for tests and any caller that never wires a shared bus but
+    /// would silently strand events from a second producer in production.
+    pub fn set_event_bus(&mut self, bus: Arc<EventBus>) {
+        self.event_bus = bus;
+    }
+
+    /// The coordinator's `EventBus`, per the design doc's "one engine
+    /// process, one bus" invariant. A future producer living outside the
+    /// coordinator (e.g. a `boss_engine::event_publish::commit_and_publish` call
+    /// site in another module) reaches the same bus `kick()` and
+    /// `spawn_dispatch_ready_subscriber` use through
+    /// `server_state.execution_coordinator.event_bus()`, rather than
+    /// constructing an unreachable bus of its own. `serve_with_merge_probe`
+    /// also uses this to log the subscriber count once the dispatch-ready
+    /// subscriber has attached, as a boot-time sanity check that the
+    /// injected bus in [`Self::set_event_bus`] is actually the one wired up.
+    pub fn event_bus(&self) -> &Arc<EventBus> {
+        &self.event_bus
+    }
+
+    /// Wire the engine's live per-slot worker registry so the dispatch
+    /// loop can run the lease-time occupancy guard (defect 3). `app.rs`
+    /// calls this once with the shared registry; tests that want to
+    /// exercise the guard install a registry, and those that don't leave
+    /// it unset (the guard then fails open, preserving legacy behaviour).
+    pub fn set_live_worker_states(&mut self, live: Arc<dyn LiveWorkerLiveness>) {
+        self.live_worker_states = Some(live);
+    }
+
+    /// The live per-slot worker registry, when [`Self::set_live_worker_states`]
+    /// has wired one up. `None` in tests that don't install it — callers must
+    /// treat that as "no corroborating signal available", never as "worker is
+    /// dead": `boss_engine::durable_liveness::corroborate_against_live_registry`
+    /// and its callers (`boss_engine::dead_pane_sweep`, `boss_engine::orphan_sweep`'s
+    /// redispatch guard) already fail open (trust the raw pid probe) on `None`.
+    pub fn live_worker_states(&self) -> Option<&dyn LiveWorkerLiveness> {
+        self.live_worker_states.as_deref()
+    }
+
+    /// Override the pre-start retry delay schedule. Pass an empty vec
+    /// to disable retries entirely (immediate permanent failure); pass
+    /// short durations in tests to avoid real sleeps.
+    pub fn with_pre_start_retry_delays(mut self, delays: Vec<Duration>) -> Self {
+        self.pre_start_retry_delays = delays;
+        self
+    }
+
+    /// Override how long a spoke lease or spawn waits for the host. Tests
+    /// shorten the intervals to avoid real sleeps.
+    pub fn with_spoke_in_doubt_timing(mut self, timing: SpokeInDoubtTiming) -> Self {
+        self.spoke_in_doubt_timing = timing;
+        self
+    }
+
+    /// In-place form of [`Self::with_spoke_in_doubt_timing`].
+    pub fn set_spoke_in_doubt_timing(&mut self, timing: SpokeInDoubtTiming) {
+        self.spoke_in_doubt_timing = timing;
+    }
+
+    /// Override the interactive-pool concurrency cap ceiling (default
+    /// [`MAX_CONCURRENT_INTERACTIVE_WORKERS`]). Tests that exercise
+    /// automation spillover/preemption at pool sizes at or near
+    /// [`WORKER_PAGE_SIZE`] raise this so the cap doesn't hold mainline rows
+    /// before they reach the spillover/preemption path under test.
+    pub fn with_max_concurrent_interactive_workers(self, max: usize) -> Self {
+        self.max_concurrent_interactive_workers.store(max, Ordering::Release);
+        self
+    }
+
+    /// Override the per-repo concurrent cube-lease bound (default
+    /// [`MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO`]). Tests that need a
+    /// tighter storm check pass 1.
+    pub fn with_max_concurrent_leases_per_repo(mut self, max: usize) -> Self {
+        self.repo_lease_limiter = super::lease_limiter::RepoLeaseLimiter::new(max);
+        self
+    }
+
+    /// Override the outer `cube workspace lease` timeout. Tests that
+    /// model a hung lease pass a short duration so the timeout path
+    /// fires without waiting [`CUBE_LEASE_TIMEOUT`].
+    pub fn with_cube_lease_timeout(mut self, timeout: Duration) -> Self {
+        self.cube_lease_timeout = timeout;
+        self
+    }
+
+    /// Current interactive-pool concurrency cap.
+    pub fn max_concurrent_interactive_workers(&self) -> usize {
+        self.max_concurrent_interactive_workers.load(Ordering::Acquire)
+    }
+
+    /// Live-set the interactive-pool concurrency cap. `0` is rejected
+    /// outright with `Err` — it would wedge all mainline dispatch with no
+    /// error surface — and anything above the live main-pool capacity
+    /// (`self.worker_pool.capacity_sync()`, the same number
+    /// `handle_worker_pool_summary` reports and the value
+    /// `config.worker_pool_size`/`BOSS_WORKER_POOL_SIZE` produces at
+    /// construction) is clamped down to it, since there are no backing slots
+    /// or panes above that on this instance. Clamping against the live pool
+    /// rather than the compile-time [`MAX_WORKER_POOL_SIZE`] ceiling avoids
+    /// accepting a cap the configured pool can never fill, which would
+    /// otherwise reproduce the same capacity-vs-cap contradiction a
+    /// shrunk-and-capped pool is meant to avoid. Reported via
+    /// `Ok(SetConcurrencyCapOutcome::clamped_from)` so the caller can still
+    /// surface a clear message instead of pretending the request was
+    /// honored verbatim.
+    ///
+    /// The caller is responsible for persisting the new value to `state.db`
+    /// (see `handle_set_dispatch_concurrency` in `app/engine_meta.rs`) so it
+    /// survives an engine restart, and for calling [`Self::kick`] afterward
+    /// when raising the cap — a bare store here does not itself wake
+    /// `drain_ready_queue`, so a raised cap would otherwise sit unused until
+    /// the next naturally-triggered drain pass.
+    pub fn set_max_concurrent_interactive_workers(&self, requested: usize) -> Result<SetConcurrencyCapOutcome, String> {
+        if requested == 0 {
+            return Err(
+                "interactive concurrency cap must be at least 1 (0 would wedge all mainline dispatch)".to_string(),
+            );
+        }
+        let ceiling = self.worker_pool.capacity_sync().min(MAX_WORKER_POOL_SIZE);
+        let applied = requested.min(ceiling);
+        self.max_concurrent_interactive_workers
+            .store(applied, Ordering::Release);
+        Ok(SetConcurrencyCapOutcome {
+            applied,
+            clamped_from: (applied != requested).then_some(requested),
+        })
+    }
+
+    /// Install a dispatch-event sink. The production engine threads
+    /// in a `JsonlFileSink` writing under the Boss state root; tests
+    /// pass a `RecordingDispatchEventSink` to assert on the stage
+    /// timeline.
+    pub fn set_dispatch_events(&mut self, sink: Arc<dyn DispatchEventSink>) {
+        self.dispatch_events = sink;
+    }
+
+    /// Builder-style equivalent for callers that construct the
+    /// coordinator inside an `Arc::new(...)` chain.
+    pub fn with_dispatch_events(mut self, sink: Arc<dyn DispatchEventSink>) -> Self {
+        self.dispatch_events = sink;
+        self
+    }
+
+    pub fn worker_pool(&self) -> WorkerPool {
+        self.worker_pool.clone()
+    }
+
+    /// Pause global dispatch with `origin`'s default scope — see
+    /// [`Self::pause_dispatch_scoped`], which this wraps.
+    pub fn pause_dispatch(&self, paused_since_epoch_s: u64, origin: DispatchPauseOrigin, reason: PauseReason) {
+        self.pause_dispatch_scoped(paused_since_epoch_s, origin, origin.default_scope(), reason);
+    }
+
+    /// Pause global dispatch. No work item in the pause's scope reaches a
+    /// worker spawn or a cube lease until it is resumed; already-running
+    /// executions are untouched, because the pause is admission-only by
+    /// design. `scope` determines what is held — see
+    /// [`DispatchPause::reviews_held`]; `origin` records who paused.
+    /// `reason` is a required, validated
+    /// non-empty [`PauseReason`] rather than a bare `String` — there is no
+    /// overload that lets a caller pause dispatch without one, which is the
+    /// point: dispatch must never be found paused with no record of who
+    /// paused it or why. See [`Self::resume_dispatch`] to clear the pause.
+    ///
+    /// The caller is responsible for persisting the new state (including
+    /// `origin` via [`DispatchPauseOrigin::as_metadata_str`], `scope` via
+    /// [`DispatchPauseScope::as_str`], and `reason`) to `state.db` so it
+    /// survives an engine restart — see the `handle_set_dispatch_paused`
+    /// handler in `app/engine_meta.rs`.
+    pub fn pause_dispatch_scoped(
+        &self,
+        paused_since_epoch_s: u64,
+        origin: DispatchPauseOrigin,
+        scope: DispatchPauseScope,
+        reason: PauseReason,
+    ) {
+        let pause = DispatchPause {
+            origin,
+            scope,
+            since_epoch_s: paused_since_epoch_s,
+            reason: reason.into(),
+        };
+        let mut current = self.dispatch_pause.lock().unwrap();
+        // Only a real change in what an observer would render is worth a
+        // notification — re-pausing with byte-identical state (the breaker
+        // re-tripping on the same rule, a restore that matches memory) is a
+        // no-op, not a fresh event.
+        let changed = current.as_ref() != Some(&pause);
+        *current = Some(pause);
+        drop(current);
+        if changed {
+            self.notify_pause_state_changed();
+        }
+    }
+
+    /// Resume global dispatch, clearing the entire pause episode — flag,
+    /// origin, scope, timestamp and reason together. A later pause therefore always
+    /// starts from a clean slate rather than silently inheriting a field the
+    /// previous episode left behind.
+    ///
+    /// The caller is responsible for persisting the new state to
+    /// `state.db` — see `handle_set_dispatch_paused` in `app/engine_meta.rs`.
+    pub fn resume_dispatch(&self) {
+        let was_paused = self.dispatch_pause.lock().unwrap().take().is_some();
+        if was_paused {
+            self.notify_pause_state_changed();
+        }
+    }
+
+    /// The current pause as one consistent snapshot, or `None` when dispatch
+    /// is running. Prefer this over the individual accessors below whenever
+    /// more than one fact about the pause is needed at once — it is the only
+    /// way to be sure they describe the same instant.
+    pub fn dispatch_pause(&self) -> Option<DispatchPause> {
+        self.dispatch_pause.lock().unwrap().clone()
+    }
+
+    /// The current dispatch focus set (empty when focus mode is off).
+    pub fn dispatch_focus(&self) -> boss_protocol::DispatchFocus {
+        self.dispatch_focus.lock().unwrap().clone()
+    }
+
+    /// Replace the dispatch focus set and kick the scheduler so rows that
+    /// just came into scope (or out of a cleared focus) dispatch now rather
+    /// than at the next heartbeat. The caller persists the new set.
+    pub fn set_dispatch_focus(self: &Arc<Self>, focus: boss_protocol::DispatchFocus) {
+        *self.dispatch_focus.lock().unwrap() = focus;
+        *self.dispatch_focus_restore_error.lock().unwrap() = None;
+        self.kick();
+    }
+
+    /// Why the persisted focus set failed to restore at startup, if it did.
+    pub fn dispatch_focus_restore_error(&self) -> Option<String> {
+        self.dispatch_focus_restore_error.lock().unwrap().clone()
+    }
+
+    /// Record that the persisted focus set could not be restored.
+    pub fn record_dispatch_focus_restore_error(&self, error: String) {
+        *self.dispatch_focus_restore_error.lock().unwrap() = Some(error);
+    }
+
+    /// Seed the focus set at startup, before the first drain. Unlike
+    /// [`Self::set_dispatch_focus`] this does not kick the scheduler.
+    pub fn restore_dispatch_focus(&self, focus: boss_protocol::DispatchFocus) {
+        *self.dispatch_focus.lock().unwrap() = focus;
+    }
+
+    /// Ready executions the current focus set holds back right now.
+    pub fn focus_held_count(&self) -> Result<usize> {
+        let focus = self.dispatch_focus();
+        if !focus.is_active() {
+            return Ok(0);
+        }
+        let ready = self.work_db.list_ready_executions()?;
+        Ok(self.work_db.executions_outside_dispatch_focus(&ready, &focus)?.len())
+    }
+
+    /// `true` when dispatch is globally paused.
+    pub fn is_dispatch_paused(&self) -> bool {
+        self.dispatch_pause.lock().unwrap().is_some()
+    }
+
+    /// `true` when the current pause exempts `pr_review` executions. `false`
+    /// when dispatch is not paused at all — an absent pause exempts nothing
+    /// because it holds nothing.
+    pub fn dispatch_pause_exempts_reviews(&self) -> bool {
+        self.dispatch_pause
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| !p.reviews_held())
+    }
+
+    /// The epoch-seconds timestamp at which dispatch was paused, or `None`
+    /// when not currently paused.
+    pub fn dispatch_paused_since_epoch_s(&self) -> Option<u64> {
+        self.dispatch_pause.lock().unwrap().as_ref().map(|p| p.since_epoch_s)
+    }
+
+    /// Why dispatch is currently paused, or `None` when not paused. See
+    /// [`Self::pause_dispatch`] / [`Self::resume_dispatch`].
+    pub fn dispatch_paused_reason(&self) -> Option<String> {
+        self.dispatch_pause.lock().unwrap().as_ref().map(|p| p.reason.clone())
+    }
+
+    /// **The single authority on whether a dispatch may proceed while the
+    /// engine is paused.** Returns `Some(hold)` when it may not.
+    ///
+    /// Every path that can spawn a worker funnels through
+    /// [`Self::schedule_execution`], which calls this — so a new dispatch
+    /// entry point cannot reach a spawn without being decided here. That
+    /// placement is deliberate: the 2026-08-10 incident happened because the
+    /// pause was enforced at *one* entry point (the ready-queue drain) while
+    /// a second, `force_dispatch`, bypassed it wholesale, and nothing about
+    /// adding a third would have surfaced the omission.
+    ///
+    /// The decision, by admission:
+    ///
+    /// - [`DispatchAdmission::Queued`] — held by any pause, except that an
+    ///   operator pause exempts review-pool rows
+    ///   ([`DispatchPause::reviews_held`]).
+    /// - [`DispatchAdmission::OperatorForced`] — never held. A human naming
+    ///   one execution by hand (`bossctl agents launch`) is overriding the
+    ///   pause deliberately, including a breaker pause they may be probing.
+    ///   Persisted operator-forced rows in the ready-queue drain are a
+    ///   different path: they are only admitted as this variant under an
+    ///   operator-origin pause. Under a breaker pause the drain holds them
+    ///   as `dispatch_paused` and keeps the flag.
+    /// - [`DispatchAdmission::BreakerRecoveryProbe`] — allowed **only** under
+    ///   a Breaker-origin pause (an operator pause is manual-resume-only and
+    ///   must never be auto-probed), and **never** for a review-pool row.
+    ///   The review exclusion is the fix for the incident's actual damage:
+    ///   the canary's death records another terminal execution against its
+    ///   work item, and for a `pr_review` that feeds
+    ///   `boss_engine::pr_review_recovery`'s churn guard, which parks the item
+    ///   and leaves an open PR permanently unreviewed. It is also what makes
+    ///   `reviews: held` true — a breaker pause that spent reviews as
+    ///   canaries was not holding them. A `progression` row is likewise
+    ///   never a canary: it does not exercise the coding-worker spawn path
+    ///   being probed, and a failed canary would be recorded against the
+    ///   stuck item it was meant to help.
+    /// - [`DispatchAdmission::PauseBypassOverride`] — allowed **only** under
+    ///   an Operator-origin pause with the default scope
+    ///   ([`DispatchPause::accepts_pause_bypass`]); a Breaker-origin pause or
+    ///   an operator all-spawns pause holds it exactly like
+    ///   [`DispatchAdmission::Queued`]. [`Self::dispatch_with_pause_bypass`]
+    ///   has already confirmed the pause was operator-originated and
+    ///   overridable before consuming this execution's
+    ///   `dispatch_pause_bypass_execution_ids` marker, so this arm exists to
+    ///   keep that confirmation honest at the chokepoint rather than to
+    ///   re-derive it.
+    /// - [`DispatchAdmission::Critical`] — the human-only `critical`
+    ///   priority: admitted under a default-scope operator pause (that is the
+    ///   pause the owner controls and the one the escape hatch exists to
+    ///   get past), held by any all-spawns pause exactly like
+    ///   [`DispatchAdmission::Queued`] — the spawn path is broken, so the
+    ///   urgent row would only burn another attempt against it.
+    pub fn dispatch_hold_for(&self, execution: &WorkExecution, admission: DispatchAdmission) -> Option<DispatchHold> {
+        let pause = self.dispatch_pause()?;
+        let targets_review_pool = self.execution_targets_review_pool(execution);
+        let hold = |detail: String| {
+            Some(DispatchHold {
+                pause: pause.clone(),
+                admission,
+                targets_review_pool,
+                detail,
+            })
+        };
+        match admission {
+            DispatchAdmission::OperatorForced => None,
+            DispatchAdmission::BreakerRecoveryProbe => {
+                if pause.origin != DispatchPauseOrigin::Breaker {
+                    return hold(format!(
+                        "dispatch is paused by the operator (scope {scope}: {reason}) — an operator \
+                         pause, all-spawns included, is manual-resume-only and is never auto-probed",
+                        scope = pause.scope.as_str(),
+                        reason = pause.reason,
+                    ));
+                }
+                if targets_review_pool {
+                    return hold(format!(
+                        "dispatch is breaker-paused ({reason}) and a `pr_review` execution is never \
+                         eligible as a recovery canary — a failed canary counts against the review \
+                         churn guard and would park the work item with an unreviewed open PR",
+                        reason = pause.reason,
+                    ));
+                }
+                if self.execution_targets_progression_pool(execution) {
+                    return hold(format!(
+                        "dispatch is breaker-paused ({reason}) and a progression execution is never \
+                         eligible as a recovery canary — it does not exercise the coding-worker spawn \
+                         path being probed, and a failed canary would be recorded against the stuck \
+                         work item it was meant to help",
+                        reason = pause.reason,
+                    ));
+                }
+                None
+            }
+            DispatchAdmission::Queued => {
+                if targets_review_pool && !pause.reviews_held() {
+                    return None;
+                }
+                hold(format!(
+                    "dispatch is paused ({origin}, scope {scope}): {reason}",
+                    origin = pause.origin.as_metadata_str(),
+                    scope = pause.scope.as_str(),
+                    reason = pause.reason,
+                ))
+            }
+            // Episode generation (matching `pause.since_epoch_s` to the
+            // episode the operator confirmed against) is owned by
+            // `dispatch_with_pause_bypass` and is not re-verified here: the
+            // drain is kicked synchronously after that confirmation, so the
+            // window for a different operator pause to begin is negligible
+            // and the blast radius is one execution. This arm only re-checks
+            // origin so a breaker pause still refuses a bypassed row.
+            DispatchAdmission::PauseBypassOverride => {
+                if pause.accepts_pause_bypass() {
+                    return None;
+                }
+                hold(format!(
+                    "dispatch is paused ({origin}, scope {scope}: {reason}) — the pause-only \
+                     forced-dispatch override applies only to an operator pause with the default \
+                     new_work scope",
+                    origin = pause.origin.as_metadata_str(),
+                    scope = pause.scope.as_str(),
+                    reason = pause.reason,
+                ))
+            }
+            DispatchAdmission::Critical => {
+                if pause.accepts_pause_bypass() {
+                    return None;
+                }
+                hold(format!(
+                    "dispatch is paused (scope {scope}: {reason}) — a `critical` priority bypasses only \
+                     the default operator pause, not an all-spawns hold",
+                    scope = pause.scope.as_str(),
+                    reason = pause.reason,
+                ))
+            }
+        }
+    }
+
+    /// Block all local dispatch until the required startup capability is
+    /// available. This deliberately does not share the resumable dispatch
+    /// pause state: breaker recovery and an operator resume must not lift a
+    /// failed runtime preflight.
+    pub fn set_dispatch_preflight_block(&self, reason: Option<String>) {
+        *self.dispatch_preflight_block_reason.lock().unwrap() = reason;
+    }
+
+    /// The reason local dispatch is blocked by startup preflight, if any.
+    /// A failed runtime preflight (tmux) wins; otherwise boot-time recovery
+    /// and the in-flight local capability probe each hold dispatch with
+    /// their own reason. Both must clear before a drain is permitted.
+    pub fn dispatch_preflight_block_reason(&self) -> Option<String> {
+        if let Some(reason) = self.dispatch_preflight_block_reason.lock().unwrap().clone() {
+            return Some(reason);
+        }
+        if self.startup_recovery_pending() {
+            return Some(STARTUP_RECOVERY_PENDING_REASON.to_owned());
+        }
+        self.local_capability_discovery_pending()
+            .then(|| LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON.to_owned())
+    }
+
+    /// Mark the local host's startup capability probe as in flight
+    /// (`true`) or complete (`false`). While pending, no execution is
+    /// dispatched or force-dispatched; the caller that clears it should
+    /// `kick()` so held work drains promptly — the kick is a no-op drain
+    /// while [`Self::startup_recovery_pending`] is still set.
+    pub fn set_local_capability_discovery_pending(&self, pending: bool) {
+        self.local_capability_discovery_pending
+            .store(pending, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the local host's startup capability probe is still in flight.
+    pub fn local_capability_discovery_pending(&self) -> bool {
+        self.local_capability_discovery_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Mark boot-only startup recovery as in flight (`true`) or complete
+    /// (`false`). Independent of the capability-discovery hold so a finished
+    /// probe cannot start the scheduler before tmux adoption and the
+    /// boot-only reconcile have run. The caller that clears it should
+    /// `kick()` so held work drains once both gates are down.
+    pub fn set_startup_recovery_pending(&self, pending: bool) {
+        self.startup_recovery_pending
+            .store(pending, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether boot-only startup recovery is still in flight.
+    pub fn startup_recovery_pending(&self) -> bool {
+        self.startup_recovery_pending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Pause automation-originated activity — independent of
+    /// [`Self::pause_dispatch`]. `drain_ready_queue` stops claiming worker
+    /// slots for executions bound for the automation pool, and the
+    /// triage-fire seam (`EngineTriageDispatcher::fire`) refuses to start a
+    /// new pass; an already-claimed automation worker is unaffected.
+    /// `reason` is a required, validated non-empty [`PauseReason`] for the
+    /// same anonymity-prevention reason as [`Self::pause_dispatch`]. See
+    /// [`Self::resume_automation`] to clear the pause.
+    ///
+    /// The caller is responsible for persisting the new state (including
+    /// `reason`) to `state.db` so it survives an engine restart — see
+    /// `handle_set_automation_paused` in `app/engine_meta.rs`.
+    pub fn pause_automation(&self, paused_since_epoch_s: u64, reason: PauseReason) {
+        let was_paused = self.automation_paused.swap(true, Ordering::AcqRel);
+        let prior_since = self
+            .automation_paused_since_epoch_s
+            .swap(paused_since_epoch_s, Ordering::AcqRel);
+        let reason: String = reason.into();
+        let prior_reason = self.automation_paused_reason.lock().unwrap().replace(reason.clone());
+        let changed =
+            !was_paused || prior_since != paused_since_epoch_s || prior_reason.as_deref() != Some(reason.as_str());
+        if changed {
+            self.notify_pause_state_changed();
+        }
+    }
+
+    /// Resume automation-originated activity. Clears the pause flag, the
+    /// paused-since timestamp, and the stored reason — see
+    /// [`Self::resume_dispatch`] for why clearing the reason matters.
+    ///
+    /// The caller is responsible for persisting the new state to
+    /// `state.db` — see `handle_set_automation_paused` in
+    /// `app/engine_meta.rs`.
+    pub fn resume_automation(&self) {
+        let was_paused = self.automation_paused.swap(false, Ordering::AcqRel);
+        let prior_since = self.automation_paused_since_epoch_s.swap(0, Ordering::AcqRel);
+        let prior_reason = self.automation_paused_reason.lock().unwrap().take();
+        if was_paused || prior_since != 0 || prior_reason.is_some() {
+            self.notify_pause_state_changed();
+        }
+    }
+
+    /// `true` when automation-originated activity is globally paused.
+    pub fn is_automation_paused(&self) -> bool {
+        self.automation_paused.load(Ordering::Acquire)
+    }
+
+    /// Bump the pause-state generation counter, waking every
+    /// [`Self::subscribe_pause_state`] receiver. Called by — and only by —
+    /// the four pause/resume transitions above, so the notification can
+    /// never be missed by a caller that forgot to fire it.
+    ///
+    /// Infallible by construction: `send_modify` does not care whether any
+    /// receiver exists, so pausing before the broadcaster task is spawned
+    /// (engine boot restoring a persisted pause) and pausing in a test with
+    /// no subscribers at all are both plain no-ops rather than errors.
+    fn notify_pause_state_changed(&self) {
+        self.pause_state_changed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+
+    /// Subscribe to pause-state transitions. The value is an opaque
+    /// generation counter — subscribers re-read the authoritative flags
+    /// ([`Self::is_dispatch_paused`] and friends) rather than trusting it,
+    /// which is what makes coalescing two rapid toggles into one wakeup
+    /// safe.
+    ///
+    /// The returned receiver starts already-seen, so `changed()` first
+    /// resolves on the next transition after subscribing; a subscriber that
+    /// needs the current state at startup reads it directly.
+    pub fn subscribe_pause_state(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.pause_state_changed.subscribe()
+    }
+
+    /// The per-(driver, worker kind) pre-start failure streak tracker. The
+    /// engine health report reads its active alerts, and
+    /// `ServerState::spawn_spawn_streak_health_broadcaster` subscribes to
+    /// its changes. See `boss_engine::pre_start_streak`.
+    pub fn pre_start_streaks(&self) -> &Arc<PreStartStreakTracker> {
+        &self.pre_start_streaks
+    }
+
+    /// The (driver, worker kind) combination a spawn of `execution` on
+    /// `worker_id` counts towards in [`Self::pre_start_streaks`].
+    ///
+    /// Resolved the same way host selection resolves the driver a spawn is
+    /// required to launch (see `select_host_for_execution`), so the label
+    /// names the driver that was actually attempted: review guides are
+    /// fixed to their one driver, a PR review uses its batch member's
+    /// requested driver, a pool worker uses its pool's driver, and
+    /// everything else uses the row / product / allocation resolution.
+    /// Resolved once, before the spawn, and used for both outcomes so a
+    /// failure and the success that ends its streak can never land on
+    /// different keys.
+    pub(super) fn pre_start_streak_key(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+    ) -> boss_execution_contracts::StreakKey {
+        let driver = self.resolve_spawn_driver(execution, worker_id).unwrap_or_else(|err| {
+            tracing::warn!(execution_id = %execution.id, error = %format!("{err:#}"),
+                "streak tracking: failed to resolve spawn driver; treating as unknown");
+            None
+        });
+        boss_execution_contracts::StreakKey::for_execution(driver.as_deref(), &execution.kind)
+    }
+
+    /// The epoch-seconds timestamp at which automation was last paused, or
+    /// `None` when not currently paused.
+    pub fn automation_paused_since_epoch_s(&self) -> Option<u64> {
+        let v = self.automation_paused_since_epoch_s.load(Ordering::Acquire);
+        if v == 0 { None } else { Some(v) }
+    }
+
+    /// Why automation is currently paused, or `None` when not paused. See
+    /// [`Self::pause_automation`] / [`Self::resume_automation`].
+    pub fn automation_paused_reason(&self) -> Option<String> {
+        self.automation_paused_reason.lock().unwrap().clone()
+    }
+
+    /// The pool `execution` is **attributed** to (`"main"`,
+    /// `"automation"`, or `"review"`), independent of which pool's slot it
+    /// physically occupies.
+    ///
+    /// These two normally agree, and for most of the engine's history the
+    /// worker-id prefix (`worker-` / `auto-worker-` / `review-`) was a
+    /// sound proxy for both. Spillover breaks that proxy: an automation
+    /// execution that spilled into Lower Decks holds an ordinary
+    /// `worker-N` slot, so anything keying attribution off the prefix
+    /// would silently report automation load as main-pool load. Diagnostic
+    /// surfaces that answer "what kind of work is this?" must use this;
+    /// code answering "which pool owns this slot?" (release routing) must
+    /// keep using [`Self::pool_for_worker_id`].
+    pub fn attributed_pool_label(&self, execution: &WorkExecution) -> &'static str {
+        self.dispatch_pool_for(execution).as_str()
+    }
+
+    /// Return the pool that should handle `execution`.
+    ///
+    /// `progression` executions always route to the progression pool, checked
+    /// before everything else: the run is bound to a stuck work item that may
+    /// itself be review- or automation-produced, but the run is neither.
+    /// `pr_review` and `pr_review_guide` executions always route to the
+    /// review pool — this is checked first so a reviewer (or guide) of an
+    /// automation-produced task still lands in the review pool, not the
+    /// automation pool. `automation_triage` executions always route to the
+    /// automation pool. Regular task executions route to the automation pool
+    /// when the owning task has `source_automation_id IS NOT NULL` (it was
+    /// produced by an automation). All other executions go to the main pool.
+    pub(crate) fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+        match self.dispatch_pool_for(execution) {
+            boss_protocol::DispatchPool::Review => &self.review_pool,
+            boss_protocol::DispatchPool::Automation => &self.automation_pool,
+            boss_protocol::DispatchPool::Progression => &self.progression_pool,
+            boss_protocol::DispatchPool::Main => &self.worker_pool,
+        }
+    }
+
+    /// `true` when `execution` must run on the dedicated review pool —
+    /// i.e. it is a `pr_review` reviewer execution or a `pr_review_guide`
+    /// generation execution. Guides are part of the PR review flow, not
+    /// automation-originated activity, so they are claimed under the same
+    /// pool and pause rules as reviews rather than the automation pool.
+    ///
+    /// `pub` rather than `pub(super)` because [`Self::dispatch_hold_for`] and
+    /// `boss_engine::spawn_health::maybe_admit_recovery_probe` must agree exactly
+    /// on what counts as a review: the gate refuses a review canary, and the
+    /// probe skips review rows so it never wastes its turn being refused.
+    /// Two independent notions of "is this a review" is precisely the drift
+    /// that would reopen the hole.
+    pub fn execution_targets_review_pool(&self, execution: &WorkExecution) -> bool {
+        execution.kind == ExecutionKind::PrReview || execution.kind == ExecutionKind::PrReviewGuide
+    }
+
+    /// `true` when `execution` is a `progression` administrative agent run. It
+    /// routes to its own pool by kind alone, whatever the stuck item it is
+    /// bound to is (a progression run on an automation-produced item is still
+    /// a progression run, never an automation one).
+    pub fn execution_targets_progression_pool(&self, execution: &WorkExecution) -> bool {
+        execution.kind == ExecutionKind::Progression
+    }
+
+    /// `true` when `execution` targets the automation pool. `pr_review_guide`
+    /// is deliberately excluded — see [`Self::execution_targets_review_pool`]
+    /// — so it is never held by [`Self::is_automation_paused`] and never
+    /// counted as automation-originated by [`Self::attributed_pool_label`].
+    /// `progression` is excluded for the same reason: the item it is bound to
+    /// may have been produced by an automation, but the run is not one.
+    pub(super) fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
+        if self.execution_targets_progression_pool(execution) {
+            return false;
+        }
+        if execution.kind == ExecutionKind::AutomationTriage {
+            return true;
+        }
+        matches!(
+            self.work_db.source_automation_id_for_work_item(&execution.work_item_id),
+            Ok(Some(_))
+        )
+    }
+
+    /// The pool `drain_ready_queue` routes `execution` to. Review is checked
+    /// first, so a reviewer of an automation-produced task counts as review.
+    pub fn dispatch_pool_for(&self, execution: &WorkExecution) -> boss_protocol::DispatchPool {
+        if self.execution_targets_progression_pool(execution) {
+            boss_protocol::DispatchPool::Progression
+        } else if self.execution_targets_review_pool(execution) {
+            boss_protocol::DispatchPool::Review
+        } else if self.execution_targets_automation_pool(execution) {
+            boss_protocol::DispatchPool::Automation
+        } else {
+            boss_protocol::DispatchPool::Main
+        }
+    }
+
+    /// Return the pool that owns `worker_id`. Automation-pool slots carry the
+    /// `"auto-worker-"` prefix, review-pool slots the `"review-"` prefix and
+    /// progression-pool slots the `"progression-"` prefix, all stamped at
+    /// construction time; everything else is the main pool.
+    pub(super) fn pool_for_worker_id<'a>(&'a self, worker_id: &str) -> &'a WorkerPool {
+        if worker_id.starts_with(PROGRESSION_WORKER_ID_PREFIX) {
+            &self.progression_pool
+        } else if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX) {
+            &self.review_pool
+        } else if worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX) {
+            &self.automation_pool
+        } else {
+            &self.worker_pool
+        }
+    }
+}

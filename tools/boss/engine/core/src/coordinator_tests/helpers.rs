@@ -4,13 +4,29 @@
 
 #![allow(unused_imports)]
 
-pub(super) use super::super::*;
+pub(super) use crate::coordinator::*;
+
+// Items the coordinator module uses internally but does not re-export; the
+// integration tests name them directly.
+pub(super) use boss_engine_storage_values::Host;
+pub(super) use boss_engine_storage_values::pool_policy::{
+    AUTOMATION_WORKER_ID_PREFIX, PROGRESSION_WORKER_ID_PREFIX, REVIEW_WORKER_ID_PREFIX,
+};
+pub(super) use boss_event_bus::{Event, EventKind, TopicFilter};
+pub(super) use boss_execution_contracts::{HostAdapter, HostAdapterProvider, LocalHostAdapterProvider};
+pub(super) use boss_protocol::{ExecutionKind, PauseReason};
+pub(super) use std::path::Path;
+pub(super) use tokio::sync::Semaphore;
+
+pub(super) use crate::dispatch_inflight::InflightDispatches;
+pub(super) use crate::effort::PoolModelTier;
+pub(super) use crate::host_adapter::LocalHostAdapter;
 
 pub(super) use crate::test_support::*;
 pub(super) use std::future::pending;
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::Arc;
-pub(super) use std::sync::atomic::{AtomicBool, Ordering};
+pub(super) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub(super) use std::time::Duration;
 
 pub(super) use anyhow::{Result, anyhow};
@@ -21,12 +37,12 @@ pub(super) use tokio::time::sleep;
 
 pub(super) use boss_protocol::{CreateRunInput, EngineToAppError, ExecutionStatus};
 
-pub(super) use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 pub(super) use crate::work::{
     AddDependencyInput, CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
     CreateTaskInput, DispatchClaimOutcome, FinishExecutionRunInput, RequestExecutionInput, TaskStatus, WorkDb,
     WorkExecution, WorkItem, WorkItemPatch,
 };
+pub(super) use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 
 /// Coordinator fixtures that exercise a launch seed the local driver's
 /// discovered capability explicitly. The production probe never fabricates
@@ -43,6 +59,8 @@ pub(super) type LeaseCall = (String, String, Option<String>, bool, Vec<String>);
 // but checkleft's `rust/giant-structs` check parses each file in isolation and
 // cannot see the ancestor `cfg(test)`; the marker tells it this is the test-only
 // fixture it is meant to skip (the builder-pattern rule targets production types).
+type CreateChangeHook = Arc<dyn Fn(&std::path::Path) + Send + Sync>;
+
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct FakeCubeClient {
@@ -57,6 +75,7 @@ pub(super) struct FakeCubeClient {
     pub(super) goto_revision_calls: Mutex<Vec<(String, String)>>,
     pub(super) create_calls: Mutex<Vec<(String, String)>>,
     pub(super) release_calls: Mutex<Vec<String>>,
+    pub(super) active_leases: Mutex<Vec<CubeWorkspaceStatus>>,
     pub(super) status_calls: Mutex<Vec<PathBuf>>,
     pub(super) heartbeat_calls: Mutex<Vec<(String, Option<u64>)>>,
     pub(super) force_release_calls: Mutex<Vec<(String, Option<String>)>>,
@@ -70,6 +89,9 @@ pub(super) struct FakeCubeClient {
     /// the empty list short-circuits before any attention item is
     /// written.
     pub(super) repos: Mutex<Vec<CubeRepoSummary>>,
+    /// Runs once the lease call is accepted, before it returns: models a
+    /// concurrent change (e.g. a sibling going live) landing mid-dispatch.
+    pub(super) on_lease: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) fail_ensure: bool,
     /// When set, `ensure_repo` for this origin blocks for
     /// [`Self::slow_ensure_delay`] before returning. Models one item
@@ -109,8 +131,25 @@ pub(super) struct FakeCubeClient {
     pub(super) fail_create: bool,
     pub(super) fail_bookmark_create: bool,
     pub(super) real_bookmarks: bool,
+    /// Exercise actual checkout positioning as well as recovery in scratch jj repos.
+    pub(super) position_real_workspace: bool,
     pub(super) bookmark_calls: Mutex<Vec<String>>,
+    /// The `inherited_base` each bookmark creation was handed, in call order.
+    pub(super) bookmark_inherited_bases: Mutex<Vec<Option<String>>>,
     pub(super) fail_goto: bool,
+    pub(super) positioning_refused: AtomicBool,
+    /// Fail the first N `goto_workspace` calls, then succeed.
+    pub(super) fail_first_n_goto: usize,
+    /// Fail the first N `release_workspace` calls, then succeed.
+    pub(super) fail_first_n_releases: usize,
+    /// Fail the first N execution-bookmark creations, then succeed.
+    pub(super) fail_first_n_bookmark_creates: usize,
+    /// Fail the first N `positioned_parent` captures, then succeed.
+    pub(super) fail_first_n_positioned_parent: AtomicUsize,
+    /// Runs after a successful `create_change`, before dispatch captures `@-`.
+    pub(super) on_create_change: Option<CreateChangeHook>,
+    pub(super) closed_pr: bool,
+    pub(super) goto_reset_bookmark: Option<String>,
     /// Make `recovery_pr_base` fail, as for a non-GitHub origin or a deleted PR base.
     pub(super) fail_pr_base: AtomicBool,
     /// Base branch `recovery_pr_base` reports; defaults to `main`.
@@ -130,6 +169,9 @@ pub(super) struct FakeCubeClient {
     /// reporting a workspace still leased to a dead worker so the
     /// stale-lease reclaim path (issue #962) can be exercised.
     pub(super) list_workspaces_response: Mutex<Vec<CubeWorkspaceStatus>>,
+    /// When true, `list_workspaces` fails so a recovery retry can observe a
+    /// transient registry fault without losing occupancy-keep evidence.
+    pub(super) list_workspaces_fail: AtomicBool,
     /// When set, `release_workspace` records its call and then parks on this
     /// gate until the test notifies it. Models the field condition behind the
     /// 2026-07-31 silent-abort incident: a `cube workspace release` that ran
@@ -137,9 +179,34 @@ pub(super) struct FakeCubeClient {
     /// long enough for a cancel to land in the middle of it. A gate rather
     /// than a sleep so the window is deterministic instead of timing-tuned.
     pub(super) release_gate: Option<Arc<tokio::sync::Notify>>,
+    /// When true, `lease_workspace` records the call then waits forever.
+    /// Models a cube lease hung behind `repo gc`.
+    pub(super) hang_lease: bool,
+    /// When set, each `lease_workspace` call (counted in-flight) waits for
+    /// a permit from this semaphore before proceeding, so a test releases
+    /// leases one at a time.
+    pub(super) lease_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// When true, `lease_workspace` fails with an error whose chain holds a
+    /// `tokio` elapsed deadline — what a transport that bounds itself
+    /// reports — rather than hanging until the outer timeout.
+    pub(super) fail_lease_with_elapsed: bool,
+    /// In-flight hung (or slow) lease calls. Tests for the per-repo bound
+    /// read this to observe concurrency.
+    pub(super) in_flight_leases: std::sync::atomic::AtomicUsize,
+    /// High-water mark of [`Self::in_flight_leases`].
+    pub(super) peak_in_flight_leases: std::sync::atomic::AtomicUsize,
+    /// Signalled each time a hung lease call is entered.
+    pub(super) lease_entered: Arc<tokio::sync::Notify>,
 }
 
 impl FakeCubeClient {
+    pub(super) fn with_real_workspace(mut self, root: &std::path::Path) -> Self {
+        boss_engine_test_git::jj::JjRepo::new(root);
+        self.workspace_root = Some(root.to_path_buf());
+        self.real_bookmarks = true;
+        self.with_next_workspace_id("worker")
+    }
+
     pub(super) fn with_next_workspace_id(self, id: impl Into<String>) -> Self {
         *self.next_workspace_id.try_lock().expect("uncontended") = Some(id.into());
         self
@@ -205,6 +272,28 @@ crate::stub_cube_client! { FakeCubeClient {
             exclude_workspace_ids.iter().map(|s| s.to_string()).collect(),
         ));
         drop(calls);
+        if self.fail_lease_with_elapsed {
+            let elapsed = tokio::time::timeout(Duration::ZERO, pending::<()>())
+                .await
+                .expect_err("a zero deadline over a pending future elapses");
+            return Err(anyhow::Error::new(elapsed).context("ssh run timed out for host fake"));
+        }
+        if self.hang_lease || self.lease_gate.is_some() {
+            struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+            impl Drop for InflightGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let n = self.in_flight_leases.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = InflightGuard(&self.in_flight_leases);
+            self.peak_in_flight_leases.fetch_max(n, Ordering::SeqCst);
+            self.lease_entered.notify_waiters();
+            match &self.lease_gate {
+                Some(gate) => gate.acquire().await.expect("lease gate open").forget(),
+                None => pending::<()>().await,
+            }
+        }
         if self.panic_on_next_lease.swap(false, Ordering::SeqCst) {
             panic!("fake cube lease panicked (claimed-dispatch RAII test)");
         }
@@ -239,6 +328,9 @@ crate::stub_cube_client! { FakeCubeClient {
         if call_index < self.fail_first_n_leases {
             return Err(anyhow!("cube workspace lease failed: workspace has uncommitted work"));
         }
+        if let Some(hook) = &self.on_lease {
+            hook();
+        }
         // Queue takes priority; falls through to next_workspace_id, then prefer,
         // then the default. The queue lets tests model a sequence of
         // workspace responses (e.g. occupied-then-free for livelock tests).
@@ -250,6 +342,10 @@ crate::stub_cube_client! { FakeCubeClient {
             .or_else(|| self.next_workspace_id.try_lock().ok().and_then(|g| g.clone()))
             .or_else(|| prefer_workspace_id.map(str::to_owned))
             .unwrap_or_else(|| "mono-agent-001".to_owned());
+        self.active_leases.lock().await.push(CubeWorkspaceStatus::builder()
+            .workspace_id(workspace_id.clone())
+            .workspace_path(self.workspace_root.clone().unwrap_or_else(|| PathBuf::from("/tmp")).join(&workspace_id))
+            .state("leased").lease_id("lease-1").build());
         Ok(CubeWorkspaceLease {
             lease_id: "lease-1".to_owned(),
             workspace_id: workspace_id.clone(),
@@ -266,18 +362,49 @@ crate::stub_cube_client! { FakeCubeClient {
         if self.fail_create {
             return Err(anyhow!("cube change create failed"));
         }
+        if self.position_real_workspace {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["describe", "-m", title]);
+        }
+        if let Some(hook) = &self.on_create_change {
+            hook(workspace_path);
+        }
         Ok(CubeChangeHandle {
             change_id: "chg-1".to_owned(),
         })
     }
 
     async fn goto_workspace(&self, workspace_path: &std::path::Path, pr: u64) -> Result<()> {
-        self.goto_calls
-            .lock()
-            .await
-            .push((workspace_path.display().to_string(), pr));
+        let call_index = {
+            let mut calls = self.goto_calls.lock().await;
+            calls.push((workspace_path.display().to_string(), pr));
+            calls.len() - 1
+        };
+        if self.positioning_refused.load(Ordering::SeqCst) {
+            return Err(boss_host_execution::cube::CubeCliError {
+                host: "local".into(),
+                exit_code: Some(2),
+                stderr: serde_json::json!({
+                    "error_kind": "workspace_positioning_refused",
+                    "retryable": false,
+                    "error": "Cannot position abc123 onto def456: unpublished content. Inspect the commits and resolve before launching."
+                }).to_string(),
+                stdout: String::new(),
+            }.into());
+        }
+        if call_index < self.fail_first_n_goto {
+            return Err(anyhow!("cube workspace goto failed"));
+        }
+        if self.closed_pr {
+            return Err(anyhow!("unexpected goto of a closed PR"));
+        }
         if self.fail_goto {
             return Err(anyhow!("cube workspace goto failed"));
+        }
+        if self.position_real_workspace {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["new", &format!("pr/{pr}"), "-m", "PR checkout"]);
+        }
+        if let Some(bookmark) = &self.goto_reset_bookmark {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["bookmark", "set", bookmark, "-r", &format!("pr/{pr}"), "--allow-backwards"]);
         }
         Ok(())
     }
@@ -290,13 +417,24 @@ crate::stub_cube_client! { FakeCubeClient {
         if self.fail_goto {
             return Err(anyhow!("cube workspace goto --revision failed"));
         }
+        if self.position_real_workspace {
+            boss_engine_test_git::jj::JjRepo::run(workspace_path, &["new", sha, "-m", "Captured head checkout"]);
+        }
         Ok(())
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         // Record BEFORE parking on the gate, so a test can observe that the
         // release was entered and still hold it open.
-        self.release_calls.lock().await.push(lease_id.to_owned());
+        let call_index = {
+            let mut calls = self.release_calls.lock().await;
+            calls.push(lease_id.to_owned());
+            calls.len() - 1
+        };
+        if call_index < self.fail_first_n_releases {
+            return Err(anyhow!("cube workspace release failed"));
+        }
+        self.active_leases.lock().await.retain(|ws| ws.lease_id.as_deref() != Some(lease_id));
         if let Some(gate) = self.release_gate.as_ref() {
             gate.notified().await;
         }
@@ -329,6 +467,7 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
+        self.active_leases.lock().await.retain(|ws| ws.lease_id.as_deref() != Some(lease_id));
         self.force_release_calls
             .lock()
             .await
@@ -337,7 +476,12 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-        Ok(self.list_workspaces_response.lock().await.clone())
+        if self.list_workspaces_fail.load(Ordering::SeqCst) {
+            anyhow::bail!("cube registry unavailable");
+        }
+        let mut rows = self.list_workspaces_response.lock().await.clone();
+        rows.extend(self.active_leases.lock().await.clone());
+        Ok(rows)
     }
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
@@ -355,22 +499,48 @@ crate::stub_cube_client! { FakeCubeClient {
         Ok(repos)
     }
     async fn recovery_pr_base(&self, _origin: &str, _pr: u64) -> Result<String> {
+        if self.closed_pr {
+            return Err(crate::host_adapter::closed_recovery_pr_error());
+        }
         if self.fail_pr_base.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(boss_engine_recovery::execution_bookmark::base_unresolvable_error("PR base unavailable"));
         }
         Ok(self.pr_base.lock().await.clone().unwrap_or_else(|| "main".into()))
     }
     async fn create_execution_bookmark(&self, workspace: &std::path::Path, execution_id: &str, predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>, inherited_base: Option<&str>) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
-        self.bookmark_calls.lock().await.push(execution_id.to_owned());
-        if self.fail_bookmark_create { return Err(anyhow!("jj bookmark create failed")); }
+        let call_index = {
+            let mut calls = self.bookmark_calls.lock().await;
+            calls.push(execution_id.to_owned());
+            calls.len() - 1
+        };
+        self.bookmark_inherited_bases.lock().await.push(inherited_base.map(str::to_owned));
+        if self.fail_bookmark_create || call_index < self.fail_first_n_bookmark_creates { return Err(anyhow!("jj bookmark create failed")); }
         if self.real_bookmarks {
             return boss_engine_recovery::execution_bookmark::create_from(
                 &boss_engine_recovery::execution_bookmark::LocalJj, workspace, execution_id, "local", predecessor, inherited_base
             ).await;
         }
         Ok(boss_engine_recovery::execution_bookmark::ExecutionBookmark {
-            execution_id: execution_id.to_owned(), repo_path: workspace.to_path_buf(), host_id: "local".to_owned(),
+            execution_id: execution_id.to_owned(), repo_path: workspace.to_path_buf(), host_id: "local".to_owned(), base_commit: None, pr_head_before: None
         })
+    }
+    async fn positioned_parent(&self, workspace: &std::path::Path) -> Result<String> {
+        if self
+            .fail_first_n_positioned_parent
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n: usize| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(anyhow!("could not capture the positioned commit"));
+        }
+        if self.real_bookmarks || self.position_real_workspace {
+            return boss_engine_recovery::execution_bookmark::one_commit(
+                &boss_engine_recovery::execution_bookmark::LocalJj,
+                workspace,
+                "@-",
+            )
+            .await;
+        }
+        Ok("test-positioned-parent".into())
     }
 } }
 
@@ -393,6 +563,19 @@ pub(super) struct FakeExecutionRunner {
     /// inner cause under this outer context (`anyhow!(msg).context(ctx)`),
     /// so tests can assert `{err:#}` persistence of the cause chain.
     pub(super) fail_context: Option<String>,
+    /// Typed spawn-confirmation cause. When set, `run_execution` returns
+    /// this error (so the coordinator can downcast it) instead of a
+    /// string-only `fail_message`.
+    pub(super) fail_source: Option<crate::runner::spawn_confirmation::SpawnConfirmationError>,
+    /// When `true`, `run_execution` fails with a typed
+    /// `BlockingDialogOnScreen` so the coordinator's spawn-failure arm
+    /// can downcast it the same way a real pane-spawn refusal does.
+    pub(super) fail_blocking_dialog: bool,
+    /// Fail this many `run_execution` calls (with `fail_message`), then
+    /// behave as otherwise configured. Unlike the all-or-nothing `fail`, this lets one
+    /// runner model a spawn path that is broken and then recovers — the
+    /// shape a pre-start failure streak and its resolving success take.
+    pub(super) fail_remaining: std::sync::atomic::AtomicUsize,
     /// When `true`, `run_execution` fails with a `SlotBusy` viewer
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
@@ -436,6 +619,9 @@ impl Default for FakeExecutionRunner {
             fail: false,
             fail_message: None,
             fail_context: None,
+            fail_source: None,
+            fail_blocking_dialog: false,
+            fail_remaining: std::sync::atomic::AtomicUsize::new(0),
             slot_busy: false,
             viewer_abort_failed: false,
             pending: false,
@@ -467,6 +653,23 @@ impl ExecutionRunner for FakeExecutionRunner {
         if self.pending {
             pending::<()>().await;
         }
+        // The failure budget is spent before any other configured outcome,
+        // so a runner can model "one genuine failure, then <whatever else
+        // this runner does>" — including `slot_busy`.
+        let fail_this_call = self
+            .fail_remaining
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if fail_this_call {
+            return Err(anyhow!(
+                "{}",
+                self.fail_message.as_deref().unwrap_or("worker prompt failed")
+            ));
+        }
         if self.viewer_abort_failed {
             return Err(
                 anyhow::Error::new(crate::spawn_flow::StartWorkerError::ViewerAbortFailed {
@@ -483,6 +686,15 @@ impl ExecutionRunner for FakeExecutionRunner {
                 occupying_run_id: Some("exec_other_occupant".to_owned()),
             };
             return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
+        }
+        if let Some(source) = self.fail_source.clone() {
+            return Err(anyhow::Error::from(source));
+        }
+        if self.fail_blocking_dialog {
+            return Err(anyhow::Error::new(boss_tmux::BlockingDialogOnScreen {
+                marker: "Do you want to proceed?".into(),
+            })
+            .context("spawn confirmation failed"));
         }
         if self.fail {
             let err = anyhow!("{}", self.fail_message.as_deref().unwrap_or("worker prompt failed"));
@@ -526,7 +738,9 @@ impl ExecutionRunner for FakeExecutionRunner {
 }
 
 pub(super) async fn wait_for_execution_status(db: &WorkDb, execution_id: &str, expected: ExecutionStatus) {
-    for _ in 0..100 {
+    // Dispatch fixtures with real recovery pointers execute several jj
+    // subprocesses before the terminal transition can be observed.
+    for _ in 0..3000 {
         let execution = db.get_execution(execution_id).unwrap();
         if execution.status == expected {
             return;

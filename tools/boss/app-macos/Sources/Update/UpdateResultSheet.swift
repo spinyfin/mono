@@ -194,7 +194,7 @@ struct UpdateResultSheet: View {
         case .installFailed(let v, let reason) where v == update.version:
             return "Install failed: \(reason)"
         default:
-            return nil
+            return UpdateInstallAction.blockedStatusNote(for: update, updateModel: updateModel)
         }
     }
 
@@ -202,7 +202,7 @@ struct UpdateResultSheet: View {
         switch updateModel.downloadState {
         case .failed(let v, _) where v == update.version: return true
         case .installFailed(let v, _) where v == update.version: return true
-        default: return false
+        default: return updateModel.isBlocked(update.version)
         }
     }
 

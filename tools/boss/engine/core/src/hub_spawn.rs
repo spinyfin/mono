@@ -1,0 +1,720 @@
+//! Compose a typed spoke `Spawn` payload for a remote worker.
+//!
+//! Uses the same [`crate::runner::compose_worker_spawn`] policy as local and
+//! SSH dispatch, then maps the result onto the protocol-spoke message the
+//! spoke supervisor launches from. The composer does not probe the hub's
+//! local filesystem for a remote workspace: Bazel membership is an explicit
+//! override, PR templates and manifest hints are explicitly empty, and
+//! structured-output paths are `$BOSS_STRUCTURED_OUTPUT`. The
+//! settings use an absolute spoke events socket supplied by the caller.
+//! The supervisor honours `effort` and allocates private host output paths
+//! from `structured_output_kind` and `pr_url_output` before launching.
+//! `lease_id` and `workspace_id`
+//! are supplied by the caller (the adapter that already leased the remote
+//! workspace); they are not invented from hub-local cube state.
+
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use boss_protocol::ExecutionKind;
+use boss_protocol_spoke::v1::{Env, Spawn};
+use boss_protocol_spoke::{Validate, ValidationError};
+
+use boss_execution_runner::WorkerSpawnOpts;
+
+use crate::driver::{DriverRegistry, EnvDirective};
+use crate::runner::compose_worker_spawn;
+use crate::work::{WorkDb, WorkExecution, WorkItem};
+use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json, worker_kind_for_execution};
+
+/// Shim binary name resolved on the remote PATH by both the SSH and spoke
+/// transports. Cube's standard install puts `boss-event` on the worker's PATH,
+/// so hook commands resolve it by name rather than an engine-local path.
+pub(crate) const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
+
+use boss_host_execution::worker::HOST_ENV_DENY;
+
+/// Provider and hub credential names that must never appear in `Spawn.env`.
+const CREDENTIAL_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+];
+
+/// Inputs for [`compose_remote_spawn`]. `lease_id` and `workspace_id` are
+/// the cube identities the adapter already allocated; `workspace_path` is
+/// the remote path used in prompt text and is never probed on the hub filesystem. PR templates and manifest
+/// hints are explicitly empty; the worker discovers repository guidance on its host.
+/// Review guides are rejected because their prompts require a host-local git store.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct ComposeRemoteSpawn<'a> {
+    pub db: &'a WorkDb,
+    pub worker_id: &'a str,
+    pub host_id: &'a str,
+    pub execution: &'a WorkExecution,
+    pub item: &'a WorkItem,
+    pub workspace_path: &'a Path,
+    /// Absolute socket path supplied by the spoke host configuration.
+    pub events_socket_path: &'a Path,
+    pub cube_change_id: Option<&'a str>,
+    pub lease_id: &'a str,
+    pub workspace_id: &'a str,
+    pub opts: WorkerSpawnOpts,
+}
+
+/// Why an execution kind cannot yet run on a spoke. The kinds listed here are
+/// told, by their prompts, to run commands that the spoke worker gateway
+/// (`boss_spoke_worker_api`) denies: it queues only run-scoped writes bound to
+/// the claimed run, and cannot answer a synchronous hub verdict or perform
+/// engine administration. Composing them remotely would let the run start and
+/// then fail at the command that records its outcome. CI remediation reaches
+/// workers both directly and through revisions with ci-fix provenance.
+fn remote_unsupported(kind: &ExecutionKind, item: &WorkItem) -> Option<&'static str> {
+    let ci_fix =
+        matches!(item, WorkItem::Task(task) | WorkItem::Chore(task) if task.created_via.starts_with("ci-fix:"));
+    if *kind == ExecutionKind::RevisionImplementation && ci_fix {
+        return remote_unsupported(&ExecutionKind::CiRemediation, item);
+    }
+    match kind {
+        ExecutionKind::PrReviewGuide => {
+            Some("remote review-guide composition requires host-local git store resolution")
+        }
+        ExecutionKind::CiRemediation => Some(
+            "remote CI remediation needs engine ci mark-noop (a live-CI verdict), mark-retriggered, classify and \
+             mark-succeeded-via-rebase, which the spoke worker gateway does not carry",
+        ),
+        ExecutionKind::AutomationTriage => Some(
+            "remote automation triage needs task create --automation, which the spoke worker gateway does not carry",
+        ),
+        ExecutionKind::Progression => Some(
+            "remote progression supervision needs task reads, design-doc commands, stuck reports and merge recovery \
+             verbs, which the spoke worker gateway does not carry",
+        ),
+        ExecutionKind::ProductDesign | ExecutionKind::ProjectDesign => {
+            Some("remote design runs need project set-design-doc, which the spoke worker gateway does not carry")
+        }
+        ExecutionKind::AnswerAgent
+        | ExecutionKind::ChoreImplementation
+        | ExecutionKind::ConflictResolution
+        | ExecutionKind::InvestigationImplementation
+        | ExecutionKind::PrReview
+        | ExecutionKind::RevisionImplementation
+        | ExecutionKind::TaskImplementation => None,
+    }
+}
+
+/// Compose a validated spoke [`Spawn`] from the shared worker-spawn policy.
+pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spawn> {
+    let ComposeRemoteSpawn {
+        db,
+        worker_id,
+        host_id,
+        execution,
+        item,
+        workspace_path,
+        events_socket_path,
+        cube_change_id,
+        lease_id,
+        workspace_id,
+        mut opts,
+    } = request;
+    if !events_socket_path.is_absolute() {
+        bail!("spoke events socket must be absolute");
+    }
+    if opts.bazel_workspace.is_none() {
+        bail!(
+            "remote spawn requires an explicit bazel_workspace override; \
+             the hub must not probe a remote workspace on the local filesystem"
+        );
+    }
+
+    if let Some(reason) = remote_unsupported(&execution.kind, item) {
+        bail!("{reason}");
+    }
+    opts.remote_workspace = true;
+    let composed = compose_worker_spawn(
+        db,
+        worker_id,
+        execution,
+        item,
+        workspace_path,
+        cube_change_id,
+        opts.clone(),
+    )
+    .await?;
+    let RemoteLaunch {
+        prompt_text,
+        driver,
+        settings_json,
+        structured_output_kind,
+        pr_url_output,
+        settings_input,
+    } = prepare_remote_launch(
+        RemoteLaunchInput::builder()
+            .db(db)
+            .execution(execution)
+            .item(item)
+            .driver_slug(&composed.spawn_config.driver)
+            .lease_id(lease_id)
+            .host(host_id)
+            .workspace_path(workspace_path)
+            .events_socket_path(events_socket_path)
+            .boss_event_path(Path::new(REMOTE_BOSS_EVENT_BIN))
+            .opts(opts)
+            .prompt_text(composed.prompt_text)
+            .maybe_embedded_output_path(composed.embedded_output_path.as_deref())
+            .build(),
+    )?;
+
+    let plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+        model: &composed.spawn_config.model,
+        effort: composed.spawn_config.effort_value,
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: settings_input.worker_kind.forced_permission_mode(),
+        run_id: Some(&execution.id),
+    });
+    let mut env = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for directive in &plan.env {
+        if let EnvDirective::Set(name, value) = directive
+            && env_allowed(name)
+            && seen.insert(name.clone())
+        {
+            env.push(Env {
+                name: name.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    if seen.insert("BOSS_RUN_ID".to_owned()) {
+        env.push(Env {
+            name: "BOSS_RUN_ID".into(),
+            value: execution.id.clone(),
+        });
+    }
+
+    let mut spawn = Spawn {
+        lease_id: lease_id.to_owned(),
+        workspace_id: workspace_id.to_owned(),
+        driver_id: composed.spawn_config.driver.clone(),
+        model: composed.spawn_config.model.clone(),
+        prompt_utf8: prompt_text.into_bytes(),
+        settings_json: settings_json.into_bytes(),
+        env,
+        effort: composed.spawn_config.effort_value.map(str::to_owned),
+        structured_output_kind,
+        pr_url_output,
+        permission_mode: settings_input.worker_kind.forced_permission_mode().map(str::to_owned),
+        agent_rules: Some(crate::worker_setup::render_claude_md(
+            &settings_input,
+            driver.agent_rules_preamble(),
+            driver.descriptor().config_dir,
+        )),
+        ..Default::default()
+    };
+    require_launch_inputs(&mut spawn);
+    spawn
+        .validate()
+        .map_err(|err: ValidationError| anyhow::anyhow!("spoke spawn: {err}"))?;
+    Ok(spawn)
+}
+
+/// Peers that predate the launch-input fields would launch with default
+/// effort and without the output variables the prompt references, so a spawn
+/// that depends on them is refused for those peers rather than silently
+/// degraded.
+fn require_launch_inputs(spawn: &mut Spawn) {
+    if spawn.permission_mode.is_some() || spawn.agent_rules.is_some() {
+        spawn.required_features.push(boss_protocol_spoke::v1::Feature {
+            name: boss_protocol_spoke::negotiate::feature::SPAWN_WORKER_POSTURE.to_owned(),
+            revision: 1,
+        });
+    }
+    if spawn.effort.is_some() || spawn.structured_output_kind.is_some() || spawn.pr_url_output {
+        spawn.required_features.push(boss_protocol_spoke::v1::Feature {
+            name: boss_protocol_spoke::negotiate::feature::SPAWN_LAUNCH_INPUTS.to_owned(),
+            revision: 1,
+        });
+    }
+}
+
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub(crate) struct RemoteLaunch {
+    pub prompt_text: String,
+    pub settings_input: WorkerSetupInput,
+    pub driver: std::sync::Arc<dyn crate::driver::AgentDriver>,
+    pub settings_json: String,
+    /// Slug of the designated structured-output payload the prompt now reads
+    /// from `$BOSS_STRUCTURED_OUTPUT`; `None` when the prompt embeds none.
+    pub structured_output_kind: Option<String>,
+    /// Whether the prompt reads `$BOSS_PR_URL_OUTPUT`.
+    pub pr_url_output: bool,
+}
+
+/// Named inputs shared by SSH and spoke launch composition.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub(crate) struct RemoteLaunchInput<'a> {
+    pub db: &'a WorkDb,
+    pub execution: &'a WorkExecution,
+    pub item: &'a WorkItem,
+    pub driver_slug: &'a str,
+    pub lease_id: &'a str,
+    pub host: &'a str,
+    pub workspace_path: &'a Path,
+    pub events_socket_path: &'a Path,
+    pub boss_event_path: &'a Path,
+    pub opts: WorkerSpawnOpts,
+    pub prompt_text: String,
+    pub embedded_output_path: Option<&'a str>,
+}
+
+/// Shared prompt relocation, remote eligibility and driver settings policy.
+pub(crate) fn prepare_remote_launch(input: RemoteLaunchInput<'_>) -> Result<RemoteLaunch> {
+    let RemoteLaunchInput {
+        db,
+        execution,
+        item,
+        driver_slug,
+        lease_id,
+        host,
+        workspace_path,
+        events_socket_path,
+        boss_event_path,
+        opts,
+        prompt_text,
+        embedded_output_path,
+    } = input;
+    let mut prompt_text = prompt_text;
+    if let Some(local_path) = embedded_output_path {
+        if !prompt_text.contains(local_path) {
+            bail!(
+                "remote spawn prompt omitted structured-output path {local_path:?} for execution {}",
+                execution.id
+            );
+        }
+        prompt_text = prompt_text.replace(local_path, "$BOSS_STRUCTURED_OUTPUT");
+    }
+
+    let pr_url_path = crate::structured_output::default_path_string(
+        &execution.id,
+        crate::structured_output::StructuredOutputKind::PrUrl,
+    );
+    prompt_text = prompt_text.replace(&pr_url_path, "$BOSS_PR_URL_OUTPUT");
+
+    let driver = DriverRegistry::default()
+        .require(driver_slug)
+        .map_err(|err| anyhow::anyhow!("remote spawn: {err}"))?;
+    crate::host_adapter::reject_host_local_remote_spawn_plan(driver.as_ref(), driver_slug, host)?;
+
+    let review_batch_member_role = if execution.kind == ExecutionKind::PrReview {
+        db.review_batch_member_for_execution(&execution.id)
+            .with_context(|| format!("review-batch role for execution {}", execution.id))?
+            .map(|member| member.role)
+    } else {
+        None
+    };
+    let settings_input = WorkerSetupInput::builder()
+        .run_id(execution.id.clone())
+        .lease_id(lease_id)
+        .workspace_path(workspace_path.to_path_buf())
+        .events_socket_path(events_socket_path.to_path_buf())
+        .boss_event_path(boss_event_path.to_path_buf())
+        .execution_kind(execution.kind.as_str().to_owned())
+        .maybe_task_kind(crate::runner::work_item_task_kind(item).map(str::to_owned))
+        .worker_kind(worker_kind_for_execution(&execution.kind))
+        .run_done_proposals_seam_enabled(opts.run_done_proposals_seam_enabled)
+        .worker_signal_proposals_seam_enabled(opts.worker_signal_proposals_seam_enabled)
+        .is_review_supervisor(review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::Supervisor))
+        .is_post_merge_reviewer(
+            review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::PostMergeReviewer),
+        )
+        .build();
+    crate::host_adapter::reject_unobservable_remote_driver(driver.as_ref(), driver_slug, &settings_input, host)?;
+    let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
+
+    let structured_output_kind = embedded_output_path
+        .and_then(|_| crate::runner::designated_output_kind(execution, item))
+        .map(|kind| kind.slug().to_owned());
+    let pr_url_output = matches!(
+        execution.kind,
+        ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::ProjectDesign
+            | ExecutionKind::InvestigationImplementation
+    );
+
+    Ok(RemoteLaunch::builder()
+        .maybe_structured_output_kind(structured_output_kind)
+        .pr_url_output(pr_url_output)
+        .prompt_text(prompt_text)
+        .settings_input(settings_input)
+        .driver(driver)
+        .settings_json(settings_json)
+        .build())
+}
+
+fn env_allowed(name: &str) -> bool {
+    if HOST_ENV_DENY.contains(&name) || CREDENTIAL_ENV.contains(&name) {
+        return false;
+    }
+    if name.starts_with("BOSS_HUB_") {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::work::Task;
+    use boss_protocol::{ExecutionStatus, TaskKind, TaskStatus};
+    use std::path::PathBuf;
+
+    fn chore_fixture(workspace: &Path) -> (WorkDb, WorkExecution, WorkItem) {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let execution = WorkExecution::builder()
+            .id("exec_remote_spawn_01")
+            .work_item_id("task-remote-spawn")
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path(workspace.to_string_lossy())
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let task = Task::builder()
+            .id("task-remote-spawn")
+            .product_id("prod-remote")
+            .kind(TaskKind::Chore)
+            .name("Widget import")
+            .description("Implement widget import.")
+            .status(TaskStatus::Todo)
+            .created_at("2026-05-15T00:00:00Z")
+            .updated_at("2026-05-15T00:00:00Z")
+            .driver("claude")
+            .effort_level(boss_protocol::EffortLevel::Small)
+            .build();
+        (db, execution, WorkItem::Chore(task))
+    }
+
+    fn opts(bazel_workspace: Option<bool>) -> WorkerSpawnOpts {
+        WorkerSpawnOpts::builder()
+            .review_signal_checks(|_| &[])
+            .maybe_bazel_workspace(bazel_workspace)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn restricted_worker_posture_is_preserved_and_kinds_needing_denied_commands_reject_remote_paths() {
+        let workspace = Path::new("/remote/nonexistent/workspace");
+        let (db, mut execution, item) = chore_fixture(workspace);
+        for (kind, rejection) in [
+            (ExecutionKind::AnswerAgent, None),
+            (ExecutionKind::PrReviewGuide, Some("host-local git store")),
+            (ExecutionKind::CiRemediation, Some("mark-noop")),
+            (ExecutionKind::AutomationTriage, Some("task create --automation")),
+            (ExecutionKind::Progression, Some("progression supervision")),
+            (ExecutionKind::ProjectDesign, Some("set-design-doc")),
+        ] {
+            execution.kind = kind.clone();
+            let result = compose_remote_spawn(
+                ComposeRemoteSpawn::builder()
+                    .db(&db)
+                    .worker_id("worker")
+                    .host_id("spoke")
+                    .execution(&execution)
+                    .item(&item)
+                    .workspace_path(workspace)
+                    .events_socket_path(Path::new("/spoke/events.sock"))
+                    .lease_id("lease")
+                    .workspace_id("workspace")
+                    .opts(opts(Some(true)))
+                    .build(),
+            )
+            .await;
+            match rejection {
+                Some(text) => assert!(result.unwrap_err().to_string().contains(text), "{kind:?}"),
+                None => {
+                    let spawn = result.unwrap();
+                    assert_eq!(spawn.permission_mode.as_deref(), Some("dontAsk"));
+                    assert!(!spawn.agent_rules.as_deref().unwrap().is_empty());
+                    assert!(
+                        spawn
+                            .required_features
+                            .iter()
+                            .any(|f| f.name == "spawn-worker-posture" && f.revision == 1)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_fix_revisions_reject_remote_composition_but_other_revisions_remain_eligible() {
+        let workspace = Path::new("/remote/workspace");
+        let (db, mut execution, mut item) = chore_fixture(workspace);
+        execution.kind = ExecutionKind::RevisionImplementation;
+        for provenance in ["human", "merge-conflict:attempt", "ci-fix:attempt"] {
+            if let WorkItem::Chore(task) = &mut item {
+                task.created_via = provenance.into();
+            }
+            let result = compose_remote_spawn(
+                ComposeRemoteSpawn::builder()
+                    .db(&db)
+                    .worker_id("worker")
+                    .host_id("spoke")
+                    .execution(&execution)
+                    .item(&item)
+                    .workspace_path(workspace)
+                    .events_socket_path(Path::new("/spoke/events.sock"))
+                    .lease_id("lease")
+                    .workspace_id("workspace")
+                    .opts(opts(Some(true)))
+                    .build(),
+            )
+            .await;
+            if provenance.starts_with("ci-fix:") {
+                let error = result.unwrap_err().to_string();
+                for verb in ["mark-noop", "mark-retriggered", "classify", "mark-succeeded-via-rebase"] {
+                    assert!(error.contains(verb));
+                }
+            } else {
+                assert!(result.is_ok(), "{provenance}: {result:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compose_remote_spawn_requires_bazel_override() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (db, execution, item) = chore_fixture(workspace.path());
+        let err = compose_remote_spawn(ComposeRemoteSpawn {
+            db: &db,
+            worker_id: "worker-1",
+            host_id: "spoke-1",
+            execution: &execution,
+            item: &item,
+            workspace_path: workspace.path(),
+            events_socket_path: Path::new("/spoke/run/events.sock"),
+            cube_change_id: None,
+            lease_id: "lease-1",
+            workspace_id: "ws-1",
+            opts: opts(None),
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("bazel_workspace"), "error was: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn compose_remote_spawn_does_not_probe_local_workspace_markers() {
+        let workspace = tempfile::tempdir().unwrap();
+        // Without the explicit override, this directory has no Bazel marker.
+        let (db, mut execution, mut item) = chore_fixture(workspace.path());
+        let product_id = workspace.path().display().to_string();
+        if let WorkItem::Chore(task) = &mut item {
+            task.product_id = product_id.clone();
+        }
+        execution.cube_lease_id = Some("probe-lease".into());
+        std::fs::write(workspace.path().join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(workspace.path().join(".github")).unwrap();
+        std::fs::write(
+            workspace.path().join(".github/PULL_REQUEST_TEMPLATE.md"),
+            "hub-local-template-sentinel",
+        )
+        .unwrap();
+        let spawn = compose_remote_spawn(ComposeRemoteSpawn {
+            db: &db,
+            worker_id: "worker-1",
+            host_id: "spoke-1",
+            execution: &execution,
+            item: &item,
+            workspace_path: workspace.path(),
+            events_socket_path: Path::new("/spoke/run/events.sock"),
+            cube_change_id: None,
+            lease_id: "lease-1",
+            workspace_id: "ws-1",
+            opts: opts(Some(true)),
+        })
+        .await
+        .unwrap();
+        let prompt = String::from_utf8(spawn.prompt_utf8.clone()).unwrap();
+        assert!(
+            prompt.contains("This repository is a Bazel workspace"),
+            "explicit bazel_workspace=true must not be overwritten by a local empty dir"
+        );
+        assert!(
+            prompt.contains("$BOSS_STRUCTURED_OUTPUT"),
+            "structured output must be the spoke-side env var, not a hub-local path"
+        );
+
+        std::fs::write(workspace.path().join("MODULE.bazel"), "").unwrap();
+        let spawn = compose_remote_spawn(ComposeRemoteSpawn {
+            db: &db,
+            worker_id: "worker-1",
+            host_id: "spoke-1",
+            execution: &execution,
+            item: &item,
+            workspace_path: workspace.path(),
+            events_socket_path: Path::new("/spoke/run/events.sock"),
+            cube_change_id: None,
+            lease_id: "lease-1",
+            workspace_id: "ws-1",
+            opts: opts(Some(false)),
+        })
+        .await
+        .unwrap();
+        let prompt = String::from_utf8(spawn.prompt_utf8).unwrap();
+        assert!(!prompt.contains("hub-local-template-sentinel"));
+        assert!(!prompt.contains("npm/Node"));
+        assert!(
+            prompt.contains("This repository is not a Bazel workspace"),
+            "explicit bazel_workspace=false must ignore a local MODULE.bazel"
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            crate::pr_template::load(&product_id, "probe-lease", empty.path()).is_empty(),
+            "remote composition must not cache hub-local PR templates"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_output_contract_only_exists_when_rendered() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (db, mut execution, mut item) = chore_fixture(workspace.path());
+        execution.kind = ExecutionKind::PrReview;
+        for rendered in [false, true] {
+            if let WorkItem::Chore(task) = &mut item {
+                task.pr_url = rendered.then(|| "fixture-pr".into());
+            }
+            let spawn = compose_remote_spawn(
+                ComposeRemoteSpawn::builder()
+                    .db(&db)
+                    .worker_id("worker")
+                    .host_id("spoke-1")
+                    .execution(&execution)
+                    .item(&item)
+                    .workspace_path(workspace.path())
+                    .events_socket_path(Path::new("/spoke/run/events.sock"))
+                    .lease_id("lease")
+                    .workspace_id("workspace")
+                    .opts(opts(Some(true)))
+                    .build(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                spawn.structured_output_kind.as_deref(),
+                rendered.then_some("review-result")
+            );
+            assert!(!spawn.pr_url_output);
+            assert_eq!(
+                String::from_utf8(spawn.prompt_utf8)
+                    .unwrap()
+                    .contains("$BOSS_STRUCTURED_OUTPUT"),
+                rendered
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compose_remote_spawn_payload_has_driver_prompt_settings_and_run_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (db, execution, item) = chore_fixture(workspace.path());
+        let spawn = compose_remote_spawn(ComposeRemoteSpawn {
+            db: &db,
+            worker_id: "worker-1",
+            host_id: "spoke-1",
+            execution: &execution,
+            item: &item,
+            workspace_path: Path::new("/remote/ws"),
+            events_socket_path: Path::new("/spoke/run/events.sock"),
+            cube_change_id: None,
+            lease_id: "lease-1",
+            workspace_id: "ws-1",
+            opts: opts(Some(true)),
+        })
+        .await
+        .unwrap();
+        spawn.validate().expect("composed spawn must validate");
+        assert_eq!(spawn.lease_id, "lease-1");
+        assert_eq!(spawn.workspace_id, "ws-1");
+        assert_eq!(spawn.driver_id, "claude");
+        assert_eq!(spawn.effort.as_deref(), Some("medium"));
+        assert_eq!(spawn.structured_output_kind.as_deref(), Some("followups"));
+        assert!(spawn.pr_url_output);
+        assert_eq!(
+            spawn.required_features,
+            vec![
+                boss_protocol_spoke::v1::Feature {
+                    name: "spawn-worker-posture".into(),
+                    revision: 1,
+                },
+                boss_protocol_spoke::v1::Feature {
+                    name: "spawn-launch-inputs".into(),
+                    revision: 1,
+                }
+            ]
+        );
+        assert!(!spawn.model.is_empty());
+        assert!(!spawn.prompt_utf8.is_empty());
+        let settings = String::from_utf8(spawn.settings_json.clone()).unwrap();
+        assert!(
+            settings.contains("/spoke/run/events.sock"),
+            "settings should name the spoke-owned socket"
+        );
+        assert!(
+            !settings.contains("boss-path-guard.py") && !settings.contains("BOSS_DATA_DIR="),
+            "remote settings must not install the hub data-dir path-guard: {settings}"
+        );
+        assert!(
+            spawn
+                .env
+                .iter()
+                .any(|env| env.name == "BOSS_RUN_ID" && env.value == execution.id),
+            "run identity missing from env: {:?}",
+            spawn.env
+        );
+        assert!(
+            spawn
+                .env
+                .iter()
+                .all(|env| env.name != "ANTHROPIC_API_KEY" && env.name != "BOSS_EVENTS_SOCKET"),
+            "credential or hub events env leaked: {:?}",
+            spawn.env
+        );
+    }
+
+    #[test]
+    fn require_launch_inputs_only_when_a_launch_input_is_set() {
+        let required = |mut spawn: Spawn| {
+            require_launch_inputs(&mut spawn);
+            spawn.required_features
+        };
+        assert!(required(Spawn::default()).is_empty());
+        for spawn in [
+            Spawn {
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+            Spawn {
+                structured_output_kind: Some("followups".into()),
+                ..Default::default()
+            },
+            Spawn {
+                pr_url_output: true,
+                ..Default::default()
+            },
+        ] {
+            let features = required(spawn);
+            assert_eq!(features.len(), 1);
+            assert_eq!(features[0].name, "spawn-launch-inputs");
+            assert_eq!(features[0].revision, 1);
+        }
+    }
+}

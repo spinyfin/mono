@@ -1,0 +1,1251 @@
+//! `ServerState` side of the convergence rule in [`boss_engine_runtime::worker_readoption`]:
+//! given a worker that has proven itself alive for an execution the engine
+//! terminalized, either put the run back under tracking or tear the process
+//! down.
+//!
+//! The policy itself is a pure function in [`boss_engine_runtime::worker_readoption`]. This
+//! module is the part that needs the engine's collaborators — the DB, the
+//! worker pool, the live-state registry, the app session — and it exists as
+//! its own submodule so the convergence path can be read end to end without
+//! being interleaved with the ordinary pane RPCs in [`super::pane_ops`].
+
+use super::*;
+
+use std::collections::HashSet;
+
+use boss_protocol::{AttachWorkerPaneInput, CreateAttentionItemInput, LiveWorkerState};
+
+use boss_engine_runtime::agent_jsonl_progress::IngressCheckpointStore;
+use boss_engine_runtime::worker_readoption::{ContradictionVerdict, ReapReason, classify_contradiction};
+use boss_work_db::WorkExecution;
+
+pub use boss_engine_storage_values::attention_kinds::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND;
+
+/// Bounded exponential backoff while the same app session stays registered.
+/// One failed stale detach must not wait for the next app relaunch.
+const VIEWER_REATTACH_RETRY_BASE: Duration = Duration::from_secs(2);
+const VIEWER_REATTACH_RETRY_MAX_ATTEMPTS: u32 = 4;
+
+/// Whether `driver` observes its worker by tailing a JSONL file, the same
+/// derivation `spawn_flow::start_worker` makes at spawn time.
+///
+/// Only the [`boss_engine_driver::ProgressIngress`] *variant* is read, and every
+/// driver picks its variant from its own identity rather than from the config
+/// it is handed, so this is a classification probe: the run id is real
+/// (Codex derives its rollout directory from it) and the rest of the config
+/// is empty because nothing here reads the wiring it would produce.
+fn driver_tails_a_progress_file(driver: &dyn boss_engine_driver::AgentDriver, run_id: &str) -> bool {
+    matches!(
+        driver.progress_observation_wiring(&boss_engine_driver::ProgressObservationConfig {
+            events_socket_path: std::path::PathBuf::new(),
+            lease_id: String::new(),
+            run_id: run_id.to_owned(),
+            workspace_path: std::path::PathBuf::new(),
+            forwarder_binary: std::path::PathBuf::new(),
+        }),
+        boss_engine_driver::ProgressIngress::AgentJsonlFile(_),
+    )
+}
+
+/// What [`ServerState::readopt_progress_ingress`] did, for the dispatch
+/// trace. Shared with boot-time tmux adoption, which re-establishes the
+/// same ingress for a live run through
+/// [`boss_engine_runtime::spawn_flow::WorkerSpawner::reestablish_progress_ingress`].
+pub(crate) use boss_engine_runtime::spawn_flow::IngressReadoption;
+
+#[async_trait::async_trait]
+impl boss_engine_runtime::worker_readoption::LiveWorkerConvergence for ServerState {
+    async fn converge_live_worker(&self, execution_id: &str, trigger: &str) {
+        let Ok(execution) = self.work_db.get_execution(execution_id) else {
+            return;
+        };
+        self.converge_terminal_execution(&execution, trigger).await;
+    }
+}
+
+impl ServerState {
+    /// Resolve a terminal execution whose worker is demonstrably alive:
+    /// re-adopt it or reap it, per [`classify_contradiction`].
+    ///
+    /// `trigger` names the signal that proved liveness (the hook event kind
+    /// from the hook fan-out, or one of `redispatch_guard` / `durable_state_scan`
+    /// / `tmux_session_sweep` from the sweeps that probe a recorded shell pid
+    /// or a live tmux pane) and is carried on the dispatch event so a recurrence
+    /// is attributable to the detector that caught it.
+    ///
+    /// Serialized per run by [`ServerState::converging_terminal_runs`]: both
+    /// triggers can fire for the same run at once (a worker hooks while the
+    /// 60 s sweep is mid-pass), and two concurrent resolutions would race
+    /// writes against the same execution row. Returns `"in_flight"` when
+    /// another resolution already holds the latch.
+    ///
+    /// Returns the verdict's stable string for the caller's trace line.
+    pub(super) async fn converge_terminal_execution(&self, execution: &WorkExecution, trigger: &str) -> &'static str {
+        if self.work_db.is_execution_quarantined(&execution.id).unwrap_or(true) {
+            return "historical_worker_quarantined";
+        }
+        if !self.begin_terminal_convergence(&execution.id) {
+            tracing::debug!(
+                run_id = %execution.id,
+                trigger,
+                "terminal-execution convergence already in flight; skipping",
+            );
+            return "in_flight";
+        }
+        let verdict = self.converge_terminal_execution_inner(execution, trigger).await;
+        self.end_terminal_convergence(&execution.id);
+        verdict
+    }
+
+    async fn converge_terminal_execution_inner(&self, execution: &WorkExecution, trigger: &str) -> &'static str {
+        let other_live = self
+            .work_db
+            .get_live_execution_for_work_item(&execution.work_item_id, &execution.id)
+            .ok()
+            .flatten()
+            .map(|live| live.id);
+        // Resolves task_/chore_ *and* cmt_ (answer-agent) bindings. Comments
+        // are not a `WorkItem` variant, so this path must not go through
+        // `get_work_item` alone — that used to yield `unknown work item id
+        // format` and a permanent `work_item_lookup_failed` verdict for every
+        // answer-agent contradiction.
+        let work_item_terminal = match self.work_db.is_bound_work_item_closed(&execution.work_item_id) {
+            Ok(closed) => closed,
+            Err(item_err) => match self.work_db.work_item_row_missing(&execution.work_item_id) {
+                Ok(true) => true,
+                Ok(false) | Err(_) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        error = %format!("{item_err:#}"),
+                        "readopt: could not establish whether the bound work item is closed; retrying convergence later",
+                    );
+                    return "work_item_lookup_failed";
+                }
+            },
+        };
+        let latest_tmux_observed_pid = match self.work_db.latest_local_tmux_pane_pid_for_execution(&execution.id) {
+            Ok(pid) => pid,
+            Err(err) => {
+                // A transient DB error must not be coerced into "no pid
+                // recorded": that value feeds `process_live` below, and with
+                // no other positive-liveness evidence it tips
+                // `classify_contradiction` toward `Reap { NoPositiveLiveness
+                // }` — the irreversible branch — on nothing more than a
+                // read failure. Readoption is recoverable; reaping destroys
+                // in-flight work and is not, so an unreadable pid must read
+                // as unknown, not as evidence of death. Skip this pass and
+                // let the next sweep decide once the read succeeds.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "readopt: could not read the latest tmux-observed pane pid; skipping contradiction \
+                     convergence for this pass rather than treating the read failure as no liveness",
+                );
+                return "tmux_pid_lookup_failed";
+            }
+        };
+        let observed_shell_pid =
+            boss_engine_runtime::durable_liveness::probe_execution_worker(&self.work_db, &execution.id).alive_pid();
+        let registry_slot = self.worker_registry.slot_for_run(&execution.id);
+        // A stored-but-dead pid is not liveness: the phantom rows had durable
+        // pids that `kill(pid, 0)` reported ESRCH. `tmux_pane_pid` is written
+        // to the same value as `shell_pid` by
+        // `persist_tmux_identity_after_observation`, so it must be probed
+        // too — trusting the stored number unprobed would make this term
+        // true exactly when the probed `observed_shell_pid` term says dead.
+        // A token-verified `#{pane_dead}` observation is terminal evidence:
+        // a retained remain-on-exit session must not disprove an inferred
+        // death, even if a registry slot or a leftover pane pid is still
+        // recorded. Only a currently-alive process (by either pid), a live
+        // slot, or a mid-turn driver hook (never `session_end`) counts —
+        // and never when the pane itself is already known dead.
+        let recorded_pane_dead = self
+            .work_db
+            .tmux_pane_observation_for_execution(&execution.id)
+            .ok()
+            .flatten()
+            .is_some_and(|obs| obs.pane_dead == Some(true) || obs.kind == boss_work_db::TmuxPaneObservationKind::Dead);
+        let process_live = observed_shell_pid.is_some()
+            || boss_engine_runtime::durable_liveness::probe_recorded_pid(latest_tmux_observed_pid).is_alive()
+            || registry_slot.is_some();
+        let hook_liveness = trigger != boss_engine_runtime::worker_readoption::SESSION_END_TRIGGER
+            && !boss_engine_runtime::worker_readoption::NON_HOOK_TRIGGERS.contains(&trigger);
+        // A recorded Dead pane is terminal evidence that must not be
+        // disproven: a stray non-session_end hook after the pane has
+        // already exited must not count as positive liveness, or
+        // classify_contradiction would Readopt the execution this pass
+        // just terminalized.
+        let positive_liveness = !recorded_pane_dead && (process_live || hook_liveness);
+        let verdict = classify_contradiction(
+            &execution.status,
+            work_item_terminal,
+            other_live.as_deref(),
+            trigger,
+            positive_liveness,
+        );
+        match verdict {
+            ContradictionVerdict::NoContradiction => "no_contradiction",
+            ContradictionVerdict::Readopt => {
+                self.readopt_live_worker(execution, trigger).await;
+                "readopt"
+            }
+            ContradictionVerdict::Reap { reason } => {
+                self.reap_contradicting_worker(execution, trigger, reason, other_live.as_deref())
+                    .await;
+                "reap"
+            }
+        }
+    }
+
+    /// Claim the right to resolve `run_id`'s contradiction. Returns `false`
+    /// when another resolution is already in flight for the same run — see
+    /// [`ServerState::converging_terminal_runs`] for why the latch exists.
+    pub(super) fn begin_terminal_convergence(&self, run_id: &str) -> bool {
+        self.converging_terminal_runs
+            .lock()
+            .expect("converging_terminal_runs poisoned")
+            .insert(run_id.to_owned())
+    }
+
+    /// Release the latch taken by [`Self::begin_terminal_convergence`].
+    pub(super) fn end_terminal_convergence(&self, run_id: &str) {
+        self.converging_terminal_runs
+            .lock()
+            .expect("converging_terminal_runs poisoned")
+            .remove(run_id);
+    }
+
+    /// Put a run the engine wrongly declared dead back under tracking.
+    ///
+    /// Order matters, and it is the reverse of teardown:
+    ///
+    /// 1. **The DB row first.** Everything else is derived state that a sweep
+    ///    can rebuild; the row is what decides whether the work item is
+    ///    eligible for re-dispatch. Restoring it first closes the duplicate
+    ///    window as early as possible, and if any later step fails the row is
+    ///    still correct.
+    /// 2. **Progress ingress**, for a driver that observes its worker by
+    ///    tailing a file rather than by receiving hook callbacks. Step 1
+    ///    makes the run *countable* again; this is what makes it *observable*
+    ///    again. For a worker that runs one turn per process the distinction
+    ///    is academic — the run is over before readoption could matter — but
+    ///    for a long-lived agent session it is the whole ballgame: with no
+    ///    tail there is no rollout record, therefore no turn boundary,
+    ///    therefore no completion, and the session sits alive holding a slot
+    ///    and a workspace lease that nothing will ever release. See
+    ///    [`Self::readopt_progress_ingress`].
+    ///
+    ///    Ahead of steps 3 and 4 rather than after them, because it is the
+    ///    one restore step that does not need a slot id: a run whose durable
+    ///    worker id cannot be resolved to a slot — or whose derived slot is
+    ///    no longer its own — still has a rollout to read, and making the
+    ///    tail wait on that answer would put the ballgame behind the
+    ///    cosmetics.
+    /// 3. **The pool claim**, keyed to the slot [`Self::hosted_pane_slot_for_run`]
+    ///    derives from the run's durable `work_runs.agent_id`, reclaimed only
+    ///    when the pool confirms that slot is unclaimed or already claimed by
+    ///    this run. This is the `is_live` oracle the re-dispatchers consult,
+    ///    so without it the row would still read as re-dispatchable to
+    ///    `orphan_sweep` even though its status now says otherwise.
+    /// 4. **The live-state entry**, which is what the agent indicator paints
+    ///    from and what `bossctl agents list` / `agents stop` resolve against.
+    ///
+    /// Steps 3 and 4 need a slot id, and the durable derivation in
+    /// [`Self::hosted_pane_slot_for_run`] is only a hint — it names the slot
+    /// this run once held, not necessarily the slot it holds now. Before
+    /// either step touches slot-scoped state it also checks the worker pool's
+    /// claim (via `reclaim_slot`) and the live-state registry's current
+    /// occupant for that slot; if either says the slot now belongs to a
+    /// different live execution, both steps are skipped so that run's
+    /// tracking is not overwritten. When no slot id resolves at all, or the
+    /// slot is owned by another run, re-adoption still completes at steps 1
+    /// and 2 — degraded (the indicator stays blank until the worker's pane is
+    /// re-observed) but convergent in the way that matters, because the row
+    /// no longer invites a duplicate dispatch and the session is still being
+    /// read.
+    async fn readopt_live_worker(&self, execution: &WorkExecution, trigger: &str) {
+        let run_id = execution.id.as_str();
+        let prior_status = execution.status.to_string();
+        let (stored_shell_pid_before, latest_tmux_observed_pid) = self
+            .work_db
+            .latest_local_pane_pid_snapshot_for_execution(run_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    run_id,
+                    error = %format!("{err:#}"),
+                    "readopt: could not read the pre-write pane pid snapshot",
+                );
+                (None, None)
+            });
+        let observed_shell_pid =
+            boss_engine_runtime::durable_liveness::probe_execution_worker(&self.work_db, run_id).alive_pid();
+        // `observed_shell_pid` always comes from the durable-liveness probe of
+        // `work_runs.shell_pid`, never from a fresh tmux observation, in every
+        // branch below — so the label names the trigger that led here, not a
+        // tmux-observation source the code never actually reads.
+        let shell_pid_write_reason = match (trigger, observed_shell_pid) {
+            ("tmux_session_sweep", Some(_)) => "durable_live_process_probe_after_tmux_sweep",
+            (_, Some(_)) => "durable_live_process_probe",
+            (_, None) => "no_positive_pid_observed_no_write",
+        };
+        tracing::info!(
+            run_id,
+            trigger,
+            stored_shell_pid_before = ?stored_shell_pid_before,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
+            observed_shell_pid = ?observed_shell_pid,
+            shell_pid_write_reason,
+            "readopt: restoring inferred-terminal execution liveness",
+        );
+
+        let (restored, liveness_age_reset) =
+            match self
+                .work_db
+                .readopt_inferred_terminal_execution(run_id, trigger, observed_shell_pid.map(i64::from))
+            {
+                Ok(restored) => restored,
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not reverse the inferred terminal status; leaving the row as-is",
+                    );
+                    return;
+                }
+            };
+
+        // Resolved once, ahead of the slot lookup, because both the live-state
+        // entry and the progress ingress need the same answer and only one of
+        // them depends on a slot resolving at all. A run whose durable worker
+        // id does not resolve to a slot — or whose derived slot now belongs
+        // to a different live execution — still has a rollout to read.
+        //
+        // Ask the driver frozen at spawn (`work_executions.driver`), not a
+        // live re-derivation from worker id or pool policy. Re-deriving is
+        // how a Codex spawn was labelled Claude Code after re-adoption.
+        // `awaiting_input_capable` gates the `WaitingForInput` promotion in
+        // `live_worker_state`, so the wrong driver here is the
+        // wrong-indicator class this path exists to end.
+        //
+        // The spawn-time *model* is not persisted, so the label is the
+        // driver's, not a specific model: being vague about the model is
+        // cosmetic; being wrong about it would put a false claim on the
+        // pane titlebar.
+        //
+        // Only an unstamped legacy run may degrade to the engine default.
+        // An unregistered launch stamp stays unresolved, including its
+        // progress ingress, capabilities, and visible label.
+        let driver = boss_engine_completion::driver_transcript::driver_for_spawned_execution(&self.work_db, run_id);
+        let ingress_outcome = self.readopt_progress_ingress(&restored, driver.clone()).await;
+        // The durably-derived slot is only a hint: it names the slot this run
+        // once held, not necessarily the slot it holds now. Before touching
+        // any bookkeeping keyed by that slot, confirm current ownership
+        // through both oracles that could disagree with it — the worker
+        // pool's claim (`reclaim_slot` refuses to yank a claim held by a
+        // different execution) and the live-state registry (whose own
+        // `register_readoption` would otherwise silently overwrite a
+        // different run's entry). Either disagreeing means the slot has
+        // already been handed to a newer run, and re-adoption must leave
+        // that run's tracking alone rather than clobber it.
+        let slot_id = match self.hosted_pane_slot_for_run(run_id) {
+            Some(candidate_slot_id) => {
+                // Live-state is the occupancy oracle that `reclaim_slot` does
+                // not consult: that helper writes a claim onto a free pool
+                // slot. Check it first so a free pool + occupied live-state
+                // cannot leave a split claim behind when we then refuse to
+                // register.
+                let held_by_other_run = self
+                    .live_worker_states
+                    .get(candidate_slot_id)
+                    .is_some_and(|state| state.run_id != run_id);
+                if held_by_other_run {
+                    tracing::warn!(
+                        run_id,
+                        slot_id = candidate_slot_id,
+                        "readopt: the durably-derived slot is currently owned by a different live \
+                         execution; skipping worker-registry and live-state registration so this \
+                         readoption does not overwrite its tracking. The row is restored but \
+                         re-dispatch protection rests on its status alone",
+                    );
+                    None
+                } else {
+                    let worker_id = boss_execution_contracts::worker_id_for_slot(candidate_slot_id);
+                    let reclaimed = self.execution_coordinator.reclaim_slot(&worker_id, run_id).await;
+                    if reclaimed {
+                        Some(candidate_slot_id)
+                    } else {
+                        tracing::warn!(
+                            run_id,
+                            slot_id = candidate_slot_id,
+                            "readopt: the durably-derived slot is currently claimed by a different \
+                             live execution; skipping worker-registry and live-state registration \
+                             so this readoption does not overwrite its tracking. The row is \
+                             restored but re-dispatch protection rests on its status alone",
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Some(slot_id) = slot_id {
+            match self.work_db.tmux_identity_for_execution(run_id) {
+                Ok(Some(identity)) => {
+                    self.worker_registry
+                        .register_tmux_run_slot(run_id.to_owned(), slot_id, identity.session_name);
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        run_id,
+                        slot_id,
+                        "readopt: local run has no durable tmux identity; registering a sessionless \
+                         slot, so pane input, probes and interrupt fail closed until it is adopted",
+                    );
+                    self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        run_id,
+                        slot_id,
+                        %error,
+                        "readopt: could not read the durable tmux identity; registering a sessionless slot",
+                    );
+                    self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
+                }
+            }
+            // Durable pids can be recycled across restart. Process identity is
+            // registered by tmux adoption (adopt_one, or the terminal-handoff
+            // branch of the session sweep) after observing the live pane pid.
+            let binding = Some(boss_engine_runtime::live_worker_metadata::execution_binding(
+                &self.work_db,
+                &restored,
+            ));
+            let has_source_automation = matches!(
+                self.work_db.source_automation_id_for_work_item(&restored.work_item_id),
+                Ok(Some(_))
+            );
+            let pool =
+                boss_engine_live_worker_state::attributed_pool_label(restored.kind.clone(), has_source_automation);
+            let (model_label, awaiting_input_capable) = boss_engine_runtime::live_worker_metadata::adopted_identity(
+                &self.work_db,
+                &restored,
+                driver.as_deref(),
+            );
+            // Register through the re-adoption entry point, not the spawn
+            // one. Registration stamps `spawned_at` with the current time,
+            // which is a fiction here — this worker has been running,
+            // unobserved, for however long — and `spawn_ack_sweep`'s
+            // driver-start pass ages that stamp against
+            // `DRIVER_START_GRACE_SECS`. Registering as a spawn would put
+            // a healthy long-running worker 300 s from being reaped as "the
+            // driver binary never started": pane torn down (signalling the
+            // recorded shell pid's process *group*), workspace torn down,
+            // cube lease force-released — the exact incident this whole
+            // path exists to prevent, re-created by the check meant to
+            // prevent a different one.
+            //
+            // The trigger decides what Boss may claim to know. A hook
+            // arriving after the engine terminalized the run came from the
+            // driver itself, so it is recorded as genuine driver-start
+            // proof rather than discarded. The other call sites into
+            // `converge_live_worker` — `redispatch_guard` from the orphan
+            // sweep's durable-pid probe, `durable_state_scan` from the
+            // dead-pane sweep's `durable_liveness::probe_execution_worker_within`
+            // probe, and `tmux_session_sweep`
+            // (`tmux_adoption::TERMINAL_HANDOFF_TRIGGER`) from tmux
+            // adoption's live pane observation — all observe only the
+            // *shell* hosting the pane and say nothing about the driver;
+            // that conflation is what `driver_signal_at` exists to prevent,
+            // so they record nothing. These non-hook triggers are named
+            // explicitly on an allow-list — shared with the positive-liveness
+            // gate above via `worker_readoption::NON_HOOK_TRIGGERS` — so an
+            // unrecognized trigger added later defaults to withholding
+            // driver evidence, not asserting it.
+            let evidence = if boss_engine_runtime::worker_readoption::NON_HOOK_TRIGGERS.contains(&trigger) {
+                boss_engine_live_worker_state::ReadoptionEvidence::LiveShellPid
+            } else {
+                boss_engine_live_worker_state::ReadoptionEvidence::DriverHook
+            };
+            // Register the slot-to-run mapping even when no pid was
+            // observable, using the same `shell_pid = 0` provisional
+            // convention `spawn_flow`'s ack-timeout path already uses
+            // (`register_spawn(slot, run, model, 0, ..)`). Dropping the
+            // live-state entry entirely — as this used to do — left
+            // `worker_registry` and `live_worker_states` disagreeing about
+            // whether the slot has an occupant: the agents list would show
+            // no worker at all for a run the row already says is `running`.
+            // `shell_pid <= 0` is the registry's own signal for "liveness
+            // unknown, do not reap on this basis" (see `mark_stalled_spawns`
+            // and the `shell_pid <= 0` skip in `unverified_driver_starts`),
+            // so a zero here degrades gracefully rather than asserting a
+            // false liveness fact.
+            if observed_shell_pid.is_none() {
+                tracing::warn!(
+                    run_id,
+                    slot_id,
+                    trigger,
+                    shell_pid_write_reason,
+                    "readopt: no positive shell pid was observable; registering the live-state entry with the provisional zero-pid sentinel",
+                );
+            }
+            // Same durable hosting-mode snapshot spawn stamps. A missing or
+            // unreadable stamp reads as not-tmux-hosted; such rows are
+            // quarantined and skipped by the `is_execution_quarantined`
+            // guard upstream, so this arm is a defensive default rather
+            // than a live path.
+            let tmux_hosted = match self.work_db.latest_run_tmux_hosting_for_execution(run_id) {
+                Ok(Some(hosted)) => hosted,
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not read durable tmux hosting; treating as not tmux-hosted",
+                    );
+                    false
+                }
+            };
+            // Explicit locality from the durable run row; a run without a
+            // recorded host predates remote dispatch and is local.
+            let readoption_host_id = match self.work_db.latest_run_host_for_execution(run_id) {
+                Ok(Some(host)) => host,
+                Ok(None) => boss_protocol::LOCAL_HOST_ID.to_owned(),
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not read the durable run host; treating as local",
+                    );
+                    boss_protocol::LOCAL_HOST_ID.to_owned()
+                }
+            };
+            self.live_worker_states.register_readoption(
+                slot_id,
+                run_id.to_owned(),
+                model_label,
+                observed_shell_pid.unwrap_or(0),
+                binding,
+                awaiting_input_capable,
+                boss_engine_live_worker_state::LiveSpawnRouting::new_with_hosting(
+                    Some(pool.to_owned()),
+                    restored.kind.as_str(),
+                    tmux_hosted,
+                )
+                .with_metadata(boss_engine_runtime::live_worker_metadata::resolve_with_automation(
+                    &self.work_db,
+                    &restored,
+                    &readoption_host_id,
+                    has_source_automation,
+                )),
+                evidence,
+            );
+            if evidence == boss_engine_live_worker_state::ReadoptionEvidence::DriverHook {
+                boss_engine_runtime::spawn_health::maybe_resume_after_canary_driver_signal(
+                    &self.spawn_health,
+                    &self.work_db,
+                    &self.execution_coordinator,
+                    self.dispatch_events.as_ref(),
+                    run_id,
+                )
+                .await;
+            }
+            match self.work_db.get_run_semantic_progress_checkpoint(run_id) {
+                Ok(Some(checkpoint)) => self.live_worker_states.seed_semantic_progress(slot_id, &checkpoint),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not load the semantic-progress checkpoint; this worker will be \
+                         reaped as a never-started driver if no checkpoint or hook arrives within the \
+                         grace window",
+                    );
+                }
+            }
+            self.broadcast_live_worker_states().await;
+        } else {
+            tracing::warn!(
+                run_id,
+                "readopt: no local pool slot could be restored for this run (remote run, no durable \
+                 worker id recorded, or the derived slot is owned by a different live execution), so \
+                 the live-state slot could not be restored. The execution row is back to live — which \
+                 is what stops the duplicate dispatch — but the agent indicator stays blank until the \
+                 pane is re-observed.",
+            );
+        }
+
+        if let Ok(item) = self.work_db.get_work_item(&restored.work_item_id) {
+            self.publisher
+                .publish_work_item_changed(item.product_id(), &restored.work_item_id, "worker_readopted")
+                .await;
+        }
+        self.dispatch_events
+            .emit(
+                boss_dispatch_events::DispatchEvent::new(
+                    boss_dispatch_events::Stage::LiveWorkerReadopted,
+                    boss_dispatch_events::Outcome::Ok,
+                    run_id,
+                )
+                .with_work_item(&restored.work_item_id)
+                .with_details(serde_json::json!({
+                    "trigger": trigger,
+                    "prior_status": prior_status,
+                    "restored_status": restored.status.to_string(),
+                    "shell_pid": observed_shell_pid,
+                    "stored_shell_pid_before": stored_shell_pid_before,
+                    "latest_tmux_observed_pid": latest_tmux_observed_pid,
+                    "shell_pid_write_reason": shell_pid_write_reason,
+                    "liveness_age_reset": liveness_age_reset,
+                    "slot_id": slot_id,
+                    "progress_ingress": ingress_outcome.as_str(),
+                })),
+            )
+            .await;
+    }
+
+    /// Put a readopted run's file-tail progress ingress back in place, from
+    /// the durable record of where the previous engine's tail had got to.
+    ///
+    /// Not conditional on anything: every readopted run consults its
+    /// checkpoint, and every checkpoint that says "file ingress" is
+    /// re-established. What varies is only *how* — a run that had already
+    /// attached to a rollout resumes at the exact byte it had consumed
+    /// through, and a run that was still waiting for its rollout to appear
+    /// re-arms discovery against the pre-spawn baseline it recorded.
+    ///
+    /// The failure modes are deliberately loud. There is no "attach from
+    /// zero" fallback (it would republish every record of every prior turn as
+    /// if it were new) and no "attach at end of file" fallback (it would
+    /// discard whatever the worker wrote while the engine was down, including
+    /// the turn boundary of a turn that ended during the restart). When the
+    /// recorded rollout cannot be re-attached the run is left un-observed
+    /// *and an operator is told*, because an unobservable live session is
+    /// exactly the state that needs a human.
+    ///
+    /// Two callers: [`Self::readopt_live_worker`] for a survivor whose row
+    /// was wrongly terminalized, and — through the
+    /// [`boss_engine_runtime::spawn_flow::WorkerSpawner`] hook — boot-time tmux adoption
+    /// for a survivor whose row was never wrong. The row's status differs;
+    /// the tail it needs back does not.
+    pub(super) async fn readopt_progress_ingress(
+        &self,
+        execution: &WorkExecution,
+        driver: Option<std::sync::Arc<dyn boss_engine_driver::AgentDriver>>,
+    ) -> IngressReadoption {
+        let run_id = execution.id.as_str();
+        let checkpoint = match self.work_db.load_ingress_checkpoint(run_id) {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => {
+                // No record at all: this run was dispatched by an engine that
+                // predates the checkpoint column, or its `Armed` write failed.
+                //
+                // Whether that matters is decidable rather than unknowable —
+                // ask the driver that was already resolved for this run. For
+                // one that tails a file, a missing checkpoint leaves exactly
+                // the state this whole path exists to prevent: a live worker
+                // with no tail, no turn boundary, and a slot and a lease
+                // nothing will release. That is an attention item, not a log
+                // line. Only a driver that never tails a file gets to be
+                // merely `Unknown`.
+                if driver
+                    .as_deref()
+                    .is_some_and(|driver| driver_tails_a_progress_file(driver, run_id))
+                {
+                    self.file_ingress_readoption_attention(
+                        execution,
+                        "this run recorded no progress-ingress checkpoint, so there is no rollout \
+                         path or resume offset to re-attach to",
+                    )
+                    .await;
+                    return IngressReadoption::Failed;
+                }
+                tracing::warn!(
+                    run_id,
+                    driver_resolved = driver.is_some(),
+                    "readopt: this run recorded no progress-ingress checkpoint. Its driver does \
+                     not tail a file (or could not be resolved to say), so there is nothing to \
+                     re-establish.",
+                );
+                return IngressReadoption::Unknown;
+            }
+            Err(err) => {
+                self.file_ingress_readoption_attention(execution, &err).await;
+                return IngressReadoption::Failed;
+            }
+        };
+        let Some(driver) = driver else {
+            self.file_ingress_readoption_attention(execution, "the run's driver could not be resolved")
+                .await;
+            return IngressReadoption::Failed;
+        };
+        let Some(arc_self) = self._self_weak.upgrade() else {
+            return IngressReadoption::Failed;
+        };
+        match self.agent_jsonl_progress_manager.resume_run(
+            run_id,
+            driver,
+            checkpoint,
+            super::worker_events::ServerEventSink(arc_self),
+            self.work_db.clone(),
+        ) {
+            Ok(boss_engine_runtime::agent_jsonl_progress::ResumeOutcome::NotFileIngress) => {
+                IngressReadoption::NotFileIngress
+            }
+            Ok(boss_engine_runtime::agent_jsonl_progress::ResumeOutcome::Reestablished) => {
+                tracing::info!(run_id, "readopt: file progress ingress re-established");
+                IngressReadoption::Reestablished
+            }
+            Err(err) => {
+                self.file_ingress_readoption_attention(execution, &err).await;
+                IngressReadoption::Failed
+            }
+        }
+    }
+
+    /// Tell an operator that a live worker is running unobserved.
+    async fn file_ingress_readoption_attention(&self, execution: &WorkExecution, reason: &str) {
+        tracing::error!(
+            run_id = %execution.id,
+            reason,
+            "readopt: could not re-establish file progress ingress; this worker is live and \
+             producing no observable progress",
+        );
+        let body = format!(
+            "Boss re-adopted this still-running worker after losing track of it, but could not \
+             re-attach to the rollout file its driver writes progress to: {reason}.\n\n\
+             The worker is alive and holding its pane, pool slot and cube workspace lease, but \
+             nothing it does from here produces a turn boundary — so it will never complete on \
+             its own. Boss deliberately did not re-attach at the start or the end of the file: \
+             the first would replay every event of every turn it has already run, and the second \
+             would silently discard whatever it wrote while Boss was not watching.\n\n\
+             Stop the worker (`bossctl agents stop`) and re-dispatch the work item."
+        );
+        if let Err(err) = self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Re-adopted worker has no progress ingress".to_owned(),
+            body_markdown: body,
+            resolved_at: None,
+        }) {
+            tracing::warn!(
+                run_id = %execution.id,
+                error = %format!("{err:#}"),
+                "readopt: failed to file the progress-ingress attention item",
+            );
+        }
+    }
+
+    /// Tear down a surviving worker whose execution is terminal for a reason
+    /// the engine must not reverse.
+    ///
+    /// Goes through [`WorkerCompletionHandler::force_release`], whose pane
+    /// half can reach a worker with no slot mapping through durable state and
+    /// whose lease half atomically clears and releases its workspace. Exactly
+    /// the same complete teardown is used for an explicit stop.
+    async fn reap_contradicting_worker(
+        &self,
+        execution: &WorkExecution,
+        trigger: &str,
+        reason: ReapReason,
+        other_live: Option<&str>,
+    ) {
+        let run_id = execution.id.as_str();
+        tracing::warn!(
+            run_id,
+            work_item_id = %execution.work_item_id,
+            status = %execution.status,
+            reason = reason.as_str(),
+            other_live_execution = ?other_live,
+            "[engine-reconcile] reaping a worker that outlived authoritative terminal state — \
+             the surviving process is what must stop",
+        );
+        let outcome = self.completion_handler.force_release(run_id).await;
+        self.dispatch_events
+            .emit(
+                boss_dispatch_events::DispatchEvent::new(
+                    boss_dispatch_events::Stage::HuskPaneReconcile,
+                    boss_dispatch_events::Outcome::Ok,
+                    run_id,
+                )
+                .with_work_item(&execution.work_item_id)
+                .with_details(serde_json::json!({
+                    "trigger": trigger,
+                    "verdict": "reap",
+                    "reason": reason.as_str(),
+                    "execution_status": execution.status.to_string(),
+                    "other_live_execution": other_live,
+                    "resource_release_outcome": format!("{outcome:?}"),
+                })),
+            )
+            .await;
+    }
+
+    /// The pool slot `run_id`'s worker was assigned at spawn time, derived
+    /// from its durable `work_runs.agent_id`.
+    ///
+    /// Tmux is the sole *local* pane host, so a local worker id a spawn
+    /// recorded durably decides the slot the run was given
+    /// ([`boss_execution_contracts::slot_id_from_worker_id`]) — the same derivation
+    /// [`boss_engine_runtime::tmux_adoption`]'s boot-time adoption uses to rebuild a slot
+    /// claim. Every caller here is resolving a case where in-memory
+    /// bookkeeping (the worker registry, the live-state registry) is known to
+    /// be missing, so the answer must come from something that survives an
+    /// engine restart and needs no live app round-trip — an app session may
+    /// not even be connected.
+    ///
+    /// This is a durable *hint*, not a current-ownership claim: the slot a
+    /// run was once given can already have been freed and handed to a
+    /// different execution (e.g. a leaked pool claim that `pool_claim_sweep`
+    /// reclaimed and a later dispatch reused). Callers that act on the
+    /// returned slot id must independently confirm it is still owned by
+    /// `run_id` — or is unowned — before touching any slot-scoped state; see
+    /// the ownership checks in [`Self::readopt_live_worker`] and
+    /// `detach_untracked_worker_viewer`.
+    ///
+    /// Host safety: a remote run never occupies a tmux-hosted local
+    /// slot. [`boss_work_db::WorkDb::latest_local_agent_id_for_execution`]
+    /// already returns `None` when the newest row is remote, so this reads
+    /// that same row the slot-to-run occupancy lookup uses rather than the
+    /// transcript-preferring hook resolver. `None` also covers "no local
+    /// run row recorded a worker id" and "the recorded id does not parse
+    /// as a pool slot".
+    pub(super) fn hosted_pane_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        match self.work_db.latest_local_agent_id_for_execution(run_id) {
+            Ok(Some(agent_id)) => boss_execution_contracts::slot_id_from_worker_id(&agent_id),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::debug!(run_id, %err, "readopt: could not read the durable worker id for this run");
+                None
+            }
+        }
+    }
+
+    /// Re-drive pane spawn for `running` executions whose cube lease was
+    /// re-adopted across the restart but whose pane was never issued.
+    /// See [`boss_engine_runtime::startup_pane_reconcile`].
+    pub(crate) async fn reconcile_unspawned_running_panes(
+        &self,
+        tmux_adopted: &HashSet<String>,
+        probe_verdicts: &std::collections::HashMap<String, boss_engine_runtime::run_reconcile::RunReconcileVerdict>,
+        candidate_ids: Option<&HashSet<String>>,
+    ) {
+        let in_flight = match self.work_db.list_in_flight_executions() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::error!(
+                    error = %format!("{err:#}"),
+                    "startup pane reconcile: failed to list in-flight executions"
+                );
+                return;
+            }
+        };
+        let in_flight: Vec<_> = in_flight
+            .into_iter()
+            .filter(|execution| candidate_ids.is_none_or(|ids| ids.contains(&execution.id)))
+            .collect();
+        if in_flight.is_empty() {
+            return;
+        }
+        let oracle = boss_engine_runtime::startup_pane_reconcile::EnginePaneOracle {
+            work_db: (*self.work_db).clone(),
+            live_states: Some(self.live_worker_states.clone()),
+            tmux_adopted: tmux_adopted.clone(),
+        };
+        let outcome = boss_engine_runtime::startup_pane_reconcile::reconcile_unspawned_running(
+            self.work_db.as_ref(),
+            &in_flight,
+            probe_verdicts,
+            &oracle,
+            &self.execution_coordinator,
+            self.dispatch_events.as_ref(),
+        )
+        .await;
+        if !outcome.undetermined_execution_ids.is_empty() {
+            self.startup_pane_retry_ids
+                .lock()
+                .expect("startup pane retry lock poisoned")
+                .extend(outcome.undetermined_execution_ids);
+        }
+    }
+
+    /// Retry executions whose startup pass could not establish durable tmux
+    /// identity (none recorded, or the identity read failed). Taking the
+    /// cohort before awaiting makes rapid registrations harmless: at most
+    /// one registration can re-drive a particular startup row.
+    pub(crate) async fn retry_startup_pane_reconcile(&self) {
+        let candidate_ids = std::mem::take(
+            &mut *self
+                .startup_pane_retry_ids
+                .lock()
+                .expect("startup pane retry lock poisoned"),
+        );
+        if candidate_ids.is_empty() {
+            return;
+        }
+        let verdicts = candidate_ids
+            .iter()
+            .cloned()
+            .map(|id| (id, boss_engine_runtime::run_reconcile::RunReconcileVerdict::Live))
+            .collect();
+        self.reconcile_unspawned_running_panes(&HashSet::new(), &verdicts, Some(&candidate_ids))
+            .await;
+    }
+
+    /// Attach viewers only for workers newly restored to live-state by the
+    /// periodic adoption pass, including terminal-handoff recoveries.
+    pub(crate) async fn reattach_after_adoption(&self, previously_live: &HashSet<String>) {
+        if self.app_session.lock().await.is_none() {
+            return;
+        }
+        let candidates: Vec<LiveWorkerState> = self
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .filter(|state| {
+                !state.activity.is_terminal()
+                    && state.tmux_hosted == Some(true)
+                    && !previously_live.contains(&state.run_id)
+            })
+            .collect();
+        // Unlike registration, a steady-state adoption pass need not inventory
+        // viewers when it restored no workers.
+        if candidates.is_empty() {
+            return;
+        }
+        self.reattach_worker_pane_candidates(candidates).await;
+    }
+
+    /// Detach terminal/unknown viewers, then re-send `AttachWorkerPane`
+    /// for every live, tmux-hosted local run the
+    /// currently registered app session has no viewer for.
+    ///
+    /// `AttachWorkerPane` is sent from exactly one production site
+    /// (`spawn_flow::start_worker`'s spawn act itself), so a worker whose
+    /// pane was never attached by *this* app session — because the app
+    /// restarted after the worker was spawned, or because this engine
+    /// process readopted the worker across its own restart while the app
+    /// stayed up — never receives a viewer. Mirrors the coordinator's
+    /// already-working restart re-attach
+    /// ([`super::sessions::attach_coordinator_to_registered_app`]); unlike
+    /// the coordinator there is no single durable record to re-attach, so
+    /// this walks every live-state entry instead of one record.
+    ///
+    /// Call sites: after `RegisterAppSession` (app (re)launch — the run
+    /// this engine process spawned may predate the current app session),
+    /// and after boot-time tmux adoption when an app session is already
+    /// registered (engine restart — every readopted run predates this
+    /// engine process's own spawn history).
+    /// The periodic sweep uses `reattach_after_adoption` to restrict this
+    /// same path to newly live workers.
+    pub(crate) async fn reattach_worker_panes_to_registered_app(&self) {
+        let candidates: Vec<LiveWorkerState> = self
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .filter(|state| !state.activity.is_terminal() && state.tmux_hosted == Some(true))
+            .collect();
+        self.reattach_worker_pane_candidates(candidates).await;
+    }
+
+    async fn reattach_worker_pane_candidates(&self, candidates: Vec<LiveWorkerState>) {
+        // Never attach into a slot the app already hosts a live session
+        // for — `hostAttachedPane` refuses those with `SlotBusy`, but that
+        // refusal is app-side flow control, not something the engine
+        // should lean on to avoid sending a request it can determine is
+        // redundant up front.
+        let outcome = match self.reconcile_worker_viewers().await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::error!(error = %err, "worker pane inventory failed; attaching live workers with SlotBusy recovery");
+                // SlotBusy recovery protects each attach without an inventory.
+                // Retry inventory separately to clean up stale viewers.
+                super::viewer_reconcile::WorkerViewerReconcile {
+                    live: HashSet::new(),
+                    blocked_slots: HashSet::new(),
+                    had_failures: true,
+                }
+            }
+        };
+        let mut cleared_error = false;
+        for run_id in &outcome.live {
+            cleared_error |= self.live_worker_states.set_viewer_attach_error(run_id, None);
+        }
+        if cleared_error {
+            self.broadcast_live_worker_states().await;
+        }
+        let mut any_attach_failed = false;
+        for state in candidates {
+            if outcome.live.contains(&state.run_id) || outcome.blocked_slots.contains(&state.slot_id) {
+                continue;
+            }
+            if self.reattach_one_worker_pane(&state).await == WorkerPaneAttachOutcome::Failed {
+                any_attach_failed = true;
+            }
+        }
+        // A failed attach is retried on the same bounded backoff as a failed
+        // inventory: the worker is live and visible in the Agents grid, and
+        // without a retry its card stays viewer-less until the app relaunches.
+        // The attempt counter resets only on a fully clean pass, so a
+        // persistent failure runs out of attempts instead of looping; from
+        // then on the app's own `RequestWorkerPaneAttach` (sent when the
+        // user brings the pane into view) is what triggers another try.
+        if outcome.had_failures || any_attach_failed {
+            self.schedule_worker_viewer_reattach_retry().await;
+        } else {
+            self.viewer_reattach_retry_attempt.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// App-requested re-attach for one run: the Agents view is showing a
+    /// live local worker it has no viewer for. Goes through the same
+    /// inventory-free single-run path as the registration pass (the app
+    /// has just said it hosts nothing for this run, and a stale occupant
+    /// of the slot is evicted by `attach_worker_viewer`'s `SlotBusy`
+    /// recovery). Declines publish a reason, or refresh membership when the
+    /// requested run has already been released.
+    pub(crate) async fn reattach_worker_pane_for_run(&self, run_id: &str) -> bool {
+        let state = self
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .find(|state| state.run_id == run_id);
+        let Some(state) = state else {
+            self.decline_worker_pane_attach(run_id, "the worker is no longer live")
+                .await;
+            return false;
+        };
+        let reason = if state.activity.is_terminal() {
+            Some("the worker has exited")
+        } else if state.tmux_hosted == Some(false) {
+            return false;
+        } else if state.tmux_hosted.is_none() {
+            Some("no local tmux terminal is available for this worker")
+        } else if self.app_session.lock().await.is_none() {
+            Some("no app session is registered")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.decline_worker_pane_attach(run_id, reason).await;
+            return false;
+        }
+        match self.reattach_one_worker_pane(&state).await {
+            WorkerPaneAttachOutcome::Attached => true,
+            WorkerPaneAttachOutcome::Failed => {
+                self.schedule_worker_viewer_reattach_retry().await;
+                false
+            }
+            WorkerPaneAttachOutcome::Skipped => false,
+        }
+    }
+
+    async fn decline_worker_pane_attach(&self, run_id: &str, reason: &str) {
+        tracing::info!(run_id, reason, "worker pane attach declined");
+        let changed = self
+            .live_worker_states
+            .set_viewer_attach_error(run_id, Some(reason.to_owned()));
+        // Also publish when the run has disappeared: the app must release its
+        // stale member rather than keep displaying a connecting card.
+        if changed
+            || !self
+                .live_worker_states
+                .snapshot()
+                .iter()
+                .any(|state| state.run_id == run_id)
+        {
+            self.broadcast_live_worker_states().await;
+        }
+    }
+
+    pub(super) async fn schedule_worker_viewer_reattach_retry(&self) {
+        let session_id = {
+            let guard = self.app_session.lock().await;
+            match guard.as_ref() {
+                Some(handle) => handle.session_id.clone(),
+                None => return,
+            }
+        };
+        self.spawn_worker_viewer_reattach_retry(session_id);
+    }
+
+    fn spawn_worker_viewer_reattach_retry(&self, session_id: String) {
+        let Some(state) = self._self_weak.upgrade() else {
+            return;
+        };
+        if self.viewer_reattach_retry_scheduled.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let attempt = self.viewer_reattach_retry_attempt.fetch_add(1, Ordering::Relaxed);
+        if attempt >= VIEWER_REATTACH_RETRY_MAX_ATTEMPTS {
+            self.viewer_reattach_retry_scheduled.store(false, Ordering::Relaxed);
+            tracing::warn!(
+                attempt,
+                "worker pane reconciliation retries exhausted for this app session"
+            );
+            return;
+        }
+        let epoch = self.viewer_reattach_epoch.load(Ordering::Relaxed);
+        let delay = VIEWER_REATTACH_RETRY_BASE.saturating_mul(1u32 << attempt.min(3));
+        tracing::info!(attempt, ?delay, "retrying worker pane reconciliation");
+        boss_task_scope::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if state.viewer_reattach_epoch.load(Ordering::Relaxed) != epoch {
+                return;
+            }
+            state.viewer_reattach_retry_scheduled.store(false, Ordering::Relaxed);
+            let still_same_session = state
+                .app_session
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|handle| handle.session_id == session_id);
+            if !still_same_session {
+                return;
+            }
+            state.reattach_worker_panes_to_registered_app().await;
+        });
+    }
+
+    /// Re-send `AttachWorkerPane` for one live worker. Returns `Attached` when
+    /// the app confirmed a viewer. Every failure is written to the run's
+    /// [`LiveWorkerState::viewer_attach_error`] (and a success clears it)
+    /// so the Agents card can show the reason rather than a generic
+    /// "connecting" forever. Terminal executions are not retried, but their
+    /// cards explain that cleanup is pending until live membership is released.
+    async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) -> WorkerPaneAttachOutcome {
+        let run_id = state.run_id.as_str();
+        match self.work_db.find_execution(run_id) {
+            Ok(Some(run)) if !run.status.is_terminal() => {}
+            Ok(_) => {
+                self.decline_worker_pane_attach(
+                    run_id,
+                    "the execution has ended or is unavailable; waiting for engine cleanup",
+                )
+                .await;
+                return WorkerPaneAttachOutcome::Skipped;
+            }
+            Err(err) => {
+                self.decline_worker_pane_attach(run_id, &format!("could not read the execution: {err:#}"))
+                    .await;
+                return WorkerPaneAttachOutcome::Failed;
+            }
+        }
+        let outcome = self.try_reattach_one_worker_pane(state).await;
+        let changed = self
+            .live_worker_states
+            .set_viewer_attach_error(run_id, outcome.as_ref().err().cloned());
+        if changed {
+            // The registration/adoption passes publish a snapshot of their
+            // own once membership settles; a per-run transition still needs
+            // its own push so a card that was "connecting" flips to the
+            // reason (or to a terminal) without waiting for the next hook.
+            self.broadcast_live_worker_states().await;
+        }
+        if outcome.is_ok() {
+            WorkerPaneAttachOutcome::Attached
+        } else {
+            WorkerPaneAttachOutcome::Failed
+        }
+    }
+
+    async fn try_reattach_one_worker_pane(&self, state: &LiveWorkerState) -> Result<(), String> {
+        let run_id = state.run_id.as_str();
+        let identity = match self.work_db.tmux_identity_for_execution(run_id) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                tracing::warn!(
+                    run_id,
+                    "worker pane reattach: no durable tmux identity; cannot re-attach a viewer",
+                );
+                return Err("no durable tmux identity is recorded for this worker".to_owned());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    error = %format!("{err:#}"),
+                    "worker pane reattach: failed reading durable tmux identity",
+                );
+                return Err(format!("could not read the worker's tmux identity: {err:#}"));
+            }
+        };
+        // Same durable-socket / legacy-label resolution `pane_delivery` and
+        // `tmux_teardown` already use for a recorded execution; shares the
+        // `pane_delivery_tmux_override` test seam rather than resolving a
+        // real `tmux` binary from PATH.
+        let tmux = match self.tmux_for_pane_delivery(run_id) {
+            Ok(tmux) => tmux,
+            Err(err) => {
+                tracing::error!(
+                    run_id,
+                    server_label = %identity.server_label,
+                    error = %format!("{err:#}"),
+                    "worker pane reattach: could not resolve a tmux handle for the recorded server",
+                );
+                return Err(format!(
+                    "could not resolve tmux for server {}: {err:#}",
+                    identity.server_label
+                ));
+            }
+        };
+        let Some(tmux_socket_path) = tmux.socket_path().map(|path| path.display().to_string()) else {
+            tracing::error!(run_id, "worker pane reattach: resolved tmux handle has no socket path",);
+            return Err("the resolved tmux server has no socket path".to_owned());
+        };
+        match self
+            .attach_worker_viewer(
+                AttachWorkerPaneInput {
+                    run_id: run_id.to_owned(),
+                    slot_id: state.slot_id,
+                    session_name: identity.session_name.clone(),
+                    tmux_socket_path,
+                    summary: None,
+                    task_title: state.work_item_name.clone(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) }) => {
+                tracing::info!(
+                    run_id,
+                    slot_id = state.slot_id,
+                    session_name = %identity.session_name,
+                    "worker pane reattach: attached tmux-hosted worker pane to the registered app session",
+                );
+                Ok(())
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    run_id,
+                    slot_id = state.slot_id,
+                    ?response,
+                    "worker pane reattach: app did not attach its viewer surface",
+                );
+                Err(boss_engine_runtime::spawn_flow::viewer_attach_failure_reason(&response))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    slot_id = state.slot_id,
+                    error = %format!("{err:#}"),
+                    "worker pane reattach: request to the app failed",
+                );
+                Err(format!("request to the app failed: {err}"))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerPaneAttachOutcome {
+    Attached,
+    Skipped,
+    Failed,
+}
+
+#[cfg(test)]
+#[path = "readoption_retry_tests.rs"]
+mod retry_tests;

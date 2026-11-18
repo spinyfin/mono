@@ -1,0 +1,52 @@
+# prost/tonic code generation toolchain for every rust_prost_library in the
+# repo (today: //tools/boss/protocol-spoke).
+#
+# rules_rust_prost ships a default toolchain that pins its own copies of
+# prost, tonic and tokio. Using it would put a second tokio in the build graph
+# next to the one every other crate links, and tonic's public API is written in
+# terms of tokio's traits, so a TcpStream or tokio-rustls stream from the repo's
+# tokio would not satisfy a tonic built against the other one. This toolchain
+# instead takes the runtime crates AND the protoc plugins from mono_crates, the
+# one crate universe resolved by Cargo.lock, so the generator and the runtime
+# cannot drift apart and there is a single tokio.
+#
+# The plugins are reached through the `protoc-gen-prost` / `protoc-gen-tonic`
+# build-dependencies declared in tools/boss/protocol-spoke/Cargo.toml and the
+# gen_binaries annotations in MODULE.bazel.
+
+load("@rules_rust//rust:defs.bzl", "rust_library_group")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_toolchain")
+
+rust_library_group(
+    name = "prost_runtime",
+    deps = ["@mono_crates//:prost"],
+)
+
+rust_library_group(
+    name = "tonic_runtime",
+    deps = [
+        ":prost_runtime",
+        "@mono_crates//:tonic",
+    ],
+)
+
+rust_prost_toolchain(
+    name = "prost_toolchain_impl",
+    prost_plugin = "@mono_crates//:protoc-gen-prost__protoc-gen-prost",
+    prost_plugin_flag = "--plugin=protoc-gen-prost=%s",
+    prost_runtime = ":prost_runtime",
+    prost_types = "@mono_crates//:prost-types",
+    # An rpc named `Connect` collides with the `connect(dst)` constructor that
+    # tonic's transport feature adds to every generated client. Clients here
+    # are built from a configured `Channel` (mTLS), so the shortcut is unused.
+    tonic_opts = ["no_transport"],
+    tonic_plugin = "@mono_crates//:protoc-gen-tonic__protoc-gen-tonic",
+    tonic_plugin_flag = "--plugin=protoc-gen-tonic=%s",
+    tonic_runtime = ":tonic_runtime",
+)
+
+toolchain(
+    name = "prost_toolchain",
+    toolchain = ":prost_toolchain_impl",
+    toolchain_type = "@rules_rust_prost//:toolchain_type",
+)

@@ -47,17 +47,11 @@ extension ChatViewModel {
         )
     }
 
-    /// Build the Doing column's "Needs Attention" section — blocked tasks
-    /// whose worker ended by asking the user a question
-    /// (`WorkTask.isAwaitingOperatorAnswer`), rendered collapsible above any
-    /// project groups. Returns `nil` when `items` is empty so the caller
-    /// omits the section entirely rather than render an empty header.
-    ///
-    /// Oldest question first (`operatorQuestion.askedAt` ascending), so the
-    /// task that has waited longest is at the top; ties — and a missing or
-    /// unparseable timestamp, which sorts last — break on task id for a
-    /// stable order. `AutomationTime.parse` accepts both the engine's epoch
-    /// seconds and RFC 3339.
+    /// Build Doing's Needs Attention section: cards parked on an operator
+    /// Yes/No (or multiple-choice) answer. The dispatcher never picks these up,
+    /// so they are not part of the queue. Oldest question first (`askedAt`
+    /// ascending; missing or unparseable timestamps last, ties by id). Returns
+    /// nil for empty input so the section is hidden.
     static func needsAttentionSection(items: [WorkTask]) -> WorkBoardSection? {
         guard !items.isEmpty else { return nil }
         let sorted = items.sorted { lhs, rhs in
@@ -76,8 +70,105 @@ extension ChatViewModel {
             items: sorted,
             isCollapsible: true,
             defaultExpanded: true,
-            groupKey: .needsAttention
+            countLabel: "\(sorted.count) \(sorted.count == 1 ? "decision" : "decisions") waiting"
         )
+    }
+
+    /// Build Doing's Queued section in the engine's dispatch order. Cards the
+    /// dispatcher would take now come first, ordered by the engine-supplied
+    /// position (ties by id). Cards it will not currently take (held by a
+    /// pause, waiting on a dependency or a retry deadline, or carrying no
+    /// pending execution) follow in the incoming board order; each shows its
+    /// wait reason on the card. The app computes no order of its own. Returns
+    /// nil for empty input so the section is omitted.
+    static func queuedSection(items: [WorkTask], dispatch: [String: QueuedDispatch] = [:]) -> WorkBoardSection? {
+        guard !items.isEmpty else { return nil }
+        let ranked = items
+            .compactMap { task in dispatch[task.id]?.position.map { (task: task, position: $0) } }
+            .sorted { lhs, rhs in
+                lhs.position != rhs.position ? lhs.position < rhs.position : lhs.task.id < rhs.task.id
+            }
+            .map(\.task)
+        let rankedIDs = Set(ranked.map(\.id))
+        return WorkBoardSection(
+            id: "doing-queued",
+            title: "Queued",
+            items: ranked + items.filter { !rankedIDs.contains($0.id) },
+            isCollapsible: true,
+            defaultExpanded: true
+        )
+    }
+
+    /// Build the Review column's labelled sections from each card's
+    /// engine-computed `reviewSection`, in `ReviewSection.allCases` order.
+    /// Empty sections are omitted rather than rendered as empty headers, and
+    /// `items` keeps its incoming order within each section, except Pending,
+    /// which is ordered by most recent activity (see `pendingRecencySort`).
+    ///
+    /// The client does not classify. A card the engine sent no section for
+    /// lands in `.pending`, the neutral "not ready, nothing wrong" section,
+    /// so it is never hidden and never claims a state the engine did not
+    /// report — but that is only legitimate when `missingSectionIsExpected`
+    /// says so (the two documented cases are in
+    /// `ChatViewModel.missingReviewSectionIsExpected(for:)`). Any other
+    /// sectionless Review card is a defect: a section-aware engine sends a
+    /// section for every Review-lane row, so a nil here means some update
+    /// path dropped it, and the card is reported through
+    /// `ReviewSectionDiagnostics.reportMissingSection` (a fault-level log in
+    /// the app, a test failure under XCTest) rather than filed silently.
+    static func reviewSections(
+        items: [WorkTask],
+        missingSectionIsExpected: (WorkTask) -> Bool = { !$0.reviewSectionReported }
+    ) -> [WorkBoardSection] {
+        for task in items where task.reviewSection == nil && !missingSectionIsExpected(task) {
+            ReviewSectionDiagnostics.reportMissingSection(task)
+        }
+        let grouped = Dictionary(grouping: items) { $0.reviewSection ?? .pending }
+        return ReviewSection.allCases.compactMap { section in
+            guard let sectionItems = grouped[section], !sectionItems.isEmpty else { return nil }
+            return WorkBoardSection(
+                id: "review-\(section.rawValue)",
+                title: section.title,
+                items: section == .pending ? sectionItems.sorted(by: pendingRecencySort) : sectionItems,
+                isCollapsible: true,
+                defaultExpanded: true
+            )
+        }
+    }
+
+    /// The two documented reasons a card in the Review column may carry no
+    /// engine section. Anything else is a defect — see
+    /// `reviewSections(items:missingSectionIsExpected:)`.
+    ///
+    /// 1. **Pre-field engine.** The payload had no `review_section` key at
+    ///    all (`reviewSectionReported == false`). A section-aware engine
+    ///    always writes the key, `null` included, so absence identifies the
+    ///    engine, not the row.
+    /// 2. **Card just dragged into Review.** It is in the column only through
+    ///    the optimistic override: its engine-reported state still places it
+    ///    elsewhere (`realEffectiveBoardColumn` is not `.review`), so the
+    ///    engine has not classified it yet. The engine's `work_item_updated`
+    ///    reply to the drop carries the section and clears the override.
+    func missingReviewSectionIsExpected(for task: WorkTask) -> Bool {
+        !task.reviewSectionReported || realEffectiveBoardColumn(for: task) != .review
+    }
+
+    /// Pending-section order: newest activity first, where activity is the
+    /// later of the work item's `updatedAt` and its PR's `prUpdatedAt`. Ties
+    /// (and unparseable timestamps, which sort last) break on id so cards do
+    /// not jitter between refreshes.
+    static func pendingRecencySort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
+        let l = lastActivity(of: lhs), r = lastActivity(of: rhs)
+        if l != r { return l > r }
+        return lhs.id < rhs.id
+    }
+
+    private static func lastActivity(of task: WorkTask) -> Date {
+        let formatters = [ISO8601DateFormatter.fractional, ISO8601DateFormatter.plain]
+        let dates = [task.updatedAt, task.prUpdatedAt ?? ""].compactMap {
+            parseUpdatedAt($0, isoFormatters: formatters)
+        }
+        return dates.max() ?? .distantPast
     }
 
     /// Bucket completed tasks by recency for the Done lane:
@@ -234,27 +325,10 @@ extension ChatViewModel {
         var items = visibleWorkItems
             .filter { effectiveBoardColumn(for: $0) == column }
             .sorted(by: sort)
-        // Revisions don't appear as standalone cards in Review or Done — they
-        // roll up as single lines on the parent task's card in both lanes.
-        // They are still visible in Backlog/Doing as distinct cards. An
-        // `in_review` revision normally routes to Review, but one whose own
-        // PR is in the merge queue / Merge When Ready
-        // (`isInMergingSection`) routes to Done instead (`boardColumn`), so
-        // the Done-column filter excludes `in_review` revisions too, not
-        // just `done` ones.
-        if column == .review {
-            items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
-            // View-only "ready to merge" narrowing — never mutates the
-            // underlying task. `readyForReview` is engine-computed
-            // (`Task.ready_for_review`), so this reads a fact, it doesn't
-            // re-derive one.
-            if reviewReadyOnly {
-                items = items.filter(\.readyForReview)
-            }
-        }
-        if column == .done {
-            items = items.filter { !($0.kind == "revision" && ($0.status == "done" || $0.status == "in_review")) }
-        }
+        // A revision with `isFoldedRevision` has no card in any column: it is
+        // rolled up as a line on its parent's card. While its PR is under AI
+        // review it is still `active`, so it stays a Doing card.
+        items = items.filter { !$0.isFoldedRevision }
         cachedItemsByColumn[column] = items
         return items
     }
@@ -286,32 +360,24 @@ extension ChatViewModel {
             sections.append(contentsOf: Self.doneSections(items: completed))
             return sections
         }
-        // Doing's "Needs Attention" section sits above everything else —
-        // flat or project-grouped alike: a task waiting on an answer needs attention
-        // regardless of which project it belongs to, so the project
-        // groups are built from the remaining items only.
-        var needsAttention: [WorkBoardSection] = []
-        var remaining = items
+        // Review is always grouped into the engine's labelled sections
+        // (Ready, In Revision, ...), whatever the board's project grouping
+        // is set to.
+        if column == .review {
+            return Self.reviewSections(items: items, missingSectionIsExpected: missingReviewSectionIsExpected(for:))
+        }
         if column == .doing {
-            let awaiting = items.filter(\.isAwaitingOperatorAnswer)
-            remaining = items.filter { !$0.isAwaitingOperatorAnswer }
-            if let section = Self.needsAttentionSection(items: awaiting) {
-                needsAttention.append(section)
-            }
+            return Self.doingSections(items: items, membership: doingSectionsByID, dispatch: queuedDispatchByID)
         }
         guard workBoardGrouping == .project else {
-            // With a Needs Attention section present, an empty flat section
-            // would only be a headerless no-op under it.
-            if remaining.isEmpty, !needsAttention.isEmpty { return needsAttention }
-            return needsAttention
-                + [WorkBoardSection(id: column.rawValue, title: column.title, items: remaining)]
+            return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]
         }
 
-        let grouped = Dictionary(grouping: remaining) { task in
+        let grouped = Dictionary(grouping: items) { task in
             projectName(for: task.projectID) ?? "No Project"
         }
 
-        return needsAttention + grouped.keys.sorted().compactMap { key in
+        return grouped.keys.sorted().compactMap { key in
             guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
             let projectID = sectionItems.first?.projectID
             return WorkBoardSection(
@@ -376,4 +442,17 @@ extension ChatViewModel {
     func taskRuntime(for taskID: String) -> WorkTaskRuntime? {
         taskRuntimesByID[taskID]
     }
+}
+
+private extension ISO8601DateFormatter {
+    nonisolated(unsafe) static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) static let plain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
 }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::support::{ExpectedCommand, FakeRunner};
 
 use crate::app::errors::{CubeError, Result};
-use crate::app::workspace_ops::{RebaseOpts, rebase_workspace_branch};
+use crate::app::workspace_ops::{BOOKMARK_NAMES_TMPL, RebaseOpts, rebase_workspace_branch};
 
 const REBASE_CWD: &str = "/ws";
 const REBASE_REMOTE: &str = "github";
@@ -189,12 +189,14 @@ fn describe_cmd(revision: &str, message: &str) -> ExpectedCommand {
     ExpectedCommand::ok(rebase_cwd(), "jj", &["describe", "-r", revision, "-m", message], "")
 }
 
-/// The stacked-PR guard probe: does any bookmark point at this commit?
+/// Bare bookmark names on a conflicted ancestor — local and remote. Bookkeeping
+/// names (`pr/<n>`, engine pointers) are ignored; any other name, including a
+/// fetched parent-PR branch with no local bookmark, is a stacked-PR boundary.
 fn bookmarks_at_cmd(commit_id: &str, out: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         rebase_cwd(),
         "jj",
-        &["log", "-r", commit_id, "--no-graph", "-T", "bookmarks"],
+        &["log", "-r", commit_id, "--no-graph", "-T", BOOKMARK_NAMES_TMPL],
         out,
     )
 }
@@ -363,6 +365,7 @@ fn rebase_pr_arg_resolves_head_branch_from_github() {
     cmds.extend(set_track_rebase_check_cmds(branch, &[]));
     cmds.extend(push_and_verify_cmds(branch));
 
+    cmds.extend([]);
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(None, Some(7), false)).expect("pr rebase");
     runner.assert_exhausted();
@@ -393,7 +396,7 @@ fn rebase_conflicts_skip_push_and_name_the_bookmark() {
     assert_eq!(result.payload["conflicted_files"][0], "src/foo.rs");
     assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
     assert!(
-        result.message.contains("jj git push -b boss/exec_c"),
+        result.message.contains("cube pr update --branch boss/exec_c"),
         "conflict message names the exact push command: {}",
         result.message
     );
@@ -687,6 +690,51 @@ fn rebase_collapses_a_replay_only_conflicted_ancestor_and_pushes() {
     );
 }
 
+/// A leftover `pr/<n>` alias on a conflicted ancestor is local bookkeeping,
+/// not another PR's branch. The rebase-time collapse must ignore it the same
+/// way the push-time collapse does, or a jj rebase that carried the alias
+/// along with the commits would still hand a replay-only conflict to an agent.
+#[test]
+fn rebase_collapses_when_the_conflicted_ancestor_only_carries_a_legacy_pr_bookmark() {
+    let branch = "boss/exec_replay_pr_alias";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "r1"),
+        positioned_cmd(branch, "r1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["ancestor7"]));
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "headbefore\n"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["ancestor7"]));
+    cmds.push(bookmarks_at_cmd("ancestor7", "pr/9\n"));
+    cmds.push(children_of_cmd("ancestor7", &["child7"]));
+    cmds.extend(collapse_round_cmds(
+        &push_range,
+        "ancestor7",
+        "child7",
+        "wip: half the fix",
+        "op-squash-1",
+    ));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &[]));
+    cmds.push(conflicts_in_revset_cmd("main@github..@", &[]));
+    cmds.push(tree_delta_cmd("headbefore", branch, ""));
+    cmds.push(description_cmd(branch, "the real change\n"));
+    cmds.push(describe_cmd(
+        branch,
+        &merged_description("the real change", &["wip: half the fix"]),
+    ));
+    cmds.push(op_id_cmd("op-describe\n"));
+    cmds.extend(push_and_verify_cmds(branch));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("legacy pr bookmark rebase");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "clean");
+    assert_eq!(result.payload["pushed"], true);
+    assert_eq!(result.payload["linearized_commits"], 1);
+}
+
 /// The `--no-push` path must disclose the collapse just as loudly as the
 /// pushing one — the branch is still rewritten, the caller just pushes it
 /// itself.
@@ -785,6 +833,34 @@ fn rebase_declines_collapse_when_a_conflicted_ancestor_carries_a_bookmark() {
     let runner = FakeRunner::new(cmds);
     let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("stacked rebase");
     // No `jj op undo` in the script: assert_exhausted proves none was needed.
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "conflicts");
+    assert_eq!(result.payload["linearized_commits"], 0);
+    assert_eq!(result.payload["linearize_decline"], "bookmarked_ancestor");
+    assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
+}
+
+/// A parent-PR branch that exists only as a fetched remote ref still names
+/// a stacked-PR boundary. The listing uses bare names (`boss/exec_lower`),
+/// matching a remote-only `boss/exec_lower@github` after fetch.
+#[test]
+fn rebase_declines_collapse_when_a_conflicted_ancestor_carries_only_a_remote_bookmark() {
+    let branch = "boss/exec_stacked_remote";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "sr1"),
+        positioned_cmd(branch, "sr1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["parentpr"]));
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "stackhead\n"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["parentpr"]));
+    cmds.push(bookmarks_at_cmd("parentpr", "boss/exec_lower\n"));
+    cmds.push(resolve_list_for_commit_cmd("parentpr", "src/stack.rs\n"));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("remote-only stacked rebase");
     runner.assert_exhausted();
     assert_eq!(result.payload["status"], "conflicts");
     assert_eq!(result.payload["linearized_commits"], 0);
@@ -1040,10 +1116,79 @@ fn rebase_clean_path_runs_no_linearization_probes() {
     assert_eq!(result.payload["linearized_commits"], 0);
 }
 
-// ───────────────────────── workspace push ─────────────────────────
+// ───────────────────── workspace local-rebase ─────────────────────
 //
-// `workspace_push` is the testable unit for `cube workspace push`. Like
-// `pr_push`, it reads `std::env::current_dir()` directly rather than
-// taking an explicit `cwd` param, so these tests capture the ambient
-// test-process cwd (matching the `pr_push` test convention) instead of
-// a synthetic path.
+// `local-rebase` resolves the PR's real GitHub remote and base branch, then
+// rebases onto the freshly fetched tracking ref without touching `pr/<n>`.
+
+#[test]
+fn local_rebase_fetches_real_github_base_without_alias_operations() {
+    for (base, existing_pr) in [
+        ("main", true),
+        ("parent-pr", true),
+        ("main", false),
+        ("parent-pr", false),
+    ] {
+        let cwd = PathBuf::from("/ws");
+        let ok = |args: &[&str], output: &str| ExpectedCommand::ok(cwd.clone(), "jj", args, output);
+        let destination = format!("\"{base}\"@\"github\"");
+        let mut commands = vec![
+            ok(
+                &["git", "remote", "list"],
+                "origin /stale/mirror\ngithub git@github.com:org/repo.git\n",
+            ),
+            ok(&["git", "fetch", "--remote", "github"], ""),
+            ok(
+                &["rebase", "-b", "@", "-d", &destination, "--ignore-immutable"],
+                "rebased",
+            ),
+            ok(
+                &[
+                    "log",
+                    "-r",
+                    &format!("{destination}..@"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \" conflicts=\" ++ conflict ++ \"\\n\"",
+                ],
+                "cccc conflicts=false\n",
+            ),
+        ];
+        if existing_pr {
+            commands.insert(
+                1,
+                ExpectedCommand::ok(
+                    cwd.clone(),
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        "77",
+                        "-R",
+                        "org/repo",
+                        "--json",
+                        "baseRefName",
+                        "--jq",
+                        ".baseRefName",
+                    ],
+                    base,
+                ),
+            );
+        }
+        let runner = FakeRunner::new(commands);
+        let result = crate::app::workspace_local_rebase::rebase_at(
+            &runner,
+            None,
+            &cwd,
+            existing_pr.then_some(77),
+            (!existing_pr).then_some(base),
+        )
+        .unwrap();
+        runner.assert_exhausted();
+        assert_eq!(result.payload["destination"], destination);
+        assert_eq!(result.payload["base_branch"], base);
+        assert_eq!(result.payload["remote"], "github");
+        assert_eq!(result.payload["commits"], "cccc conflicts=false\n");
+        assert!(result.message.contains("cccc conflicts=false"));
+    }
+}

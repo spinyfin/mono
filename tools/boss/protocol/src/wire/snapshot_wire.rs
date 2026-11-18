@@ -7,6 +7,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Outcome of the live `getQueue` smoke check `boss engine trunk status`
+/// runs against a `trunk_queue`-mechanism product's queue, once one exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrunkQueueCheckDto {
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// An open operator decision, independent of the selected product or board filters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct OperatorDecisionNotification {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remind_after_secs: Option<u64>,
+    pub question_id: String,
+    pub text: String,
+    pub work_item_id: String,
+    pub product_id: String,
+    pub label: String,
+}
+
 /// Snapshot of one feature flag's static metadata + current value.
 /// Mirrors `boss_engine::feature_flags::FeatureFlagSnapshot` so the
 /// engine can ship its in-memory snapshot over the wire without
@@ -52,6 +73,24 @@ pub struct SettingSnapshot {
     pub default_enabled: bool,
     /// Current effective value.
     pub enabled: bool,
+}
+
+/// Persisted `[backup.offsite]` configuration. Wire type for
+/// `FrontendEvent::OffsiteBackupSettings`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OffsiteBackupSettings {
+    pub enabled: bool,
+    /// Absolute directory replicated by a sync agent; `None` when unset.
+    #[serde(default)]
+    pub destination: Option<String>,
+    /// Distinct most-recent hours that keep their newest copy.
+    pub keep_hourly: u32,
+    /// Distinct most-recent days that keep their newest copy.
+    pub keep_daily: u32,
+    /// Set when the stored section is unparseable; the other fields are
+    /// then defaults and a save overwrites the bad section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<String>,
 }
 
 /// One row of the cube workspace pool, as exposed via

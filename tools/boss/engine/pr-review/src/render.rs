@@ -27,17 +27,14 @@ pub const REVISION_CLOSE_SENTENCE: &str = "Address ALL findings before finalisin
 /// `tools/boss/app-macos/Sources/MarkdownDocumentChrome.swift`.
 pub const REVISION_HARD_RULE_HEADING: &str = "HARD RULE: no punting — do the actual work";
 
-/// Provenance of the PR + work item that produced a `ReviewResult`. Threaded
-/// into both the rendered revision instructions and the revision/follow-up
-/// card title so a row is never anonymous — including after
+/// Provenance of the PR that produced a `ReviewResult`. Threaded into both
+/// the rendered revision instructions and the revision/follow-up card title so
+/// a row is never anonymous — including after
 /// `block_pending_revisions_on_parent_close` converts it from `revision` to
 /// `followup` when the reviewed PR merges before the findings are addressed.
+/// Only the public PR number is carried: both strings are worker-facing.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewOrigin {
-    /// Per-product short id of the task under review — the chain root for a
-    /// re-review of an existing revision, the task itself otherwise. `None`
-    /// only for a legacy row that predates the `short_id` column.
-    pub task_short_id: Option<i64>,
     /// GitHub PR number parsed from `ReviewResult::pr_url`. `None` when the
     /// URL didn't parse to a canonical `.../pull/<n>` form (defensive; the
     /// finalize path always supplies a validated PR url in practice).
@@ -60,28 +57,22 @@ pub struct ReviewerReportDestination {
 }
 
 impl ReviewOrigin {
-    /// Human-readable origin reference, e.g. `"PR #<n> (originating work
-    /// item T<short_id>)"`. Degrades gracefully when either half is
-    /// unavailable, and falls back to a generic phrase if neither is.
+    /// Public PR reference for worker-facing revision instructions.
     fn describe(&self) -> String {
-        match (self.pr_number, self.task_short_id) {
-            (Some(pr), Some(short_id)) => format!("PR #{pr} (originating work item T{short_id})"),
-            (Some(pr), None) => format!("PR #{pr}"),
-            (None, Some(short_id)) => format!("originating work item T{short_id}"),
-            (None, None) => "the reviewed PR".to_owned(),
+        match self.pr_number {
+            Some(pr) => format!("PR #{pr}"),
+            None => "the reviewed PR".to_owned(),
         }
     }
 }
 
-/// Short (1–10 word) card title identifying the origin PR and work item so
+/// Short (1–10 word) card title identifying the origin PR so
 /// automated-review cards are distinguishable on the board without opening
 /// them — see `boss task create-revision`'s `name` field.
 pub fn render_revision_title(origin: ReviewOrigin, finding_count: usize) -> String {
-    match (origin.task_short_id, origin.pr_number) {
-        (Some(short_id), Some(pr)) => format!("T{short_id} PR #{pr} review: {finding_count} finding(s)"),
-        (Some(short_id), None) => format!("T{short_id} PR review: {finding_count} finding(s)"),
-        (None, Some(pr)) => format!("PR #{pr} review: {finding_count} finding(s)"),
-        (None, None) => format!("Automated PR review: {finding_count} finding(s)"),
+    match origin.pr_number {
+        Some(pr) => format!("PR #{pr} review: {finding_count} finding(s)"),
+        None => format!("Automated PR review: {finding_count} finding(s)"),
     }
 }
 
@@ -128,8 +119,7 @@ pub fn render_post_merge_followup_provenance(origin_pr_url: &str) -> String {
 /// is the `revision_instructions` passed to the revising worker — it must
 /// be specific enough to act on without guessing.
 ///
-/// Opens with `origin` (the PR reviewed and the work item that produced it)
-/// before the generic no-punting preamble, so the description alone
+/// Opens with `origin` (the PR reviewed) before the generic no-punting preamble, so the description alone
 /// identifies what the findings are about.
 ///
 /// This string is stored verbatim (only `.trim()`'d) as the created
@@ -171,7 +161,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
          Each finding below requires a real code change that resolves it.\n\
          The following are FORBIDDEN — they do NOT count as addressing a finding:\n\
          \n\
-         - Filing a follow-up task, chore, or issue in lieu of fixing the finding.\n\
+         - Filing a follow-up task or issue in lieu of fixing the finding.\n\
          - Leaving a `TODO`, `FIXME`, `Phase N`, \"wire this later\", or similar\n\
            deferral comment and calling the finding done.\n\
          - Acknowledging the finding in a comment or PR description without making\n\
@@ -185,7 +175,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
          **If — and only if — a finding genuinely cannot or should not be fixed within\n\
          this revision's scope**, you must EXPLICITLY SURFACE that in your response:\n\
          state which finding you are not fixing and exactly why (technical blocker,\n\
-         out-of-scope dependency, requires operator decision, etc.). Do NOT silently\n\
+         out-of-scope dependency, requires a decision from the repo owner, etc.). Do NOT silently\n\
          file a follow-up or leave a TODO. The default is to do the work.\n\
          \n",
         origin.describe(),
@@ -372,7 +362,7 @@ pub fn render_reviewer_claude_md(
             intro: "You are running inside a Boss-managed **reviewer** session. The engine\n\
                     spawned you in a leased cube workspace checked out to the PR head.",
             last_forbidden_bullet: "Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
-               this does NOT include the `boss propose review-report` call named\n\
+               this does NOT include the `\"$BOSS_BIN\" propose review-report` call named\n\
                below, which is not a Boss PR helper: it reports findings, it does\n\
                not touch the PR.",
             permitted_write_section: "**The one permitted write** is whichever single delivery your task\n\
@@ -382,9 +372,9 @@ pub fn render_reviewer_claude_md(
                (also exported as `$BOSS_STRUCTURED_OUTPUT`): write your\n\
                `ReviewResult` JSON there.\n\
              - If it instead names a review-report body-file path and a\n\
-               `boss propose review-report` command: write the report JSON to\n\
-               that body file, then run exactly that one `boss propose` call to\n\
-               submit it. `boss propose` is a local call to the engine control\n\
+               `\"$BOSS_BIN\" propose review-report` command: write the report JSON to\n\
+               that body file, then run exactly that one `\"$BOSS_BIN\" propose` call to\n\
+               submit it. `\"$BOSS_BIN\" propose` is a local call to the engine control\n\
                socket, not a write to the PR or repo.\n\
              \n\
              Either path is OUTSIDE every worker workspace, so making that one\n\
@@ -559,7 +549,7 @@ pub fn render_reviewer_initial_prompt(
         _ => String::new(),
     };
 
-    // incident-002 P2: rationale-independent both-parents deletion tripwire.
+    // Both-parents deletion tripwire, independent of any stated rationale.
     // When the engine deterministically found merged-parent surfaces this
     // resolution removed, the reviewer receives them as authoritative,
     // must-address context — independent of any "supersedes" narrative.
@@ -567,7 +557,7 @@ pub fn render_reviewer_initial_prompt(
         .map(|c| render_merged_parent_deletion_block(&c.merged_parent_deletions))
         .unwrap_or_default();
 
-    // incident-002 P3: deterministic supersession-language scan of the PR
+    // Supersession-language check: deterministic supersession-language scan of the PR
     // narrative. When present, the reviewer must verify a design-doc citation
     // for each flagged claim.
     let supersession_flag_block = ctx
@@ -754,13 +744,13 @@ pub fn render_batch_reviewer_initial_prompt(
          2. Submit it immediately with:\n\
          \n\
          ```sh\n\
-         boss propose review-report --batch-id {batch_id} --target-sha {target_sha} --body-file \"{body_path}\"\n\
+         \"$BOSS_BIN\" propose review-report --batch-id {batch_id} --target-sha {target_sha} --body-file \"{body_path}\"\n\
          ```\n\
          \n\
          The command validates the report immediately. If it rejects the file, correct the\n\
          reported field errors and submit again before ending your turn. Do not put the JSON\n\
          in your final response: transcript recovery is intentionally unavailable for batch\n\
-         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
+         reviews. The one body-file write and this local `\"$BOSS_BIN\" propose` call are permitted;\n\
          do not edit repository files or publish anything.\n\
          \n\
          This is static analysis only. Do not run builds, tests, formatters, generators, or\n\
@@ -809,8 +799,8 @@ pub fn render_batch_reviewer_initial_prompt(
     )
 }
 
-/// Render the authoritative merged-parent deletion-tripwire block (incident-002
-/// P2). `deletions` are engine-computed, rename/move-aware descriptions of
+/// Render the authoritative merged-parent deletion-tripwire block.
+/// `deletions` are engine-computed, rename/move-aware descriptions of
 /// surfaces a merged parent added and this resolution removed. Returns an empty
 /// string when there are none, so the caller can unconditionally interpolate it.
 ///
@@ -829,8 +819,8 @@ fn render_merged_parent_deletion_block(deletions: &[String]) -> String {
         "This PR resolves a merge / forward-port. The engine diffed the \
          resolution against **both merge parents** (not just `main`) and found \
          that it **removes surfaces a MERGED parent added** — functionality that \
-         already landed and that this resolution drops. This is the exact \
-         incident-002 failure class: a forward-port deleting a just-merged \
+         already landed and that this resolution drops. This is the \
+         Forward-port failure class: a forward-port deleting a just-merged \
          feature and calling it \"superseded\".\n\n\
          This finding is **rationale-independent** — it is anchored on the fact \
          that a merged parent lost functionality, NOT on the worker's stated \
@@ -870,8 +860,7 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                that a MERGED parent added and this resolution removes is a \
                regression **regardless of any \"supersedes\" narrative** — anchor \
                on the fact of the deletion, not the worker's stated purpose. \
-               This is the T793 / incident-002 check: a live feature silently \
-               removed during a forward-port must be caught. (`category: \
+               (`category: \
                \"regression\"`)\n\
              - **Supersession / obsolescence claims** *(first-class, explicit \
                check)* — if the PR body, a commit message, or a comment claims \
@@ -889,88 +878,29 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
              - **Architectural issues** — wrong layer, missed reuse, abstraction \
                that fights the codebase's conventions. (`category: \
                \"architecture\"`)\n\
-             - **Reuse/duplication** *(first-class, explicit check)* — for \
-               every substantial new construct the PR introduces (an \
-               HTTP/API client, external-service wiring such as endpoints, \
-               auth headers, or version constants, a serialization helper, \
-               retry/backoff logic, or a utility module), search the WHOLE \
-               repo — not just the changed files — for an existing \
-               equivalent before accepting the new code as necessary: grep \
-               for distinctive strings (the exact endpoint URL, header name, \
-               version constant, or a crate-typical helper/module name). If \
-               an equivalent already exists, raise a finding naming the \
-               existing file/module and recommending reuse or extraction of \
-               a shared module — do not let a plausible-looking \
-               reimplementation pass just because it works in isolation. \
-               Example: a new `api.anthropic.com` HTTP client in a repo that \
-               already has five hand-rolled Anthropic clients is a \
-               duplication finding regardless of how well the new one is \
-               written. A justified exception (duplication that really is \
-               necessary) must be explicitly explained in the PR \
-               description; its absence there is itself grounds for the \
-               finding. (`category: \"duplication\"`) Any confirmed \
-               duplication finding forces a revision regardless of the \
-               severity you assign it — the same treatment as a regression \
-               finding, not an advisory suggestion.\n\
-             - **Deferred-scope hygiene** *(first-class, explicit check)* — \
-               compare the PR's delivered changes against the owning work \
-               item's brief (given above in **Task description** for an \
-               ordinary item, or **Chain-root brief** + **Revision ask** for \
-               a revision) and check for three distinct failure modes:\n\
-               (1) **Undeclared deferral** — the brief asked for scope that \
-               the diff does not deliver, and no `[deferred-scope] \
-               summary=\"...\" reason=\"...\"` marker (recorded by the \
-               engine from the worker's final response) covers the gap. The \
-               worker narrowed scope without declaring it anywhere the \
-               engine can see.\n\
-               (2) **Misdeclared deferral** — the PR body, summary, or a \
-               commit message contains prose deferral language (a \
-               \"## Deferred\" section, \"left for a followup\", \"out of \
-               scope for this PR\", \"will address later\", etc.) that has \
-               no matching `[deferred-scope]` marker backing it. Prose alone \
-               creates no engine-tracked record, so the deferred work is \
-               silently lost. Live example: PR spinyfin/mono#1968 declared \
-               two deferred items only in a prose section — nothing was \
-               recorded, and the coordinator had to hand-file T2576 after \
-               the fact to recover the lost scope.\n\
-               (3) **Malformed markers** — a `[deferred-scope]` marker is \
-               present but missing `summary=`/`reason=` or improperly \
-               quoted. Flag it so the worker fixes the marker's grammar \
-               while the PR is still open; the engine records malformed \
-               markers with a parse warning, but a clean marker is the \
-               contract.\n\
-               **Exception — manual/interactive verification a headless \
-               worker cannot perform**: none of the three failure modes \
-               above apply when the deferred item is manual, interactive, \
-               or display-requiring verification — live GUI runs, \
-               \"spawn real workers and watch the app\", screenshot-based \
-               checks, physical-device tests, or anything else that needs an \
-               interactive session with a display. A worker running headless \
-               has no way to do this, so do NOT raise a `deferred_scope` \
-               finding demanding a `[deferred-scope]` marker for it, and do \
-               NOT demand the worker actually perform the manual \
-               verification. A prose \"## Deferred\" / \"Validation\" note \
-               describing exactly this kind of deferral is acceptable and \
-               expected — that is the normal, correct way to surface it. \
-               This carve-out is narrow: it keys on infeasibility for a \
-               headless agent, not on the word \"testing\" in general. \
-               Deferring work the agent COULD do headlessly — code changes, \
-               follow-up fixes, or unit/integration tests runnable without a \
-               display — still requires the `[deferred-scope]` marker exactly \
-               as in (1)/(2) above; this exception does not weaken the \
-               spinyfin/mono#1968 lesson that prose deferrals of trackable \
-               work get silently lost; it only narrows the marker \
-               requirement for work no marker could make trackable anyway \
-               (an agent still can't run it after filing a followup). If \
-               it's cheap to do so, you may still mention in the overall \
-               `summary` field that live verification remains outstanding, so \
-               the operator sees it — but do not add it to `findings` and do \
-               not let it affect `revision_warranted`.\n\
-               (`category: \"deferred_scope\"`) Any confirmed finding in \
-               this dimension forces a revision regardless of the severity \
-               you assign it — the same treatment as a regression or \
-               duplication finding: an undeclared or unrecorded deferral is \
-               a process gap, not a style nit.\n\
+             - **Reuse/duplication** *(first-class, explicit check)* — for every substantial new construct (HTTP/API client, external-service \
+               endpoints/auth/version wiring, serialization helper, retry/backoff, utility module), search the WHOLE \
+               repo: grep for distinctive strings (endpoints such as `api.anthropic.com`, headers, constants or \
+               helper/module names). If one exists, name its file/module and recommend reuse or shared extraction. \
+               Working in isolation does not justify duplication; a necessary exception must be explicitly justified in \
+               the PR description. A missing justification is itself grounds for a `category: \"duplication\"` finding. \
+               Every confirmed duplication finding forces a revision regardless of the severity.\n\
+             - **Deferred-scope hygiene** *(first-class, explicit check)* — use the Brief conformance comparison against **Task description**, or \
+               **Chain-root brief** + **Revision ask**. Check (1) **Undeclared deferral**: requested scope absent from \
+               the diff without a recorded `[deferred-scope] summary=\"...\" reason=\"...\"`; (2) **Misdeclared \
+               deferral**: PR body, summary or commit prose (\"## Deferred\", \"left for a followup\", \"out of scope \
+               for this PR\", \"will address later\") without a matching recorded marker; prose creates no tracked \
+               record; (3) **Malformed markers**: missing `summary=`/`reason=` or improper quoting, even though \
+               malformed markers are recorded with parse warnings. Require corrected grammar while the PR is open. \
+               (`category: \"deferred_scope\"`) Every confirmed finding forces a revision regardless of the severity. \
+               This is a process gap, not a style nit. See spinyfin/mono#1968 for prose-only scope loss.\n\
+             **Exception — manual/interactive verification a headless worker cannot perform**: live GUI runs, \"spawn \
+               real workers and watch the app\", screenshot-based checks, physical-device checks or other infeasible \
+               interactive verification need only a precise prose Deferred/Validation note, which is acceptable and \
+               expected. Do NOT demand performance or a marker; do NOT raise a `deferred_scope` finding or affect \
+               `revision_warranted`; optionally mention outstanding live verification in `summary`. This narrow \
+               exception does not exempt headlessly feasible code, fixes or unit/integration tests merely because they \
+               are called testing.\n\
              - **Agent-isms in code comments and PR descriptions** *(first-class, \
                explicit check)* — read every new or changed comment in the diff, \
                plus the PR title and description (fetch with `gh pr view` — \
@@ -1085,6 +1015,14 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                expected headings are present: Problem / Goal, Goals, Chosen \
                approach (or equivalent). Flag any that are absent or \
                substantively empty.\n\
+             - **Task footprint plausibility** — for every design breakdown entry, \
+               require numbered Major deliverables, Likely changed files (explicit \
+               paths or globs with approximate counts), and Estimated size: ~N files / \
+               ~M changed lines. Inspect the referenced code and callers: are the file \
+               list and line estimate plausible, including tests, build wiring, and \
+               mechanical edits? Flag missing or implausibly low estimates. Entries \
+               over 3 major deliverables, 25 files, or 1,500 changed lines must be \
+               split by the design author along capability boundaries before approval.\n\
              \n\
              Do NOT apply the code rubric (correctness, regressions, \
              architecture, tests, edge cases) to this docs-only PR.\n\
@@ -1147,13 +1085,13 @@ mod tests {
             "reviewer CLAUDE.md must still authorise the legacy ReviewResult artifact write"
         );
         assert!(
-            rendered.contains("boss propose review-report"),
-            "reviewer CLAUDE.md must authorise the review-batch boss propose call"
+            rendered.contains("\"$BOSS_BIN\" propose review-report"),
+            "reviewer CLAUDE.md must authorise the review-batch \"$BOSS_BIN\" propose call"
         );
         assert!(
             !rendered.contains("**The one permitted write** is your `ReviewResult`"),
             "reviewer CLAUDE.md must not categorically name ReviewResult as the only permitted write, \
-             which reads as forbidding the boss propose delivery a batch member's task prompt requires"
+             which reads as forbidding the \"$BOSS_BIN\" propose delivery a batch member's task prompt requires"
         );
     }
 
@@ -1219,14 +1157,14 @@ mod tests {
         assert!(prompt.contains("gh pr diff"));
         assert!(prompt.contains("--repo org/repo"), "prompt must include --repo flag");
         assert!(prompt.contains("org/repo"), "prompt must state the repo slug");
-        // incident-002 P2: the regression rubric must instruct diffing against
+        // Both-parents deletion tripwire: the regression rubric must instruct diffing against
         // BOTH merge parents for forward-ports and anchoring on the fact of the
         // deletion rather than the worker's narrative.
         assert!(
             prompt.contains("both merge parents"),
             "regression rubric must require diffing against both merge parents",
         );
-        // incident-002 P3: the reviewer must verify a design-doc citation for
+        // Supersession-language check: the reviewer must verify a design-doc citation for
         // supersession claims.
         assert!(
             prompt.contains("Supersession / obsolescence claims"),
@@ -1255,7 +1193,9 @@ mod tests {
             None,
             "org/repo",
         );
-        assert!(prompt.contains("boss propose review-report --batch-id rvb_1 --target-sha head_1 --body-file"));
+        assert!(
+            prompt.contains("\"$BOSS_BIN\" propose review-report --batch-id rvb_1 --target-sha head_1 --body-file")
+        );
         assert!(prompt.contains("needs_runtime_verification"));
         assert!(prompt.contains("transcript recovery is intentionally unavailable"));
         assert!(!prompt.contains("revision_warranted\": true"));
@@ -1286,13 +1226,27 @@ mod tests {
             Some(&ctx),
             "org/repo",
         );
-        // P2 authoritative deletion-tripwire block.
+        // Authoritative deletion-tripwire block.
         assert!(prompt.contains("Merged-parent deletion tripwire (engine-computed)"));
         assert!(prompt.contains("RecommendationBadge.tsx"));
         assert!(prompt.contains("rationale-independent"));
-        // P3 authoritative supersession block.
+        assert!(prompt.contains("Forward-port failure class"));
+        assert!(!prompt.contains("incident-002"));
+        // Authoritative supersession-language block.
         assert!(prompt.contains("Supersession-claim citation check (engine-flagged)"));
         assert!(prompt.contains("supersedes"));
+        let docs_prompt = render_reviewer_initial_prompt(
+            "Update design doc",
+            "Reconcile the design with shipped behavior.",
+            "https://github.com/org/repo/pull/753",
+            "/tmp/bwo/exec.json",
+            ReviewScope::DocsOnly,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(docs_prompt.contains("require design authorization"));
+        assert!(docs_prompt.contains("verify a specific design doc citation"));
+        assert!(!docs_prompt.contains("Apply the Supersession / obsolescence claims rubric"));
     }
 
     #[test]
@@ -1483,7 +1437,7 @@ mod tests {
         assert!(prompt.contains("tests"));
     }
 
-    /// The reuse/duplication rubric dimension (P1690 incident: a sixth
+    /// The reuse/duplication rubric dimension (a sixth
     /// hand-rolled Anthropic Messages API client landed unflagged) must be
     /// present with the search-then-compare behaviour and the
     /// revision-forcing note — a vague one-liner would not satisfy the
@@ -1845,7 +1799,7 @@ mod tests {
     /// When `last_reviewed_sha` is set (a revision pushed after a prior
     /// review pass), the prompt must tell the reviewer to prioritise the
     /// delta AND explicitly override diff-only scoping for whole-PR-state
-    /// defects — the motivating T192/rec_engine duplication incident.
+    /// defects — the motivating rec_engine duplication incident.
     #[test]
     fn revision_triggered_prompt_includes_delta_and_whole_pr_guidance() {
         let ctx = PrReviewContext {
@@ -1936,6 +1890,9 @@ mod tests {
         assert!(prompt.contains("light rubric"));
         assert!(prompt.contains("Internal consistency"));
         assert!(prompt.contains("Required-sections check"));
+        assert!(prompt.contains("Task footprint plausibility"));
+        assert!(prompt.contains("Inspect the referenced code and callers"));
+        assert!(prompt.contains("1,500 changed lines"));
         // Code rubric must NOT appear in docs-only prompt.
         assert!(!prompt.contains("code PR"));
         assert!(!prompt.contains("T793"));
@@ -1991,10 +1948,7 @@ mod tests {
     /// from data at the call site (never a literal short-id string) so
     /// nothing here reads as a hardcoded work-item reference.
     fn test_origin() -> ReviewOrigin {
-        ReviewOrigin {
-            task_short_id: Some(40 + 2),
-            pr_number: Some(5),
-        }
+        ReviewOrigin { pr_number: Some(5) }
     }
 
     #[test]
@@ -2093,20 +2047,18 @@ mod tests {
         let origin = test_origin();
         let instructions = render_revision_instructions(&result, origin);
         let origin_marker = format!("PR #{}", origin.pr_number.expect("test origin has a pr_number"));
-        let short_id_marker = format!("T{}", origin.task_short_id.expect("test origin has a task_short_id"));
         let origin_pos = instructions
             .find(&origin_marker)
             .expect("origin PR reference must be present");
-        let short_id_pos = instructions
-            .find(&short_id_marker)
-            .expect("origin work item short id must be present");
         let preamble_pos = instructions
             .find("HARD RULE: no punting")
             .expect("no-punting preamble must be present");
         assert!(
-            origin_pos < preamble_pos && short_id_pos < preamble_pos,
+            origin_pos < preamble_pos,
             "origin must open the description before the generic no-punting preamble: {instructions}"
         );
+        let instructions = render_revision_instructions(&result, ReviewOrigin { pr_number: None });
+        assert!(instructions.contains("review of the reviewed PR found"));
     }
 
     /// The `## HARD RULE ...` heading is the structural marker the macOS
@@ -2144,13 +2096,7 @@ mod tests {
         let pre_merge = render_revision_instructions(&result, test_origin());
         let post_merge = {
             let mut description = render_post_merge_followup_provenance("https://github.com/org/repo/pull/117");
-            description.push_str(&render_revision_instructions(
-                &result,
-                ReviewOrigin {
-                    task_short_id: None,
-                    ..test_origin()
-                },
-            ));
+            description.push_str(&render_revision_instructions(&result, test_origin()));
             description
         };
 
@@ -2176,16 +2122,30 @@ mod tests {
     }
 
     #[test]
+    fn titles_carry_only_the_public_pr_number() {
+        let origin = test_origin();
+        let pr = origin.pr_number.expect("test origin has a pr_number");
+        assert_eq!(
+            render_revision_title(origin, 2),
+            format!("PR #{pr} review: 2 finding(s)")
+        );
+        assert_eq!(
+            render_post_merge_followup_title(origin, 2),
+            format!("Post-merge review findings: PR #{pr} review: 2 finding(s)")
+        );
+        assert_eq!(
+            render_post_merge_followup_title(ReviewOrigin { pr_number: None }, 1),
+            "Post-merge review findings: Automated PR review: 1 finding(s)"
+        );
+    }
+
+    #[test]
     fn render_revision_title_identifies_origin_without_pr_number() {
-        let origin = ReviewOrigin {
-            task_short_id: Some(7),
-            pr_number: None,
-        };
+        let origin = ReviewOrigin { pr_number: None };
         let title = render_revision_title(origin, 3);
-        let short_id_marker = format!("T{}", origin.task_short_id.expect("test origin has a task_short_id"));
         assert!(
-            title.contains(&short_id_marker),
-            "title must name the origin work item: {title}"
+            title.starts_with("Automated PR review"),
+            "title must fall back to the generic form: {title}"
         );
         assert!(title.contains('3'), "title must include the finding count: {title}");
         assert!(

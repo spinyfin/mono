@@ -13,8 +13,9 @@ import Foundation
 /// events may therefore invoke `handle` N times back-to-back inside one
 /// main-actor turn. Per-event routing stays correct; SwiftUI coalesces
 /// `@Published` writes until the end of that turn. Invalidation-driven
-/// *fetches* still go through [[scheduleWorkTreeRefetch]]'s 150 ms debounce
-/// — that is a different boundary (request coalescing), not delivery batching.
+/// *fetches* go through the per-product burst in
+/// `ChatViewModel+InvalidationRefetch.swift` — that is a different boundary
+/// (request coalescing), not delivery batching.
 extension ChatViewModel {
     /// Point the engine's event stream at `handle(_:)`. Called from
     /// `commonInit`; kept here so the dispatch itself stays private to this
@@ -27,48 +28,30 @@ extension ChatViewModel {
         }
     }
 
+    func replayRemediationEvents(for requestID: String) {
+        let events = remediationEventsDuringRead.removeValue(forKey: requestID) ?? []
+        replayingRemediationEvents = true
+        for event in events { handle(event) }
+        replayingRemediationEvents = false
+    }
+
     private func handle(_ event: EngineEvent) {
+        recordRemediationEvent(event)
         switch event {
+        case .operatorDecisionSnapshot(let questions):
+            reviewNotifier.applyDecisionSnapshot(questions)
+        case .criticalPriorityRequests(let requests):
+            criticalPriorityRequests = requests
+        case .criticalPriorityResolved(let id):
+            criticalPriorityRequests.removeAll { $0.id == id }
         case .connected:
-            markConnected()
-            resetConnectionLostBanner()
-            // A quota request in flight when the socket dropped will never be
-            // answered, so clear the pending flag rather than leaving the
-            // pane's Refresh button disabled for the rest of the session.
-            isRefreshingDriverQuota = false
-            engine.sendRegisterAppSession()
-            refreshWorkSubscriptions()
-            // Re-subscribe any open markdown viewers' comment topics and reload
-            // them; the engine dropped every subscription on the disconnect.
-            commentBridge.handleReconnected()
-            engine.sendListProducts()
-            engine.sendListWorkerLiveStates()
-            engine.sendListLiveStatusDisabledSlots()
-            // Pull the engine's configuration health on every (re)connect
-            // so the top-of-window banner reflects the *current* engine,
-            // not the one we attached to before a restart (#699).
-            engine.sendGetEngineHealth()
-            // Pull the current per-installation settings snapshot so
-            // Settings reflects the engine immediately after connecting
-            // rather than waiting until Settings is opened.
-            engine.sendGetSettings()
-            // Pull the current GitHub OAuth auth state so the "GitHub
-            // account" settings subsection reflects a token persisted by a
-            // prior session (the engine restores it from the keychain at
-            // boot) without waiting for a device-flow transition.
-            engine.sendGitHubAuthStatus()
-            if let productID = currentSelectedProductID {
-                // Cold-start population of the restored product. NOTE: the
-                // `.productsList` handler below fetches this same product a
-                // SECOND time (a confirmed cold-start double-fetch) — the
-                // per-product fetch counter makes both visible.
-                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
-                engine.sendListAttentionGroups(productId: productID)
-            }
-            startBackgroundWorkPolling()
+            handleConnected()
+        case .workerPaneCapture(let capture):
+            remotePaneViewer.apply(capture)
         case .resyncRequired:
-            handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
+            handleResyncRequired() // socket never went down; see ChatViewModel+ResyncRefetch.swift
         case .appSessionRegistered:
+            executionLabelsInvalidatedHandler?()
             isAppSessionRegistered = true
             engine.sendRegisterCapabilities(capabilityIds: CapabilityRegistry.shared.all)
             // The engine drops the recorded selection on every app-session
@@ -80,7 +63,27 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            // The engine ends a capture with its session.
+            remotePaneViewer.connectionLost()
+            failOutstandingMergeRequests(message: "Connection lost while requesting merge. Check the PR before retrying.")
+            reviewNotifier.suspendDecisionReminders()
+            remediationStateRequestID = nil
+            remediationEventsDuringRead.removeAll()
+            cancelPendingResyncRefetch()
+            pendingProjectDesignDocOpen = nil
+            engine.resetConnectTreeClaims()
+            // No reply is coming for a read the dropped connection carried.
+            resetBoardReadFences()
+            updateBoardLoad { $0.noteDisconnected() }
+            disconnectOffsiteBackupEdit()
+            if engine.hasUnsentAction(kind: "recreate_coordinator") {
+                coordinatorResetWaiting = false
+            } else {
+                clearCoordinatorReset()
+            }
             isConnected = false
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
+            liveWorkerStates.markFeedUnavailable()
             stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
@@ -94,6 +97,10 @@ extension ChatViewModel {
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
             operatorAnswerInFlightByTaskID.removeAll()
+            attentionRequestGroupByRequestID.removeAll()
+            // An archive in flight gets no reply either; drop its pending
+            // mark so the row is not stuck reading "Archiving…".
+            settleAllArchiveRequests()
             // Same reasoning for a review-guide retry in flight: no
             // `review_guide_retry_queued` or `work_error` reply is ever
             // coming for a request the disconnect killed in transit, so
@@ -105,16 +112,17 @@ extension ChatViewModel {
             // `.loading` for the rest of the session, so fail it with a
             // retry that re-opens the pending guide.
             failLoadingReviewGuideViewer(message: "Connection lost while loading this guide.")
+            navigatorReviewGuides.disconnect()
             // Same reasoning for a drag-to-Doing admission check in
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
             // `pendingDragAdmissionCheck` or the optimistic move it guards.
-            if pendingDragAdmissionCheck != nil {
-                pendingDragAdmissionCheck = nil
-                bounceBackOptimisticMoves(message: nil)
-            }
+            // A check parked for Retry is still in the unsent queue and is
+            // kept; only checks whose request was in flight are settled.
+            bounceUnparkedDrags(message: nil, includeMovesWithoutCheck: false)
             scheduleConnectionLostBannerCheck()
-        case .workInvalidated(let topic, let productId, let itemIDs):
+        case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
+            executionLabelsInvalidatedHandler?()
             if CommentEngineBridge.isCommentTopic(topic) {
                 // A comment row on an open viewer's artifact changed elsewhere;
                 // the bridge reloads the bound layer(s). Invalidation-not-patch.
@@ -123,23 +131,24 @@ extension ChatViewModel {
             if topic == "work.products" {
                 engine.sendListProducts()
             }
-            if let selectedProductID = currentSelectedProductID,
-               topic == workTopic(forProductID: selectedProductID)
-            {
-                refetchForInvalidation(productID: selectedProductID)
-            } else if let productId,
-                      productId == currentSelectedProductID {
-                refetchForInvalidation(productID: productId)
-            }
-            // Execution history is loaded lazily, outside the work-tree
-            // snapshot. Refresh only already-visible histories so a spawned
-            // worker's persisted launch tuple appears live in its card
-            // popover and transcript viewer without broad polling.
-            for itemID in itemIDs where executionsByTaskID[itemID] != nil {
-                engine.sendListExecutions(taskId: itemID)
-            }
-            requestBackgroundWorkRefresh()
+            // Nothing is fetched here: the push joins its product's pending
+            // burst, which re-reads the board, its side lists, the
+            // background-work snapshot and — outside the work-tree snapshot,
+            // so a spawned worker's persisted launch tuple appears live —
+            // the execution history of the invalidated items that a card
+            // popover or transcript viewer is showing.
+            let onBoard = currentSelectedProductID.map {
+                topic == workTopic(forProductID: $0) || productId == $0
+            } ?? false
+            scheduleInvalidationRefetch(
+                productID: onBoard ? currentSelectedProductID : productId,
+                itemIDs: itemIDs,
+                invalidationClass: invalidationClass
+            )
+        case .workRuntimePatch(let productId, let cards, let absent, let isComplete, let requestID, let revision):
+            handleWorkRuntimePatch(productID: productId, cards: cards, absent: absent, isComplete: isComplete, requestID: requestID, revision: revision)
         case .productsList(let products):
+            selectionHistory.pruneProducts(validIDs: Set(products.filter { $0.status != "archived" }.map(\.id)))
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
             if let selectedWorkProductID,
@@ -158,18 +167,14 @@ extension ChatViewModel {
                 self.selectedWorkProductID = first.id
                 persistSelectedProductID(first.id)
                 engine.sendGetWorkTree(productId: first.id, flow: .coldStart)
-            } else if let productID = currentSelectedProductID {
-                // On cold start this is the redundant SECOND fetch of the
-                // already-restored product (see `.connected` above); it also
-                // fires on later `products_list` refreshes. Tagged cold_start
-                // because the double-fetch is the case worth spotting; the
-                // per-product fetch counter disambiguates either way.
-                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
             }
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
+            selectionHistory.pruneProjects(productID: productId, validIDs: Set(projects.filter { $0.status != "archived" }.map(\.id)))
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas, let attentionItems, let attentionGroups, let attentionMembers, let plannerRuns, let requestID, let revision):
+            guard acceptWorkTree(productID: product.id, requestID: requestID, revision: revision) else { return }
+            updateBoardLoad { $0.noteSnapshot(product.id) }
             applyWorkTree(
                 product: product,
                 projects: projects,
@@ -177,19 +182,32 @@ extension ChatViewModel {
                 chores: chores,
                 taskRuntimes: taskRuntimes,
                 dependencies: dependencies,
-                ideas: ideas
+                ideas: ideas,
+                attentionItems: attentionItems,
+                attentionGroups: attentionGroups,
+                attentionMembers: attentionMembers,
+                plannerRuns: plannerRuns
             )
+        case .boardPopulationProgress(let productId, let phase, let stage, let elapsedMs, let items, _):
+            // `done` follows the snapshot frame, so only the stages describe a wait.
+            guard phase != "done" else { break }
+            updateBoardLoad {
+                $0.noteProgress(productId, BoardLoadProgress(stage: stage, engineElapsedMs: elapsedMs, items: items), started: phase == "started")
+            }
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
         case .workItemsCreated(let items):
             handleCreatedWorkItemsBatch(items)
-        case .workItemUpdated(let item):
+        case .workItemUpdated(let item, let revision):
+            noteBoardRevision(revision, item: item)
+            executionLabelsInvalidatedHandler?()
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
             if let productID = project(withID: projectId)?.productID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
         case .workItemDeleted(let id):
+            executionLabelsInvalidatedHandler?()
             let deletedTask = task(withID: id)
             if selectedTask?.id == id {
                 selectedWorkCardID = nil
@@ -199,14 +217,23 @@ extension ChatViewModel {
             }
         case .operatorQuestionError(let message, let requestId):
             handleOperatorQuestionError(message: message, requestId: requestId)
+        case .boardReadFailed(let requestId):
+            failBoardRead(requestID: requestId)
         case .workError(let message, let requestId):
+            if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
+            failBoardRead(requestID: requestId)
+            if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
             // settle it onto that card without blaming any other request.
             if settleOperatorAnswerWorkError(message: message, requestId: requestId) { return }
+            if settleAttentionWorkError(message: message, requestId: requestId) { return }
+            // Likewise a refused project archive: the row drops its pending
+            // mark and the message surfaces, with no other state touched.
+            if settleArchiveWorkError(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
-            // The engine's WorkError reply carries no request context, so we
-            // can't tell which in-flight list_executions/list_attachments
-            // call failed. `hasOtherTrackedAppRequestInFlight` checks every
+            // Legacy list_executions/list_attachments guards do not retain
+            // request IDs, so they cannot match the error's envelope ID.
+            // `hasOtherTrackedAppRequestInFlight` checks every
             // other in-flight guard this same handler already reacts to
             // (merge, review terminal, planner action, kanban move, engine
             // attempt detail, …), captured BEFORE any of them are cleared
@@ -220,6 +247,11 @@ extension ChatViewModel {
             // case: one viewer window open, nothing else in flight) do we
             // attribute the error to the waiting viewer(s).
             let otherRequestInFlight = hasOtherTrackedAppRequestInFlight()
+            // Unattributable errors clear every pending archive rather than
+            // risk a row stuck on "Archiving…" for a reply that never comes.
+            if requestId == nil {
+                settleAllArchiveRequests()
+            }
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
@@ -240,11 +272,7 @@ extension ChatViewModel {
             }
             openingReviewTerminalIDs.removeAll()
             openingLiveWorkspaceTerminalIDs.removeAll()
-            for taskId in mergingWhenReadyIDs {
-                mergeErrorNoticesByTaskID[taskId] = message
-            }
-            mergingWhenReadyIDs.removeAll()
-            mergeRevisionConfirmationOrigins.removeAll()
+            failOutstandingMergeRequests(message: message)
             // Mirror the disconnect path, but only when this WorkError is
             // the in-flight `get_review_guide_content` envelope — the
             // generic reply's message is otherwise as likely to belong to
@@ -257,12 +285,12 @@ extension ChatViewModel {
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
             }
-            if !pendingMoveOriginByTaskID.isEmpty {
-                // Error is likely from an in-flight kanban move: bounce the
-                // card(s) back and show an inline non-blocking notice instead
-                // of interrupting with a modal dialog.
-                bounceBackOptimisticMoves(message: message)
-            } else {
+            // Error is likely from an in-flight kanban move: bounce the
+            // card(s) back and show the notice inline on the card. Parked
+            // drags are not bounced, so with nothing eligible the error is
+            // still surfaced — on the passive `WorkNoticeBanner`, never a
+            // modal.
+            if pendingMoveOriginByTaskID.isEmpty || !bounceBackOptimisticMoves(message: message) {
                 workErrorMessage = message
             }
         case .transportError(let message):
@@ -271,38 +299,67 @@ extension ChatViewModel {
             // debounced banner (`showConnectionLostBanner`) is the
             // user-facing signal; never a modal.
             appendSystemMessage(message)
+        case .retriedActionsStatus(let message):
+            if let message {
+                uncertainActionMessages.append(message)
+                uncertainActionNotice = uncertainActionMessages.joined(separator: "\n")
+                bounceUnparkedDrags(message: nil)
+            }
+            retryingDisconnectedActions = false
+            if engine.hasRoomForDisconnectedActions() { unsavedActionNotice = nil }
+            refreshUnsentActions()
+            showDisconnectedActionNotice()
         case .notConnected(let requestKind):
+            if requestKind == "merge_when_ready" {
+                failOutstandingMergeRequests(message: "Merge request could not be sent. Check the engine connection and retry.")
+            }
+            if requestKind == "recreate_coordinator" {
+                if engine.hasUnsentAction(kind: requestKind) {
+                    coordinatorResetWaiting = false
+                } else {
+                    clearCoordinatorReset()
+                }
+            }
+            if requestKind == "update_work_item" {
+                settleAllArchiveRequests()
+            }
             // Only the drag's own requests may clear admission/optimistic state.
             if requestKind == "evaluate_dispatch_admission" || requestKind == "move_work_item_on_board" {
-                pendingDragAdmissionCheck = nil
-                bounceBackOptimisticMoves(message: "Not connected to the engine — reconnect and try again.")
+                bounceUnparkedDrags(message: "Lost connection to the engine; this move was not sent.")
             }
-            showDisconnectedActionNotice()
+            // Only kinds retained for Retry earn the "your actions are saved" notice.
+            if refreshUnsentActions() { showDisconnectedActionNotice() }
             appendSystemMessage("Not connected to the engine; \(requestKind) was not sent.", alwaysShow: true)
-        case .error(let message):
-            if pendingDragAdmissionCheck != nil {
-                // A malformed/undecodable `dispatch_admission_evaluated`
-                // reply (EngineClient emits `.error`, never
-                // `.dispatchAdmissionEvaluated`, when the payload fails to
-                // decode) would otherwise leave the card optimistically
-                // rendered in Doing forever — nothing else ever clears
-                // `pendingDragAdmissionCheck` for a reply that never
-                // arrives in the expected shape. Bounce it back exactly as
-                // a hard-blocker refusal would.
-                pendingDragAdmissionCheck = nil
-                bounceBackOptimisticMoves(message: message)
+        case .actionNotSaved(let requestKind):
+            showActionNotSaved(requestKind: EngineClient.describeAction(kind: requestKind))
+        case .workItemUpdateDecodeFailed(let message, let requestId):
+            // The reply a pending archive was waiting on arrived undecodable;
+            // it is the only reply that request gets, so settle it here.
+            if settleArchiveWorkError(message: message, requestId: requestId) { return }
+            handle(.error(message: message))
+        case .error(let message, let requestId):
+            if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
+            failBoardRead(requestID: requestId)
+            if let requestId,
+               let pending = pendingDragAdmissionChecks.values.first(where: { $0.requestID == requestId }),
+               !engine.unsentDragTaskIDs().contains(pending.taskID) {
+                engine.finishAdmissionRetry(taskID: pending.taskID)
+                pendingDragAdmissionChecks[pending.taskID] = nil
+                bounceBackOptimisticMoves(message: message, only: [pending.taskID])
                 return
             }
+            if handleCoordinatorResetError(message) { return }
             workErrorMessage = message
-        case .workerLiveStatesList(let states):
+        case .workerLiveStatesList(let states, let doingSections, let queuedDispatch):
+            guard WorkerLiveState.hasUniqueIds(states) else { return }
             liveWorkerStates.update(states: states)
-        case .liveStatusDisabledSlotsList(let slotIds):
-            liveStatusDisabledSlotIDs = Set(slotIds)
-        case .liveStatusEnabledSet(let slotId, let enabled):
-            if enabled {
-                liveStatusDisabledSlotIDs.remove(slotId)
-            } else {
-                liveStatusDisabledSlotIDs.insert(slotId)
+            if doingSectionsByID != doingSections {
+                cachedSectionsByColumn[.doing] = nil
+                doingSectionsByID = doingSections
+            }
+            if queuedDispatchByID != queuedDispatch {
+                cachedSectionsByColumn[.doing] = nil
+                queuedDispatchByID = queuedDispatch
             }
         case .featureFlagsList(let flags):
             featureFlags = flags
@@ -326,14 +383,16 @@ extension ChatViewModel {
             engineHealthIssues = issues
         case .driverTrafficSplitResult(let split):
             driverTrafficSplit = split
+        case .codexSolPercentage(let percentage):
+            codexSolPercentage = percentage
         case .driverQuotaUsageResult(let snapshot):
             driverQuota = snapshot
-            // A cold-cache reply is empty and arrives immediately; keep the
-            // checking flag until a completed cycle lands so the pane can
-            // show "Checking…" rather than a false "not checked yet".
-            if !snapshot.neverChecked {
-                isRefreshingDriverQuota = false
-            }
+            // The engine lists the drivers still being probed. The in-flight
+            // state (spinner, "Checking…", disabled Refresh) lasts until that
+            // list is empty: the immediate reply to an accepted refresh names
+            // every driver, each pushed partial drops the ones that landed,
+            // and a cached read or declined refresh arrives already empty.
+            isRefreshingDriverQuota = !snapshot.pendingDrivers.isEmpty
         case .trunkStatus(let configured, let source, let queueCheck, let note):
             trunkTokenConfigured = configured
             trunkTokenSource = source
@@ -344,6 +403,8 @@ extension ChatViewModel {
             panePoolConfigHandler?(workerSlots, automationSlots, reviewSlots, coordinatorModel)
         case .settingsList(let settings):
             engineSettings = settings
+        case .offsiteBackupSettings(let settings, let requestId):
+            receiveOffsiteBackup(settings, requestID: requestId)
         case .settingSet(let key, let enabled):
             if let idx = engineSettings.firstIndex(where: { $0.key == key }) {
                 let prior = engineSettings[idx]
@@ -371,9 +432,9 @@ extension ChatViewModel {
         case .metricsListLiveResult(let entries):
             engineMetrics = entries
         case .projectDesignDocResolved(let output):
-            // Batch bookkeeping and its timing log are private to
-            // ChatViewModel.swift, alongside `refreshDesignDocStates`.
             applyResolvedProjectDesignDoc(output)
+        case .executionLabelsResolved(let labels):
+            executionLabelsHandler?(labels)
         case .dispatchAdmissionEvaluated(let admission):
             handleDispatchAdmissionEvaluated(admission)
         case .productDesignDocsList(let productID, let state):
@@ -386,37 +447,49 @@ extension ChatViewModel {
             } else {
                 reviewGuideFindingsBySeriesID.removeValue(forKey: seriesId)
             }
-        case .reviewGuideContent(let versionId, let content):
-            applyReviewGuideContent(versionId: versionId, content: content)
+        case .reviewGuideContent(let versionId, let content, let requestId):
+            navigatorReviewGuides.receive(versionID: versionId, content: content, requestID: requestId)
+            if let requestId, requestId == pendingReviewGuideRequestId {
+                applyReviewGuideContent(versionId: versionId, content: content, requestId: requestId)
+            }
         case .reviewGuideRetryQueued(let rootTaskId, _, _):
             applyReviewGuideRetryQueued(rootTaskId: rootTaskId)
         case .conflictResolutionsList(let attempts):
-            conflictResolutions = attempts
-        case .conflictResolutionStarted(_, _, _, let prURL):
+            conflictResolutions = attempts.map(\.listEntry)
+            var seenPRs = Set<String>()
+            for row in attempts where seenPRs.insert(row.prURL).inserted {
+                if row.status == "succeeded",
+                   let finished = AutomationTime.parse(row.finishedAt ?? row.createdAt) {
+                    recentlyClearedConflictPRs[row.prURL] = finished
+                } else {
+                    recentlyClearedConflictPRs.removeValue(forKey: row.prURL)
+                }
+            }
+        case .conflictResolutionStarted(_, _, _, let prURL, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // A (re)dispatch of the conflict resolver means the PR is
             // conflicting again, so the prior "conflict cleared" badge is
             // stale. Mirrors the ciRemediationStarted arm that clears
             // recentlyClearedCIPRs for the same reason.
             recentlyClearedConflictPRs.removeValue(forKey: prURL)
-            engine.sendListConflictResolutions(limit: 200)
-            refreshEngineAttempts()
-        case .conflictResolutionFailed, .conflictResolutionAbandoned:
-            // Refreshes the engine-tab list so the status column re-renders.
-            // These don't touch the badge: failure/abandon don't un-clear a
-            // previously cleared conflict — only a new start signals re-conflict.
-            engine.sendListConflictResolutions(limit: 200)
-            refreshEngineAttempts()
-        case .conflictResolutionSucceeded(_, _, _, let prURL):
+        case .conflictResolutionFailed(_, _, _, _, _, let attempt),
+             .conflictResolutionAbandoned(_, _, _, _, _, let attempt):
+            if let attempt { applyRemediationPush(attempt) }
+        case .conflictResolutionSucceeded(_, _, _, let prURL, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // Stamp the PR url so the kanban card shows the
             // "🔧 conflict cleared" chip for the next 24h (#15). The
             // engine doesn't carry a finished_at on the push, so we
             // record the wall-clock observation time — close enough
             // for an ageing window measured in hours.
             recentlyClearedConflictPRs[prURL] = Date()
-            engine.sendListConflictResolutions(limit: 200)
-            refreshEngineAttempts()
         case .ciRemediationsList(let attempts):
-            ciRemediations = attempts
+            ciRemediations = attempts.map(\.listEntry)
+            reconcileCIFailureBadges(from:
+                tasksByProjectID.values.flatMap { $0 }
+                + choresByProductID.values.flatMap { $0 }
+                + productLevelTasksByProductID.values.flatMap { $0 }
+                + productLevelRevisionsByProductID.values.flatMap { $0 })
             // Reconcile both PR-card chips against the row list, which is
             // freshest-first (`created_at DESC, id DESC`) — so the first
             // row seen per PR is that PR's latest attempt:
@@ -440,10 +513,9 @@ extension ChatViewModel {
             // retry — they are not derivable from the row list alone (the
             // engine tracks them via `task_blocked_signals`), so we leave
             // pre-existing exhausted chips alone. Terminal failed/abandoned
-            // attempts also leave the `in_flight` chip alone: the parent PR
-            // is still `blocked: ci_failure` until the engine retries or
-            // exhausts (see the `.ciRemediationFailed`/`.ciRemediationAbandoned`
-            // handling below), so the chip is still accurate.
+            // attempts are not handled here: the push path
+            // (`reconcileRemediationBadge`) applies the engine's `card_state`,
+            // which is derived from the same signals as the open-PR snapshot.
             var seenPRs = Set<String>()
             for row in attempts {
                 guard seenPRs.insert(row.prURL).inserted else { continue }
@@ -490,7 +562,8 @@ extension ChatViewModel {
             if engineAttemptDetailRequestID == attempt.id {
                 engineAttemptDetailRequestID = nil
             }
-        case .ciRemediationStarted(_, _, _, let prURL, _):
+        case .ciRemediationStarted(_, _, _, let prURL, _, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // A fresh CI attempt was created (detect path or `retry`).
             // The card stays in `blocked: ci_failure` — the in-flight
             // chip lives until the next probe either reports clean or
@@ -507,37 +580,28 @@ extension ChatViewModel {
                 existing.state = .inFlight
                 ciFailureBadges[prURL] = existing
             }
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
-        case .ciRemediationSucceeded(_, _, _, let prURL):
+        case .ciRemediationSucceeded(_, _, _, let prURL, let attempt):
+            if let attempt { applyRemediationPush(attempt); break }
             // Engine observed CI back at clean and retired the attempt.
             // Drop the failure chip and stamp the "✅ ci auto-fixed"
             // chip for the next 24h (per design Q11).
             ciFailureBadges.removeValue(forKey: prURL)
             recentlyClearedCIPRs[prURL] = Date()
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
         case .ciFailureCleared(_, _, let prURL):
             // Engine cleared `blocked: ci_failure` but found no active
             // remediation attempt (the prior attempt was already terminal).
             // Clear the failure badge only — do NOT set the auto-fixed badge
             // because the clearance was not driven by an auto-fix.
             ciFailureBadges.removeValue(forKey: prURL)
-        case .ciRemediationFailed(_, _, _, _, _),
-             .ciRemediationAbandoned(_, _, _, _, _):
-            // Terminal failures keep the parent `blocked: ci_failure`
-            // until the engine either retries or exhausts. The list
-            // refresh keeps the engine tab consistent.
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
+        case .ciRemediationFailed(_, _, _, _, _, let attempt),
+             .ciRemediationAbandoned(_, _, _, _, _, let attempt):
+            if let attempt { applyRemediationPush(attempt) }
         case .ciRemediationExhausted(_, _, let prURL, let used, let budget):
             // Budget exhausted means CI is still failing and auto-fix
             // cannot help further. Any prior "ci auto-fixed" claim is now
             // stale.
             recentlyClearedCIPRs.removeValue(forKey: prURL)
             ciFailureBadges[prURL] = CiFailureBadge(state: .exhausted, attemptsUsed: used, budget: budget)
-            engine.sendListCiRemediations(limit: 200)
-            refreshEngineAttempts()
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
         case .attentionItemCreated, .attentionItemUpdated, .attentionItemConverted, .deferredScopeAttentionsList:
@@ -558,10 +622,13 @@ extension ChatViewModel {
                 upsertAttentionMember(attention)
             }
             refreshSelectedProductAttentionCaches()
-        case .attentionGroupUpdated(let group, let members):
+            syncNavigatorAttention()
+        case .attentionGroupUpdated(let group, let members, let requestId):
             applyAttentionGroupSnapshot(group, members: members)
-        case .attentionGroupActioned(let group, let members):
+            settleAttentionRequest(requestId)
+        case .attentionGroupActioned(let group, let members, let requestId):
             applyAttentionGroupSnapshot(group, members: members)
+            settleAttentionRequest(requestId)
         case .attentionMergesList(let attentionID, let merges):
             attentionMergesByAttentionID[attentionID] = merges
         case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
@@ -594,6 +661,7 @@ extension ChatViewModel {
         case .mergeConfirmationRequired(let workItemID, let revisions):
             handleMergeConfirmation(workItemID: workItemID, revisions: revisions)
         case .mergeWhenReadyAccepted(let workItemID, _, let action):
+            recordMergeAcknowledgement(for: workItemID)
             // Engine successfully initiated the merge. Clear the in-flight
             // guard so the button re-enables if the user wants to retry.
             // The PR-reconciler was kicked on the engine side, so a
@@ -613,7 +681,11 @@ extension ChatViewModel {
             // subsection observes `gitHubAuthState` and re-renders.
             gitHubAuthState = state
         case .executionsList(let taskId, let executions):
-            executionsByTaskID[taskId] = executions
+            // A reply that lands after its last consumer closed must not
+            // re-create the entry that closing evicted.
+            if hasOpenExecutionsConsumer(taskID: taskId) {
+                executionsByTaskID[taskId] = executions
+            }
             executionsInFlightTaskIDs.remove(taskId)
             executionsLoadFailureByTaskID.removeValue(forKey: taskId)
         case .attachmentsList(let taskId, let attachments):
@@ -632,35 +704,34 @@ extension ChatViewModel {
         case .executionTranscriptUnavailable(let executionId, let reason):
             transcriptsByExecutionID[executionId] = .unavailable(reason: reason)
         // MARK: Automation events
-        case .automationsList(let productID, let automations, let openTaskCounts):
+        case .automationsList(let productID, let automations, let openTaskCounts, let lastRuns):
             automationsByProductID[productID] = automations
             automationsFetchStateByProductID[productID] = .loaded
             for (id, count) in openTaskCounts {
                 openTaskCountByAutomationID[id] = count
             }
             for automation in automations {
-                engine.sendListAutomationRuns(automationId: automation.id)
+                latestRunByAutomationID[automation.id] = lastRuns[automation.id]
             }
-        case .automationCreated(let automation):
+        case .automationCreated(let automation, let count, let lastRun):
             upsertAutomation(automation)
+            applyAutomationSummary(automation.id, count: count, lastRun: lastRun)
             selectedAutomationID = automation.id
-            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
-            engine.sendListAutomationRuns(automationId: automation.id)
-        case .automationResult(let automation):
+        case .automationResult(let automation, let count, let lastRun):
             upsertAutomation(automation)
-            engine.sendListAutomationRuns(automationId: automation.id)
-        case .automationUpdated(let automation):
+            applyAutomationSummary(automation.id, count: count, lastRun: lastRun)
+            refreshVisibleAutomationHistory(automation.id)
+        case .automationUpdated(let automation, let count, let lastRun):
             upsertAutomation(automation)
-            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
-            engine.sendListAutomationRuns(automationId: automation.id)
+            applyAutomationSummary(automation.id, count: count, lastRun: lastRun)
         case .automationDeleted(let automationID):
             for productID in automationsByProductID.keys {
                 automationsByProductID[productID]?.removeAll { $0.id == automationID }
             }
             openTaskCountByAutomationID.removeValue(forKey: automationID)
             automationRunsByID.removeValue(forKey: automationID)
-        case .automationOpenTaskCount(let automationID, let count):
-            openTaskCountByAutomationID[automationID] = count
+            latestRunByAutomationID.removeValue(forKey: automationID)
+            if visibleAutomationHistoryID == automationID { visibleAutomationHistoryID = nil }
         case .automationRunsList(let automationID, let runs):
             automationRunsByID[automationID] = runs
         // MARK: Idea events
@@ -707,16 +778,20 @@ extension ChatViewModel {
             let result = paneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendAttachWorkerPaneResponse(requestId: requestId, result: result)
         case .attachCoordinatorPane(let attach):
+            // A replacement exists even if attaching its viewer fails.
+            if attach.spawnToken != pendingCoordinatorReset?.token {
+                clearCoordinatorReset()
+            }
             let result = coordinatorPaneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             if case .success = result {
                 coordinatorPaneAttached(attach)
             }
             engine.sendAttachCoordinatorPaneResponse(requestId: requestId, result: result)
-        case .detachWorkerPane(let slotId):
-            let result = paneDetachHandler.map { $0(slotId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+        case .detachWorkerPane(let runId):
+            let result = paneDetachHandler.map { $0(runId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendDetachWorkerPaneResponse(requestId: requestId, result: result)
-        case .focusWorkerPane(let slotId):
-            let result = paneFocusHandler.map { $0(slotId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+        case .focusWorkerPane(let runId):
+            let result = focusAgentRun(runId)
             engine.sendFocusWorkerPaneResponse(requestId: requestId, result: result)
         case .revealWorkItem(let workItemId, let productId):
             revealWorkCard(workItemId, productID: productId) { [weak self] result in
@@ -746,20 +821,9 @@ extension ChatViewModel {
         }
     }
 
-    private static let noPaneAllocatorReason = "no pane allocator wired into this build (Bazel without GhosttyKit)"
+    static let noPaneAllocatorReason = "no pane allocator wired into this build (Bazel without GhosttyKit)"
 
     // MARK: - Arm helpers
-
-    /// Refetch everything a dropped/observed invalidation for `productID`
-    /// could have covered. Shared by the topic-matched and payload-matched
-    /// arms of `.workInvalidated`, which want identical refreshes.
-    private func refetchForInvalidation(productID: String) {
-        scheduleWorkTreeRefetch(productID: productID, flow: .invalidationRefetch)
-        engine.sendListAttentionItemsForWorkItem(workItemID: productID)
-        engine.sendListAttentionGroups(productId: productID)
-        engine.sendListDeferredScopeAttentions(productId: productID)
-        refreshPlannerRuns(forProductID: productID)
-    }
 
     /// Clear the in-flight guard for a completed `release_project` /
     /// `unpopulate_project` request and pull the audit trail plus the
@@ -769,26 +833,6 @@ extension ChatViewModel {
         engine.sendListPlannerRuns(projectId: projectID)
         if let productID = project(withID: projectID)?.productID {
             scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
-        }
-    }
-
-    /// Coalesce bursts of invalidation-style refetch triggers (repeated
-    /// `WorkInvalidated` pushes, bulk deletes/reorders, planner actions
-    /// touching many projects) into a single `GetWorkTree` request per
-    /// product, instead of one full-tree fetch — and one full,
-    /// synchronous `applyWorkTree` rebuild — per triggering event. A
-    /// later call for the same product within the debounce window
-    /// supersedes an earlier one rather than queuing a second request.
-    /// Not used for cold-start/product-switch/manual-refresh fetches,
-    /// which want to land immediately.
-    func scheduleWorkTreeRefetch(productID: String, flow: PopulationFlow) {
-        pendingWorkTreeRefetchTasks[productID]?.cancel()
-        pendingWorkTreeRefetchTasks[productID] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            guard !Task.isCancelled else { return }
-            guard let self else { return }
-            self.pendingWorkTreeRefetchTasks.removeValue(forKey: productID)
-            self.engine.sendGetWorkTree(productId: productID, flow: flow)
         }
     }
 
@@ -835,13 +879,15 @@ extension ChatViewModel {
         if !openingReviewTerminalIDs.isEmpty { return true }
         if !openingLiveWorkspaceTerminalIDs.isEmpty { return true }
         if !mergingWhenReadyIDs.isEmpty { return true }
+        if !archivingProjectIDs.isEmpty { return true }
         if !retryingReviewGuideRootTaskIDs.isEmpty { return true }
         if !plannerActionInFlightProjectIDs.isEmpty { return true }
         if !deferredScopeActionInFlightIDs.isEmpty { return true }
         if !operatorAnswerInFlightByTaskID.isEmpty { return true }
         if !pendingMoveOriginByTaskID.isEmpty { return true }
-        if pendingDragAdmissionCheck != nil { return true }
+        if !pendingDragAdmissionChecks.isEmpty { return true }
         if engineAttemptDetailRequestID != nil { return true }
+        if navigatorReviewGuides.readers.values.contains(where: { $0.requestID != nil }) { return true }
         // `pendingReviewGuideVersionId` is retained after a successful load
         // (it is the displayed version), so pair it with `.loading`.
         if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {

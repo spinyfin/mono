@@ -41,7 +41,7 @@
 //! provide cross-process exclusion, and does not need to: the dispatch-event
 //! stream has exactly one writer process by construction. The engine refuses
 //! to start at all if a live process already holds `<state_root>/events.sock`
-//! (`tools/boss/engine/core/src/app/server.rs:368-390`) — the probe is derived
+//! (`tools/boss/engine/app/src/app/server.rs:368-390`) — the probe is derived
 //! from the state root, so a different `--socket-path` does not evade it, and
 //! it fires before the event sink is constructed. `bossctl` only reads these
 //! files. Anything that appends to a Boss `.jsonl` from a second process is

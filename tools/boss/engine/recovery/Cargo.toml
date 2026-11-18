@@ -8,7 +8,6 @@ workspace = "../../../.."
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
-boss-log-files = { path = "../../log-files" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }

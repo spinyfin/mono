@@ -293,6 +293,8 @@ pub const LAST_STATUS_ACTOR_ENGINE: &str = "engine";
 /// only ever resolves `'boss'` or `'human'`); it is engine-internal and
 /// passes this literal to `update_work_item_as_actor` directly.
 pub const LAST_STATUS_ACTOR_BOOTHBY: &str = "boothby";
+/// Scoped autonomous progression decisions are not reversible engine cascades.
+pub const LAST_STATUS_ACTOR_PROGRESSION: &str = "progression";
 
 /// The `last_status_actor` vocabulary as a closed set.
 ///
@@ -317,6 +319,7 @@ pub enum StatusActor {
     Boss,
     Engine,
     Boothby,
+    Progression,
 }
 
 impl StatusActor {
@@ -325,6 +328,7 @@ impl StatusActor {
         StatusActor::Boss,
         StatusActor::Engine,
         StatusActor::Boothby,
+        StatusActor::Progression,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -333,6 +337,7 @@ impl StatusActor {
             StatusActor::Boss => LAST_STATUS_ACTOR_BOSS,
             StatusActor::Engine => LAST_STATUS_ACTOR_ENGINE,
             StatusActor::Boothby => LAST_STATUS_ACTOR_BOOTHBY,
+            StatusActor::Progression => LAST_STATUS_ACTOR_PROGRESSION,
         }
     }
 
@@ -354,7 +359,7 @@ impl StatusActor {
     pub fn is_engine_cascade(self) -> bool {
         match self {
             StatusActor::Engine => true,
-            StatusActor::Human | StatusActor::Boss | StatusActor::Boothby => false,
+            StatusActor::Human | StatusActor::Boss | StatusActor::Boothby | StatusActor::Progression => false,
         }
     }
 }
@@ -373,8 +378,9 @@ impl std::str::FromStr for StatusActor {
             LAST_STATUS_ACTOR_BOSS => Ok(StatusActor::Boss),
             LAST_STATUS_ACTOR_ENGINE => Ok(StatusActor::Engine),
             LAST_STATUS_ACTOR_BOOTHBY => Ok(StatusActor::Boothby),
+            LAST_STATUS_ACTOR_PROGRESSION => Ok(StatusActor::Progression),
             other => Err(format!(
-                "unknown status actor `{other}`; expected one of: human, boss, engine, boothby"
+                "unknown status actor `{other}`; expected one of: human, boss, engine, boothby, progression"
             )),
         }
     }
@@ -419,6 +425,9 @@ pub const CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX: &str = "pr_review:post_merge:
 /// question group, or the batch of tasks/chores produced from a followup
 /// group. Design: `tools/boss/docs/designs/attentions.md`.
 pub const CREATED_VIA_ATTENTION: &str = "attention";
+/// Answer recovery for a blocked conflict revision. The suffix is the original
+/// conflict revision's task id, whose writer-exclusion ordering is inherited.
+pub const CREATED_VIA_CONFLICT_RECOVERY_PREFIX: &str = "attention_conflict_recovery:";
 /// Prefix for the revision/chore spawned by `CommentsReviseDoc`:
 /// `doc-comment:<artifact_kind>:<artifact_id>`. Design:
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
@@ -434,6 +443,12 @@ pub const CREATED_VIA_GUIDE_COMMENT_PREFIX: &str = "guide-comment:";
 /// row Boothby touched in that pass is recoverable from `boothby_actions`,
 /// which carries the pre/post images needed to undo it.
 pub const CREATED_VIA_BOOTHBY_PREFIX: &str = "boothby:";
+/// Prefix for work a progression run created for a stuck item (a revision, a
+/// precursor chore, or the execution a `redispatch` minted):
+/// `progression:<progression execution id>`. The execution id is the
+/// back-pointer; the create budget, the redispatch bound and the churn guard
+/// all count work by this stamp.
+pub const CREATED_VIA_PROGRESSION_PREFIX: &str = "progression:";
 /// Prefix for the chore produced by graduating an idea to a chore
 /// (`FrontendRequest::GraduateIdea`): `idea-graduation:<ideas.id>`. The
 /// idea id is the back-pointer; graduating to a project has no equivalent
@@ -461,6 +476,7 @@ pub const KNOWN_CREATED_VIA: &[&str] = &[
 /// a warning is logged at the insert site.
 pub fn is_known_created_via(value: &str) -> bool {
     KNOWN_CREATED_VIA.contains(&value)
+        || value.starts_with(CREATED_VIA_CONFLICT_RECOVERY_PREFIX)
         || value.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
         || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
         || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
@@ -468,6 +484,7 @@ pub fn is_known_created_via(value: &str) -> bool {
         || value.starts_with(CREATED_VIA_GUIDE_COMMENT_PREFIX)
         || value.starts_with(CREATED_VIA_BOOTHBY_PREFIX)
         || value.starts_with(CREATED_VIA_IDEA_GRADUATION_PREFIX)
+        || value.starts_with(CREATED_VIA_PROGRESSION_PREFIX)
         || value.starts_with("pr-comment:")
 }
 
@@ -613,6 +630,79 @@ impl From<PauseReason> for String {
 pub enum PauseReasonError {
     #[error("pause reason must not be empty")]
     Empty,
+}
+
+/// What a dispatch pause holds — chosen by the operator, separately from
+/// *who* paused (the engine's `DispatchPauseOrigin`), so the two stay
+/// independently visible.
+///
+/// An absent scope on the wire means [`Self::NewWork`], the long-standing
+/// default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchPauseScope {
+    /// New work is held; `pr_review` and review-guide executions are exempt
+    /// and keep dispatching — a review is the lifecycle of a change already
+    /// in flight, not new work.
+    #[default]
+    NewWork,
+    /// Every pool is held, PR reviews and review guides included. For use
+    /// when the spawn path itself is suspect, so dispatching anything — a
+    /// review included — would just burn an attempt against it.
+    AllSpawns,
+}
+
+impl DispatchPauseScope {
+    /// Stable string persisted to `state.db` and printed by `bossctl`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchPauseScope::NewWork => "new_work",
+            DispatchPauseScope::AllSpawns => "all_spawns",
+        }
+    }
+
+    /// Parse a persisted value. `None` (never recorded) is the caller's
+    /// decision; an unrecognised value restores as the **stricter**
+    /// [`Self::AllSpawns`], because restoring an unknown scope as the more
+    /// permissive one could resume spawning into a path the operator held.
+    pub fn from_persisted(value: &str) -> Self {
+        match value {
+            "new_work" => DispatchPauseScope::NewWork,
+            _ => DispatchPauseScope::AllSpawns,
+        }
+    }
+
+    /// Whether this scope holds `pr_review` / review-guide executions.
+    pub fn holds_reviews(self) -> bool {
+        self == DispatchPauseScope::AllSpawns
+    }
+}
+
+#[cfg(test)]
+mod pause_scope_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_round_trip_and_unknown_is_stricter() {
+        for scope in [DispatchPauseScope::NewWork, DispatchPauseScope::AllSpawns] {
+            assert_eq!(DispatchPauseScope::from_persisted(scope.as_str()), scope);
+        }
+        assert_eq!(
+            DispatchPauseScope::from_persisted("something_new"),
+            DispatchPauseScope::AllSpawns
+        );
+        assert_eq!(DispatchPauseScope::from_persisted(""), DispatchPauseScope::AllSpawns);
+    }
+
+    #[test]
+    fn serde_uses_snake_case_names_matching_as_str() {
+        for scope in [DispatchPauseScope::NewWork, DispatchPauseScope::AllSpawns] {
+            assert_eq!(
+                serde_json::to_string(&scope).unwrap(),
+                format!("\"{}\"", scope.as_str())
+            );
+        }
+    }
 }
 
 #[cfg(test)]

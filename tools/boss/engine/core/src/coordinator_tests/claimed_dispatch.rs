@@ -24,7 +24,7 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
         publisher.clone(),
     ));
     let worker = coordinator.worker_pool().claim_worker("exec_busy", None).await.unwrap();
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     let runtime = db.get_task_runtime(&chore.id).unwrap();
     assert_eq!(runtime.execution_status, Some(ExecutionStatus::Ready));
     assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some("pool_exhausted"));
@@ -32,7 +32,12 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
         *publisher.events.lock().await,
         vec![(product.id.clone(), chore.id.clone(), "dispatch_wait_changed".into())]
     );
-    coordinator.drain_ready_queue().await;
+    assert_eq!(
+        publisher.runtime_reasons().await,
+        vec!["dispatch_wait_changed".to_owned()],
+        "a wait-reason change touches one card's runtime, never the board's shape"
+    );
+    coordinator.drain_ready_queue_for_test().await;
     assert_eq!(
         publisher.events.lock().await.len(),
         1,
@@ -40,7 +45,7 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
     );
 
     coordinator.worker_pool().release_worker(&worker, None).await;
-    coordinator.drain_ready_queue().await;
+    coordinator.drain_ready_queue_for_test().await;
     assert!(
         publisher
             .events
@@ -48,6 +53,13 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
             .await
             .iter()
             .any(|(pid, id, reason)| { pid == &product.id && id == &chore.id && reason == "dispatch_claimed" })
+    );
+    assert!(
+        publisher
+            .runtime_reasons()
+            .await
+            .contains(&"dispatch_claimed".to_owned()),
+        "claiming a slot clears the card's wait: a runtime-class change"
     );
     assert!(db.get_task_runtime(&chore.id).unwrap().dispatch_wait_reason.is_none());
 }
@@ -226,7 +238,7 @@ async fn recover_failed_dispatch_records_pre_start_failure_and_unclaims() {
         .with_pre_start_retry_delays(vec![Duration::from_secs(30)]),
     );
     coordinator
-        .recover_failed_dispatch(&execution, "worker-1", &anyhow!("cube setup exploded"))
+        .recover_failed_dispatch_for_test(&execution, "worker-1", &anyhow!("cube setup exploded"))
         .await;
 
     let after = db.get_execution(&execution_id).unwrap();
@@ -275,5 +287,134 @@ async fn spawn_panic_during_lease_reverts_claimed_to_ready() {
     panic!(
         "claimed row was not reverted after spawn panic; status={:?}",
         db.get_execution(&execution_id).unwrap().status
+    );
+}
+
+/// The scheduler's claim-lost tail must not free a slot a replacement already
+/// holds. `dispatch_claimed_execution` is given the worker id after a
+/// replacement has claimed it; the lost DB claim releases only if this
+/// execution still owns the slot.
+#[tokio::test]
+async fn claim_lost_cleanup_does_not_release_a_replacement_claim() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let old_chore = create_test_chore(&db, product.id.clone(), "old");
+    let replacement_chore = create_test_chore(&db, product.id.clone(), "replacement");
+    let old_id = create_spawned_execution(&db, &old_chore.id, 4242);
+    let replacement = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(replacement_chore.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let old_exec = db.get_execution(&old_id).unwrap();
+
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let worker = coordinator
+        .worker_pool()
+        .claim_worker(&replacement.id, None)
+        .await
+        .unwrap();
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
+
+    coordinator
+        .dispatch_claimed_execution_for_test(&old_exec, &worker, "interactive", false, DispatchAdmission::Queued)
+        .await;
+
+    assert_eq!(
+        coordinator.claim_holder(&worker).await.as_deref(),
+        Some(replacement.id.as_str()),
+        "claim-lost cleanup must leave the replacement's claim in place",
+    );
+    assert!(
+        !coordinator.scheduling_pending().load(Ordering::Acquire),
+        "claim-lost cleanup must not kick dispatch when the slot belongs to a replacement"
+    );
+}
+
+/// The scheduler's `schedule_execution` error tail must not free a slot a
+/// replacement already holds. The failing dispatch never owned the claim.
+#[tokio::test]
+async fn schedule_error_cleanup_does_not_release_a_replacement_claim() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let replacement_chore = create_test_chore(&db, product.id.clone(), "replacement");
+    let ready_chore = create_test_chore(&db, product.id.clone(), "ready");
+    let replacement = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(replacement_chore.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let ready = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(ready_chore.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    let cube = Arc::new(FakeCubeClient {
+        fail_ensure: true,
+        ..FakeCubeClient::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![]),
+    );
+    let worker = coordinator
+        .worker_pool()
+        .claim_worker(&replacement.id, None)
+        .await
+        .unwrap();
+    coordinator.scheduling_active().store(true, Ordering::Release);
+    coordinator.scheduling_pending().store(false, Ordering::Release);
+
+    coordinator
+        .dispatch_claimed_execution_for_test(&ready, &worker, "interactive", false, DispatchAdmission::Queued)
+        .await;
+
+    for _ in 0..200 {
+        if db.get_execution(&ready.id).unwrap().status != ExecutionStatus::Claimed {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_ne!(
+        db.get_execution(&ready.id).unwrap().status,
+        ExecutionStatus::Claimed,
+        "the failed dispatch must leave the claimed CAS",
+    );
+    assert_eq!(
+        coordinator.claim_holder(&worker).await.as_deref(),
+        Some(replacement.id.as_str()),
+        "schedule-error cleanup must leave the replacement's claim in place",
+    );
+    assert!(
+        !coordinator.scheduling_pending().load(Ordering::Acquire),
+        "schedule-error cleanup must not kick dispatch when the slot belongs to a replacement"
     );
 }

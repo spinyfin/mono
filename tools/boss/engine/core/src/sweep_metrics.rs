@@ -1,0 +1,121 @@
+//! Per-pass telemetry for the engine's background sweeps.
+//!
+//! Duration, item counts and pass counts describe the work performed.
+//! Periodic singleton sweeps also report the interval between pass starts.
+//! Concurrent tails and rebase operations do not have a shared cadence.
+
+#[cfg(test)]
+use std::time::Instant;
+
+use crate::metrics::Registry;
+pub(crate) use crate::work::sweep_handles::AGENT_JSONL_STREAM_ROOT_REVALIDATIONS;
+use crate::work::sweep_handles::{
+    AGENT_JSONL_STREAM_ITEMS_PER_PASS, AGENT_JSONL_STREAM_PASS_DURATION_MS, AGENT_JSONL_STREAM_PASSES,
+    DEAD_PANE_TERMINAL_ITEMS_PER_PASS, DEAD_PANE_TERMINAL_PASS_DURATION_MS, DEAD_PANE_TERMINAL_PASSES,
+    ENVELOPE_WATCH_ITEMS_PER_PASS, ENVELOPE_WATCH_PASS_DURATION_MS, ENVELOPE_WATCH_PASSES,
+    ENVELOPE_WATCH_TICK_INTERVAL_MS, TERMINAL_WORK_SWEEP_ITEMS_PER_PASS, TERMINAL_WORK_SWEEP_PASS_DURATION_MS,
+    TERMINAL_WORK_SWEEP_PASSES, TERMINAL_WORK_SWEEP_TICK_INTERVAL_MS,
+};
+pub(crate) use boss_metrics::sweep::{PassTimer, SweepTicker};
+pub(crate) static DEAD_PANE_TERMINAL: SweepTicker = SweepTicker::new(
+    &DEAD_PANE_TERMINAL_PASS_DURATION_MS,
+    &DEAD_PANE_TERMINAL_ITEMS_PER_PASS,
+    None,
+    &DEAD_PANE_TERMINAL_PASSES,
+);
+
+/// Register every handle this module declares. Called from
+/// `boss_engine::metrics_init::init_all` at engine startup.
+pub fn register_metrics(registry: &Registry) {
+    for ticker in [
+        &DEAD_PANE_TERMINAL,
+        &ENVELOPE_WATCH,
+        &TERMINAL_WORK_SWEEP,
+        &AGENT_JSONL_STREAM,
+    ] {
+        ticker.register(registry);
+    }
+    registry.register_counter(&AGENT_JSONL_STREAM_ROOT_REVALIDATIONS);
+}
+
+pub(crate) static ENVELOPE_WATCH: SweepTicker = SweepTicker::new(
+    &ENVELOPE_WATCH_PASS_DURATION_MS,
+    &ENVELOPE_WATCH_ITEMS_PER_PASS,
+    Some(&ENVELOPE_WATCH_TICK_INTERVAL_MS),
+    &ENVELOPE_WATCH_PASSES,
+);
+pub(crate) static TERMINAL_WORK_SWEEP: SweepTicker = SweepTicker::new(
+    &TERMINAL_WORK_SWEEP_PASS_DURATION_MS,
+    &TERMINAL_WORK_SWEEP_ITEMS_PER_PASS,
+    Some(&TERMINAL_WORK_SWEEP_TICK_INTERVAL_MS),
+    &TERMINAL_WORK_SWEEP_PASSES,
+);
+pub(crate) static AGENT_JSONL_STREAM: SweepTicker = SweepTicker::new(
+    &AGENT_JSONL_STREAM_PASS_DURATION_MS,
+    &AGENT_JSONL_STREAM_ITEMS_PER_PASS,
+    None,
+    &AGENT_JSONL_STREAM_PASSES,
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticker_records_duration_items_interval_and_pass_count() {
+        let registry = Registry::new();
+        register_metrics(&registry);
+
+        let mut previous = None;
+        ENVELOPE_WATCH.record_tick(&registry, &mut previous);
+        let first = ENVELOPE_WATCH.begin();
+        first.finish(&registry, 3);
+        assert_eq!(registry.gauge_value("envelope_watch.items_per_pass"), Some(3));
+        assert_eq!(registry.counter_value("envelope_watch.passes"), Some(1));
+        assert!(registry.gauge_value("envelope_watch.pass_duration_ms").is_some());
+
+        ENVELOPE_WATCH.record_tick(&registry, &mut previous);
+        let second = ENVELOPE_WATCH.begin();
+        second.finish(&registry, 0);
+        assert_eq!(registry.gauge_value("envelope_watch.items_per_pass"), Some(0));
+        assert_eq!(registry.counter_value("envelope_watch.passes"), Some(2));
+        // The interval gauge is populated only once a previous pass exists.
+        assert!(registry.gauge_value("envelope_watch.tick_interval_ms").is_some());
+    }
+
+    #[test]
+    fn every_sweep_ticker_registers_distinct_names() {
+        let registry = Registry::new();
+        register_metrics(&registry);
+        for name in [
+            "envelope_watch.pass_duration_ms",
+            "terminal_work_sweep.items_per_pass",
+            "agent_jsonl_stream.items_per_pass",
+        ] {
+            assert_eq!(registry.gauge_value(name), Some(0), "{name}");
+        }
+        for name in [
+            "envelope_watch.passes",
+            "terminal_work_sweep.passes",
+            "agent_jsonl_stream.passes",
+            "agent_jsonl_stream.root_revalidations",
+        ] {
+            assert_eq!(registry.counter_value(name), Some(0), "{name}");
+        }
+    }
+
+    #[test]
+    fn direct_passes_do_not_change_loop_cadence() {
+        let registry = Registry::new();
+        register_metrics(&registry);
+        let mut previous = Some(Instant::now() - std::time::Duration::from_secs(1));
+        ENVELOPE_WATCH.record_tick(&registry, &mut previous);
+        let interval = registry.gauge_value("envelope_watch.tick_interval_ms");
+        ENVELOPE_WATCH.begin().finish(&registry, 0);
+        ENVELOPE_WATCH.begin().finish(&registry, 0);
+        assert_eq!(registry.gauge_value("envelope_watch.tick_interval_ms"), interval);
+        let mut other_loop = None;
+        ENVELOPE_WATCH.record_tick(&registry, &mut other_loop);
+        assert_eq!(registry.gauge_value("envelope_watch.tick_interval_ms"), interval);
+    }
+}

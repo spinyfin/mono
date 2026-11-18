@@ -1,0 +1,20 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When the same worker terminal could appear in two Boss windows, where should it be live? The design picks the first option; the earlier investigation recommended the second.",
+    "choices": [
+      "Follow the visible page: the terminal moves automatically to the tab that is actually showing Agents, and stays put only when two windows show it at once",
+      "Stay put: the terminal stays in the window that first had it until I press Move Terminal Here"
+    ],
+    "anchor": "ownership-rules"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which macOS versions must pass the acceptance matrix before native tabs are turned on by default? Automated runs can only cover the machine the workers run on; any other version needs you to run the manual checklist there.",
+    "choices": [
+      "Only the macOS version on the worker machine",
+      "The worker machine's version and macOS 15 (the oldest supported)"
+    ],
+    "anchor": "flag-and-rollout"
+  }
+]

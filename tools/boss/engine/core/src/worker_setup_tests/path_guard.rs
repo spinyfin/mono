@@ -1,6 +1,32 @@
 use super::super::*;
 use super::helpers::*;
 
+#[test]
+fn path_guard_denials_avoid_internal_vocabulary() {
+    for name in ["MALFORMED", "RECOVERY", "TRAVERSAL_RECOVERY"] {
+        let prefix = format!("{name} = (\n");
+        let body = PATH_GUARD_SCRIPT
+            .split_once(&prefix)
+            .unwrap()
+            .1
+            .split_once("\n)")
+            .unwrap()
+            .0;
+        let mut message = String::new();
+        for line in body.lines() {
+            message.push_str(&serde_json::from_str::<String>(line.trim()).unwrap());
+        }
+        // Directory spellings with and without a trailing slash name the
+        // same structured path already exempted by the shared scanner.
+        for marker in crate::prose_vocabulary::STRUCTURED_MARKERS {
+            if marker.ends_with('/') {
+                message = message.replace(marker.trim_end_matches('/'), "");
+            }
+        }
+        crate::prose_vocabulary::assert_no_forbidden_prose(name, &message);
+    }
+}
+
 /// Locate the deterministic path-guard PreToolUse hook command (the
 /// one that invokes the gate script), if present.
 fn path_guard_command(parsed: &serde_json::Value) -> Option<String> {
@@ -69,8 +95,8 @@ fn path_guard_script_has_the_load_bearing_logic() {
         "must be able to emit a block decision"
     );
     assert!(
-        s.contains("boss task restore") || s.contains("boss shake"),
-        "block message must point at the sanctioned recovery surface"
+        s.contains("propose blocked --reason"),
+        "block message must point at propose blocked when progress needs a human"
     );
 }
 
@@ -201,6 +227,10 @@ fn path_guard_blocks_a_relative_read_whose_cwd_is_the_data_dir() {
         "a Read of a relative path resolving into the data dir must be blocked: {reason}",
     );
     assert!(reason.contains("engine-owned"), "{reason}");
+    assert!(
+        reason.contains("propose blocked --reason"),
+        "data-directory rejection must name propose blocked: {reason}"
+    );
 
     // Same shape one level deeper, and via `..` — canonicalisation, not
     // string matching, is what makes the boundary hold.
@@ -257,6 +287,41 @@ fn path_guard_blocks_a_bash_cd_then_relative_read_of_the_data_dir() {
         "cd-into-data-dir then read must be blocked: {reason}"
     );
     assert!(reason.contains("engine-owned"), "{reason}");
+}
+
+#[test]
+fn path_guard_blocks_arithmetic_rebinding_of_the_data_dir() {
+    let data = TempDir::new().unwrap();
+    std::fs::write(data.path().join("state.db"), b"x").unwrap();
+    for command in [
+        r#"(( BOSS_DATA_DIR = 0 )); cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"$[BOSS_DATA_DIR=0]; cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"echo "${a[BOSS_DATA_DIR=0]}"; cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"[[ 1 -eq BOSS_DATA_DIR=0 ]]; cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"(( BOSS_DATA_DIR = 0 )); echo x > "${BOSS_DATA_DIR}/../T/state.db""#,
+        "(( BOSS_DATA\\\n_DIR = 0 )); cat \"${BOSS_DATA_DIR}/../T/state.db\"",
+        r#"n=BOSS_DATA; echo "${a[${n}_DIR=0]}"; cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"n=BOSS_DATA; echo $[${n}_DIR=0]; cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"n=BOSS_DATA; printf '%s' $[${n}_DIR=0]; echo x > "${BOSS_DATA_DIR}/../T/state.db""#,
+    ] {
+        let (decision, reason) = run_path_guard(
+            data.path(),
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
+        );
+        assert_eq!(
+            decision, "block",
+            "arithmetic rebinding of BOSS_DATA_DIR must be blocked: {command}: {reason}"
+        );
+        assert!(reason.contains("engine-owned"), "{command}: {reason}");
+    }
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "rg BOSS_DATA_DIR ."}}),
+    );
+    assert_eq!(
+        decision, "approve",
+        "a bare name used as search text must not be treated as a rebinding: {reason}"
+    );
 }
 
 #[test]

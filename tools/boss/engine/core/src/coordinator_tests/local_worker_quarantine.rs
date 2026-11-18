@@ -21,10 +21,18 @@ fn historical_quarantine_blocks_local_placement_and_duplicate_dispatch_but_allow
         Arc::new(FakeCubeClient::default()),
         Arc::new(FakeExecutionRunner::default()),
     );
-    let error = coordinator.validate_requested_host(&unrelated.id, "local").unwrap_err();
+    let error = coordinator
+        .validate_requested_host_for_test(&unrelated.id, "local")
+        .unwrap_err();
     assert!(error.to_string().contains("local dispatch quarantined"), "{error:#}");
-    coordinator.validate_requested_host(&unrelated.id, "remote").unwrap();
-    assert!(coordinator.validate_requested_host(&historical.id, "remote").is_err());
+    coordinator
+        .validate_requested_host_for_test(&unrelated.id, "remote")
+        .unwrap();
+    assert!(
+        coordinator
+            .validate_requested_host_for_test(&historical.id, "remote")
+            .is_err()
+    );
     let error = db
         .request_execution(RequestExecutionInput::builder().work_item_id(&historical.id).build())
         .unwrap_err();

@@ -17,9 +17,9 @@
 
 use anyhow::Result;
 use boss_client::BossClient;
-use boss_engine::coordinator::CubeWorkspaceLease;
 use boss_engine::ladder_lease_registry;
 use boss_engine::work::{CiRemediationInsertInput, ConflictResolutionInsertInput, WorkDb};
+use boss_host_execution::types::CubeWorkspaceLease;
 use boss_protocol::{CreateChoreInput, WorkItemPatch};
 
 use common::{run_boss, run_boss_expect_failure, run_boss_human};

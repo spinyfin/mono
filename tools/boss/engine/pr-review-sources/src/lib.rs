@@ -1037,7 +1037,7 @@ where
     loop {
         while pending.len() < 8 {
             let Some(request) = requests.next() else { break };
-            pending.spawn(boss_gh_telemetry::scope(caller, request));
+            boss_task_scope::spawn_into(&mut pending, boss_gh_telemetry::scope(caller, request));
         }
         let Some(result) = pending.join_next().await else { break };
         results.push(result.context("pinned source read task failed")?);

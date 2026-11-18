@@ -1,27 +1,29 @@
-//! Garbage collection: consumed bookmarks, closed-PR bookmarks, aged
+//! Garbage collection: consumed bookmarks, aged
 //! unhealthy workspaces, stale logs, and the background pool GC trigger.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
-
-use git_utils::pr_bookmark;
 
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config, paths};
 
+use crate::app::cleanup::{any_cleanup_awaiting_retry, any_volume_below_low_water};
 use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{self, run_jj, run_jj_network, workspace_path_exists};
+use crate::app::pr_head;
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
 use crate::app::salvage::{
-    attributed_holder, attributed_task, discard_salvage_record, gc_aged_salvage_records, salvage_workspace,
+    ProbeSalvageError, ProbedAndSalvaged, attributed_holder, attributed_task, discard_salvage_record,
+    gc_aged_salvage_records, probe_and_salvage,
 };
+use crate::app::store_gc::{spawn_detached_store_gc, store_gc_due};
 use crate::app::util::current_epoch_s;
 
 /// Pool-wide gc runs at most once per 24 hours (when there is no known
@@ -76,22 +78,32 @@ pub(super) const POOL_GC_BACKLOG_RETRY_SECS: i64 = 5 * 60;
 /// pass that came up empty falls back to [`AUTO_GC_INTERVAL_SECS`].
 pub(super) const POOL_GC_TRIM_PROGRESS_KEY: &str = "last_pool_gc_trim_made_progress";
 
-/// List and optionally forget consumed `boss/exec_*` bookmarks and
-/// unreferenced `pr/<n>` bookmarks in a workspace.
+/// The same signal for repo-declared workspace cleanup: `1` if the last pass
+/// cleaned something or stopped early at its deadline, `0` if it walked every
+/// eligible workspace and could clean none (all busy, all failing). Free-space
+/// pressure and failed-cleanup marks only shorten the GC interval while the
+/// previous pass showed it could act on them, so a volume that stays low with
+/// nothing cleanable — or a cleanup command that keeps failing — does not pin
+/// the throttle at [`POOL_GC_BACKLOG_RETRY_SECS`].
+pub(super) const POOL_GC_CLEANUP_PROGRESS_KEY: &str = "last_pool_gc_cleanup_made_progress";
+
+/// List and optionally forget consumed `boss/exec_*` bookmarks.
 ///
 /// A `boss/exec_*` bookmark is "consumed" when its tip is reachable from `main`
-/// (`bookmarks(glob:"boss/exec_*") & ::main`). A `pr/<n>` bookmark is eligible
-/// for GC when no workspace in the shared store is positioned on it any more
-/// (see [`collect_unreferenced_pr_bookmarks`]) — a purely local decision, with
-/// no network call and no dependence on GitHub's view of the PR.
+/// (`bookmarks(glob:"boss/exec_*") & ::main`). A bookmark that is *conflicted*
+/// has one tip per side, and `jj bookmark forget` drops every side at once, so
+/// a name is forgotten only when no side holds unpublished non-empty work: a
+/// side that is merged, published to a remote, or an empty commit over such
+/// history loses nothing, but a side with unpushed work keeps the whole
+/// bookmark (the merged side included) in place. Other bookmark namespaces,
+/// and conflicts in them, are never touched here.
 ///
 /// If `do_fetch` is true, runs `jj git fetch` first so `::main` reflects the
 /// latest merged PRs. If `dry_run` is true, lists what would be forgotten
 /// without acting.
 ///
 /// Returns the names of bookmarks forgotten (or that would be forgotten on
-/// dry-run). **Every failure is propagated.** Neither half of the sweep may
-/// degrade to "found nothing": pruning is the only thing that bounds these
+/// dry-run). Errors propagate: the sweep is the only thing that bounds these
 /// bookmark sets, so a sweep that cannot decide has to say so loudly rather
 /// than report an empty result that reads identically to a clean pool. See
 /// the caller in `workspace::release` for how that surfaces.
@@ -109,60 +121,77 @@ pub(super) fn gc_workspace_bookmarks(
             &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
         )?;
     }
+    if !dry_run {
+        pr_head::prune_stale_temp_remotes(runner, database_path, workspace_path);
+    }
 
-    let output = run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            workspace_path,
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"boss/exec_*\") & ::main",
-                "--no-graph",
-                "-T",
-                BOOKMARK_NAMES_TEMPLATE,
-            ],
-        ),
-    )?;
-
-    let mut bookmarks: Vec<String> = dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_"));
-
-    // Also sweep pr/<n> bookmarks no workspace is positioned on any more.
-    bookmarks.extend(collect_unreferenced_pr_bookmarks(
-        runner,
-        database_path,
-        workspace_path,
-    )?);
-
-    if bookmarks.is_empty() || dry_run {
-        return Ok(bookmarks);
+    let exec_bookmarks = collect_consumed_exec_bookmarks(runner, database_path, workspace_path).map_err(|error| {
+        crate::app::errors::CubeError::InvalidArgument(format!(
+            "cannot sweep consumed bookmarks in {}: {error}",
+            workspace_path.display()
+        ))
+    })?;
+    if exec_bookmarks.is_empty() || dry_run {
+        return Ok(exec_bookmarks);
     }
 
     let mut args: Vec<&str> = vec!["bookmark", "forget"];
-    let bookmark_refs: Vec<&str> = bookmarks.iter().map(String::as_str).collect();
-    args.extend_from_slice(&bookmark_refs);
+    args.extend(exec_bookmarks.iter().map(String::as_str));
     run_jj(
         runner,
         database_path,
         &RealCommandRunner::invocation(workspace_path, "jj", &args),
     )?;
 
-    Ok(bookmarks)
+    Ok(exec_bookmarks)
+}
+
+/// Tips of `boss/exec_*` bookmark sides that main does not contain.
+const UNMERGED_EXEC_TIPS: &str = r#"bookmarks(glob:"boss/exec_*") ~ ::main"#;
+
+/// Unmerged tips whose history holds a non-empty commit that neither main nor
+/// any remote bookmark contains: the unpublished work a forget would orphan.
+pub(super) fn unpublished_exec_tips() -> String {
+    format!(
+        "({UNMERGED_EXEC_TIPS}) & descendants((::({UNMERGED_EXEC_TIPS}) ~ ::main ~ ::remote_bookmarks()) ~ empty())"
+    )
+}
+
+fn collect_consumed_exec_bookmarks(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+) -> Result<Vec<String>> {
+    let names_of = |revset: &str| -> Result<Vec<String>> {
+        let output = run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                workspace_path,
+                "jj",
+                &["log", "-r", revset, "--no-graph", "-T", BOOKMARK_NAMES_TEMPLATE],
+            ),
+        )?;
+        Ok(dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_")))
+    };
+    let consumed = names_of(r#"bookmarks(glob:"boss/exec_*") & ::main"#)?;
+    if consumed.is_empty() {
+        return Ok(consumed);
+    }
+    let holding_work = names_of(&unpublished_exec_tips())?;
+    Ok(consumed
+        .into_iter()
+        .filter(|name| !holding_work.contains(name))
+        .collect())
 }
 
 /// Render bookmark names from a `jj log` template without jj's sync-status
 /// markers.
 ///
 /// The bare `bookmarks` keyword decorates a name that is not synced with its
-/// remote counterpart — `pr/1648` renders as `pr/1648*`. The sweep used to
-/// read that keyword and split on whitespace, so a decorated name failed
-/// [`pr_bookmark::is_pr_bookmark`]'s all-digits check and was dropped from the
-/// candidate set entirely: six of the sixty `pr/*` bookmarks in the live
-/// `mono` store were permanently unforgettable for that reason alone. Mapping
-/// over `.name()` yields the undecorated name, which is both what the filters
-/// expect and what `jj bookmark forget` will accept.
+/// remote counterpart (`name*`). Mapping over `.name()` yields the undecorated
+/// name, which is both what the filters expect and what `jj bookmark forget`
+/// will accept.
 pub(super) const BOOKMARK_NAMES_TEMPLATE: &str = r#"bookmarks.map(|b| b.name()).join("\n") ++ "\n""#;
 
 /// Parse [`BOOKMARK_NAMES_TEMPLATE`] output into a de-duplicated list of the
@@ -177,89 +206,6 @@ fn dedup_bookmark_names(output: &str, keep: impl Fn(&str) -> bool) -> Vec<String
         .filter(|s| seen.insert(s.to_string()))
         .map(str::to_string)
         .collect()
-}
-
-/// Revset for `pr/<n>` bookmarks no workspace is positioned on any more: every
-/// `pr/*` bookmark, minus those reachable from some workspace's working copy.
-///
-/// `working_copies()` resolves the `@` of *every* workspace registered in the
-/// shared store, which is the right scope precisely because the store is
-/// shared — see [`collect_unreferenced_pr_bookmarks`].
-pub(super) const UNREFERENCED_PR_BOOKMARKS_REVSET: &str = r#"bookmarks(glob:"pr/*") ~ ::(working_copies())"#;
-
-/// Collect local `pr/<n>` bookmarks that no workspace in the shared store is
-/// positioned on any more, and which are therefore safe to forget.
-///
-/// ## Why the retained set is bounded by construction
-///
-/// Cube workspaces are *secondary jj workspaces sharing one object store per
-/// repo*, so `pr/*` bookmarks are repo-global, not per-workspace: the set one
-/// release walks is every PR any workspace of that repo has ever touched.
-/// Deciding eligibility from GitHub's view of the PR bounded that set at
-/// "every open PR the pool has ever touched", which is not a bound cube owns
-/// — measured on the live `mono` store, 57 of 60 accumulated bookmarks were
-/// for PRs still open, so a *fully successful* sweep would have forgotten
-/// three and left fifty-seven.
-///
-/// Reachability replaces that with a bound cube does own. A `pr/<n>` bookmark
-/// is retained only while some workspace's `@` sits at or below it, so the
-/// retained set is at most one PR stack per workspace. It cannot grow with
-/// elapsed time, with the number of PRs the pool has touched, with GitHub's
-/// PR lifecycle, or with whether the previous sweep succeeded — a workspace
-/// that has been in the pool for a year carries the stack it is on, not a
-/// year of stacks.
-///
-/// ## Why forgetting the rest cannot lose anything
-///
-/// These bookmarks are derivable on demand: every path that needs one also
-/// creates it (`cube workspace goto --pr`, `cube pr create`, `cube pr
-/// update`), so a worker returning to a PR re-establishes the bookmark as a
-/// side effect of the command it was going to run anyway. The one use that
-/// genuinely requires local state — `cube pr push` inferring its PR from
-/// `@`'s ancestry — only ever consults bookmarks that are reachable from `@`,
-/// which is exactly the set kept here. A workspace still holding unpushed
-/// work keeps its bookmarks for the same reason: its `@` is still on them,
-/// and the release path does not even reach this sweep when the reuse guard
-/// preserves a working copy.
-///
-/// ## Failure is not an empty result
-///
-/// The old collector returned `vec![]` on every error — unreachable remote,
-/// failed `jj log`, failed or timed-out PR-state lookup — and the release
-/// caller logged that as a warning and moved on. Pruning is the only thing
-/// that bounds this set, so "the sweep broke" and "there was nothing to
-/// prune" reported identically while the backlog grew and made the next
-/// sweep slower still. Every failure here is returned to the caller instead.
-///
-/// This runs no network commands at all, so unlike its predecessor it also
-/// works offline and cannot be wedged by a hung or rate-limited GitHub.
-pub(super) fn collect_unreferenced_pr_bookmarks(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-) -> Result<Vec<String>> {
-    let output = run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            workspace_path,
-            "jj",
-            &[
-                "log",
-                "-r",
-                UNREFERENCED_PR_BOOKMARKS_REVSET,
-                "--no-graph",
-                "-T",
-                BOOKMARK_NAMES_TEMPLATE,
-            ],
-        ),
-    )?;
-
-    // A commit carrying an unreferenced `pr/<n>` can also carry bookmarks in
-    // other namespaces (a `boss/exec_*` head, most commonly). Only the `pr/*`
-    // ones are this sweep's business; the `boss/exec_*` half has its own,
-    // stricter "reachable from main" test in `gc_workspace_bookmarks`.
-    Ok(dedup_bookmark_names(&output, pr_bookmark::is_pr_bookmark))
 }
 
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently
@@ -345,7 +291,28 @@ fn aged_unhealthy_since(record: &WorkspaceRecord, threshold_epoch_s: i64) -> Opt
 /// stall lease dispatch, and wrapped in `catch_unwind` so a panic inside it
 /// cannot leave `last_pool_gc_started_at` permanently ahead of
 /// `last_pool_gc_at`.
-pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Path>, now_epoch_s: i64) -> Result<()> {
+pub(super) fn maybe_trigger_pool_gc(
+    runner: &dyn CommandRunner,
+    store: &mut Store,
+    database_path: Option<&Path>,
+    now_epoch_s: i64,
+) -> Result<()> {
+    maybe_trigger_pool_gc_with_spawner(
+        runner,
+        store,
+        database_path,
+        now_epoch_s,
+        &crate::app::periodic_cleanup::spawn,
+    )
+}
+
+pub(super) fn maybe_trigger_pool_gc_with_spawner(
+    runner: &dyn CommandRunner,
+    store: &mut Store,
+    database_path: Option<&Path>,
+    now_epoch_s: i64,
+    spawn_cleanup: &dyn Fn(Option<&Path>) -> std::io::Result<()>,
+) -> Result<()> {
     // Skip if a pass is already in progress (started within the safety-net timeout).
     let last_started = store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)?;
     if last_started.is_some_and(|t| (now_epoch_s - t) < POOL_GC_IN_PROGRESS_TIMEOUT_SECS) {
@@ -363,8 +330,13 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
         // POOL_GC_TRIM_PROGRESS_KEY for the steady state this rules out.
         // Every check here is DB-only.
         let trim_made_progress = store.get_pool_metadata_i(POOL_GC_TRIM_PROGRESS_KEY)?.unwrap_or(1) != 0;
+        // Low free space (or a cleanup waiting on retry) is backlog too — the
+        // volume cannot wait a day — but, like the surplus, only while the last
+        // cleanup pass demonstrated it could act.
+        let cleanup_made_progress = store.get_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY)?.unwrap_or(1) != 0;
         let has_backlog = pool_gc_has_aged_unhealthy_backlog(store, now_epoch_s).unwrap_or(true)
-            || (trim_made_progress && has_free_workspace_surplus(store));
+            || (trim_made_progress && has_free_workspace_surplus(store))
+            || (cleanup_made_progress && (any_volume_below_low_water(store) || any_cleanup_awaiting_retry(store)));
         let interval = if has_backlog {
             POOL_GC_BACKLOG_RETRY_SECS
         } else {
@@ -379,7 +351,7 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     let db_path_owned = database_path.map(Path::to_path_buf);
     let deadline = Instant::now() + POOL_GC_TIME_BUDGET;
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_pool_gc_background(db_path_owned, deadline);
+        run_pool_gc_background(runner, db_path_owned, deadline, spawn_cleanup);
     })) {
         eprintln!("cube: auto gc: pass panicked: {panic:?}");
     }
@@ -392,7 +364,16 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     Ok(())
 }
 
-pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, deadline: Instant) {
+/// Every subprocess of the pass, including the detached store-upkeep
+/// child, goes through `runner`: the pass must never build its own real
+/// runner, or a test that leases on a fresh database would start real
+/// processes (see `store_gc` for the one that fork-bombed a dev Mac).
+fn run_pool_gc_background(
+    runner: &dyn CommandRunner,
+    database_path: Option<std::path::PathBuf>,
+    deadline: Instant,
+    spawn_cleanup: &dyn Fn(Option<&Path>) -> std::io::Result<()>,
+) {
     let store = match database_path.as_deref() {
         Some(p) => Store::open_at(p),
         None => Store::open_default(),
@@ -401,7 +382,6 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         eprintln!("cube: auto gc: failed to open store");
         return;
     };
-    let runner = RealCommandRunner;
 
     // Compaction goes first: it is the pass that actually returns the disk
     // (uncleaned build-artifact trees were 82% of the entire workspaces tree
@@ -422,7 +402,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     let compaction_deadline = deadline.checked_sub(POOL_GC_TIME_BUDGET / 2).unwrap_or(deadline);
     if let Ok(now) = current_epoch_s() {
         let compacted = compact_free_workspaces(
-            &runner,
+            runner,
             &store,
             database_path.as_deref(),
             None,
@@ -440,6 +420,19 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         }
     }
 
+    // Repo commands have their own timeout and can take minutes. Launch them
+    // independently so lease dispatch never waits for shutdown or removal.
+    if any_volume_below_low_water(&store) || any_cleanup_awaiting_retry(&store) {
+        if let Err(error) = spawn_cleanup(database_path.as_deref()) {
+            eprintln!("cube: auto gc: cannot launch workspace cleanup: {error}");
+        }
+    } else {
+        // A healthy pass resets the signal so future pressure gets a chance.
+        let _ = store
+            .set_pool_metadata_i(POOL_GC_CLEANUP_PROGRESS_KEY, 1)
+            .map_err(|e| eprintln!("cube: auto gc: failed to record the cleanup outcome: {e}"));
+    }
+
     if Instant::now() >= deadline {
         eprintln!("cube: auto gc: time budget exhausted after compaction, deferring the rest to the next pass");
         return;
@@ -453,7 +446,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     let max_age_secs = gc_config.max_age_secs();
     if let Ok(now) = current_epoch_s() {
         gc_aged_unhealthy_workspaces(
-            &runner,
+            runner,
             &store,
             database_path.as_deref(),
             now,
@@ -475,7 +468,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     // it could) and is itself bounded by the same deadline so it cannot eat
     // into the remaining budget meant for the log/bookmark sweep below.
     let health_report = reconcile_free_workspace_health(
-        &runner,
+        runner,
         &store,
         database_path.as_deref(),
         None,
@@ -502,7 +495,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     // stuck-dirty workspaces (making them provably empty of work, hence
     // eligible here) and reconcile has just relabelled whatever recovered.
     if let Ok(now) = current_epoch_s() {
-        let trimmed = trim_free_workspaces_to_mark(&runner, &store, database_path.as_deref(), now, Some(deadline));
+        let trimmed = trim_free_workspaces_to_mark(runner, &store, database_path.as_deref(), now, Some(deadline));
         if trimmed.workspaces_removed > 0 {
             eprintln!(
                 "cube: auto gc: removed {} surplus free workspace(s), reclaiming {}",
@@ -537,6 +530,21 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         }
     }
 
+    // Shared-store upkeep, once a day per repo, in a detached `cube repo gc`
+    // process: abandoning old operations is quick, but the collection that
+    // follows deletes one file per abandoned operation and view and cannot
+    // be bounded by this pass's budget (the first run on a neglected store
+    // is minutes of unlinks). The stamp is written before the child starts,
+    // so a slow child is never doubled by the next lease, and the child
+    // itself takes the repo's store-gc lock.
+    if let (Ok(now), Ok(repos)) = (current_epoch_s(), store.list_repos()) {
+        for record in repos.iter().filter(|r| r.source.is_some()) {
+            if store_gc_due(&store, &record.repo, now) {
+                spawn_detached_store_gc(runner, &store, database_path.as_deref(), &record.repo, now);
+            }
+        }
+    }
+
     // Sweep consumed bookmarks from every non-leased workspace. Each workspace
     // runs jj git fetch; a broken/unreachable remote times out after
     // network_cmd_timeout() and is skipped so one slow workspace cannot block
@@ -565,7 +573,7 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
         // rather than absorbed: this sweep is the only thing that prunes
         // either bookmark namespace, so a silent failure is unbounded growth
         // with no signal.
-        if let Err(e) = gc_workspace_bookmarks(&runner, database_path.as_deref(), &record.workspace_path, true, false) {
+        if let Err(e) = gc_workspace_bookmarks(runner, database_path.as_deref(), &record.workspace_path, true, false) {
             eprintln!(
                 "cube: auto gc: error: bookmark gc for {} failed, nothing pruned: {e}",
                 record.workspace_id,
@@ -824,80 +832,52 @@ pub(super) fn gc_aged_unhealthy_workspaces(
         // this probe is 120s per attempt with two retries behind it, so one
         // slow remote could otherwise hold a lease for several minutes and
         // blow both this pass's 20s budget and the engine's 90s lease timeout.
-        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch, deadline)
-        {
-            Ok(status) => status,
-            Err(e) if jj::is_time_budget_error(&e) => {
-                // Deferral, not a health verdict: this candidate was never
-                // actually evaluated, so it must not be reported the same way
-                // as a genuine probe failure below.
-                eprintln!(
-                    "cube: retention: {}: time budget exhausted, leaving retained (not evaluated): {e}",
-                    record.workspace_id,
-                );
-                audit!(
-                    database_path,
-                    "workspace.retention_budget_exhausted",
-                    repo = record.repo,
-                    workspace_id = record.workspace_id,
-                    prior_health = prior_health,
-                    age_secs = age_secs,
-                    error = e.to_string(),
-                );
-                continue;
-            }
-            Err(e) => {
-                eprintln!(
-                    "cube: retention: {}: reuse probe failed, leaving retained: {e}",
-                    record.workspace_id,
-                );
-                audit!(
-                    database_path,
-                    "workspace.retention_probe_error",
-                    repo = record.repo,
-                    workspace_id = record.workspace_id,
-                    prior_health = prior_health,
-                    age_secs = age_secs,
-                    error = e.to_string(),
-                );
-                continue;
-            }
-        };
-
-        // Anything the workspace holds that no remote has gets salvaged before
-        // the reset. A failed salvage is a hard stop for this workspace: the
-        // whole basis for bounding retention is that expiry cannot lose work.
-        // "Failed" includes any capture that cannot be proven complete — an
-        // empty log after a probe that refused reuse, or a stack larger than
-        // the export cap — see `salvage_workspace`.
-        let mut salvaged_to: Option<PathBuf> = None;
-        if !status.is_reusable() {
-            match salvage_workspace(runner, database_path, &record, &main_branch, now_epoch_s, deadline) {
-                Ok(path) => {
-                    let path_str = path.display().to_string();
+        let (status, salvaged_to) =
+            match probe_and_salvage(runner, database_path, &record, &main_branch, now_epoch_s, deadline) {
+                Ok(ProbedAndSalvaged { status, salvaged_to }) => (status, salvaged_to),
+                Err(ProbeSalvageError::Probe(e)) if jj::is_time_budget_error(&e) => {
+                    // Deferral, not a health verdict: this candidate was never
+                    // actually evaluated, so it must not be reported the same way
+                    // as a genuine probe failure below.
                     eprintln!(
-                        "cube: retention: {} held unpushed work; salvaged to {path_str} before reclaiming",
+                        "cube: retention: {}: time budget exhausted, leaving retained (not evaluated): {e}",
                         record.workspace_id,
                     );
                     audit!(
                         database_path,
-                        "workspace.retention_salvaged",
+                        "workspace.retention_budget_exhausted",
                         repo = record.repo,
                         workspace_id = record.workspace_id,
                         prior_health = prior_health,
-                        prior_holder = attributed_holder(&record),
-                        prior_task = attributed_task(&record),
                         age_secs = age_secs,
-                        head_change_id = status.head_change_id(),
-                        unpushed_commits = status.unpushed_summary(),
-                        salvage_path = path_str,
+                        error = e.to_string(),
                     );
-                    salvaged_to = Some(path);
+                    continue;
                 }
-                Err(e) => {
+                Err(ProbeSalvageError::Probe(e)) => {
+                    eprintln!(
+                        "cube: retention: {}: reuse probe failed, leaving retained: {e}",
+                        record.workspace_id,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.retention_probe_error",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        prior_health = prior_health,
+                        age_secs = age_secs,
+                        error = e.to_string(),
+                    );
+                    continue;
+                }
+                // A failed salvage is a hard stop for this workspace: the whole
+                // basis for bounding retention is that expiry cannot lose work.
+                // "Failed" includes any capture that cannot be proven complete —
+                // see `salvage_workspace`.
+                Err(ProbeSalvageError::Salvage { status, error: e }) => {
                     eprintln!(
                         "cube: retention: {}: salvage failed, leaving retained rather than \
-                         reclaiming: {e}",
+                     reclaiming: {e}",
                         record.workspace_id,
                     );
                     audit!(
@@ -913,8 +893,28 @@ pub(super) fn gc_aged_unhealthy_workspaces(
                     );
                     continue;
                 }
-            }
-        } else if is_quarantined {
+            };
+        if let Some(path) = &salvaged_to {
+            let path_str = path.display().to_string();
+            eprintln!(
+                "cube: retention: {} held unpushed work; salvaged to {path_str} before reclaiming",
+                record.workspace_id,
+            );
+            audit!(
+                database_path,
+                "workspace.retention_salvaged",
+                repo = record.repo,
+                workspace_id = record.workspace_id,
+                prior_health = prior_health,
+                prior_holder = attributed_holder(&record),
+                prior_task = attributed_task(&record),
+                age_secs = age_secs,
+                head_change_id = status.head_change_id(),
+                unpushed_commits = status.unpushed_summary(),
+                salvage_path = path_str,
+            );
+        }
+        if salvaged_to.is_none() && is_quarantined {
             audit!(
                 database_path,
                 "workspace.quarantine_cleared",

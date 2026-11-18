@@ -10,7 +10,7 @@ extension ChatViewModel {
     /// Reception of a full `WorkTree` snapshot for one product: replaces that
     /// product's slice of every bucket, re-sorts it, and re-runs the
     /// reconciliations a fresh snapshot invalidates (optimistic overrides,
-    /// selection, subscriptions, design-doc state).
+    /// selection, subscriptions).
     func applyWorkTree(
         product: WorkProduct,
         projects: [WorkProject],
@@ -18,7 +18,11 @@ extension ChatViewModel {
         chores: [WorkTask],
         taskRuntimes: [WorkTaskRuntime],
         dependencies: [WorkItemDependency],
-        ideas: [WorkIdea]
+        ideas: [WorkIdea],
+        attentionItems: [WorkAttentionItem],
+        attentionGroups: [AttentionGroup],
+        attentionMembers: [Attention],
+        plannerRuns: [PlannerRunSummary] = []
     ) {
         // Fan-out regression counter (design entry 2): full work-tree applies.
         UIUpdateCounters.shared.recordApplyWorkTree()
@@ -31,6 +35,8 @@ extension ChatViewModel {
         if currentSelectedProductID == nil {
             selectedWorkProductID = product.id
         }
+        applyPlannerRunSummaries(plannerRuns, forProductID: product.id, projects: projects)
+        selectionHistory.pruneProjects(productID: product.id, validIDs: Set(projects.filter { $0.status != "archived" }.map(\.id)))
         projectsByProductID[product.id] = projects.sorted(by: projectSort)
         let popBucketStartNanos = PopulationTiming.now()
         // Evict exactly this product's previous buckets (tracked
@@ -81,20 +87,24 @@ extension ChatViewModel {
         mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
         dependenciesByProductID[product.id] = dependencies
         ideasByProductID[product.id] = ideas
+        attentionItemsByWorkItemID[product.id] = attentionItems
+        applyAttentionGroupsList(productID: product.id, groups: attentionGroups, members: attentionMembers)
         seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
         // After tasksByProjectID reflects real engine state, clear optimistic
         // overrides for cards whose true column now matches the target.
         // Done before the @Published assignments take effect in the view so
         // the next render uses real boardColumn values — no visible flicker.
         reconcileOptimisticOverrides(from: tasks + chores)
+        reconcileCIFailureBadges(from: tasks + chores)
         reconcileWorkSelection()
+        reconcileNavigatorSelection()
         refreshWorkSubscriptions()
-        refreshDesignDocStates(for: projects)
-        engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
-        engine.sendListAttentionGroups(productId: product.id)
         workErrorMessage = nil
         if let pending = pendingRevealScrollID, revealProductID == product.id {
             pendingRevealScrollID = nil
+            reconcileProjectFilterForReveal(
+                pending, hadProjectFilter: pendingRevealReconcilesProjectFilter)
+            pendingRevealReconcilesProjectFilter = false
             prepareReveal(pending)
         }
         recordPopulationApplyBurst(
@@ -107,12 +117,29 @@ extension ChatViewModel {
     }
 
     func upsertProduct(_ product: WorkProduct) {
+        if product.status == "archived" { selectionHistory.forgetProduct(product.id) }
         if let index = products.firstIndex(where: { $0.id == product.id }) {
             products[index] = product
         } else {
             products.append(product)
             products.sort(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
         }
+    }
+
+    /// Replace (or insert) one project in its product's bucket without a
+    /// work-tree refetch. The bucket's `didSet` performs the full derived-
+    /// cache drop, which is correct here: project status drives navigator
+    /// visibility and board grouping, and a project row is tiny next to a
+    /// `GetWorkTree` round trip.
+    func upsertProject(_ project: WorkProject) {
+        if project.status == "archived" { selectionHistory.forgetProject(project.id, productID: project.productID) }
+        var projects = projectsByProductID[project.productID] ?? []
+        if let index = projects.firstIndex(where: { $0.id == project.id }) {
+            projects[index] = project
+        } else {
+            projects.append(project)
+        }
+        projectsByProductID[project.productID] = projects.sorted(by: projectSort)
     }
 
     func handleCreatedWorkItem(_ item: WorkItemPayload) {
@@ -158,32 +185,24 @@ extension ChatViewModel {
     /// push (e.g. the auto-populate Populator staging a project's task
     /// breakdown while the operator is looking at something else). Unlike
     /// the single-item path, this must never hijack the operator's current
-    /// selection/filters — it only refreshes the affected product's board
-    /// and, for any touched projects, their planner-run audit trail so a
-    /// [[PlannerRunAffordance]] icon that hasn't appeared yet surfaces
-    /// without a view remount.
+    /// selection/filters — it only refreshes the affected product's board.
+    /// The refreshed tree also carries each project's latest planner run, so
+    /// a [[PlannerRunAffordance]] icon surfaces without a separate
+    /// `list_planner_runs` round trip or a view remount.
     func handleCreatedWorkItemsBatch(_ items: [WorkItemPayload]) {
         var productIDs: Set<String> = []
-        var projectIDs: Set<String> = []
         for item in items {
             switch item {
             case .product(let product):
                 productIDs.insert(product.id)
             case .project(let project):
                 productIDs.insert(project.productID)
-                projectIDs.insert(project.id)
             case .task(let task), .chore(let task):
                 productIDs.insert(task.productID)
-                if let projectID = task.projectID {
-                    projectIDs.insert(projectID)
-                }
             }
         }
         for productID in productIDs where productID == currentSelectedProductID {
             engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
-        }
-        for projectID in projectIDs {
-            refreshPlannerRuns(projectID: projectID)
         }
     }
 
@@ -202,7 +221,15 @@ extension ChatViewModel {
                 return
             }
         case .project(let project):
-            engine.sendGetWorkTree(productId: project.productID, flow: .itemRefetch)
+            // Apply the reply in place, as task updates do. Do not send
+            // `GetWorkTree` here: the engine's `work_invalidated` push for
+            // this patch already schedules the debounced refetch, and a
+            // second, un-debounced full fetch would double the cost of every
+            // project edit.
+            upsertProject(project)
+            if project.status == "archived" {
+                settleArchiveRequest(projectID: project.id)
+            }
         case .task(let updatedTask), .chore(let updatedTask):
             // When the engine confirms an optimistic move, drop the origin record
             // so a subsequent work_error from an unrelated operation won't bounce
@@ -228,6 +255,7 @@ extension ChatViewModel {
             let isChore: Bool
             if case .chore = item { isChore = true } else { isChore = false }
             applyIncrementalTaskUpdate(updatedTask, isChore: isChore)
+            reconcileNavigatorSelection()
             // Reconcile optimistic overrides now that the local store reflects
             // the confirmed state — the update above already wrote the new
             // status, so the real column matches the optimistic target.
@@ -247,10 +275,14 @@ extension ChatViewModel {
     /// snapshots would go stale (status / name for prereq rows; any field
     /// on a revision row). Project-membership, kind, or unknown-previous
     /// updates still full-invalidate.
-    private func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
+    func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
         // Fan-out regression counter (design entry 2): single-task board update.
         UIUpdateCounters.shared.recordIncrementalTaskUpdate()
         let previous = task(withID: updatedTask.id)
+        var updatedTask = updatedTask
+        // Mutation acknowledgements need not contain family projections. Keep
+        // the last authoritative placement until the coherent tree arrives.
+        if updatedTask.navigator == nil { updatedTask.navigator = previous?.navigator }
         let requiresFullInvalidation = Self.incrementalUpdateRequiresFullInvalidation(
             previous: previous,
             updated: updatedTask,
@@ -415,7 +447,7 @@ extension ChatViewModel {
             persistProjectFilterIDs()
         }
 
-        if let selectedTask, !isTaskVisible(selectedTask) {
+        if navigator.mode == .kanban, let selectedTask, !isTaskVisible(selectedTask) {
             selectedWorkCardID = nil
         }
 

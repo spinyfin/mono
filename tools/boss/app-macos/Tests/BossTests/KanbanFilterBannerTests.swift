@@ -68,6 +68,31 @@ final class KanbanFilterBannerTests: XCTestCase {
         XCTAssertEqual(Set(model.visibleWorkItems.map(\.id)), ["task_a", "task_b"])
     }
 
+    func testLeavingWorkTabClearsSearch() {
+        let model = makeModel()
+        model.applyEventForTest(
+            makeWorkTreeEvent(tasks: [
+                makeTask(id: "task_a", name: "Alpha"),
+                makeTask(id: "task_b", name: "Beta"),
+            ])
+        )
+        model.workSearchText = "Alpha"
+        XCTAssertTrue(model.isWorkSearchActive)
+
+        model.setNavigationMode(.agents, refreshWorkOnEntry: false)
+
+        XCTAssertEqual(model.workSearchText, "", "leaving Work must clear the search query")
+        XCTAssertFalse(model.isWorkSearchActive)
+        XCTAssertEqual(Set(model.visibleWorkItems.map(\.id)), ["task_a", "task_b"])
+    }
+
+    func testStayingOnWorkTabKeepsSearch() {
+        let model = makeModel()
+        model.workSearchText = "Alpha"
+        model.setNavigationMode(.work, refreshWorkOnEntry: false)
+        XCTAssertEqual(model.workSearchText, "Alpha")
+    }
+
     // MARK: - Helpers
 
     private func makeTask(id: String, name: String) -> WorkTask {

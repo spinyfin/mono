@@ -137,17 +137,16 @@ use anyhow::Result;
 use boss_protocol::WorkerActivity;
 use boss_tmux::Tmux;
 
-use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::driver::ProgressFidelity;
 use crate::hold_registry::HoldRegistry;
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::semantic_progress::SemanticToolCondition;
 use crate::work::WorkDb;
+use boss_execution_contracts::{CubeClient, worker_id_for_slot};
 
-/// Engine-owned attention kind for a worker that is alive but has stopped
-/// making observable terminal progress.
-pub const STALE_WORKER_ATTENTION_KIND: &str = "stale_worker";
+pub use boss_engine_storage_values::attention_kinds::STALE_WORKER_ATTENTION_KIND;
 
 /// Why a tmux pane is classified dead. Only [`DeadPaneEvidence::PaneExited`]
 /// observed a process exit; the other two are derived from session identity
@@ -163,7 +162,7 @@ pub enum DeadPaneEvidence {
 }
 
 impl DeadPaneEvidence {
-    fn requires_pid_corroboration(&self) -> bool {
+    pub(crate) fn requires_pid_corroboration(&self) -> bool {
         !matches!(self, Self::PaneExited { .. })
     }
 
@@ -275,7 +274,10 @@ pub fn classify_semantic_staleness(
     now_epoch_secs: i64,
     stale_threshold_secs: i64,
 ) -> SemanticStaleness {
-    if tool_condition == SemanticToolCondition::InFlight {
+    if matches!(
+        tool_condition,
+        SemanticToolCondition::InFlight | SemanticToolCondition::Yielded
+    ) {
         return SemanticStaleness::Healthy;
     }
     let effective_at = progress_at.unwrap_or(started_at);
@@ -287,7 +289,9 @@ pub fn classify_semantic_staleness(
         return SemanticStaleness::DegradedEvidence(DegradedEvidenceReason::FidelityBelowRich);
     }
     match tool_condition {
-        SemanticToolCondition::InFlight => unreachable!("in_flight returned Healthy above"),
+        SemanticToolCondition::InFlight | SemanticToolCondition::Yielded => {
+            unreachable!("in_flight returned Healthy above")
+        }
         SemanticToolCondition::Unknown => {
             SemanticStaleness::DegradedEvidence(DegradedEvidenceReason::ToolConditionUnknown)
         }
@@ -327,6 +331,28 @@ pub trait WorkerTerminalInspector: Send + Sync {
             boss_tmux::quote_for_shell(session_name)
         )
     }
+}
+
+/// Confirmed death for inferred tmux evidence: an observed pane exit, or
+/// session-absent / token-mismatch whose durable PID is not alive.
+/// Shared with the live-status refresh guard so both paths apply one
+/// standard for "dead".
+pub(crate) fn inferred_death_is_confirmed(
+    work_db: &WorkDb,
+    evidence: &DeadPaneEvidence,
+    run_id: &str,
+    now_epoch_secs: i64,
+) -> bool {
+    if !evidence.requires_pid_corroboration() {
+        return true;
+    }
+    !crate::durable_liveness::probe_execution_worker_within(
+        work_db,
+        run_id,
+        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+        now_epoch_secs,
+    )
+    .is_alive()
 }
 
 /// Production tmux inspector. A run without tmux identity (a remote detached
@@ -453,6 +479,17 @@ pub fn resolve_stale_worker_attention(work_db: &WorkDb, execution_id: &str) {
     ) else {
         return;
     };
+    resolve_stale_worker_attention_for_execution(work_db, &execution);
+}
+
+/// Resolve any open `stale_worker` attention for the work item `execution`
+/// ran against — except for a `progression` execution. A progression run is
+/// bound to the stuck item it diagnoses, so its teardown or timeout must not
+/// clear that item's pre-existing `stale_worker` evidence.
+pub fn resolve_stale_worker_attention_for_execution(work_db: &WorkDb, execution: &boss_protocol::WorkExecution) {
+    if execution.kind == boss_protocol::ExecutionKind::Progression {
+        return;
+    }
     resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
 }
 
@@ -473,12 +510,9 @@ pub fn resolve_stale_worker_attention_for_work_item(work_db: &WorkDb, work_item_
 }
 
 /// No hook event for this long while a worker is `working` with no tool
-/// in flight ⇒ presumed wedged. 30 minutes is deliberately generous: a
-/// healthy worker emits a `PreToolUse`/`PostToolUse`/`UserPromptSubmit`
-/// hook far more often than this, so the threshold sits well clear of
-/// normal think/stream gaps while still bounding the indefinite hang the
-/// incident exhibited (~35 min and counting before manual recovery).
-pub const DEFAULT_STALE_THRESHOLD_SECS: i64 = 1_800;
+/// in flight ⇒ presumed wedged. Shared with the completion service's
+/// run-done backstop, so defined below both.
+pub use boss_engine_storage_values::pool_policy::DEFAULT_STALE_THRESHOLD_SECS;
 
 /// Grace period after `started_at` (epoch seconds) during which we skip
 /// staleness probing, mirroring [`crate::dead_pid_sweep::DEAD_PID_GRACE_SECS`].
@@ -638,6 +672,7 @@ pub struct StaleWorkerSweepDeps {
     /// Forwarded to [`crate::dead_pid_sweep::reap_observed_worker_death`] so a
     /// tmux-confirmed dead pane can force-release its cube lease.
     pub cube_client: Arc<dyn CubeClient>,
+    pub broadcaster: Arc<dyn crate::live_status_loop::LiveStatusBroadcaster>,
 }
 
 /// Borrowed control collaborators for a single pass. Keeping teardown
@@ -690,6 +725,7 @@ pub fn spawn_loop(
         reaper,
         hold_registry,
         cube_client,
+        broadcaster,
     } = deps;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
@@ -700,8 +736,10 @@ pub fn spawn_loop(
         let reaper = Arc::clone(&reaper);
         let hold_registry = Arc::clone(&hold_registry);
         let cube_client = Arc::clone(&cube_client);
+        let broadcaster = Arc::clone(&broadcaster);
         async move {
-            run_one_pass_with_terminal(
+            let before = live_states.snapshot();
+            let outcome = run_one_pass_with_terminal(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 terminal_inspector.as_deref(),
@@ -717,7 +755,11 @@ pub fn spawn_loop(
                     auto_reap_threshold_secs,
                 },
             )
-            .await
+            .await;
+            if live_states.snapshot() != before {
+                broadcaster.broadcast_live_worker_states().await;
+            }
+            outcome
         }
     })
 }
@@ -831,11 +873,8 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         }
 
-        // Only `working` slots are candidates. `Spawning` is still
-        // coming up (no event history expected); `Idle` and
-        // `WaitingForInput` are handled by the completion and
-        // transient-recovery paths; terminal states are done.
-        if state.activity != WorkerActivity::Working {
+        // A spawn may have persisted its session identity before creating it.
+        if state.activity == WorkerActivity::Spawning {
             outcome.not_working_skipped += 1;
             continue;
         }
@@ -853,7 +892,34 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         };
         if execution.status.is_terminal() {
-            resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+            live_states.mark_terminated(&state.run_id);
+            resolve_stale_worker_attention_for_execution(work_db, &execution);
+            continue;
+        }
+
+        // A `progression` run is bounded by its own wall-clock timeout, not by
+        // the semantic-staleness ladder: that ladder raises `stale_worker`
+        // attention and appends audit text on the *work item*, and a progression
+        // run's item is the stuck item it is inspecting, which this sweep must
+        // not touch. Reaped past the timeout through the ordinary reaper; until
+        // then left alone.
+        if execution.kind == boss_protocol::ExecutionKind::Progression {
+            if reap_timed_out_progression(
+                ProgressionReapContext {
+                    work_db,
+                    live_states,
+                    coordinator: coordinator.clone(),
+                    dispatch_events,
+                    reaper,
+                },
+                &state,
+                &execution,
+                now_epoch_secs,
+            )
+            .await
+            {
+                outcome.reaped += 1;
+            }
             continue;
         }
 
@@ -863,26 +929,22 @@ pub async fn run_one_pass_with_terminal_and_grace(
             Some(inspector) => match inspector.inspect(&state.run_id).await {
                 Ok(Some(TerminalLiveness::Dead { session_name, evidence })) => {
                     // Tmux's death signal is authoritative on its own terms;
-                    // it needs no cadence/semantic evidence.
-                    if evidence.requires_pid_corroboration() {
-                        let process = crate::durable_liveness::probe_execution_worker_within(
-                            work_db,
-                            &state.run_id,
-                            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-                            now_epoch_secs,
+                    // it needs no cadence/semantic evidence. Inferred absence
+                    // still requires a dead PID before the permanent fence.
+                    if !inferred_death_is_confirmed(work_db, &evidence, &state.run_id, now_epoch_secs) {
+                        // Surviving PID: reversible exited display, no hook fence.
+                        live_states.mark_terminated_display(&state.run_id);
+                        tracing::warn!(
+                            execution_id = %state.run_id,
+                            session_name,
+                            ?evidence,
+                            "stale-worker sweep: tmux inferred death without an observed exit, \
+                             but durable_liveness still reports the worker pid alive; not reaping"
                         );
-                        if process.is_alive() {
-                            tracing::warn!(
-                                execution_id = %state.run_id,
-                                session_name,
-                                ?evidence,
-                                "stale-worker sweep: tmux inferred death without an observed exit, \
-                                 but durable_liveness still reports the worker pid alive; not reaping"
-                            );
-                            outcome.dead_uncorroborated += 1;
-                            continue;
-                        }
+                        outcome.dead_uncorroborated += 1;
+                        continue;
                     }
+                    live_states.mark_terminated(&state.run_id);
                     outcome.dead += 1;
                     let reason = evidence.reap_reason(&session_name);
                     tracing::info!(
@@ -907,7 +969,10 @@ pub async fn run_one_pass_with_terminal_and_grace(
                     }
                     continue;
                 }
-                Ok(Some(TerminalLiveness::Alive { session_name, .. })) => Some(TmuxIdentity::Live { session_name }),
+                Ok(Some(TerminalLiveness::Alive { session_name, .. })) => {
+                    let _ = live_states.revive_from_liveness_inference(&state.run_id);
+                    Some(TmuxIdentity::Live { session_name })
+                }
                 Ok(None) => None,
                 Err(err) => {
                     // A failed probe is never proof of health or death — it
@@ -927,6 +992,12 @@ pub async fn run_one_pass_with_terminal_and_grace(
             },
             None => None,
         };
+
+        // Death is independent of activity; semantic staleness requires Working.
+        if state.activity != WorkerActivity::Working {
+            outcome.not_working_skipped += 1;
+            continue;
+        }
 
         let Some(identity) = identity else {
             // No tmux identity for this run at all (no terminal inspector
@@ -995,7 +1066,7 @@ pub async fn run_one_pass_with_terminal_and_grace(
         match (verdict, &identity) {
             (SemanticStaleness::Healthy, _) => {
                 outcome.alive_and_working += 1;
-                resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+                resolve_stale_worker_attention_for_execution(work_db, &execution);
             }
             (verdict, TmuxIdentity::ProbeUnavailable) => {
                 raise_probe_unavailable_attention(
@@ -1093,6 +1164,102 @@ pub async fn run_one_pass_with_terminal_and_grace(
     }
 
     outcome
+}
+
+/// Collaborators for [`reap_timed_out_progression`].
+struct ProgressionReapContext<'a> {
+    work_db: &'a WorkDb,
+    live_states: &'a LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &'a dyn DispatchEventSink,
+    reaper: &'a dyn StaleWorkerReaper,
+}
+
+/// The published `progression.run_timeout`, in seconds. Falls back to the
+/// placeholder default when the engine has not published one (or it is
+/// unreadable), the same convention the candidate views use for their limits.
+fn progression_run_timeout_secs(work_db: &WorkDb) -> i64 {
+    use boss_engine_storage_values::progression::{DEFAULT_RUN_TIMEOUT_SECS, METADATA_KEY_RUN_TIMEOUT_SECS};
+    work_db
+        .get_metadata(METADATA_KEY_RUN_TIMEOUT_SECS)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(i64::try_from(DEFAULT_RUN_TIMEOUT_SECS).unwrap_or(i64::MAX))
+}
+
+/// Reap a `progression` run that has outlived `progression.run_timeout`.
+/// Returns `true` when it was reaped.
+///
+/// Goes through the sweep's ordinary reap path (`StaleWorkerReaper`, the same
+/// teardown `bossctl agents stop` performs) and records the execution
+/// `orphaned`, a status the candidate view's infrastructure-failure clause
+/// counts, so two timeouts in a row stop the sweep nominating the item. Unlike
+/// the worker reap paths it appends no audit line and resolves no attention on
+/// the work item, takes no recovery backup (the run has no bookmark) and
+/// releases no lease (it holds none).
+async fn reap_timed_out_progression(
+    ctx: ProgressionReapContext<'_>,
+    state: &boss_protocol::LiveWorkerState,
+    execution: &boss_protocol::WorkExecution,
+    now_epoch_secs: i64,
+) -> bool {
+    let ProgressionReapContext {
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        reaper,
+    } = ctx;
+    let Some(started_epoch) = execution.started_epoch() else {
+        return false;
+    };
+    let timeout_secs = progression_run_timeout_secs(work_db);
+    if now_epoch_secs.saturating_sub(started_epoch) <= timeout_secs {
+        return false;
+    }
+    let execution_id = &state.run_id;
+    let reason = format!(
+        "progression-run-timeout: the run was still going {}s after it started (limit {timeout_secs}s); reaped",
+        now_epoch_secs.saturating_sub(started_epoch)
+    );
+    tracing::warn!(
+        execution_id,
+        work_item_id = %execution.work_item_id,
+        timeout_secs,
+        "stale-worker sweep: progression run exceeded its timeout; reaping",
+    );
+    if let Err(err) = work_db.mark_execution_orphaned(execution_id, &reason) {
+        tracing::warn!(
+            execution_id,
+            ?err,
+            "stale-worker sweep: failed to mark timed-out progression run orphaned"
+        );
+        return false;
+    }
+    // Removes the scratch directory along with any driver-owned state.
+    crate::driver_teardown::teardown_driver_workspace(
+        work_db,
+        execution_id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+        crate::driver_teardown::TeardownReason::StaleWorkerReconcile,
+    )
+    .await;
+    reaper.reap_worker(execution_id).await;
+    crate::dead_pid_sweep::release_reaped_execution(live_states, &coordinator, state).await;
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::StaleWorkerReconcile, Outcome::Ok, execution_id)
+                .with_work_item(&execution.work_item_id)
+                .with_details(serde_json::json!({
+                    "slot_id": state.slot_id,
+                    "progression_run_timeout": true,
+                    "timeout_secs": timeout_secs,
+                })),
+        )
+        .await;
+    true
 }
 
 /// Tmux identity evidence available for a slot whose terminal inspector did
@@ -1465,10 +1632,7 @@ async fn execute_auto_reap(
         "stale-worker sweep: two-hour token-verified auto-reap firing",
     );
 
-    // 1. Export the engine-created execution reference from the shared store.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
-    // 2. Orphan + audit.
+    // 1. Orphan + audit.
     let reason = format!(
         "stale-worker-auto-reap: tmux session {session_name} confirmed live and idle for more than \
          {auto_reap_threshold_secs}s (last driver event: {progress_at}); worker force-reaped after a \
@@ -1482,7 +1646,7 @@ async fn execute_auto_reap(
         );
         return false;
     }
-    resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+    resolve_stale_worker_attention_for_execution(work_db, execution);
     if let Some(work_item_id) = state.work_item_id.as_deref().map(|id| work_db.owning_work_item_id(id))
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
@@ -1493,7 +1657,6 @@ async fn execute_auto_reap(
                  live but idle for more than {auto_reap_threshold_secs}s (last driver event: {progress_at}); \
                  chore reset to todo for redispatch"
             ),
-            recovery_patch.as_deref(),
         )
     {
         tracing::warn!(
@@ -1526,9 +1689,12 @@ async fn execute_auto_reap(
     // 6. Lease release comes last: it is a remote RPC and must not leave an
     // await between the pane reaper's release and this guarded cleanup.
     if let Some(lease_id) = execution.cube_lease_id.as_deref() {
-        crate::execution_liveness::force_release_lease_best_effort(
-            execution_id,
-            lease_id,
+        crate::workspace_lease_release::release_lease_after_inferred_death(
+            work_db,
+            execution,
+            crate::workspace_lease_release::PaneStatus::Gone,
+            None,
+            Some(cube_client),
             cube_client.force_release_lease(lease_id, Some("stale-worker auto-reap: two-hour idle tmux worker")),
         )
         .await;
@@ -1544,9 +1710,6 @@ async fn execute_auto_reap(
                     "session_name": session_name,
                     "progress_at": progress_at,
                     "auto_reap_threshold_secs": auto_reap_threshold_secs,
-                    "recovery_patch": recovery_patch
-                        .as_deref()
-                        .map(|p| p.display().to_string()),
                 })),
         )
         .await;
@@ -1689,7 +1852,7 @@ async fn run_cadence_fallback(
     // entry, so no later pass can reconcile a still-open stale_worker
     // attention for this work item — resolve it now while we still hold
     // `execution.work_item_id`.
-    resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+    resolve_stale_worker_attention_for_execution(work_db, execution);
 
     // Reap termination path (stale-worker sweep): tear down any
     // driver-owned state outside the workspace. `mark_execution_orphaned`
@@ -1703,13 +1866,8 @@ async fn run_cadence_fallback(
     )
     .await;
 
-    // Export the wedged worker's recorded shared-store reference.
-    // Missing or unreadable references raise recovery attention.
-    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
-
     // Append [engine-reconcile] audit line to the task description so
-    // a human inspecting the chore can see why it was reset (and
-    // where to find the recovery patch, if one was captured).
+    // a human inspecting the chore can see why it was reset.
     if let Some(work_item_id) = state.work_item_id.as_deref().map(|id| work_db.owning_work_item_id(id))
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
@@ -1718,7 +1876,6 @@ async fn run_cadence_fallback(
             &format!(
                 "stale worker (exec {execution_id}) detected — no transcript progress for > {stale_threshold_secs}s while working; chore reset to todo for redispatch"
             ),
-            recovery_patch.as_deref(),
         )
     {
         tracing::warn!(
@@ -1748,12 +1905,14 @@ async fn run_cadence_fallback(
     // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
     // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
     // "auto-worker-N" prefix and release_worker_and_kick routes to the
-    // correct pool via pool_for_worker_id. Idempotent with the
-    // pool-slot release the reaper's `release_worker_pane` already
-    // performed in production (find-or-skip no-op); in tests where the
-    // reaper is a recording stub, this is what frees the slot.
+    // correct pool via pool_for_worker_id. Release only if this execution
+    // still owns the claim, because the reaper's release may already have
+    // given the slot to a new occupant; with a recording-stub reaper this is
+    // what frees the slot.
     let worker_id = worker_id_for_slot(state.slot_id);
-    coordinator.release_worker_and_kick(&worker_id, None).await;
+    coordinator
+        .release_worker_and_kick(&worker_id, execution_id, None)
+        .await;
 
     // Structured event for bossctl dispatch tail.
     dispatch_events
@@ -1764,9 +1923,6 @@ async fn run_cadence_fallback(
                     "slot_id": state.slot_id,
                     "last_event_at": last_event_at,
                     "stale_threshold_secs": stale_threshold_secs,
-                    "recovery_patch": recovery_patch
-                        .as_deref()
-                        .map(|p| p.display().to_string()),
                 })),
         )
         .await;

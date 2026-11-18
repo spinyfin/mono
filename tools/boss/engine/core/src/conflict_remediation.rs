@@ -78,9 +78,9 @@ use tokio::sync::Semaphore;
 
 use crate::conflict_ladder::{self, LadderOutcome};
 use crate::conflict_watch;
-use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::PrLifecycleProbe;
 use crate::work::{ConflictResolution, GhPrStateChecker, PendingMergeCheck, PrOpenState, PrStateChecker, WorkDb};
+use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
 /// How many conflict remediations may run at once.
 ///
@@ -244,6 +244,15 @@ impl LadderRemediationJob {
                 );
             }
         }
+        // The owner may have parked the row while this job waited for its turn
+        // (or while the ladder held a lease): a parked row atrophies, so no
+        // further rebase or worker is spent on it.
+        if self
+            .work_db
+            .is_parked_or_assume_not(&candidate.work_item_id, "conflict_remediation")
+        {
+            return Some("work item was parked while the remediation was queued".to_owned());
+        }
         match self.pr_checker.check(&candidate.pr_url) {
             Ok(PrOpenState::Open) => None,
             Ok(other) => Some(format!("PR is no longer open ({other:?})")),
@@ -311,6 +320,16 @@ impl ConflictRemediationJob for LadderRemediationJob {
                 );
                 RemediationDisposition::Settled
             }
+            LadderOutcome::LockfileRegenerationFailed => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = %attempt.id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "conflict_remediation: lockfile regeneration failed; attempt marked failed, no worker spawned",
+                );
+                RemediationDisposition::Settled
+            }
             LadderOutcome::MechanicalRungsUnavailable => {
                 // Same contract as the inline path: spawn nothing, leave the
                 // attempt `pending` with no `revision_task_id` so a later
@@ -323,6 +342,21 @@ impl ConflictRemediationJob for LadderRemediationJob {
                     attempt_id = %attempt.id,
                     elapsed_ms = started.elapsed().as_millis(),
                     "conflict_remediation: mechanical rungs unavailable this attempt (rung-1 lease); \
+                     no worker spawned, ladder will retry on a later tick",
+                );
+                RemediationDisposition::RetryAfterCooldown
+            }
+            LadderOutcome::DeferredForLiveWriter => {
+                // A worker is live on this PR's chain; the engine does not
+                // rebase under it. Nothing was leased or changed, so retry
+                // later: the cooldown holds the slot as for an unavailable
+                // rung.
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = %attempt.id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "conflict_remediation: a worker is live on this PR's chain; engine rebase deferred, \
                      no worker spawned, ladder will retry on a later tick",
                 );
                 RemediationDisposition::RetryAfterCooldown
@@ -467,7 +501,7 @@ impl ConflictRemediationQueue {
         let candidate = candidate.clone();
         let attempt = attempt.clone();
         let probe = probe.clone();
-        tokio::spawn(async move {
+        boss_task_scope::spawn(async move {
             // The guard releases the slot on *every* exit path, including a
             // panic inside the job or the runtime dropping the task — a
             // leaked `InFlight` entry would silently wedge remediation for
@@ -975,9 +1009,9 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         use super::*;
-        use crate::coordinator::CubeRepoHandle;
         use crate::test_support::{RecordingPublisher, create_test_chore_manual, create_test_product_with_repo};
         use crate::work::{ConflictResolutionInsertInput, StaticPrStateChecker, WorkItemPatch};
+        use boss_host_execution::types::CubeRepoHandle;
 
         /// Cube double that records every `ensure_repo` origin the ladder
         /// asks for. `ensure_repo` is the ladder's **first** cube call, so
@@ -1206,6 +1240,30 @@ mod tests {
                 RemediationDisposition::Settled,
                 "an aborted job owes no retry, so it must not hold its PR in a cooldown",
             );
+        }
+
+        /// The owner parked the row while the job waited for its turn: a parked
+        /// row atrophies, so the job spends no lease and spawns no worker.
+        #[tokio::test]
+        async fn a_row_parked_while_the_job_waited_leases_and_spawns_nothing() {
+            let db = memory_db();
+            let f = fixture(&db, "parked-meanwhile", "https://github.com/foo/bar/pull/5", 5);
+            db.park_work_item_as_actor(&f.candidate.work_item_id, true, Some("not now"), "human")
+                .unwrap();
+            let (cube, origins) = RecordingCube::new();
+            let job = ladder_job(&db, cube, PrOpenState::Open);
+
+            let disposition = job
+                .run(f.candidate.clone(), f.attempt.clone(), probe(&f.candidate.pr_url))
+                .await;
+
+            assert_eq!(
+                RecordingCube::leased(&origins),
+                Vec::<String>::new(),
+                "a row parked while the job was queued must not be leased for",
+            );
+            assert_eq!(revision_task_id(&db, &f.attempt.id), None);
+            assert_eq!(disposition, RemediationDisposition::Settled);
         }
 
         /// The second checkpoint. The ladder holds a cube lease for minutes;

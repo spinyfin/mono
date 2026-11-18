@@ -213,6 +213,12 @@ async fn evaluate_project(
         // so skip rather than create work nobody can act on.
         return Ok(EvalOutcome::Skipped);
     }
+    if project.is_parked() {
+        // The owner parked the project: a parked project atrophies, so it gets
+        // no postmortem task until it is un-parked (the signal that triggers
+        // one is durable, so the postmortem is scheduled then).
+        return Ok(EvalOutcome::Skipped);
+    }
     let signaled = work_db.has_project_postmortem_signal(&project.id)?;
     let tasks = work_db.list_project_trigger_tasks(&product.id, &project.id)?;
     let recent_completion = tasks.iter().any(|task| {
@@ -256,25 +262,10 @@ fn epoch_secs(value: Option<&str>) -> Option<i64> {
     value.and_then(|s| s.parse::<i64>().ok())
 }
 
-/// Compose the postmortem task's `description` — the remit brief that
-/// surfaces to the worker via `runner::work_item_details`'s `- details:`
-/// block. Lists every PR the review must cover so the worker doesn't have
-/// to rediscover the wave from scratch.
-pub(crate) fn compose_postmortem_brief(project: &Project, merged_prs: &[(&str, &str)]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Design postmortem for project \"{}\": review the PRs merged since the last postmortem (or since the project began, if this is the first) and update the project's design doc to reflect what actually shipped — decisions that diverged, scope added or dropped, and contracts that evolved during implementation. Also flag any uncompleted work the review surfaces (see the required structured-output section in your instructions below) so the engine can schedule it.\n\n",
-        project.name
-    ));
-    if let Some(path) = project.design_doc_path.as_deref().filter(|p| !p.is_empty()) {
-        out.push_str(&format!("Design doc: `{path}`\n"));
-    }
-    out.push_str("Merged PRs to review:\n");
-    for (name, url) in merged_prs {
-        out.push_str(&format!("- {name}: {url}\n"));
-    }
-    out
-}
+pub(crate) use boss_engine_storage_values::postmortem_brief::compose_postmortem_brief;
+
+// Keep the legacy function signature checked independently of storage callers.
+const _: fn(&Project, &[(&str, &str)]) -> String = compose_postmortem_brief;
 
 #[cfg(test)]
 mod tests {

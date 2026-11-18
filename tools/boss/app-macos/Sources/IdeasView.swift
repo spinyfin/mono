@@ -184,7 +184,10 @@ private struct IdeaEditorView: View {
     @ObservedObject var chat: ChatViewModel
     let idea: WorkIdea
     @Binding var isPreviewShowing: Bool
-    @State private var showSendFailedAlert = false
+    /// Inline failure note for the Send button. Shown next to the control
+    /// that failed instead of in a modal alert, so it never steals focus
+    /// from the draft; cleared on the next edit or successful send.
+    @State private var sendFailureNote: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -196,11 +199,7 @@ private struct IdeaEditorView: View {
                 editor
             }
         }
-        .alert("Couldn't send to coordinator", isPresented: $showSendFailedAlert) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("The coordinator pane isn't ready yet. Try again in a moment.")
-        }
+        .onChange(of: chat.ideaDraftBody) { _, _ in sendFailureNote = nil }
     }
 
     private var header: some View {
@@ -228,9 +227,18 @@ private struct IdeaEditorView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(width: 140)
+                if let sendFailureNote {
+                    Label(sendFailureNote, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("idea-send-failure-note")
+                }
                 Button {
-                    if !chat.sendIdeaDraftToCoordinator() {
-                        showSendFailedAlert = true
+                    if chat.sendIdeaDraftToCoordinator() {
+                        sendFailureNote = nil
+                    } else {
+                        sendFailureNote = "Couldn't send: the coordinator pane isn't ready yet. Try again in a moment."
                     }
                 } label: {
                     Label("Send to Coordinator", systemImage: "arrow.up.message")

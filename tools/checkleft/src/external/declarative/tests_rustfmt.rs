@@ -156,10 +156,7 @@ fn rustfmt_linelist_nonzero_with_no_output_is_error() {
 }
 
 #[test]
-fn rustfmt_has_bazel_default_and_path_fallback() {
-    // The manifest must declare a bazel default (hermetic CI toolchain) AND a path
-    // fallback (standalone / non-Bazel use). The framework warns loudly when it
-    // uses the fallback so the operator knows hermetic resolution was skipped.
+fn rustfmt_requires_bazel_without_host_fallback() {
     let package = parse_rustfmt_package();
     let req = package.needs.get("rustfmt").expect("rustfmt binary must be declared");
     assert!(
@@ -168,8 +165,8 @@ fn rustfmt_has_bazel_default_and_path_fallback() {
         req.default
     );
     assert!(
-        matches!(req.fallback, Some(super::BinaryBinding::Path(_))),
-        "fallback binding must be a path for non-Bazel use; got: {:?}",
+        req.fallback.is_none(),
+        "host fallback must be absent; got: {:?}",
         req.fallback
     );
 }
@@ -186,7 +183,7 @@ fn rustfmt_missing_binary_degrades_to_check_error() {
 
     // Replace the bazel default and remove the fallback so there's no valid binary.
     let manifest = RUSTFMT_MANIFEST.replace(
-        "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"\n    fallback:\n      path: \"rustfmt\"",
+        "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"",
         "path: \"nonexistent_rustfmt_binary_xyz\"",
     );
     let package = parse_declarative_check_manifest(&manifest).expect("modified manifest must parse");
@@ -258,7 +255,7 @@ fn linelist_absolute_paths_are_normalised_to_repo_relative() {
         std::fs::set_permissions(&script_path, perms).expect("chmod");
 
         let manifest = RUSTFMT_MANIFEST.replace(
-            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"\n    fallback:\n      path: \"rustfmt\"",
+            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"",
             &format!("path: \"{}\"", script_path.display()),
         );
         let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");
@@ -322,7 +319,7 @@ fn duplicate_findings_across_module_tree_are_deduplicated() {
         std::fs::set_permissions(&script_path, perms).expect("chmod");
 
         let manifest = RUSTFMT_MANIFEST.replace(
-            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"\n    fallback:\n      path: \"rustfmt\"",
+            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"",
             &format!("path: \"{}\"", script_path.display()),
         );
         let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");
@@ -396,7 +393,7 @@ fn rustfmt_repo_root_arg_expands_to_absolute_path() {
         std::fs::set_permissions(&script_path, perms).expect("chmod");
 
         let manifest = RUSTFMT_MANIFEST.replace(
-            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"\n    fallback:\n      path: \"rustfmt\"",
+            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"",
             &format!("path: \"{}\"", script_path.display()),
         );
         let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");

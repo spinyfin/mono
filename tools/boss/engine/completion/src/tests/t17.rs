@@ -1,0 +1,633 @@
+//! A stamped `run_done` declaration must reach a terminal write without the
+//! worker doing anything further: transient DB failures, an inconclusive
+//! GitHub answer after one, a lost retry task (recovered by the sweep) and a
+//! failed `no-changes-needed` write are all retried to a terminal state.
+
+use super::*;
+
+const OWN_PR: &str = "https://github.com/spinyfin/mono/pull/1764";
+
+fn own_branch(execution_id: &str) -> String {
+    expected_branch_name(execution_id, &BranchNaming::BossExecPrefix, None)
+}
+
+fn flags_on(workspace: &Path) -> Arc<crate::feature_flags::FeatureFlagsStore> {
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.join("feature-flags.toml"),
+    ));
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("run_done_proposals_seam", true).unwrap();
+    flags
+}
+
+fn task_row(db: &WorkDb, id: &str) -> boss_protocol::Task {
+    match db.get_work_item(id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        other => panic!("expected a task row, got {other:?}"),
+    }
+}
+
+fn stamp_delivered(db: &WorkDb, execution_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET run_done_outcome = 'delivered', run_done_declared_at = '1' WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+}
+
+const FAIL_TERMINAL_WRITE: &str = "CREATE TRIGGER fail_finalize BEFORE UPDATE OF status ON work_executions
+     WHEN NEW.status IN ('completed', 'failed')
+     BEGIN SELECT RAISE(ABORT, 'database is locked'); END;";
+
+/// Detector that parks every lookup until released, holding one finalize
+/// in flight.
+struct GatedPrDetector {
+    inner: Arc<StubPrDetector>,
+    entered: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl PrDetector for GatedPrDetector {
+    async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        self.inner.detect_pr(repo_remote_url, expected_branch).await
+    }
+}
+
+/// A non-transient failure of the terminalizing write keeps the run live and
+/// retrying; once it clears the run ends finalized with its slot released.
+#[tokio::test]
+async fn delivered_finalize_retries_a_failing_write_until_it_commits() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    stamp_delivered(&db, &execution_id);
+    db.connect().unwrap().execute_batch(FAIL_TERMINAL_WRITE).unwrap();
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)));
+    let handler = Arc::new(handler.with_branch_verifier(StubBranchVerifier::ok(&own_branch(&execution_id))));
+
+    let first = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert_eq!(first, StopOutcome::DbError);
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+
+    let retrying = tokio::spawn({
+        let handler = Arc::clone(&handler);
+        let execution_id = execution_id.clone();
+        async move {
+            handler
+                .finalize_declared_run_done_until_resolved(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!retrying.is_finished(), "still failing, so still retrying");
+    db.connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_finalize;")
+        .unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), retrying)
+        .await
+        .expect("retry commits once the failure clears")
+        .unwrap();
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == OWN_PR),
+        "{outcome:?}"
+    );
+    let task = task_row(&db, &chore_id);
+    assert_eq!(task.pr_url.as_deref(), Some(OWN_PR));
+    assert_ne!(task.status, TaskStatus::Todo, "{task:?}");
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
+/// A genuine SQLITE_BUSY (another connection holds the write lock past the
+/// busy timeout) is retried and the run ends finalized once it is released.
+#[tokio::test]
+async fn delivered_finalize_survives_a_genuine_sqlite_busy() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    stamp_delivered(&db, &execution_id);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)));
+    let handler = Arc::new(handler.with_branch_verifier(StubBranchVerifier::ok(&own_branch(&execution_id))));
+
+    let path = db.path().to_path_buf();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        // Longer than the engine's 5s busy timeout, so the first attempt fails.
+        std::thread::sleep(std::time::Duration::from_millis(5500));
+        conn.execute_batch("ROLLBACK").unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        handler.finalize_declared_run_done_until_resolved(&execution_id, boss_protocol::RunDoneOutcome::Delivered),
+    )
+    .await
+    .expect("finalize resolves once the lock is released");
+    holder.join().unwrap();
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == OWN_PR),
+        "{outcome:?}"
+    );
+    assert_eq!(task_row(&db, &chore_id).pr_url.as_deref(), Some(OWN_PR));
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
+/// After a DB failure, a transient GitHub failure on the next attempt must
+/// not end the retry: ownership is kept until a terminal commit.
+#[tokio::test]
+async fn retry_outlives_a_transient_pr_resolution_failure_after_a_db_failure() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    stamp_delivered(&db, &execution_id);
+    db.connect().unwrap().execute_batch(FAIL_TERMINAL_WRITE).unwrap();
+    let detector = StubPrDetector::ok(Some(OWN_PR));
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = Arc::new(handler.with_branch_verifier(StubBranchVerifier::ok(&own_branch(&execution_id))));
+
+    let retrying = tokio::spawn({
+        let handler = Arc::clone(&handler);
+        let execution_id = execution_id.clone();
+        async move {
+            handler
+                .finalize_declared_run_done_until_resolved(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The DB recovers, but GitHub now cannot answer.
+    db.connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_finalize;")
+        .unwrap();
+    detector.set_error("gh: connect: network is unreachable").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+    assert!(!retrying.is_finished(), "a DetectorFailed attempt is not a resolution");
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+
+    detector.set_result(PrStatus::Fresh { url: OWN_PR.to_owned() }).await;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), retrying)
+        .await
+        .expect("retry commits once GitHub answers")
+        .unwrap();
+    assert!(matches!(outcome, StopOutcome::PrDetected { .. }), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
+/// A stamped declaration whose retry task was lost (engine restart, panic) is
+/// recovered by the durable sweep run against a freshly built handler.
+#[tokio::test]
+async fn sweep_finalizes_a_stamped_declaration_after_handler_recreation() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    stamp_delivered(&db, &execution_id);
+    // A declaration made moments ago is left to the submission path.
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)));
+    let handler = handler
+        .with_branch_verifier(StubBranchVerifier::ok(&own_branch(&execution_id)))
+        .with_feature_flags(flags_on(workspace.path()));
+    assert_eq!(
+        handler.sweep_pending_finalizes(0).await,
+        PendingFinalizeSweepOutcome::default(),
+        "a declaration newer than the cutoff is not swept"
+    );
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+
+    let outcome = handler.sweep_pending_finalizes(i64::MAX).await;
+    assert_eq!(outcome.finalized, 1, "{outcome:?}");
+    assert_eq!(task_row(&db, &chore_id).pr_url.as_deref(), Some(OWN_PR));
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    assert_eq!(
+        handler.sweep_pending_finalizes(i64::MAX).await,
+        PendingFinalizeSweepOutcome::default(),
+        "a terminal execution is not swept again"
+    );
+}
+
+/// A failed `no-changes-needed` terminal write at the Stop boundary is
+/// retained and retried by the sweep with no further worker event.
+#[tokio::test]
+async fn failed_no_op_completion_write_is_retried_without_another_worker_event() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    crate::test_support::declare_no_changes_needed(&db, &execution_id);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_feature_flags(flags_on(workspace.path()));
+    db.connect().unwrap().execute_batch(FAIL_TERMINAL_WRITE).unwrap();
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert_eq!(outcome, StopOutcome::DbError, "{outcome:?}");
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+
+    let pass = handler.sweep_pending_finalizes(i64::MAX).await;
+    assert_eq!(pass.no_ops_still_pending, 1, "{pass:?}");
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+
+    db.connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_finalize;")
+        .unwrap();
+    let pass = handler.sweep_pending_finalizes(i64::MAX).await;
+    assert_eq!(pass.no_ops_finalized, 1, "{pass:?}");
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    assert_eq!(
+        handler.sweep_pending_finalizes(i64::MAX).await,
+        PendingFinalizeSweepOutcome::default(),
+        "nothing left pending once the no-op committed"
+    );
+}
+
+/// A turn-end arriving while a real finalize is in flight waits for it, then
+/// runs against the resolved state instead of racing it.
+#[tokio::test]
+async fn turn_end_during_an_in_flight_finalize_waits_and_sees_the_terminal_state() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    stamp_delivered(&db, &execution_id);
+    let gated = Arc::new(GatedPrDetector {
+        inner: StubPrDetector::ok(Some(OWN_PR)),
+        entered: Default::default(),
+        release: tokio::sync::Notify::new(),
+    });
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), gated.clone());
+    let handler = Arc::new(handler.with_branch_verifier(StubBranchVerifier::ok(&own_branch(&execution_id))));
+
+    let finalize = tokio::spawn({
+        let handler = Arc::clone(&handler);
+        let execution_id = execution_id.clone();
+        async move {
+            handler
+                .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+                .await
+        }
+    });
+    while gated.entered.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let stop = tokio::spawn({
+        let handler = Arc::clone(&handler);
+        let execution_id = execution_id.clone();
+        async move { handler.on_stop(&execution_id).await }
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!stop.is_finished(), "the turn-end must wait for the in-flight finalize");
+    assert_eq!(
+        gated.entered.load(Ordering::SeqCst),
+        1,
+        "the turn-end ran inside the finalize"
+    );
+
+    gated.release.notify_one();
+    let finalized = finalize.await.unwrap();
+    assert!(matches!(finalized, StopOutcome::PrDetected { .. }), "{finalized:?}");
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+        .await
+        .expect("turn-end handled once the finalize resolves")
+        .unwrap();
+    assert_eq!(stopped, StopOutcome::AlreadyTerminal);
+    assert_eq!(
+        cube.release_calls.lock().await.as_slice(),
+        ["lease-1"],
+        "released exactly once"
+    );
+}
+
+fn item_snapshot(db: &WorkDb, id: &str) -> Vec<Option<String>> {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, CAST(autostart AS TEXT), dispatch_failed_reason, dispatch_failed_error,
+                    dispatch_failed_at, updated_at, description, pr_url FROM tasks WHERE id = ?1",
+            [id],
+            |row| (0..8).map(|i| row.get::<_, Option<String>>(i)).collect(),
+        )
+        .unwrap()
+}
+
+/// A stuck item carrying dispatch-failure evidence, with a started
+/// `progression` execution bound to it.
+fn stuck_item_with_started_progression(dir: &Path) -> (Arc<WorkDb>, String, crate::work::WorkExecution) {
+    let db = Arc::new(WorkDb::open(dir.join("boss.db")).unwrap());
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let chore = crate::test_support::create_test_chore_manual(&db, product.id.clone(), "stuck item");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'todo', autostart = 1, dispatch_failed_reason = 'cube_workspace_lease_failed',
+                    dispatch_failed_error = 'lease boom', dispatch_failed_at = '2026-11-01T00:00:00Z'
+             WHERE id = ?1",
+            [&chore.id],
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(boss_protocol::ExecutionKind::Progression)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_progression_run_on_local_host(
+        &execution.id,
+        "progression-1",
+        "/tmp/boss-progression-scratch/t17",
+        true,
+    )
+    .unwrap();
+    (db, chore.id, execution)
+}
+
+#[tokio::test]
+async fn a_progression_stop_without_a_declaration_fails_the_run_as_no_disposition_and_leaves_the_item_alone() {
+    // A progression run holds no lease and no checkout. Its Stop must finalize
+    // the execution and release the pane only: no PR detection, no nudge, no
+    // cube call, and — above all — no change to the item it was sent to inspect.
+    // A run that ended its turn without declaring how it ended has no disposition,
+    // so it is a failed run (counted toward the infrastructure-failure cap), not a
+    // completed one.
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    // The item's pre-existing stale-worker evidence must survive the Stop's
+    // production teardown path.
+    db.upsert_external_tracker_attention(&chore_id, "stale_worker", "stuck item", "pre-existing")
+        .unwrap();
+    let before = item_snapshot(&db, &chore_id);
+
+    // A detector that would bind a PR if the progression run reached PR detection.
+    let TestHarness {
+        handler, cube, pane, ..
+    } = TestHarness::new(
+        db.clone(),
+        StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1")),
+    );
+    let outcome = handler.on_stop(&execution.id).await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Failed);
+    let (run_status, error_text): (String, Option<String>) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, error_text FROM work_runs WHERE execution_id = ?1",
+            [&execution.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run_status, "failed");
+    assert_eq!(error_text.as_deref(), Some("no disposition"));
+    assert_eq!(db.progression_disposition(&execution.id).unwrap(), None);
+    assert_eq!(pane.calls.lock().await.as_slice(), [execution.id.as_str()]);
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "no lease was held, so none is released"
+    );
+    assert_eq!(
+        item_snapshot(&db, &chore_id),
+        before,
+        "the stuck item is untouched by the run ending"
+    );
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "stale_worker" && item.status == "open"),
+        "the item's stale_worker attention stays open"
+    );
+}
+
+/// Declare `done` for a progression run through the real submission path (the
+/// proposal row, the disposition), as `boss propose done` does.
+fn declare_progression_done(
+    db: &WorkDb,
+    execution_id: &str,
+    payload: serde_json::Value,
+) -> boss_protocol::WorkerProposal {
+    use boss_engine_proposal_validation::{derive_idempotency_key, validate_payload};
+    let execution = db.get_execution(execution_id).unwrap();
+    let kind = boss_protocol::ProposalKind::RunDone;
+    let validated = validate_payload(kind, &payload).expect("done payload validates");
+    let key = derive_idempotency_key(execution_id, kind, &validated.canonical_json);
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id,
+        work_item_id: &execution.work_item_id,
+        kind,
+        payload_json: &validated.canonical_json,
+        idempotency_key: &key,
+    })
+    .unwrap()
+    .expect("done submission accepted")
+    .proposal
+}
+
+#[tokio::test]
+async fn a_declared_progression_run_completes_at_submission_and_never_looks_for_a_pr() {
+    // `delivered` and `no-changes-needed` both finish the run when the declaration
+    // lands (a no-op is not deferred to the driver's Stop, which has no command
+    // evidence to add for a run that holds no checkout), with the disposition the
+    // declaration earned and no PR resolution.
+    for (outcome, disposition) in [
+        ("delivered", boss_protocol::ProgressionDisposition::Progressed),
+        ("no_changes_needed", boss_protocol::ProgressionDisposition::NoAction),
+    ] {
+        let dir = tempdir().unwrap();
+        let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+        let before = item_snapshot(&db, &chore_id);
+        let proposal = declare_progression_done(
+            &db,
+            &execution.id,
+            serde_json::json!({"outcome": outcome, "summary": "Looked at it."}),
+        );
+        assert_eq!(proposal.state, boss_protocol::ProposalState::Applied);
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1"));
+        let TestHarness { handler, pane, .. } = TestHarness::new(db.clone(), detector.clone());
+
+        let run_outcome = handler
+            .finalize_declared_run_done(
+                &execution.id,
+                if outcome == "delivered" {
+                    boss_protocol::RunDoneOutcome::Delivered
+                } else {
+                    boss_protocol::RunDoneOutcome::NoChangesNeeded
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(run_outcome, StopOutcome::Progression),
+            "{outcome}: {run_outcome:?}"
+        );
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().status,
+            ExecutionStatus::Completed,
+            "{outcome}"
+        );
+        assert_eq!(
+            db.progression_disposition(&execution.id).unwrap(),
+            Some(disposition),
+            "{outcome}"
+        );
+        assert!(
+            detector.calls.lock().unwrap().is_empty(),
+            "{outcome}: no PR lookup for a run with no branch"
+        );
+        assert_eq!(
+            item_snapshot(&db, &chore_id),
+            before,
+            "{outcome}: the item is untouched"
+        );
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution.id.as_str()]);
+        // A late Stop finds a finished run.
+        assert!(matches!(
+            handler
+                .finalize_declared_run_done(&execution.id, boss_protocol::RunDoneOutcome::Delivered)
+                .await,
+            StopOutcome::AlreadyTerminal
+        ));
+    }
+}
+
+#[tokio::test]
+async fn an_asking_progression_run_parks_the_item_on_its_question_and_completes_as_asked() {
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    let proposal = declare_progression_done(
+        &db,
+        &execution.id,
+        serde_json::json!({
+            "outcome": "blocked", "summary": "Needs the owner", "criterion": "3",
+            "question": {
+                "text": "Should the old importer be removed?",
+                "answer_type": {"kind": "yes_no"},
+                "explanation": "Context:\nThe brief and the code disagree.\nYes:\nRemove it.\nNo:\nKeep it.\nRecommendation:\nI recommend Yes because it has no callers."
+            }
+        }),
+    );
+    assert_eq!(proposal.state, boss_protocol::ProposalState::Applied);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+
+    let outcome = handler
+        .finalize_declared_run_done(&execution.id, boss_protocol::RunDoneOutcome::Blocked)
+        .await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(
+        db.progression_disposition(&execution.id).unwrap(),
+        Some(boss_protocol::ProgressionDisposition::Asked)
+    );
+    let task = task_row(&db, &chore_id);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+    assert_eq!(
+        task.dispatch_failed_reason, None,
+        "the question supersedes the halt stamp"
+    );
+    let questions = db.list_operator_questions(&chore_id).unwrap();
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].status, boss_protocol::OperatorQuestionStatus::Open);
+    assert_eq!(questions[0].question.execution_id, execution.id);
+}
+
+#[tokio::test]
+async fn a_progression_stop_with_a_no_changes_needed_stamp_and_both_flags_on_leaves_the_item_alone() {
+    // The no-op finalizer closes PR-less work as done. A progression run must
+    // never reach it, even if a declaration got stamped on its execution.
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    crate::test_support::declare_no_changes_needed(&db, &execution.id);
+    let before = item_snapshot(&db, &chore_id);
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_feature_flags(flags_on(dir.path()));
+    let outcome = handler.on_stop(&execution.id).await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
+    assert_eq!(item_snapshot(&db, &chore_id), before, "the stuck item is unchanged");
+}
+
+#[tokio::test]
+async fn a_progression_driver_error_stop_records_a_failed_execution_and_run_but_leaves_the_item_alone() {
+    // Start from the real post-spawn state: the pane spawn already closed the
+    // run as `completed` and the execution is still live. A driver-reported
+    // fatal error at Stop must still land as a failed execution and run, so the
+    // candidate view's infrastructure-failure cap can see it.
+    let dir = tempdir().unwrap();
+    let (db, chore_id, execution) = stuck_item_with_started_progression(dir.path());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET status = 'completed', finished_at = '2026-11-01T00:00:01Z' WHERE execution_id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let before = item_snapshot(&db, &chore_id);
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let turn_end = crate::driver::TurnEnd {
+        session_id: "progression-session".to_owned(),
+        reason: boss_protocol::StopReason::Other,
+        continuation: false,
+    };
+    let outcome = handler.on_stop_with_turn_end(&execution.id, Some(&turn_end)).await;
+
+    assert!(matches!(outcome, StopOutcome::Progression), "got {outcome:?}");
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Failed);
+    let (run_status, summary): (String, Option<String>) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, result_summary FROM work_runs WHERE execution_id = ?1",
+            [&execution.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run_status, "failed");
+    assert!(
+        summary
+            .as_deref()
+            .is_some_and(|s| s.contains("progression: driver error")),
+        "the failure detail is recorded on the run: {summary:?}"
+    );
+    assert_eq!(item_snapshot(&db, &chore_id), before, "the item is unchanged");
+}

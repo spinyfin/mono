@@ -15,9 +15,9 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_engine::coordinator::CubeWorkspaceLease;
 use boss_engine::ladder_lease_registry;
 use boss_engine::work::{ClaimPlannerRunInput, ConflictResolutionInsertInput, WorkDb};
+use boss_host_execution::types::CubeWorkspaceLease;
 use boss_protocol::{
     BackgroundWorkKind, CreateChoreInput, CreateProductInput, CreateProjectInput, FrontendEvent, FrontendRequest,
     Product, Project, Task, WorkItem,
@@ -28,6 +28,7 @@ use common::TestEngine;
 
 fn list_engine_attempts_request(include_background_work: bool, limit: Option<u32>) -> FrontendRequest {
     FrontendRequest::ListEngineAttempts {
+        open_prs_only: false,
         kinds: vec![],
         product_id: None,
         status: vec![],

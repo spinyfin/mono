@@ -108,6 +108,34 @@ struct EngineSetting: Identifiable, Hashable {
     let enabled: Bool
 }
 
+/// The `[backup.offsite]` off-machine backup configuration, decoded from an
+/// `offsite_backup_settings` response. Mirrors
+/// `boss_protocol::OffsiteBackupSettings`.
+struct OffsiteBackupSettings: Hashable {
+    static let defaultKeepHourly = 24
+    static let defaultKeepDaily = 14
+
+    var enabled: Bool
+    var destination: String?
+    var keepHourly: Int
+    var keepDaily: Int
+    /// Set when the stored section could not be parsed; the other fields are
+    /// then defaults and saving overwrites the bad section.
+    var loadError: String?
+
+    /// The reason the engine would reject this config, or nil when it would
+    /// accept it. Mirrors `OffsiteConfig::destination_setting` and the
+    /// zero-retention rule so the form can explain before the round trip.
+    var validationProblem: String? {
+        guard enabled else { return nil }
+        let trimmed = (destination ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "Choose a destination folder." }
+        if !trimmed.hasPrefix("/") { return "The destination must be an absolute path." }
+        if keepHourly == 0 && keepDaily == 0 { return "Keep at least one hourly or daily copy." }
+        return nil
+    }
+}
+
 /// One UI-actionable engine-health issue, decoded from an
 /// `engine_health_result` response. Mirrors
 /// `boss_protocol::EngineHealthIssue` one-for-one. Drives the

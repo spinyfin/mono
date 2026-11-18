@@ -16,8 +16,9 @@
 //! prompt composer (`runner::compose_execution_prompt`) renders the
 //! markdown surface.
 //!
-//! The collector is intentionally *pure-ish*: it shells out to `git`
-//! but doesn't mutate working state. A failed probe (git missing,
+//! The collector shells out to `git` without changing the checkout.
+//! The current-base entry point fetches into a temporary private ref.
+//! A failed probe (git missing,
 //! refs unresolvable, no conflicts after all) returns a populated
 //! `ConflictDiagnosis` with `files = []` and an `error` field so the
 //! worker prompt can still render something sensible — better than
@@ -38,14 +39,18 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 mod classify;
+mod current_base;
+pub use current_base::collect_current_base;
+#[cfg(test)]
+mod ssh_tests;
 pub use classify::classify_conflict_class;
 
 /// Structured pre-spawn conflict-diagnosis blob. Wire-encoded as JSON
 /// and stored in `conflict_resolutions.conflict_diagnosis`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConflictDiagnosis {
-    /// Schema version. Bump when fields are added/removed; consumers
-    /// can refuse to render unknown versions.
+    /// Version 1 probes caller-supplied endpoints. Version 2 has the same
+    /// fields but guarantees `base_sha` is the freshly fetched branch tip.
     pub schema_version: u32,
     /// Sha of the base ref (`main` at probe time).
     pub base_sha: String,
@@ -127,12 +132,53 @@ async fn git_version() -> Option<(u32, u32, u32)> {
 /// invocation (e.g. new-syntax `merge-tree` treats exit 1 as a conflict
 /// signal rather than a failure).
 async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::io::Result<Output> {
-    Command::new("git")
+    probe_command(args, workspace_path, git_dir, |key| std::env::var_os(key))
+        .await?
+        .kill_on_drop(true)
+        .output()
+        .await
+}
+
+async fn probe_command(
+    args: &[&str],
+    workspace_path: &Path,
+    git_dir: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> std::io::Result<Command> {
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(workspace_path)
         .env("GIT_DIR", git_dir)
-        .output()
-        .await
+        // A probe must fail fast on missing credentials, never wait on a prompt.
+        .env("GIT_TERMINAL_PROMPT", "0");
+    // SSH prompts use /dev/tty, which GIT_TERMINAL_PROMPT does not cover.
+    // Preserve explicit SSH environment settings; otherwise append BatchMode
+    // to core.sshCommand, retaining its key and connection options.
+    if env("GIT_SSH_COMMAND").is_none() && env("GIT_SSH").is_none() {
+        let config = Command::new("git")
+            .args(["config", "--get", "core.sshCommand"])
+            .current_dir(workspace_path)
+            .env("GIT_DIR", git_dir)
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        let mut ssh_command = if config.status.success() {
+            let value = String::from_utf8(config.stdout)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            value.strip_suffix('\n').unwrap_or(&value).to_owned()
+        } else if config.status.code() == Some(1) {
+            "ssh".to_owned()
+        } else {
+            return Err(std::io::Error::other(format!(
+                "could not read core.sshCommand: {}",
+                String::from_utf8_lossy(&config.stderr)
+            )));
+        };
+        ssh_command.push_str(" -o BatchMode=yes");
+        command.env("GIT_SSH_COMMAND", ssh_command);
+    }
+    Ok(command)
 }
 
 /// Resolve the jj repo directory (the dir that directly contains
@@ -229,6 +275,73 @@ pub async fn collect(workspace_path: &Path, base_sha: &str, head_sha: &str) -> s
     } else {
         collect_legacy(workspace_path, &git_dir, base_sha, head_sha).await
     }
+}
+
+/// Collect without a leased checkout. Fetch the two immutable endpoints into
+/// an engine-owned scratch object store, then use the same merge-tree collector.
+/// No working tree, branch, shared cube store or worker lease is modified.
+pub async fn collect_remote(
+    scratch: &Path,
+    remote: &str,
+    base_sha: &str,
+    head_sha: &str,
+) -> std::io::Result<ConflictDiagnosis> {
+    if ![base_sha, head_sha]
+        .iter()
+        .all(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            "probe endpoints must be full commit SHAs",
+        ));
+    }
+    std::fs::create_dir_all(scratch)?;
+    let git_dir = scratch.join(".git");
+    let init = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&git_dir)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !init.status.success() {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            format!("scratch git init failed: {}", String::from_utf8_lossy(&init.stderr)),
+        ));
+    }
+    // Blob-less partial fetch: commits and trees for both endpoints, with the
+    // few blobs `merge-tree` needs for conflicting paths fetched lazily. A full
+    // fetch would download close to the whole repository on every probe.
+    let remote_add = run_git(&["remote", "add", "origin", "--", remote], scratch, &git_dir).await?;
+    if !remote_add.status.success() {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            format!(
+                "scratch remote setup failed: {}",
+                String::from_utf8_lossy(&remote_add.stderr)
+            ),
+        ));
+    }
+    let fetch = run_git(
+        &["fetch", "--no-tags", "--filter=blob:none", "origin", base_sha, head_sha],
+        scratch,
+        &git_dir,
+    )
+    .await?;
+    if !fetch.status.success() {
+        return Ok(ConflictDiagnosis::errored(
+            base_sha,
+            head_sha,
+            format!(
+                "scratch endpoint fetch failed: {}",
+                String::from_utf8_lossy(&fetch.stderr)
+            ),
+        ));
+    }
+    collect(scratch, base_sha, head_sha).await
 }
 
 /// New-syntax path: `git merge-tree --write-tree --name-only --no-messages
@@ -635,6 +748,25 @@ changed in both\n\
         assert!(diag.error.is_none(), "diagnosis errored: {:?}", diag.error);
         assert_eq!(diag.files.len(), 1, "expected one conflicted file");
         assert_eq!(diag.files[0].path, "a.txt");
+
+        // Progression has only a scratch directory: fetch immutable endpoints
+        // without creating a working tree or using a lease.
+        let sha = |branch: &str| {
+            std::process::Command::new("git")
+                .args(["rev-parse", branch])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+        };
+        let base = String::from_utf8(sha("main").stdout).unwrap();
+        let head = String::from_utf8(sha("feature").stdout).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let remote_diag = collect_remote(scratch.path(), repo.to_str().unwrap(), base.trim(), head.trim())
+            .await
+            .unwrap();
+        assert!(remote_diag.error.is_none(), "{remote_diag:?}");
+        assert_eq!(remote_diag.files[0].path, "a.txt");
+        assert!(!scratch.path().join("a.txt").exists());
     }
 
     /// Regression test: `collect` must succeed when the workspace is

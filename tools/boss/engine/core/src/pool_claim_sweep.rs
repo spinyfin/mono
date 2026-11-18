@@ -3,10 +3,10 @@
 //!
 //! ## The leak this closes
 //!
-//! A [`crate::coordinator::WorkerPool`] slot is claimed at dispatch
+//! A [`boss_execution_contracts::WorkerPool`] slot is claimed at dispatch
 //! (`drain_ready_queue` / `force_dispatch` → `claim_worker`) and, for a
 //! pane-spawned run, its release is DEFERRED to
-//! [`crate::app::ServerState::release_worker_pane`], which frees the
+//! `boss_engine::app::ServerState::release_worker_pane`, which frees the
 //! slot after token-verified tmux teardown and viewer detach. Every
 //! other release path keys off a *live* worker:
 //!
@@ -18,7 +18,7 @@
 //!   [`LiveWorkerStateRegistry`] and derive the slot to release from a
 //!   *live-state entry*;
 //! * transient-recovery iterates the same registry but routes teardown
-//!   through [`crate::app::ServerState::release_worker_pane`], so the
+//!   through `boss_engine::app::ServerState::release_worker_pane`, so the
 //!   pool claim is handed back only when the app confirms the pane is
 //!   gone.
 //!
@@ -153,7 +153,7 @@ pub trait WorkerViewerDetach: Send + Sync {
     async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>>;
 }
 
-pub(crate) const TEARDOWN_ATTENTION_KIND: &str = "pool_claim_teardown_pending";
+pub(crate) use boss_engine_storage_values::attention_kinds::POOL_CLAIM_TEARDOWN_ATTENTION_KIND as TEARDOWN_ATTENTION_KIND;
 
 /// Consecutive failed confirmations, retained across sweep passes.
 #[derive(Default)]
@@ -206,6 +206,7 @@ impl TeardownRetries {
             coordinator.worker_pool(),
             coordinator.automation_worker_pool(),
             coordinator.review_worker_pool(),
+            coordinator.progression_worker_pool(),
         ] {
             claimed.extend(pool.claims().await.into_iter().map(|claim| claim.execution_id));
         }
@@ -345,6 +346,7 @@ pub async fn run_one_pass(
         (coordinator.worker_pool(), "main"),
         (coordinator.automation_worker_pool(), "automation"),
         (coordinator.review_worker_pool(), "review"),
+        (coordinator.progression_worker_pool(), "progression"),
     ] {
         for claim in pool.claims().await {
             // A live pane still backs this slot — the completion /

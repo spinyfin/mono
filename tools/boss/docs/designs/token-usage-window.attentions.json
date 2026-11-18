@@ -1,0 +1,31 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep every token figure engine-computed, so each regroup, filter or range change in the Token Usage window is one engine round trip (recommended), rather than fetching rows once and summing in the app for instant regrouping?",
+    "anchor": "1-the-invariant-stated-where-it-is-load-bearing"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Switch the three existing `boss cost` verbs (task, window, top) to the corrected projection in the same engine PR, so they also count answer-agent, review-guide and automation-triage runs? This changes their printed output by adding a '(no task)' group.",
+    "anchor": "finding-1-the-existing-projection-silently-drops-executions-that-have-no-task"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which definition should the 'tokens per completed task' normalizer use?",
+    "choices": [
+      "All-in: inclusive chain cost of tasks completed in the bucket, whenever those tokens were spent (recommended; non-additive across buckets, labelled)",
+      "In-bucket: tokens of runs created in the bucket divided by tasks completed in the bucket (additive, but mixes unrelated work)"
+    ],
+    "anchor": "3-gettokenusageseries-buckets-with-normalizers"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Ship the estimated-USD column in v1 (off by default, labelled an estimate, priced only for net-input Claude runs with gross-input and unknown-driver runs shown as unpriceable), rather than omitting USD from the window until the cost-attribution rate table lands?",
+    "anchor": "2-gettokenusagerows-the-tree-for-a-window"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Promote the deferred entry 'Record reasoning in the execution launch tuple' to in-scope, so grouping by reasoning is historical rather than by the task's current setting?",
+    "anchor": "finding-2-the-launch-tuple-records-driver-model-and-effort-but-not-reasoning"
+  }
+]

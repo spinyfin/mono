@@ -3,6 +3,21 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+struct WorkViewModePicker: View {
+    @ObservedObject var model: ChatViewModel
+
+    var body: some View {
+        Picker("Work view", selection: Binding(
+            get: { model.navigator.mode },
+            set: { model.setWorkViewMode($0) }
+        )) {
+            ForEach(WorkViewMode.allCases) { mode in Text(mode.title).tag(mode) }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 180)
+    }
+}
+
 /// Whether a collapsible board section is currently showing its cards.
 ///
 /// The state is one sticky bit per section in `BossDefaults`, written by the
@@ -37,6 +52,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
     let sectionID: String
     let title: String
     let count: Int
+    let countLabel: String?
     let defaultExpanded: Bool
     var shortIDLabel: String? = nil
     /// "Trunk queue paused/draining" (or similar) banner shown under the
@@ -56,6 +72,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         title: String,
         count: Int,
         defaultExpanded: Bool,
+        countLabel: String? = nil,
         shortIDLabel: String? = nil,
         banner: String? = nil,
         revealGeneration: UUID? = nil,
@@ -66,6 +83,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         self.sectionID = sectionID
         self.title = title
         self.count = count
+        self.countLabel = countLabel
         self.defaultExpanded = defaultExpanded
         self.shortIDLabel = shortIDLabel
         self.banner = banner
@@ -100,7 +118,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(width: 10)
-                        Text("\(title) (\(count))")
+                        Text(countLabel.map { "\(title) · \($0)" } ?? "\(title) (\(count))")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                         if let label = shortIDLabel {
@@ -263,31 +281,6 @@ struct WorkSidebarFilterRow: View {
     }
 }
 
-struct WorkProjectFilterToolbarButton: View {
-    @ObservedObject var model: ChatViewModel
-    @State private var isShowingPopover = false
-
-    var body: some View {
-        Button {
-            isShowingPopover.toggle()
-        } label: {
-            Image(systemName: "square.stack.3d.up")
-                .overlay(alignment: .topTrailing) {
-                    if model.hasProjectFilters {
-                        Circle()
-                            .fill(Color.accentColor)
-                            .frame(width: 6, height: 6)
-                            .offset(x: 3, y: -3)
-                    }
-                }
-        }
-        .help("Project filter")
-        .popover(isPresented: $isShowingPopover, arrowEdge: .bottom) {
-            ProjectFilterPopover(model: model)
-        }
-    }
-}
-
 struct WorkGroupToolbarMenu: View {
     @ObservedObject var model: ChatViewModel
 
@@ -310,129 +303,6 @@ struct WorkGroupToolbarMenu: View {
         .help("Group by")
     }
 }
-
-struct WorkSearchToolbarItem: View {
-    @ObservedObject var model: ChatViewModel
-    @Binding var isExpanded: Bool
-
-    var body: some View {
-        if isExpanded {
-            SearchTextField(
-                text: $model.workSearchText,
-                onEscape: {
-                    isExpanded = false
-                    model.workSearchText = ""
-                },
-                onFocusLost: {
-                    isExpanded = false
-                }
-            )
-            .frame(width: 160)
-        } else {
-            Button {
-                isExpanded = true
-            } label: {
-                Image(systemName: "magnifyingglass")
-            }
-            .help("Search (⌘F)")
-            .keyboardShortcut("f", modifiers: .command)
-        }
-    }
-}
-
-private struct SearchTextField: View {
-    @Binding var text: String
-    var onEscape: () -> Void
-    var onFocusLost: () -> Void
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-                .font(.system(size: 11))
-            TextField("Search", text: $text)
-                .textFieldStyle(.plain)
-                .focused($isFocused)
-                .onKeyPress(.escape) {
-                    onEscape()
-                    return .handled
-                }
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 4)
-        .background(.quaternary, in: Capsule())
-        .onAppear { isFocused = true }
-        .onChange(of: isFocused) { _, focused in
-            if !focused { onFocusLost() }
-        }
-    }
-}
-
-private struct ProjectFilterPopover: View {
-    @ObservedObject var model: ChatViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            let allSelected = !model.hasProjectFilters
-            Button {
-                model.clearProjectFilters()
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: allSelected ? "checkmark.square.fill" : "square")
-                        .foregroundStyle(allSelected ? Color.accentColor : .secondary)
-                        .font(.system(size: 14, weight: .medium))
-                        .frame(width: 15)
-                    Text("All Projects")
-                        .font(.body.weight(allSelected ? .semibold : .regular))
-                    Spacer()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Divider()
-
-            ForEach(model.projectsForSelectedProduct) { project in
-                let isOn = model.selectedProjectFilterIDs.contains(project.id)
-                Button {
-                    model.toggleProjectFilter(project.id)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: isOn ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(isOn ? Color.accentColor : .secondary)
-                            .font(.system(size: 14, weight: .medium))
-                            .frame(width: 15)
-                        Text(project.name)
-                            .font(.body.weight(isOn ? .semibold : .regular))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        if let id = project.shortID {
-                            Text("P" + String(id))
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(minWidth: 200, maxWidth: 280)
-        .padding(.vertical, 4)
-    }
-}
-
-/// Compact warning banner shown in the sidebar below the product picker
-/// when the external-tracker reconciler has unresolved attention items for
-/// the selected product. Clicking the banner opens a popover with each
-/// item's title and body. Disappears automatically once all items are
-/// resolved (resolved_at set).
 
 struct SidebarProductPicker: View {
     @Binding var selection: String?

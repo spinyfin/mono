@@ -57,13 +57,13 @@ use boss_protocol::{
     PlannerOutput, ProductContext, ProjectContext, TaskBrief, TaskKind, WorkItem,
 };
 
-use crate::coordinator::ExecutionPublisher;
 use crate::materializer::Materializer;
 use crate::planner::{PLANNER_MODEL, Planner, PlannerOutcome};
 use crate::utility_model::{UtilityModel, UtilityTask};
 use crate::work::{ClaimPlannerRunInput, PlannerRunPatch, WorkDb};
 use boss_design_doc_fetcher::{DocFetchOutcome, fetch_design_doc};
 use boss_engine_planner_validation::{ValidationResult, validate};
+use boss_execution_contracts::ExecutionPublisher;
 
 /// Default hard cap on how many tasks one populate may create (design
 /// §"Bounding & guardrails"). A proposal exceeding it is rejected whole —
@@ -84,7 +84,7 @@ pub const CALLER_OPERATOR: &str = "operator";
 /// default `followup|{task_id}` derivation) so a populate outcome never
 /// collapses into — or reopens — a group formed by the design worker's own
 /// `FOLLOWUPS:` block on the same task; the two are unrelated sources.
-pub(crate) const ATTENTION_GROUP_KEY_PREFIX: &str = "followup|populate";
+pub const ATTENTION_GROUP_KEY_PREFIX: &str = "followup|populate";
 
 /// Fallback ref when the project's `design_doc_branch` pointer is unset. The
 /// design doc has merged, so it lives on the default branch.
@@ -372,6 +372,7 @@ impl Populator {
                         .result_summary(format!("internal error: {err}"))
                         .build(),
                 );
+                Self::publish_planner_run_changed(publisher, ctx).await;
                 PopulateOutcome::Errored
             }
         }
@@ -654,6 +655,11 @@ impl Populator {
             }
         };
 
+        let footprints = match crate::planner::validate_breakdown_footprints(&doc) {
+            Ok(footprints) => footprints,
+            Err(reason) => return Ok(Self::bad_breakdown_attempt(reason)),
+        };
+
         // Assemble the Planner input. Existing task names are a dedup hint;
         // design tasks are excluded (the merged design already exists, and the
         // Planner must never re-propose it). Filtering on `kind != design`
@@ -712,7 +718,7 @@ impl Populator {
 
         // 5. Plan (the one LLM step).
         let plan_outcome = steps.plan(&planner_input).await;
-        let output = match plan_outcome {
+        let mut output = match plan_outcome {
             PlannerOutcome::Success(output) => output,
             failure => {
                 let detail = failure.detail();
@@ -732,6 +738,10 @@ impl Populator {
                 });
             }
         };
+
+        if let Err(reason) = crate::planner::attach_task_footprints(&mut output, &footprints) {
+            return Ok(Self::bad_breakdown_attempt(reason));
+        }
 
         // Persist the raw structured output + rationale + effort audit before
         // validating, so the operator can always read exactly what the model
@@ -805,6 +815,21 @@ impl Populator {
             ))),
             ValidationResult::Valid { low_confidence } => Ok(PlanAttempt::Valid { output, low_confidence }),
         }
+    }
+
+    fn bad_breakdown_attempt(reason: String) -> PlanAttempt {
+        let mut attempt = Self::bad_graph_attempt(reason.clone());
+        if let PlanAttempt::Terminal { title, body, .. } = &mut attempt {
+            *title = "Auto-populate rejected: revise design breakdown";
+            *body = format!(
+                "Return the design doc to its author. No tasks were created. Fix these entries:\n{reason}\n\n\
+                 Add numbered Major deliverables, Likely changed files (explicit paths or globs with \
+                 approximate counts), and Estimated size: ~N files / ~M changed lines. Split entries \
+                 exceeding 3 deliverables, 25 files, or 1,500 changed lines along capability boundaries, \
+                 then re-run `boss project plan <project>`. The planner never splits entries."
+            );
+        }
+        attempt
     }
 
     /// Build the terminal [`PlanAttempt`] for a rejected malformed graph
@@ -968,6 +993,19 @@ impl Populator {
         })
     }
 
+    /// Invalidate the product's work topic after a `planner_runs` row settles,
+    /// so subscribers refetch the work tree — which carries each project's
+    /// latest settled planner run — instead of polling `list_planner_runs`.
+    /// `running` → settled is the only populator transition the tree reflects
+    /// (the in-flight state comes from the background-work snapshot), and
+    /// every settled outcome passes through [`Self::finish`] or the
+    /// internal-error path in [`Self::run_with_force`].
+    async fn publish_planner_run_changed(publisher: &dyn ExecutionPublisher, ctx: &PopulateContext) {
+        publisher
+            .publish_work_item_changed(&ctx.product_id, &ctx.project_id, "planner_run_changed")
+            .await;
+    }
+
     /// Update the claimed `planner_runs` row with the terminal patch and raise
     /// the operator-facing attention, publishing `AttentionCreated` on the
     /// project's product topic so the operator sees the outcome-specific text
@@ -997,6 +1035,7 @@ impl Populator {
         if let Err(err) = db.update_planner_run(run_id, patch) {
             tracing::warn!(project_id = %ctx.project_id, run_id, ?err, "populator: failed to update planner run");
         }
+        Self::publish_planner_run_changed(publisher, ctx).await;
         match db.create_attention(
             CreateAttentionInput::builder()
                 .kind("followup")
@@ -1075,7 +1114,7 @@ pub fn enqueue_from_merge(work_db: &WorkDb, ctx: PopulateContext) {
     let max_tasks = config.max_tasks;
     let publisher = config.publisher.clone();
     tracing::info!(project_id = %ctx.project_id, pr_url = %ctx.pr_url, "populator: enqueuing auto-populate");
-    tokio::spawn(async move {
+    boss_task_scope::spawn(async move {
         let outcome = Populator::run(&db, &steps, &ctx, max_tasks, publisher.as_ref()).await;
         tracing::info!(
             project_id = %ctx.project_id,
@@ -1155,6 +1194,7 @@ mod tests {
 
     /// Cloneable descriptors the fake maps to real (non-Clone) outcome enums.
     enum DocFetchOutcomeKind {
+        FromPlan,
         Content(String),
         Missing,
         Failed,
@@ -1168,6 +1208,13 @@ mod tests {
     impl PopulatorSteps for FakeSteps {
         async fn fetch_doc(&self, _repo: &str, _path: &str, _git_ref: &str) -> DocFetchOutcome {
             match &self.doc {
+                DocFetchOutcomeKind::FromPlan => {
+                    let doc = match &self.plan {
+                        PlannerOutcomeKind::Success(output) => footprint_tests::estimated_doc(output),
+                        PlannerOutcomeKind::NoApiKey => "# doc".to_owned(),
+                    };
+                    DocFetchOutcome::Content(doc)
+                }
                 DocFetchOutcomeKind::Content(s) => DocFetchOutcome::Content(s.clone()),
                 DocFetchOutcomeKind::Missing => DocFetchOutcome::DocMissing,
                 DocFetchOutcomeKind::Failed => DocFetchOutcome::FetchFailed {
@@ -1263,6 +1310,8 @@ mod tests {
             .count()
     }
 
+    mod footprint_tests;
+
     // ---- happy path: stage tasks ------------------------------------------
 
     #[tokio::test]
@@ -1278,10 +1327,7 @@ mod tests {
             Confidence::High,
             true,
         );
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
 
         let publisher = RecordingPublisher::default();
         let outcome = Populator::run(
@@ -1316,6 +1362,12 @@ mod tests {
         // kanban refreshes in one round-trip (design §"Surfacing").
         assert_eq!(publisher.attentions_created().await, 1);
         assert_eq!(publisher.work_items_created_len().await, Some(2));
+        // The run settling invalidates the product's work topic so the work
+        // tree (which carries the latest settled planner run) is refetched.
+        assert_eq!(
+            publisher.lifecycle_reasons().await,
+            vec!["planner_run_changed".to_owned()]
+        );
     }
 
     /// Codex-eligibility Phase 2 acceptance criterion (agent-driver design
@@ -1341,8 +1393,8 @@ mod tests {
 
         let codex_authored_doc = "# Codex driver follow-on: load balancing\n\n\
             ## Proposed implementation task breakdown\n\n\
-            ### T-01 Per-driver capacity accounting\n\nAttach an in-flight counter at the dispatch gate.\n\n\
-            ### T-02 Per-provider rate-limit state\n\nRecord Codex's per-turn `usage` fields. Depends on T-01.\n";
+            ### Per-driver capacity accounting\n\nAttach an in-flight counter at the dispatch gate.\nMajor deliverables:\n1. Capacity accounting.\nLikely changed files:\n- `src/dispatch.rs`\nEstimated size: ~1 files / ~100 changed lines\n\n\
+            ### Per-provider rate-limit state\n\nRecord Codex's per-turn `usage` fields. Depends on Per-driver capacity accounting.\nMajor deliverables:\n1. Rate-limit state.\nLikely changed files:\n- `src/usage.rs`\nEstimated size: ~1 files / ~100 changed lines\n";
         let output = plan_output(
             vec![
                 ptask("capacity", "Per-driver capacity accounting"),
@@ -1389,10 +1441,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::Low, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1423,7 +1472,7 @@ mod tests {
         let first = Populator::run(
             &db,
             &steps_with(
-                DocFetchOutcomeKind::Content("# doc".to_owned()),
+                DocFetchOutcomeKind::FromPlan,
                 PlannerOutcomeKind::Success(output.clone()),
             ),
             &ctx(&product_id, &project_id, &design_id),
@@ -1437,10 +1486,7 @@ mod tests {
         // holds the idempotency gate.
         let second = Populator::run(
             &db,
-            &steps_with(
-                DocFetchOutcomeKind::Content("# doc".to_owned()),
-                PlannerOutcomeKind::Success(output),
-            ),
+            &steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output)),
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
             &RecordingPublisher::default(),
@@ -1468,7 +1514,7 @@ mod tests {
         .unwrap();
 
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let publisher = RecordingPublisher::default();
@@ -1518,7 +1564,7 @@ mod tests {
         insert_project_revision_row(&db, &product_id, &project_id, &design_id);
 
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let publisher = RecordingPublisher::default();
@@ -1566,6 +1612,27 @@ mod tests {
         assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
     }
 
+    /// A failed run settles the planner row without staging anything, so the
+    /// work tree's per-project planner summary changes with no task change to
+    /// piggyback on — the transition must publish its own invalidation.
+    #[tokio::test]
+    async fn failed_run_invalidates_the_product_work_topic() {
+        let db = open();
+        let (product_id, project_id, design_id) = seed(&db);
+        let steps = steps_with(DocFetchOutcomeKind::Missing, PlannerOutcomeKind::NoApiKey);
+        let publisher = RecordingPublisher::default();
+        Populator::run(
+            &db,
+            &steps,
+            &ctx(&product_id, &project_id, &design_id),
+            DEFAULT_MAX_TASKS,
+            &publisher,
+        )
+        .await;
+        let events = publisher.events.lock().await.clone();
+        assert_eq!(events, vec![(product_id, project_id, "planner_run_changed".to_owned())]);
+    }
+
     #[tokio::test]
     async fn fetch_failure_is_recorded() {
         let db = open();
@@ -1587,10 +1654,7 @@ mod tests {
     async fn planner_no_api_key_is_recorded() {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::NoApiKey,
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::NoApiKey);
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1613,10 +1677,7 @@ mod tests {
     async fn planner_failed_outcome_is_visible_via_the_attention_list_query_path() {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::NoApiKey,
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::NoApiKey);
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1654,10 +1715,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
         let output = plan_output(vec![], vec![], Confidence::High, false);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1678,10 +1736,7 @@ mod tests {
         let (product_id, project_id, design_id) = seed(&db);
         let tasks: Vec<_> = (0..3).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
         let output = plan_output(tasks, vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         // Cap of 2, proposal of 3.
         let outcome = Populator::run(
             &db,
@@ -1718,10 +1773,7 @@ mod tests {
         let n = DEFAULT_MAX_TASKS + 1;
         let tasks: Vec<_> = (0..n).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
         let output = plan_output(tasks, vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let ctx = ctx(&product_id, &project_id, &design_id);
 
         let rejected = Populator::run(&db, &steps, &ctx, DEFAULT_MAX_TASKS, &RecordingPublisher::default()).await;
@@ -1757,10 +1809,7 @@ mod tests {
         let (_product_id, project_id, _design_id) = seed(&db);
         let tasks: Vec<_> = (0..3).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
         let output = plan_output(tasks, vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let preview = Populator::preview(&db, &steps, &project_id, 2, false)
             .await
             .expect("preview");
@@ -1802,10 +1851,7 @@ mod tests {
             Confidence::High,
             true,
         );
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run(
             &db,
             &steps,
@@ -1839,10 +1885,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, _design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let outcome = Populator::run_operator(
             &db,
             &steps,
@@ -1880,7 +1923,7 @@ mod tests {
         )
         .unwrap();
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let outcome = Populator::run_operator(
@@ -1910,7 +1953,7 @@ mod tests {
         )
         .unwrap();
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let outcome = Populator::run_operator(
@@ -1943,10 +1986,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, _design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         let preview = Populator::preview(&db, &steps, &project_id, DEFAULT_MAX_TASKS, false)
             .await
             .unwrap();
@@ -1975,7 +2015,7 @@ mod tests {
         )
         .unwrap();
         let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            DocFetchOutcomeKind::FromPlan,
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
         let preview = Populator::preview(&db, &steps, &project_id, DEFAULT_MAX_TASKS, false)
@@ -1990,10 +2030,7 @@ mod tests {
         let db = open();
         let (product_id, project_id, design_id) = seed(&db);
         let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
-        let steps = steps_with(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-        );
+        let steps = steps_with(DocFetchOutcomeKind::FromPlan, PlannerOutcomeKind::Success(output));
         // A real run first stages the batch...
         let first = Populator::run(
             &db,

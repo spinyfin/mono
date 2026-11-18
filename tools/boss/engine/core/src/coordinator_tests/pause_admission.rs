@@ -234,7 +234,7 @@ async fn schedule_execution_refuses_a_queued_row_when_a_pause_lands_after_the_cl
 
     // The slot is claimed first — i.e. the drain already passed its own gate.
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("main pool slot available");
@@ -243,7 +243,7 @@ async fn schedule_execution_refuses_a_queued_row_when_a_pause_lands_after_the_cl
     breaker_pause(coordinator.as_ref());
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_err(),
@@ -289,13 +289,13 @@ async fn operator_pause_still_admits_a_review_at_the_chokepoint() {
     operator_pause(coordinator.as_ref());
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("review pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::Queued)
         .await;
     assert!(
         result.is_ok(),
@@ -508,13 +508,13 @@ async fn pause_bypass_override_is_admitted_under_an_operator_pause() {
     operator_pause(coordinator.as_ref());
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("main pool slot available");
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::PauseBypassOverride)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::PauseBypassOverride)
         .await;
     assert!(
         result.is_ok(),
@@ -542,7 +542,7 @@ async fn pause_bypass_override_is_held_under_a_breaker_pause() {
     let (coordinator, cube, runner, events) = paused_dispatch_fixture(db.clone());
 
     let worker_id = coordinator
-        .pool_for_execution(&execution)
+        .pool_for_execution_for_test(&execution)
         .claim_worker(&execution.id, None)
         .await
         .expect("main pool slot available");
@@ -550,7 +550,7 @@ async fn pause_bypass_override_is_held_under_a_breaker_pause() {
     breaker_pause(coordinator.as_ref());
 
     let result = coordinator
-        .schedule_execution(&execution, &worker_id, DispatchAdmission::PauseBypassOverride)
+        .schedule_execution_for_test(&execution, &worker_id, DispatchAdmission::PauseBypassOverride)
         .await;
     assert!(
         result.is_err(),

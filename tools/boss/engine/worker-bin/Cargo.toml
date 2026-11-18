@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-worker-processes = { path = "../../worker-processes" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 

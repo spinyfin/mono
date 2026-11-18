@@ -1,0 +1,219 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# Signed spoke packages: the manifest and signature format, the package archive,
+# the launchd/systemd definitions and the idempotent installer. The `boss-spoke`
+# daemon is bundled by the release step, not linked: this package depends on
+# the daemon's readiness checks only.
+rust_library(
+    name = "spoke-package",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    compile_data = glob(["service/*.in"]),
+    crate_name = "boss_spoke_package",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        "//tools/boss/engine/spoke-preflight",
+        "//tools/boss/http_retry",
+        "//tools/boss/spoke-credentials",
+    ] + all_crate_deps(normal = True),
+)
+
+# Run on the worker host by the person installing; also bundled into each
+# platform package so a reinstall can use the previously installed copy.
+rust_binary(
+    name = "boss-spoke-package",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke-preflight",
+    ] + all_crate_deps(normal = True),
+)
+
+# Privileged update helper: fetch/verify/switch/rollback against a staging root.
+# size = "small" / timeout = "moderate": each case unpacks a package through
+# the real installer as a subprocess, same as install_test.
+rust_test(
+    name = "update_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/update.rs"],
+    # Live tmux is optional: Linux bazel-any agents get host_tmux's
+    # exit-127 stub, and update_test skips session-survival asserts there.
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+        "TMUX_BIN": "$(rootpath @host_tmux//:tmux)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke:test_hub",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Live tmux pane survival against a real packaged daemon. Tagged manual: the
+# bazel-any Linux queue is not guaranteed to have a host tmux, and skipping
+# would report a pass. Hosts that run this target must have a real tmux.
+rust_test(
+    name = "update_tmux_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = ["tests/update.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+        "@host_tmux//:tmux",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+        "TMUX_BIN": "$(rootpath @host_tmux//:tmux)",
+        "BOSS_REQUIRE_TMUX": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    tags = ["manual"],
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/spoke:test_hub",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Signature, digest, platform and archive-safety checks.
+rust_test(
+    name = "verification_test",
+    size = "small",
+    srcs = ["tests/verification.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":spoke-package"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The installer against a staging root, with the real installed binaries.
+# size = "small" / timeout = "moderate" (300 s): each case unpacks a
+# package and execs the real installer as a subprocess. Merge-queue
+# hosts running the rest of //... in parallel miss the 60 s small
+# default; isolated runs finish in a few seconds.
+rust_test(
+    name = "install_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/install.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":spoke-package"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Manual host enrollment: tokens minted by a hub serving the real `Enroll`
+# endpoint over TLS, taken through the as-user enroll step (the real binary),
+# service start and the as-user preflight; replay, revocation, unreachable hub
+# and failed-preflight outcomes. `moderate` because the real preflight runs
+# tool and credential probes as a subprocess.
+rust_test(
+    name = "bootstrap_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/bootstrap.rs"],
+    data = [
+        ":boss-spoke-package",
+        "//tools/boss/engine/spoke:boss-spoke",
+    ],
+    edition = "2024",
+    env = {
+        "INSTALLER_BIN": "$(rootpath :boss-spoke-package)",
+        "SPOKE_BIN": "$(rootpath //tools/boss/engine/spoke:boss-spoke)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":spoke-package",
+        "//tools/boss/engine/host-enrollment",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The runbook's commands, paths, service labels and failure codes against the
+# shipped ones.
+rust_test(
+    name = "runbook_test",
+    size = "small",
+    srcs = ["tests/runbook.rs"],
+    data = ["//tools/boss/docs:runbooks/manual-host-enrollment.md"],
+    edition = "2024",
+    env = {"RUNBOOK": "$(rootpath //tools/boss/docs:runbooks/manual-host-enrollment.md)"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":spoke-package"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "spoke-package_test",
+    size = "small",
+    crate = ":spoke-package",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

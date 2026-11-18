@@ -440,6 +440,7 @@ fn review_guide_hook_chain_masks_literal_body_and_still_rejects_wrappers() {
         data_dir: Some(data_dir.to_path_buf()),
         path_guard_script: Some(script),
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: false,

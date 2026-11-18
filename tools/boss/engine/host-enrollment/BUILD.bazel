@@ -1,0 +1,75 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# bossctl opens the credential state to mint tokens, list and revoke hosts. The
+# hub's provisioning jobs are added to `visibility` in the PRs that make them
+# depend on this crate.
+# spoke-credentials depends on it from its tests only, to run the spoke client
+# against the real authority, and the spoke daemon's tests issue its client
+# certificate from it.
+rust_library(
+    name = "host-enrollment",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_host_enrollment",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/bossctl:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/spoke:__pkg__",
+        "//tools/boss/engine/spoke-adapter:__pkg__",
+        "//tools/boss/engine/spoke-hub:__pkg__",
+        "//tools/boss/engine/spoke-stream:__pkg__",
+        "//tools/boss/spoke-credentials:__pkg__",
+        "//tools/boss/spoke-package:__pkg__",
+    ],
+    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "host-enrollment_test",
+    size = "small",
+    crate = ":host-enrollment",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = ["//tools/boss/protocol-spoke"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The credential authority end to end, in one crate so both suites share their
+# fixtures: the lifecycle against a real CA and database with time under the
+# test's control (enrollment, renewal overlap, expiry, revocation, restart),
+# and the authority behind a real mutual-TLS listener (enrollment and renewal
+# over gRPC, a stand-in for the stream manager's Connect handler, revocation
+# closing open streams and refusing reconnects).
+#
+# `medium` for the 300 s timeout, not for its footprint. The suite takes about
+# 5.5 s on a developer Mac, but its lagged-receiver tests each commit 600
+# fsynced SQLite transactions, which is slow on a busy CI agent; the 300 s
+# limit leaves a wide margin over that.
+rust_test(
+    name = "integration_test",
+    size = "medium",
+    srcs = glob(["tests/integration/**/*.rs"]),
+    crate_root = "tests/integration/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":host-enrollment",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -395,8 +395,11 @@ final class EngineProcessController: @unchecked Sendable {
     }
 
     func stop() {
+        emit("[engine stop] begin")
+        defer { emit("[engine stop] end") }
         disableSupervision()
         guard stopOnExit else {
+            emit("[engine stop] keeping shared engine running")
             return
         }
 
@@ -548,6 +551,7 @@ final class EngineProcessController: @unchecked Sendable {
             .deletingLastPathComponent()
             .appendingPathComponent("engine-launch.log")
             .path
+        try EngineLaunchLog.preservePrevious(at: URL(fileURLWithPath: launchErrorPath))
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         // zsh's BG_NICE option (on by default) reduces the priority of any
@@ -569,7 +573,6 @@ final class EngineProcessController: @unchecked Sendable {
         // server is drained at boot rather than relocated.
         let script = """
         setopt NO_BG_NICE
-        : > \(shellQuote(launchErrorPath))
         nohup \(command) >/dev/null 2>\(shellQuote(launchErrorPath)) &
         child=$!
         print -r -- $child

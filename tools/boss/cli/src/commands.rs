@@ -2,6 +2,9 @@
 
 use crate::*;
 
+mod question;
+pub(crate) use question::{TaskAnswerArgs, TaskDismissQuestionArgs};
+
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]
 pub(crate) struct Cli {
@@ -302,6 +305,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: EditorialCommand,
     },
+    /// Report task progression and the reasons work is waiting.
+    Report {
+        #[command(subcommand)]
+        command: crate::report::ReportCommand,
+    },
     /// Read-only reporting over recorded per-run token spend
     /// (`work_runs.input_tokens` / `output_tokens` / `cache_creation_tokens`
     /// / `cache_read_tokens`). Token counts are the measured figures the
@@ -401,6 +409,10 @@ pub(crate) enum ProjectCommand {
     List(ProjectListArgs),
     Show(ProjectShowArgs),
     Update(ProjectUpdateArgs),
+    /// Park a project and cascade onto its open children.
+    Park(ProjectParkArgs),
+    /// Un-park a project. Directly-parked children stay parked.
+    Unpark(ProjectSelectorArgs),
     /// Archive a project. Projects are not hard-deleted; the engine convention
     /// is to set status=archived so the row stays available for history.
     Delete(ProjectSelectorArgs),
@@ -458,17 +470,6 @@ pub(crate) enum ProjectCommand {
     },
 }
 
-#[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("answer").required(true).args(["yes", "no"])))]
-pub(crate) struct TaskAnswerArgs {
-    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
-    pub id: String,
-    #[arg(long)]
-    pub yes: bool,
-    #[arg(long)]
-    pub no: bool,
-}
-
 /// Subcommands under `boss task ...`.
 ///
 /// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
@@ -484,8 +485,18 @@ pub(crate) struct TaskAnswerArgs {
 /// meaningful for project tasks).
 #[derive(Debug, Subcommand)]
 pub(crate) enum TaskCommand {
+    /// Ask for one app confirmation to raise these items to critical (coordinator only).
+    RequestCritical {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        /// The human's verbatim request, shown for confirmation.
+        #[arg(long)]
+        ask: String,
+    },
     /// Answer the open question on a task, or a specific question id.
     Answer(TaskAnswerArgs),
+    /// Close a worker question without answering or restarting the item.
+    DismissQuestion(TaskDismissQuestionArgs),
     Create(TaskCreateArgs),
     /// Bulk-create N tasks from a JSON array. Sidesteps the per-call
     /// CLI startup overhead of running `task create` N times — one
@@ -550,6 +561,10 @@ pub(crate) enum TaskCommand {
     /// (`T43`). Find tombstoned ids with `boss task list --deleted`.
     #[command(alias = "undelete")]
     Restore(TaskRestoreArgs),
+    /// Park a task or chore. Keeps status; skipped by dispatch until un-parked.
+    Park(TaskParkArgs),
+    /// Un-park a task or chore. A project-cascaded stamp needs `project unpark`.
+    Unpark(TaskIdArg),
     Reorder(TaskReorderArgs),
     /// Manage dependency edges (`A depends on B` ⇒ B gates A).
     Depend {
@@ -626,6 +641,14 @@ pub(crate) enum TaskCommand {
 /// and for callers who prefer to name the kind explicitly.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ChoreCommand {
+    /// Ask for one app confirmation to raise these items to critical (coordinator only).
+    RequestCritical {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        /// The human's verbatim request, shown for confirmation.
+        #[arg(long)]
+        ask: String,
+    },
     Create(ChoreCreateArgs),
     /// Bulk-create N chores from a JSON array. See `boss task
     /// create-many --help` for the schema; chores omit `project_id`.
@@ -643,6 +666,10 @@ pub(crate) enum ChoreCommand {
     /// Alias for `boss task restore`. Accepts any leaf work item id.
     #[command(alias = "undelete")]
     Restore(TaskRestoreArgs),
+    /// Alias for `boss task park`. Accepts any leaf work item id.
+    Park(TaskParkArgs),
+    /// Alias for `boss task unpark`. Accepts any leaf work item id.
+    Unpark(TaskIdArg),
     /// Alias for `boss task depend`. The engine doesn't care about kind.
     Depend {
         #[command(subcommand)]
@@ -1390,6 +1417,9 @@ pub(crate) struct EngineAttemptsListArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineCiClassifyArgs {
+    /// Successful main-rebased Bazel verification, required for queue CI verdicts.
+    #[arg(long)]
+    pub(crate) queue_ci_evidence_file: Option<std::path::PathBuf>,
     /// Attempt id from the `ci_remediations` table (`cir_…`).
     #[arg(long = "attempt-id")]
     pub(crate) attempt_id: String,
@@ -1407,6 +1437,9 @@ pub(crate) struct EngineCiMarkFailedArgs {
     /// Free-form failure reason. Stored verbatim on the attempt row.
     #[arg(long)]
     pub(crate) reason: String,
+    /// JSON evidence of successful Bazel verification after rebasing onto current main.
+    #[arg(long)]
+    pub(crate) queue_ci_evidence_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1450,7 +1483,7 @@ pub(crate) struct EngineCiMarkNoopArgs {
 pub(crate) enum EngineConflictsCommand {
     /// List `conflict_resolutions` rows, freshest first. Filters are
     /// AND-ed; omit them all to see every attempt. Human output is a
-    /// table; `--json` emits the full row vector.
+    /// table; `--json` emits rows, with `ladder_outcomes` as objects.
     List(EngineConflictsListArgs),
     /// Show a single `conflict_resolutions` row by id. Carries every
     /// column the engine has for the attempt, including the structured
@@ -1461,6 +1494,10 @@ pub(crate) enum EngineConflictsCommand {
     /// engine re-dispatches a worker. Rejected for non-terminal rows
     /// (`pending` / `running`). The parent work item is re-flipped to
     /// `blocked: merge_conflict` as part of the reset.
+    ///
+    /// On a `deferred` row this asks the engine to resolve the conflict
+    /// now instead of waiting for a merge request: the deferral ends and
+    /// the resolution starts on the engine's next look at the PR.
     Retry(EngineConflictsRetryArgs),
     /// Mark a non-terminal attempt `abandoned`. Distinct from
     /// `mark-failed`: the caller is explicitly stepping away (PR closed,
@@ -1497,7 +1534,8 @@ pub(crate) struct EngineConflictsListArgs {
 
     /// Filter by status. Repeatable / comma-separated. Documented
     /// values: pending, running, succeeded, failed, abandoned,
-    /// superseded.
+    /// superseded, deferred (conflict recorded, resolution waiting
+    /// for a merge request).
     #[arg(long, value_delimiter = ',')]
     pub(crate) status: Vec<String>,
 
@@ -1532,21 +1570,6 @@ pub(crate) struct EngineConflictsAbandonArgs {
     /// Free-form reason stored verbatim in `failure_reason`.
     /// Default: `manual_abandon`.
     #[arg(long, default_value = "manual_abandon")]
-    pub(crate) reason: String,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct EngineConflictsMarkFailedArgs {
-    /// Attempt id from the `conflict_resolutions` table (e.g.
-    /// `crz_…`). The current attempt id is part of the worker's
-    /// spawn prompt.
-    pub(crate) attempt_id: String,
-
-    /// Free-form failure reason. The design canonicalises three:
-    /// `obsolescence_suspected`, `product_decision_required`,
-    /// `architectural_mismatch`. Any string is accepted; the engine
-    /// stores it verbatim on the attempt row.
-    #[arg(long)]
     pub(crate) reason: String,
 }
 
@@ -1842,6 +1865,9 @@ pub(crate) struct ProjectListArgs {
     /// against the parent product's `repo_remote_url`.
     #[arg(long = "repo")]
     pub(crate) repo: Option<String>,
+
+    #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
 
     #[command(flatten)]
     pub(crate) dep: DependencyFilterArgs,
@@ -2147,6 +2173,9 @@ pub(crate) struct TaskListArgs {
     /// their history and can be reopened.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
+
+    #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
 
     /// Filter by resolved repo. Accepts a full URL or a short
     /// name (basename of the URL minus `.git`). Resolution falls
@@ -2454,6 +2483,9 @@ pub(crate) struct RevisionListArgs {
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
+    #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
+
     /// Restrict to revisions whose parent is this task. Accepts `T<n>` short
     /// ids (e.g. `T651`) or full `task_<hex>` ids.
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
@@ -2549,31 +2581,15 @@ pub(crate) struct ChoreListArgs {
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
+    #[command(flatten)]
+    pub(crate) parked: ParkedListArgs,
+
     /// Filter by resolved repo. See `boss task list --help`.
     #[arg(long = "repo")]
     pub(crate) repo: Option<String>,
 
     #[command(flatten)]
     pub(crate) dep: DependencyFilterArgs,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct TaskIdArg {
-    /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
-    /// (`T441`, `t441`, `42`, or `#42`), or cross-product form
-    /// (`boss/42` or `boss/#42`). Globally unique short ids resolve
-    /// without `--product`; ambiguous ones error listing every candidate.
-    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
-    pub(crate) id: String,
-    /// Resolve a friendly short id (`42` or `#42`) against this product
-    /// (slug or id). Optional when the short id is globally unique.
-    /// Ignored when the selector already embeds a product slug
-    /// (`boss/42`) or when the selector is a primary id.
-    #[arg(long)]
-    pub(crate) product: Option<String>,
-    /// Also display the primary id alongside the friendly id.
-    #[arg(long = "with-primary-id")]
-    pub(crate) with_primary_id: bool,
 }
 
 /// Args for `boss task complete` — the human close ritual for
@@ -2691,6 +2707,8 @@ pub(crate) struct TaskReorderArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum CostCommand {
+    /// Compare Sol-eligible PRs by Sol/Astra arm, including revisions and retries.
+    Sol,
     /// Token cost for one work item, aggregated across every execution
     /// and run it has ever had. The natural companion to `boss task
     /// show` / `boss chore show`.

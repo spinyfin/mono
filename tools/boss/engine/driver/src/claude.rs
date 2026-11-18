@@ -145,6 +145,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "CLAUDE.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
+        resolve_model_effort: None,
         // Intentionally stays "opus", not "fable": this is only the step-5
         // fallback in resolve_spawn_config for a row with no model_override,
         // no pool override, no effort_level, and no product default — a
@@ -251,96 +252,16 @@ macro_rules! python_command_guard {
 ///
 /// `shlex.split` does not tokenize a shell operator written without
 /// surrounding spaces (`cd x&&bazel test //y` is a single token), so this
-/// uses `shlex.shlex(..., punctuation_chars=";&|")` with `whitespace_split =
-/// True`, which splits `a&&b` into `a`, `&&`, `b`. `commenters` is cleared
-/// because `shlex.shlex` otherwise treats `#` as a comment introducer
-/// anywhere in a word, not just at the start of one, silently discarding the
-/// remainder of the line (`shlex.split` does not have this behavior — it
-/// sets `commenters=''` itself). This is the same lexer configuration used
-/// by `boss_engine::worker_setup`'s `PATH_GUARD_SCRIPT` for the
-/// `BOSS_DATA_DIR` path guard, and by
-/// `crate::codex::guard_python::CODEX_COMMAND_TOKENIZER_PY`'s
-/// `command_groups` — the Codex-side copy of this fragment, spliced into
-/// both Codex guard scripts. It is kept separate only because this macro
-/// must expand to string literals for `concat!`.
+/// uses the shared logical-line tokenizer from `guard_python`. Parentheses
+/// delimit commands, heredoc data stays attached to its receiving command,
+/// and launcher prefixes use the same vocabulary across drivers.
 ///
 /// A plain string-literal macro (not a `const`) for the same reason
 /// [`python_command_guard!`] is one: it is spliced into other `concat!`
 /// invocations, which require every argument to be a literal.
 macro_rules! shell_command_tokenizer_fragment {
     () => {
-        "DELIMS={'&&','||',';','|','&'}\n\
-         WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
-         ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
-         def heredoc_delim(line):\n\
-         \x20   idx=line.find('<<')\n\
-         \x20   if idx<0:\n\
-         \x20       return None\n\
-         \x20   rest=line[idx+2:]\n\
-         \x20   if rest.startswith('-'):\n\
-         \x20       rest=rest[1:]\n\
-         \x20   rest=rest.lstrip()\n\
-         \x20   if not rest:\n\
-         \x20       return None\n\
-         \x20   q1=chr(39)\n\
-         \x20   q2=chr(34)\n\
-         \x20   quote=None\n\
-         \x20   if rest[0] in (q1,q2):\n\
-         \x20       quote=rest[0]\n\
-         \x20       rest=rest[1:]\n\
-         \x20   end=0\n\
-         \x20   while end<len(rest) and (rest[end].isalnum() or rest[end]=='_'):\n\
-         \x20       end+=1\n\
-         \x20   word=rest[:end]\n\
-         \x20   if not word:\n\
-         \x20       return None\n\
-         \x20   if quote:\n\
-         \x20       if end<len(rest) and rest[end]==quote:\n\
-         \x20           return word\n\
-         \x20       return None\n\
-         \x20   return word\n\
-         def command_groups(command):\n\
-         \x20   groups=[]\n\
-         \x20   heredoc_end=None\n\
-         \x20   for line in command.split(chr(10)):\n\
-         \x20       if heredoc_end is not None:\n\
-         \x20           if line==heredoc_end:\n\
-         \x20               heredoc_end=None\n\
-         \x20           continue\n\
-         \x20       d=heredoc_delim(line)\n\
-         \x20       if d:\n\
-         \x20           heredoc_end=d\n\
-         \x20       try:\n\
-         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
-         \x20           _lex.whitespace_split=True\n\
-         \x20           _lex.commenters=''\n\
-         \x20           toks=list(_lex)\n\
-         \x20       except Exception:\n\
-         \x20           toks=line.split()\n\
-         \x20       cur=[]\n\
-         \x20       for tok in toks:\n\
-         \x20           if tok in DELIMS:\n\
-         \x20               if cur:\n\
-         \x20                   groups.append(cur)\n\
-         \x20               cur=[]\n\
-         \x20           else:\n\
-         \x20               cur.append(tok)\n\
-         \x20       if cur:\n\
-         \x20           groups.append(cur)\n\
-         \x20   return groups\n\
-         def strip_prefixes(group):\n\
-         \x20   i=0\n\
-         \x20   while i<len(group):\n\
-         \x20       tok=group[i]\n\
-         \x20       base=os.path.basename(tok)\n\
-         \x20       if ASSIGNMENT_RE.match(tok) or base in WRAPPERS:\n\
-         \x20           i+=1\n\
-         \x20           continue\n\
-         \x20       if base=='timeout' and i+1<len(group):\n\
-         \x20           i+=2\n\
-         \x20           continue\n\
-         \x20       break\n\
-         \x20   return group[i:]\n"
+        crate::render_command_tokenizer!("", "")
     };
 }
 
@@ -443,6 +364,13 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "def is_bundle_cli(p):\n",
     "    d=os.path.dirname(os.path.normpath(p))\n",
     "    return d.endswith('/Contents/Resources/bin')\n",
+    "def guard_handoff(rest):\n",
+    "    if rest and os.path.basename(rest[0])=='boss':\n",
+    "        j=1\n",
+    "        while j<len(rest) and rest[j].startswith('-'):\n",
+    "            j += 2 if rest[j] in ('--socket-path','--engine-max-wait') else 1\n",
+    "        if j<len(rest) and rest[j]=='handoff':\n",
+    "            _block('Blocked: boss handoff is coordinator-only; workers cannot read or mutate the coordinator handoff. If this blocks your task, use '+chr(34)+chr(36)+'BOSS_BIN'+chr(34)+' propose blocked --reason '+chr(34)+'<specific question>'+chr(34)+'.')\n",
     "matched=None\n",
     "for g in groups:\n",
     "    rest=strip_prefixes(g)\n",
@@ -450,6 +378,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "        continue\n",
     "    prog=rest[0]\n",
     "    base=os.path.basename(prog)\n",
+    "    guard_handoff(rest)\n",
     "    if base in ('Boss','engine','boss-engine','bossctl'):\n",
     "        matched=prog\n",
     "        break\n",
@@ -555,6 +484,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    return strip_prefixes(toks) if toks else rest\n",
     "for g in groups:\n",
     "    rest=peel_shell_c(strip_prefixes(g))\n",
+    "    guard_handoff(rest)\n",
     "    if not rest: continue\n",
     "    orig=rest[0]\n",
     "    if orig in (DOL+'BOSS_BIN', DOL+'{BOSS_BIN}', DOL+'CUBE_BIN', DOL+'{CUBE_BIN}'):\n",
@@ -590,6 +520,12 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "_approve()\n",
 );
 
+/// Env var that switches [`PR_REDIRECT_GUARD_COMMAND`] onto the revision
+/// rejection. Set to `1` on revision sessions so a blocked `gh pr create`
+/// never recommends `cube pr create` (the next step the revision PR guard
+/// then refuses). Ordinary Standard workers leave it unset.
+pub const PR_REDIRECT_REVISION_ENV: &str = "BOSS_REVISION_WORKER";
+
 /// Inline Python decision hook that blocks all Standard workers from pushing
 /// branches or opening PRs via bare VCS commands (`gh pr create`, `jj git push`,
 /// `git push`). Uses `shlex.split()` so push/PR-creation phrases inside quoted
@@ -597,7 +533,11 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
 ///
 /// Applies to ALL `WorkerKind::Standard` workers (local and remote). The
 /// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
-/// revision workers and adds additional blocks.
+/// revision workers and adds additional blocks. When
+/// [`PR_REDIRECT_REVISION_ENV`] is `1`, the block names `cube pr update` and
+/// `"$BOSS_BIN" propose done --answer-type create-prerequisite-task` (blocking
+/// work) and `"$BOSS_BIN" propose followup-task` (non-blocking work) instead of
+/// `cube pr create`.
 pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
@@ -634,15 +574,36 @@ pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "if matched:\n",
     "    q=chr(34)\n",
     "    cub=q+chr(36)+'CUBE_BIN'+q\n",
-    "    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: '+cub+' pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or '+cub+' pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
+    "    if os.environ.get('BOSS_REVISION_WORKER')=='1':\n",
+    "        bos=q+chr(36)+'BOSS_BIN'+q\n",
+    "        prereq=bos+' propose done --outcome blocked --summary '+q+'<blocker>'+q+' --answer-type create-prerequisite-task --prerequisite-name '+q+'<short task name>'+q+' --prerequisite-brief '+q+'<self-contained description>'+q+' --explanation '+q+'<Context, Yes, No, Recommendation, and optional Details>'+q\n",
+    "        follow=bos+' propose followup-task --name '+q+'<short title>'+q+' --description '+q+'<one paragraph of scope>'+q+' --rationale '+q+'<why a separate PR>'+q\n",
+    "        msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). A revision never opens a new PR. Push in-scope commits to the existing parent PR with '+cub+' pr update --branch <branch>. If another PR must land before this revision can finish and your instructions enable completion declarations, run '+prereq+' (the revision waits for it and is redispatched once it is done). Otherwise report the dependency using the blocker channel in your instructions; '+follow+' is only for non-blocking work that can happen later; finish the in-scope work meanwhile. Never use jj git push, git push, or gh pr create directly. Do not declare you could not complete.'\n",
+    "    else:\n",
+    "        msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: '+cub+' pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or '+cub+' pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
     "    _block(msg)\n",
     "_approve()\n",
 );
+
+/// Hook command for [`PR_REDIRECT_GUARD_COMMAND`]. Revision sessions prefix
+/// [`PR_REDIRECT_REVISION_ENV`] so the rejection never recommends
+/// `cube pr create`.
+pub fn pr_redirect_guard_command(is_revision: bool) -> String {
+    if is_revision {
+        format!("{PR_REDIRECT_REVISION_ENV}=1 {PR_REDIRECT_GUARD_COMMAND}")
+    } else {
+        PR_REDIRECT_GUARD_COMMAND.to_owned()
+    }
+}
 
 /// Inline Python decision hook that guards revision tasks from opening new PRs.
 /// Uses `shlex.split()` to tokenise the Bash command so PR-creation phrases
 /// inside quoted arguments do NOT trigger the block. Blocks `gh pr create`,
 /// `cube pr create`, and the deprecated `cube pr ensure`; allows `cube pr update`.
+/// A block names `cube pr update` for in-scope commits and
+/// `"$BOSS_BIN" propose done --answer-type create-prerequisite-task` for a PR
+/// that must land first, and `"$BOSS_BIN" propose followup-task` only for
+/// non-blocking work.
 pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
@@ -687,8 +648,12 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "        break\n",
     "if matched:\n",
     "    cub=chr(34)+chr(36)+'CUBE_BIN'+chr(34)\n",
+    "    bos=chr(34)+chr(36)+'BOSS_BIN'+chr(34)\n",
     "    sug=cub+' pr update --branch '+br if br else cub+' pr update --branch <your-pr-bookmark>'\n",
-    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push your commits to the existing PR with: '+sug\n",
+    "    q=chr(34)\n",
+    "    prereq=bos+' propose done --outcome blocked --summary '+q+'<blocker>'+q+' --answer-type create-prerequisite-task --prerequisite-name '+q+'<short task name>'+q+' --prerequisite-brief '+q+'<self-contained description>'+q+' --explanation '+q+'<Context, Yes, No, Recommendation, and optional Details>'+q\n",
+    "    follow=bos+' propose followup-task --name '+q+'<short title>'+q+' --description '+q+'<one paragraph of scope>'+q+' --rationale '+q+'<why a separate PR>'+q\n",
+    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push in-scope commits to the existing PR with: '+sug+'. If another PR must land before this revision can finish and your instructions enable completion declarations, run '+prereq+' (the revision waits for it and is redispatched once it is done). Otherwise report the dependency using the blocker channel in your instructions; '+follow+' is only for non-blocking work that can happen later; finish the in-scope work on this parent PR. Do not declare you could not complete.'\n",
     "    _block(msg)\n",
     "_approve()\n",
 );
@@ -705,7 +670,7 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
 /// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
 pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
     shell_command_tokenizer_fragment!(),
-    "BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin','checkleft'}\n",
+    crate::render_reviewer_blocked_programs!(),
     "matched=None\n",
     "for group in command_groups(cmd):\n",
     "    rest=strip_prefixes(group)\n",
@@ -722,7 +687,7 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
     "        matched='cargo execution subcommand'\n",
     "    elif base=='go' and subcommands.intersection({'build','test','run','generate','install'}):\n",
     "        matched='go execution subcommand'\n",
-    "    elif base in BLOCKED:\n",
+    "    elif base in REVIEWER_BLOCKED:\n",
     "        matched=base\n",
     "    elif prog.startswith('./') or prog.startswith('../') or '/bazel-bin/' in prog or '/target/' in prog:\n",
     "        matched=prog\n",
@@ -736,12 +701,7 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// `boss_engine::worker_setup::render_claude_md`.
-const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
-     spawned you in a leased cube workspace and observes this session\n\
-     via claude hooks.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.";
+const CLAUDE_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!("via claude hooks.", "");
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
@@ -783,6 +743,24 @@ impl AgentDriver for ClaudeDriver {
         true
     }
 
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        ["Choose the text style", "Sign in with", "Sign in to"]
+            .map(String::from)
+            .to_vec()
+    }
+
+    fn paste_landed_markers(&self) -> Vec<String> {
+        // Recorded from Claude Code 2.1.322, which shows `[Pasted text #1 +N
+        // lines]` in the composer once it has taken a large paste. It holds a
+        // paste in which any line ends in an image extension (a diff header
+        // naming a `.png` is enough) while it runs `osascript` to ask the
+        // macOS clipboard for a file, showing only `Pasting…` meanwhile:
+        // 0.08-3.3 s on a host at its normal load and up to 46 s under heavy
+        // load. Return sent in that window reaches an empty composer and is
+        // lost.
+        vec!["[Pasted text #".into()]
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Exact reproduction of the pre-spec literals in
         // `GhosttyTerminalView.makeClaudeSnapshot` / the tracker's
@@ -790,6 +768,15 @@ impl AgentDriver for ClaudeDriver {
         // app's Claude-default fallback and the engine-supplied path
         // behaviour-identical for Claude workers.
         Some(PaneMonitorSpec {
+            blocking_dialog_markers: vec![
+                "Do you want to proceed?".into(),
+                "Do you want to make this edit".into(),
+                "Do you want to create".into(),
+                "Do you want to allow".into(),
+                "Do you trust the files in this folder?".into(),
+                "Yes, I trust this folder".into(),
+                "Yes, I accept".into(),
+            ],
             // "auto mode on" is the footer under `--permission-mode auto`;
             // "bypass permissions on" is its counterpart under
             // `--dangerously-skip-permissions`. Without it a bypass-mode
@@ -798,6 +785,8 @@ impl AgentDriver for ClaudeDriver {
                 "Claude Code".into(),
                 "auto mode on".into(),
                 "bypass permissions on".into(),
+                // Footer under the forced dontAsk mode (answer agent).
+                "don't ask on".into(),
                 "/effort".into(),
             ],
             busy_markers: vec!["esc to interrupt".into()],
@@ -832,8 +821,8 @@ impl AgentDriver for ClaudeDriver {
         // has the right channel: stop and summarize (a real Stop boundary).
         // Equals form (`--disallowedTools=AskUserQuestion`), not the
         // space-separated variadic form: the CLI takes `<tools...>` until the
-        // next `--` token, so a later move of this push in front of the
-        // positional prompt would swallow the prompt as a second tool name.
+        // next option, so a space-separated value would swallow any
+        // positional argument appended after it as a second tool name.
         cmd.push_str(" --disallowedTools=AskUserQuestion");
         if let Some(mode) = permission_mode_override {
             // Forced mode (e.g. `dontAsk` for the capability-restricted answer
@@ -854,12 +843,8 @@ impl AgentDriver for ClaudeDriver {
             // single quote, so naive single-quoting is sufficient.
             cmd.push_str(&format!(" --settings '{}'", settings.display()));
         }
-        // Use the descriptor's config_dir and initial_prompt_filename so this
-        // stays in sync with provision_workspace's write location.
-        cmd.push_str(&format!(
-            " \"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
-        ));
+        cmd.push('\n');
+        let cmd = super::initial_prompt::launcher_command(CLAUDE_DESCRIPTOR.config_dir, &cmd);
         SpawnPlan {
             // Claude must authenticate via OAuth credentials
             // (~/.claude/.credentials.json), not a stray ANTHROPIC_API_KEY
@@ -877,7 +862,10 @@ impl AgentDriver for ClaudeDriver {
     /// prompt. Specifically:
     ///
     /// - Creates `<workspace>/<config_dir>/` (`.claude/`)
-    /// - Writes the initial prompt to `<config_dir>/<initial_prompt_filename>`
+    /// - Writes the initial prompt into a private per-run input home (recorded
+    ///   as `initial_prompt_home` runtime state for retention) and links
+    ///   `<config_dir>/<initial_prompt_filename>` to it, with the PTY launcher
+    ///   and its readiness config alongside
     /// - Writes a catch-all `.gitignore` so engine-injected files never appear
     ///   in `jj status` / `git status`
     /// - Pre-seeds `~/.claude.json` so the folder-trust dialog does not block
@@ -886,14 +874,21 @@ impl AgentDriver for ClaudeDriver {
         &self,
         workspace: &Path,
         prompt_text: &str,
-        _run_id: &str,
+        run_id: &str,
     ) -> anyhow::Result<Option<super::DriverRuntimeState>> {
         let config_dir = workspace.join(CLAUDE_DESCRIPTOR.config_dir);
         std::fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
 
-        let prompt_path = config_dir.join(CLAUDE_DESCRIPTOR.initial_prompt_filename);
-        std::fs::write(&prompt_path, prompt_text)
-            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        anyhow::ensure!(
+            !run_id.is_empty()
+                && run_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "invalid worker run id"
+        );
+        let prompt_home = super::codex::codex_home_for_run(&format!("claude-{run_id}"))?;
+        super::initial_prompt::warm_preflight().await?;
+        super::initial_prompt::provision(&config_dir, &prompt_home, prompt_text, self)?;
 
         let gitignore_path = config_dir.join(".gitignore");
         std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)
@@ -904,19 +899,14 @@ impl AgentDriver for ClaudeDriver {
         // swallowed by pre_trust_workspace.
         pre_trust_workspace(workspace);
 
-        // Claude creates no per-run state outside the cube workspace, so
-        // there is nothing for teardown (or a future retention sweep) to
-        // clean up. A Codex driver would return its Boss-owned CODEX_HOME
-        // (or archive root) here instead.
-        Ok(None)
+        // Record the private input home for the existing restart-safe home
+        // retention sweep; the workspace link does not own these bytes.
+        Ok(Some(super::DriverRuntimeState::new(serde_json::json!({
+            (crate::initial_prompt::INITIAL_PROMPT_HOME_KEY): prompt_home,
+        }))))
     }
 
-    /// No-op: Claude needs no teardown. It creates no per-run state outside
-    /// the cube workspace — the `.claude/` config dir `provision_workspace`
-    /// writes lives inside the workspace, which cube owns and tears down
-    /// itself. `runtime_state` is expected to be `None` for Claude and is
-    /// ignored; we deliberately do not invent a cleanup target from the
-    /// engine environment or by scanning a shared provider home.
+    /// The recorded private input home is reclaimed by per-run retention.
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
@@ -962,22 +952,10 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
-        // Inline-prefix every env var the `boss-event` shim needs. `BOSS_RUN_ID`
-        // is load-bearing: without it the shim can't splice `_boss_run_id` and
-        // the engine drops the event, pinning the worker at `Spawning`.
-        // `BOSS_WORKSPACE` tells the shim where to buffer events when the
-        // engine is unreachable. Setting them here (rather than relying on env
-        // inheritance from the worker pane through Claude into the hook
-        // subprocess) guarantees the shim sees them regardless of how Claude
-        // propagates env.
-        let command = format!(
-            "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
-            socket = shell_quote(&config.events_socket_path.display().to_string()),
-            lease = shell_quote(&config.lease_id),
-            run_id = shell_quote(&config.run_id),
-            workspace = shell_quote(&config.workspace_path.display().to_string()),
-            shim = shell_quote(&config.forwarder_binary.display().to_string()),
-        );
+        // Inline-prefixed env vars (see `forwarder_command`): setting them here
+        // rather than relying on env inheritance from the worker pane through
+        // Claude into the hook subprocess guarantees the shim sees them.
+        let command = crate::hook_settings::forwarder_command(config);
 
         // Every hook event fires this same forwarder hook (matcher `*`). The
         // caller may extend the `PreToolUse` array with interception guards —
@@ -1048,6 +1026,18 @@ impl AgentDriver for ClaudeDriver {
             }));
         }
 
+        // 1b. Shared-source-store write gate (every local worker kind).
+        //     Refuses raw git writes -- and any shallow fetch/pull/clone --
+        //     against cube's shared jj/git store, whichever way git is pointed
+        //     at it. Bash only: it judges shell commands. See
+        //     `crate::git_store_guard`.
+        if let Some(guard_script) = &config.git_store_guard_script {
+            hooks.push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": crate::git_store_guard::hook_command(guard_script, config.workspace_path.as_deref())}],
+            }));
+        }
+
         // 2. Boss-launch guard (always on, all workers). Blocks the worker from
         //    starting the Boss macOS app or its bundled engine binary.
         hooks.push(serde_json::json!({
@@ -1062,7 +1052,7 @@ impl AgentDriver for ClaudeDriver {
         if config.is_standard_worker {
             hooks.push(serde_json::json!({
                 "matcher": "Bash",
-                "hooks": [{"type": "command", "command": PR_REDIRECT_GUARD_COMMAND}],
+                "hooks": [{"type": "command", "command": pr_redirect_guard_command(config.is_revision)}],
             }));
         }
 
@@ -1078,7 +1068,9 @@ impl AgentDriver for ClaudeDriver {
             );
             hooks.push(serde_json::json!({
                 "matcher": "Bash",
-                "hooks": [{"type": "command", "command": guard_command}],
+                // Covers the guard's sequential probe + run budgets so Claude's
+                // default 60s hook timeout does not cut the gate short.
+                "hooks": [{"type": "command", "command": guard_command, "timeout": crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS}],
             }));
         }
 
@@ -1543,7 +1535,13 @@ mod tests {
             .expect("ClaudeDriver supplies pane-monitor markers");
         assert_eq!(
             spec.agent_markers,
-            vec!["Claude Code", "auto mode on", "bypass permissions on", "/effort"]
+            vec![
+                "Claude Code",
+                "auto mode on",
+                "bypass permissions on",
+                "don't ask on",
+                "/effort"
+            ]
         );
         assert_eq!(spec.busy_markers, vec!["esc to interrupt"]);
         assert_eq!(
@@ -1714,6 +1712,7 @@ mod tests {
             data_dir: Some(PathBuf::from("/Library/Application Support/Boss")),
             path_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-path-guard.py")),
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-checkleft-push-guard.py")),
+            git_store_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-git-store-guard.py")),
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
@@ -1728,6 +1727,7 @@ mod tests {
             data_dir: None,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
@@ -1740,13 +1740,32 @@ mod tests {
     #[test]
     fn local_standard_worker_gets_all_five_guards() {
         let wiring = ClaudeDriver.tool_use_interception_wiring(&local_standard_config());
-        // path guard + boss-launch guard + PR redirect guard + checkleft guard = 4
+        // path guard + git store guard + boss-launch guard + PR redirect guard + checkleft guard = 5
         // (no revision guard since is_revision: false)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            4,
-            "local standard non-revision worker must get exactly 4 guards: {:?}",
+            5,
+            "local standard non-revision worker must get exactly 5 guards: {:?}",
             wiring.pre_tool_use_hooks,
+        );
+    }
+
+    #[test]
+    fn checkleft_push_guard_gets_a_two_hour_hook_timeout() {
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&local_standard_config());
+        let checkleft = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .find(|entry| {
+                entry["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("boss-checkleft-push-guard.py"))
+            })
+            .expect("local standard worker must arm the checkleft push guard");
+        assert_eq!(
+            checkleft["hooks"][0]["timeout"].as_u64(),
+            Some(crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS),
+            "Claude must not cut the checkleft gate at the 60s hook default: {checkleft}"
         );
     }
 
@@ -1755,11 +1774,11 @@ mod tests {
         let mut config = local_standard_config();
         config.is_revision = true;
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + boss-launch guard + PR redirect guard + checkleft guard + revision guard = 5
+        // path guard + git store guard + boss-launch guard + PR redirect guard + checkleft guard + revision guard = 6
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            5,
-            "local standard revision worker must get exactly 5 guards: {:?}",
+            6,
+            "local standard revision worker must get exactly 6 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring
@@ -1770,6 +1789,10 @@ mod tests {
         assert!(
             cmds.iter().any(|c| c.contains("ensure")),
             "revision guard must block cube pr ensure: {cmds:?}",
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("BOSS_REVISION_WORKER=1")),
+            "revision PR-redirect must set BOSS_REVISION_WORKER: {cmds:?}",
         );
     }
 
@@ -1819,6 +1842,132 @@ mod tests {
     }
 
     #[test]
+    fn git_store_guard_command_names_workspace_and_script() {
+        let mut config = local_standard_config();
+        config.workspace_path = Some(PathBuf::from("/tmp/ws"));
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
+        let entry = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .find(|e| {
+                e["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME)
+            })
+            .expect("shared-source-store guard must be present for local workers");
+        let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("BOSS_WORKSPACE='/tmp/ws'"),
+            "must name the workspace: {cmd}"
+        );
+        assert!(
+            cmd.contains("python3 '/tmp/boss-settings/boss-git-store-guard.py'"),
+            "must invoke the materialised script: {cmd}"
+        );
+        assert_eq!(entry["matcher"], "Bash", "it judges shell commands only");
+        // Order: directly after the path guard, before the launch guard, so
+        // the two boundary gates come first in every driver's chain.
+        let position = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .position(|e| std::ptr::eq(e, entry))
+            .unwrap();
+        assert_eq!(position, 1, "{:?}", wiring.pre_tool_use_hooks);
+    }
+
+    /// Run the exact hook command Claude's settings file would carry, with
+    /// a Claude-shaped PreToolUse payload, and return its decision.
+    fn claude_git_store_guard_decision(
+        layout: &crate::git_store_guard::tests::CubeLayout,
+        command: &str,
+    ) -> (String, String) {
+        let config = ToolUseInterceptionConfig {
+            data_dir: None,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+            git_store_guard_script: Some(layout.script.clone()),
+            is_revision: false,
+            is_standard_worker: true,
+            is_reviewer: false,
+            is_review_guide: false,
+            run_id: None,
+            workspace_path: Some(layout.workspace.clone()),
+        };
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
+        let hook = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .filter_map(|e| e["hooks"][0]["command"].as_str())
+            .find(|c| c.contains(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME))
+            .expect("hook present")
+            .to_owned();
+        let payload = serde_json::json!({
+            "tool_name": "Bash",
+            "cwd": layout.workspace.display().to_string(),
+            "tool_input": {"command": command},
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&hook)
+            .env_remove("GIT_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start shared-source-store guard");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("decision JSON");
+        (
+            value["decision"].as_str().unwrap().to_owned(),
+            value["reason"].as_str().unwrap_or_default().to_owned(),
+        )
+    }
+
+    #[test]
+    fn git_store_guard_refuses_store_writes_through_the_claude_hook_command() {
+        // End-to-end through the Claude wiring: the incident shapes are
+        // refused with the redirection, read-only git and the ordinary
+        // workspace flow still pass.
+        let layout = crate::git_store_guard::tests::cube_layout();
+        let store = layout.store.display().to_string();
+        for command in [
+            format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
+            format!("cd {store} && git fetch --depth=200 origin main"),
+            format!("git -C {store} push origin main"),
+            format!("git --git-dir={store}/.git gc"),
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::bypass_commands(&layout))
+        {
+            let (decision, reason) = claude_git_store_guard_decision(&layout, &command);
+            assert_eq!(decision, "block", "{command}: {reason}");
+            assert!(reason.contains("jj"), "{command}: {reason}");
+        }
+        for command in [
+            format!("GIT_DIR={store}/.git git log -1"),
+            format!("git --git-dir {store}/.git show HEAD:README.md"),
+            format!("git -C {store} diff --no-ext-diff abc def"),
+            "jj git fetch && jj new main@origin".to_owned(),
+            "git status".to_owned(),
+        ]
+        .into_iter()
+        .chain(crate::git_store_guard::tests::approved_commands(&layout))
+        {
+            let (decision, reason) = claude_git_store_guard_decision(&layout, &command);
+            assert_eq!(decision, "approve", "{command}: {reason}");
+        }
+    }
+
+    #[test]
     fn boss_launch_guard_is_always_present() {
         for config in [local_standard_config(), remote_standard_config()] {
             let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
@@ -1840,6 +1989,7 @@ mod tests {
             data_dir: Some(PathBuf::from("/Library/Boss")),
             path_guard_script: Some(PathBuf::from("/tmp/boss-path-guard.py")),
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
+            git_store_guard_script: Some(PathBuf::from("/tmp/boss-git-store-guard.py")),
             is_revision: false,
             is_standard_worker: false,
             is_reviewer: true,
@@ -1848,11 +1998,11 @@ mod tests {
             workspace_path: None,
         };
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
+        // path guard + git store guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            3,
-            "reviewer worker must get exactly 3 guards: {:?}",
+            4,
+            "reviewer worker must get exactly 4 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring
@@ -1906,6 +2056,11 @@ mod tests {
             // `#` inside a word or after a delimiter must not truncate the
             // command: the blocked program following it must still be seen.
             "echo a#b && bazel test //x",
+            ": '()'; bazel test //x",
+            // Arithmetic `<<` is a shift, not a heredoc that would hide the
+            // following lines; a comment does not continue onto the next line.
+            "(( 1 << 2 ))\nbazel test //x\n2",
+            "true # x \\\nbazel test //x",
         ] {
             assert_eq!(
                 reviewer_static_guard_decision(command)["decision"],
@@ -2076,30 +2231,36 @@ mod tests {
             "preamble must name 'claude hooks': {preamble}"
         );
         assert!(
-            preamble.contains("Boss-managed"),
-            "preamble must describe Boss session: {preamble}"
+            preamble.contains("managed worker session"),
+            "preamble must describe the managed worker session: {preamble}"
         );
         assert!(
             preamble.contains("checkleft run") && preamble.contains("checkleft --all"),
             "preamble must direct ordinary validation to scoped checkleft: {preamble}"
         );
+        assert!(
+            preamble.contains("Do not wrap `bazel build`"),
+            "preamble must forbid wrapping Bazel/checkleft in a shell timeout: {preamble}"
+        );
     }
 
-    #[tokio::test]
-    async fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
+    #[test]
+    fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
         // Redirect this thread's trust store without changing process HOME.
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
         let _config = claude_config_override(&fake_home.path().join(".claude.json"));
 
-        let driver = ClaudeDriver;
-        let runtime_state = driver
-            .provision_workspace(workspace.path(), "hello prompt", "run-1")
-            .await
+        let _homes = crate::test_support::codex_homes_override(&fake_home.path().join("homes"));
+        let runtime_state = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ClaudeDriver.provision_workspace(workspace.path(), "hello prompt", "run-1"))
             .unwrap();
         assert!(
-            runtime_state.is_none(),
-            "Claude creates no out-of-workspace runtime state"
+            runtime_state.is_some(),
+            "Claude records its private input home for retention"
         );
 
         // Prompt file at the descriptor-derived path.
@@ -2168,10 +2329,7 @@ mod tests {
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
         let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
-        let expected_cat = format!(
-            "\"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
-        );
+        let expected_cat = format!("python3 -I {}/initial-prompt.py", CLAUDE_DESCRIPTOR.config_dir);
         assert!(
             plan.command.contains(&expected_cat),
             "spawn invocation must read from descriptor paths; got: {}",
@@ -2245,12 +2403,12 @@ mod tests {
         // The self-check survives: the worker still checks its own plan
         // against the work item before writing code.
         assert!(
-            addendum.contains("Check that plan against the work item's description yourself"),
+            addendum.contains("Check that plan against the task description yourself"),
             "addendum must keep the self-check; got: {addendum}",
         );
         // The correction is explicit, not merely an omission.
         assert!(
-            addendum.contains("do not ask the operator to confirm scope"),
+            addendum.contains("do not ask anyone to confirm scope"),
             "addendum must explicitly redirect the confirmation to the worker itself; got: {addendum}",
         );
         // Genuinely underspecified work still has an instruction: pick, say

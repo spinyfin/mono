@@ -765,3 +765,76 @@ fn workspace_lease_gcs_broken_empty_and_keeps_dirty_then_auto_creates() {
         "dirty workspace should still be marked dirty"
     );
 }
+
+/// Bookmarks belong to the repository's shared store, so every workspace of it
+/// reports the same conflicts. They are not damage to the workspace: the health
+/// check reads a clean tree as clean and issues nothing but `jj status`, so a
+/// conflicted engine pointer (`boss-recovery/`, `boss/`, `boss-base/`,
+/// `preserved/`) or any other bookmark is never forgotten, skipped or audited
+/// as a workspace problem. The runner scripts one command, so any other jj
+/// invocation would fail the test.
+#[test]
+fn conflicted_bookmarks_in_the_shared_store_are_not_workspace_damage() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace = tempdir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".jj")).expect("workspace dir");
+    let status = [
+        "The working copy is clean",
+        "Working copy : abc1234 (empty) main",
+        "These bookmarks have conflicts:",
+        "  boss-recovery/exec_x",
+        "  boss/exec_x",
+        "  boss-base/exec_x",
+        "  preserved/exec_x",
+        "  pr/3226",
+        "  some-feature",
+        "  Use `jj bookmark list` to see details.",
+    ]
+    .join("\n");
+    let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+        workspace.clone(),
+        "jj",
+        &["status", "--no-pager"],
+        &status,
+    )]);
+
+    let outcome = crate::app::health::check_workspace_health(&runner, Some(&database_path), &workspace)
+        .expect("a clean tree is healthy");
+
+    assert!(
+        matches!(outcome, crate::app::health::WorkspaceHealthOutcome::Clean),
+        "{outcome:?}"
+    );
+    runner.assert_exhausted();
+    let events = audit_events(&tempdir);
+    for forbidden in ["workspace.bookmark_forgotten", "workspace.bookmark_forget_skipped"] {
+        assert!(!events.iter().any(|e| e["event"] == forbidden), "{events:?}");
+    }
+}
+
+/// Dirty trees stay dirty even when the store also has conflicted bookmarks:
+/// the working-copy verdict is the only one a workspace health check gives.
+#[test]
+fn a_dirty_tree_is_dirty_regardless_of_bookmark_conflicts() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace = tempdir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".jj")).expect("workspace dir");
+    let status = format!(
+        "{}\nThese bookmarks have conflicts:\n  pr/3226\n  Use `jj bookmark list` to see details.",
+        jj_status_dirty()
+    );
+    let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+        workspace.clone(),
+        "jj",
+        &["status", "--no-pager"],
+        &status,
+    )]);
+
+    let outcome = crate::app::health::check_workspace_health(&runner, Some(&database_path), &workspace).unwrap();
+
+    assert!(
+        matches!(outcome, crate::app::health::WorkspaceHealthOutcome::DirtyWorkingCopy),
+        "{outcome:?}"
+    );
+    runner.assert_exhausted();
+}

@@ -1,10 +1,9 @@
 import AppKit
 import UserNotifications
 
-/// Manages macOS system notifications for tasks that transition into the
-/// Review lane. Fires a banner notification when a `WorkTask` reaches
-/// `status == "in_review"` while the app is backgrounded, allowing the
-/// user to see the event without keeping Boss.app in the foreground.
+/// Manages review-entry and operator-decision notifications. Review banners
+/// appear in the background; decisions also interrupt in the foreground.
+/// The global decision feed and its reminders live in the Decisions extension.
 ///
 /// Authorization is requested lazily on the first qualifying transition
 /// so the permission dialog appears in a meaningful context. The OS
@@ -23,6 +22,14 @@ final class ReviewNotificationCenter: NSObject {
     /// from the notification's userInfo. Set before any notifications fire.
     var onSelectWorkItem: ((String) -> Void)?
 
+    var onSelectDecision: ((String, String) -> Void)?
+    var decisionSchedule = DecisionReminderSchedule(
+        lastSent: BossDefaults.store.dictionary(forKey: decisionHistoryKey) as? [String: Double] ?? [:]
+    )
+    var decisionTimer: Timer?
+    var pendingDecisionIDs: Set<String> = []
+    var decisionFeedAvailable = false
+    nonisolated static let reviewCategory = "Ready for Review"
     private var hasRequestedAuthorization = false
 
     /// `UNUserNotificationCenter.current()` throws
@@ -36,14 +43,23 @@ final class ReviewNotificationCenter: NSObject {
     ///    `.app` (so `pathExtension != "app"`).
     ///
     /// Returning false skips notification wiring on both.
-    private var isBundleContextSafe: Bool {
+    var isBundleContextSafe: Bool {
+        guard !BossCaptureArgs.shared.isCaptureMode else { return false }
         guard NSClassFromString("XCTestCase") == nil else { return false }
         return Bundle.main.bundleURL.pathExtension == "app"
     }
 
     func configure() {
         guard isBundleContextSafe else { return }
-        UNUserNotificationCenter.current().delegate = self
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.didWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(decisionSystemDidWake), name: NSWorkspace.didWakeNotification, object: nil
+        )
+        center.setNotificationCategories([
+            UNNotificationCategory(identifier: Self.decisionCategory, actions: [], intentIdentifiers: [])
+        ])
     }
 
     func notifyReadyForReview(task: WorkTask) {
@@ -60,7 +76,8 @@ final class ReviewNotificationCenter: NSObject {
         }
 
         let content = UNMutableNotificationContent()
-        content.title = "Ready for Review"
+        content.title = Self.reviewCategory
+        content.categoryIdentifier = Self.reviewCategory
         if let shortID = task.shortID {
             content.body = "#\(shortID): \(task.name)"
         } else {
@@ -76,14 +93,17 @@ final class ReviewNotificationCenter: NSObject {
 }
 
 extension ReviewNotificationCenter: UNUserNotificationCenterDelegate {
-    /// Suppress banners when Boss.app is already in the foreground — the
-    /// kanban card is visible and a system banner would be redundant.
+    nonisolated static func presentationOptions(category: String) -> UNNotificationPresentationOptions {
+        category == decisionCategory ? [.banner, .list, .sound] : []
+    }
+
+    /// Only decisions interrupt while Boss is in the foreground.
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([])
+        completionHandler(Self.presentationOptions(category: notification.request.content.categoryIdentifier))
     }
 
     /// User tapped the notification: activate the app and navigate to the
@@ -94,9 +114,12 @@ extension ReviewNotificationCenter: UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let workItemID = response.notification.request.content.userInfo["work_item_id"] as? String
+        let productID = response.notification.request.content.userInfo["product_id"] as? String
         Task { @MainActor in
             NSApplication.shared.activate(ignoringOtherApps: true)
-            if let workItemID {
+            if let workItemID, let productID {
+                self.onSelectDecision?(workItemID, productID)
+            } else if let workItemID {
                 self.onSelectWorkItem?(workItemID)
             }
         }

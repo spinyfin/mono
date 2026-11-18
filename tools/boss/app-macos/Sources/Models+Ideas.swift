@@ -59,9 +59,9 @@ enum IdeaStatus: String, Codable, CaseIterable {
 }
 
 /// Autosave status for the idea currently open in the editor, surfaced as
-/// a small inline indicator (`IdeasView`) rather than the app's blocking
-/// `workErrorMessage` alert — a background autosave hiccup must never
-/// interrupt drafting. See `ChatViewModel+Ideas.swift`.
+/// a small inline indicator (`IdeasView`) rather than the app-wide
+/// `workErrorMessage` banner — a background autosave hiccup belongs next
+/// to the draft it concerns. See `ChatViewModel+Ideas.swift`.
 enum IdeaSaveStatus: Equatable {
     /// Nothing open, or the open idea has no unconfirmed edits.
     case idle

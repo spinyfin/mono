@@ -195,31 +195,6 @@ impl<'a> BazelUserRootCache<'a> {
     }
 }
 
-/// Recursively restore the owner-write bit on every directory under (and
-/// including) `root`, without following symlinks. Bazel marks output-tree
-/// directories read-only; `fs::remove_dir_all` cannot unlink entries inside a
-/// directory it cannot write to, and fails part-way through with `Permission
-/// denied` on a populated output base (verified against a real one — see
-/// `remove_output_base`'s doc comment).
-fn make_dirs_writable(root: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let meta = fs::symlink_metadata(root)?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Ok(());
-    }
-    let mut perms = meta.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(root, perms)?;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            make_dirs_writable(&entry.path())?;
-        }
-    }
-    Ok(())
-}
-
 /// Remove one bazel output base, handling bazel's read-only directory
 /// permissions. Returns `Ok(true)` if something was removed, `Ok(false)` if
 /// nothing was there to begin with (not an error — the common case for a
@@ -230,7 +205,7 @@ fn make_dirs_writable(root: &Path) -> io::Result<()> {
 /// contains directories such as
 /// `execroot/_main/bazel-out/darwin_arm64-opt/bin/external/rules_rust++crate+*`
 /// mode `0500` (read+execute, no write) — a plain `remove_dir_all` on that
-/// tree fails with `Permission denied`; this function's `make_dirs_writable`
+/// tree fails with `Permission denied`; this function's `fs_util::make_dirs_writable`
 /// pass clears it first, and the same tree then removes cleanly.
 pub(super) fn remove_output_base(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
@@ -243,11 +218,7 @@ pub(super) fn remove_output_base(path: &Path) -> Result<bool> {
             });
         }
     }
-    make_dirs_writable(path).map_err(|source| CubeError::BazelOutputBaseRemove {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    fs::remove_dir_all(path).map_err(|source| CubeError::BazelOutputBaseRemove {
+    super::fs_util::remove_tree_writable(path).map_err(|source| CubeError::BazelOutputBaseRemove {
         path: path.to_path_buf(),
         source,
     })?;
@@ -283,10 +254,29 @@ pub(super) fn cleanup_output_base_for_workspace(
         return CleanupOutcome::RootUnknown;
     };
     let base = output_base_path(&root, workspace_path);
-    match remove_output_base(&base) {
+    let removing = root.join(format!("{}.cube-removing", hash_workspace_path(workspace_path)));
+    let result = (|| {
+        let base_removed = remove_output_base(&base)?;
+        let retired_removed = remove_output_base(&removing)?;
+        let owner_removed =
+            remove_owner_record(&root.join(format!("{}.cube-removing-owner", hash_workspace_path(workspace_path))))?;
+        Ok(base_removed || retired_removed || owner_removed)
+    })();
+    match result {
         Ok(true) => CleanupOutcome::Removed(base),
         Ok(false) => CleanupOutcome::NothingToRemove,
         Err(e) => CleanupOutcome::Failed(e),
+    }
+}
+
+fn remove_owner_record(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CubeError::BazelOutputBaseRemove {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -348,11 +338,16 @@ pub(super) fn sweep_orphaned_output_bases(store: &Store, bazel_user_root: &Path,
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !is_output_base_dir_name(name) {
+        let hash = name
+            .strip_suffix(".cube-removing-owner")
+            .or_else(|| name.strip_suffix(".cube-removing"))
+            .unwrap_or(name);
+        if !is_output_base_dir_name(hash) {
             continue;
         }
         let Ok(file_type) = entry.file_type() else { continue };
-        if !file_type.is_dir() {
+        let owner = name.ends_with(".cube-removing-owner");
+        if !(if owner { file_type.is_file() } else { file_type.is_dir() }) {
             continue;
         }
         report.candidates_examined += 1;
@@ -362,7 +357,7 @@ pub(super) fn sweep_orphaned_output_bases(store: &Store, bazel_user_root: &Path,
         // workspace can be provisioned for the duration of a sweep over
         // hundreds of orphans, each removal taking 20-30s.
         let live = live_output_base_hashes(store);
-        if live.contains(name) {
+        if live.contains(hash) {
             report.skipped_now_live += 1;
             continue;
         }
@@ -372,7 +367,21 @@ pub(super) fn sweep_orphaned_output_bases(store: &Store, bazel_user_root: &Path,
             continue;
         }
 
-        match remove_output_base(&path) {
+        // Preserve ownership evidence if removal of the retired tree fails.
+        if owner && bazel_user_root.join(format!("{hash}.cube-removing")).exists() {
+            continue;
+        }
+        let result = if owner {
+            remove_owner_record(&path)
+        } else {
+            remove_output_base(&path).and_then(|removed| {
+                if name.ends_with(".cube-removing") {
+                    remove_owner_record(&bazel_user_root.join(format!("{hash}.cube-removing-owner")))?;
+                }
+                Ok(removed)
+            })
+        };
+        match result {
             Ok(true) => report.removed.push(path),
             Ok(false) => {}
             Err(e) => {

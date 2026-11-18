@@ -14,7 +14,7 @@ use crate::app::change::resolve_body_file;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
-use crate::app::jj::run_jj_push;
+use crate::app::jj::{is_bookkeeping_bookmark, run_jj, run_jj_push};
 use crate::app::stage::run_stage;
 
 /// Resolved context for a PR create/update operation: the workspace, the
@@ -72,7 +72,7 @@ fn resolve_pr_context(branch_arg: Option<String>, runner: &dyn CommandRunner) ->
 /// following `jj edit <bookmark>`) leaves the bookmark on the rebased commit
 /// while `@` stays on the old tree. Any local build/test gate then runs
 /// against the wrong tree, and a push ships a commit that was never actually
-/// verified locally (T2764 postmortem, spinyfin/mono#2023). Accepts the two
+/// verified locally (see spinyfin/mono#2023). Accepts the two
 /// shapes a clean workflow leaves `@` in: `@` IS the bookmark head, or `@` is
 /// an empty working-copy child of it.
 fn assert_working_copy_matches_branch(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<()> {
@@ -136,7 +136,7 @@ fn jj_is_empty(runner: &dyn CommandRunner, cwd: &Path, revision: &str) -> Result
 /// `--body`/`--body-file`), when the caller has one to check — see
 /// [`run_checkleft_gate`] for why this must be resolved and passed in
 /// *before* the push, not looked up afterward.
-fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_description: Option<&str>) -> Result<()> {
+fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_description: Option<&str>) -> Result<String> {
     // Run checkleft against the outgoing changes before pushing. Refuses
     // (with the findings) if checkleft reports errors — no PR push reaches
     // GitHub with a known convention violation.
@@ -180,8 +180,8 @@ fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_descrip
 
 /// Return the URL of the single open PR for `ctx.branch`, or `None` when
 /// there is no open PR. Errors when more than one open PR matches.
-fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<String>> {
-    let prs = gh_pr::list_open_prs_for_branch(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)
+fn list_open_pr(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, branch: &str) -> Result<Option<String>> {
+    let prs = gh_pr::list_open_prs_for_branch(runner, cwd, owner_repo, branch)
         .map_err(|e| CubeError::InvalidArgument(format!("failed to check for existing PR: {e}")))?;
 
     if prs.len() > 1 {
@@ -189,7 +189,7 @@ fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<St
             "found {} open PRs for branch `{}` — expected at most 1. \
              Close duplicate PRs before retrying.",
             prs.len(),
-            ctx.branch
+            branch
         )));
     }
 
@@ -322,7 +322,7 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
     // success rather than a hard error so retries after a caller-side
     // timeout are safe. A caller with genuinely new commits to add should
     // use `cube pr update` instead; this path never pushes.
-    if let Some(url) = list_open_pr(&ctx, runner)? {
+    if let Some(url) = list_open_pr(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)? {
         eprintln!(
             "cube: an open PR already exists for branch `{branch}` — treating this `pr create` call \
              as already satisfied. If you have new commits to push, use \
@@ -330,10 +330,18 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
             branch = ctx.branch
         );
         let number = pr_number_from_url(&url);
-        let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
+        let local = jj_commit_id(runner, &ctx.cwd, &ctx.branch)?;
+        let published = fetch_github_sha(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)?;
+        let published = published.trim();
+        if local.trim() != published {
+            return Err(CubeError::InvalidArgument(format!(
+                "local `{branch}` differs from GitHub's existing PR head; use `cube pr update --branch {branch}` to publish local commits",
+                branch = ctx.branch
+            )));
+        }
         return RunResult::new(
             url.clone(),
-            json!({"action": "already_exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
+            json!({"action": "already_exists", "url": url, "number": number}),
         );
     }
 
@@ -341,11 +349,7 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
     push_branch_to_github(&ctx, runner, body.text.as_deref())?;
     let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
-    RunResult::new(
-        url.clone(),
-        json!({"action": "created", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
-    )
+    RunResult::new(url.clone(), json!({"action": "created", "url": url, "number": number}))
 }
 
 /// Push new commits to the existing GitHub PR for the current jj bookmark.
@@ -366,7 +370,7 @@ pub(super) fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Resul
         assert_working_copy_matches_branch(&ctx, runner)?;
     }
 
-    let Some(url) = list_open_pr(&ctx, runner)? else {
+    let Some(url) = list_open_pr(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)? else {
         return Err(CubeError::InvalidArgument(format!(
             "no open PR exists for branch `{branch}`. Open one with `cube pr create --branch {branch}` \
              — `cube pr update` only pushes commits to an existing PR and never creates one.",
@@ -376,11 +380,7 @@ pub(super) fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Resul
 
     push_branch_to_github(&ctx, runner, None)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
-    RunResult::new(
-        url.clone(),
-        json!({"action": "updated", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
-    )
+    RunResult::new(url.clone(), json!({"action": "updated", "url": url, "number": number}))
 }
 
 /// Deprecated create-or-reuse alias. Kept for one transitional release so
@@ -397,46 +397,14 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
     let body = resolve_pr_body(&args)?;
     push_branch_to_github(&ctx, runner, body.text.as_deref())?;
 
-    if let Some(url) = list_open_pr(&ctx, runner)? {
+    if let Some(url) = list_open_pr(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)? {
         let number = pr_number_from_url(&url);
-        let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
-        return RunResult::new(
-            url.clone(),
-            json!({"action": "exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
-        );
+        return RunResult::new(url.clone(), json!({"action": "exists", "url": url, "number": number}));
     }
 
     let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
-    let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
-    RunResult::new(
-        url.clone(),
-        json!({"action": "created", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
-    )
-}
-
-/// Sets the local `pr/<n>` bookmark on the given branch.
-///
-/// Returns the bookmark name if the number was resolved, or `None` if the PR
-/// URL didn't contain a parseable number (so callers can include it in JSON).
-fn set_pr_bookmark(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    number: Option<u64>,
-    branch: &str,
-) -> Result<Option<String>> {
-    let Some(n) = number else {
-        return Ok(None);
-    };
-    let bookmark_name = pr_bookmark::pr_bookmark_name(n);
-    runner
-        .run(&RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &["bookmark", "set", &bookmark_name, "-r", branch],
-        ))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to set local bookmark `{bookmark_name}`: {e}")))?;
-    Ok(Some(bookmark_name))
+    RunResult::new(url.clone(), json!({"action": "created", "url": url, "number": number}))
 }
 
 /// Verify that a just-pushed branch actually reached GitHub.
@@ -451,7 +419,7 @@ pub(super) fn verify_push_reached_github(
     cwd: &Path,
     owner_repo: &str,
     branch: &str,
-) -> Result<()> {
+) -> Result<String> {
     let local_sha = runner
         .run(&RealCommandRunner::invocation(
             cwd,
@@ -490,7 +458,7 @@ pub(super) fn verify_push_reached_github(
              against `gh api repos/{owner_repo}/branches/{branch} --jq .commit.sha`."
         )));
     }
-    Ok(())
+    Ok(local_sha.to_owned())
 }
 
 /// Extract the PR number from a GitHub pull request URL.
@@ -532,11 +500,46 @@ fn detect_jj_bookmark(runner: &dyn CommandRunner, cwd: &Path) -> Result<String> 
         .map(str::to_string)
 }
 
+/// The nearest local branch bookmark in `@`'s ancestry, ignoring the engine's
+/// pointer namespaces and the trunk branches.
+fn infer_branch_from_ancestry(runner: &dyn CommandRunner, cwd: &Path) -> Result<String> {
+    let output = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "-n",
+                "20",
+                "-r",
+                "ancestors(@) & bookmarks()",
+                "--no-graph",
+                "-T",
+                r#"local_bookmarks.map(|b| b.name()).join("\n") ++ "\n""#,
+            ],
+        ))
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to infer the PR branch from ancestry: {e}")))?;
+    output
+        .lines()
+        .map(str::trim)
+        .find(|name| !name.is_empty() && !matches!(*name, "main" | "master") && !is_bookkeeping_bookmark(name))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CubeError::InvalidArgument(
+                "could not infer the PR from `@`'s ancestry — no branch bookmark found. \
+                 Pass `--pr <n>` or `--branch <name>` explicitly, or run \
+                 `cube workspace goto --pr <n>` to position the workspace first."
+                    .to_string(),
+            )
+        })
+}
+
 /// Advance an existing PR by pushing the current commit (`@`) to its head branch.
 ///
-/// Implements the `cube pr push` subcommand. Advances both the remote head
-/// branch and the local `pr/<n>` bookmark to `@` (fast-forward only by
-/// default) and verifies the push reached GitHub.
+/// Implements the `cube pr push` subcommand. Advances the PR's head branch to
+/// `@` (fast-forward from GitHub's current head only, by default) and verifies
+/// the push reached GitHub. GitHub's own head is the only record of the PR's
+/// position; cube keeps no per-PR pointer of its own.
 pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
     let cwd = std::env::current_dir().map_err(CubeError::Io)?;
 
@@ -556,8 +559,6 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
     // Guard: the head branch must not be a reserved pr/* bookmark.
     pr_bookmark::assert_not_pr_bookmark(&head_branch).map_err(CubeError::InvalidArgument)?;
 
-    let pr_bm = pr_bookmark::pr_bookmark_name(pr_number);
-
     // Check that the PR is still open — refuse to push onto a merged/closed PR.
     check_pr_open(runner, &cwd, &owner_repo, pr_number)?;
 
@@ -573,16 +574,16 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
 
     if at_is_empty {
         // @ is empty: this is either a no-op (already pushed) or a "nothing to land" error.
-        // Check whether the pr/<n> bookmark and GitHub are already in sync.
+        // Check whether the local head branch and GitHub are already in sync.
         let github_sha = fetch_github_sha(runner, &cwd, &owner_repo, &head_branch)?;
-        let pr_bm_sha_result = runner.run(&RealCommandRunner::invocation(
+        let local_branch_sha = runner.run(&RealCommandRunner::invocation(
             &cwd,
             "jj",
-            &["log", "-r", &pr_bm, "--no-graph", "-T", "commit_id"],
+            &["log", "-r", &head_branch, "--no-graph", "-T", "commit_id"],
         ));
-        match pr_bm_sha_result {
+        match local_branch_sha {
             Ok(sha) if sha.trim() == github_sha.trim() => {
-                // Bookmarks and GitHub are already in sync — idempotent no-op.
+                // The branch and GitHub are already in sync — idempotent no-op.
                 let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
                 return RunResult::new(
                     pr_url.clone(),
@@ -607,7 +608,7 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
     run_checkleft_gate(&cwd, None)?;
 
     // For force-with-lease: skip the descendant check (lease verification is the safety instead).
-    // For normal push: @ must be a descendant of pr/<n> (fast-forward enforcement).
+    // For normal push: @ must be a descendant of GitHub's current head (fast-forward enforcement).
     if args.force_with_lease {
         // Lease verification: jj's last-fetched remote state must match GitHub.
         let remote_ref = format!("{head_branch}@{github_remote}");
@@ -635,8 +636,17 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
             )));
         }
 
-        // Advance both bookmarks to @.
-        advance_pr_bookmarks(runner, &cwd, &head_branch, &pr_bm)?;
+        runner.run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["bookmark", "set", &head_branch, "-r", "@"],
+        ))?;
+        // The git push below reads the real branch ref, so write it out first.
+        run_jj(
+            runner,
+            None,
+            &RealCommandRunner::invocation(&cwd, "jj", &["git", "export"]),
+        )?;
 
         // Force push via git (jj git push has no --force-with-lease flag).
         runner
@@ -647,25 +657,49 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
             ))
             .map_err(|e| CubeError::InvalidArgument(format!("force-with-lease push of `{head_branch}` failed: {e}")))?;
     } else {
-        // Normal fast-forward push: @ must be a descendant of pr/<n>.
-        let ancestor_rev = format!("{pr_bm} & ancestors(@)");
+        // Normal fast-forward push: @ must be a descendant of the head GitHub
+        // reports for the branch. A head this store has never seen cannot be an
+        // ancestor of `@`, so it is refused as a non-fast-forward.
+        let github_sha = fetch_github_sha(runner, &cwd, &owner_repo, &head_branch)?;
+        let github_sha = github_sha.trim();
+        if github_sha.len() != 40 || !github_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(CubeError::InvalidArgument(format!(
+                "GitHub returned {github_sha:?} as the head of `{head_branch}`, not a full commit id"
+            )));
+        }
         let ancestor_out = runner
             .run(&RealCommandRunner::invocation(
                 &cwd,
                 "jj",
-                &["log", "-r", &ancestor_rev, "--no-graph", "-T", "commit_id"],
+                &[
+                    "log",
+                    "-r",
+                    &format!("present({github_sha}) & ancestors(@)"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                ],
             ))
-            .map_err(|e| CubeError::InvalidArgument(format!("failed to check ancestry of `{pr_bm}`: {e}")))?;
+            .map_err(|e| {
+                CubeError::InvalidArgument(format!("failed to check ancestry of GitHub's head {github_sha}: {e}"))
+            })?;
         if ancestor_out.trim().is_empty() {
             return Err(CubeError::InvalidArgument(format!(
-                "@ is not a descendant of `{pr_bm}` — refusing to push (this would not be a \
-                 fast-forward). Use `--force-with-lease` for rewrite scenarios, or run \
+                "@ is not a descendant of `{head_branch}` on GitHub ({github_sha}) — refusing to push (this would \
+                 not be a fast-forward). Use `--force-with-lease` for rewrite scenarios, or run \
                  `cube workspace goto --pr {pr_number}` to rebuild on the current head."
             )));
         }
 
-        // Advance both bookmarks to @.
-        advance_pr_bookmarks(runner, &cwd, &head_branch, &pr_bm)?;
+        // Advance the head branch to @. No `--allow-backwards`: a move that is
+        // not a fast-forward of the local branch is refused by jj itself.
+        runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["bookmark", "set", &head_branch, "-r", "@"],
+            ))
+            .map_err(|e| CubeError::InvalidArgument(format!("failed to advance `{head_branch}` bookmark to @: {e}")))?;
 
         // Push the head branch (no --allow-new: the branch already exists remotely).
         runner
@@ -699,38 +733,16 @@ fn resolve_pr_push_target(
         (Some(n), Some(b)) => Ok((n, b.to_string())),
 
         (Some(n), None) => {
-            // Have PR number; find head branch from the pr/<n> bookmark's co-located bookmarks.
-            let pr_bm = pr_bookmark::pr_bookmark_name(n);
-            let bm_out = runner
-                .run(&RealCommandRunner::invocation(
-                    cwd,
-                    "jj",
-                    &[
-                        "log",
-                        "-r",
-                        &pr_bm,
-                        "--no-graph",
-                        "-T",
-                        r#"bookmarks.map(|b| b.name()).join("\n")"#,
-                    ],
+            // Have the PR number; GitHub names its head branch.
+            let info = gh_pr::fetch_pr_json(runner, cwd, owner_repo, n)
+                .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo}: {e}")))?;
+            require_same_repo_head(&info, owner_repo, n)?;
+            let head_branch = gh_pr::head_ref(&info).ok_or_else(|| {
+                CubeError::InvalidArgument(format!(
+                    "PR {n} ({owner_repo}) returned no head.ref from GitHub; pass --branch explicitly"
                 ))
-                .map_err(|e| {
-                    CubeError::InvalidArgument(format!(
-                        "could not find `{pr_bm}` bookmark locally: {e}; \
-                         run `cube workspace goto --pr {n}` first or pass --branch"
-                    ))
-                })?;
-            let head_branch = bm_out
-                .lines()
-                .map(str::trim)
-                .find(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
-                .ok_or_else(|| {
-                    CubeError::InvalidArgument(format!(
-                        "no head branch found co-located with `{pr_bm}`; pass --branch explicitly"
-                    ))
-                })?
-                .to_string();
-            Ok((n, head_branch))
+            })?;
+            Ok((n, head_branch.to_string()))
         }
 
         (None, Some(b)) => {
@@ -746,57 +758,30 @@ fn resolve_pr_push_target(
         }
 
         (None, None) => {
-            // Infer from @'s ancestry: find nearest commit with a pr/* bookmark.
-            let infer_out = runner
-                .run(&RealCommandRunner::invocation(
-                    cwd,
-                    "jj",
-                    &[
-                        "log",
-                        "-r",
-                        r#"latest(ancestors(@) & bookmarks(glob:"pr/*"))"#,
-                        "--no-graph",
-                        "-T",
-                        r#"bookmarks.map(|b| b.name()).join("\n")"#,
-                    ],
-                ))
-                .map_err(|e| CubeError::InvalidArgument(format!("failed to infer PR from ancestry: {e}")))?;
-
-            if infer_out.trim().is_empty() {
-                return Err(CubeError::InvalidArgument(
-                    "could not infer PR from `@`'s ancestry — no `pr/<n>` bookmark found. \
-                     Pass `--pr <n>` or `--branch <name>` explicitly, or run \
-                     `cube workspace goto --pr <n>` to position the workspace first."
-                        .to_string(),
-                ));
-            }
-
-            let mut pr_number: Option<u64> = None;
-            let mut head_branch: Option<String> = None;
-            for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
-                if pr_bookmark::is_pr_bookmark(name) {
-                    if let Some(n) = name.strip_prefix("pr/").and_then(|s| s.parse::<u64>().ok()) {
-                        pr_number = Some(n);
-                    }
-                } else {
-                    head_branch = Some(name.to_string());
-                }
-            }
-
-            match (pr_number, head_branch) {
-                (Some(n), Some(b)) => Ok((n, b)),
-                (Some(n), None) => Err(CubeError::InvalidArgument(format!(
-                    "found `pr/{n}` in ancestry but no co-located head branch; \
-                     pass --branch explicitly"
-                ))),
-                _ => Err(CubeError::InvalidArgument(
-                    "failed to infer PR and branch from ancestry; \
-                     pass --pr and --branch explicitly"
-                        .to_string(),
-                )),
-            }
+            // Infer the head branch from @'s ancestry (the nearest local
+            // branch bookmark), then let GitHub say which PR it heads.
+            let branch = infer_branch_from_ancestry(runner, cwd)?;
+            let number = gh_pr::find_open_pr_for_branch(runner, cwd, owner_repo, &branch)
+                .map_err(|e| {
+                    CubeError::InvalidArgument(format!("failed to look up open PR for branch `{branch}`: {e}"))
+                })?
+                .ok_or_else(|| {
+                    CubeError::InvalidArgument(format!(
+                        "no open PR found for branch `{branch}`; pass --pr and --branch explicitly"
+                    ))
+                })?;
+            Ok((number, branch))
         }
     }
+}
+
+fn require_same_repo_head(info: &serde_json::Value, owner_repo: &str, number: u64) -> Result<()> {
+    if !super::pr_head::head_repo_full_name(info).is_some_and(|name| name.eq_ignore_ascii_case(owner_repo)) {
+        return Err(CubeError::InvalidArgument(format!(
+            "PR {number} does not have a head repository matching {owner_repo}; refusing to push a fork or unknown head"
+        )));
+    }
+    Ok(())
 }
 
 /// Verify the PR identified by `pr_number` is open on GitHub; error if merged/closed.
@@ -810,7 +795,7 @@ fn check_pr_open(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, pr_nu
              Only OPEN pull requests can be advanced with `cube pr push`."
         )));
     }
-    Ok(())
+    require_same_repo_head(&pr_info, owner_repo, pr_number)
 }
 
 /// Fetch the current head SHA of `branch` from GitHub (authoritative source).
@@ -823,23 +808,4 @@ fn fetch_github_sha(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, br
             &["api", &api_path, "--jq", ".commit.sha"],
         ))
         .map_err(|e| CubeError::InvalidArgument(format!("failed to fetch GitHub head sha for `{branch}`: {e}")))
-}
-
-/// Advance `head_branch` and `pr_bm` bookmarks to `@`.
-fn advance_pr_bookmarks(runner: &dyn CommandRunner, cwd: &Path, head_branch: &str, pr_bm: &str) -> Result<()> {
-    runner
-        .run(&RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &["bookmark", "set", head_branch, "-r", "@"],
-        ))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to advance `{head_branch}` bookmark to @: {e}")))?;
-    runner
-        .run(&RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &["bookmark", "set", pr_bm, "-r", "@"],
-        ))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to advance `{pr_bm}` bookmark to @: {e}")))?;
-    Ok(())
 }

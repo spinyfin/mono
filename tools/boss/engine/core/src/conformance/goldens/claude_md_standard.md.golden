@@ -1,15 +1,25 @@
-# Boss worker rules
+# Worker rules
 
-You are running inside a Boss-managed worker session. The engine
+You are running inside a managed worker session. The engine
 spawned you in a leased cube workspace and observes this session
 via claude hooks.
 For ordinary pre-push validation, run `checkleft run` with no flags; use
 `checkleft --all` only in CI, when modifying checkleft itself, or with a
 strong stated justification.
+Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`
+in a shell `timeout`.
 
 ## Pull requests are the deliverable
 
 **A task is not complete until a PR exists.** Local commits are NOT enough.
+
+### Before every PR branch push
+
+Before the first push and every later push (`"$CUBE_BIN" pr create` or `"$CUBE_BIN" pr update`), fetch and compare the branch's base with its current upstream tip; do not rely on the base recorded at dispatch or an earlier check. Use `"$CUBE_BIN" workspace local-rebase --pr <bound-pr-number> --json` for an existing PR: it resolves the actual GitHub remote and PR base, including a parent PR branch for stacked PRs. Before a PR exists, use the same flow with `"$CUBE_BIN" workspace local-rebase --base <intended-pr-base-branch> --json`, naming the branch the PR will target (the configured integration branch, or the parent branch for a stack).
+
+The command fetches that remote and rebases the preserved working-copy history onto the freshly fetched tracking ref without publishing, repositioning the working copy, or collapsing commits. Use `jj` and the returned `destination` to compare ancestry and inspect the result. If the base has advanced, the branch must include the latest base before pushing. Resolve every conflicted commit from the base upward, integrating both sides' intent; never discard upstream changes, take either side wholesale, drop commits, squash, or reword existing descriptions. Preserve published PR bookmarks after rebasing.
+
+After a rebase, re-run the builds and tests affected by the upstream changes and conflict resolutions before pushing, even when the rebase looked clean. Verify with `jj` that no commit to be pushed has unresolved conflicts. If the rebase or resolution cannot be completed cleanly, stop and report the conflicting files and reason; never push a half-resolved branch. Only then publish with the existing PR tooling.
 
 - Open a PR with `"$CUBE_BIN" pr create` once commits exist and tests pass.
 - **If a PR already exists** (resuming or addressing review),
@@ -27,6 +37,14 @@ chain root does), so an empty `task.pr_url` does NOT mean "no
 PR exists" when you're a revision worker. `"$BOSS_BIN" pr status`
 resolves your actually-bound PR correctly either way.
 - Do not hard-wrap PR bodies.
+- **Every PR body must contain an evidence section.** Show concretely how
+the change achieves its stated intent: commands run and their results,
+repeated-run counts for flake fixes, measurements, before/after behavior,
+and screenshots registered via `"$BOSS_BIN" attach`, as applicable. Describe
+registered screenshots by caption and what you verified; keep attachment
+URLs out of the PR body. A bare "tests pass" is not enough. Where evidence
+could not be gathered, state the specific limitation and what would be
+needed to gather it. Distinguish observed results from expectations.
 - **Declare work that ships inert prominently in the PR body.** If your change
 does not take effect on deploy (a default-off flag, per-environment config,
 unscheduled task, missing capability, or other human action), state that it
@@ -37,12 +55,19 @@ evaluates backticks and `$(...)` inside double-quoted strings, which
 corrupts any body that contains inline code. Always write the body to
 a file and use `--body-file` (see the recipe below).
 - Print the PR URL on its own line as the last thing in your final response.
+- Confirm the published PR contains your commit with `gh pr view` and
+its head SHA; pass `-R owner/repo` in a jj workspace (resolve the slug
+from the PR URL or `jj git remote`).
 - Before pushing, run `jj diff -r @`. If the diff is empty,
 do NOT commit, push, or open a PR — stop and explain.
 
+## Revisions
+
+A revision never opens a new PR. Push in-scope commits to the existing parent PR with `"$CUBE_BIN" pr update`. If another PR must land first, report the dependency using the blocker channel below. `"$BOSS_BIN" propose followup-task --name "<short title>" --description "<one paragraph of scope>" --rationale "<why a separate PR>"` is only for non-blocking work that can happen later. Finish the in-scope work on the parent PR. If a guard, policy, or decision blocks progress, emit a `[blocked] reason="<specific question>"` marker instead of declaring you could not complete.
+
 ## Checking your own PR's state
 
-Boss already stores most of what you'd otherwise ask GitHub for.
+The engine already stores most of what you'd otherwise ask GitHub for.
 These read your own PR only — never another run's — and cost one
 local round trip against the engine, not a GitHub API call:
 
@@ -57,7 +82,7 @@ not the revision), so it reads as "no PR" even when one exists.
 ```sh
 "$BOSS_BIN" pr status --json
 ```
-This is Boss's **last stored observation from the merge poller,
+This is the engine's **last stored observation from the merge poller,
 not live GitHub truth** — `observed_at` (Unix epoch seconds) is
 the timestamp of that observation, not of your call. Right after
 a push, the stored snapshot usually still reflects the *pre-push*
@@ -72,10 +97,15 @@ in the response) if the engine-wide budget is exhausted — in
 that case you still get the last stored snapshot, never an error
 or a hang. Never loop calling `--refresh` waiting for a state
 change: the engine's own merge poller is what watches your PR to
-green after you push, not you — the same "do not babysit CI"
-principle your task prompt states applies here too.
-- `"$BOSS_BIN" pr body` — the PR title and body/description Boss
-snapshotted when this run started, for a read-modify-write of
+green after you push. Do not babysit CI with `gh pr checks` or
+`gh pr view` loops either. Finish required post-push artifacts, then
+complete the run using its enabled completion channel. Required checks
+are effectively green at SUCCESS, NEUTRAL, or SKIPPED; still-running
+and human-gated checks do not block completion. A genuinely failed
+check must be classified using the CI failure classification below;
+a CI-fix revision is no substitute for a fix you can make in this run.
+- `"$BOSS_BIN" pr body` — the PR title and body/description the
+engine snapshotted when this run started, for a read-modify-write of
 the description without a `gh pr view` round trip. If the
 response's `body` is null (`--json`) or says "(none stored)"
 (text), it means this run began a brand-new PR flow — there is
@@ -136,6 +166,16 @@ Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.
 - `"$CUBE_BIN" pr update --branch <name>` — existing PR (pushes new commits to it)
 - Never `jj git push --deleted` or `git push --delete`
 without explicit user approval.
+- **Never run raw `git` against cube's shared source store** — the
+checkout your workspace's `.jj/repo` pointer names, under cube's repos
+root — whether by `cd`-ing into it or by pointing `GIT_DIR`, `--git-dir`
+or `-C` at it. A PreToolUse hook refuses every git write there and every
+shallow `fetch`/`pull`/`clone` (`--depth`, `--shallow-since`, …) that
+would touch it: one such fetch turns the shared store into a shallow
+clone and breaks every dispatch for that repository. Read-only git
+against the store (`log`, `show`, `diff`, `rev-parse`, …) is allowed.
+To reproduce a CI script that runs raw git, clone into a throwaway
+directory under your own temp dir and run it there.
 - `.claude/` is gitignored by the engine. Do not force-track
 or commit anything inside it (no `--force`,
 no `jj file track .claude/...`).
@@ -237,7 +277,7 @@ config loading, caching, logging wiring, retry/backoff, or similar
 infrastructure), search the repo for an existing implementation
 first. If one exists, reuse or extend it instead of writing a new
 one. If duplication is genuinely necessary, say so explicitly in the
-PR description with the reason — a justified, operator-visible
+PR description with the reason — a justified, visible
 exception is the only way to avoid a "revision required"
 reuse/duplication finding from the automated reviewer.
 
@@ -246,49 +286,10 @@ reuse/duplication finding from the automated reviewer.
 - Do not modify files outside this workspace. Sibling workspaces
 belong to other workers.
 - Do not modify cube's database, lease state, or workspace registry.
-- `~/Library/Application Support/Boss/` is coordinator/engine-only.
-Never read, write, or touch it. Ask the coordinator for
-work-taxonomy context; do not query the DB yourself.
-`bossctl` is coordinator-only.
-
-## Running Boss itself
-
-Never launch the installed `/Applications/Boss.app`, never `open -a
-Boss`, and never start an engine that can reach production state.
-This machine is someone's laptop: an unisolated app launch puts a
-window on their screen and terminates the engine they are using.
-Bare `bazel run //tools/boss/app-macos:Boss` (no isolation env) is
-also blocked.
-
-To exercise a real engine, start an isolated one:
-
-```sh
-env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine/core:engine -- \
---socket-path /tmp/boss-test-$(uuidgen).sock
-```
-
-Any `--socket-path` other than the production socket puts the engine
-in test-fixture mode, where the db, events socket, pid file and
-control token are all derived from that socket's path — this
-includes the legacy `/tmp/boss-engine.sock`, which is a test
-fixture, not a safe alternative. Unset
-`BOSS_EVENTS_SOCKET` because your pane inherits one pointing at
-production. Point a client at the same `--socket-path` to drive it.
-
-To screenshot the real Boss UI quietly, launch an isolated capture
-instance (both env vars required):
-
-```sh
-BOSS_SOCKET_PATH=/tmp/boss-shot-$(uuidgen).sock BOSS_ENGINE_AUTOSTART=0 \
-bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png
-```
-
-The instance renders itself in-process via `cacheDisplay` and exits;
-it never shows a window, never takes focus, and needs no
-screen-recording permission. Read the PNG back and state in the PR
-what you verified and what you could not.
-
-`bazel build` and `bazel test` are unaffected.
+- `~/Library/Application Support/Boss/` is engine-only.
+Never read, write, or touch it. Do not query the database
+yourself; ask for any task or product context you need.
+`bossctl` is not available to workers.
 
 ## Capturing a screenshot for your own verification
 
@@ -300,9 +301,9 @@ Attach them:
 ```
 
 The engine stores the image outside this workspace (which is
-recycled after your run), for your own verification and for an
-operator looking at this run locally. `"$BOSS_BIN" attach --list` shows
-what this work item already has, across runs.
+recycled after your run), for your own verification and for
+someone looking at this run locally. `"$BOSS_BIN" attach --list` shows
+what this task already has, across runs.
 
 Validation is immediate and typed: a path outside this workspace or
 a temp dir, a file that is not really a PNG/JPEG, an oversize render,
@@ -315,13 +316,29 @@ stored exactly as you rendered it or refused.
 PR body.** The link it prints is only reachable on this machine;
 nobody reading the PR on GitHub can open it. This applies whether or
 not the evidence server is listening: if it isn't, the image is
-still stored, but that is still not a reason to paste a URL, describe
-the screenshot in prose, or inline it as base64 as a substitute. Where
+still stored, but that is still not a reason to paste a URL or inline
+it as base64. Summarize registered screenshots by caption in the evidence
+section; that notice does not give GitHub readers access to the images. Where
 a PR body needs evidence a GitHub reader can actually open, use
 something that is — a CI artifact, a deploy preview, a code
 reference.
 
-## Coordinator
+## Probes
 
-The coordinator may probe this session between turns. Treat probes
-as questions from a human reviewer — short, specific answers.
+Messages may arrive between turns. Treat them as questions from a
+human reviewer — short, specific answers.
+
+## CI failure classification
+
+Classify a CI failure by cause, then act — do not park, and do not leave "someone else will handle it" as an available excuse:
+- Caused by your change: fix it. No judgement call, not grounds to block, no handoff.
+- Unrelated to your change AND trivial: fix it inline — that is what a human would do.
+- Unrelated AND not trivial: do not absorb it into this PR. Do not silently expand this PR into repairing someone else's breakage — that makes the diff unreviewable and couples two unrelated changes. This is the case where stopping to escalate can be legitimate. Flag it, stating whether the remedy is a separate fix or reverting the offending commit, and why. "CI is red" is not an escalation; name the specific problem and the proposed remedy.
+
+Whichever branch you take, the PR description must say which category you judged the failure into and on what basis. A silent inline fix of an unrelated failure is nearly as bad as ignoring it, because nobody can review a decision they cannot see.
+
+Trivial means the correct fix is mechanical and obviously correct — the canonical case is `main` adding a required `is_review_supervisor` field to `StartWorkerInput` after a test was written, breaking clippy on an unrelated PR's merge-queue synthetic commit. One line, mechanical. A failing test whose correct behaviour you would have to reason about, or a failure whose cause you cannot identify, is not trivial, regardless of how few lines the fix looks.
+
+The engine already mints CI-fix revisions. That path is the fallback for failures that genuinely need a separate change (the unrelated-and-not-trivial case). It is not a reason to punt a failure you could fix in this run.
+
+

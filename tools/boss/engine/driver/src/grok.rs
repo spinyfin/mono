@@ -31,9 +31,7 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
-use crate::transcript_store::{
-    durable_sessions_dir, persistable_transcript_path, transcript_store_root, verified_durable_sessions_dir,
-};
+use crate::transcript_store::{durable_transcript_containment_root, persistable_transcript_path};
 
 /// Namespace this driver's durable transcripts are filed under in Boss's
 /// worker transcript store. Every caller that resolves, provisions, or grants
@@ -46,6 +44,7 @@ mod environment;
 mod home;
 mod hooks;
 mod model_menu;
+mod oauth_refresh;
 mod permissions;
 mod preflight;
 mod progress;
@@ -63,6 +62,7 @@ pub use home::{
 use classify_error::classify_grok_error;
 use environment::GrokProcessEnvironment;
 use home::{provision_grok_home, read_session_id, read_workspace_path_stamp};
+pub use oauth_refresh::{GROK_LOGIN_AFFIRMATION, GrokOauthLiveness, refresh_shared_oauth_credential_blocking};
 use progress::GrokProgressSession;
 use transcript::GrokTranscriptSession;
 use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
@@ -73,8 +73,7 @@ use super::{
     PermissionInput, PrUrlCaptureFeed, ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
     ProgressObservationWiring, ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery,
     StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-    TranscriptSessionNormalizer, TurnEnd, TurnEndEvidence, WorkerErrorClass, WorkerKind,
-    default_structured_output_wiring,
+    TranscriptSessionNormalizer, TurnEnd, TurnEndEvidence, WorkerErrorClass, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,6 +100,7 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
+        resolve_model_effort: None,
         // Authenticated `grok models` reported this as the default on
         // 2026-08-18. Step-5 fall-through and every classified row resolve
         // to the current generation.
@@ -138,12 +138,9 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// isn't asking anything answerable by a default, it's entered a UI whose
 /// only exit is a human pressing a key. Planning and recording a plan are
 /// still fine; blocking on approval of one is not.
-const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
-     spawned you in a leased cube workspace and observes this session\n\
-     via Grok hooks under a Boss-owned GROK_HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
+const GROK_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!(
+    "via Grok hooks under an engine-owned GROK_HOME.",
+    "\n\
      \n\
      Default to proceeding on a reasonable assumption instead of stopping to\n\
      ask the human: pick the interpretation a competent engineer would\n\
@@ -167,7 +164,8 @@ const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed w
      surface, not an interactive prompt mid-run. This does not change the\n\
      genuinely blocking cases above (unsafe, destructive, or irreversible\n\
      actions, or a missing credential) — those remain reasons to stop\n\
-     and emit a blocked marker, not reasons to open an approval UI.";
+     and emit a blocked marker, not reasons to open an approval UI."
+);
 
 // ---------------------------------------------------------------------------
 // GrokDriver
@@ -191,9 +189,8 @@ pub struct GrokDriver {
 ///
 /// Execution shape (design §Execution shape + T-03 pane mode):
 /// ```text
-/// grok --model … --reasoning-effort … --no-alt-screen --always-approve
+/// python3 -I .grok/initial-prompt.py grok --model … --reasoning-effort … --no-alt-screen --always-approve
 ///      --trust --session-id <uuid> --cwd <ws> --no-subagents --no-memory
-///      "$(cat .grok/initial-prompt.txt)"
 /// ```
 ///
 /// `GROK_HOME` / scoped `HOME` / `Unset(GROK_FOLDER_TRUST)` are env
@@ -261,12 +258,8 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     // investigation's "What would have to change" section.
     cmd.push_str(" --no-subagents");
     cmd.push_str(" --no-memory");
-    // Prompt from file via command substitution — briefs run to tens of KB.
-    cmd.push_str(&format!(
-        " \"$(cat {}/{})\"\n",
-        GROK_DESCRIPTOR.config_dir, GROK_DESCRIPTOR.initial_prompt_filename,
-    ));
-    cmd
+    cmd.push('\n');
+    super::initial_prompt::launcher_command(GROK_DESCRIPTOR.config_dir, &cmd)
 }
 
 #[async_trait]
@@ -346,6 +339,14 @@ impl AgentDriver for GrokDriver {
         ])
     }
 
+    fn launcher_starting_markers(&self) -> Vec<String> {
+        vec![
+            "Connecting...".into(),
+            "Waiting for approval".into(),
+            "Approve in your browser".into(),
+        ]
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Measured under GhosttyKit with `--no-alt-screen` (recommended
         // pane mode). See
@@ -353,6 +354,7 @@ impl AgentDriver for GrokDriver {
         // Do NOT merge these into Claude's marker sets — each driver
         // owns its surface strings.
         Some(PaneMonitorSpec {
+            blocking_dialog_markers: vec![],
             // OR-semantics. "always-approve" assumes Boss spawn keeps
             // --always-approve. "Grok 4" matches footer "Grok 4.6 …"
             // without pinning the patch model id — the prefix is
@@ -420,8 +422,16 @@ impl AgentDriver for GrokDriver {
         prompt_text: &str,
         run_id: &str,
     ) -> anyhow::Result<Option<DriverRuntimeState>> {
-        let runtime = provision_grok_home(workspace, prompt_text, run_id)
-            .with_context(|| format!("provisioning Boss-owned GROK_HOME for run_id {run_id:?}"))?;
+        // Provisioning shells out (`grok inspect`, the capability preflight) and
+        // is synchronous, so it runs on the blocking pool: a wedged tool must
+        // never occupy an async worker thread.
+        let (workspace_owned, prompt_owned, run_id_owned) =
+            (workspace.to_path_buf(), prompt_text.to_owned(), run_id.to_owned());
+        let runtime =
+            tokio::task::spawn_blocking(move || provision_grok_home(&workspace_owned, &prompt_owned, &run_id_owned))
+                .await
+                .context("Grok workspace provisioning task did not complete")?
+                .with_context(|| format!("provisioning Boss-owned GROK_HOME for run_id {run_id:?}"))?;
         Ok(Some(runtime.to_driver_runtime_state()))
     }
 
@@ -483,30 +493,7 @@ impl AgentDriver for GrokDriver {
         // Mirrors CodexDriver::write_permission_config's construction of
         // ToolUseInterceptionConfig from PermissionInput exactly — remote
         // workers get no local sandbox/guard scripts (never shipped there).
-        let interception = ToolUseInterceptionConfig {
-            data_dir: if input.is_remote {
-                None
-            } else {
-                input.events_socket_path.parent().map(|p| p.to_path_buf())
-            },
-            path_guard_script: if input.is_remote {
-                None
-            } else {
-                input.path_guard_script.clone()
-            },
-            checkleft_guard_script: if input.is_remote {
-                None
-            } else {
-                input.checkleft_guard_script.clone()
-            },
-            is_revision: input.execution_kind == "revision_implementation"
-                || input.task_kind.as_deref() == Some("revision"),
-            is_standard_worker: input.worker_kind == WorkerKind::Standard,
-            is_reviewer: input.worker_kind == WorkerKind::Reviewer,
-            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
-            run_id: Some(input.run_id.clone()),
-            workspace_path: Some(input.workspace_path.clone()),
-        };
+        let interception = ToolUseInterceptionConfig::from_permission_input(input);
 
         let mut config_files = hooks::write_hooks(&grok_home, &obs_config, &interception)
             .with_context(|| format!("writing Grok hook wiring under {}", grok_home.display()))?;
@@ -698,33 +685,7 @@ impl AgentDriver for GrokDriver {
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let grok_home = grok_home_for_run(run_id)?;
         let sessions_path = grok_home.join("sessions");
-        match fs::symlink_metadata(&sessions_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let store_root = transcript_store_root()?;
-                return Ok(Some(verified_durable_sessions_dir(
-                    &grok_home,
-                    &store_root,
-                    TRANSCRIPT_DRIVER_SLUG,
-                    run_id,
-                )?));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let store_root = transcript_store_root()?;
-                let durable = durable_sessions_dir(&store_root, TRANSCRIPT_DRIVER_SLUG, run_id)?;
-                if let Ok(canonical) = fs::canonicalize(&durable)
-                    && canonical.is_dir()
-                {
-                    return Ok(Some(canonical));
-                }
-            }
-            Err(err) => tracing::debug!(
-                ?err,
-                path = %sessions_path.display(),
-                "stat of temporary sessions path failed; falling back to legacy containment"
-            ),
-            _ => {}
-        }
-        Ok(None)
+        durable_transcript_containment_root(&sessions_path, TRANSCRIPT_DRIVER_SLUG, run_id)
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
@@ -826,7 +787,11 @@ impl AgentDriver for GrokDriver {
     /// `None` when this run has no resolvable per-run state (never
     /// provisioned, or already torn down) — interrupt delivery itself is
     /// unaffected either way.
-    fn prepare_interrupt_recovery(&self, run_id: &str) -> Option<InterruptRecoverySnapshot> {
+    fn prepare_interrupt_recovery(
+        &self,
+        run_id: &str,
+        _claimed_session_id: Option<&str>,
+    ) -> Option<InterruptRecoverySnapshot> {
         prepare_snapshot(run_id)
     }
 
@@ -1069,7 +1034,7 @@ mod tests {
             "preamble must still reserve asking for genuinely blocking cases: {preamble}",
         );
         // The pre-existing observability paragraph must survive untouched.
-        assert!(preamble.contains("via Grok hooks under a Boss-owned GROK_HOME"));
+        assert!(preamble.contains("via Grok hooks under an engine-owned GROK_HOME"));
     }
 
     /// Extends the ask-threshold guidance to cover interactive approval
@@ -1591,7 +1556,10 @@ mod tests {
         );
 
         let cmd = &plan.command;
-        assert!(cmd.starts_with("grok "), "command starts with grok: {cmd}");
+        assert!(
+            cmd.starts_with("python3 -I .grok/initial-prompt.py grok "),
+            "command starts with grok: {cmd}"
+        );
         assert!(cmd.contains("--model "), "has --model: {cmd}");
         assert!(cmd.contains("grok-4.6"), "has model slug: {cmd}");
         assert!(cmd.contains("--reasoning-effort "), "has --reasoning-effort: {cmd}");
@@ -1616,8 +1584,8 @@ mod tests {
         assert!(cmd.contains("--no-subagents"), "has --no-subagents: {cmd}");
         assert!(cmd.contains("--no-memory"), "has --no-memory: {cmd}");
         assert!(
-            cmd.contains("\"$(cat .grok/initial-prompt.txt)\""),
-            "prompt via cat substitution: {cmd}"
+            cmd.contains(".grok/initial-prompt.py"),
+            "prompt through the private terminal launcher: {cmd}"
         );
         assert!(!cmd.contains("--worktree"), "forbids --worktree: {cmd}");
         assert!(!cmd.contains("--worktree-ref"), "forbids --worktree-ref: {cmd}");
@@ -1921,6 +1889,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let err = GrokDriver::default()
@@ -1969,6 +1938,7 @@ mod tests {
             is_remote: false,
             path_guard_script: Some(path_guard_script),
             checkleft_guard_script: Some(checkleft_guard_script),
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2049,6 +2019,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2066,7 +2037,11 @@ mod tests {
                 "local macOS pane must launch without an outer Seatbelt: {}",
                 spawn.command
             );
-            assert!(spawn.command.starts_with("grok "), "{}", spawn.command);
+            assert!(
+                spawn.command.starts_with("python3 -I .grok/initial-prompt.py grok "),
+                "{}",
+                spawn.command
+            );
         } else {
             let sandbox_toml_path = grok_home.join("sandbox.toml");
             assert!(
@@ -2158,6 +2133,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2232,6 +2208,7 @@ mod tests {
             is_remote: true,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
 
@@ -2355,6 +2332,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let artifacts = driver
@@ -2520,6 +2498,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let artifacts = driver
@@ -2641,6 +2620,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            git_store_guard_script: None,
             codex_sandbox_enforced: false,
         };
         let artifacts = driver
@@ -2799,7 +2779,7 @@ mod tests {
         driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
 
         let snapshot = driver
-            .prepare_interrupt_recovery(run_id)
+            .prepare_interrupt_recovery(run_id, None)
             .expect("a provisioned run must yield a recovery snapshot");
 
         assert_eq!(snapshot.offset, 0, "events.jsonl does not exist yet; offset must be 0");
@@ -2842,7 +2822,7 @@ mod tests {
         let existing = b"{\"type\":\"turn_started\"}\n";
         fs::write(&events_path, existing).unwrap();
 
-        let snapshot = driver.prepare_interrupt_recovery(run_id).unwrap();
+        let snapshot = driver.prepare_interrupt_recovery(run_id, None).unwrap();
         assert_eq!(snapshot.offset, existing.len() as u64);
         assert_eq!(snapshot.events_path, events_path);
     }
@@ -2852,6 +2832,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _guard = env_for_provision(tmp.path(), &tmp.path().join("auth.json"), true);
         let driver = GrokDriver::default();
-        assert!(driver.prepare_interrupt_recovery("never-provisioned-run").is_none());
+        assert!(
+            driver
+                .prepare_interrupt_recovery("never-provisioned-run", None)
+                .is_none()
+        );
     }
 }

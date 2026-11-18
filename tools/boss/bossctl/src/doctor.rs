@@ -33,22 +33,36 @@ pub async fn run_tmux_preflight(json: bool) -> Result<()> {
     // (emptier) one, so the engine's own startup log is authoritative for
     // the engine. See `tools/boss/docs/postmortems/`.
     let locale = boss_command_runner::LocaleDiagnostics::probe();
+    let warning = preflight.crash_warning().await.map(|issue| issue.body);
     match preflight {
-        boss_engine::tmux_preflight::TmuxPreflight::Ready { program, version } => {
+        ready @ (boss_engine::tmux_preflight::TmuxPreflight::Ready { .. }
+        | boss_engine::tmux_preflight::TmuxPreflight::ReadyUnknown { .. }) => {
+            let (program, version) = match ready {
+                boss_engine::tmux_preflight::TmuxPreflight::Ready { program, version } => {
+                    (program, Some(format!("{}.{}", version.major, version.minor)))
+                }
+                boss_engine::tmux_preflight::TmuxPreflight::ReadyUnknown { program } => (program, None),
+                _ => unreachable!(),
+            };
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "ready": true,
-                        "program": program,
-                        "version": format!("{}.{}", version.major, version.minor),
+                        "ready": true, "program": program, "version": version, "warning": warning,
                         "locale_inherited": locale.inherited_summary(),
                         "locale_has_utf8": locale.has_utf8_locale,
                         "locale_forced_for_children": locale.forced.map(|(n, v)| format!("{n}={v}")),
                     })
                 );
             } else {
-                println!("tmux ready: {} {}.{}", program.display(), version.major, version.minor);
+                println!(
+                    "tmux ready: {} {}",
+                    program.display(),
+                    version.as_deref().unwrap_or("(unknown version)")
+                );
+                if let Some(warning) = warning {
+                    println!("{warning}");
+                }
                 println!("locale (this shell): {}", locale.inherited_summary());
                 if locale.has_utf8_locale {
                     println!("locale charset: UTF-8");
@@ -231,6 +245,7 @@ pub fn match_dispatch_signatures(
     findings.extend(match_sig_d_transient_exhausted(events, scope_execution_ids));
     findings.extend(match_sig_e_spawn_nack(events, scope_execution_ids));
     findings.extend(match_sig_f_worker_parse(events, scope_execution_ids));
+    findings.extend(match_sig_i_repeated_pre_start_failure(events, scope_execution_ids));
     // Fleet scan: a wedged husk breaker is a pool-level fact, and the
     // execution an operator diagnoses is usually the redispatch it blocked,
     // not one of the held-back runs.
@@ -1204,6 +1219,71 @@ fn match_sig_f_worker_parse(events: &[DispatchEvent], scope: &BTreeSet<String>) 
     out
 }
 
+// ── SIG-I ──────────────────────────────────────────────────────────────
+
+/// Minimum identical pre-start failures for a work item before SIG-I fires.
+const SIG_I_MIN_REPEATS: usize = 2;
+
+/// The same pre-start failure (same reason, same error text) recorded
+/// repeatedly against a work item: the retry loop is not curing it, so
+/// the cause is environmental or a code defect rather than a transient.
+fn match_sig_i_repeated_pre_start_failure(events: &[DispatchEvent], scope: &BTreeSet<String>) -> Vec<Finding> {
+    let mut groups: BTreeMap<(String, String, String), Vec<&DispatchEvent>> = BTreeMap::new();
+    for event in events {
+        if !in_scope(&event.execution_id, scope) || event.stage != "pre_start_failure" || event.outcome != "error" {
+            continue;
+        }
+        let reason = event.details.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        let error = event.error_message.as_deref().unwrap_or("");
+        groups
+            .entry((
+                work_item_of(event)
+                    .map(|id| format!("work:{id}"))
+                    .unwrap_or_else(|| format!("execution:{}", event.execution_id)),
+                reason.to_owned(),
+                error.to_owned(),
+            ))
+            .or_default()
+            .push(event);
+    }
+    let mut out = Vec::new();
+    for ((_, reason, error), group) in groups {
+        if group.len() < SIG_I_MIN_REPEATS {
+            continue;
+        }
+        let exhausted = events.iter().any(|e| {
+            group.iter().any(|failure| failure.execution_id == e.execution_id)
+                && e.stage == "pre_start_retries_exhausted"
+                && e.outcome == "error"
+        });
+        out.push(Finding {
+            sig_id: "SIG-I".into(),
+            absence_based: false,
+            severity: if exhausted { Severity::P1 } else { Severity::P2 },
+            title: format!(
+                "Repeated pre-start failure ({reason}) x{}{}",
+                group.len(),
+                if exhausted { ", retries exhausted" } else { "" }
+            ),
+            execution_id: group
+                .iter()
+                .all(|e| e.execution_id == group[0].execution_id)
+                .then(|| group[0].execution_id.clone()),
+            work_item_id: work_item_of(group[0]),
+            count: group.len(),
+            evidence: group.iter().map(|e| evidence_line(e)).collect(),
+            recovery: format!(
+                "The same error recurred on every attempt, so retrying will not clear it: {error}. \
+                 Fix the cause named by `{reason}` (cube repo/workspace health, jj bookmark \
+                 state, host reachability) before re-dispatching; once retries are exhausted \
+                 the work item is bounced to the backlog with autostart cleared."
+            ),
+            details: serde_json::json!({ "reason": reason, "error": error, "retries_exhausted": exhausted }),
+        });
+    }
+    out
+}
+
 // ── Trace SIGs ─────────────────────────────────────────────────────────
 
 fn fields_of(record: &Value) -> &Value {
@@ -1453,7 +1533,7 @@ pub fn resolve_diagnose_scope(
                 work_item_id: resolved.work_item_id,
             });
         }
-        if !resolved.execution_ids.is_empty() {
+        if resolved.work_item_id.is_some() {
             return Ok(DiagnoseScope {
                 input_id: id.to_owned(),
                 resolved_as: ResolvedAs::WorkItem,
@@ -1777,6 +1857,39 @@ pub fn render_findings(findings: &[Finding], integrity: &crate::stream_integrity
     out
 }
 
+/// The `waiting:` line of `dispatch diagnose`: the engine's wait reason for
+/// the item (code and phrase), the execution it applies to, and what it is
+/// waiting behind. `unclassified` is called out as the anomaly it is.
+fn dispatch_wait_line(runtime: &boss_protocol::TaskRuntime) -> String {
+    let reason = runtime.dispatch_wait_reason.as_deref().unwrap_or_default();
+    let label = runtime.dispatch_wait_label.as_deref().unwrap_or(reason);
+    let mut line = match (&runtime.execution_id, &runtime.execution_status) {
+        (Some(id), Some(status)) if !status.is_terminal() => {
+            format!("waiting: {reason} — {label} (execution {id}, {status})")
+        }
+        _ => format!("waiting: {reason} — {label} (no execution queued)"),
+    };
+    if let Some(blocker) = &runtime.dispatch_wait_blocker {
+        line.push_str(&format!("; behind {} {}", blocker.kind, blocker.work_item_id));
+    }
+    if reason == boss_protocol::DISPATCH_WAIT_REASON_UNCLASSIFIED {
+        line.push_str("\n  UNEXPECTED: the engine could not name this wait; it is reported as a `dispatch_wait_unclassified` attention item");
+    }
+    line
+}
+
+fn dispatch_wait_json(runtime: &boss_protocol::TaskRuntime) -> Value {
+    serde_json::json!({
+        "reason": runtime.dispatch_wait_reason,
+        "label": runtime.dispatch_wait_label,
+        "execution_id": runtime.execution_id,
+        "execution_status": runtime.execution_status,
+        "blocker": runtime.dispatch_wait_blocker,
+        "since_epoch_s": runtime.dispatch_wait_since,
+        "not_before_epoch_s": runtime.dispatch_not_before,
+    })
+}
+
 /// Full `bossctl dispatch diagnose` pipeline: resolve scope, load artifacts,
 /// match signatures, print timeline + findings (or JSON).
 ///
@@ -1789,6 +1902,20 @@ pub fn run_diagnose(
     now_ms: u128,
     db: Option<&boss_engine::work::WorkDb>,
 ) -> Result<()> {
+    if let Some(payload) = diagnose_report(root, id, json, signatures_only, now_ms, db)? {
+        println!("{payload}");
+    }
+    Ok(())
+}
+
+fn diagnose_report(
+    root: &Path,
+    id: &str,
+    json: bool,
+    signatures_only: bool,
+    now_ms: u128,
+    db: Option<&boss_engine::work::WorkDb>,
+) -> Result<Option<Value>> {
     let db_resolution = db.and_then(|work_db| {
         if let Ok(exec) = work_db.get_execution(id) {
             return Some(WorkItemResolution {
@@ -1797,8 +1924,8 @@ pub fn run_diagnose(
                 execution_ids: vec![id.to_owned()],
             });
         }
-        if let Ok(list) = work_db.list_executions(Some(id))
-            && !list.is_empty()
+        if work_db.get_work_item(id).is_ok()
+            && let Ok(list) = work_db.list_executions(Some(id))
         {
             return Some(WorkItemResolution {
                 as_execution: false,
@@ -1879,6 +2006,35 @@ pub fn run_diagnose(
             }
         }
     }
+
+    // Focus mode can hold a ready execution without any dispatch event
+    // saying so (the hold is a wait reason, not a stream stage), so diagnose
+    // reads it from state.db and says it outright.
+    let focus_diagnosis = db.and_then(|work_db| {
+        crate::focus::FocusDiagnosis::load(work_db, &scope.execution_ids)
+            .map_err(|err| eprintln!("warning: dispatch focus lookup skipped: {err:#}"))
+            .ok()
+    });
+
+    // Whether the engine would spend a progression agent on this item is a fact
+    // about the item, not a dispatch event, so diagnose reads it from state.db
+    // too: it names the clause that says no when the answer is no.
+    let progression_diagnosis = db.zip(scope.work_item_id.as_deref()).and_then(|(work_db, item_id)| {
+        crate::progression::ProgressionDiagnosis::load(work_db, item_id)
+            .map_err(|err| eprintln!("warning: progression lookup skipped: {err:#}"))
+            .ok()
+    });
+
+    // Why the item is waiting right now is a fact about its current rows, not
+    // a dispatch event, so diagnose reads it from state.db: the same engine
+    // classification the board's card shows.
+    let wait_diagnosis = db.zip(scope.work_item_id.as_deref()).and_then(|(work_db, item_id)| {
+        work_db
+            .get_task_runtime(item_id)
+            .map_err(|err| eprintln!("warning: dispatch wait lookup skipped: {err:#}"))
+            .ok()
+            .filter(|runtime| runtime.dispatch_wait_reason.is_some())
+    });
 
     let mut findings = match_dispatch_signatures(&events, now_ms, Some(&fleet), Some(&db_facts), &scope_execs);
 
@@ -1962,8 +2118,16 @@ pub fn run_diagnose(
             payload.insert("events".into(), events_value);
         }
         payload.insert("timelines".into(), Value::Object(timelines));
-        println!("{}", Value::Object(payload));
-        return Ok(());
+        if let Some(focus) = &focus_diagnosis {
+            payload.insert("focus".into(), focus.to_json());
+        }
+        if let Some(progression) = &progression_diagnosis {
+            payload.insert("progression".into(), progression.to_json());
+        }
+        if let Some(wait) = &wait_diagnosis {
+            payload.insert("wait".into(), dispatch_wait_json(wait));
+        }
+        return Ok(Some(Value::Object(payload)));
     }
 
     match scope.resolved_as {
@@ -1992,6 +2156,22 @@ pub fn run_diagnose(
     // prevent.
     integrity.print_banner();
 
+    if let Some(focus) = focus_diagnosis.as_ref().filter(|f| f.focus.is_active()) {
+        for line in focus.lines() {
+            println!("{line}");
+        }
+    }
+
+    if let Some(progression) = &progression_diagnosis {
+        for line in progression.lines(i64::try_from(now_ms / 1000).unwrap_or(i64::MAX)) {
+            println!("{line}");
+        }
+    }
+
+    if let Some(wait) = &wait_diagnosis {
+        println!("{}", dispatch_wait_line(wait));
+    }
+
     if events.is_empty() && findings.is_empty() {
         // "Nothing here" is precisely the conclusion damage invalidates, so it
         // is the one case that must never be stated bare.
@@ -2002,7 +2182,7 @@ pub fn run_diagnose(
             println!("  {}", crate::stream_integrity::NO_EVENTS_CAVEAT);
         }
         integrity.print_footer();
-        return Ok(());
+        return Ok(None);
     }
 
     if !signatures_only {
@@ -2024,7 +2204,7 @@ pub fn run_diagnose(
     println!();
     print!("{}", render_findings(&findings, &integrity));
     integrity.print_footer();
-    Ok(())
+    Ok(None)
 }
 
 /// Render one execution's timeline with its unreadable regions marked in place.
@@ -2105,9 +2285,9 @@ fn write_timeline_event(out: &mut String, event: &DispatchEvent, stage_duration_
     // Lower Decks spawn/claim failure is distinguishable from a Bridge Crew
     // one at a glance. Automation/review workers resolve a slot but no page.
     if let Some(worker_id) = &event.worker_id
-        && let Some(slot) = boss_engine::coordinator::slot_id_from_worker_id(worker_id)
+        && let Some(slot) = boss_execution_contracts::slot_id_from_worker_id(worker_id)
     {
-        let _ = match boss_engine::coordinator::worker_page_label(slot) {
+        let _ = match boss_execution_contracts::worker_page_label(slot) {
             Some(page) => writeln!(out, "    page:      {page} (slot {slot})"),
             None => writeln!(out, "    slot:      {slot}"),
         };

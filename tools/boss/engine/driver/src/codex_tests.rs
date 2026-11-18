@@ -1,6 +1,110 @@
 use super::*;
 
 #[test]
+fn progression_profile_is_read_only_with_the_engine_socket_and_github_hosts_only() {
+    let config: toml::Value = toml::from_str(&render_progression_config(
+        Path::new("/repo"),
+        Path::new("/tmp/frontend.sock"),
+    ))
+    .unwrap();
+    assert_eq!(config["default_permissions"].as_str(), Some("progression"));
+    assert_eq!(
+        config["permissions"]["progression"]["extends"].as_str(),
+        Some(":read-only")
+    );
+    assert!(config.get("sandbox_workspace_write").is_none());
+    assert_eq!(config["web_search"].as_str(), Some("disabled"));
+    let network = &config["permissions"]["progression"]["network"];
+    let sockets = network["unix_sockets"].as_table().unwrap();
+    assert_eq!(sockets.len(), 1);
+    assert_eq!(sockets["/tmp/frontend.sock"].as_str(), Some("allow"));
+    let mut domains: Vec<_> = network["domains"].as_table().unwrap().keys().cloned().collect();
+    domains.sort();
+    assert_eq!(domains, ["api.github.com", "github.com"]);
+    for (_, mode) in network["domains"].as_table().unwrap() {
+        assert_eq!(mode.as_str(), Some("allow"));
+    }
+    let proxy_domains = config["features"]["network_proxy"]["domains"].as_table().unwrap();
+    assert_eq!(proxy_domains.len(), 2);
+}
+
+/// The projects a rendered config trusts.
+fn trusted_projects(config: &str) -> Vec<String> {
+    let config: toml::Value = toml::from_str(config).unwrap();
+    let projects = config["projects"].as_table().unwrap();
+    for (project, entry) in projects {
+        assert_eq!(entry["trust_level"].as_str(), Some("trusted"), "{project}");
+    }
+    let notices = config["notice"]["external_config_migration_prompts"]["projects"]
+        .as_table()
+        .unwrap();
+    assert_eq!(
+        notices.keys().collect::<Vec<_>>(),
+        projects.keys().collect::<Vec<_>>(),
+        "the migration notice must be suppressed for exactly the trusted spellings"
+    );
+    projects.keys().cloned().collect()
+}
+
+/// Codex keys project trust by the directory it resolves for itself, which is
+/// the physical path. A progression run's scratch directory lives under the
+/// system temp directory, and on macOS that path crosses a symlink
+/// (`/var/folders` -> `/private/var/folders`), so a config trusting only the
+/// engine's spelling would leave Codex asking "Trust this folder?" instead of taking its brief.
+#[test]
+fn a_workspace_reached_through_a_symlink_is_trusted_under_its_physical_path_too() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let physical = root.join("real").join("ws");
+    fs::create_dir_all(&physical).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+    let logical = root.join("link").join("ws");
+
+    for config in [
+        render_base_config_toml(&logical),
+        render_progression_config(&logical, &root.join("frontend.sock")),
+        render_review_guide_config(&logical, &root.join("guide.sock")),
+    ] {
+        let trusted = trusted_projects(&config);
+        for spelling in [&logical, &physical] {
+            assert!(
+                trusted.contains(&spelling.display().to_string()),
+                "{} must be trusted: {trusted:?}",
+                spelling.display()
+            );
+        }
+    }
+
+    // A path with one spelling keeps its one entry, resolvable or not.
+    assert_eq!(
+        trusted_projects(&render_base_config_toml(Path::new("/no/such/workspace"))),
+        vec!["/no/such/workspace".to_owned()]
+    );
+}
+
+/// The folder-trust dialog's selected row starts with `›`, an agent marker, so
+/// the launcher must hold the brief while the dialog is on screen.
+#[test]
+fn the_launcher_holds_the_brief_while_the_folder_trust_dialog_is_on_screen() {
+    let config: serde_json::Value =
+        serde_json::from_str(&crate::initial_prompt::launcher_config(&CodexDriver::default()).unwrap()).unwrap();
+    let starting: Vec<&str> = config["starting_markers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|marker| marker.as_str().unwrap())
+        .collect();
+    assert!(starting.contains(&CODEX_FOLDER_TRUST_DIALOG_MARKER), "{starting:?}");
+    // Launcher-only: the pane monitor must not read a trust dialog as "starting".
+    assert!(
+        !pane_monitor::spec()
+            .starting_markers
+            .iter()
+            .any(|marker| marker == CODEX_FOLDER_TRUST_DIALOG_MARKER)
+    );
+}
+
+#[test]
 fn guide_sandbox_is_read_only_with_only_the_proposal_socket() {
     for enforced in [false, true] {
         assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::ReviewGuide, enforced), None);
@@ -124,12 +228,12 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "tools.write_stdin",
         "chars: \"\"",
         "text(JSON.stringify(r))",
-        "completion in the same JavaScript cell",
+        "poll it with `write_stdin` until the result carries\n`exit_code`.",
         "let r = await tools.exec_command",
         "session_id: r.session_id",
         "yield_time_ms: 300000",
-        "carries `exit_code`.",
-        "own foreground timeout",
+        "Do not wrap `bazel build`",
+        "at least two hours",
     ] {
         assert!(
             preamble.contains(required),
@@ -145,6 +249,10 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         "the worker must retain its session handle for polling: {preamble}"
     );
     assert!(
+        !preamble.contains("same JavaScript cell"),
+        "polling is correlated by shell session, so the rules must not demand a single cell: {preamble}"
+    );
+    assert!(
         preamble.contains("only that invocation's output and logs") && preamble.contains("global process-name matches"),
         "the worker must not attribute unrelated global processes to its command: {preamble}"
     );
@@ -152,6 +260,32 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         preamble.contains("without the real `exit_code`"),
         "the worker must not infer success from a missing exit status: {preamble}"
     );
+}
+
+#[test]
+fn agent_rules_point_a_deliberate_background_job_at_propose_wait_without_banning_it() {
+    let preamble = CodexDriver::default().agent_rules_preamble();
+    let flat = preamble.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "must be declared with `\"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
+             before you end the turn."
+        ),
+        "a deliberately backgrounded job must be pointed at `propose wait`: {preamble}"
+    );
+    let lower = flat.to_lowercase();
+    for banned in [
+        "do not background",
+        "never background",
+        "do not run a long build in the background",
+        "idle-poll",
+        "instead of polling forever",
+    ] {
+        assert!(
+            !lower.contains(banned),
+            "the Codex worker rules must not carry a blanket background prohibition ({banned:?}): {preamble}"
+        );
+    }
 }
 
 #[test]
@@ -367,7 +501,7 @@ fn pane_launch_spec_does_not_use_shell_exec() {
     let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-6-astra", "run-pane-a"));
     let trimmed = plan.command.trim_start();
     assert!(
-        trimmed.starts_with("codex "),
+        trimmed.starts_with("python3 -I .codex/initial-prompt.py codex "),
         "pane launch must type a plain `codex` command line, not shell-exec into it; got: {}",
         plan.command
     );
@@ -782,11 +916,32 @@ fn append_hooks_toml_emits_pre_tool_use_groups() {
     let guards = vec![MaterializedGuard {
         command_path: PathBuf::from("/tmp/guard.sh"),
         matcher: Some(".*"),
+        timeout_sec: None,
     }];
     let full = append_hooks_toml(&base, &guards);
     assert!(full.contains("[[hooks.PreToolUse]]"));
     assert!(full.contains("matcher = \".*\""));
     assert!(full.contains("command = \"/tmp/guard.sh\""));
+    assert!(
+        !full.contains("timeout ="),
+        "omitted timeout_sec must leave Codex's default in place: {full}"
+    );
+}
+
+#[test]
+fn append_hooks_toml_emits_explicit_timeout_when_set() {
+    let full = append_hooks_toml(
+        "",
+        &[MaterializedGuard {
+            command_path: PathBuf::from("/tmp/checkleft.sh"),
+            matcher: Some("Bash"),
+            timeout_sec: Some(7500),
+        }],
+    );
+    assert!(
+        full.contains("timeout = 7500"),
+        "checkleft hook must outlive a contended Bazel compile: {full}"
+    );
 }
 
 #[test]
@@ -807,6 +962,7 @@ fn materialize_guards_writes_executables() {
         data_dir: Some(tmp.path().to_path_buf()),
         path_guard_script: Some(path_guard),
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: false,
@@ -831,6 +987,7 @@ fn materialize_guards_adds_static_analysis_guard_for_reviewer() {
         data_dir: None,
         path_guard_script: None,
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: true,
@@ -855,6 +1012,8 @@ fn full_interception(tmp: &Path) -> (PathBuf, ToolUseInterceptionConfig) {
     fs::write(&path_guard, "print('ok')\n").unwrap();
     let checkleft = tmp.join("boss-checkleft-push-guard.py");
     fs::write(&checkleft, "print('ok')\n").unwrap();
+    let git_store = tmp.join(crate::git_store_guard::GIT_STORE_GUARD_SCRIPT_NAME);
+    fs::write(&git_store, crate::git_store_guard::GIT_STORE_GUARD_SCRIPT).unwrap();
     let home = tmp.join("home");
     fs::create_dir_all(&home).unwrap();
     (
@@ -863,6 +1022,7 @@ fn full_interception(tmp: &Path) -> (PathBuf, ToolUseInterceptionConfig) {
             data_dir: Some(tmp.to_path_buf()),
             path_guard_script: Some(path_guard),
             checkleft_guard_script: Some(checkleft),
+            git_store_guard_script: Some(git_store),
             is_revision: true,
             is_standard_worker: true,
             is_reviewer: false,
@@ -910,6 +1070,118 @@ fn every_guard_is_armed_through_the_trace_shim() {
     }
 }
 
+/// Run a materialised Codex guard wrapper end-to-end (shim hash check,
+/// guard, trace record) with a Codex-shaped `PreToolUse` payload.
+fn run_codex_wrapper(wrapper: &Path, command: &str, cwd: &Path) -> (String, String) {
+    use std::io::Write as _;
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "cwd": cwd.display().to_string(),
+        "tool_input": {"command": command},
+    });
+    let mut child = std::process::Command::new("sh")
+        .arg(wrapper)
+        .env_remove("GIT_DIR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh must be available");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if stdout.trim().is_empty() {
+        // The shim stays silent on approve (Codex treats an untranslated
+        // approve as a hook failure); silence with a clean exit is approval.
+        assert!(out.status.success(), "wrapper failed: {stderr}");
+        return ("approve".to_owned(), String::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    (
+        value["decision"].as_str().unwrap_or("approve").to_owned(),
+        value["reason"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+#[test]
+fn git_store_guard_is_armed_through_the_trace_shim_and_refuses_store_writes() {
+    // The incident this guard exists for, through the real Codex chain: the
+    // wrapper exports the workspace, the shim verifies and runs the shared
+    // script, and a shallow fetch at the shared store is refused while the
+    // read-only form the review guide relies on still passes.
+    let layout = crate::git_store_guard::tests::cube_layout();
+    let home = layout.dir.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let config = ToolUseInterceptionConfig {
+        data_dir: None,
+        path_guard_script: None,
+        checkleft_guard_script: None,
+        git_store_guard_script: Some(layout.script.clone()),
+        is_revision: false,
+        is_standard_worker: true,
+        is_reviewer: false,
+        is_review_guide: false,
+        run_id: Some("r".into()),
+        workspace_path: Some(layout.workspace.clone()),
+    };
+    let guards = materialize_guards(&home, &config).unwrap();
+    let guard = guards
+        .iter()
+        .find(|guard| guard.command_path.to_string_lossy().contains("git_store_guard"))
+        .expect("the shared-source-store guard must be materialised");
+    assert_eq!(guard.matcher, Some("Bash"));
+    let body = fs::read_to_string(&guard.command_path).unwrap();
+    assert!(
+        body.contains(&format!(
+            "export {}={}",
+            crate::git_store_guard::GIT_STORE_GUARD_WORKSPACE_ENV,
+            shell_quote(&layout.workspace.display().to_string())
+        )),
+        "wrapper must hand the script its workspace: {body}"
+    );
+    assert!(
+        body.contains(&layout.script.display().to_string()),
+        "wrapper must run the engine-materialised script, not a copy: {body}"
+    );
+
+    let store = layout.store.display().to_string();
+    for command in [
+        format!("GIT_DIR={store}/.git git fetch --depth=200 origin main"),
+        format!("cd {store} && git fetch --depth=200 origin main"),
+        format!("git -C {store} reset --hard origin/main"),
+    ]
+    .into_iter()
+    .chain(crate::git_store_guard::tests::bypass_commands(&layout))
+    {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, &command, &layout.workspace);
+        assert_eq!(decision, "block", "{command}: {reason}");
+        assert!(reason.contains("jj"), "{command}: {reason}");
+    }
+    for command in [
+        format!("git --git-dir {store}/.git show HEAD:README.md"),
+        format!("GIT_DIR={store}/.git git log -1"),
+        "jj git fetch".to_owned(),
+    ]
+    .into_iter()
+    .chain(crate::git_store_guard::tests::approved_commands(&layout))
+    {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, &command, &layout.workspace);
+        assert_eq!(decision, "approve", "{command}: {reason}");
+    }
+    let trace = fs::read_to_string(guard_trace_path(&home)).unwrap();
+    assert!(
+        trace.lines().filter(|line| line.contains("git_store_guard")).count() >= 6,
+        "every decision must land in the guard trace: {trace}"
+    );
+}
+
 #[test]
 fn codex_tool_surface_guard_is_always_armed_on_every_tool() {
     // It is the only guard that sees non-Bash tool names, which is what
@@ -938,6 +1210,14 @@ fn codex_tool_surface_guard_is_always_armed_on_every_tool() {
         Some(".*"),
         "it must see every tool name, not just Bash"
     );
+    for command in [
+        "bash # it's interactive",
+        "# Let's start a shell\nbash",
+        "echo 'unterminated\nbash",
+    ] {
+        let (decision, reason) = run_codex_wrapper(&surface.command_path, command, tmp.path());
+        assert_eq!(decision, "block", "{command}: {reason}");
+    }
 }
 
 #[test]
@@ -952,6 +1232,14 @@ fn reviewer_publish_guard_is_armed_only_for_reviewers() {
             .file_name()
             .is_some_and(|name| name.to_string_lossy().contains("reviewer_publish_guard"))
     });
+    for command in [
+        "git push # don't publish",
+        "# Let's publish\ngh pr review 1 --approve",
+        "echo 'unterminated\ngh pr review 1 --approve",
+    ] {
+        let (decision, reason) = run_codex_wrapper(&reviewer_guard.unwrap().command_path, command, tmp.path());
+        assert_eq!(decision, "block", "{command}: {reason}");
+    }
     assert_eq!(reviewer_guard.map(|guard| guard.matcher), Some(Some(".*")));
 
     let non_reviewer_home = tmp.path().join("non-reviewer");
@@ -963,6 +1251,42 @@ fn reviewer_publish_guard_is_armed_only_for_reviewers() {
             .file_name()
             .is_some_and(|name| name.to_string_lossy().contains("reviewer_publish_guard"))
     }));
+}
+
+#[test]
+fn progression_guard_is_armed_only_for_progression_and_blocks_mutating_commands() {
+    let tmp = TempDir::new().unwrap();
+    let (home, config) = full_interception(tmp.path());
+    let is_progression_guard = |guard: &MaterializedGuard| {
+        guard
+            .command_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("progression_guard"))
+    };
+    let guards = materialize_guards_for(&home, &config, true).unwrap();
+    let guard = guards
+        .iter()
+        .find(|guard| is_progression_guard(guard))
+        .expect("progression guard must be armed for a progression agent");
+    assert_eq!(guard.matcher, Some(".*"));
+    for command in [
+        "gh pr comment 1 --body hi",
+        "gh api -X POST repos/o/r/issues",
+        "jj git push",
+        "git commit -m x",
+        "\"$CUBE_BIN\" pr update --branch b",
+    ] {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, command, tmp.path());
+        assert_eq!(decision, "block", "{command}: {reason}");
+    }
+    for command in ["gh pr view 1 --json state", "\"$BOSS_BIN\" pr status --json"] {
+        let (decision, reason) = run_codex_wrapper(&guard.command_path, command, tmp.path());
+        assert_eq!(decision, "approve", "{command}: {reason}");
+    }
+
+    let other_home = tmp.path().join("other");
+    let guards = materialize_guards(&other_home, &config).unwrap();
+    assert!(!guards.iter().any(is_progression_guard));
 }
 
 #[test]
@@ -983,6 +1307,49 @@ fn path_guard_keeps_its_data_dir_env_through_the_wrapper() {
         .expect("path guard must be armed for a local worker");
     let body = fs::read_to_string(&path_guard.command_path).unwrap();
     assert!(body.contains("export BOSS_DATA_DIR="), "{body}");
+}
+
+#[test]
+fn checkleft_push_guard_gets_a_two_hour_hook_timeout() {
+    let tmp = TempDir::new().unwrap();
+    let (home, config) = full_interception(tmp.path());
+    let guards = materialize_guards(&home, &config).unwrap();
+    let checkleft = guards
+        .iter()
+        .find(|guard| {
+            guard
+                .command_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("checkleft_push_guard"))
+        })
+        .expect("standard worker must arm the checkleft push guard");
+    assert_eq!(
+        checkleft.timeout_sec,
+        Some(crate::CHECKLEFT_GUARD_CODEX_RUNNER_TIMEOUT_SECS),
+        "Codex must not cut the checkleft gate at the 600s hook default"
+    );
+    let body = fs::read_to_string(&checkleft.command_path).unwrap();
+    assert!(
+        body.contains(&format!(
+            "export BOSS_GUARD_TIMEOUT_SECONDS='{}'",
+            crate::CHECKLEFT_GUARD_HOOK_TIMEOUT_SECS
+        )),
+        "shim budget must cover the guard's probe + run budgets: {body}"
+    );
+    for guard in &guards {
+        if guard
+            .command_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("checkleft_push_guard"))
+        {
+            continue;
+        }
+        assert_eq!(
+            guard.timeout_sec, None,
+            "ordinary guards keep Codex's default timeout: {:?}",
+            guard.command_path
+        );
+    }
 }
 
 #[test]
@@ -1121,6 +1488,13 @@ fn standard_worker_sandbox_defaults_to_danger_full_access() {
         codex_sandbox_for_worker_kind(WorkerKind::AnswerAgent, false),
         Some("danger-full-access")
     );
+    // A progression agent holds no checkout and writes nothing: its read-only
+    // profile is selected in the rendered config (never the Standard posture,
+    // and no bare `--sandbox read-only` that would cut off the engine socket).
+    for enforced in [false, true] {
+        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Progression, enforced), None);
+        assert!(codex_sandbox_extra_args(WorkerKind::Progression, enforced).is_empty());
+    }
     // codex_sandbox_enforced=true restores the OS-enforced fence.
     assert_eq!(
         codex_sandbox_for_worker_kind(WorkerKind::Standard, true),
@@ -1220,6 +1594,18 @@ fn codex_buffers_mid_turn_pane_input() {
     let driver = CodexDriver::default();
     assert_eq!(driver.mid_turn_pane_input(), MidTurnPaneInput::Buffers);
     assert!(driver.mid_turn_pane_input().buffers());
+}
+
+/// Codex takes a Return that lands right behind typed text as a newline in a
+/// paste, so the engine must leave a gap before submitting. Drivers whose
+/// composer reads input in order keep the trait default of none.
+#[test]
+fn codex_declares_a_submit_settle_and_the_default_is_none() {
+    assert_eq!(
+        CodexDriver::default().pane_submit_settle(),
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(crate::ClaudeDriver.pane_submit_settle(), std::time::Duration::ZERO);
 }
 
 #[test]
@@ -1329,6 +1715,7 @@ fn guide_permission_materialization_requires_socket_and_writes_named_profile() {
         is_remote: false,
         path_guard_script: None,
         checkleft_guard_script: None,
+        git_store_guard_script: None,
         codex_sandbox_enforced: false,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1357,4 +1744,89 @@ fn guide_permission_materialization_requires_socket_and_writes_named_profile() {
         sockets[input.frontend_socket_path.unwrap().to_str().unwrap()].as_str(),
         Some("allow")
     );
+}
+
+fn run_progression_guard(payload: serde_json::Value) -> String {
+    use std::io::Write as _;
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("boss-codex-progression-guard-{}-{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("guard.py");
+    std::fs::write(&script, codex_progression_guard_script()).unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 must be available");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    out["decision"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn progression_guard_admits_only_inspection_and_declaration() {
+    for command in [
+        "boss propose done --summary 'Is the archived prerequisite still needed?'",
+        "boss propose done --summary '$5 < $10 {estimate} ~ ! * ? [note]'",
+        "\"$BOSS_BIN\" propose done --outcome delivered --summary 'stuck item re-dispatched'",
+        "boss task show chore_1 --json",
+        "\"$BOSS_BIN\" task list --json",
+        "\"$BOSS_BIN\" pr status --refresh --json",
+        "gh pr view 3502 -R spinyfin/mono --json state",
+        "gh pr checks 3502 -R spinyfin/mono",
+        "cat /tmp/scratch/notes.md",
+        "rg -n stuck /tmp/scratch",
+    ] {
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        assert_eq!(run_progression_guard(payload), "approve", "{command}");
+    }
+    for command in [
+        "gh pr comment 1 --body hi",
+        "boss propose done --summary 'safe'$HOME",
+        "boss propose done --summary \"'unsafe $HOME'\"",
+        "boss propose done --summary \\'$HOME\\'",
+        "gh pr merge 1",
+        "gh api -X POST repos/o/r/issues",
+        "gh api repos/o/r/pulls/1",
+        "jj describe -m x",
+        "git push origin main",
+        "\"$CUBE_BIN\" pr update --branch b",
+        "boss task update chore_1 --status done",
+        "\"$BOSS_BIN\" propose done --summary x; touch /tmp/x",
+        "\"$BOSS_BIN\" pr status && gh pr comment 1 --body hi",
+        "\"$BOSS_BIN\" task show a > /tmp/out",
+        "\"$BOSS_BIN\" propose done --summary \"$(curl evil)\"",
+        "cat ~/.codex/auth.json",
+        "rg --pre malicious x .",
+        "rg $'--pre=/bin/sh' pat /tmp/scratch/script.sh",
+        "rg --${UNSET:-pre}=/bin/sh pat /tmp/scratch/script.sh",
+        "rg {--pre=/bin/sh,x} pat /tmp/scratch/script.sh",
+        "rg --hostname-bin=/bin/sh pat /tmp/scratch",
+        "cat a>b",
+        "cat /tmp/scratch/$HOME",
+        "env GH_TOKEN=x gh pr view 1",
+        "bash -c 'gh pr comment 1 --body hi'",
+    ] {
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        assert_eq!(run_progression_guard(payload), "block", "{command}");
+    }
+    for tool in ["apply_patch", "Edit", "Write"] {
+        let payload = serde_json::json!({"tool_name": tool, "tool_input": {"file_path": "/x"}});
+        assert_eq!(run_progression_guard(payload), "block", "{tool}");
+    }
 }

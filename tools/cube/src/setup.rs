@@ -18,6 +18,41 @@ pub struct SetupConfig {
     pub version: u32,
     #[serde(default)]
     pub steps: Vec<SetupStep>,
+    /// How to give back the disk a free workspace of this repo is holding
+    /// (build output, caches kept outside the checkout). cube decides when and
+    /// whether a workspace may be cleaned; the repo decides what cleaning means.
+    #[serde(default)]
+    pub cleanup: Option<CleanupStep>,
+}
+
+/// Exit status a cleanup command uses to say "this workspace is in use right
+/// now, I did nothing" (`EX_TEMPFAIL`). cube treats it as a skip — not a
+/// failure — and tries a different workspace.
+pub const CLEANUP_BUSY_EXIT_CODE: i32 = 75;
+
+/// A repo's cleanup command, declared under `cleanup:` in
+/// `.cube/setup.yaml`.
+///
+/// Run through `sh -c` with cwd and `CUBE_WORKSPACE` set to the workspace
+/// being cleaned (and `CUBE_BASE_REPO` set when the repo has a canonical
+/// source), exactly like a setup step. Exit 0 means cleaned,
+/// [`CLEANUP_BUSY_EXIT_CODE`] means the workspace was busy and nothing was
+/// done, and any other exit is a failure that cube logs and retries. The
+/// command must be idempotent: a cleanup that was interrupted is re-run from
+/// the top.
+///
+/// The declaration and its .cube assets are exported from fetched trunk,
+/// independently of the source working copy, and a workspace on an older
+/// revision may not contain the files the command refers to. cube therefore
+/// exports `CUBE_CLEANUP_ROOT`, the snapshot the declaration came from, so a
+/// command can address its own assets as `"$CUBE_CLEANUP_ROOT/.cube/..."`
+/// without depending on its own branch.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CleanupStep {
+    pub command: String,
+    /// The root containing the cleanup declaration and assets, set by cube.
+    #[serde(skip)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -230,7 +265,25 @@ pub fn read_setup_config(workspace_path: &Path) -> Result<Option<SetupConfig>, C
             )));
         }
     }
+    if let Some(cleanup) = &config.cleanup
+        && cleanup.command.trim().is_empty()
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "cleanup step has an empty command in `{}`",
+            path.display()
+        )));
+    }
     Ok(Some(config))
+}
+
+/// The environment cube gives every repo-declared command it runs against a
+/// workspace (setup steps and the cleanup step alike).
+pub fn workspace_step_env(workspace_path: &Path, source: Option<&Path>) -> Vec<(String, String)> {
+    let mut env = vec![("CUBE_WORKSPACE".to_string(), workspace_path.display().to_string())];
+    if let Some(source) = source {
+        env.push(("CUBE_BASE_REPO".to_string(), source.display().to_string()));
+    }
+    env
 }
 
 pub fn compute_fingerprint(workspace_path: &Path, step: &SetupStep) -> Result<String, CubeError> {
@@ -280,13 +333,7 @@ pub fn run_setup_engine(
     now_epoch_s: i64,
 ) -> Result<SetupReport, CubeError> {
     let source_path = store.get_repo(&workspace.repo)?.and_then(|r| r.source);
-    let mut step_env = vec![(
-        "CUBE_WORKSPACE".to_string(),
-        workspace.workspace_path.display().to_string(),
-    )];
-    if let Some(ref source) = source_path {
-        step_env.push(("CUBE_BASE_REPO".to_string(), source.display().to_string()));
-    }
+    let step_env = workspace_step_env(&workspace.workspace_path, source_path.as_deref());
 
     let mut report = SetupReport::empty();
     for step in &config.steps {
@@ -441,6 +488,35 @@ steps:
                 },
             ]
         );
+    }
+
+    #[test]
+    fn cleanup_step_is_optional_and_parsed_when_declared() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(setup_config_path(temp.path()).parent().unwrap()).unwrap();
+        fs::write(setup_config_path(temp.path()), "version: 1\nsteps: []\n").unwrap();
+        assert!(read_setup_config(temp.path()).unwrap().unwrap().cleanup.is_none());
+
+        fs::write(
+            setup_config_path(temp.path()),
+            "version: 1\ncleanup:\n  command: sh .cube/clean.sh\n",
+        )
+        .unwrap();
+        let cleanup = read_setup_config(temp.path()).unwrap().unwrap().cleanup.unwrap();
+        assert_eq!(cleanup.command, "sh .cube/clean.sh");
+    }
+
+    #[test]
+    fn cleanup_step_rejects_an_empty_command() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(setup_config_path(temp.path()).parent().unwrap()).unwrap();
+        fs::write(
+            setup_config_path(temp.path()),
+            "version: 1\ncleanup:\n  command: '  '\n",
+        )
+        .unwrap();
+        let err = read_setup_config(temp.path()).unwrap_err();
+        assert!(err.to_string().contains("cleanup step has an empty command"));
     }
 
     #[test]
@@ -677,6 +753,7 @@ steps:
             last_holder: None,
             last_task: None,
             last_activity_at_epoch_s: None,
+            lease_generation: 0,
         }
     }
 
