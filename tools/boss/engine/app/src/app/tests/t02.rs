@@ -886,8 +886,10 @@ async fn retained_remote_worker_release(completed: bool) {
                 server_state.cube_client.as_ref(),
                 server_state.dispatch_events.as_ref(),
                 &server_state.teardown_registry,
-                &mut seen,
-                confirm_delay,
+                boss_engine_runtime::terminal_work_sweep::Confirmation {
+                    seen: &mut seen,
+                    min_delay: confirm_delay,
+                },
             )
             .await;
             assert_eq!(outcome.pending_confirmation, usize::from(pass == 0));

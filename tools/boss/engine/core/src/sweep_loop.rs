@@ -252,26 +252,9 @@ where
     }
 }
 
-/// Spawn a tokio task that runs `pass_fn` forever at `interval`, exactly
-/// like [`spawn_sweep_loop`], but ALSO subscribes to an event bus
-/// [`boss_event_bus::Subscription`] filtered to [`Event::ExecutionTerminal`]:
-/// receiving one runs an out-of-cycle pass right away (subject to
-/// `quiesce`) instead of waiting out the rest of `interval`, so a burst of
-/// terminations can't turn into a hot loop of full passes. The periodic
-/// tick remains the backstop regardless: a dropped or coalesced event never
-/// leaves a pass unrun for longer than `interval`.
-///
-/// `log_prefix` names the sweep in the `tracing::debug!`/`warn!` lines this
-/// helper emits for the event-wait bookkeeping (e.g. `"pool-claim sweep"`);
-/// per-pass activity logging is still the caller's `pass_fn` / `SweepOutcome`
-/// responsibility, as in [`spawn_sweep_loop`].
-///
-/// This helper only decides WHEN to run `pass_fn` — it has no opinion on
-/// what a candidate confirmation guard `pass_fn` uses internally means for
-/// event-triggered passes. A guard that is a wall-clock delay (see
-/// [`confirm_after_delay`]) is unaffected by extra passes running closer
-/// together; a guard that is merely a pass count is not, and should not be
-/// combined with this helper without accounting for that.
+/// Run targeted terminal reconciles with retained retry deadlines, alongside
+/// independent full backstop passes. The callback returns any safety delay.
+#[track_caller]
 pub(crate) fn spawn_sweep_loop_with_events<O, Fut, F>(
     interval: Duration,
     quiesce: Duration,
@@ -281,55 +264,46 @@ pub(crate) fn spawn_sweep_loop_with_events<O, Fut, F>(
 ) -> tokio::task::JoinHandle<()>
 where
     O: SweepOutcome + Send,
-    Fut: Future<Output = O> + Send,
-    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = (O, Option<Duration>)> + Send,
+    F: FnMut(Option<String>) -> Fut + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::work::db_diagnostics::spawn(async move {
         let mut events_closed = false;
+        let mut pending = std::collections::HashMap::<String, tokio::time::Instant>::new();
+        let mut full_deadline = tokio::time::Instant::now();
         loop {
-            let outcome = pass_fn().await;
-            if outcome.has_activity() {
-                outcome.log();
-            }
-
-            let last_run_at = tokio::time::Instant::now();
-            'wait: loop {
-                let remaining = interval.saturating_sub(last_run_at.elapsed());
-                tokio::select! {
-                    _ = tokio::time::sleep(remaining) => break 'wait,
-                    event = subscription.recv(), if !events_closed => {
-                        match event {
-                            Some(Event::ExecutionTerminal { execution_id, .. }) => {
-                                let since_last = last_run_at.elapsed();
-                                if since_last >= quiesce {
-                                    tracing::debug!(
-                                        execution_id,
-                                        since_last_ms = since_last.as_millis(),
-                                        "{log_prefix}: ExecutionTerminal received, running an immediate pass",
-                                    );
-                                    break 'wait;
-                                }
-                                tracing::debug!(
-                                    execution_id,
-                                    since_last_ms = since_last.as_millis(),
-                                    quiesce_ms = quiesce.as_millis(),
-                                    "{log_prefix}: ExecutionTerminal within quiesce window, absorbing",
-                                );
-                            }
-                            Some(_) => {
-                                tracing::warn!(
-                                    "{log_prefix}: subscription received an unexpected event kind \
-                                     (the subscribing filter should have excluded it)",
-                                );
-                            }
-                            None => {
-                                events_closed = true;
-                                tracing::warn!(
-                                    "{log_prefix}: event subscription closed (event bus dropped) — \
-                                     the periodic sweep remains the backstop",
-                                );
-                            }
+            let deadline = pending
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(full_deadline)
+                .min(full_deadline);
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= full_deadline {
+                        let (outcome, _) = pass_fn(None).await;
+                        if outcome.has_activity() { outcome.log(); }
+                        full_deadline = tokio::time::Instant::now() + interval;
+                    }
+                    let ready: Vec<_> = pending.iter().filter(|(_, due)| **due <= now)
+                        .map(|(id, _)| id.clone()).collect();
+                    for id in ready {
+                        pending.remove(&id);
+                        let (outcome, retry) = pass_fn(Some(id.clone())).await;
+                        if outcome.has_activity() { outcome.log(); }
+                        if let Some(delay) = retry {
+                            pending.insert(id, tokio::time::Instant::now() + if delay.is_zero() { quiesce } else { delay });
                         }
+                    }
+                }
+                event = subscription.recv(), if !events_closed => {
+                    match event {
+                        Some(Event::ExecutionTerminal { execution_id, .. }) => {
+                            pending.entry(execution_id).or_insert_with(tokio::time::Instant::now);
+                        }
+                        Some(_) => tracing::warn!("{log_prefix}: unexpected event kind"),
+                        None => events_closed = true,
                     }
                 }
             }
@@ -632,14 +606,17 @@ mod tests {
 
         let passes_c = passes.clone();
         let log_c = log_calls.clone();
-        let handle = spawn_sweep_loop_with_events(interval, quiesce, subscription, "test sweep", move || {
+        let handle = spawn_sweep_loop_with_events(interval, quiesce, subscription, "test sweep", move |_| {
             passes_c.fetch_add(1, Ordering::SeqCst);
             let log_c = log_c.clone();
             async move {
-                FakeOutcome {
-                    has_activity: false,
-                    log_calls: log_c,
-                }
+                (
+                    FakeOutcome {
+                        has_activity: false,
+                        log_calls: log_c,
+                    },
+                    None,
+                )
             }
         });
 
@@ -661,59 +638,95 @@ mod tests {
         handle.abort();
     }
 
-    // An ExecutionTerminal event arriving WITHIN the quiesce window is
-    // absorbed — it must not trigger an extra pass; the periodic tick is
-    // still what eventually fires the next pass.
     #[tokio::test(start_paused = true)]
-    async fn event_within_quiesce_is_absorbed() {
-        let interval = Duration::from_secs(60);
-        let quiesce = Duration::from_secs(5);
-        let passes = Arc::new(AtomicUsize::new(0));
-        let log_calls = Arc::new(AtomicUsize::new(0));
-
+    async fn distinct_events_are_retained_and_retries_preserve_backstop() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let bus = boss_event_bus::EventBus::new();
-        let subscription = bus.subscribe(boss_event_bus::TopicFilter::kind(
+        let sub = bus.subscribe(boss_event_bus::TopicFilter::kind(
             boss_event_bus::EventKind::ExecutionTerminal,
         ));
-
-        let passes_c = passes.clone();
-        let log_c = log_calls.clone();
-        let handle = spawn_sweep_loop_with_events(interval, quiesce, subscription, "test sweep", move || {
-            passes_c.fetch_add(1, Ordering::SeqCst);
-            let log_c = log_c.clone();
-            async move {
-                FakeOutcome {
-                    has_activity: false,
-                    log_calls: log_c,
+        let observed = calls.clone();
+        let handle = spawn_sweep_loop_with_events(
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            sub,
+            "test",
+            move |id| {
+                observed.lock().unwrap().push(id.clone());
+                async move {
+                    (
+                        FakeOutcome {
+                            has_activity: false,
+                            log_calls: Arc::default(),
+                        },
+                        id.map(|_| Duration::from_secs(10)),
+                    )
                 }
-            }
-        });
-
-        // Boot pass.
-        settle().await;
-        assert_eq!(passes.load(Ordering::SeqCst), 1, "boot pass");
-
-        // Publish immediately (well inside the quiesce window) — must be
-        // absorbed, not trigger a pass.
-        bus.publish(terminal_event("exec-1"));
-        settle().await;
-        assert_eq!(
-            passes.load(Ordering::SeqCst),
-            1,
-            "an event inside the quiesce window must be absorbed, not trigger a pass",
+            },
         );
-
-        // The periodic tick is unaffected by the absorbed event and still
-        // fires exactly once per `interval`.
-        tokio::time::advance(interval).await;
         settle().await;
-        assert_eq!(
-            passes.load(Ordering::SeqCst),
-            2,
-            "the periodic tick still fires on schedule"
-        );
-
+        bus.publish(terminal_event("first"));
+        bus.publish(terminal_event("second"));
+        settle().await;
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(calls.lock().unwrap().len(), 5);
+        tokio::time::advance(Duration::from_secs(50)).await;
+        settle().await;
+        assert_eq!(calls.lock().unwrap().iter().filter(|id| id.is_none()).count(), 2);
+        for id in ["first", "second"] {
+            assert_eq!(
+                calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| call.as_deref() == Some(id))
+                    .count(),
+                3
+            );
+        }
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn event_sweep_is_cancelled_and_drained_by_engine_scope() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        boss_task_scope::run(async {
+            let bus = boss_event_bus::EventBus::new();
+            let sub = bus.subscribe(boss_event_bus::TopicFilter::kind(
+                boss_event_bus::EventKind::ExecutionTerminal,
+            ));
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let mut started = Some(started);
+            let marker = dropped.clone();
+            let handle = spawn_sweep_loop_with_events(
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+                sub,
+                "test",
+                move |_| {
+                    let guard = Dropped(marker.clone());
+                    let started = started.take().unwrap();
+                    async move {
+                        let _guard = guard;
+                        started.send(()).unwrap();
+                        std::future::pending::<(FakeOutcome, Option<Duration>)>().await
+                    }
+                },
+            );
+            ready.await.unwrap();
+            boss_task_scope::shutdown().await;
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(handle.await.unwrap_err().is_cancelled());
+        })
+        .await;
     }
 
     // Once the event bus (and so the subscription's mailbox) is dropped, the
@@ -735,14 +748,17 @@ mod tests {
 
         let passes_c = passes.clone();
         let log_c = log_calls.clone();
-        let handle = spawn_sweep_loop_with_events(interval, quiesce, subscription, "test sweep", move || {
+        let handle = spawn_sweep_loop_with_events(interval, quiesce, subscription, "test sweep", move |_| {
             passes_c.fetch_add(1, Ordering::SeqCst);
             let log_c = log_c.clone();
             async move {
-                FakeOutcome {
-                    has_activity: false,
-                    log_calls: log_c,
-                }
+                (
+                    FakeOutcome {
+                        has_activity: false,
+                        log_calls: log_c,
+                    },
+                    None,
+                )
             }
         });
 

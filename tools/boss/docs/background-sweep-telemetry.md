@@ -23,7 +23,7 @@ metrics registry (`bossctl metrics list --prefix <sweep>`; values flush to
 | Sweep prefix          | What a pass is                                                                   | What `items_per_pass` counts                                                       |
 | --------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `envelope_watch`      | one 60 s envelope-watchdog sweep                                                 | live worker slots evaluated                                                        |
-| `terminal_work_sweep` | the candidate-gathering phase of one 60 s terminal-work pass                     | live worker slots inspected                                                        |
+| `terminal_work_sweep` | candidate gathering for a targeted event/retry or 60 s full backstop pass        | live worker slots inspected                                                        |
 | `dead_pane_terminal`  | the terminal execution scan plus the process probes of one pane-death sweep pass | recent terminal execution rows probed                                              |
 | `agent_jsonl_stream`  | one 50 ms tail poll iteration of any live JSONL stream                           | sessions-root revalidations (`lstat` + `canonicalize`) performed in that iteration |
 
@@ -31,6 +31,8 @@ Only the singleton envelope and terminal-work sweeps publish tick intervals.
 `dead_pane_terminal` has no `tick_interval_ms`. Concurrent tails and bookmark
 operations have no shared cadence. Root revalidation counts are isolated per
 tail, excluding discovery and other tails.
+
+Terminal-work passes also run for execution-terminal events and safety-delay retries. Short gaps can reflect these targeted passes rather than a hot loop; a long gap alone does not prove healthy reconciliation. The 60 s full sweep remains a backstop.
 
 One extra counter:
 
