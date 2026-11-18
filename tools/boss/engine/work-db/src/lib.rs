@@ -10,15 +10,6 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::event_publish::{PendingEvents, commit_and_publish};
 
-/// How long sqlite will internally retry on `SQLITE_BUSY` before
-/// surfacing the error to the caller. We funnel concurrent CLI writes
-/// against the same `state.db` (multiple `boss chore bind-pr` etc.
-/// landing in the engine in parallel) — without this the second writer
-/// would fail with "database is locked" even though the first writer
-/// finishes in microseconds. Five seconds is overkill for the in-engine
-/// case (writes are tiny) but cheap when uncontended.
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// SQL fragment for the set of task kinds that behave like chores: they own
 /// their own PR and follow the active → in_review → done lifecycle. Used in
 /// every `kind IN (...)` filter that drives the merge-poller and blocking
@@ -781,6 +772,11 @@ pub struct WorkDb {
     /// or an alternate generator at the open boundary.
     #[builder(default = default_token_generator())]
     token_generator: Arc<dyn Fn() -> String + Send + Sync>,
+    /// SQLite lock-contention registry for this database, shared by every
+    /// clone and by the per-query connections `query_connection` hands out,
+    /// so the engine health report sees every wait on it. See `contention`.
+    #[builder(default)]
+    contention_health: Arc<contention::Health>,
 }
 
 impl Clone for WorkDb {
@@ -796,6 +792,7 @@ impl Clone for WorkDb {
             event_bus: Arc::clone(&self.event_bus),
             persona_metrics: Arc::clone(&self.persona_metrics),
             token_generator: Arc::clone(&self.token_generator),
+            contention_health: Arc::clone(&self.contention_health),
         }
     }
 }
@@ -818,6 +815,11 @@ impl WorkDb {
     /// than threading a second `Arc<Registry>` through every spawn signature.
     pub fn metrics_registry(&self) -> &boss_metrics::Registry {
         &self.persona_metrics
+    }
+
+    /// This database's SQLite lock-contention registry.
+    pub fn contention_health(&self) -> &Arc<contention::Health> {
+        &self.contention_health
     }
 }
 
@@ -920,6 +922,7 @@ mod wait_diagnostics;
 pub mod work_dependencies;
 pub use feedback_target::FeedbackTarget;
 mod connection_wait;
+pub mod contention;
 pub mod db_diagnostics;
 mod description_guard;
 mod guide_comments;

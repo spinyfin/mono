@@ -112,7 +112,10 @@ mod db_helpers {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.db");
         super::db_template::copy_to(&path);
-        let db = WorkDb::open_existing(path).unwrap();
+        // The fixture stands in for the engine's own database, so it attaches
+        // the way the engine does: lock contention is absorbed. `open_existing`
+        // is the CLI's attach, which gives up after a bounded wait.
+        let db = WorkDb::attach_existing(path, Default::default(), crate::contention::LockWait::Absorb).unwrap();
         (dir, db)
     }
 
