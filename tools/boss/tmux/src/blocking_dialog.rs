@@ -85,7 +85,9 @@ fn normalize_dialog_line(line: &str) -> &str {
         .trim_start_matches(BOX_GLYPHS)
         .trim_end_matches(BOX_GLYPHS)
         .trim()
-        .trim_start_matches('❯')
+        // `❯` marks the selected choice in Claude's and Codex's menus, `>` in
+        // Antigravity's.
+        .trim_start_matches(['❯', '>'])
         .trim()
 }
 

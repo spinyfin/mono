@@ -3,14 +3,16 @@
 //! Descriptor, capability set, Gemini-family model menu, per-run `HOME`
 //! provisioning, per-kind permission rendering (`--settings`), PreToolUse
 //! authorization, hook progress observation (conversation-id filtering for
-//! undisableable subagents), and transcript access: the per-run `brain/` tree
+//! undisableable subagents), transcript access: the per-run `brain/` tree
 //! is linked into Boss's durable per-execution transcript store, the
 //! `transcriptPath` the claimed parent stamps is resolved onto it, and the
-//! native `transcript_full.jsonl` dialect is normalised. Interactive TUI spawn
-//! stays disabled (`launch_ready` false) until pane launch calls
-//! `verify_startup_authorization` and qualifies CLI hook discovery and
-//! review-mode failure behavior. Retention preserves transcript evidence
-//! in the per-run HOME.
+//! native `transcript_full.jsonl` dialect is normalised, and the interactive
+//! pane command (`pane_command`) with its `PaneMonitorSpec`. The pane runs
+//! the shared initial-brief launcher, which withholds the brief until the
+//! CLI's startup log shows the rendered posture and the guard hooks loaded.
+//! `launch_ready` stays false until the control verbs (interrupt, probe,
+//! reap) land; the pane command itself is live for explicit pins. Retention
+//! preserves transcript evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -37,6 +39,7 @@ mod environment;
 mod home;
 mod hooks;
 mod model_menu;
+mod pane_command;
 mod pending_tools;
 pub mod permissions;
 mod progress;
@@ -84,7 +87,7 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     // Workspace-local leaf used only as the descriptor's config-dir name.
     // Per-run `agy` state lives under the Boss-owned process HOME; the
     // initial-prompt launcher lives in that run's `control/` directory.
-    // Agent rules go to `<run container>/rules-root/.agents/rules/boss.md`, a rules-only
+    // Agent rules go to `<run container>/rules-root/AGENTS.md`, a rules-only
     // directory passed to agy with --add-dir.
     config_dir: ".agy",
     agent_rules_filename: "AGENTS.md",
@@ -110,12 +113,10 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 ///
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning, permission
-/// rendering, PreToolUse authorization, hook progress observation, and
-/// transcript access are live; interactive TUI spawn stays disabled
-/// (`launch_ready` false) until pane launch calls
-/// `verify_startup_authorization` and qualifies CLI hook discovery and
-/// review-mode failure behavior. Retention preserves per-run
-/// transcript evidence.
+/// rendering, PreToolUse authorization, hook progress observation, transcript
+/// access, and the interactive pane command are live. `launch_ready` stays
+/// false until the control verbs land, so unpinned traffic never reaches this
+/// driver. Retention preserves per-run transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -157,10 +158,8 @@ impl AgentDriver for AgyDriver {
         // ToolUseInterception is rewrite-or-deny: PreToolUse rewrites
         // arguments through `overwrite` on both measured binaries (hook
         // surface study, "PreToolUse can rewrite arguments"). Authorization
-        // is installed by `write_permission_config`; TUI spawn stays disabled
-        // (`launch_ready` false) until pane launch calls
-        // `verify_startup_authorization` and qualifies CLI hook discovery
-        // and review-mode failure behavior.
+        // is installed by `write_permission_config`, which proves the
+        // installed chain with `verify_startup_authorization` before returning.
         CapabilitySet::new([
             Capability::Spawn,
             Capability::WorkspaceProvisioning,
@@ -194,12 +193,13 @@ impl AgentDriver for AgyDriver {
     }
 
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
-        // Measured in `docs/investigations/ghostty-agy-pane-viability.md`
-        // ("Proposed PaneMonitorSpec"). Needed here so provision can write
-        // the initial-prompt launcher config; TUI spawn stays disabled
-        // (`launch_ready` false) until pane launch calls
-        // `verify_startup_authorization` and qualifies CLI hook discovery
-        // and review-mode failure behavior.
+        // Measured on `agy` 1.5.5 in
+        // `docs/investigations/ghostty-agy-pane-viability.md` ("Proposed
+        // PaneMonitorSpec"); the status pill reads these before the first
+        // hook event arrives, and the launcher reads them to decide when the
+        // composer is ready for the brief. `Antigravity CLI` is deliberately
+        // not an agent marker: it is on the sign-in, onboarding and trust
+        // screens, and the banner scrolls away.
         Some(PaneMonitorSpec {
             agent_markers: vec![
                 "? for shortcuts".into(),
@@ -214,7 +214,20 @@ impl AgentDriver for AgyDriver {
             starting_markers: vec!["Signing in...".into()],
             prompt_prefixes: vec![">".into()],
             idle_debounce_polls: 2,
-            blocking_dialog_markers: vec![],
+            // Screens that answer to input. Text delivered while one is up
+            // answers it: a pasted message plus Return approved a pending
+            // command, and typed text starting with `3` saved a global
+            // always-allow rule (permission study, section 8). The first four
+            // are the approval dialogs, the last two are blocking startup
+            // screens.
+            blocking_dialog_markers: vec![
+                "Run this command?".into(),
+                "Allow creation of this file?".into(),
+                "Accept this file edit?".into(),
+                "Allow access to this file?".into(),
+                "Do you trust the contents of this project?".into(),
+                "Settings Error".into(),
+            ],
         })
     }
 
@@ -227,6 +240,10 @@ impl AgentDriver for AgyDriver {
             "Do you trust the contents of this project?".into(),
             "You are currently not signed in".into(),
             "Select login method:".into(),
+            // A settings file the CLI rejects stops here and waits. Listing it
+            // keeps the brief held, so the launcher fails the run instead of
+            // pasting into a screen that would read it as a menu answer.
+            "Settings Error".into(),
         ]
     }
 
@@ -298,11 +315,44 @@ impl AgentDriver for AgyDriver {
             );
         }
 
-        // HOME is isolated; spawn stays refused until guard hooks land.
+        // The guard chain must be on disk with the bytes that were attested
+        // when it was installed, immediately before the CLI starts.
+        if let Err(error) = verify_attestation(&process_home) {
+            return refuse_agy_plan(
+                env,
+                &format!("agy spawn refused: authorization chain is not installed or has changed: {error:#}"),
+            );
+        }
+        let control_dir = control_dir_for_run(run_id).unwrap_or_else(|_| process_home.join("../control"));
+        // The launcher, its configuration and the brief are written at
+        // provisioning, and the settings-log check at permission rendering.
+        // A missing one would otherwise surface as a launcher crash on a
+        // pane nobody is watching.
+        for required in [
+            "initial-prompt.py",
+            "initial-prompt.json",
+            "initial-prompt.txt",
+            "settings-log-check.json",
+            "session-settings.json",
+        ] {
+            if !control_dir.join(required).is_file() {
+                return refuse_agy_plan(
+                    env,
+                    &format!(
+                        "agy spawn refused: {} is missing from the run control directory",
+                        control_dir.join(required).display()
+                    ),
+                );
+            }
+        }
+
         // A home whose `brain/` is the durable-store link is freely
         // reclaimable; only a legacy home holding a real `brain/` or
         // `conversations/` is retained as the sole copy of its transcript.
-        refuse_agy_plan(env, "agy driver is not spawnable yet (guard hooks are not wired)")
+        SpawnPlan {
+            env,
+            command: pane_command::build_agy_pane_command(&environment, &control_dir, request.model, request.effort),
+        }
     }
 
     async fn provision_workspace(
@@ -340,7 +390,8 @@ impl AgentDriver for AgyDriver {
     /// PreToolUse authorization and forwarder wiring into the per-run home's
     /// global-root `hooks.json`, overwriting the provisioned no-op canary.
     /// Settings are rendered first because the authorization attestation hashes
-    /// them. `dest_dir` is unused: the artifacts live in the driver's own
+    /// them. The installed chain is then verified, and a chain that cannot be
+    /// verified fails the call. `dest_dir` is unused: the artifacts live in the driver's own
     /// per-run container, outside the checkout and outside any engine settings
     /// directory, so the retention sweep reclaims them with the run. The
     /// control directory is deliberately not added to `trustedWorkspaces`.
@@ -387,6 +438,22 @@ impl AgentDriver for AgyDriver {
                 artifacts.config_files.push(file);
             }
         }
+        // Prove the installed chain before any brief can be sent: the host
+        // side of the guards, exercised end to end, with no reliance on a
+        // native `SessionStart` (which only fires with the first prompt).
+        // The CLI side (hooks discovered, settings initialized) is proven by
+        // the launcher against the CLI's own startup log before it pastes.
+        // A failure here fails the run loudly instead of launching unguarded.
+        let verified_input = input.clone();
+        tokio::task::spawn_blocking(move || verify_startup_authorization(&verified_input))
+            .await
+            .context("agy startup authorization verification task did not complete")?
+            .with_context(|| {
+                format!(
+                    "AgyDriver::write_permission_config: startup authorization is not verifiable for run_id {:?}",
+                    input.run_id
+                )
+            })?;
         Ok(artifacts)
     }
 
@@ -458,14 +525,11 @@ impl AgentDriver for AgyDriver {
         AGY_AGENT_RULES_PREAMBLE
     }
 
-    /// Route Boss worker rules to `<rules-root>/.agents/rules/boss.md` under the
-    /// per-run container, added to the CLI workspace with `--add-dir`.
+    /// Route Boss worker rules to `<rules-root>/AGENTS.md` under the per-run
+    /// container, added to the CLI workspace with `--add-dir`.
     fn agent_rules_destination(&self, _workspace: &Path, run_id: &str) -> PathBuf {
-        agent_rules_path_for_run(run_id).unwrap_or_else(|_| {
-            agy_homes_root()
-                .join("unknown-run")
-                .join("rules-root/.agents/rules/boss.md")
-        })
+        agent_rules_path_for_run(run_id)
+            .unwrap_or_else(|_| agy_homes_root().join("unknown-run").join("rules-root/AGENTS.md"))
     }
 
     /// The transcript of the **claimed parent** conversation, from the payload
@@ -836,7 +900,7 @@ mod tests {
                 .stderr,
         )
         .unwrap();
-        assert!(stderr.contains("guard hooks are not wired"), "{stderr}");
+        assert!(stderr.contains("authorization chain is not installed"), "{stderr}");
         let fallback = runtime.process_home.join(".gemini/antigravity-cli/fallback-token.json");
         fs::write(&fallback, "private token").unwrap();
         let transcript = runtime
@@ -903,7 +967,7 @@ mod tests {
         fs::set_permissions(owned.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
         let qualified = AgyDriver::default().spawn_invocation(spawn_request("model", None, Some("run-old")));
         assert!(
-            qualified.command.contains("guard hooks are not wired"),
+            qualified.command.contains("authorization chain is not installed"),
             "{}",
             qualified.command
         );
@@ -921,7 +985,7 @@ mod tests {
         let _guard = env_for_provision(tmp.path());
         let workspace = tmp.path().join("ws");
         let dest = AgyDriver::default().agent_rules_destination(&workspace, "run-agents-1");
-        assert!(dest.ends_with("rules-root/.agents/rules/boss.md"), "dest={dest:?}");
+        assert!(dest.ends_with("rules-root/AGENTS.md"), "dest={dest:?}");
         assert!(
             !dest.components().any(|c| c.as_os_str() == ".agy"),
             "must not write under workspace .agy: {dest:?}"
@@ -1374,5 +1438,179 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Provision, arm and return the artifacts the spawn flow merges into the command.
+    async fn armed_run(tmp: &TempDir, run_id: &str) -> PermissionArtifacts {
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let driver = AgyDriver::default();
+        driver
+            .provision_workspace(&workspace, "the brief", run_id)
+            .await
+            .unwrap();
+        let input = permission_input(tmp, run_id, workspace);
+        driver.write_permission_config(&input, tmp.path()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn armed_run_spawns_the_launcher_with_settings_scoped_home_and_no_prompt_in_argv() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = env_for_provision(&homes);
+        let run_id = "run-agy-spawn-1";
+        let artifacts = armed_run(&tmp, run_id).await;
+
+        let plan = AgyDriver::default().spawn_invocation(spawn_request(
+            "gemini-4-hydrogen-xhigh",
+            Some("xhigh"),
+            Some(run_id),
+        ));
+        let command = crate::apply_permission_extra_args(&plan.command, &artifacts.extra_args);
+
+        let control = control_dir_for_run(run_id).unwrap();
+        assert!(
+            command.starts_with(&format!("python3 -I '{}'/initial-prompt.py ", control.display())),
+            "{command}"
+        );
+        assert!(
+            command.contains("--model 'gemini-4-hydrogen-xhigh' --effort 'xhigh'"),
+            "{command}"
+        );
+        let settings = session_settings_path_for_run(run_id).unwrap();
+        assert!(
+            command.contains(&format!("'--settings' '{}'", settings.display())),
+            "--settings must come from the rendered permission artifacts: {command}"
+        );
+        assert!(
+            command.contains(&format!(
+                "'--add-dir' '{}'",
+                control.parent().unwrap().join("rules-root").display()
+            )),
+            "{command}"
+        );
+        assert!(command.contains("'--log-file'"), "{command}");
+        assert!(!command.contains("the brief"), "brief must never reach argv: {command}");
+        assert!(!command.contains(" -i "), "{command}");
+        assert_eq!(command.matches('\n').count(), 1, "one command line: {command:?}");
+
+        let process_home = process_home_for_run(run_id).unwrap();
+        for (key, value) in [
+            ("HOME", process_home.display().to_string()),
+            ("AGY_CLI_DISABLE_AUTO_UPDATE", "true".to_owned()),
+            ("AGY_CLI_HIDE_ACCOUNT_INFO", "true".to_owned()),
+        ] {
+            assert!(
+                plan.env
+                    .iter()
+                    .any(|d| matches!(d, EnvDirective::Set(k, v) if k == key && v == &value)),
+                "{key}: {:?}",
+                plan.env
+            );
+        }
+        // The brief the launcher will paste lives in the control directory, outside every checkout.
+        assert_eq!(
+            fs::read_to_string(control.join("initial-prompt.txt")).unwrap(),
+            "the brief"
+        );
+        // The launcher is told the status markers and the dialogs to refuse.
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(control.join("initial-prompt.json")).unwrap()).unwrap();
+        assert!(
+            config["blocking_dialog_markers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m == "Run this command?")
+        );
+        assert!(
+            config["starting_markers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m == "Settings Error")
+        );
+        assert_eq!(config["paste_landed_markers"], serde_json::json!([]));
+        assert_eq!(config["check_settings_log"], true);
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_when_the_authorization_chain_changed_after_installation() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = env_for_provision(&homes);
+        let run_id = "run-agy-spawn-tamper";
+        armed_run(&tmp, run_id).await;
+        let hooks = hooks_file_path(&process_home_for_run(run_id).unwrap());
+        fs::write(&hooks, "{}").unwrap();
+
+        let plan = AgyDriver::default().spawn_invocation(spawn_request("gemini-4-carbon-high", None, Some(run_id)));
+        assert!(plan.command.starts_with("printf"), "{}", plan.command);
+        assert!(
+            plan.command
+                .contains("authorization chain is not installed or has changed"),
+            "{}",
+            plan.command
+        );
+        assert!(!plan.command.contains("initial-prompt.py"), "{}", plan.command);
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_when_the_settings_log_check_was_never_written() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = env_for_provision(&homes);
+        let run_id = "run-agy-spawn-no-check";
+        armed_run(&tmp, run_id).await;
+        fs::remove_file(control_dir_for_run(run_id).unwrap().join("settings-log-check.json")).unwrap();
+
+        let plan = AgyDriver::default().spawn_invocation(spawn_request("gemini-4-carbon-high", None, Some(run_id)));
+        assert!(
+            plan.command.contains("settings-log-check.json is missing"),
+            "{}",
+            plan.command
+        );
+        assert!(!plan.command.contains("initial-prompt.py"), "{}", plan.command);
+    }
+
+    #[test]
+    fn pane_monitor_spec_carries_the_measured_markers() {
+        let spec = AgyDriver::default().pane_monitor_spec().unwrap();
+        assert_eq!(
+            spec.agent_markers,
+            ["? for shortcuts", "esc to cancel", "Press up to edit queued messages"]
+        );
+        assert_eq!(
+            spec.busy_markers,
+            ["esc to cancel", "Press up to edit queued messages", "task(s) · /tasks"]
+        );
+        assert_eq!(spec.starting_markers, ["Signing in..."]);
+        assert_eq!(spec.prompt_prefixes, [">"]);
+        assert_eq!(spec.idle_debounce_polls, 2);
+        assert!(
+            !spec.agent_markers.iter().any(|m| m == "Antigravity CLI"),
+            "the banner appears on onboarding screens and scrolls away"
+        );
+        for dialog in [
+            "Run this command?",
+            "Allow creation of this file?",
+            "Accept this file edit?",
+            "Allow access to this file?",
+            "Do you trust the contents of this project?",
+            "Settings Error",
+        ] {
+            assert!(spec.blocking_dialog_markers.iter().any(|m| m == dialog), "{dialog}");
+        }
+        let driver = AgyDriver::default();
+        assert_eq!(driver.blocking_dialog_markers(), spec.blocking_dialog_markers);
+        let starting = driver.launcher_starting_markers();
+        for screen in [
+            "Do you trust the contents of this project?",
+            "Settings Error",
+            "Select login method:",
+        ] {
+            assert!(starting.iter().any(|m| m == screen), "{screen}");
+        }
+        assert!(driver.paste_landed_markers().is_empty());
     }
 }

@@ -91,3 +91,68 @@ for case in json.loads(sys.argv[2]):
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn launcher_refuses_an_antigravity_approval_dialog() {
+    use crate::AgentDriver;
+    let temp = tempfile::tempdir().unwrap();
+    provision(
+        temp.path(),
+        temp.path(),
+        "private sentinel",
+        &crate::AgyDriver::default(),
+    )
+    .unwrap();
+    // The launcher also gates on the CLI's startup log, which never appears
+    // here: the dialog must be refused while the brief is still held back.
+    fs::write(
+        temp.path().join("settings-log-check.json"),
+        serde_json::json!({"log_path": temp.path().join("agy.log"), "expected": "x"}).to_string(),
+    )
+    .unwrap();
+    let stub = temp.path().join("driver.py");
+    // The selected choice is marked `>`, and the footer shares a line with the model name.
+    fs::write(
+        &stub,
+        r#"
+import os, sys, tty
+from pathlib import Path
+tty.setraw(0)
+os.write(1, b'\r\nRequesting permission for:\r\n   printf X > f.txt\r\nRun this command?\r\n> 1. Yes, run command\r\n  2. Yes, and always allow in this conversation\r\n  3. Yes, and always allow (Persist to settings.json)\r\n  4. No, cancel\r\nesc to cancel      Gemini 3.8 Flash \xc2\xb7 low')
+while True:
+    data = os.read(0, 4096)
+    if data:
+        Path(sys.argv[1]).write_bytes(data)
+"#,
+    )
+    .unwrap();
+    let received = temp.path().join("received");
+    let output = boss_command_runner::output_blocking_timeout(
+        std::process::Command::new("python3")
+            .arg(temp.path().join("initial-prompt.py"))
+            .arg("python3")
+            .arg(stub)
+            .arg(&received)
+            .stdin(std::process::Stdio::null()),
+        Duration::from_secs(15),
+    )
+    .unwrap();
+    assert_eq!(output.status.code(), Some(BRIEF_NOT_DELIVERED_EXIT), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("BlockingDialogOnScreen"),
+        "{output:?}"
+    );
+    assert!(!received.exists(), "the dialog received input");
+    assert_eq!(
+        blocking_dialog_marker(temp.path()).as_deref(),
+        Some("Run this command?")
+    );
+    assert!(
+        crate::AgyDriver::default()
+            .pane_monitor_spec()
+            .unwrap()
+            .blocking_dialog_markers
+            .iter()
+            .any(|marker| marker == "Run this command?")
+    );
+}

@@ -1,4 +1,5 @@
-//! Host-side authorization prerequisite for a future pane launcher.
+//! Host-side authorization proof, run by `write_permission_config` before the
+//! pane command can be built.
 
 use std::fs;
 
@@ -14,8 +15,9 @@ use crate::{PermissionInput, ToolUseInterceptionConfig};
 
 /// Verify the installed chain for the expected run before sending any brief.
 ///
-/// Call after permission installation, immediately before launch, with the same
-/// [`PermissionInput`] used to arm the run. This compares the installed policy
+/// `AgyDriver::write_permission_config` calls this after permission
+/// installation, with the same [`PermissionInput`] used to arm the run, and
+/// fails the run if it fails. This compares the installed policy
 /// to the shared expected renderer (guard commands, matchers, timeouts, required
 /// artifact paths, revision flag, run identity) and the session settings to the
 /// per-kind render, then checks exact lifecycle wiring and executes the existing
@@ -24,10 +26,12 @@ use crate::{PermissionInput, ToolUseInterceptionConfig};
 /// result. No SessionStart event, hook count, or cached success is accepted as
 /// proof.
 ///
-/// This proves the installed host-side authorization path, not CLI discovery
-/// or review-mode failure semantics. Pane qualification must still establish
-/// those properties and verify the CLI settings log before delivering a brief;
-/// `AgyDriver::launch_ready` remains false until that complete path is qualified.
+/// This proves the installed host-side authorization path, not CLI discovery.
+/// The launcher proves discovery before it pastes the brief: it waits for the
+/// CLI's own startup log to show the rendered settings and `loaded 1 named
+/// hooks from 1 hooks.json file(s)`, and refuses the run if the CLI reports an
+/// unparseable hooks file. `AgyDriver::launch_ready` remains false until the
+/// control verbs land.
 pub fn verify_startup_authorization(input: &PermissionInput) -> anyhow::Result<AuthorizationProbeReport> {
     let expected = observation_from_permission(input);
     let interception = ToolUseInterceptionConfig::from_permission_input(input);

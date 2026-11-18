@@ -94,8 +94,13 @@ fn provision_creates_private_tree_and_keychain_bridge() {
     assert!(gemini.join("antigravity-cli/cache/onboarding.json").is_file());
     assert!(gemini.join("antigravity-cli/settings.json").is_file());
     assert!(gemini.join("config/hooks.json").is_file());
-    let rules_dir = homes.join("run-prov-1/rules-root/.agents/rules");
+    let rules_dir = homes.join("run-prov-1/rules-root");
     assert!(rules_dir.is_dir());
+    assert_eq!(
+        agent_rules_path_for_run("run-prov-1").unwrap(),
+        rules_dir.join("AGENTS.md"),
+        "an always-on rule needs no frontmatter only at the root of the added directory"
+    );
     assert_eq!(
         agent_rules_path_for_run("run-prov-1").unwrap().parent(),
         Some(rules_dir.as_path())
@@ -197,9 +202,9 @@ fn reclaim_keeps_conversations_and_brain_and_removes_the_rest() {
     fs::write(&brain, b"keep-brain").unwrap();
     fs::write(cli.join("settings.json"), b"drop-settings").unwrap();
     fs::write(cli.join("log"), b"drop-log").unwrap();
-    let rules_root = container.join("rules-root/.agents/rules");
+    let rules_root = container.join("rules-root");
     fs::create_dir_all(&rules_root).unwrap();
-    fs::write(rules_root.join("boss.md"), b"drop-rules").unwrap();
+    fs::write(rules_root.join("AGENTS.md"), b"drop-rules").unwrap();
     let control = container.join("control");
     fs::create_dir_all(&control).unwrap();
     fs::write(control.join("session-settings.json"), b"drop-control").unwrap();
@@ -261,8 +266,9 @@ printf '%s\n' 'CLI settings initialized: permissions=&{Allow:[] Deny:[] Ask:[]},
     fs::write(
         &log,
         format!(
-            "CLI settings initialized: permissions=&{{Allow:[] Deny:[{}] Ask:[]}}, toolPermission=request-review",
+            "CLI settings initialized: permissions=&{{Allow:[] Deny:[{}] Ask:[]}}, toolPermission=request-review\n{}\n",
             settings.deny_rules().join(" "),
+            super::super::permissions::HOOKS_LOADED_LINE,
         ),
     )
     .unwrap();

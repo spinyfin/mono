@@ -262,8 +262,10 @@ def _strip_box_glyphs(row):
 
 def _dialog_line(line):
     row = _strip_box_glyphs(line.strip())
-    while row.startswith(PROMPT_MARK):
-        row = row[len(PROMPT_MARK):]
+    # `❯` marks the selected choice in Claude's and Codex's menus, `>` in
+    # Antigravity's.
+    while row.startswith((PROMPT_MARK, b">")):
+        row = row[len(PROMPT_MARK) if row.startswith(PROMPT_MARK) else 1:]
     return row.strip()
 
 
@@ -344,6 +346,11 @@ class SettingsLogWatcher:
         check = json.loads(Path(check_path).read_text())
         self.log_path = Path(check["log_path"])
         self.expected = check["expected"]
+        # Lines that must appear before admission, and lines that must never
+        # appear. Optional: a check file without them gates on settings alone.
+        self.required = frozenset(check.get("require", []))
+        self.pending = set(self.required)
+        self.forbid = list(check.get("forbid", []))
         self.offset = 0
         self.buf = b""
         self.initialized = False
@@ -381,7 +388,7 @@ class SettingsLogWatcher:
             # its newline arrives.
             self._consume(self.buf.decode("utf-8", "replace"), now, terminated=False)
         self.ready = bool(
-            self.initialized and self.initialized_at is not None
+            self.initialized and not self.pending and self.initialized_at is not None
             and now - self.initialized_at >= SETTINGS_SETTLE
         )
         return self.ready
@@ -389,6 +396,11 @@ class SettingsLogWatcher:
     def _consume(self, line, now, terminated):
         if "ignoring invalid" in line:
             raise RuntimeError(f"agy dropped rendered permission rules: {line}")
+        for text in self.forbid:
+            if text in line:
+                raise RuntimeError(f"agy reported a startup failure that disarms the guards: {line}")
+        if terminated:
+            self.pending = {text for text in self.pending if text not in line}
         if terminated and "CLI settings initialized" in line:
             if self.expected not in line:
                 raise RuntimeError(
@@ -403,6 +415,7 @@ class SettingsLogWatcher:
             raise RuntimeError("agy settings initialization evidence disappeared")
         self.offset = 0
         self.buf = b""
+        self.pending = set(self.required)
         self.ready = False
 
 

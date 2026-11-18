@@ -212,3 +212,40 @@ fn spawn_rejection_round_trips_marker_and_rejects_unrelated_errors() {
     assert!(BlockingDialogOnScreen::from_rejection_reason("capture failed").is_none());
     assert!(BlockingDialogOnScreen::from_rejection_reason("BlockingDialogOnScreen: invalid").is_none());
 }
+
+// Captured from Antigravity 1.5.5 (`10-hook-reply-semantics.txt`): its menus
+// mark the selected choice with `>`, not `❯`, and the footer shares a line
+// with the model name.
+const ANTIGRAVITY_APPROVAL: &str = "\
+Requesting permission for:
+   printf SHELL_OK > shell_marker.txt
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'printf'
+  3. Yes, and always allow for commands that start with 'printf' (Persist to settings.json)
+  4. No, cancel
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+esc to cancel                                                          Gemini 3.8 Flash · low";
+
+#[tokio::test]
+async fn antigravity_approval_dialog_is_blocked_but_its_transcript_copy_is_clear() {
+    let (tmux, runner) = tmux([success(ANTIGRAVITY_APPROVAL)]);
+    let error = tmux
+        .with_blocking_dialog_markers(vec!["Run this command?".into()])
+        .send_keys("worker", "3 quick questions")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<BlockingDialogOnScreen>().unwrap().marker,
+        "Run this command?"
+    );
+    assert_eq!(runner.calls().len(), 1, "nothing was typed: {:?}", runner.calls());
+
+    // A later composer means the footer above it is scrollback.
+    let transcript = format!("{ANTIGRAVITY_APPROVAL}\n> status?");
+    let (tmux, _) = super::tmux([success(&transcript), success("")]);
+    tmux.with_blocking_dialog_markers(vec!["Run this command?".into()])
+        .send_submit("worker")
+        .await
+        .unwrap();
+}

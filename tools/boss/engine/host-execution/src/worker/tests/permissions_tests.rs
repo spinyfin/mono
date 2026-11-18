@@ -1,7 +1,7 @@
 use super::*;
 use boss_engine_driver::agy::{
     AgyRuntimeState,
-    permissions::{SettingsPlan, render_settings},
+    permissions::{HOOKS_LOADED_LINE, SettingsPlan, render_settings},
 };
 
 fn agy_state(root: &std::path::Path) -> (AgyRuntimeState, String) {
@@ -33,7 +33,7 @@ fn agy_state(root: &std::path::Path) -> (AgyRuntimeState, String) {
         .join(" ");
     std::fs::write(&state.session_settings_path, &body).unwrap();
     let matching = format!(
-        "CLI settings initialized: permissions=&{{Allow:[] Deny:[{deny}] Ask:[]}}, toolPermission=request-review"
+        "CLI settings initialized: permissions=&{{Allow:[] Deny:[{deny}] Ask:[]}}, toolPermission=request-review\n{HOOKS_LOADED_LINE}"
     );
     (state, matching)
 }

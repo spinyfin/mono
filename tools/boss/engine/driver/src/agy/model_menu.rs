@@ -15,8 +15,9 @@
 //! There are no unsuffixed family ids. The effort rung is a `-low` /
 //! `-medium` / `-high` / `-xhigh` suffix on the model id. The CLI also
 //! accepts `--effort low|medium|high|xhigh|max` (pane viability study,
-//! 1.5.5+). Boss encodes the rung in the model id and never emits
-//! `--effort`, so the flag cannot contradict the suffix.
+//! 1.5.5+). Boss encodes the rung in the model id, and the pane command
+//! passes `--effort` only when it equals that suffix (`pane_command`), so the
+//! flag cannot contradict the model id.
 //!
 //! # Refresh path
 //!

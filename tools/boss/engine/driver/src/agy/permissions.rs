@@ -572,6 +572,8 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
         serde_json::to_string(&serde_json::json!({
             "log_path": super::home::log_file_for_run(&input.run_id)?,
             "expected": expected_initialized_fragment(&settings),
+            "require": [HOOKS_LOADED_LINE],
+            "forbid": [HOOKS_UNPARSEABLE_LINE],
         }))?
         .as_bytes(),
     )?;
@@ -590,6 +592,18 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
 // ---------------------------------------------------------------------------
 
 pub use crate::SettingsLogCheck;
+
+/// The CLI's startup line once it has read the run's global-root `hooks.json`:
+/// one hook group (`boss`) from one file. A missing file logs `0 named hooks
+/// from 0 hooks.json file(s)` and a malformed one `0 from 1`; either way the
+/// session still runs, with no authorization hook and no progress ingress.
+/// Absence of this line is the only pre-prompt evidence that hooks did not
+/// load: native `SessionStart` fires with the first prompt, too late to gate
+/// the brief on.
+pub const HOOKS_LOADED_LINE: &str = "loaded 1 named hooks from 1 hooks.json file(s)";
+
+/// Logged when the CLI cannot parse `hooks.json` at all.
+pub const HOOKS_UNPARSEABLE_LINE: &str = "failed to parse hooks.json";
 
 /// The text the CLI logs after `CLI settings initialized: ` for `settings`,
 /// as Go formats the struct: space-separated slices, `Ask` empty.
@@ -624,6 +638,13 @@ pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result
         );
     }
 
+    if let Some(line) = log.lines().find(|line| line.contains(HOOKS_UNPARSEABLE_LINE)) {
+        bail!(
+            "agy could not read its hooks file, so no authorization hook is armed: {}",
+            line.trim()
+        );
+    }
+
     let expected = expected_initialized_fragment(&settings);
     let mut initialised = false;
     for line in log.lines().filter(|line| line.contains("CLI settings initialized")) {
@@ -636,7 +657,9 @@ pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result
             );
         }
     }
-    Ok(if initialised {
+    // Settings alone are not admission: the guard chain rides on the hooks.
+    let hooks_loaded = log.lines().any(|line| line.contains(HOOKS_LOADED_LINE));
+    Ok(if initialised && hooks_loaded {
         SettingsLogCheck::ConsistentSoFar
     } else {
         SettingsLogCheck::NotYetInitialized
