@@ -699,6 +699,31 @@ pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str)
     Ok(work_db.get_execution(execution_id)?.status.is_terminal())
 }
 
+/// For a budget deferral, release a dispatch claim a transient DB error left
+/// behind (the deferral already held the row) instead of waiting for the boot
+/// sweep. Returns whether `err` was a budget deferral.
+pub(super) fn release_budget_deferred_claim(
+    work_db: &boss_work_db::WorkDb,
+    err: &anyhow::Error,
+    current: &boss_protocol::WorkExecution,
+) -> bool {
+    if err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_none()
+        && err.downcast_ref::<DispatchDeferred>().is_none()
+    {
+        return false;
+    }
+    if current.status == ExecutionStatus::Claimed
+        && let Err(release_err) = work_db.release_dispatch_claim(&current.id)
+    {
+        tracing::error!(
+            execution_id = %current.id,
+            ?release_err,
+            "budget deferral: failed to release a still-claimed dispatch"
+        );
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
