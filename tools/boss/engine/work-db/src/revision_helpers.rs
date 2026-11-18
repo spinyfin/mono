@@ -1932,12 +1932,28 @@ pub fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Resul
 
     // Decide (and durably record) which driver governs this execution —
     // explicit row override, Codex-percentage roll, or no override at all
-    // — before returning. Every `insert_execution` call site funnels
-    // through here, so this is the single place a routing decision is
-    // made; the two real dispatch paths (`driver_lookup::get_execution_driver_slug`
-    // for the events socket, `runner::worker_spawn` for the actual spawn)
-    // both read the recorded decision back rather than re-deriving it.
-    let decision = decide_execution_driver(conn, &input.work_item_id, input.kind)?;
+    // — before returning. Dispatch claim and launch composition revalidate
+    // this initial decision against current shares and row constraints.
+    // Hook routing reads the saved result without changing a live worker.
+    //
+    // An allocation refusal is scoped to this one execution: record it and
+    // keep the row, so a single item with no funded eligible driver cannot
+    // roll back execution creation for every other item reconciled in the
+    // same product transaction. Claim-time revalidation refuses the row and
+    // fails it visibly. Any other error (database access) still propagates.
+    let decision = match decide_execution_driver(conn, &input.work_item_id, input.kind) {
+        Ok(decision) => decision,
+        Err(err) if err.downcast_ref::<DriverAllocationRefused>().is_some() => {
+            tracing::warn!(
+                execution_id = %id,
+                work_item_id = %input.work_item_id,
+                error = %format!("{err:#}"),
+                "driver allocation refused at insert; recording the refusal so dispatch fails this execution visibly",
+            );
+            DriverDecision::allocation_failed()
+        }
+        Err(err) => return Err(err),
+    };
     record_execution_driver_decision(conn, &id, &input.work_item_id, &decision, &now)?;
 
     query_execution(conn, &id)?.with_context(|| format!("missing execution after insert: {id}"))

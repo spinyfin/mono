@@ -59,11 +59,10 @@
 //! attempt — so the same row under the same split always lands on the same
 //! driver across retries, redispatch, and recovery. Changing the split moves
 //! the boundaries and therefore reallocates some rows that have not been
-//! dispatched yet; that is deliberate, and it cannot make a row flip
-//! *between attempts of one dispatch* because the decision is computed once,
-//! at [`crate::revision_helpers::insert_execution`] time, and
-//! persisted per-execution in `execution_driver_decisions` (see
-//! [`record_execution_driver_decision`]).
+//! dispatched yet. Decisions are persisted per-execution in
+//! `execution_driver_decisions`. Before a claim or a new launch, allocation
+//! is revalidated against the current split and row constraints. Unchanged
+//! inputs stay stable across retries; running workers keep their driver.
 //!
 //! An explicit driver pin wins over allocation when the pin clears the
 //! dispatch capability gate for the execution: the work item's own `driver`
@@ -87,14 +86,15 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+pub(crate) mod dispatch;
 pub(super) mod traffic_split_migration;
 
 /// Metadata KV key for the persisted split, stored as the JSON encoding of
 /// [`DriverTrafficSplit`]. Same shape as `dispatch_concurrency_limit` (see
 /// `app/handler_helpers.rs`): read fresh at each decision point rather than
-/// cached, so a change takes effect on the very next execution created —
-/// without disturbing any execution already dispatched (a decision already
-/// recorded on an existing row is never recomputed).
+/// cached. New executions use it immediately; queued allocations are
+/// revalidated before dispatch and launch. Already-running workers retain
+/// their recorded routing for hook decoding.
 ///
 /// Deliberately ONE row holding the whole split rather than four rows: an
 /// operator edit is a single atomic write, so a concurrent dispatch can
@@ -116,6 +116,34 @@ pub const REASON_POOL: &str = "pool";
 /// execution — it is not bound to a `tasks` row. No override; the row
 /// resolves through the ordinary precedence chain.
 pub const REASON_DEFAULT: &str = "default";
+/// `execution_driver_decisions.reason`: allocation refused this execution
+/// when its row was created (no eligible driver holds a share). The row still
+/// exists so one bad item cannot stop the rest of its product from
+/// reconciling; claim-time revalidation refuses it and surfaces the failure.
+/// `driver` is `None`, and nothing routes on this reason.
+pub const REASON_ALLOCATION_FAILED: &str = "allocation_failed";
+
+/// Why allocation refused to choose a driver: no eligible driver holds a
+/// share, the persisted split is unreadable, or the work item's kind is not
+/// recognised. A distinct type so dispatch can tell this scoped, per-execution
+/// refusal from a database or other infrastructure error and fail that one
+/// execution visibly instead of retrying it on every drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverAllocationRefused {
+    pub message: String,
+}
+
+impl std::fmt::Display for DriverAllocationRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DriverAllocationRefused {}
+
+fn allocation_refused(message: String) -> anyhow::Error {
+    anyhow::Error::new(DriverAllocationRefused { message })
+}
 
 /// The reason value written by the superseded single-Codex-percentage
 /// scheme. Never written any more; still recognised on read so decisions
@@ -124,7 +152,7 @@ pub const REASON_DEFAULT: &str = "default";
 pub const REASON_LEGACY_PERCENTAGE: &str = "percentage";
 
 /// The routing decision for one execution. `driver` is `None` only for
-/// [`REASON_DEFAULT`] — an ineligible row, which falls through to the normal
+/// [`REASON_DEFAULT`] and [`REASON_ALLOCATION_FAILED`] — an ineligible row, which falls through to the normal
 /// row → product → engine default resolution. [`REASON_POOL`] names the
 /// fixed driver the execution will actually run on. `split_at_decision` is
 /// set for [`REASON_ALLOCATION`] so a later analysis can tell which split a
@@ -157,6 +185,14 @@ impl DriverDecision {
         Self {
             driver: None,
             reason: REASON_DEFAULT,
+            split_at_decision: None,
+        }
+    }
+
+    pub(crate) fn allocation_failed() -> Self {
+        Self {
+            driver: None,
+            reason: REASON_ALLOCATION_FAILED,
             split_at_decision: None,
         }
     }
@@ -213,20 +249,6 @@ fn eligible_drivers_for(
         .collect()
 }
 
-/// Fall back when all persisted shares sit on unavailable drivers, including
-/// registered skeletons. Funded launchable drivers excluded by capability or
-/// model constraints must still fail loudly.
-fn whole_share_sits_on_unavailable_drivers(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
-    if eligible.is_empty() {
-        return false;
-    }
-    let registry = boss_engine_driver::DriverRegistry::default();
-    DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
-        .iter()
-        .filter(|driver| registry.get(driver).is_some_and(|driver| driver.launch_ready()))
-        .all(|driver| split.share_for(driver) == Some(0))
-}
-
 /// Deterministic hash of `work_item_id` into `[0, 100)`. SHA-256 rather
 /// than `std::hash::Hasher` so the mapping is stable across engine
 /// versions/restarts, not just within one process — the whole point is
@@ -254,14 +276,9 @@ fn hash_bucket(work_item_id: &str) -> u8 {
 /// always did. `agy` starting at 0 also means shipping this sends nothing
 /// to the Antigravity driver until its configured share is explicitly increased.
 ///
-/// A value that is present but does not parse, or parses to a split that
-/// fails [`DriverTrafficSplit::validate`], can only come from a hand-edited
-/// `state.db` — [`WorkDb::set_driver_traffic_split`] refuses to persist one.
-/// It is logged at ERROR and the default is used. Note what this is NOT: the
-/// corrupt value is discarded whole, never clamped or normalised into a
-/// nearby valid-looking split. Failing the read outright would wedge every
-/// subsequent execution insert, which is a far worse outcome than routing to
-/// the default driver with a loud log line.
+/// Present but invalid data fails closed: falling back to a default split
+/// could route work to a driver whose configured share is zero. The CLI and
+/// Settings surface the same error.
 pub(crate) fn load_driver_traffic_split_conn(conn: &Connection) -> Result<DriverTrafficSplit> {
     let raw: Option<String> = conn
         .query_row(
@@ -273,27 +290,12 @@ pub(crate) fn load_driver_traffic_split_conn(conn: &Connection) -> Result<Driver
     let Some(raw) = raw else {
         return Ok(DriverTrafficSplit::default());
     };
-    match serde_json::from_str::<DriverTrafficSplit>(&raw) {
-        Ok(split) => match split.validate() {
-            Ok(()) => Ok(split),
-            Err(err) => {
-                tracing::error!(
-                    raw = %raw,
-                    %err,
-                    "driver_traffic_split: persisted split is invalid — discarding it, allocating on the default split",
-                );
-                Ok(DriverTrafficSplit::default())
-            }
-        },
-        Err(err) => {
-            tracing::error!(
-                raw = %raw,
-                %err,
-                "driver_traffic_split: persisted split is unparseable — discarding it, allocating on the default split",
-            );
-            Ok(DriverTrafficSplit::default())
-        }
-    }
+    let split: DriverTrafficSplit = serde_json::from_str(&raw)
+        .map_err(|err| allocation_refused(format!("driver_traffic_split: persisted split is unparseable: {err}")))?;
+    split
+        .validate()
+        .map_err(|err| allocation_refused(format!("driver_traffic_split: persisted split is invalid: {err}")))?;
+    Ok(split)
 }
 
 #[work_db_boundary::instrument]
@@ -311,10 +313,9 @@ impl WorkDb {
     /// — an invalid split is the caller's error to surface, and
     /// all-four-zero is rejected by the same rule as every other bad total.
     ///
-    /// Takes effect on the next execution created — never touches an
-    /// execution already dispatched, exactly like the interactive
-    /// concurrency cap. Written as one metadata row, so no concurrent
-    /// dispatch can observe a partially-applied edit.
+    /// Takes effect on new allocations and prevents queued allocations to
+    /// zero-share drivers from launching. Running workers are unaffected.
+    /// Written as one metadata row, so dispatch never reads a partial edit.
     pub fn set_driver_traffic_split(&self, split: DriverTrafficSplit) -> Result<DriverTrafficSplit> {
         split.validate()?;
         self.set_metadata(METADATA_KEY_DRIVER_TRAFFIC_SPLIT, &serde_json::to_string(&split)?)?;
@@ -350,6 +351,7 @@ pub(crate) fn get_execution_driver_decision_conn(
                 REASON_ALLOCATION => REASON_ALLOCATION,
                 REASON_POOL => REASON_POOL,
                 REASON_LEGACY_PERCENTAGE => REASON_LEGACY_PERCENTAGE,
+                REASON_ALLOCATION_FAILED => REASON_ALLOCATION_FAILED,
                 _ => REASON_DEFAULT,
             };
             let split_raw: Option<String> = row.get(2)?;
@@ -413,8 +415,32 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
         .is_some_and(|driver| driver.descriptor().model_menu.design_investigation_model.is_some())
 }
 
+/// Whether a driver pin may govern an execution of `(task_kind, execution_kind)`.
+///
+/// The pin must clear the capability gate. On a design/investigation-tier row
+/// it must also have a dedicated tier model, unless it is a `tasks.driver`
+/// pin (`from_task_pin`): that is an explicit decision whose failure at spawn
+/// is the intended signal, so it is never silently routed around. A
+/// `products.default_driver` is only a default, so it yields to allocation.
+///
+/// The single rule allocation, spawn composition and the events-socket driver
+/// lookup all apply, so the three cannot disagree about which pin is live.
+pub fn pin_is_honourable(
+    driver_slug: &str,
+    task_kind: Option<&TaskKind>,
+    execution_kind: &ExecutionKind,
+    design_or_investigation_tier: bool,
+    from_task_pin: bool,
+) -> bool {
+    // An unrecognised task kind is reported as a hard error once allocation
+    // runs; keep the pin so that data-integrity failure surface does not move.
+    let gate_ok = task_kind.is_none_or(|kind| driver_clears_dispatch_gate(driver_slug, kind, execution_kind));
+    let tier_ok = from_task_pin || !design_or_investigation_tier || driver_has_design_investigation_model(driver_slug);
+    gate_ok && tier_ok
+}
+
 /// Decide which driver governs a newly-created execution row and why.
-/// Called once, from `insert_execution`, using the same open `Connection`
+/// Called from insertion and dispatch revalidation, using the open `Connection`
 /// (never `WorkDb::connect()` — see `load_driver_traffic_split_conn`).
 ///
 /// Precedence:
@@ -454,18 +480,9 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
 ///    [`TaskKind`] ([`eligible_drivers_for`]).
 /// 5. Not a `tasks` row at all — no override.
 ///
-/// Errors (failing the execution insert) when the row's kind is
-/// unrecognised, or when the eligible drivers hold no share between them
-/// and that is not because the whole share sits on unregistered drivers.
-/// Remaining failures are loud on purpose: falling back to the engine
-/// default would hand an eligibility failure to a driver whose gate refuses
-/// it, or revive a registered driver that was set to 0. Zero means zero.
-/// A Settings-reachable split that puts the whole share on unregistered
-/// drivers (today: `agy = 100` with no Antigravity implementation) falls
-/// through to the engine default instead of failing every unpinned insert.
-/// A leftover unregistered share next to a funded registered driver does
-/// not: ConflictResolution / CiRemediation with `claude = 0` still fails
-/// the insert, as does an empty eligible set.
+/// Errors when the kind is unrecognised, no driver is eligible, or eligible
+/// drivers hold no share. Model, reasoning and launch-readiness restrictions
+/// never turn that failure into an engine-default fallback: zero means zero.
 pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: ExecutionKind) -> Result<DriverDecision> {
     let row = conn
         .query_row(
@@ -499,7 +516,9 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         .map(str::parse)
         .transpose()
         .map_err(|err| {
-            anyhow::anyhow!("driver_traffic_split: work item {work_item_id} has invalid reasoning: {err}")
+            allocation_refused(format!(
+                "driver_traffic_split: work item {work_item_id} has invalid reasoning: {err}"
+            ))
         })?;
     let design_or_investigation_tier =
         boss_engine_effort::is_design_or_investigation_tier(task_kind.as_ref().ok(), reasoning);
@@ -516,30 +535,20 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
     let from_task_pin = explicit_driver.is_some();
     let pinned = explicit_driver.or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
     if let Some(driver) = pinned {
-        // Honour the pin only when it clears the capability gate for this
-        // execution kind. A product default (or `--driver`) of codex/grok
-        // must not stall ConflictResolution / CiRemediation — those kinds
-        // require CommandOutcomeObservation, which only claude declares
-        // today. Drop the pin and fall through to allocation among the
-        // eligible set instead of recording an explicit decision the spawn
-        // path would then hard-fail on.
-        let pin_ok = match &task_kind {
-            Ok(tk) => driver_clears_dispatch_gate(&driver, tk, &kind),
-            // Unrecognised task kind is handled below as a hard error once
-            // we reach allocation; keep the pin so the error surface does
-            // not change for that data-integrity case.
-            Err(_) => true,
-        };
-        // A tier row's pin also needs a dedicated design/investigation-tier
-        // model (`ModelMenu::design_investigation_model`) or spawn hard-fails
-        // with `IneligibleDesignInvestigationDriver` instead of ever running.
-        // A `products.default_driver` is a default, not a row-level pin, so
-        // it yields to allocation the same way a gate-failing pin does; a
-        // `tasks.driver` pin is an explicit human decision and stays loud —
-        // its failure at spawn is the intended signal, not silently routed
-        // around.
-        let tier_ok = from_task_pin || !design_or_investigation_tier || driver_has_design_investigation_model(&driver);
-        if pin_ok && tier_ok {
+        // Honour the pin only when `pin_is_honourable`: it clears the
+        // capability gate for this execution kind (a product default of
+        // codex/grok must not stall ConflictResolution / CiRemediation) and,
+        // for a product default on a tier row, has a dedicated tier model.
+        // Otherwise drop it and allocate among the eligible set instead of
+        // recording an explicit decision the spawn path would hard-fail on.
+        let pin_honourable = pin_is_honourable(
+            &driver,
+            task_kind.as_ref().ok(),
+            &kind,
+            design_or_investigation_tier,
+            from_task_pin,
+        );
+        if pin_honourable {
             return Ok(DriverDecision::explicit(driver));
         }
         tracing::info!(
@@ -551,10 +560,10 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         );
     }
     let task_kind: TaskKind = task_kind.map_err(|err| {
-        anyhow::anyhow!(
+        allocation_refused(format!(
             "driver_traffic_split: work item {work_item_id} has unrecognised kind {task_kind_raw:?} ({err}); \
              refusing to allocate a driver for a kind whose capability requirements this engine cannot resolve",
-        )
+        ))
     })?;
     let model_override = row
         .model_override
@@ -562,19 +571,8 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         .map(str::trim)
         .filter(|model| !model.is_empty());
     let eligible = eligible_drivers_for(&task_kind, &kind, model_override, design_or_investigation_tier);
-    if eligible.is_empty() && model_override.is_some() {
-        return Ok(DriverDecision::default_no_override());
-    }
     let split = load_driver_traffic_split_conn(conn)?;
-    let driver = match allocate_among(split, work_item_id, &task_kind, &eligible) {
-        Ok(driver) => driver,
-        Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
-        Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
-        Err(_) if whole_share_sits_on_unavailable_drivers(&split, &eligible) => {
-            return Ok(DriverDecision::default_no_override());
-        }
-        Err(err) => return Err(err),
-    };
+    let driver = allocate_among(split, work_item_id, &task_kind, &eligible)?;
     Ok(DriverDecision::allocated(driver, split))
 }
 
@@ -610,16 +608,15 @@ fn allocate_among(
                 %err,
                 "driver_traffic_split: cannot allocate a driver for this work item",
             );
-            anyhow::anyhow!(
+            allocation_refused(format!(
                 "driver_traffic_split: cannot allocate a driver for work item {work_item_id} (kind {kind}): {err}"
-            )
+            ))
         })
 }
 
-/// Persist `decision` for `execution_id`. Called once, right after the
-/// `work_executions` row is inserted, in the same transaction — this is
-/// the durable, queryable record the task requires ("how much went to each
-/// driver", "did one driver's rows fail more"), not just a log line.
+/// Persist `decision` in the transaction that inserts or claims the
+/// execution, and refresh it if launch composition finds changed inputs.
+/// This durable record also routes subsequent worker hook events.
 pub(crate) fn record_execution_driver_decision(
     conn: &Connection,
     execution_id: &str,
@@ -1184,3 +1181,6 @@ pub(super) mod sol_selection {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dispatch_tests;

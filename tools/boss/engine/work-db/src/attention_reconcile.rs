@@ -85,6 +85,13 @@ const ATTENTION_WORK_ITEM: &str = "COALESCE(
 /// to `created_at`, which is precisely their re-raise-free semantics.
 const ATTENTION_RAISED_AT: &str = "COALESCE(work_attention_items.last_raised_at, work_attention_items.created_at)";
 
+/// SQL predicate (over aliases `r` = work_runs, `e` = work_executions) that
+/// is true only for a run that really started. A terminal pre-start failure
+/// records a failed bookkeeping run stamped `started_at = now` although
+/// nothing launched; its execution never got a real start (`started_at`
+/// stays NULL), so it must not count as a run start.
+const REAL_RUN_START: &str = "(r.started_at IS NOT NULL AND NOT (r.status = 'failed' AND e.started_at IS NULL))";
+
 /// `EXISTS` clause for [`ClearedBy::WorkResumed`]: a run for the same work
 /// item started at or after the attention was most recently raised.
 ///
@@ -105,7 +112,7 @@ fn work_resumed_evidence() -> String {
              JOIN work_executions e ON e.id = r.execution_id
              WHERE e.work_item_id = {ATTENTION_WORK_ITEM}
                AND e.kind <> 'progression'
-               AND r.started_at IS NOT NULL
+               AND {REAL_RUN_START}
                AND (work_attention_items.kind != 'pane_spawn_failed' OR r.status = 'completed')
                AND CAST(r.started_at AS INTEGER) >= CAST({ATTENTION_RAISED_AT} AS INTEGER)
                AND r.execution_id IS NOT work_attention_items.execution_id
@@ -256,7 +263,8 @@ fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
         conn,
         "clear_stale_dispatch_failures",
         "engine",
-        "UPDATE tasks
+        &format!(
+            "UPDATE tasks
          SET dispatch_failed_reason = NULL,
              dispatch_failed_error  = NULL,
              dispatch_failed_at     = NULL
@@ -268,9 +276,10 @@ fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
                JOIN work_executions e ON e.id = r.execution_id
                WHERE e.work_item_id = tasks.id
                  AND e.kind <> 'progression'
-                 AND r.started_at IS NOT NULL
+                 AND {REAL_RUN_START}
                  AND CAST(r.started_at AS INTEGER) >= CAST(tasks.dispatch_failed_at AS INTEGER)
-           )",
+           )"
+        ),
         [],
     )?;
     if rows > 0 {

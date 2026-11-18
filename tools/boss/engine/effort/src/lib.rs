@@ -581,9 +581,7 @@ pub fn resolve_spawn_config_in(
         && menu.design_investigation_model.is_none()
         && matches!(
             driver_source,
-            DriverResolutionSource::ProductDefault
-                | DriverResolutionSource::TrafficAllocation
-                | DriverResolutionSource::EngineDefault
+            DriverResolutionSource::ProductDefault | DriverResolutionSource::EngineDefault
         )
     {
         driver = ENGINE_DEFAULT_DRIVER.to_owned();
@@ -642,17 +640,12 @@ pub fn resolve_spawn_config_in(
         model_source = ModelResolutionSource::DriverDefaultAfterProductDefaultMismatch;
     }
 
-    // A traffic decision is a preference, not a row-level driver pin. A
-    // live task model pin may have been edited after that decision was
-    // recorded, so let an unpinned driver yield rather than deterministically
-    // failing the same bucket forever. Explicit task/product/pool drivers
-    // remain hard configuration errors below.
+    // Only an engine default can yield to model ownership here. Traffic
+    // allocations are revalidated against the split before launch; choosing
+    // another driver here would bypass its share and eligibility constraints.
     if model_source == ModelResolutionSource::TaskOverride
         && !(menu.model_belongs_to_driver)(&model)
-        && matches!(
-            driver_source,
-            DriverResolutionSource::TrafficAllocation | DriverResolutionSource::EngineDefault
-        )
+        && driver_source == DriverResolutionSource::EngineDefault
     {
         let replacement = registry
             .slugs()
@@ -1987,18 +1980,17 @@ mod tests {
     }
 
     #[test]
-    fn tier_replaces_a_recorded_grok_traffic_allocation_with_claude() {
-        let cfg = resolve_spawn_config(
+    fn tier_rejects_ineligible_traffic_allocation_without_choosing_an_unchecked_driver() {
+        let err = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .allocated_driver("grok")
                 .kind(&TaskKind::Design)
                 .build(),
         )
-        .unwrap();
-        assert_eq!(cfg.driver, ENGINE_DEFAULT_DRIVER);
-        assert_eq!(cfg.driver_source, DriverResolutionSource::EngineDefault);
-        assert_eq!(cfg.model, "fable");
-        assert_eq!(cfg.model_source, ModelResolutionSource::DesignInvestigationTier);
+        .unwrap_err();
+        assert!(
+            matches!(err, SpawnResolutionError::IneligibleDesignInvestigationDriver { driver } if driver == "grok")
+        );
     }
 
     #[test]
@@ -2035,18 +2027,17 @@ mod tests {
     }
 
     #[test]
-    fn allocated_driver_yields_to_a_live_task_model_override() {
-        let cfg = resolve_spawn_config(
+    fn incompatible_allocated_driver_fails_without_choosing_an_unchecked_driver() {
+        let err = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .allocated_driver("codex")
                 .model_override("opus")
                 .build(),
         )
-        .unwrap();
-        assert_eq!(cfg.driver, "claude");
-        assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.driver_source, DriverResolutionSource::EngineDefault);
-        assert_eq!(cfg.model_source, ModelResolutionSource::TaskOverride);
+        .unwrap_err();
+        assert!(
+            matches!(err, SpawnResolutionError::IncompatibleModel { driver_source: DriverResolutionSource::TrafficAllocation, driver, model, .. } if driver == "codex" && model == "opus")
+        );
     }
 
     #[test]

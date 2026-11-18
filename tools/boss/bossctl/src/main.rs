@@ -41,6 +41,7 @@ mod review;
 mod selected_product;
 mod stream_integrity;
 mod stuck_report;
+mod traffic_split;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
@@ -477,6 +478,8 @@ enum LiveStatusAction {
 
 #[derive(Subcommand, Debug)]
 enum DispatchAction {
+    /// Show the engine's current persisted driver traffic percentages.
+    TrafficSplit,
     /// Items without live work, grouped by the reason they are waiting.
     Stuck {
         #[arg(long, default_value = "7d")]
@@ -1464,6 +1467,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Dispatch {
             action: DispatchAction::Concurrency { set },
         } => dispatch_concurrency::dispatch_concurrency(&cli.socket_path, cli.json, set).await,
+        Command::Dispatch {
+            action: DispatchAction::TrafficSplit,
+        } => traffic_split::run(&cli.socket_path, cli.json).await,
         Command::Automation {
             action: AutomationAction::Pause { reason },
         } => pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await,

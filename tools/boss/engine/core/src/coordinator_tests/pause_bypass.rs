@@ -30,10 +30,22 @@ async fn force_start_dispatches_past_operator_pause_and_records_override_event()
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
     let chore = create_test_chore(&db, product.id.clone(), "Held by pause");
     db.reconcile_product_executions(&product.id).unwrap();
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
     assert_eq!(execution.status, ExecutionStatus::Ready);
+    assert_eq!(
+        db.get_execution_driver_decision(&execution.id)
+            .unwrap()
+            .unwrap()
+            .driver
+            .as_deref(),
+        Some("grok")
+    );
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 100, 0, 0))
+        .unwrap();
 
     let cube = Arc::new(FakeCubeClient::default());
     let runner = Arc::new(FakeExecutionRunner::default());
@@ -60,6 +72,9 @@ async fn force_start_dispatches_past_operator_pause_and_records_override_event()
     // `dispatch_with_pause_bypass`'s doc on why this doesn't wait for it.
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert_eq!(runner.calls.lock().await.len(), 1, "the worker must actually spawn");
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.driver.as_deref(), Some("claude"));
+    assert_eq!(decision.reason, "allocation");
 
     // The pause itself is untouched — force overrides admission for this
     // one row only, never the global switch.
@@ -77,6 +92,41 @@ async fn force_start_dispatches_past_operator_pause_and_records_override_event()
     let details = &override_event.details;
     assert_eq!(details["entry_point"], "cli");
     assert_eq!(details["pause_origin"], "operator");
+}
+
+#[tokio::test]
+async fn automatic_dispatch_reallocates_a_driver_disabled_while_queued() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Queued allocation");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    assert_eq!(
+        db.get_execution_driver_decision(&execution.id)
+            .unwrap()
+            .unwrap()
+            .driver
+            .as_deref(),
+        Some("grok")
+    );
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 100, 0, 0))
+        .unwrap();
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        runner.clone(),
+    ));
+    coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+    assert_eq!(runner.calls.lock().await.len(), 1);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.driver.as_deref(), Some("claude"));
+    assert_eq!(decision.reason, "allocation");
 }
 
 /// A breaker-originated pause is never overridable: force-start must
@@ -602,4 +652,100 @@ async fn critical_force_start_creates_execution_under_pause_and_full_cap() {
     assert!(admission.pause.active);
     assert!(!admission.pause.overridable);
     assert!(crate::coordinator::pause_bypass_decision(&admission, None).is_err());
+}
+
+/// An auto-drained execution whose allocation no funded driver can satisfy
+/// must end in a visible failed state, not loop in `ready` on every drain.
+#[tokio::test]
+async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Queued before share change");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    // The whole share moves to a driver that cannot launch work.
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 0, 0, 100))
+        .unwrap();
+
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let publisher = Arc::new(crate::test_support::RecordingPublisher::default());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::with_publisher(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            runner.clone(),
+            publisher.clone(),
+        )
+        .with_dispatch_events(recording.clone()),
+    );
+    coordinator.drain_ready_queue_for_test().await;
+
+    let failed = db.get_execution(&execution.id).unwrap();
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert!(
+        failed.last_error.as_deref().is_some_and(|e| e.contains("0 share")),
+        "{:?}",
+        failed.last_error
+    );
+    assert_eq!(runner.calls.lock().await.len(), 0, "no worker may spawn");
+    let attention = db.list_attention_items(&execution.id).unwrap();
+    assert!(
+        attention
+            .iter()
+            .any(|item| item.kind == crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND),
+        "{attention:?}"
+    );
+    let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&chore.id).unwrap() else {
+        panic!("expected a chore");
+    };
+    assert_eq!(
+        task.dispatch_failed_reason.as_deref(),
+        Some(crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND)
+    );
+    let events = recording.events_for(&execution.id).await;
+    assert!(
+        events.iter().any(
+            |e| e.stage == crate::dispatch_events::Stage::PreStartRetriesExhausted.as_str()
+                && e.outcome == crate::dispatch_events::Outcome::Error.as_str()
+        ),
+        "{events:?}"
+    );
+    // The app learns of the failure like any other permanent start failure.
+    let mut broadcast = false;
+    for _ in 0..100 {
+        let execution_published = publisher
+            .publish_calls
+            .lock()
+            .await
+            .iter()
+            .any(|(_, _, _, reason)| reason == "execution_start_failed");
+        let card_published = publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(pid, id, reason)| pid == &product.id && id == &chore.id && reason == "execution_start_failed");
+        if execution_published && card_published {
+            broadcast = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(broadcast, "execution and work-item changes must be published");
+
+    // The next attention sweep must not erase the banner: nothing launched.
+    db.reconcile_stale_attention_signals().unwrap();
+    let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&chore.id).unwrap() else {
+        panic!("expected a chore");
+    };
+    assert_eq!(
+        task.dispatch_failed_reason.as_deref(),
+        Some(crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND),
+        "the refusal banner must survive the sweep while allocation is still refused"
+    );
 }

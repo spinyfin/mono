@@ -1678,6 +1678,9 @@ impl ExecutionCoordinator {
                     continue;
                 }
                 Err(err) => {
+                    if self.fail_execution_if_allocation_refused(&execution, &err).await {
+                        continue;
+                    }
                     tracing::error!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
@@ -2635,12 +2638,14 @@ impl ExecutionCoordinator {
                 return;
             }
             Err(err) => {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    worker_id,
-                    ?err,
-                    "spawn_attempt status=ready -> skipped reason=claim_error"
-                );
+                if !self.fail_execution_if_allocation_refused(execution, &err).await {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        worker_id,
+                        ?err,
+                        "spawn_attempt status=ready -> skipped reason=claim_error"
+                    );
+                }
                 self.pool_for_worker_id(worker_id)
                     .release_worker_if_execution(worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
                     .await;
