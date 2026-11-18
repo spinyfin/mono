@@ -1550,8 +1550,9 @@ pub trait HostAdapter: Send + Sync {
         record: &ExecutionBookmark,
         workspace: &Path,
         recorded: Option<&PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<execution_bookmark::RestoreReport>> {
-        let _ = (record, workspace, recorded);
+        let _ = (record, workspace, recorded, pr_bound);
         bail!("preserved work restoration is not supported by this host adapter")
     }
 

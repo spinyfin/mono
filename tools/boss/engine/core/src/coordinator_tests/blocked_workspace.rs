@@ -890,18 +890,34 @@ async fn resumed_revision_without_pr_url_recovers_using_the_chain_root_pr() {
 }
 
 #[tokio::test]
-async fn conflicting_revision_restore_reaches_the_database() {
+async fn conflicting_revision_restore_is_refused_and_blocks_the_task() {
     let h = chain_harness(true, true, true).await;
-    h.dispatch().await.unwrap();
-    let report = h
-        .coordinator
-        .work_db()
-        .execution_restore_report(&h.next.id)
+    let error = h.dispatch().await.unwrap_err();
+    assert!(
+        boss_engine_recovery::execution_bookmark::is_uncontained_preserved_work(&error),
+        "{error:#}"
+    );
+    let db = h.coordinator.work_db();
+    assert!(db.execution_restore_report(&h.next.id).unwrap().is_none());
+    let blocked: (String, Option<String>, Option<String>) = db
+        .connect()
         .unwrap()
-        .expect("report");
-    assert!(!report.conflicts.is_empty(), "{}", report.conflicts);
-    assert!(boss_engine_test_git::jj::JjRepo::run(&h.repo.replacement, &["resolve", "--list"]).contains("base.txt"));
-    assert!(report.instructions().contains("FIRST TASK"));
+        .query_row(
+            "SELECT status, blocked_reason, blocked_detail FROM tasks WHERE id = ?1",
+            [&h.next.work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(blocked.0, "blocked");
+    assert_eq!(blocked.1.as_deref(), Some("execution_recovery_failed"));
+    assert!(blocked.2.unwrap().contains(&format!("{error:#}")));
+    assert!(
+        boss_engine_test_git::jj::JjRepo::run(
+            &h.repo.replacement,
+            &["log", "--no-graph", "-r", "@ & conflicts()", "-T", "commit_id"]
+        )
+        .is_empty()
+    );
 }
 
 /// Model a lost SSH reply after the transplant committed, before its baseline

@@ -811,10 +811,18 @@ impl HostAdapter for SpokeHostAdapter {
         record: &ExecutionBookmark,
         workspace: &Path,
         recorded: Option<&PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<RestoreReport>> {
         match self.route_path(workspace).await? {
-            Route::Spoke(assignment) => self.rec_restore_preserved(&assignment, record, recorded).await,
-            Route::Legacy(legacy) => legacy.restore_preserved_work(record, workspace, recorded).await,
+            Route::Spoke(assignment) => {
+                self.rec_restore_preserved(&assignment, record, recorded, pr_bound)
+                    .await
+            }
+            Route::Legacy(legacy) => {
+                legacy
+                    .restore_preserved_work(record, workspace, recorded, pr_bound)
+                    .await
+            }
         }
     }
 

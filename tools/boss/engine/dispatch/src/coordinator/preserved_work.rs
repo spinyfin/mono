@@ -2,7 +2,9 @@ use std::path::Path;
 
 use super::blocked_workspace::Recovered;
 use super::*;
-use boss_engine_recovery::execution_bookmark::{is_pointer_integrity_error, pointer_integrity_error, preserved_name};
+use boss_engine_recovery::execution_bookmark::{
+    is_pointer_integrity_error, is_uncontained_preserved_work, pointer_integrity_error, preserved_name,
+};
 use boss_engine_storage_values::attention_kinds::{
     PRESERVED_WORK_ARCHIVED_ATTENTION_KIND, PRESERVED_WORK_NOT_RESTAGED_ATTENTION_KIND,
 };
@@ -39,7 +41,7 @@ impl ExecutionCoordinator {
                 .ok_or_else(|| pointer_integrity_error("preserved work store location is unavailable"))?;
             let recorded = self.work_db.preserved_tip(&prior.id)?;
             adapter
-                .restore_preserved_work(&record, &lease.workspace_path, recorded.as_ref())
+                .restore_preserved_work(&record, &lease.workspace_path, recorded.as_ref(), pr.is_some())
                 .await
         }
         .await;
@@ -62,6 +64,13 @@ impl ExecutionCoordinator {
                     predecessor: prior.id.clone(),
                     has_work,
                 }))
+            }
+            Err(err) if is_uncontained_preserved_work(&err) => {
+                if let Err(block_error) = self.lifecycle.block_unrecoverable_bookmark(execution, &err) {
+                    tracing::error!(?block_error, "could not park uncontained preserved work");
+                }
+                self.lifecycle.report_bookmark_failure(execution, &format!("{err:#}"));
+                Err(err)
             }
             Ok(None) => {
                 let name = preserved_name(&prior.id);

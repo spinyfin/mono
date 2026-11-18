@@ -111,6 +111,13 @@ impl SpokeHostAdapter {
         {
             return Err(error.into());
         }
+        if result.code == ResultCode::Rejected as i32
+            && let Some(command_result::Value::Workspace(value)) = &result.value
+            && let Some(error) =
+                boss_engine_recovery::execution_bookmark::uncontained_refusal_from_wire(&value.cube_result_json)
+        {
+            return Err(error);
+        }
         Self::workspace_value(self.host_name(), name, expect_ok(self.host_name(), name, result)?)
     }
 
@@ -659,8 +666,26 @@ impl SpokeHostAdapter {
         fill: impl FnOnce(&mut WorkspaceOp),
     ) -> Result<WorkspaceResult> {
         self.owned_record(record)?;
+        // Restoration consumes a predecessor's preserved pointer in the
+        // current assignment's lease; other operations own their pointers.
+        let restores_predecessor = if kind == Kind::RestorePreserved && record.execution_id != assignment.execution_id {
+            let execution_id = assignment.execution_id.clone();
+            let record = record.clone();
+            self.db(move |db| {
+                if db.preservation_source(&record.execution_id)?.as_ref() != Some(&record) {
+                    return Ok(false);
+                }
+                let execution = db.get_execution(&execution_id)?;
+                Ok(db
+                    .recovery_source(&execution)?
+                    .is_some_and(|source| source.has_preserved_tip && source.execution.id == record.execution_id))
+            })
+            .await?
+        } else {
+            false
+        };
         ensure!(
-            record.execution_id == assignment.execution_id,
+            restores_predecessor || record.execution_id == assignment.execution_id,
             "recovery record belongs to execution {}, not {}",
             record.execution_id,
             assignment.execution_id
@@ -739,9 +764,11 @@ impl SpokeHostAdapter {
         assignment: &SpokeAssignment,
         record: &ExecutionBookmark,
         recorded: Option<&PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<RestoreReport>> {
         let request = serde_json::to_vec(&HostRecoveryRequest {
             recorded: recorded.cloned(),
+            pr_bound,
             ..Default::default()
         })?;
         let result = self

@@ -34,9 +34,9 @@ crate::stub_host_adapter! { FailedRestore {
         JjRepo::run(workspace, &["new", "main", "-m", "Fresh execution"]);
         Ok(())
     }
-    async fn restore_preserved_work(&self, record: &ExecutionBookmark, workspace: &std::path::Path, recorded: Option<&PreservedTip>) -> anyhow::Result<Option<RestoreReport>> {
+    async fn restore_preserved_work(&self, record: &ExecutionBookmark, workspace: &std::path::Path, recorded: Option<&PreservedTip>, pr_bound: bool) -> anyhow::Result<Option<RestoreReport>> {
         if self.integrity { return Err(recovery::pointer_integrity_error("undecidable preserved work")); }
-        recovery::restore_preserved(&RecordedLookupFailure, record, workspace, recorded).await
+        recovery::restore_preserved_for(&RecordedLookupFailure, record, workspace, recorded, pr_bound).await
     }
 } }
 

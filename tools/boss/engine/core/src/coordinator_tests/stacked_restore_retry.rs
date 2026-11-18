@@ -20,6 +20,7 @@ impl HostAdapter for FlakyRestoreAdapter {
         record: &ExecutionBookmark,
         workspace: &Path,
         recorded: Option<&boss_engine_recovery::execution_bookmark::PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<RestoreReport>> {
         let base = self.inner.positioned_parent(workspace).await?;
         let first = {
@@ -36,7 +37,9 @@ impl HostAdapter for FlakyRestoreAdapter {
             }
             return Err(anyhow!("injected transient fetch failure"));
         }
-        self.inner.restore_preserved_work(record, workspace, recorded).await
+        self.inner
+            .restore_preserved_work(record, workspace, recorded, pr_bound)
+            .await
     }
 
     async fn recovery_pr_base(&self, origin: &str, pr: u64) -> Result<String> {

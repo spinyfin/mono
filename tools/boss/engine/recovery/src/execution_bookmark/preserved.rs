@@ -50,6 +50,9 @@ pub struct HostRecoveryRequest {
     /// Which preserved references a forget removes; the tip alone by default.
     #[serde(default)]
     pub scope: PreservedScope,
+    /// Whether the restore destination is a PR head, as dispatch decided.
+    #[serde(default)]
+    pub pr_bound: bool,
 }
 
 pub fn preserved_name(execution_id: &str) -> String {

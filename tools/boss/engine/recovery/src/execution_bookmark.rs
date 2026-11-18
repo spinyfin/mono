@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 mod preserved;
 #[cfg(test)]
+mod preserved_contained_tests;
+#[cfg(test)]
 mod preserved_quarantine_tests;
 #[cfg(test)]
 mod preserved_retry_tests;
@@ -31,7 +33,7 @@ pub use preserved::{
     preserved_work_unpublished,
 };
 mod preserved_restore;
-pub use preserved_restore::restore_preserved;
+pub use preserved_restore::{restore_preserved, restore_preserved_for};
 
 mod preserved_cleanup;
 pub use preserved_cleanup::{PreservedScope, forget_preserved_references};
@@ -169,6 +171,53 @@ pub fn base_unresolvable_error(message: impl Into<String>) -> anyhow::Error {
 /// True when `error` (or any cause in its chain) is a base-unresolvable failure.
 pub fn is_base_unresolvable_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<BaseUnresolvableError>())
+}
+
+/// Restaging a PR-bound predecessor onto a rewritten PR head left work that
+/// is neither contained in that head nor clean to restage. Dispatch parks
+/// the row rather than starting a worker or archiving and starting fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncontainedPreservedWork(pub String);
+
+impl std::fmt::Display for UncontainedPreservedWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UncontainedPreservedWork {}
+
+pub fn uncontained_preserved_work(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UncontainedPreservedWork(message.into()))
+}
+
+/// The refusal as it crosses the spoke transport: a JSON object that no other
+/// workspace diagnostic shares a key with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UncontainedRefusalWire {
+    pub uncontained_preserved_work: String,
+}
+
+/// Encode `error` for the wire when it is an uncontained refusal.
+pub fn uncontained_refusal_to_wire(error: &anyhow::Error) -> Option<Vec<u8>> {
+    let cause = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<UncontainedPreservedWork>())?;
+    serde_json::to_vec(&UncontainedRefusalWire {
+        uncontained_preserved_work: cause.0.clone(),
+    })
+    .ok()
+}
+
+/// Rebuild the typed refusal from a host's rejected workspace result.
+pub fn uncontained_refusal_from_wire(bytes: &[u8]) -> Option<anyhow::Error> {
+    let wire: UncontainedRefusalWire = serde_json::from_slice(bytes).ok()?;
+    Some(uncontained_preserved_work(wire.uncontained_preserved_work))
+}
+
+/// True when `error` (or any cause in its chain) is an uncontained preserved-work refusal.
+pub fn is_uncontained_preserved_work(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<UncontainedPreservedWork>())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -333,10 +382,23 @@ pub struct RestoreReport {
     #[serde(default)]
     #[builder(default)]
     pub unrestaged_unpublished: String,
+    /// Preserved changes left out of `commits` because the destination
+    /// already carries their content: restaging them changed nothing.
+    #[serde(default)]
+    #[builder(default)]
+    pub already_contained: String,
 }
 
 impl RestoreReport {
     pub fn instructions(&self) -> String {
+        let contained = if self.already_contained.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nPreserved commits whose content that base already carries (not restaged):\n```text\n{}```\n",
+                self.already_contained
+            )
+        };
         let conflict_task = if self.conflicts.is_empty() {
             "The rebase completed without conflicts.".to_owned()
         } else {
@@ -366,8 +428,14 @@ impl RestoreReport {
                 self.discarded_tips
             )
         };
+        if self.commits.trim().is_empty() {
+            return format!(
+                "## EXECUTION BOOKMARK RECOVERY\n\nThe predecessor's preserved pointer `{}` holds nothing to restage onto base SHA `{}`: its changes are published or already in that history. The engine positioned this lease normally.{contained}{discarded}\n\n{pr_rewrite}The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+                self.pointer, self.base_sha
+            );
+        }
         format!(
-            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine restaged this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n{discarded}\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine restaged this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n{discarded}{contained}\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
             self.pointer, self.base_sha, self.commits
         )
     }

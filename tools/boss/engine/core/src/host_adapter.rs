@@ -265,13 +265,14 @@ impl HostAdapter for LocalHostAdapter {
         record: &ExecutionBookmark,
         workspace: &Path,
         recorded: Option<&execution_bookmark::PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<execution_bookmark::RestoreReport>> {
         if record.host_id != self.host_id() {
             return Err(execution_bookmark::pointer_integrity_error(
                 "preserved work belongs to another host",
             ));
         }
-        execution_bookmark::restore_preserved(&LocalJj, record, workspace, recorded).await
+        execution_bookmark::restore_preserved_for(&LocalJj, record, workspace, recorded, pr_bound).await
     }
 
     async fn preserved_work_unpublished(
@@ -888,13 +889,14 @@ impl HostAdapter for SshHostAdapter {
         record: &ExecutionBookmark,
         workspace: &Path,
         recorded: Option<&execution_bookmark::PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<execution_bookmark::RestoreReport>> {
         if record.host_id != self.host_id() {
             return Err(execution_bookmark::pointer_integrity_error(
                 "preserved work belongs to another host",
             ));
         }
-        execution_bookmark::restore_preserved(self, record, workspace, recorded).await
+        execution_bookmark::restore_preserved_for(self, record, workspace, recorded, pr_bound).await
     }
 
     async fn preserved_work_unpublished(

@@ -13,7 +13,8 @@ pub(crate) use boss_engine_storage_values::attention_kinds::REVISION_CHAIN_RECOV
 /// the coordinator's pre-start backoff and rerun repair on the next attempt.
 pub(crate) fn block_unrecoverable(db: &WorkDb, execution: &WorkExecution, err: &anyhow::Error) -> Result<bool> {
     use crate::work::ExecutionKind;
-    let damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(err);
+    let damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(err)
+        || boss_engine_recovery::execution_bookmark::is_uncontained_preserved_work(err);
     if damaged
         && matches!(
             execution.kind,
@@ -107,5 +108,68 @@ mod tests {
         );
         assert_eq!(cleared.actor, "engine");
         assert_eq!(cleared.basis, "execution_bookmark_recovery:block_unrecoverable");
+    }
+
+    /// The hold describes the attempt that was refused. A later attempt that
+    /// gets as far as starting a run has passed recovery, so the hold and its
+    /// detail are lifted rather than left on a card with a live worker.
+    #[test]
+    fn a_started_run_lifts_the_hold_this_block_raised() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id, "Recovered later");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
+        let err = boss_engine_recovery::execution_bookmark::pointer_integrity_error(
+            "preserved work is not contained in the PR head",
+        );
+        assert!(block_unrecoverable(&db, &execution, &err).unwrap());
+        let chore_row = |db: &WorkDb| match db.get_work_item(&chore.id).unwrap() {
+            boss_protocol::WorkItem::Chore(task) | boss_protocol::WorkItem::Task(task) => task,
+            other => panic!("expected a chore: {other:?}"),
+        };
+        let blocked = chore_row(&db);
+        assert_eq!(blocked.blocked_reason.as_deref(), Some("execution_recovery_failed"));
+        assert!(blocked.blocked_detail.is_some());
+
+        db.start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+        let started = chore_row(&db);
+        assert_eq!(started.status, boss_protocol::TaskStatus::Active);
+        assert_eq!((started.blocked_reason, started.blocked_detail), (None, None));
+    }
+
+    #[test]
+    fn uncontained_preserved_work_parks_as_execution_recovery_failed() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id, "Uncontained restage");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
+        let err = boss_engine_recovery::execution_bookmark::uncontained_preserved_work(
+            "preserved work of execution exec_prior is not contained in PR head abc",
+        );
+
+        assert!(block_unrecoverable(&db, &execution, &err).unwrap());
+        let blocked = match db.get_work_item(&chore.id).unwrap() {
+            boss_protocol::WorkItem::Chore(task) | boss_protocol::WorkItem::Task(task) => task,
+            other => panic!("expected a chore: {other:?}"),
+        };
+        assert_eq!(blocked.status, boss_protocol::TaskStatus::Blocked);
+        assert_eq!(blocked.blocked_reason.as_deref(), Some("execution_recovery_failed"));
+        assert!(
+            blocked
+                .blocked_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("PR head abc")),
+            "{blocked:?}"
+        );
+        assert!(!blocked.autostart);
     }
 }

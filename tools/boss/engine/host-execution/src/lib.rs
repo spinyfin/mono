@@ -1576,8 +1576,11 @@ mod validation {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing recovery bookmark"))?;
             bookmark(value, &op.repo_id)?;
+            // A successor restores its predecessor's preserved work into its
+            // own lease; the source bookmark therefore names the prior run.
+            // All other operations act on the assignment's own pointers.
             ensure!(
-                value.execution_id == run.expect("validated assignment").execution_id,
+                kind == Kind::RestorePreserved || value.execution_id == run.expect("validated assignment").execution_id,
                 "bookmark belongs to another execution"
             );
             allowed.bookmark.clone_from(&op.bookmark);
@@ -1710,6 +1713,15 @@ pub mod workspace {
                 Ok(Err(error)) => {
                     result.code = phase.failure().into();
                     result.reason = format!("workspace operation failed: {error:#}");
+                    if let Some(refusal) = boss_engine_recovery::execution_bookmark::uncontained_refusal_to_wire(&error)
+                    {
+                        // Containment refusal is definitive: the restage was undone.
+                        result.code = ResultCode::Rejected.into();
+                        result.value = Some(command_result::Value::Workspace(WorkspaceResult {
+                            cube_result_json: refusal,
+                            ..Default::default()
+                        }));
+                    }
                     if let Some(cube_error) = error.downcast_ref::<cube::CubeCliError>()
                         && cube_error.positioning_refused()
                     {

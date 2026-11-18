@@ -602,6 +602,7 @@ mod revision_recovery;
 mod revision_sequencing;
 mod semantic_progress_tests;
 mod short_id_alloc_tests;
+mod stale_recovery_hold_tests;
 mod t06;
 mod t07;
 mod t08;
