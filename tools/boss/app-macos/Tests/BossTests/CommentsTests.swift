@@ -597,6 +597,124 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertFalse(bridge.settleIntentRefusal(message: "late duplicate", requestId: requestId), "settled once")
     }
 
+    func testUnrelatedEchoDoesNotConsumeIntentRefusal() throws {
+        let (engine, bridge, layer) = intentBridgeFixture()
+        _ = engine
+        layer.setIntent(.revision, for: layer.comments[0])
+        let request = try XCTUnwrap(bridge.pendingIntentRequests.keys.first)
+        bridge.handleCommentResult(intentWire(status: "resolved"), requestId: "resolve-request")
+        XCTAssertEqual(layer.pendingIntent(for: layer.comments[0]), .revision)
+        XCTAssertTrue(bridge.settleIntentRefusal(message: "Reopen first.", requestId: request))
+        XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Reopen first.")
+    }
+
+    func testOverlappingPicksOnlySettleTheLatestSelection() throws {
+        let (engine, bridge, layer) = intentBridgeFixture()
+        _ = engine
+        layer.setIntent(.revision, for: layer.comments[0])
+        let first = try XCTUnwrap(bridge.pendingIntentRequests.keys.first)
+        layer.setIntent(.question, for: layer.comments[0])
+        let second = try XCTUnwrap(bridge.pendingIntentRequests.keys.first { $0 != first })
+        bridge.handleCommentResult(intentWire(status: "active", intent: "revision"), requestId: first)
+        XCTAssertEqual(layer.pendingIntent(for: layer.comments[0]), .question)
+        XCTAssertEqual(bridge.pendingIntentRequests.count, 1)
+        XCTAssertTrue(bridge.settleIntentRefusal(message: "Cannot change now.", requestId: second))
+        XCTAssertNil(layer.pendingIntent(for: layer.comments[0]))
+        XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Cannot change now.")
+    }
+
+    func testReconnectAbandonsSentPickAndReloadUsesEngineKind() {
+        let (engine, bridge, layer) = intentBridgeFixture()
+        _ = engine
+        layer.setIntent(.revision, for: layer.comments[0])
+        bridge.handleReconnected()
+        bridge.handleCommentsList(artifactKind: "work_item", artifactId: "t",
+                                  comments: [Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", status: "answering", intent: "question")])
+        XCTAssertNil(layer.pendingIntent(for: layer.comments[0]))
+        XCTAssertEqual(layer.comments[0].intent, .question)
+        XCTAssertTrue(layer.intentRefusal(for: layer.comments[0])?.contains("interrupted") == true)
+        XCTAssertTrue(bridge.pendingIntentRequests.isEmpty)
+    }
+
+    func testDisconnectedPickKeepsRetryCorrelationAcrossReconnect() throws {
+        let (engine, bridge, layer) = intentBridgeFixture(connected: false)
+        layer.setIntent(.revision, for: layer.comments[0])
+        let request = try XCTUnwrap(bridge.pendingIntentRequests.keys.first)
+        XCTAssertTrue(engine.isAwaitingRetry(request))
+        XCTAssertEqual(layer.pendingIntent(for: layer.comments[0]), .revision)
+        XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Will send on Retry.")
+        bridge.handleReconnected()
+        XCTAssertEqual(bridge.pendingIntentRequests[request], "cmt_1")
+        XCTAssertTrue(bridge.settleIntentRefusal(message: "Reopen first.", requestId: request))
+        XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Reopen first.")
+    }
+
+    func testRejectedDisconnectedPickDoesNotStayPending() {
+        let (engine, bridge, layer) = intentBridgeFixture(connected: false)
+        for index in 0..<EngineClient.maxUnsentActions {
+            engine.sendLine(["type": "create_chore", "name": "queued-\(index)"])
+        }
+        layer.setIntent(.revision, for: layer.comments[0])
+        XCTAssertTrue(bridge.pendingIntentRequests.isEmpty)
+        XCTAssertNil(layer.pendingIntent(for: layer.comments[0]))
+        XCTAssertTrue(layer.intentRefusal(for: layer.comments[0])?.contains("not sent") == true)
+    }
+
+    func testOlderRefusalLeavesNewerPickPending() throws {
+        let (engine, bridge, layer) = intentBridgeFixture()
+        _ = engine
+        layer.setIntent(.revision, for: layer.comments[0])
+        let first = try XCTUnwrap(bridge.pendingIntentRequests.keys.first)
+        layer.setIntent(.question, for: layer.comments[0])
+        XCTAssertTrue(bridge.settleIntentRefusal(message: "Older refusal.", requestId: first))
+        XCTAssertEqual(layer.pendingIntent(for: layer.comments[0]), .question)
+        XCTAssertNil(layer.intentRefusal(for: layer.comments[0]))
+    }
+
+    func testFallbackRevisionRehomesFailedAnswer() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.comments[0].status = .answerFailed
+        layer.comments[0].intent = .question
+        layer.setIntent(.revision, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].intent, .revision)
+        XCTAssertEqual(layer.comments[0].status, .active)
+    }
+
+    func testCommentResultDecoderPreservesEnvelopeRequestId() async throws {
+        let engine = EngineClient(socketPath: "/tmp/comment-result-unused.sock")
+        let received = expectation(description: "correlated comment echo")
+        engine.onEvent = { event in
+            if case .commentResult(let comment, let requestId) = event {
+                XCTAssertEqual(comment.id, "cmt_1")
+                XCTAssertEqual(requestId, "intent-request")
+                received.fulfill()
+            }
+        }
+        let comment = try JSONSerialization.jsonObject(with: JSONEncoder().encode(intentWire(status: "active")))
+        let data = try JSONSerialization.data(withJSONObject: [
+            "request_id": "intent-request",
+            "payload": ["type": "comment_result", "comment": comment],
+        ])
+        engine.consumeLineForTesting(String(decoding: data, as: UTF8.self))
+        await fulfillment(of: [received], timeout: 2)
+    }
+
+    private func intentBridgeFixture(connected: Bool = true) -> (EngineClient, CommentEngineBridge, CommentLayer) {
+        let engine = EngineClient(socketPath: "/tmp/intent-correlation-unused.sock")
+        engine.simulateConnectedForTesting = connected
+        let bridge = CommentEngineBridge(engine: engine, draftStore: GuideCommentDrafts(directory: nil))
+        let layer = CommentLayer()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: bridge)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", status: "answering", intent: "question")])
+        return (engine, bridge, layer)
+    }
+
+    private func intentWire(status: String, intent: String = "question") -> WorkComment {
+        WorkComment(id: "cmt_1", artifactId: "t", anchor: CommentAnchor(exact: "alpha"), artifactKind: "work_item",
+                    author: "user:me", body: "one", createdAt: "2026-07-04T12:00:00Z", status: status, intent: intent)
+    }
+
     // MARK: - `[Revise]` banner + chips (artifact-less fallback, unchanged behaviour)
 
     /// A `revision`-classified, unclaimed comment renders no chip at all —

@@ -107,7 +107,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// `Created` outcome is reflected by the topic-invalidation-triggered
     /// reload instead). Clears itself a few seconds after being set.
     @Published private(set) var reviseDocMessage: String? = nil
-    /// Kind the operator picked for a comment whose `CommentsSetIntent` call
+    /// Kind picked for a comment whose `CommentsSetIntent` call
     /// has not been answered yet, by comment id. The badge renders it with a
     /// trailing ellipsis; it is never copied onto the comment — the engine's
     /// `comment_result` echo (`applyCommentResult`) or its refusal
@@ -115,7 +115,7 @@ final class CommentLayer: NSObject, ObservableObject {
     @Published private(set) var pendingIntents: [String: CommentIntent] = [:]
     /// The engine's reason for refusing the last kind change, by comment id,
     /// rendered inline under the row's badges. Clears itself after a few
-    /// seconds, or as soon as the operator picks again.
+    /// seconds, or on the next pick.
     @Published private(set) var intentRefusals: [String: String] = [:]
 
     // NSEvent monitor tokens; stored nonisolated(unsafe) because the opaque Any
@@ -838,7 +838,7 @@ final class CommentLayer: NSObject, ObservableObject {
             // stood down rather than waited on. `.inRevision` is deliberately
             // untouched: it's already claimed by a task whose directive is
             // immutable.
-            if [.answering, .answered, .awaitingFollowup].contains(comments[index].status) {
+            if [.answering, .answered, .answerFailed, .awaitingFollowup].contains(comments[index].status) {
                 comments[index].status = .active
                 comments[index].statusActor = "user"
             }
@@ -869,11 +869,13 @@ final class CommentLayer: NSObject, ObservableObject {
     /// Settle the picker from the engine's single-comment echo: the row the
     /// engine replied with is authoritative, so copy its routing fields onto
     /// the local comment right away (the follow-up `reload()` brings thread
-    /// entries and run state) and drop the pending state. A refusal that
-    /// raced an echo is moot too — the echo is newer.
-    func applyCommentResult(_ wire: WorkComment) {
-        pendingIntents[wire.id] = nil
-        intentRefusals[wire.id] = nil
+    /// entries and run state). Only the echo for the latest intent request
+    /// settles its pending selection and clears its notice.
+    func applyCommentResult(_ wire: WorkComment, settlesIntent: Bool = true) {
+        if settlesIntent {
+            pendingIntents[wire.id] = nil
+            intentRefusals[wire.id] = nil
+        }
         guard let index = comments.firstIndex(where: { $0.id == wire.id }) else { return }
         comments[index].intent = wire.intent.flatMap(CommentIntent.init(rawValue:))
         comments[index].intentOverriddenByUser = wire.intentOverriddenBy != nil
@@ -881,6 +883,10 @@ final class CommentLayer: NSObject, ObservableObject {
         comments[index].statusActor = wire.statusActor
         comments[index].reviseTaskId = wire.reviseTaskId
         comments[index].reopenedAt = wire.reopenedAt
+    }
+
+    func showIntentRetryNotice(commentId: String) {
+        intentRefusals[commentId] = "Will send on Retry."
     }
 
     /// The engine refused the last kind change on `commentId`: the picker

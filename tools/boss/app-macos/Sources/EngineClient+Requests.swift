@@ -1137,14 +1137,14 @@ extension EngineClient {
     /// Manually reclassify a comment's intent (sidebar badge override).
     /// Engine replies `comment_result` with the updated `WorkComment`, or a
     /// `work_error` carrying the reason it refused — correlated to the
-    /// returned envelope request id, which is `nil` when nothing was sent.
+    /// returned envelope request id for sent or retained requests; `nil` means rejected.
     @discardableResult
     func sendCommentsSetIntent(commentId: String, intent: String) -> String? {
         sendLine([
             "type": "comments_set_intent",
             "comment_id": commentId,
             "intent": intent,
-        ])
+        ], returnRetainedRequestId: true)
     }
 
     /// Operator-authored reply in a bucket-2 comment's thread. Only valid

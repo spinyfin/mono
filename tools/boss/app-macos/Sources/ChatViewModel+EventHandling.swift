@@ -779,8 +779,8 @@ extension ChatViewModel {
             commentBridge.handleCommentsList(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
         case .commentsResolved(let artifactKind, let artifactId, let comments):
             commentBridge.handleCommentsResolved(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
-        case .commentResult(let comment):
-            commentBridge.handleCommentResult(comment)
+        case .commentResult(let comment, let requestId):
+            commentBridge.handleCommentResult(comment, requestId: requestId)
         case .commentsBannerState(let artifactKind, let artifactId, let state):
             commentBridge.handleCommentsBannerState(artifactKind: artifactKind, artifactId: artifactId, state: state)
         case .commentsReviseDocResult(let outcome):
