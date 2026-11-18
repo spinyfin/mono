@@ -256,14 +256,14 @@ fn post_tool_use_clears_current_tool_and_records_end_time() {
 }
 
 #[test]
-fn stop_after_tools_transitions_to_idle() {
+fn stop_after_tools_transitions_to_waiting_for_input() {
     let reg = LiveWorkerStateRegistry::new();
     reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
     reg.apply_event(1, &pre_tool("Bash"));
     reg.apply_event(1, &post_tool("Bash"));
     reg.apply_event(1, &stop_event());
     let state = reg.get(1).unwrap();
-    assert_eq!(state.activity, WorkerActivity::Idle);
+    assert_eq!(state.activity, WorkerActivity::WaitingForInput);
     assert!(state.current_tool.is_none());
 }
 
@@ -297,8 +297,8 @@ fn pretooluse_after_notification_clears_pending_flag_and_marks_working() {
     reg.apply_event(1, &pre_tool("Edit"));
     reg.apply_event(1, &stop_event());
     let state = reg.get(1).unwrap();
-    // Stop without a fresh notification should now be Idle.
-    assert_eq!(state.activity, WorkerActivity::Idle);
+    // Stop without a declared wait still requires input.
+    assert_eq!(state.activity, WorkerActivity::WaitingForInput);
 }
 
 #[test]
@@ -562,8 +562,8 @@ fn apply_event_reports_changed_for_a_meaningful_field() {
 /// Replays a representative multi-worker trace through `apply_event`.
 /// Each turn has two duplicate `Stop`s while idle plus a redundant
 /// `Notification` while already waiting for input; those three events
-/// must be suppressed. The first `Notification` is meaningful because
-/// `register_spawn` enables awaiting-input capability by default.
+/// plus both notifications must be suppressed: Stop already requires input
+/// for a worker with awaiting-input capability.
 #[test]
 fn apply_event_dedup_broadcast_rate_over_a_multi_worker_trace() {
     const WORKER_COUNT: u8 = 6; // matches the six-worker incident noted on `SessionEnd` above.
@@ -594,8 +594,8 @@ fn apply_event_dedup_broadcast_rate_over_a_multi_worker_trace() {
                 events.push(post_tool(&tool));
             }
             events.push(stop_event());
-            // The first Notification promotes Idle to WaitingForInput;
-            // the second is redundant. Force timestamp movement before
+            // Stop already projects WaitingForInput; both notifications
+            // are redundant. Force timestamp movement before
             // every no-op so this trace cannot pass due to the clock's
             // second-level granularity.
             events.push(stop_event());
@@ -625,8 +625,8 @@ fn apply_event_dedup_broadcast_rate_over_a_multi_worker_trace() {
 
     assert!(broadcast_events < total_events);
     assert_eq!(total_events, 1080);
-    assert_eq!(broadcast_events, 810);
-    assert_eq!(suppressed, 270);
+    assert_eq!(broadcast_events, 720);
+    assert_eq!(suppressed, 360);
 }
 
 #[test]
@@ -1412,7 +1412,7 @@ fn a_tool_call_after_stop_resumes_working_without_a_user_prompt() {
     reg.apply_event(1, &pre_tool("Bash"));
     reg.apply_event(1, &post_tool("Bash"));
     assert!(reg.apply_event(1, &stop_event()));
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 
     assert!(reg.apply_event(1, &pre_tool("Read")));
     let state = reg.get(1).unwrap();
@@ -1421,7 +1421,7 @@ fn a_tool_call_after_stop_resumes_working_without_a_user_prompt() {
 
     assert!(reg.apply_event(1, &stop_event()));
     let state = reg.get(1).unwrap();
-    assert_eq!(state.activity, WorkerActivity::Idle);
+    assert_eq!(state.activity, WorkerActivity::WaitingForInput);
     assert!(state.current_tool.is_none());
 }
 
@@ -1457,7 +1457,7 @@ fn a_stop_that_arrives_behind_a_later_tool_event_cannot_rewind_the_slot() {
         ApplyEventOutcome::Applied { changed: true }
     );
     let state = reg.get(1).unwrap();
-    assert_eq!(state.activity, WorkerActivity::Idle);
+    assert_eq!(state.activity, WorkerActivity::WaitingForInput);
     assert!(state.current_tool.is_none());
 }
 
@@ -1488,7 +1488,7 @@ fn unsequenced_events_always_apply_even_after_sequenced_ones() {
     reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
     reg.apply_sequenced_event(1, Some(7), &pre_tool("Bash"));
     assert!(reg.apply_event(1, &stop_event()));
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
     // And a later sequenced event is still judged against the newest
     // sequenced one, not against the unsequenced event in between.
     assert_eq!(
@@ -1648,17 +1648,17 @@ fn a_notification_overtaken_by_its_stop_still_makes_the_stop_waiting_for_input()
         applied(&reg, 3, &stop_event(), false).outcome,
         ApplyEventOutcome::Applied { changed: true }
     );
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 
     let late = applied(&reg, 2, &notification_event(), false);
     assert_eq!(late.outcome, ApplyEventOutcome::Stale { last_applied_seq: 3 });
     assert!(late.repaired, "the slot changed even though the event was late");
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
     // Same result as emission order: the flag was consumed by the Stop, so
-    // the next turn's Stop is a plain Idle.
+    // the next turn's Stop still requires input without a wait.
     applied(&reg, 4, &pre_tool("Bash"), false);
     applied(&reg, 5, &stop_event(), false);
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 }
 
 #[test]
@@ -1686,7 +1686,7 @@ fn a_notification_overtaken_by_a_pre_tool_use_is_moot() {
     applied(&reg, 3, &pre_tool("Read"), false);
     assert!(!applied(&reg, 2, &notification_event(), false).repaired);
     applied(&reg, 4, &stop_event(), false);
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 }
 
 #[test]
@@ -1702,7 +1702,7 @@ fn late_notification_uses_first_consumer_across_stop_boundaries() {
         }
         applied(&reg, 5, &stop_event(), false);
         assert!(!applied(&reg, 2, &notification_event(), false).repaired);
-        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
     }
 }
 
@@ -1714,9 +1714,9 @@ fn a_consumer_arriving_after_a_repairing_notification_reverts_the_repair() {
     assert!(applied(&reg, 2, &notification_event(), false).repaired);
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
     assert!(applied(&reg, 3, &pre_tool("Read"), false).repaired);
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
     assert!(!applied(&reg, 4, &post_tool("Read"), false).repaired);
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 }
 
 #[test]
@@ -1727,7 +1727,7 @@ fn a_consumer_arriving_after_a_pending_late_notification_clears_it() {
     assert!(!applied(&reg, 2, &notification_event(), false).repaired);
     assert!(!applied(&reg, 3, &pre_tool("Read"), false).repaired);
     applied(&reg, 5, &stop_event(), false);
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 }
 
 #[test]

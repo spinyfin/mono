@@ -4,10 +4,10 @@
 //! from idle-park *and* stale-worker reap. This registry is the worker's own
 //! "I am deliberately waiting" signal, submitted through `boss propose wait`.
 //! It suppresses only the produce-a-PR nudge and the nudge circuit breaker.
-//! A declaration belongs to the park it was made in: main-session activity
-//! after a Stop consumes it without refunding the charged duration
-//! ([`WaitRegistry::end_if_declared_before`]). The 2-hour stale-worker reap,
-//! pane-death / dead-pid reconcile, hook-trust, and every other safety check
+//! An accepted declaration survives resumed turns until its bounded deadline.
+//! Status replies and job checks do not prove the background job finished.
+//! The 2-hour stale-worker reap, pane-death / dead-pid reconcile, hook-trust,
+//! and every other safety check
 //! keep firing.
 //!
 //! Each declaration is capped at [`boss_protocol::WAIT_MAX_DURATION_SECS`];
@@ -39,13 +39,8 @@ pub struct WaitRecord {
     /// Duration charged against the per-execution total for this
     /// declaration, in seconds.
     pub granted_secs: u64,
-    /// Ingress sequence of the newest hook the worker's slot had applied when
-    /// the wait was declared (`None` when the worker has no sequenced hooks
-    /// yet). A turn boundary numbered above it ended the turn the wait was
-    /// declared in; one numbered below it belongs to an earlier turn and says
-    /// nothing about this wait. See [`WaitRegistry::end_if_declared_before`].
-    /// Also used to project a stopped worker as waiting on its job rather than
-    /// waiting for input.
+    /// Newest accepted hook sequence when declared, used to project a stopped
+    /// worker as waiting on its job while keeping mid-turn prompts visible.
     pub declared_after_seq: Option<u64>,
 }
 
@@ -240,34 +235,6 @@ impl WaitRegistry {
             .is_some_and(|record| record.expires_at_epoch <= now_epoch_secs)
     }
 
-    /// End the active wait for `execution_id` because the worker's main
-    /// session resumed at `resume_seq`, without touching the budget the wait
-    /// has already been charged. Returns the record that was ended, or `None`
-    /// when nothing was active or the wait was declared at or after
-    /// `resume_seq` (inside the resumed turn, so this resume does not end it).
-    pub fn end_if_declared_before(&self, execution_id: &str, resume_seq: Option<u64>) -> Option<WaitRecord> {
-        let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
-        let state = guard.get_mut(execution_id)?;
-        if let (Some(declared), Some(resume)) = (state.active.as_ref()?.declared_after_seq, resume_seq)
-            && declared >= resume
-        {
-            return None;
-        }
-        // A declaration older than the resume was made while the worker was
-        // parked, however many hooks (its own idle notification, other
-        // workers') were accepted since the Stop. It ends on this resume.
-        let ended = state.active.take()?;
-        state.expiry_logged = false;
-        tracing::info!(
-            execution_id,
-            reason = %ended.reason,
-            expires_at_epoch = ended.expires_at_epoch,
-            total_granted_secs = state.total_granted_secs,
-            "worker wait ended — the worker resumed a turn before expiry; produce-a-PR nudge ladder resumes"
-        );
-        Some(ended)
-    }
-
     /// Cumulative seconds already granted to `execution_id`.
     pub fn total_granted_secs(&self, execution_id: &str) -> u64 {
         self.inner
@@ -293,10 +260,6 @@ impl WaitRegistry {
 }
 
 impl boss_engine_live_worker_state::DeclaredWaitSource for WaitRegistry {
-    fn resume(&self, run_id: &str, resume_seq: Option<u64>) {
-        self.end_if_declared_before(run_id, resume_seq);
-    }
-
     fn declared_wait(&self, run_id: &str, now_epoch_secs: i64) -> boss_engine_live_worker_state::DeclaredWait {
         use boss_engine_live_worker_state::DeclaredWait;
         if self.active(run_id, now_epoch_secs).is_some() {
@@ -426,43 +389,17 @@ mod tests {
     }
 
     #[test]
-    fn end_if_declared_before_drops_the_wait_but_keeps_the_budget_charged() {
-        let registry = WaitRegistry::new();
-        registry.declare("exec_a", "bazel".into(), None, 60, 0).unwrap();
-        let ended = registry
-            .end_if_declared_before("exec_a", Some(5))
-            .expect("the active wait is returned");
-        assert_eq!(ended.reason, "bazel");
-        assert!(registry.active("exec_a", 0).is_none());
-        assert_eq!(
-            registry.total_granted_secs("exec_a"),
-            60,
-            "ending a wait early is not a refund against the per-execution cap"
-        );
-        assert!(
-            registry.end_if_declared_before("exec_a", None).is_none(),
-            "nothing is left to end"
-        );
-        assert!(registry.end_if_declared_before("exec_unknown", None).is_none());
-        registry
-            .declare("exec_a", "still waiting".into(), None, 30, 10)
-            .unwrap();
-        assert_eq!(registry.total_granted_secs("exec_a"), 90);
-        assert!(registry.active("exec_a", 10).is_some());
-    }
-
-    #[test]
-    fn a_resume_at_or_before_the_declaration_does_not_end_the_wait() {
+    fn reading_a_wait_preserves_its_deadline_and_charged_duration() {
         let registry = WaitRegistry::new();
         registry
             .declare_after("exec_a", "bazel".into(), None, 60, 0, Some(10))
             .unwrap();
-        assert!(
-            registry.end_if_declared_before("exec_a", Some(10)).is_none(),
-            "declared inside the resumed turn"
-        );
-        assert!(registry.end_if_declared_before("exec_a", Some(7)).is_none());
-        assert!(registry.active("exec_a", 0).is_some());
-        assert!(registry.end_if_declared_before("exec_a", Some(11)).is_some());
+        for now in [0, 10, 59] {
+            assert_eq!(registry.active("exec_a", now).unwrap().expires_at_epoch, 60);
+            assert_eq!(registry.total_granted_secs("exec_a"), 60);
+        }
+        assert!(registry.active("exec_a", 60).is_none());
+        assert!(registry.lapsed("exec_a", 60));
+        assert_eq!(registry.total_granted_secs("exec_a"), 60);
     }
 }

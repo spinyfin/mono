@@ -46,10 +46,6 @@ impl StubWaits {
 }
 
 impl DeclaredWaitSource for StubWaits {
-    fn resume(&self, _run_id: &str, _resume_seq: Option<u64>) {
-        self.set(DeclaredWait::None);
-    }
-
     fn declared_wait(&self, _run_id: &str, _now_epoch_secs: i64) -> DeclaredWait {
         match self.0.load(Ordering::SeqCst) {
             x if x == DeclaredWait::Live as u8 => DeclaredWait::Live,
@@ -94,17 +90,15 @@ fn the_idle_prompt_after_a_live_wait_stop_stays_waiting_on_work() {
 }
 
 #[test]
-fn stop_with_no_wait_and_no_prompt_is_still_idle() {
+fn stop_with_no_wait_and_no_background_work_needs_input() {
     let (reg, _waits) = fixture();
     reg.apply_event(1, &working());
     reg.apply_event(1, &stop());
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 }
 
 #[test]
 fn idle_prompt_with_no_wait_still_needs_input() {
-    // Acceptance case for a no-wait human park: Claude emits Stop followed
-    // by the idle prompt; a bare Stop alone only marks the turn boundary.
     let (reg, _waits) = fixture();
     reg.apply_event(1, &working());
     reg.apply_event(1, &stop());
@@ -160,7 +154,7 @@ fn a_wake_up_after_expiry_returns_to_working() {
     reg.apply_event(1, &working());
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
     reg.apply_event(1, &stop());
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
 }
 
 #[test]
@@ -185,7 +179,7 @@ fn without_a_wait_source_nothing_changes() {
     reg.register_spawn(1, "run-1", "claude-opus-4-7", 0, None);
     reg.apply_event(1, &working());
     reg.apply_event(1, &stop());
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
     assert!(reg.reconcile_declared_waits(now()).is_empty());
 }
 
@@ -248,10 +242,10 @@ fn subagent_activity_does_not_consume_the_main_sessions_wait() {
     );
     assert_eq!(waits.declared_wait("run-1", now()), DeclaredWait::Live);
     reg.apply_event(1, &working());
-    assert_eq!(waits.declared_wait("run-1", now()), DeclaredWait::None);
+    assert_eq!(waits.declared_wait("run-1", now()), DeclaredWait::Live);
     reg.apply_event(1, &stop());
     reg.apply_event(1, &notification(IDLE_PROMPT));
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingOnWork);
 }
 
 #[test]
@@ -294,7 +288,7 @@ fn continuing_after_permission_without_a_stop_preserves_the_wait() {
 }
 
 #[test]
-fn resumed_wait_cannot_hide_a_later_human_prompt() {
+fn resumed_wait_preserves_classification_but_cannot_hide_a_blocking_prompt() {
     for wait in [DeclaredWait::Live, DeclaredWait::Lapsed] {
         for resume in [
             working(),
@@ -311,9 +305,9 @@ fn resumed_wait_cannot_hide_a_later_human_prompt() {
 
             reg.apply_event(1, &resume);
             assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
-            assert_eq!(waits.declared_wait("run-1", now()), DeclaredWait::None);
+            assert_eq!(waits.declared_wait("run-1", now()), wait);
             reg.apply_event(1, &stop());
-            reg.apply_event(1, &notification(IDLE_PROMPT));
+            reg.apply_event(1, &notification("Permission required"));
             let parked = &reg.snapshot()[0];
             assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
             assert!(parked.activity.needs_human());

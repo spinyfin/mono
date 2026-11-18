@@ -1917,8 +1917,8 @@ impl LiveWorkerStateRegistry {
     ///   events after it did not clear);
     /// - a `Stop` overtaken by the resumed turn's tool hook still opened a
     ///   turn boundary, which is reported through
-    ///   [`HookApplied::resumed_after`] and consumes the wait declared before
-    ///   that boundary before another event can read it.
+    ///   [`HookApplied::resumed_after`] without consuming the wait declared before
+    ///   that boundary.
     ///
     /// Every other late event describes a state the worker has already left
     /// and is refused.
@@ -1968,18 +1968,6 @@ impl LiveWorkerStateRegistry {
                      the slot already reflects what the worker did after it",
                 );
                 let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin);
-                if resumed_after.is_some()
-                    && let Some(source) = &wait_source
-                {
-                    // The Stop proves the resume only through the main-session
-                    // activity that overtook it; any other late event is itself
-                    // the resume.
-                    let resume_seq = match event {
-                        WorkerEvent::Stop { .. } => meta.last_main_activity_seq,
-                        _ => Some(ingress_seq),
-                    };
-                    source.resume(&state.run_id, resume_seq);
-                }
                 if repaired && matches!(state.activity, WorkerActivity::Idle | WorkerActivity::WaitingForInput) {
                     state.activity = settle_parked(
                         state.activity,
@@ -1998,12 +1986,6 @@ impl LiveWorkerStateRegistry {
         }
         let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
         let before = state.clone();
-
-        if resumed_after.is_some()
-            && let Some(source) = &wait_source
-        {
-            source.resume(&state.run_id, ingress_seq);
-        }
 
         // A replayed hook carries the time the host saw it. Both the display
         // stamp and the liveness checkpoint use that time, so draining a
@@ -2143,7 +2125,11 @@ impl LiveWorkerStateRegistry {
                 } else {
                     WorkerActivity::Idle
                 };
-                state.activity = settle_parked(raw, blocking, wait_state(&wait_source, &state.run_id));
+                state.activity = if meta.awaiting_input_capable {
+                    settle_parked(raw, blocking, wait_state(&wait_source, &state.run_id))
+                } else {
+                    raw
+                };
             }
             WorkerEvent::SessionEnd { .. } => {
                 state.activity = WorkerActivity::Terminated;
@@ -2795,7 +2781,10 @@ fn reconcile_late_event(
                     if stop_is_newest
                         && matches!(
                             state.activity,
-                            WorkerActivity::Idle | WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue
+                            WorkerActivity::Idle
+                                | WorkerActivity::WaitingForInput
+                                | WorkerActivity::WaitingOnWork
+                                | WorkerActivity::WaitOverdue
                         )
                     {
                         meta.blocking_prompt_pending |= !is_idle_prompt_message(message);

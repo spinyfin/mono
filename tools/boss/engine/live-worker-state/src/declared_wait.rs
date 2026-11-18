@@ -17,7 +17,7 @@
 //! | idle prompt / `Stop`, declared wait still live            | `WaitingOnWork`  |
 //! | idle prompt / `Stop`, unconsumed wait has lapsed           | `WaitOverdue`    |
 //! | idle prompt, no wait                                      | `WaitingForInput` |
-//! | `Stop`, no wait                                           | `Idle`           |
+//! | `Stop`, no wait                                           | `WaitingForInput`           |
 //!
 //! A blocking prompt always wins: a worker with a live wait that hits a
 //! permission prompt really does need a person.
@@ -43,13 +43,6 @@ pub enum DeclaredWait {
 /// below completion: the wait registry implements the trait there.
 pub trait DeclaredWaitSource: Send + Sync {
     fn declared_wait(&self, run_id: &str, now_epoch_secs: i64) -> DeclaredWait;
-
-    /// Consume the declaration when the worker resumes from a park.
-    /// `resume_seq` is the ingress sequence of the main-session event that
-    /// proves the resume. A wait declared before it belongs to the park being
-    /// resumed from; one declared at or after it was made inside the resumed
-    /// turn and is kept.
-    fn resume(&self, run_id: &str, resume_seq: Option<u64>);
 }
 
 pub(super) type SharedWaitSource = Arc<dyn DeclaredWaitSource>;
@@ -67,7 +60,7 @@ pub(super) fn is_idle_prompt_message(message: &str) -> bool {
 ///
 /// A pending `blocking_prompt` needs a person, whatever the wait says.
 ///
-/// Consumed declarations are cleared when a parked worker resumes.
+/// Declarations survive resumed turns until their bounded deadline.
 pub(super) fn settle_parked(raw: WorkerActivity, blocking_prompt: bool, wait: DeclaredWait) -> WorkerActivity {
     if raw == WorkerActivity::WaitingForInput && blocking_prompt {
         return raw;
@@ -75,7 +68,7 @@ pub(super) fn settle_parked(raw: WorkerActivity, blocking_prompt: bool, wait: De
     match wait {
         DeclaredWait::Live => WorkerActivity::WaitingOnWork,
         DeclaredWait::Lapsed => WorkerActivity::WaitOverdue,
-        DeclaredWait::None => raw,
+        DeclaredWait::None => WorkerActivity::WaitingForInput,
     }
 }
 
@@ -120,8 +113,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_without_wait_stays_idle() {
-        assert_eq!(settle_parked(Idle, false, DeclaredWait::None), Idle);
+    fn stop_without_wait_needs_input() {
+        assert_eq!(settle_parked(Idle, false, DeclaredWait::None), WaitingForInput);
     }
 
     #[test]

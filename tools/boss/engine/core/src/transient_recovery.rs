@@ -1281,15 +1281,8 @@ mod tests {
                 execution_id: execution_id.to_owned(),
             }),
         );
-        // Drive Spawning → Idle via a Stop event (no pending notification).
-        live_states.apply_event(
-            slot_id,
-            &boss_protocol::WorkerEvent::Stop {
-                session_id: "s".to_owned(),
-                stop_hook_active: false,
-                stop_reason: boss_protocol::StopReason::Completed,
-            },
-        );
+        // Seed legacy Idle explicitly; a no-wait Stop now requires input.
+        live_states.set_activity_for_test(slot_id, WorkerActivity::Idle);
     }
 
     const SOCKET_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: The socket connection was closed unexpectedly."}]}}"#;

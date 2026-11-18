@@ -111,9 +111,9 @@ fn hook_stop_and_agy_stop_produce_identical_turn_end() {
 }
 
 #[test]
-fn decoded_event_sequence_drives_activity_machine_to_idle_from_either_source() {
+fn decoded_event_sequence_requires_input_after_stop_from_either_source() {
     // Claim 2: apply_event is fed WorkerEvents (not TurnEnd). Every
-    // transport's decoded sequence leaves the live-worker slot Idle after
+    // transport's decoded sequence leaves the input-capable slot waiting after
     // the turn.
     let codex = codex_shaped_driver();
     let grok = GrokDriver::default();
@@ -146,8 +146,8 @@ fn decoded_event_sequence_drives_activity_machine_to_idle_from_either_source() {
         let state = reg.get(1).expect("slot still registered");
         assert_eq!(
             state.activity,
-            WorkerActivity::Idle,
-            "{label}: completed turn must leave the slot Idle, got {:?}",
+            WorkerActivity::WaitingForInput,
+            "{label}: completed turn without a wait must require input, got {:?}",
             state.activity,
         );
         assert!(

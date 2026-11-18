@@ -797,7 +797,7 @@ async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idl
     );
     assert_eq!(
         live_states.activity_for_run(&execution_id),
-        Some(boss_protocol::WorkerActivity::Idle),
+        Some(boss_protocol::WorkerActivity::WaitingForInput),
         "fixture must model the worker having already reached its own Stop boundary",
     );
 
