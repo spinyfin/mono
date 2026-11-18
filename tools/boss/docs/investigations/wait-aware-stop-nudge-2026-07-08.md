@@ -1,0 +1,338 @@
+# Design: Wait-aware Stop handling — let workers block on background subagents without tripping the produce-a-PR nudge
+
+**Date:** 2026-07-08 · **Refreshed:** 2026-07-18 — all `file:line` citations re-verified against current `main`; §1 expanded with the two T2856-era incidents (the T2843 completion-path finalization, the T2856 reap/redispatch) and the coordinator workaround; §2.4 added to position the tactical fixes that landed in between (T875, the T2608/T2612 build-wait suppression, T2618, the husk-pane sweep, and the in-flight T2865).
+**Status:** Investigation + design. **No code changes** — the deliverable is this doc. Concrete follow-up code tasks are listed in §10 for the operator to file separately.
+**Lineage:** produce-PR nudge-loop diagnostics (T740 era, the "Worf" loop `exec_18b3945c5b7d7e78_1b`), the sanctioned no-op marker (`NO_CHANGES_NEEDED`, T1868), the worker-escalation markers (`[effort-escalation]` / `[blocked]`, T2085), and the automation-triage decision-marker work (T2348). This doc extends that same marker/nudge-suppression machinery to a new failure mode. The 2026-07-18 refresh folds in the T2856 investigation's evidence, which upgraded this from "one observed nudge misfire" to a family of liveness misjudgments the fleet has now hit three separate ways (§1).
+
+## TL;DR
+
+A worker that spawns a background subagent (the Claude Code `Agent`/`Task` tool) and **deliberately stops its turn to wait** for the subagent's completion is doing the correct, token-efficient thing: the harness re-invokes the session when the tracked background work finishes. But the engine's Stop-boundary handler cannot tell that Stop apart from "worker finished, no PR" — so it fires the `PROBE_NO_PR` nudge (`completion.rs:1980-1982`), which is injected into the pane _as if the human typed it_ (`app/worker_events.rs:640`). That injection pre-empts the wait: in the first observed incident (§1.1) the worker abandoned its pending subagent, re-did the investigation inline (duplicated work, wasted tokens), then spawned yet another agent.
+
+**Root cause:** when a worker Stops, the engine decides finalize/nudge/park purely from PR/branch state + execution kind + final-message markers. It has **no signal that a harness-tracked background agent is still outstanding** (`WorkerEvent` has 7 variants, none of them `SubagentStop`; `driver/claude.rs:109-118`).
+
+**Since first writing (refresh, 2026-07-18):** the same blindness has produced two further coordinator-verified incidents — the engine **finalized a run as `completed` and routed its PR while the worker's background subagents were still working** (§1.2), and a worker was **reaped mid-background-work and its task redispatched from scratch to a fresh worker** (§1.3) — and the coordinator ultimately had to run the affected investigation task **outside the worker fleet entirely**, with manual cube-lease heartbeating (§1.4). The durable design claim this evidence sharpens: **a Stop boundary is not completion while the worker has live background children**, and nudging, idle-park, completion finalization, and lease heartbeating should all key on **one unified worker-liveness definition** that includes descendant processes / harness background-task state (§7). Tactical fixes landed in between (T875, the T2608/T2612 build-wait suppression, T2618, the husk-pane sweep; T2865 in flight) each cover one corner; §2.4 positions them so scopes don't overlap.
+
+**Authoritative hook facts** (verified against `code.claude.com/docs/en/hooks.md`, 2026-07-08):
+
+- The `Stop` payload carries `last_assistant_message` (the final assistant text of the turn) plus the common fields (`session_id`, `transcript_path`, `cwd`, `permission_mode`, …). **There is no documented field that signals pending background/async work at the main Stop.** (An earlier research pass floated a `background_tasks` array; it is **not** in the official reference. It is not rejected outright — see §3.2 and §9 for the empirical work that would be needed to earn trust in it as an opportunistic corroborator — but it must not be a sole or primary signal today.)
+- `SubagentStop` **is** a documented, stable hook that fires "when a subagent finishes," carrying `agent_id` and `agent_type`. Boss does **not** currently wire it.
+- The transcript JSONL schema is documented as "internal and subject to change," so transcript-shape inspection is explicitly unsupported.
+
+**Recommendation (§7):** a **hybrid**. Primary signal is a worker-emitted **`[waiting]` marker**, parsed from `last_assistant_message` in the same family as `[effort-escalation]`/`[blocked]` but with _self-clearing, no-human-attention_ semantics. Backstop signal is **engine-side SubagentStop-vs-spawn counting** (wire the documented `SubagentStop` hook; the engine already sees the spawn via `PreToolUse{tool_name:"Task"}`). Suppression is **bounded** — by the subagent actually returning, by an absolute waiting cap analogous to `ABSOLUTE_MAX_NUDGES`, and by the existing `stale_worker_sweep` as the ultimate hang backstop — so hang detection does not regress.
+
+---
+
+## 1. The incidents
+
+What was a single observed incident when this doc was first written is now three, each hitting a different edge of the same blindness. Together they show the problem is not "the nudge fires at an awkward moment" but that **every liveness-dependent decision the engine makes about a worker — nudge, park, finalize, route, reap, sweep the lease — is blind to live background children**.
+
+### 1.1 The nudge pre-empts a wait (2026-07-07)
+
+Operator report (verbatim worker transcript excerpt):
+
+> I'll pause here and wait for the research agent's findings before proceeding.
+>
+> ✻ Waiting for 1 background agent to finish
+>
+> ❯ You stopped without producing a PR for this work. If the work is complete, open the PR with `cube pr create --branch <bookmark>` … If you're blocked, explain what you need.
+>
+> The wait mechanism isn't giving me a notification promptly, so I'll investigate directly instead of blocking on the background agent.
+
+The worker stopped its main turn (idle, "Waiting for 1 background agent"). The engine saw a `Stop`, found no PR on the branch, and injected `PROBE_NO_PR`. The nudge arrived as the next user prompt, the worker read it as "you should be producing a PR, not idling," abandoned the pending subagent, and redid the work inline.
+
+**Two distinct harms** (a third, worse one appears in §1.2):
+
+1. **The observed one — wasted work.** The worker discards a running subagent and re-does it inline. Pure token/latency waste, and it defeats the entire point of fanning work out to a subagent.
+2. **The more dangerous cousin — already partially mitigated by prompt.** A worker that opens the _terminal_ PR while background work is still in flight loses the background result entirely, because PR creation reaps the worker. This is exactly the incident behind `pr_terminal_directive` (`runner.rs:1830`, injected into the brief at `runner.rs:1554`): "a worker opened a PR, then tried to wait for background review subagents … The engine terminated the worker the moment the PR was created, so the review was never consumed." The nudge can _push a waiting worker toward_ this failure by telling it to open the PR now.
+
+### 1.2 The completion path has the same blind spot — run finalized as `completed` with children still working (T2843)
+
+Worker "Riker" finished chore T2843 and hit a Stop boundary while its session **still had live background subagents**. The engine's completion handler found the PR, finalized the run as `completed`, and routed the PR at 10:29:54Z (`exec_18c2e56b18170180_1cd`). The children kept working — past noon — and their hook events kept arriving at an engine that had already terminalized the run, producing a stream of
+
+```
+[engine-reconcile] live hook event arrived for a TERMINAL execution
+```
+
+warns (`app/worker_events.rs:446`, in `dispatch_live_worker_state`).
+
+This is a **distinct failure mode from harm #2 above**. Harm #2 is PR _creation_ reaping a still-waiting worker — the worker-initiated edge, mitigated by prompt convention. This is the engine-initiated edge on the _success_ path: `on_stop_inner` treated "Stop + PR present" as "run complete" and **finalized a run whose worker was not done**, with whatever the children produced falling outside the engine's view entirely. No prompt directive can cover it, because the worker did nothing wrong — the engine's own definition of completion is what lacks the liveness check. §4.4 extends the design to gate this path on the same waiting signal as the nudge.
+
+Two side-effects of this incident feed §9's open questions: a main `Stop` demonstrably fires — and is acted on — while background subagents are outstanding (§9 item 1, now confirmed), and subagent activity demonstrably reaches the engine as hook events carrying the parent run's id — that is exactly what the TERMINAL warns are (§9 item 2, strong evidence).
+
+The husk-pane sweep (`husk_pane_sweep.rs`, landed since) cites this same warn line as its motivating symptom and retires leftover panes after this class of divergence. Note the division of labor: the sweeps are _reconcilers_ — they clean up after the engine's liveness misjudgment. This design is about not making the misjudgment.
+
+### 1.3 Reap-mid-background-work, second occurrence — and redispatch from scratch (T2856)
+
+Riker then picked up T2856 — the investigation task into these very incidents — fanned work out to background agents, and was **reaped mid-background-work**. The engine then **redispatched the task to a fresh worker ("La Forge"), which started the investigation over from scratch**: the second occurrence of lost background work inside a week, this time with the added cost of a full redo. Which reap path fired matters less than what they all key on: none of the candidates — the nudge-breaker park (which since `exec_18b932df99d17658_475` deliberately tears down the lease and pane via `finalize_idle_park`, `completion.rs:4759`), the stale-worker sweep (whose reap flow marks the execution orphaned and kicks the coordinator to redispatch the stranded work), or lease-liveness sweeping — includes background children in its liveness definition.
+
+### 1.4 The coordinator workaround — and the prioritization argument
+
+To let T2856 finish at all, the coordinator had to **pull the task out of the worker fleet entirely**: park the row with `autostart` off, stop the redispatched worker, and run the investigation as a coordinator-side background agent with **manual cube-lease heartbeating** to keep the lease alive. That is the strongest prioritization signal this doc can cite: "long background tasks" work is currently **incompatible with the Boss worker model** — the only way to run one to completion was to hand-operate around every piece of engine automation this doc touches (nudges, idle-park, completion finalization, lease liveness). The design below is what makes that class of work first-class instead of hand-carried.
+
+---
+
+## 2. How the Stop → nudge path works today (grounding)
+
+### 2.1 Hook plumbing
+
+Every worker's Claude settings wire **seven** lifecycle hooks — `SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, Notification, SessionEnd` (`driver/claude.rs:109-118`) — to the `boss-event` shim (`event-shim/src/main.rs`), which forwards the raw hook JSON over the engine's Unix events socket, splicing in `_boss_run_id` from the environment (`event-shim/src/main.rs:176-189`) — which is why a subagent's hook events carry the parent run's id (§1.2). `normalize_hook_event` turns each payload into a typed `WorkerEvent` (`protocol/src/worker_event.rs:84-135`).
+
+The `Stop` variant carries almost nothing:
+
+```rust
+// protocol/src/worker_event.rs:34-38
+Stop {
+    session_id: String,
+    stop_hook_active: bool,
+    stop_reason: StopReason,   // always normalized to Completed; a sequencer may overwrite
+}
+```
+
+- `transcript_path` rides the **envelope** (`IncomingHookEvent`, `events_socket.rs:52-57`), not the `Stop` variant, and is persisted onto `WorkRun` the first time it is seen. So the engine already _has_ the transcript path at every Stop.
+- **No `SubagentStop`.** `WorkerEvent` has exactly the seven variants above; `normalize_hook_event` returns `UnknownEvent` for anything else (`worker_event.rs:133`). The engine is structurally blind to subagent lifecycle.
+- `last_assistant_message` is present in the raw Stop payload (per the hook docs) but is **not currently captured** by `normalize_hook_event` — today the engine reconstructs the final message by tailing the transcript instead (`read_final_triage_message`, `completion.rs:3288`).
+
+### 2.2 The nudge decision
+
+`dispatch_completion_on_stop` (`app/worker_events.rs:1129`) routes a `Stop` into `WorkerCompletionHandler::on_stop` → `on_stop_inner` (`completion.rs:1210`/`1366`). After the staged-PR fast path and `detect_pr`, the no-PR branch (`PrStatus::None | Closed`, `completion.rs:1878`) walks a series of guards — bound sibling PR? `ci_remediation`/`revision` with no PR → park? `NO_CHANGES_NEEDED` marker → no-op success? — and, only if all decline, fires the nudge:
+
+```rust
+// completion.rs:1980-1982
+return self
+    .nudge_or_park(&execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
+    .await;
+```
+
+`nudge_or_park` (`completion.rs:4501`) is the **single choke point** for every auto-nudge. It (a) refuses to nudge and returns `EscalationPending` if the worker has an unresolved `[effort-escalation]`/`[blocked]` attention item (`completion.rs:4509-4525`); (b) — landed since this doc was first written — returns `BuildWaitPending` without consulting the breaker when the final message narrates a legitimate backgrounded build/test wait (`detect_build_wait_signal`, horizon-bounded by `build_wait_tracker`; `completion.rs:4526-4579`, positioned in §2.4); else (c) records intent against the `NudgeBreaker` and either queues the probe, waits out a debounce, or parks:
+
+```rust
+// completion.rs:4580-4621
+match self.nudge_breaker.record(&execution.id, fingerprint, self.max_unproductive_nudges, (self.now_fn)()) {
+    NudgeDecision::Proceed { count }      => { … self.probe_queuer.queue_probe(&execution.id, probe_text); proceed_outcome }
+    NudgeDecision::TooSoon { since_last } => { /* debounce: same fingerprint re-fired seconds later — wait quietly */ proceed_outcome }
+    NudgeDecision::Trip    { count }      => { self.park_for_unproductive_nudges(…).await }
+}
+```
+
+The breaker (`nudge_breaker.rs`) caps `DEFAULT_MAX_UNPRODUCTIVE_NUDGES = 3` consecutive _same-fingerprint_ nudges and `ABSOLUTE_MAX_NUDGES = 12` cross-fingerprint total; the fingerprint for the no-PR case is the constant `"no_pr"`, so a repeatedly-waiting worker never changes fingerprint and is parked after 3 nudges. **Parking is itself a bad outcome here** — it files a `nudge_breaker_tripped` attention item, and since `exec_18b932df99d17658_475` it also tears down the lease and pane via `finalize_idle_park` (`completion.rs:4759`) on a worker that was healthy and mid-wait — which is what converts a false park into lost background work (§1.3).
+
+The queued probe is delivered by `dispatch_probe_on_stop` (`app/worker_events.rs:640`) via `SendToPane` — literally typed into the worker's tmux pane, so "claude treats it as the next user prompt." That is why the nudge derails the wait.
+
+### 2.3 Existing crude mitigations (and why they're insufficient)
+
+- **`pr_terminal_directive`** (`runner.rs:1830`, injected at `runner.rs:1554`): a _prompt_ telling the worker not to open the PR while background work is in flight. Prevents harm #2 by convention, does nothing about the nudge that provokes it — and nothing about the engine-initiated finalization in §1.2.
+- **`automation_triage` forbids the Agent tool** (`automation_triage.rs:94`): "Do NOT use the `Agent` tool. Spawning a sub-agent provides no resume mechanism — the session will hang waiting for a result that never returns." This is the **blunt current workaround** — ban the capability. Note the apparent contradiction with the incident (where the worker _was_ re-invoked): it is resolved by execution kind. A **triage** run is single-shot — its completion handler finalizes on the first Stop by parsing the decision marker, so the run is reaped before any subagent could return. A **primary-implementation** worker (like the one in §1.1) is _not_ reaped on a bare Stop — it is nudged — so its harness auto-resume _does_ fire, and the nudge is what interferes. The fix in this doc is for the implementation-worker case; triage's ban remains appropriate for single-shot runs.
+- **`stale_worker_sweep`** (reworked since first writing): reaps a worker slot after `DEFAULT_STALE_THRESHOLD_SECS` (30 min, `stale_worker_sweep.rs:74`) with no hook event — but now only while `activity == Working` **and no tool is in flight**: the `current_tool.is_some()` skip (the T2618-era fix, see the module's Algorithm doc) exists precisely because a foreground `bazel build` on a cold cache runs for many minutes without emitting a hook, and reaping it was a real false positive. The reap is a full teardown (process tree → pane → slot) followed by marking the execution orphaned and kicking the coordinator to redispatch the stranded work. It is the genuine hang backstop — but its liveness definition still contains no notion of background children (see §4.3), and its reap-then-redispatch flow is one candidate mechanism for §1.3's lost-work incident.
+
+### 2.4 Tactical fixes landed since 2026-07-08 — what each covers, and what remains
+
+The T2856-era incidents (§1.2–§1.4) triggered a round of tactical fixes. Each is real and worth keeping (or knowingly retiring), but none supplies the missing signal — a worker-liveness definition that includes background children. Positioning them explicitly so this design's scope doesn't overlap them:
+
+| Fix                                                                                                                                                  | Status    | What it solves                                                                                                                                                                          | What it deliberately does not                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **T875 — worker briefs ban backgrounding the build gate** (`runner.rs:1654`, `1694`)                                                                 | Done      | The self-inflicted variant: a worker that backgrounds bazel and idles in a poll loop can wait forever on a wedged server. Foreground + `timeout` makes the wait bounded and observable. | A prompt-level _ban on the capability_, parallel to `automation_triage`'s Agent-tool ban. Once this design lands, harness-tracked background waits become safe and the ban should be **retired for tracked waits** (§10 item 10) — it is a band-aid this doc aims to obsolete, not a policy to preserve.                                                                                                                                                                                |
+| **T2608/T2612 — build-wait nudge suppression** (`detect_build_wait_signal`, `build_wait.rs:68`; horizon-bounded; wired at `completion.rs:4526-4579`) | Done      | A worker _narrating_ "waiting on the build" no longer burns the nudge breaker on honest "still building" replies; the horizon bound keeps wedge detection alive.                        | It is exactly the **NL heuristic §3.2 ranks as fragile**, shipped as a bounded stopgap. It matches build-flavored phrasing only, knows nothing about subagents, and cannot see a wait the worker doesn't narrate. The `[waiting]` marker (§5) is its principled successor and should subsume it (§10 item 3).                                                                                                                                                                           |
+| **T2618 — no false reap on slow foreground builds** (`current_tool.is_some()` skip in `stale_worker_sweep`)                                          | Done      | The sweep no longer reaps a worker mid-foreground-build: a tool in flight is proof of life.                                                                                             | The skip keys on _foreground_ tool state. A worker that stopped its turn to wait on background children has **no** tool in flight — to the sweep it is indistinguishable from a wedge once the children go quiet.                                                                                                                                                                                                                                                                       |
+| **Husk-pane sweep** (`husk_pane_sweep.rs`)                                                                                                           | Done      | Retires app-hosted panes for slots the engine has already forgotten — the pane-side debris of §1.2-style divergence (its module doc cites the same TERMINAL warn).                      | A pure _reconciler_: cleans up after the liveness misjudgment, prevents nothing.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **T2865 — descendant-process busy-check + `bossctl agents hold`**                                                                                    | In flight | An OS-level busy signal (live descendant processes) for idle-park **and the completion path**, plus an operator verb to pin a worker against automation.                                | Process-tree liveness is the _bottom_ layer: it sees processes, not intent. It cannot distinguish "healthy children, worker correctly waiting" from "orphaned children of a worker that genuinely finished," and it misses harness-tracked waits with no live process at that instant (e.g. between a subagent's tool calls). It complements — does not replace — the marker + `SubagentStop` count, which carry intent and harness state. Both should feed the unified predicate (§7). |
+
+The through-line: every fix patches one consumer of liveness (the brief, the nudge, the sweep, the pane registry, the park) in isolation. §7's unified-liveness contract is the alternative to accreting more of them.
+
+---
+
+## 3. Question 1 — Detection: what signal distinguishes "waiting, will be re-invoked" from "done/blocked"?
+
+### 3.1 What the Stop boundary actually carries
+
+Per the official hooks reference (`code.claude.com/docs/en/hooks.md`, fetched 2026-07-08):
+
+| Field                                                     | On `Stop`?                          | Notes                                                                                                                                                                                                                                                          |
+| --------------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `last_assistant_message`                                  | ✓ documented                        | The final assistant text of the turn. Docs recommend using it _instead of_ reading the transcript.                                                                                                                                                             |
+| `session_id`, `transcript_path`, `cwd`, `permission_mode` | ✓ common fields                     | Engine already extracts `transcript_path`.                                                                                                                                                                                                                     |
+| `stop_hook_active`                                        | present in payload, engine reads it | Means "this Stop hook is itself running inside a stop-finalization loop" — an anti-infinite-loop guard, **not** a background-work signal.                                                                                                                      |
+| `background_tasks`                                        | ✗ **not documented**                | Floated by an earlier research pass from third-party blogs; **not** in the official reference. Do not gate on it today — see §3.2 for its role as a validated opportunistic corroborator (log-only until §9 item 5's shadow-comparison and canary gates pass). |
+| pending-background indicator                              | ✗ **none documented**               | No field, on any hook, says "N background agents still running."                                                                                                                                                                                               |
+
+Separately, `SubagentStop` is a **documented, stable** hook: it fires "when a subagent finishes" and carries `agent_id` + `agent_type`; the docs note "for subagents, `Stop` hooks are automatically converted to `SubagentStop`." Boss does not wire it today.
+
+### 3.2 Candidate signals, ranked by robustness
+
+| Candidate                                     | How                                                                                                                                                                   | Robustness                                                                                                                                                                                  | Verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`background_tasks` payload field**          | read array from Stop payload                                                                                                                                          | Undocumented; may not exist; schema unstable                                                                                                                                                | **Opportunistic corroborator, not sole gate.** Undocumented ⇒ no version contract, so it cannot be the load-bearing signal on its own. But "undocumented" bundles three distinct risks — presence, semantics/schema, and version contract — and only the last is actually hard to retire: Boss pins the CC version its workers run, so the risk only materializes on a deliberate upgrade, which can be gated on re-validation. Safe to gate on it as a fast-path once (a) shadow-compared against the `outstanding_subagents` counter from §3.2's SubagentStop-vs-spawn signal across real Stops, and (b) guarded by a shape/presence canary that pages on drift — see §8 and §9 item 5 for what that validation looks like concretely. Until both are in place, log only. |
+| **`last_assistant_message` NL heuristic**     | classify "I'll wait for the agent…"                                                                                                                                   | Fragile NL matching; the incident worker's phrasing varies                                                                                                                                  | **Reject as the durable primary** — same class of fragility the marker family exists to avoid. (Main has since shipped exactly this shape as a horizon-bounded stopgap for _build_ waits — `detect_build_wait_signal`, §2.4 — fine as a stopgap, and precisely what the `[waiting]` marker should subsume.)                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Transcript unmatched `tool_use`**           | tail JSONL (engine already has `TranscriptTail`, `transcript-tail/src/lib.rs`), find a `Task`/`Agent` `tool_use` with no terminal `tool_result`                       | Feasible with existing machinery, but schema is officially "internal, subject to change"; and a _background_ Task returns a "launched" placeholder immediately, so "unmatched" is ambiguous | **Fallback only.** Fragile; use only if the two better signals are unavailable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **SubagentStop-vs-spawn count** (engine-side) | count `PreToolUse{tool_name∈{Task,Agent}}` (already received) minus `SubagentStop` (needs wiring) per run; `>0` at a main Stop ⇒ a background subagent is outstanding | Documented + stable hooks; automatic; no worker cooperation needed                                                                                                                          | **Recommended backstop.** One new wired hook.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **Worker-side `[waiting]` marker**            | worker emits `[waiting] reason="…"` on its own line; rides to the engine in `last_assistant_message`                                                                  | Fully Boss-owned; precise (the worker _knows_ it just spawned auto-resuming work); matches existing marker precedent; zero dependence on undocumented internals                             | **Recommended primary.** Needs a worker-preamble instruction + parser.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+**Why the count discriminates cleanly:** a _foreground_ Agent call resolves within the turn — its `SubagentStop` fires _before_ the main `Stop`, so the count nets to 0 by Stop time. A _background_ spawn leaves the count at ≥1 at the main Stop. So `outstanding_subagents > 0` at a main `Stop` is a precise "waiting on auto-resuming work" signal.
+
+### 3.3 Conclusion
+
+There is **no free engine-side field** that answers the question. The two robust options are (a) the worker asserting intent via a marker and (b) the engine reconstructing outstanding-subagent state from the documented hook stream. They are complementary — one covers worker non-compliance, the other covers "the worker told us exactly what it's waiting on and why." The design uses both.
+
+---
+
+## 4. Question 2 — Engine behavior when waiting is detected
+
+### 4.1 Suppress the nudge, cheaply and passively
+
+When waiting is detected at a Stop, `nudge_or_park` should return **before** touching the circuit breaker (mirroring the existing `EscalationPending` early-out at `completion.rs:4509`), with a **new** outcome:
+
+```rust
+StopOutcome::WaitingOnBackgroundWork { reason: String }   // new variant
+```
+
+Semantics deliberately different from `[blocked]`/`[effort-escalation]`:
+
+- **No human attention item.** Waiting is transient and self-resolving; it is not a cry for help. Filing a `work_attention_items` row (as `EscalationPending` does) would spam the coordinator UI.
+- **Does not consume breaker budget.** The `"no_pr"` fingerprint count is left untouched, so a worker that legitimately waits, resumes, and _then_ genuinely idles still gets its full nudge budget.
+- **Emit a passive live-status** instead — a new live-state reason `worker_waiting_on_background_work` carrying the reason string, published the same way `worker_escalation_pending` is (`completion.rs:4516-4523`). This answers the "emit a passive 'still waiting' status to the UI" option directly: the operator sees "waiting on: research agent" rather than either silence or a false alarm.
+
+The landed build-wait suppression (§2.4) is production precedent that this exact shape works: `StopOutcome::BuildWaitPending` returns before the breaker, publishes a passive `worker_build_wait_pending` status, files no attention item, and is horizon-bounded (`completion.rs:4526-4579`). `WaitingOnBackgroundWork` is the same mechanics keyed on a robust signal instead of an NL heuristic.
+
+### 4.2 Bounded, never indefinite
+
+Suppression must terminate. Three independent bounds, cheapest first:
+
+1. **Event-driven clear (happy path).** When the background subagent returns, the harness re-invokes the worker; it takes another turn and Stops again. If that Stop produced a PR → finalize; if it's genuinely idle with no outstanding subagent and no `[waiting]` marker → nudge normally. With the SubagentStop signal wired, the engine _knows_ the wait ended (count back to 0) and needs no timer for the common case.
+2. **Absolute waiting cap.** Analogous to `ABSOLUTE_MAX_NUDGES`: cap the number of consecutive _waiting-suppressed_ Stops per execution (proposal: 12, reusing the existing constant's spirit). A worker that emits `[waiting]` forever — buggy, or gaming the nudge — is eventually nudged/parked anyway. Track this in the `NudgeBreaker` (or a sibling in-memory map) keyed by execution id.
+3. **`stale_worker_sweep` remains the ultimate hang backstop** (see §4.3).
+
+### 4.3 Interaction with hang detection — the load-bearing constraint
+
+**The backgrounded-bazel idle-wait pattern (nudging IS correct).** A worker that idles on a raw `&` shell build, a `sleep`, or a foreground poll has **no** harness-tracked auto-resume — it is genuinely stuck. The discriminator is exactly the positive signal from §3: no `[waiting]` marker _and_ `outstanding_subagents == 0` ⇒ default behavior (nudge) is unchanged. Suppression requires a positive assertion; it is never the default. This keeps the known-good nudge behavior intact. (Two tactical carve-outs have since landed at the edges of this default: T875 bans backgrounding the build gate outright in worker briefs, and the T2608/T2612 build-wait suppression gives a _narrated_ build wait a horizon-bounded reprieve — both positioned in §2.4. Neither changes the principle: untracked, unasserted idles still get nudged.)
+
+**The silent-wait vs wedge tension.** A legitimately-waiting worker stops and then goes **silent** (no further hook events from its _own_ main loop) until the subagent returns. `stale_worker_sweep` reaps after 30 minutes with no hook event while `Working` with no tool in flight (`stale_worker_sweep.rs:74` and the module's Algorithm doc; the no-tool-in-flight guard is T2618's fix for the foreground-build false positive — §2.4). So a wait whose children go quiet for longer than the threshold risks reaping a healthy worker. Two mitigations, both needed:
+
+- **Make the sweep waiting-aware.** While `outstanding_subagents > 0` for a run (or a `[waiting]` marker is the last observed final message), the sweep should extend its patience — but **must not** disable itself: a hard ceiling (e.g. `stale_threshold_secs × k`, or a separate `waiting_stale_threshold_secs`) still reaps a wait that has clearly hung. This is the one place the design must be conservative: a never-returning subagent has to be caught. (T2865's in-flight descendant-process busy-check attacks the same gap from the OS layer; see §2.4 for why the two are complementary rather than redundant.)
+- **Confirm whether subagent-internal tool hooks refresh liveness.** A running subagent makes its own tool calls; if those fire `PreToolUse`/`PostToolUse` that reach `boss-event` and refresh `last_event_at`, then an _active_ subagent already keeps its parent "alive" to the sweep, and only a subagent that _itself_ hangs (no tool calls) trips it — which is the correct outcome. §1.2 supplies strong evidence for the mechanism: subagent hook events demonstrably reach the engine under the parent run's id (that is what the TERMINAL warns are), and the live-state registry stamps `last_event_at` on every hook. What remains is confirming coverage across subagent tool types (§9 item 2).
+
+**Pane-death / orphan reconciliation is unaffected.** If the subagent never returns and the worker's process dies, `dead_pid_sweep`/`lost_workspace_sweep` reap it exactly as today. The design adds no path that keeps a dead worker's slot held.
+
+### 4.4 Not just the nudge: the completion path must consult the same signal
+
+§1.2 is proof that suppressing the nudge is necessary but not sufficient — the same Stop-boundary blindness lives in the _success_ path. `on_stop_inner` treated "Stop + PR present" as "run complete" and finalized/routed a run whose background children were still working. The waiting signal (marker, or `outstanding_subagents > 0`) must therefore gate **completion finalization too**: at a Stop that would finalize a run as `completed`, a live waiting signal means _hold_ — do not terminalize, do not route, take the next Stop when the children drain. The bounds of §4.2 apply identically (event-driven clear, absolute cap, sweep ceiling), so a hung child cannot hold a finished run open forever. T2865's completion-path descendant busy-check is the process-tree version of this hold; the unified predicate (§7) is where the two meet. This is the "a Stop is not completion" contract in mechanism form.
+
+---
+
+## 5. Question 3 — Worker-side convention (`[waiting]` marker)
+
+### 5.1 Spec
+
+A worker that is about to stop-and-wait emits, on its own line as (part of) its final message:
+
+```
+[waiting] reason="<one-line what/why>"
+```
+
+Optional structured fields for richer UI + tighter engine gating:
+
+```
+[waiting] reason="research agent: transport survey" on=subagent expect=auto-resume
+```
+
+- `reason="…"` — required, double-quoted, one line (identical discipline to `[blocked]`).
+- `on=subagent|background-bash|workflow|ci` — optional; what is being awaited (feeds §6 generalization + the passive UI status).
+- `expect=auto-resume` — optional; asserts the awaited work re-invokes the session. Absence is treated as `auto-resume` for `on=subagent`.
+
+### 5.2 Parser — reuse the `worker_escalation` family
+
+Add to `worker_escalation.rs` alongside `[effort-escalation]`/`[blocked]`:
+
+- `WAITING_MARKER = "[waiting]"`, a `WorkerSignalKind::Waiting`, and a `validate_waiting_fields`.
+- Matching discipline: **trimmed-line prefix** match (`strip_prefix("[waiting]")`), exactly like the sibling markers (`worker_escalation.rs:92-111`). Line-start anchoring means a worker that merely _mentions_ the protocol in prose does not trip it — the same false-positive guard the family already relies on and tests.
+- **Parse source:** prefer `last_assistant_message` straight from the Stop payload (documented, avoids a transcript read entirely). Capture it by extending `WorkerEvent::Stop` with an optional `last_assistant_message` field in `normalize_hook_event`. Fall back to the existing joined-final-message reader (`read_final_triage_message`, `completion.rs:3288`) if the field is absent — that reader already joins _all_ assistant turns to dodge the known Stop-hook/flush race.
+
+### 5.3 Engine hook-in
+
+In `nudge_or_park`, after the `unresolved_worker_signal_reason` check and before the breaker — the same slot the landed build-wait suppression occupies (`completion.rs:4526-4579`, §2.4), which the marker check should sit beside and eventually subsume — add: if the current final message carries a live `[waiting]` marker (and the absolute waiting cap is not exhausted) → return `WaitingOnBackgroundWork { reason }`. Unlike the escalation path, do **not** file an attention item and do **not** require coordinator ack to clear — the next Stop re-evaluates from scratch.
+
+### 5.4 Marker vs hook-count — robustness tradeoff
+
+|            | `[waiting]` marker                                                               | SubagentStop-vs-spawn count                                      |
+| ---------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Depends on | worker compliance (preamble instruction)                                         | one documented hook wired + correct spawn/finish pairing         |
+| Precision  | high — worker states _what_ and _why_                                            | binary — "something outstanding"                                 |
+| Covers     | any auto-resuming wait the worker declares (§6)                                  | only Agent/Task subagents                                        |
+| Fails when | worker forgets to emit it (the §1.1 worker did — but it had no such instruction) | tool name isn't `Task`/`Agent`; nested/forwarded spawns miscount |
+| UI value   | carries a human reason string                                                    | none by itself                                                   |
+
+They cover each other's failure modes, which is why the recommendation uses both: the marker is the primary, precise, UI-friendly signal; the count is the automatic safety net for workers that forget.
+
+---
+
+## 6. Question 4 — Scope: generalize beyond the Agent tool?
+
+**Yes — the same false nudge fires for any legitimate stop-and-wait**, not just Agent-tool waits: a worker that backgrounds a long CI/build via `run_in_background` Bash and stops to be re-invoked on exit, a Monitor-style wait, or a `Workflow` run. All share the property that makes stopping correct: **the harness re-invokes the session when the tracked work completes.**
+
+Generalize the _marker_ to cover "harness-tracked auto-resuming background work" (the `on=` field expresses which kind), and keep the engine treatment identical. **Do not** generalize to "any Stop" — that reintroduces the very hang the nudge exists to catch. The positive signal (marker, or outstanding-subagent count) is precisely what scopes suppression to the auto-resuming cases and leaves genuine idles (raw `&` builds, sleeps, dead waits) getting nudged as today.
+
+The engine-side count (§3.2) only covers subagents. If the operator wants automatic (marker-free) coverage of background _Bash_, that needs a second counter over `run_in_background` Bash lifecycle events — feasible with the same `PreToolUse`/`PostToolUse` stream, but a larger change. Recommendation: ship the marker (which already covers all cases the worker declares) first; add the Bash counter only if non-compliance data shows it's needed.
+
+---
+
+## 7. Recommendation
+
+**A hybrid, marker-primary design with an automatic backstop and hard bounds.**
+
+1. **Worker-side `[waiting]` marker (primary).** New marker in the `worker_escalation` family, parsed from `last_assistant_message`; suppresses the produce-PR nudge with _self-clearing, no-attention-item, no-breaker-consumption_ semantics; publishes a passive `worker_waiting_on_background_work` live status. Add a short worker-preamble instruction (next to the `NO_CHANGES_NEEDED` / escalation instructions in `runner.rs`) teaching workers to emit it before stopping to wait.
+2. **SubagentStop-vs-spawn count (automatic backstop).** Wire the documented `SubagentStop` hook (8th lifecycle hook); add `WorkerEvent::SubagentStop`; maintain a per-run outstanding-subagent counter from `PreToolUse{tool_name∈{Task,Agent}}` minus `SubagentStop`. Treat `count > 0` at a main Stop as an implicit waiting state even when the marker is absent.
+3. **Hard bounds so hang detection can't regress.** Absolute cap on consecutive waiting-suppressed Stops (reuse the `ABSOLUTE_MAX_NUDGES = 12` ceiling's spirit); a waiting-aware but still-ceilinged `stale_worker_sweep`; unchanged pane-death/orphan reconciliation.
+4. **Gate completion finalization on the same signal (§4.4).** A Stop that would finalize a run as `completed` holds — no terminalize, no route — while the waiting signal is live, under the same bounds as item 3.
+
+**The durable contract (sharpened by §1.2–§1.4): a Stop boundary is NOT completion while the worker has live background children.** Today four separate consumers each improvise their own liveness answer — the nudge path (final-message markers plus the build-wait heuristic), idle-park (breaker state), completion finalization (PR presence alone), and the sweeps/lease heartbeating (hook recency, foreground tool state, pane liveness). §1 shows each of them failing on the same input. The pieces above should therefore land as **one worker-liveness predicate** — "does this run have outstanding harness-tracked work or live descendant processes?" — computed from the `[waiting]` marker, the `outstanding_subagents` counter, and (per T2865) the descendant process tree, and consulted by every consumer: nudge/park decisions (§4.1), completion finalization (§4.4), the stale sweep's patience (§4.3), and cube-lease heartbeating — the manual heartbeating the coordinator performed in §1.4 is exactly this last consumer done by hand. The numbered items are the signal plumbing; the predicate is the single place they meet, and the alternative to accreting more one-consumer patches (§2.4).
+
+**Why this over the alternatives:**
+
+- _Suppress-only-on-marker_ is simplest but strands non-compliant workers (the §1.1 worker forgot). The count backstop fixes that.
+- _Detect-only-via-count_ needs no worker change but gives the UI no reason string and can't cover background Bash / Workflow waits. The marker fixes that.
+- _Grace-timer-only_ (defer the nudge N seconds, then fire) is the weakest: it still fires a false nudge on any wait longer than the grace, and picking N trades false nudges against slow hang detection. The event-driven clear (subagent-return) is strictly better and needs no magic constant on the happy path.
+
+**Tradeoffs / residual risk:**
+
+- Wiring an 8th hook slightly increases hook traffic (`boss-event` invocations). Negligible — the shim is already on every tool call.
+- The count assumes the spawn tool is named `Task`/`Agent`; a rename or a `Workflow`-style spawner would miscount. Mitigated by the marker (name-independent) being primary, and by matching a configurable set of tool names.
+- A worker could suppress nudges indefinitely by spamming `[waiting]`. Bounded by the absolute waiting cap + sweep ceiling.
+
+---
+
+## 8. Question 5 — Instrumentation (make false nudges visible in engine-trace)
+
+- **Structured log on every suppression:** `execution_id`, detection source (`marker` | `subagent_count` | `both`), `reason`, `outstanding_subagents`, and the waiting-cap counter — at `info`, mirroring the existing `auto-nudge: suppressed …` lines (`completion.rs:4510-4515`, and the build-wait sibling at `completion.rs:4549-4556`).
+- **The false-negative detector (most important).** When the engine _does_ nudge a no-PR worker and the **very next** event for that run is a `SubagentStop` (or a `PostToolUse{tool_name:"Task"}` resolving), emit a `warn`: `nudge_landed_during_pending_subagent`. This surfaces exactly the misses — cases where detection failed and a nudge hit a real wait — and makes the false-positive rate measurable rather than invisible.
+- **Counters** (whatever metrics sink the engine already uses): `waiting_suppressed_nudges_total`, `waiting_cap_tripped_total`, `nudge_during_pending_subagent_total`, `waiting_stale_sweep_reaps_total`. The first climbing with the last near-zero is the success signal; the third above zero flags detection gaps.
+- **`background_tasks` shape/presence canary.** The one path by which the undocumented `background_tasks` field (§3.2) can be trusted at all is if drift in it is loud, not silent. On every Stop, log `background_tasks_presence_rate` (does the field appear, and non-empty-vs-empty-vs-absent) and emit `background_tasks_shape_changed_total` whenever its schema diverges from the expectation captured in §9 item 5. Also log `background_tasks.len()` (when present) alongside `outstanding_subagents` on every Stop as a standing shadow comparison — divergence between the two is either a `background_tasks` surprise or a counter-pairing bug in the documented signal, and either is worth knowing about. A presence-rate cliff or a shape-changed spike is the signal that a CC upgrade silently broke the corroborator, at which point detection falls back to the `[waiting]` marker and the `outstanding_subagents` counter, both unaffected.
+- **Live status** `worker_waiting_on_background_work{reason}` so the waiting state is visible in the UI and in `bossctl` inspection, not just logs.
+
+---
+
+## 9. Empirical validation items (confirm before/while implementing)
+
+These are the assumptions the design rests on. Each is cheaply checkable by capturing a real worker's forwarded hook stream (the engine already receives and can log every payload):
+
+1. **Does a main `Stop` actually fire while a background subagent is outstanding?** ~~The §1.1 incident implies yes (the nudge is `on_stop`-queued and requires a Stop). Confirm the engine isn't instead nudging via the idle-injection path (`dispatch_probe_if_idle`, `app/worker_events.rs:864`) — the fix location differs if so.~~ **Confirmed by §1.2 (refresh):** the T2843 finalization was an `on_stop` action taken while background subagents were live — the Stop boundary fires, and is acted on, mid-wait.
+2. **Do subagent-internal tool calls fire `PreToolUse`/`PostToolUse` that reach `boss-event`?** Determines whether an active subagent already keeps `last_event_at` fresh (so the sweep only reaps genuinely-hung subagents) or whether the sweep needs explicit waiting-awareness (§4.3). **Strong evidence from §1.2 (refresh):** hook events for the run kept arriving — and tripping the TERMINAL warn — long after finalization, so subagent activity does reach `boss-event` tagged with the parent run's id. Remaining: confirm coverage across subagent tool types on a _live_ run (the live-state registry stamps `last_event_at` on every hook, so this should follow).
+3. **Exact spawn tool name(s):** `Task` vs `Agent` vs a `Workflow` spawner — and whether `SubagentStop.agent_type` correlates with the spawn's `tool_input.subagent_type`. Fixes the count's matcher set.
+4. **Is `last_assistant_message` reliably populated on the Stop payload** for a worker whose final turn is just "I'll wait…", so the marker rides in without a transcript read?
+5. **Capture a matrix of real Stop payloads for `background_tasks`**, not a single sample — this is what would let a later task actually rely on the field as the fast-path corroborator described in §3.2. For each capture, tag the exact CC version and cover: a single background `Agent`, multiple concurrent background `Agent`s, `run_in_background` Bash, a `Workflow` spawn, a _foreground_ Agent (must **not** show it at the main Stop — the key false-positive check), and a plain no-background idle Stop (control — must be empty/absent). For each shape, record: is the field present at all; is it absent-vs-empty when nothing is outstanding; its exact schema (array of ids vs objects, keys present); and whether it self-clears (empty on the _next_ Stop after the subagent returns — this is what would guarantee suppression terminates on the happy path if gated on it). Two validation gates sit on top of this capture, both required before §3.2's fast-path can be enabled, not just logged:
+   - **Shadow comparison** against the `outstanding_subagents` counter (§3.2, §7): once `SubagentStop` is wired, log `background_tasks.len()` next to `outstanding_subagents` on every real Stop, gating nothing on it initially. Agreement across many Stops and several CC versions is the evidence; every divergence is a free bug report.
+   - **Presence/shape canary** (§8): the runtime assertion that turns a silent CC-side change into a loud one (`background_tasks_presence_rate`, `background_tasks_shape_changed_total`). Must be wired and observed stable before the field is used as anything more than a logged corroborator.
+
+---
+
+## 10. Follow-up code changes (out of scope for this investigation)
+
+This doc changes no code. The concrete implementation tasks it recommends, for the operator to file separately. Status annotations added in the 2026-07-18 refresh: several corners have since been covered tactically (§2.4), so each item below notes what a filed task should — and should not — include to avoid overlapping a landed fix.
+
+1. **Wire `SubagentStop`** — add it to the driver's lifecycle-hook list (`driver/claude.rs:109-118`), add `WorkerEvent::SubagentStop { session_id, agent_id, agent_type }` + normalization (`worker_event.rs`), and a per-run outstanding-subagent counter fed by `PreToolUse{Task}` − `SubagentStop`. _(Still open.)_
+2. **Capture `last_assistant_message` on `Stop`** — extend the `Stop` variant + `normalize_hook_event` so markers can be parsed from the payload without a transcript read. _(Still open; would also let the landed build-wait detector stop reading the transcript.)_
+3. **Add the `[waiting]` marker** — `WAITING_MARKER`, `WorkerSignalKind::Waiting`, `validate_waiting_fields` in `worker_escalation.rs`; a worker-preamble instruction in `runner.rs`. _(Still open. Should **subsume** the landed build-wait NL suppression (§2.4): once the marker exists, `detect_build_wait_signal` becomes its fallback for non-compliant workers, or is retired.)_
+4. **Suppress in `nudge_or_park`** — new `StopOutcome::WaitingOnBackgroundWork`, passive `worker_waiting_on_background_work` status, no attention item, no breaker consumption, absolute waiting cap. _(Still open; `StopOutcome::BuildWaitPending` (§2.4, `completion.rs:4526-4579`) is landed precedent for the exact mechanics.)_
+5. **Make `stale_worker_sweep` waiting-aware** — extend patience while a subagent is outstanding, with a hard ceiling that still reaps a hung wait. _(Partially covered: T2618's `current_tool` skip fixed the foreground-build false positive, and T2865 (in flight) adds descendant-process patience. What remains is keying the sweep on the harness-level waiting signal — marker + subagent count.)_
+6. **Instrumentation** — the logs, counters, and the `nudge_landed_during_pending_subagent` false-negative detector from §8. _(Still open.)_
+7. _(Optional, data-driven)_ background-Bash lifecycle counter for marker-free coverage of `run_in_background` waits (§6). _(Still open; note T875 currently bans backgrounding builds in worker briefs, so there is little of this traffic to observe until item 10 lands.)_
+8. **NEW (refresh) — Gate completion finalization on the waiting signal (§4.4)** — at a Stop that would finalize a run as `completed`, hold terminalization and PR routing while the liveness predicate reports outstanding children, under §4.2's bounds. Complements T2865's completion-path descendant busy-check; closes the §1.2 failure mode.
+9. **NEW (refresh) — Unified worker-liveness predicate (§7)** — one function ("outstanding harness-tracked work or live descendants?") consulted by nudge/park, completion finalization, the sweeps, and cube-lease heartbeating; folds in the marker, the subagent count, and T2865's process-tree signal.
+10. **NEW (refresh) — Retire the T875 backgrounding ban for harness-tracked waits** once items 1–5 and 8 land, restoring background builds/subagents as first-class for workers. This is the exit criterion for §1.4's "long background tasks are incompatible with the worker model" state — and the test that this design actually did its job.
