@@ -19,7 +19,7 @@ async fn conflict_no_op_cannot_complete_after_attempt_retired_while_pr_still_con
         .finalize_no_op_completion(&execution, Some(ContributionEvidence::ProvenAbsent), None)
         .await;
     assert!(
-        matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail } if detail.contains("CONFLICTING")),
+        matches!(outcome, StopOutcome::ConflictDeliveryUnverified { ref detail } if detail.contains("CONFLICTING")),
         "{outcome:?}"
     );
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
@@ -68,7 +68,7 @@ async fn conflict_delivery_requires_github_mergeability_even_after_head_moves() 
                 assert_eq!(task.status, TaskStatus::InReview);
             } else {
                 assert!(
-                    matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { .. }),
+                    matches!(outcome, StopOutcome::ConflictDeliveryUnverified { .. }),
                     "{outcome:?}"
                 );
                 assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
@@ -93,7 +93,7 @@ async fn conflict_delivery_fails_closed_when_github_is_unavailable() {
         .finalize_pr_transition(&execution_id, pr.into(), WorkerPrCompletionTarget::InReview, "test")
         .await;
     assert!(
-        matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail } if detail.contains("could not be verified")),
+        matches!(outcome, StopOutcome::ConflictDeliveryUnverified { ref detail } if detail.contains("could not be verified")),
         "{outcome:?}"
     );
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
@@ -163,7 +163,7 @@ async fn conflict_delivery_gate_reports_a_missing_bound_pr_url_specifically() {
     assert!(
         matches!(
             outcome,
-            ConflictDeliveryDecision::Failed(StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail })
+            ConflictDeliveryDecision::Failed(StopOutcome::ConflictDeliveryUnverified { ref detail })
                 if detail.contains("no bound PR URL")
         ),
         "{outcome:?}"
@@ -356,4 +356,71 @@ async fn merged_branch_pr_with_stale_task_binding_releases_execution() {
         "a merged own-branch PR that is not the bound PR must file attention"
     );
     assert!(!cube.release_calls.lock().await.is_empty());
+}
+
+/// A probe that reports a fixed mergeability for one specific head.
+struct HeadProbe {
+    head: &'static str,
+    mergeability: OpenPrMergeability,
+}
+
+#[async_trait]
+impl MergeProbe for HeadProbe {
+    async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+        let mut probe = FixedMergeabilityProbe {
+            mergeability: self.mergeability,
+        }
+        .probe(url)
+        .await?;
+        probe.head_ref_oid = Some(self.head.to_owned());
+        Ok(probe)
+    }
+}
+
+#[tokio::test]
+async fn conflict_delivery_gate_does_not_fail_on_a_conflicting_read_of_a_stale_head() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/2070";
+    let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), pr, "old-head");
+    let verifier = StubBranchVerifier::ok("my-feature");
+    verifier.set_fresh_head_oid(Ok("pushed-head".into())).await;
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    // The read still describes the pre-push head: unsettled, execution stays live.
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier.clone())
+        .with_merge_probe(Arc::new(HeadProbe {
+            head: "old-head",
+            mergeability: OpenPrMergeability::Conflict,
+        }))
+        .with_conflict_unknown_backoff(std::time::Duration::ZERO);
+    let decision = handler.conflict_delivery_decision(&execution, Some(pr)).await;
+    assert!(
+        matches!(
+            decision,
+            ConflictDeliveryDecision::Unsettled(StopOutcome::DetectorFailed)
+        ),
+        "{decision:?}"
+    );
+    assert_ne!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+
+    // A CONFLICTING answer for the pushed head is definitive and fails the run.
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier)
+        .with_merge_probe(Arc::new(HeadProbe {
+            head: "pushed-head",
+            mergeability: OpenPrMergeability::Conflict,
+        }))
+        .with_conflict_unknown_backoff(std::time::Duration::ZERO);
+    let decision = handler.conflict_delivery_decision(&execution, Some(pr)).await;
+    assert!(
+        matches!(
+            decision,
+            ConflictDeliveryDecision::Failed(StopOutcome::ConflictDeliveryUnverified { .. })
+        ),
+        "{decision:?}"
+    );
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
 }

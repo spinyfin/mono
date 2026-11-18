@@ -573,6 +573,31 @@ async fn rearm_does_not_retry_lockfile_failure_for_the_same_base_head_pair() {
 }
 
 #[tokio::test]
+async fn rearm_does_not_retry_lockfile_failure_when_probe_has_no_head() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/83";
+    let (product, chore) = make_in_review(&db, "C-lockfile-no-head", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    seed_lockfile_failure(&db, &product, &chore, pr, "head456", "abc123");
+
+    let mut headless = probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
+    headless.head_ref_oid = None;
+    let retried = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &headless,
+    )
+    .await;
+    assert!(!retried, "an unknown head must not mint a new attempt");
+    let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(all.len(), 1, "failed row is kept and not duplicated: {all:?}");
+}
+
+#[tokio::test]
 async fn rearm_retries_lockfile_failure_when_head_moves() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
