@@ -92,7 +92,12 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 );
                 return;
             }
-            Ok(_) => {}
+            Ok(revisions) => {
+                if let Err(err) = work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &revisions) {
+                    refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
+                    return;
+                }
+            }
             Err(err) => {
                 refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
                 return;
@@ -2405,5 +2410,89 @@ mod trunk_queue_tests {
             ),
             "in_review revisions have already published and must not prompt"
         );
+    }
+
+    /// The Direct-merge executor injected on [`ServerState`] is the same
+    /// object the poller's sweep host uses to continue a merge after
+    /// conflict resolution. The one-line `with_merge_executor` wiring in
+    /// `app.rs` is the production path this pins.
+    #[tokio::test]
+    async fn server_state_direct_merge_executor_sees_poller_continuation() {
+        let server = MockServer::start().await;
+        let pr_url = "https://github.com/brianduff/flunge/pull/998";
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("resolved-head"));
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "poller-continuation-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "poller-continuation-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some(pr_url.into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        state
+            .work_db
+            .start_merge_conflict_resolution(&chore.id, pr_url, "main")
+            .unwrap();
+        state
+            .work_db
+            .mark_chore_blocked_merge_conflict(&chore.id, pr_url)
+            .unwrap();
+        let attempt = state
+            .work_db
+            .insert_conflict_resolution(
+                boss_work_db::ConflictResolutionInsertInput::builder()
+                    .product_id(product.id.clone())
+                    .work_item_id(chore.id.clone())
+                    .pr_url(pr_url)
+                    .pr_number(998)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger("base")
+                    .head_sha_before("old-head")
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        state
+            .work_db
+            .clear_chore_blocked_merge_conflict(&chore.id, pr_url)
+            .unwrap();
+        state
+            .work_db
+            .mark_conflict_resolution_succeeded_at_rung(&attempt.id, Some("resolved-head"), 1)
+            .unwrap();
+
+        let probe = boss_engine_merge_poller::tests::StubProbe::new();
+        probe.set(
+            pr_url,
+            boss_engine_merge_poller::PrLifecycleState::Open(boss_engine_merge_poller::OpenPrStatus::clean()),
+        );
+        boss_engine_merge_poller::run_one_pass(
+            &state.work_db,
+            probe.as_ref(),
+            state.publisher.as_ref(),
+            None,
+            None,
+            Some(state.sweep_host.as_ref() as &dyn boss_engine_merge_poller::SweepHost),
+        )
+        .await;
+
+        assert_eq!(
+            direct_executor.calls.lock().unwrap().as_slice(),
+            &[pr_url.to_owned()],
+            "the injected ServerState executor must be the one the poller continuation calls"
+        );
+        server.verify().await;
     }
 }

@@ -21,6 +21,8 @@ pub struct GithubMergeIntent {
     /// withdrawn), `disarm_pending` (conflict resolution stopped while GitHub
     /// auto-merge was armed; the poller must turn it off) and
     /// `conflict_resolution_stopped` (stopped, nothing left armed).
+    /// `confirmed_revisions` stores the open-revision snapshot taken when the
+    /// person asked to merge (`head_sha` holds a JSON array of ids).
     pub status: String,
     pub created_at: String,
 }

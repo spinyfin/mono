@@ -34,23 +34,8 @@ impl WorkDb {
         reason: &str,
         deletions: &[String],
     ) -> Result<()> {
-        anyhow::ensure!(!reason.trim().is_empty(), "a ladder decision needs a reason");
         let conn = self.connect()?;
-        let mut event = serde_json::json!({
-            "tier": tier, "outcome": outcome, "reason": reason, "recorded_at": now_string(),
-        });
-        if !deletions.is_empty() {
-            event["deletions"] = serde_json::json!(deletions);
-        }
-        let changed = conn.execute(
-            "UPDATE conflict_resolutions
-                SET ladder_outcomes = json_insert(COALESCE(ladder_outcomes, '[]'), '$[#]', json(?2)),
-                    ladder_reason = CASE WHEN ?4 IN ('small_agent', 'full_agent')
-                                         THEN COALESCE(ladder_reason, ?3) ELSE ?3 END
-              WHERE id = ?1",
-            params![attempt_id, event.to_string(), reason, tier],
-        )?;
-        anyhow::ensure!(changed == 1, "unknown conflict resolution: {attempt_id}");
+        append_ladder_outcome_in_tx(&conn, attempt_id, tier, outcome, reason, deletions)?;
         self.metrics_registry().counter_inc_by_dynamic(
             &format!("conflict_ladder.{tier}.{outcome}"),
             "Conflict ladder tier decisions since engine start.",
@@ -58,6 +43,33 @@ impl WorkDb {
         );
         Ok(())
     }
+}
+
+pub(crate) fn append_ladder_outcome_in_tx(
+    conn: &Connection,
+    attempt_id: &str,
+    tier: &str,
+    outcome: &str,
+    reason: &str,
+    deletions: &[String],
+) -> Result<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "a ladder decision needs a reason");
+    let mut event = serde_json::json!({
+        "tier": tier, "outcome": outcome, "reason": reason, "recorded_at": now_string(),
+    });
+    if !deletions.is_empty() {
+        event["deletions"] = serde_json::json!(deletions);
+    }
+    let changed = conn.execute(
+        "UPDATE conflict_resolutions
+            SET ladder_outcomes = json_insert(COALESCE(ladder_outcomes, '[]'), '$[#]', json(?2)),
+                ladder_reason = CASE WHEN ?4 IN ('small_agent', 'full_agent')
+                                     THEN COALESCE(ladder_reason, ?3) ELSE ?3 END
+          WHERE id = ?1",
+        params![attempt_id, event.to_string(), reason, tier],
+    )?;
+    anyhow::ensure!(changed == 1, "unknown conflict resolution: {attempt_id}");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -294,6 +294,9 @@ pub async fn run_one_pass_observed(
     } else {
         Vec::new()
     };
+    if let Some(host) = host {
+        drain_pending_merge_disarms(work_db, publisher, host).await;
+    }
     let total = in_review.len()
         + blocked_conflict.len()
         + blocked_ci.len()
@@ -539,6 +542,22 @@ pub async fn run_one_pass_observed(
     (outcome, observations)
 }
 
+/// Turn off GitHub auto-merge for every `disarm_pending` intent, including
+/// cards the ordinary candidate lists never visit (deletion sign-off, parked,
+/// moved, rebound). Driven from the intent, not from task status.
+async fn drain_pending_merge_disarms(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, host: &dyn SweepHost) {
+    let pending = match work_db.list_pending_merge_disarms() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list pending merge disarms");
+            return;
+        }
+    };
+    for candidate in &pending {
+        host.disarm_stopped_merge(work_db, publisher, candidate).await;
+    }
+}
+
 /// Classify each probed URL into the tier that should drive its adaptive
 /// polling. Shared by the full sweep and the batched adaptive reconcile so
 /// both feed [`PrPollSchedule`] through identical rules: a URL whose probe
@@ -639,6 +658,9 @@ pub async fn reconcile_batch(
     let wanted: std::collections::HashSet<&str> = pr_urls.iter().map(String::as_str).collect();
     if wanted.is_empty() {
         return (outcome, Vec::new());
+    }
+    if let Some(host) = host {
+        drain_pending_merge_disarms(work_db, publisher, host).await;
     }
 
     let in_review = candidates_for_pr_urls(work_db.list_chores_pending_merge_check(), &wanted);
@@ -1529,9 +1551,6 @@ pub(crate) async fn sweep_one(
             caller,
         )
         .await;
-        if !parked && let Some(host) = host {
-            host.disarm_stopped_merge(work_db, publisher, candidate).await;
-        }
         if !parked
             && open.mergeability == OpenPrMergeability::Clean
             && let Some(host) = host

@@ -5,7 +5,10 @@ use boss_engine_merge_poller::{OpenPrStatus, PrLifecycleState, run_one_pass};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Default)]
-struct RecordingMerge(AtomicUsize);
+struct RecordingMerge {
+    calls: AtomicUsize,
+    disarms: AtomicUsize,
+}
 
 struct MovingMerge<'a> {
     db: &'a WorkDb,
@@ -30,13 +33,14 @@ impl DirectMergeExecutor for MovingMerge<'_> {
 #[async_trait::async_trait]
 impl DirectMergeExecutor for RecordingMerge {
     async fn execute(&self, _: &str) -> Result<DirectMergeSuccess> {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(DirectMergeSuccess {
             head_sha: "resolved".into(),
         })
     }
 
     async fn disarm(&self, _: &str) -> Result<()> {
+        self.disarms.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -87,7 +91,7 @@ async fn clean_sweeps_wait_for_tripwire_and_only_resume_approved_resolution_once
             Some(1)
         );
         run_one_pass(&db, probe.as_ref(), &publisher, None, None, Some(&host)).await;
-        assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         assert!(db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
         assert_eq!(db.task_blocked_reason(&id).unwrap().as_deref(), Some("merge_conflict"));
         if moved {
@@ -114,7 +118,7 @@ async fn clean_sweeps_wait_for_tripwire_and_only_resume_approved_resolution_once
         for _ in 0..3 {
             run_one_pass(&db, probe.as_ref(), &publisher, None, None, Some(&host)).await;
         }
-        assert_eq!(executor.0.load(Ordering::SeqCst), usize::from(!rejected));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), usize::from(!rejected));
         let WorkItem::Chore(card) = db.get_work_item(&id).unwrap() else {
             panic!("expected chore")
         };
@@ -173,7 +177,7 @@ async fn clean_sweep_recovers_persisted_rejection_before_resuming() {
         )
         .await;
     }
-    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         db.task_blocked_reason(&id).unwrap().as_deref(),
         Some("deletion_signoff")
@@ -191,7 +195,11 @@ fn assert_signoff_attention(db: &WorkDb, id: &str) {
         .filter(|item| item.work_item_id.as_deref() == Some(id))
         .collect();
     assert_eq!(items.len(), 1);
-    assert!(items[0].body_markdown.contains("deletion tripwire"));
+    assert!(
+        items[0].body_markdown.contains("evidence unavailable") || items[0].body_markdown.contains("surface(s)"),
+        "{}",
+        items[0].body_markdown
+    );
 }
 
 #[tokio::test]
@@ -233,7 +241,7 @@ async fn startup_recovery_stops_unverified_merge_requests_before_clean_sweeps() 
             )
             .await;
         }
-        assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         assert!(!db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
         if rejected {
             assert_eq!(
@@ -279,7 +287,7 @@ async fn clean_sweep_stops_persisted_rejection_after_human_move_to_review() {
         )
         .await;
     }
-    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
     assert!(!db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
 }
 
@@ -323,7 +331,7 @@ fn failed_signoff_write_rolls_back_attempt_retirement() {
         )
         .unwrap();
     assert!(
-        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1)
+        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &[])
             .is_err()
     );
     let live = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
@@ -332,4 +340,92 @@ fn failed_signoff_write_rolls_back_attempt_retirement() {
     db.clear_resolved_pr_signal(&id, &candidate.pr_url, false).unwrap();
     assert_eq!(db.task_blocked_reason(&id).unwrap().as_deref(), Some("merge_conflict"));
     assert!(db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
+}
+
+#[test]
+fn signoff_attention_lists_every_deleted_surface_on_halt_and_recovery() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, id) = blocked_with_attempt(&db);
+    db.start_merge_conflict_resolution(&id, &candidate.pr_url, "main")
+        .unwrap();
+    let deletions = vec!["a.rs".to_owned(), "b.rs".to_owned()];
+    db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &deletions)
+        .unwrap();
+    let expected = crate::merge_parent_deletion::render_signoff_attention_body(&deletions, &candidate.pr_url);
+    let items = db.list_attention_items_for_work_item(&id).unwrap();
+    let body = &items
+        .iter()
+        .find(|item| item.kind == crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND)
+        .unwrap()
+        .body_markdown;
+    assert_eq!(body, &expected);
+    assert!(body.contains("2 surface(s)"));
+    assert!(body.contains("- a.rs"));
+    assert!(body.contains("- b.rs"));
+
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, id) = blocked_with_attempt(&db);
+    db.record_conflict_ladder_outcome_with_deletions(
+        &attempt.id,
+        "engine_rebase",
+        "halted_for_signoff",
+        "deletion tripwire",
+        &deletions,
+    )
+    .unwrap();
+    db.mark_chore_blocked_deletion_signoff(&id, &candidate.pr_url).unwrap();
+    let recovered = db
+        .list_attention_items_for_work_item(&id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND)
+        .unwrap()
+        .body_markdown;
+    assert_eq!(
+        recovered,
+        crate::merge_parent_deletion::render_signoff_attention_body(&deletions, &candidate.pr_url)
+    );
+}
+
+#[tokio::test]
+async fn sweep_disarms_a_deletion_signoff_card() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, id) = blocked_with_attempt(&db);
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(&id)
+            .pr_url(&candidate.pr_url)
+            .head_sha("before-rebase")
+            .build(),
+        "{}",
+    )
+    .unwrap();
+    db.start_merge_conflict_resolution(&id, &candidate.pr_url, "main")
+        .unwrap();
+    db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &["gone.rs".into()])
+        .unwrap();
+    assert_eq!(
+        db.task_blocked_reason(&id).unwrap().as_deref(),
+        Some("deletion_signoff")
+    );
+    assert!(db.merge_disarm_pending(&id, &candidate.pr_url).unwrap());
+    let executor = Arc::new(RecordingMerge::default());
+    let host =
+        crate::merge_poller_adapters::CoreSweepHost::with_remediation(None).with_merge_executor(executor.clone());
+    let probe = StubProbe::new();
+    probe.set(&candidate.pr_url, PrLifecycleState::Open(OpenPrStatus::clean()));
+    run_one_pass(
+        &db,
+        probe.as_ref(),
+        &RecordingPublisher::default(),
+        None,
+        None,
+        Some(&host),
+    )
+    .await;
+    assert_eq!(executor.disarms.load(Ordering::SeqCst), 1);
+    assert!(!db.merge_disarm_pending(&id, &candidate.pr_url).unwrap());
 }

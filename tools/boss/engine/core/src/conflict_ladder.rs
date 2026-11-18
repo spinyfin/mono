@@ -1338,17 +1338,7 @@ async fn halt_attempt_for_deletion_signoff(
         ),
     );
 
-    let reason = format!("deletion tripwire: {}", deletions.join("; "));
-    if let Err(err) = work_db.record_conflict_ladder_outcome_with_deletions(
-        &attempt.id,
-        if rung == 0 { "deterministic" } else { "engine_rebase" },
-        "halted_for_signoff",
-        &reason,
-        deletions,
-    ) {
-        tracing::error!(attempt_id = %attempt.id, ?err, "conflict_ladder: could not persist tier decision");
-    }
-    if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, rung) {
+    if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, rung, deletions) {
         tracing::error!(attempt_id = %attempt.id, ?err, "could not persist atomic deletion-signoff halt");
         return;
     }

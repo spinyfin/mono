@@ -1510,7 +1510,13 @@ impl WorkDb {
                     .as_ref()
                     .is_some_and(|outcomes| outcomes.iter().any(|outcome| outcome.outcome == "halted_for_signoff"))
             {
-                crate::blocking::mark_deletion_signoff_in_tx(&tx, &work_item_id, &pr_url)?;
+                crate::blocking::mark_deletion_signoff_in_tx(
+                    &tx,
+                    &work_item_id,
+                    &pr_url,
+                    None,
+                    blocked_attempt_id.as_deref(),
+                )?;
                 mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, attempt_id, None, rung.unwrap_or(0))?;
                 recovered.push(RecoveredConflictLadderAttempt {
                     work_item_id,
