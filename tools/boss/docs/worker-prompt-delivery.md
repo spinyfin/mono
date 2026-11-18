@@ -113,6 +113,21 @@ A `paste_unverified` on every spawn of one driver means its composer no longer s
 
 A driver start that arrives only after the start wait expired rescues the spawn from that failure and nothing more: the prompt wait still runs, with its Return retries, and fails the spawn if no turn begins.
 
+### Before the pane
+
+The `pane_spawned` dispatch event is emitted only after confirmation ends, so the time from `run_started` to `pane_spawned` covers everything above plus the steps that come before the pane exists. Those are reported on the `pane spawned for execution` line, logged when the pane is up:
+
+| Field                  | Step                                                                |
+| ---------------------- | ------------------------------------------------------------------- |
+| `compose_ms`           | composing the prompt and resolving the model, effort and driver     |
+| `provision_ms`         | the driver's own preparation                                        |
+| `permission_config_ms` | writing the driver's permission and hook config                     |
+| `title_ms`             | the pane title, which can ask the utility model for a summary       |
+| `pane_start_ms`        | creating the tmux pane                                              |
+| `pre_pane_ms`          | all of the above and the work between them, from the runner's start |
+
+`provision_ms` is where drivers differ. Claude and Codex write files. Grok also runs its posture and capability checks as subprocesses, and logs `Grok spawn preparation step finished` with `step` and `elapsed_ms` for each one, including when a check fails. The capability checks' lines are written together when they end, so read `elapsed_ms`, not the lines' timestamps. The `grok_home` field on those lines is the per-run home, whose path contains the execution id. A `Grok spawn preparation waited for a live OAuth refresh before probing the credential` line means the `grok models` step spent `waited_ms` waiting on another Grok process's token refresh. Measured costs are in [the Grok spawn latency investigation](investigations/grok-spawn-latency-2026-11-18.md).
+
 ## Engine restart and spoke workers
 
 New local launches durably mark prompt confirmation pending before creating the pane, and complete that marker after confirmation. The adoption sweep resumes the same bounded delivery and Return-only confirmation for pending launches. Persisted turn evidence also satisfies recovery if the engine stopped before writing success. A SessionStart alone does not. Legacy rows without the marker are exempt from prompt re-confirmation.

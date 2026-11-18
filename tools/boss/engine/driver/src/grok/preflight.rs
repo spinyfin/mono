@@ -7,9 +7,10 @@
 //! async worker threads with `spawn_blocking`; an unbounded call here once
 //! pinned two runtime threads for hours and stopped the engine from exiting.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
@@ -20,6 +21,10 @@ use crate::bounded_command::run_bounded_as;
 
 /// Wall-clock limit for the OAuth-sensitive `grok models` probe.
 const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Shortest wait for a live OAuth refresh worth a log line: anything under it
+/// is the cost of reading the lock file, not a wait.
+const OAUTH_WAIT_REPORT_THRESHOLD: Duration = Duration::from_millis(250);
 
 /// Wall-clock limit for every other preflight subprocess. Generous enough for
 /// `cube workspace status` to reach the git remote, short enough that a hung
@@ -54,9 +59,21 @@ impl PreflightRunner for RealPreflightRunner {
         environment: &GrokProcessEnvironment,
     ) -> anyhow::Result<PreflightOutput> {
         if program == "grok" {
+            let wait_started = Instant::now();
             environment
                 .wait_for_auth_ready_for_oauth_probe()
                 .context("waiting for a Grok OAuth refresh before preflight")?;
+            // This wait is silent when it ends well, and it is counted in the
+            // step's time. Report one that actually held the spawn so it is
+            // not read as a slow `grok models`.
+            let waited = wait_started.elapsed();
+            if waited >= OAUTH_WAIT_REPORT_THRESHOLD {
+                tracing::info!(
+                    grok_home = %environment.grok_home().display(),
+                    waited_ms = waited.as_millis() as u64,
+                    "Grok spawn preparation waited for a live OAuth refresh before probing the credential"
+                );
+            }
         }
         let mut command = Command::new(program);
         command.args(args).current_dir(workspace);
@@ -75,6 +92,79 @@ impl PreflightRunner for RealPreflightRunner {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
+}
+
+/// One subprocess Grok's spawn preparation ran, and how long it took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepTiming {
+    step: String,
+    elapsed: Duration,
+}
+
+/// Times every command the wrapped runner executes.
+///
+/// These subprocesses run on each Grok spawn before its pane exists, and no
+/// other driver has an equivalent step, so their cost is logged per command
+/// instead of being left inside one opaque provisioning interval.
+struct TimingRunner<'a> {
+    inner: &'a dyn PreflightRunner,
+    steps: RefCell<Vec<StepTiming>>,
+}
+
+impl<'a> TimingRunner<'a> {
+    fn new(inner: &'a dyn PreflightRunner) -> Self {
+        Self {
+            inner,
+            steps: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl PreflightRunner for TimingRunner<'_> {
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        workspace: &Path,
+        environment: &GrokProcessEnvironment,
+    ) -> anyhow::Result<PreflightOutput> {
+        let started = Instant::now();
+        let result = self.inner.run(program, args, workspace, environment);
+        self.steps.borrow_mut().push(StepTiming {
+            step: step_label(program, args),
+            elapsed: started.elapsed(),
+        });
+        result
+    }
+}
+
+/// A short name for a preflight command: the program and its subcommand
+/// words, without flags, flag values or paths. `cube --json workspace status
+/// --workspace /w` is `cube workspace status`.
+fn step_label(program: &str, args: &[&str]) -> String {
+    let program = Path::new(program)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_owned());
+    let subcommand = args
+        .iter()
+        .skip_while(|arg| arg.starts_with('-'))
+        .take_while(|arg| !arg.starts_with('-') && !arg.starts_with('/'));
+    std::iter::once(program.as_str())
+        .chain(subcommand.copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Log how long one spawn-preparation subprocess took. `grok_home` is the
+/// per-run home, whose path carries the execution id.
+pub(super) fn report_step(grok_home: &Path, step: &str, elapsed: Duration) {
+    tracing::info!(
+        grok_home = %grok_home.display(),
+        step,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "Grok spawn preparation step finished"
+    );
 }
 
 /// Prefix on every preflight error, so a failure reads as what it is wherever
@@ -99,7 +189,14 @@ pub fn run_worker_preflight(
     environment: &GrokProcessEnvironment,
     kind: ExecutionWorkspaceKind,
 ) -> anyhow::Result<()> {
-    run_worker_preflight_with(&RealPreflightRunner, workspace, environment, kind)
+    let runner = TimingRunner::new(&RealPreflightRunner);
+    let result = run_worker_preflight_with(&runner, workspace, environment, kind);
+    // Reported for a failed preflight too: the steps before the failure are
+    // where its time went.
+    for timing in runner.steps.into_inner() {
+        report_step(environment.grok_home(), &timing.step, timing.elapsed);
+    }
+    result
 }
 
 fn run_worker_preflight_with(
@@ -462,6 +559,151 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("Scratch workspace access command exited"), "{error}");
+    }
+
+    #[test]
+    fn step_labels_name_the_command_without_flags_or_paths() {
+        assert_eq!(step_label("grok", &["models"]), "grok models");
+        assert_eq!(
+            step_label(
+                "/bundle/bin/cube",
+                &["--json", "workspace", "status", "--workspace", "/workspace"]
+            ),
+            "cube workspace status"
+        );
+        assert_eq!(
+            step_label("gh", &["auth", "status", "--active", "--hostname", "github.com"]),
+            "gh auth status"
+        );
+        assert_eq!(step_label("jj", &["git", "remote", "list"]), "jj git remote list");
+        assert_eq!(step_label("/usr/bin/touch", &["/home/sessions/.probe"]), "touch");
+        assert_eq!(step_label("/bin/ls", &["-a", "."]), "ls .");
+    }
+
+    /// Sleeps a different length for each command, so a time recorded against
+    /// the wrong step falls short of that step's own floor.
+    struct PacedRunner {
+        outputs: RefCell<VecDeque<(Duration, PreflightOutput)>>,
+    }
+
+    impl PreflightRunner for PacedRunner {
+        fn run(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _workspace: &Path,
+            _environment: &GrokProcessEnvironment,
+        ) -> anyhow::Result<PreflightOutput> {
+            let (pause, output) = self
+                .outputs
+                .borrow_mut()
+                .pop_front()
+                .with_context(|| format!("no paced output for {program}"))?;
+            std::thread::sleep(pause);
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn every_preflight_command_is_timed_in_the_order_it_ran() {
+        let ms = Duration::from_millis;
+        let paced = PacedRunner {
+            outputs: RefCell::new(
+                vec![
+                    (ms(60), success("You are logged in with grok.com.\n")),
+                    (ms(50), success(r#"{"workspace":{"workspace_path":"/workspace"}}"#)),
+                    (ms(40), success("Logged in to github.com account worker (keyring)\n")),
+                    (ms(30), success("/workspace\n")),
+                    (ms(20), success("origin git@github.com:example/repo.git\n")),
+                    (ms(10), success("")),
+                ]
+                .into(),
+            ),
+        };
+        let runner = TimingRunner::new(&paced);
+
+        run_worker_preflight_with(
+            &runner,
+            Path::new("/workspace"),
+            &environment(),
+            ExecutionWorkspaceKind::Cube,
+        )
+        .unwrap();
+
+        let steps = runner.steps.into_inner();
+        assert_eq!(
+            steps.iter().map(|timing| timing.step.as_str()).collect::<Vec<_>>(),
+            [
+                "grok models",
+                "cube workspace status",
+                "gh auth status",
+                "jj root",
+                "jj git remote list",
+                "touch"
+            ]
+        );
+        // Floors only: a sleep never returns early, and nothing bounds how
+        // late a loaded host lets it return.
+        for (timing, floor) in steps.iter().zip([60, 50, 40, 30, 20, 10]) {
+            assert!(timing.elapsed >= ms(floor), "{timing:?} is under {floor} ms");
+        }
+    }
+
+    /// A check that fails still has its time recorded, along with the checks
+    /// before it: that is where a slow failure spent its time.
+    #[test]
+    fn a_failing_command_is_still_timed() {
+        let failing = FakeRunner::new(vec![
+            success("You are logged in with grok.com.\n"),
+            PreflightOutput {
+                success: false,
+                status: "exit status: 5".to_owned(),
+                stdout: String::new(),
+                stderr: "workspace is not tracked".to_owned(),
+            },
+        ]);
+        let runner = TimingRunner::new(&failing);
+
+        run_worker_preflight_with(
+            &runner,
+            Path::new("/workspace"),
+            &environment(),
+            ExecutionWorkspaceKind::Cube,
+        )
+        .unwrap_err();
+
+        let steps = runner.steps.into_inner();
+        assert_eq!(
+            steps.iter().map(|timing| timing.step.as_str()).collect::<Vec<_>>(),
+            ["grok models", "cube workspace status"]
+        );
+    }
+
+    /// A scratch workspace runs a different, shorter set of commands, and the
+    /// timings follow whatever ran.
+    #[test]
+    fn a_scratch_preflight_times_the_commands_it_runs() {
+        let scratch = FakeRunner::new(vec![
+            success("You are logged in with grok.com.\n"),
+            success(".\n..\n.grok\n"),
+            success("Logged in to github.com account worker (keyring)\n"),
+            success(""),
+        ]);
+        let runner = TimingRunner::new(&scratch);
+
+        run_worker_preflight_with(
+            &runner,
+            Path::new("/scratch"),
+            &environment().with_bundled_cube(None),
+            ExecutionWorkspaceKind::Scratch,
+        )
+        .unwrap();
+
+        let steps = runner.steps.into_inner();
+        assert_eq!(
+            steps.iter().map(|timing| timing.step.as_str()).collect::<Vec<_>>(),
+            ["grok models", "ls .", "gh auth status", "touch"]
+        );
     }
 
     /// With no bundled `cube`, the preflight must fail loudly and name the
