@@ -1223,23 +1223,23 @@ if __name__ == "__main__":
 /// the `BYPASS_` guidance) are echoed back so the worker can act.
 ///
 /// All policy lives in checkleft: the script shells out and trusts the
-/// exit code (0 = allow, non-zero = block). It is fail-open by
-/// construction — a non-push command, a repo with no checkleft binary
-/// (e.g. no `bin/checkleft` and none on PATH), or any error
-/// resolving/running checkleft all *approve* — so the gate can never
-/// wedge a session; its only deterministic action is to block a push that
-/// checkleft itself rejected. checkleft's own "no CHECKS.yaml → exit 0"
-/// behaviour means repos without convention checks are transparently
-/// allowed.
+/// exit code (0 = allow, non-zero = block). Non-push commands and repos
+/// that neither declare checkleft in REPOBIN.toml nor have bin/checkleft
+/// are approved; for a repo that declares or installs checkleft, resolution
+/// and execution failures block with a diagnostic, and a declared repo
+/// never falls back to a PATH checkleft. checkleft's own "no CHECKS.yaml →
+/// exit 0" behaviour means repos without convention checks are
+/// transparently allowed.
 ///
 /// The checkleft invocation is resolved from (in order): `BOSS_CHECKLEFT_BIN`
-/// (an override used by tests, used as-is); `repobin exec checkleft` via a
-/// `repobin` binary found at `$BOSS_BIN_DIR/repobin` (the Boss-bundled copy),
-/// `<repo-root>/bin/repobin` or on `PATH`, in that order, but
-/// only once a cheap `repobin exec checkleft --version` probe confirms the
-/// dispatch actually works (see `probe_repobin_checkleft` below);
-/// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
-/// bare `checkleft` on `PATH`.
+/// (an override used by tests, used as-is); `$BOSS_WORKER_BIN_DIR/checkleft`
+/// (the launcher the engine pinned for this worker); `repobin exec checkleft`
+/// via a `repobin` binary found at `$BOSS_BIN_DIR/repobin` (the Boss-bundled
+/// copy) or `<repo-root>/bin/repobin`, but only once a cheap
+/// `repobin exec checkleft --version` probe confirms the dispatch actually
+/// works (see `probe_repobin_checkleft` below); `<repo-root>/bin/checkleft`
+/// (a repobin-installed tool symlink); then a bare `checkleft` on `PATH`
+/// only when the workspace does not require checkleft.
 ///
 /// repobin is preferred over a direct `checkleft` lookup because a bare
 /// `checkleft` on `PATH` can silently resolve to an unrelated, stale build —
@@ -1259,9 +1259,10 @@ if __name__ == "__main__":
 /// with nothing checkleft-shaped on stdout. Without the probe that reads as
 /// a checkleft internal error and hard-blocks every push with no `BYPASS_`
 /// escape, even though the failure has nothing to do with the change being
-/// pushed. Probing with `--version` first, and falling back to the legacy
-/// `<repo-root>/bin/checkleft` / PATH resolution when it fails, keeps a
-/// broken repobin dispatch from taking down the push gate.
+/// pushed. Probing with `--version` first, and falling back to
+/// `<repo-root>/bin/checkleft` when it fails, keeps a broken repobin
+/// dispatch from taking down the push gate. A declared repo still never
+/// falls through to PATH.
 use boss_engine_driver::CHECKLEFT_PUSH_GUARD_SCRIPT;
 
 /// Directory holding all per-workspace worker settings files. The

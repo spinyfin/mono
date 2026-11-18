@@ -1,0 +1,10 @@
+# Default skip/require lists for this checkout's workspace shim installer.
+# install-workspace-shims.sh reads this file when it sits next to the script.
+# REPOBIN_SHIM_SKIP / REPOBIN_SHIM_REQUIRE in the environment override these.
+#
+# boss, boss-event, bossctl and cube are engine-owned launchers: the lease
+# must not write repobin shims for them. checkleft is required so a workspace
+# without a usable bin/checkleft fails its lease rather than letting a worker
+# discover it later.
+SKIP=boss boss-event bossctl cube
+REQUIRE=checkleft
