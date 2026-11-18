@@ -536,6 +536,21 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
     assert_eq!(reclaimed, "worker-1");
 }
 
+/// Move a spawned execution to `completed`, as a finished worker's run does
+/// after its tmux identity has been recorded.
+fn complete_execution_after_spawn(server_state: &Arc<ServerState>, execution_id: &str) {
+    let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
+    server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = COALESCE(finished_at, ?2) WHERE id = ?1",
+            rusqlite::params![execution_id, now],
+        )
+        .unwrap();
+}
+
 /// Set up a worker-pool claim plus a slot mapping for `execution_id`, the
 /// way the coordinator does when it defers a pane-spawned run's slot
 /// release to `release_worker_pane`.
@@ -674,11 +689,15 @@ async fn release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms() 
             boss_protocol::CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status(boss_protocol::ExecutionStatus::Completed)
+                .status(boss_protocol::ExecutionStatus::Running)
                 .build(),
         )
         .unwrap();
+    // The tmux identity is installed while the execution is still running:
+    // the spawn-intent write refuses terminal executions. Only then does the
+    // execution complete.
     claim_slot_one_for(&server_state, &execution.id).await;
+    complete_execution_after_spawn(&server_state, &execution.id);
 
     // An app session that is registered but never answers: `send_to_app`
     // runs out its deadline and the teardown goes unconfirmed.
@@ -746,11 +765,15 @@ async fn verify_sweep_handback(disconnected: bool) {
             boss_protocol::CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status(boss_protocol::ExecutionStatus::Completed)
+                .status(boss_protocol::ExecutionStatus::Running)
                 .build(),
         )
         .unwrap();
+    // The tmux identity is installed while the execution is still running:
+    // the spawn-intent write refuses terminal executions. Only then does the
+    // execution complete.
     claim_slot_one_for(&server_state, &execution.id).await;
+    complete_execution_after_spawn(&server_state, &execution.id);
 
     // Completion while the app is disconnected leaves the detach pending.
     server_state.release_worker_pane(&execution.id).await;
