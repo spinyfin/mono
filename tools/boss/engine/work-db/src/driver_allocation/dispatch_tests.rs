@@ -168,6 +168,49 @@ fn an_unallocatable_task_does_not_stop_its_products_other_executions() {
     // Claim revalidation refuses only the offending execution, with a typed error.
     let err = db.claim_execution_for_dispatch(&refused.id).unwrap_err();
     let refusal = err.downcast_ref::<DriverAllocationRefused>().expect("typed refusal");
-    db.fail_execution_for_allocation_refusal(&refused.id, refusal).unwrap();
-    assert_eq!(db.get_execution(&refused.id).unwrap().status, ExecutionStatus::Failed);
+    assert!(!refusal.to_string().is_empty());
+}
+
+#[test]
+fn attention_sweep_keeps_the_banner_of_a_pre_start_failure_until_a_real_run_starts() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, &product.id, "refused at dispatch");
+    let execution = create_ready_chore_execution(&db, &chore.id);
+
+    // A terminal pre-start failure writes a failed bookkeeping run stamped
+    // `started_at = now` in the same second as the bounce's banner stamp.
+    db.record_pre_start_failure(&execution.id, "engine", None, "refused", &[])
+        .unwrap();
+    db.bounce_dispatch_failed_to_backlog(&chore.id, "driver_allocation_refused", "refused")
+        .unwrap();
+    let banner = |db: &WorkDb| -> Option<String> {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT dispatch_failed_reason FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(banner(&db).is_some());
+    db.reconcile_stale_attention_signals().unwrap();
+    assert_eq!(
+        banner(&db).as_deref(),
+        Some("driver_allocation_refused"),
+        "a failed bookkeeping run is not evidence that anything started"
+    );
+
+    // A genuine later run start does clear it.
+    db.connect()
+        .unwrap()
+        .execute(
+        "INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, started_at)
+         VALUES ('run_real', ?1, 'worker', 'running', '1', CAST((SELECT CAST(dispatch_failed_at AS INTEGER) + 5 FROM tasks WHERE id = ?2) AS TEXT))",
+        rusqlite::params![execution.id, chore.id],
+    )
+    .unwrap();
+    db.reconcile_stale_attention_signals().unwrap();
+    assert_eq!(banner(&db), None);
 }

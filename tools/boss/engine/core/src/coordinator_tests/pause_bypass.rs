@@ -672,12 +672,14 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
 
     let runner = Arc::new(FakeExecutionRunner::default());
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let publisher = Arc::new(crate::test_support::RecordingPublisher::default());
     let coordinator = Arc::new(
-        ExecutionCoordinator::new(
+        ExecutionCoordinator::with_publisher(
             db.clone(),
             WorkerPool::new(1),
             Arc::new(FakeCubeClient::default()),
             runner.clone(),
+            publisher.clone(),
         )
         .with_dispatch_events(recording.clone()),
     );
@@ -707,10 +709,43 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
     );
     let events = recording.events_for(&execution.id).await;
     assert!(
-        events
-            .iter()
-            .any(|e| e.stage == crate::dispatch_events::Stage::PreStartFailure.as_str()
-                && e.outcome == crate::dispatch_events::Outcome::Error.as_str()),
+        events.iter().any(
+            |e| e.stage == crate::dispatch_events::Stage::PreStartRetriesExhausted.as_str()
+                && e.outcome == crate::dispatch_events::Outcome::Error.as_str()
+        ),
         "{events:?}"
+    );
+    // The app learns of the failure like any other permanent start failure.
+    let mut broadcast = false;
+    for _ in 0..100 {
+        let execution_published = publisher
+            .publish_calls
+            .lock()
+            .await
+            .iter()
+            .any(|(_, _, _, reason)| reason == "execution_start_failed");
+        let card_published = publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(pid, id, reason)| pid == &product.id && id == &chore.id && reason == "execution_start_failed");
+        if execution_published && card_published {
+            broadcast = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(broadcast, "execution and work-item changes must be published");
+
+    // The next attention sweep must not erase the banner: nothing launched.
+    db.reconcile_stale_attention_signals().unwrap();
+    let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&chore.id).unwrap() else {
+        panic!("expected a chore");
+    };
+    assert_eq!(
+        task.dispatch_failed_reason.as_deref(),
+        Some(crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND),
+        "the refusal banner must survive the sweep while allocation is still refused"
     );
 }

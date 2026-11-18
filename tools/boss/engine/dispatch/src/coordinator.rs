@@ -901,6 +901,7 @@ mod config;
 mod dispatch_admission;
 mod execution;
 mod lease_limiter;
+mod permanent_start_failure;
 mod predecessor_hold;
 mod preserved_work;
 mod progression_spawn;

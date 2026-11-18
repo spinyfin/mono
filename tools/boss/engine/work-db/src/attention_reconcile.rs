@@ -269,6 +269,10 @@ fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
                WHERE e.work_item_id = tasks.id
                  AND e.kind <> 'progression'
                  AND r.started_at IS NOT NULL
+                 -- A terminal pre-start failure records a failed bookkeeping run
+                 -- stamped `started_at = now` although nothing launched; its
+                 -- execution never got a real start (`started_at` stays NULL).
+                 AND NOT (r.status = 'failed' AND e.started_at IS NULL)
                  AND CAST(r.started_at AS INTEGER) >= CAST(tasks.dispatch_failed_at AS INTEGER)
            )",
         [],

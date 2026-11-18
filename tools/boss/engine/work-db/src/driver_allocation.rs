@@ -408,7 +408,7 @@ pub fn driver_clears_dispatch_gate(driver_slug: &str, task_kind: &TaskKind, exec
 /// mirroring the substitution [`boss_engine_effort::resolve_spawn_config_in`]
 /// applies at spawn time for a `TrafficAllocation`/`EngineDefault`-sourced
 /// driver.
-pub fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
+pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
     let registry = boss_engine_driver::DriverRegistry::default();
     registry
         .get(driver_slug)
