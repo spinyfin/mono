@@ -2031,6 +2031,17 @@ pub trait AgentDriver: Send + Sync {
         None
     }
 
+    /// Directory holding the launcher's delivery markers and log.
+    ///
+    /// The default is the directory `<config_dir>/initial-prompt.txt`
+    /// resolves to, which is where Claude, Codex and Grok write the brief.
+    /// A driver that provisions the launcher outside the workspace must
+    /// override this so spawn confirmation reads the same directory the
+    /// launcher writes.
+    fn delivery_home(&self, workspace: &Path, _run_id: &str) -> PathBuf {
+        crate::initial_prompt::delivery_home(&workspace.join(self.descriptor().config_dir))
+    }
+
     // ── WorkspaceProvisioning capability ────────────────────────────────────
 
     /// Write per-session workspace files (prompt file, agent-rules, gitignore)

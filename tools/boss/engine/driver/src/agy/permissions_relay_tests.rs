@@ -341,7 +341,7 @@ fn relay_holds_the_brief_until_the_cli_log_shows_the_hooks_loaded() {
             "log_path": root.path().join("agy.log"),
             "expected": expected,
             "require": [HOOKS_LOADED_LINE],
-            "forbid": [HOOKS_UNPARSEABLE_LINE],
+            "forbid": [HOOKS_UNPARSEABLE_LINE, HOOKS_NONE_LOADED_LINE],
         }))
         .unwrap(),
     )
@@ -389,18 +389,25 @@ assert os.read(0, 1) == b'\r'
             std::time::Duration::from_secs(20),
         )
         .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
         if mode == "loaded" {
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "{stderr}");
             assert!(root.path().join(initial_prompt::DELIVERED_MARKER).exists());
         } else {
             assert_eq!(
                 output.status.code(),
                 Some(initial_prompt::BRIEF_NOT_DELIVERED_EXIT),
-                "{mode}: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "{mode}: {stderr}"
             );
             assert!(!root.path().join(initial_prompt::DELIVERED_MARKER).exists(), "{mode}");
             assert!(root.path().join(initial_prompt::UNDELIVERED_MARKER).exists(), "{mode}");
+            if mode == "absent" {
+                assert!(
+                    stderr.contains("startup failure that disarms the guards"),
+                    "absent hooks must fail immediately, not as a readiness timeout: {stderr}"
+                );
+                assert!(stderr.contains("loaded 0 named hooks"), "{stderr}");
+            }
         }
     }
 }

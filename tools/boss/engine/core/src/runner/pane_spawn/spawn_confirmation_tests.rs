@@ -1,5 +1,6 @@
 //! Spawn confirmation, prompt acceptance, and cancellation regressions.
 use super::*;
+use boss_execution_runner::test_exports::confirm_local_spawn;
 
 struct DialogCapture {
     spawner: Arc<CapturingSpawner>,
@@ -702,4 +703,36 @@ async fn an_ordinary_cancel_during_prompt_confirmation_never_presses_return() {
     assert!(spawner.cancel_on_capture.lock().unwrap().is_none());
     assert!(spawner.sent_keys().is_empty(), "{:?}", spawner.sent_keys());
     assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn agy_blocking_dialog_refusal_is_read_from_the_control_dir() {
+    let workspace = TempDir::new().unwrap();
+    let homes = workspace.path().join("agy-homes");
+    let _homes = crate::driver::test_support::agy_homes_override(&homes);
+    let (spawner, _weak, _cfg, work_db) = spawn_test_env(&workspace);
+    let run_id = "exec-agy-dialog-1";
+    let control = homes.join(run_id).join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    std::fs::write(
+        control.join(crate::driver::initial_prompt::DELIVERY_LOG),
+        "{\"step\":\"failed\",\"at_ms\":0,\"blocking_dialog_marker\":\"Do you trust the contents of this project?\"}\n",
+    )
+    .unwrap();
+    // A delivered marker under the workspace config-dir name must not hide
+    // the refusal: that directory is not where the agy launcher writes.
+    let decoy = workspace.path().join(".agy");
+    std::fs::create_dir_all(&decoy).unwrap();
+    std::fs::write(decoy.join(crate::driver::initial_prompt::DELIVERED_MARKER), "").unwrap();
+
+    let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
+    let tmux_host = TmuxWorkerHost::new(tmux, spawner.clone(), "boss-test-worker".into());
+    let driver = crate::driver::AgyDriver::default();
+    let err = confirm_local_spawn(&tmux_host, &driver, None, &work_db, run_id, workspace.path())
+        .await
+        .expect_err("dialog refusal in the control dir must fail confirmation");
+    let dialog = err
+        .downcast_ref::<boss_tmux::BlockingDialogOnScreen>()
+        .unwrap_or_else(|| panic!("expected BlockingDialogOnScreen, got {err:#}"));
+    assert_eq!(dialog.marker, "Do you trust the contents of this project?");
 }

@@ -575,7 +575,7 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
             "log_path": super::home::log_file_for_run(&input.run_id)?,
             "expected": expected_initialized_fragment(&settings),
             "require": [HOOKS_LOADED_LINE],
-            "forbid": [HOOKS_UNPARSEABLE_LINE],
+            "forbid": [HOOKS_UNPARSEABLE_LINE, HOOKS_NONE_LOADED_LINE],
         }))?
         .as_bytes(),
     )?;
@@ -599,13 +599,19 @@ pub use crate::SettingsLogCheck;
 /// one hook group (`boss`) from one file. A missing file logs `0 named hooks
 /// from 0 hooks.json file(s)` and a malformed one `0 from 1`; either way the
 /// session still runs, with no authorization hook and no progress ingress.
-/// Absence of this line is the only pre-prompt evidence that hooks did not
-/// load: native `SessionStart` fires with the first prompt, too late to gate
-/// the brief on.
+/// The launcher forbids [`HOOKS_NONE_LOADED_LINE`] so that case fails
+/// immediately rather than waiting out the ready timeout. Absence of this
+/// line with no `0 named hooks` line is still a wait: native `SessionStart`
+/// fires with the first prompt, too late to gate the brief on.
 pub const HOOKS_LOADED_LINE: &str = "loaded 1 named hooks from 1 hooks.json file(s)";
 
 /// Logged when the CLI cannot parse `hooks.json` at all.
 pub const HOOKS_UNPARSEABLE_LINE: &str = "failed to parse hooks.json";
+
+/// Logged when the CLI started without loading any named hook group: a
+/// missing file (`from 0`) or a file that parsed to nothing (`from N`).
+/// Either way the session carries on with no authorization hook.
+pub const HOOKS_NONE_LOADED_LINE: &str = "loaded 0 named hooks";
 
 /// The text the CLI logs after `CLI settings initialized: ` for `settings`,
 /// as Go formats the struct: space-separated slices, `Ask` empty.
@@ -643,6 +649,13 @@ pub fn verify_settings_log(rendered_settings: &str, log: &str) -> anyhow::Result
     if let Some(line) = log.lines().find(|line| line.contains(HOOKS_UNPARSEABLE_LINE)) {
         bail!(
             "agy could not read its hooks file, so no authorization hook is armed: {}",
+            line.trim()
+        );
+    }
+
+    if let Some(line) = log.lines().find(|line| line.contains(HOOKS_NONE_LOADED_LINE)) {
+        bail!(
+            "agy loaded no named hooks, so no authorization hook is armed: {}",
             line.trim()
         );
     }

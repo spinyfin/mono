@@ -1662,7 +1662,7 @@ async fn confirm_prompt_after_late_start(
     let Some(signals) = signals else {
         return Ok(());
     };
-    let home = crate::driver::initial_prompt::delivery_home(&workspace_path.join(driver.descriptor().config_dir));
+    let home = driver.delivery_home(workspace_path, run_id);
     let last_capture = std::sync::Mutex::new(String::new());
     let result = confirm_prompt_phase(
         tmux_host,
@@ -1746,10 +1746,10 @@ async fn confirm_prompt_phase(
 }
 
 /// The bounds on each of spawn confirmation's waits.
-struct SpawnConfirmBounds {
-    composer_timeout: StdDuration,
-    turn_timeout: StdDuration,
-    prompt: PromptSubmitPolicy,
+pub(crate) struct SpawnConfirmBounds {
+    pub(crate) composer_timeout: StdDuration,
+    pub(crate) turn_timeout: StdDuration,
+    pub(crate) prompt: PromptSubmitPolicy,
 }
 
 /// Report the launcher's delivery steps: readiness and how long it took, the
@@ -1768,6 +1768,7 @@ fn log_delivery_steps(run_id: &str, driver_name: &str, home: &Path) {
             ),
             "submit_sent" => ("prompt delivery: submit sent", false),
             "failed" => ("prompt delivery: launcher failed", true),
+            "post_submit_failure" => ("prompt delivery: launcher reported a post-submit failure", true),
             _ => ("prompt delivery: unrecognised launcher step", false),
         };
         if degraded {
@@ -1782,7 +1783,7 @@ fn log_delivery_steps(run_id: &str, driver_name: &str, home: &Path) {
 /// the CLI is up, then a driver hook/session event *or* a persisted
 /// `transcript_path` on the current `work_runs` row that the driver
 /// started, then evidence that it began a turn on its prompt.
-async fn confirm_local_spawn(
+pub(crate) async fn confirm_local_spawn(
     tmux_host: &TmuxWorkerHost,
     driver: &dyn crate::driver::AgentDriver,
     live_states: Option<&dyn crate::host::DriverSignals>,
@@ -1798,7 +1799,7 @@ async fn confirm_local_spawn(
     let started_at = boss_engine_utils::epoch_time::now_epoch_secs();
     let started = std::time::Instant::now();
     let last_capture = std::sync::Mutex::new(String::new());
-    let home = crate::driver::initial_prompt::delivery_home(&workspace_path.join(driver.descriptor().config_dir));
+    let home = driver.delivery_home(workspace_path, run_id);
     tracing::info!(run_id, %started_at, "composer readiness wait started");
     let mut result = confirm_spawn_started(
         driver_name,
