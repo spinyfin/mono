@@ -1,0 +1,211 @@
+use super::*;
+use crate::merge_when_ready::{DirectMergeExecutor, DirectMergeSuccess};
+use boss_engine_merge_poller::tests::StubProbe;
+use boss_engine_merge_poller::{OpenPrStatus, PrLifecycleState, run_one_pass};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Default)]
+struct RecordingMerge(AtomicUsize);
+
+struct MovingMerge<'a> {
+    db: &'a WorkDb,
+    id: &'a str,
+}
+
+#[async_trait::async_trait]
+impl DirectMergeExecutor for MovingMerge<'_> {
+    async fn execute(&self, _: &str) -> Result<DirectMergeSuccess> {
+        self.db
+            .stop_merge_conflict_resolution(self.id, "Stopped during merge")?;
+        Ok(DirectMergeSuccess {
+            head_sha: "resolved".into(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl DirectMergeExecutor for RecordingMerge {
+    async fn execute(&self, _: &str) -> Result<DirectMergeSuccess> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(DirectMergeSuccess {
+            head_sha: "resolved".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn clean_sweeps_wait_for_tripwire_and_only_resume_approved_resolution_once() {
+    for rejected in [false, true] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let (candidate, attempt, id) = blocked_with_attempt(&db);
+        db.record_github_merge_intent(
+            crate::work::GithubMergeIntentInsertInput::builder()
+                .work_item_id(&id)
+                .pr_url(&candidate.pr_url)
+                .head_sha("before-rebase")
+                .build(),
+            "{}",
+        )
+        .unwrap();
+        db.start_merge_conflict_resolution(&id, &candidate.pr_url, "main")
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let cube = ScriptCube {
+            tripwire_gate: Some(gate.clone()),
+            ..ScriptCube::with_tripwire_findings(
+                Script::CleanPushed,
+                if rejected { vec!["important.rs".into()] } else { vec![] },
+            )
+        };
+        let publisher = RecordingPublisher::default();
+        let executor = Arc::new(RecordingMerge::default());
+        let host =
+            crate::merge_poller_adapters::CoreSweepHost::with_remediation(None).with_merge_executor(executor.clone());
+        let probe = StubProbe::new();
+        probe.set(&candidate.pr_url, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let ladder = try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt);
+        tokio::pin!(ladder);
+        // Poll the real ladder until its tripwire future is pending.
+        tokio::select! {
+            outcome = &mut ladder => panic!("tripwire must still be pending: {outcome:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(
+            db.get_conflict_resolution(&attempt.id)
+                .unwrap()
+                .unwrap()
+                .mechanical_rung_in_flight,
+            Some(1)
+        );
+        run_one_pass(&db, probe.as_ref(), &publisher, None, None, Some(&host)).await;
+        assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+        assert!(db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
+        assert_eq!(db.task_blocked_reason(&id).unwrap().as_deref(), Some("merge_conflict"));
+        gate.notify_one();
+        let outcome = ladder.await;
+        assert_eq!(
+            outcome,
+            if rejected {
+                LadderOutcome::HaltedForSignoff
+            } else {
+                LadderOutcome::Retired
+            }
+        );
+        for _ in 0..3 {
+            run_one_pass(&db, probe.as_ref(), &publisher, None, None, Some(&host)).await;
+        }
+        assert_eq!(executor.0.load(Ordering::SeqCst), usize::from(!rejected));
+        let WorkItem::Chore(card) = db.get_work_item(&id).unwrap() else {
+            panic!("expected chore")
+        };
+        if rejected {
+            assert_eq!(card.blocked_reason.as_deref(), Some("deletion_signoff"));
+            assert_eq!(card.merge_queue_state, None);
+            assert!(card.merge_queue_detail.unwrap().contains("approval for deleted files"));
+            assert!(
+                db.get_active_github_merge_intent(&id, &candidate.pr_url)
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert_eq!(card.merge_queue_state.as_deref(), Some("queued"));
+            assert_eq!(
+                db.get_active_github_merge_intent(&id, &candidate.pr_url)
+                    .unwrap()
+                    .unwrap()
+                    .head_sha,
+                "resolved"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn clean_sweep_recovers_persisted_rejection_before_resuming() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let (candidate, attempt, id) = blocked_with_attempt(&db);
+    db.start_merge_conflict_resolution(&id, &candidate.pr_url, "main")
+        .unwrap();
+    db.record_conflict_ladder_outcome(&attempt.id, "engine_rebase", "halted_for_signoff", "deletion tripwire")
+        .unwrap();
+    db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, 1)
+        .unwrap();
+    drop(db);
+    let db = WorkDb::open(path).unwrap();
+    let executor = Arc::new(RecordingMerge::default());
+    let host =
+        crate::merge_poller_adapters::CoreSweepHost::with_remediation(None).with_merge_executor(executor.clone());
+    let probe = StubProbe::new();
+    probe.set(&candidate.pr_url, PrLifecycleState::Open(OpenPrStatus::clean()));
+    for _ in 0..3 {
+        run_one_pass(
+            &db,
+            probe.as_ref(),
+            &RecordingPublisher::default(),
+            None,
+            None,
+            Some(&host),
+        )
+        .await;
+    }
+    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        db.task_blocked_reason(&id).unwrap().as_deref(),
+        Some("deletion_signoff")
+    );
+    assert!(!db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
+}
+
+#[tokio::test]
+async fn a_card_moved_during_merge_does_not_publish_continuation() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, id) = blocked_with_attempt(&db);
+    db.start_merge_conflict_resolution(&id, &candidate.pr_url, "main")
+        .unwrap();
+    db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, 1)
+        .unwrap();
+    db.clear_resolved_pr_signal(&id, &candidate.pr_url, false).unwrap();
+    let publisher = RecordingPublisher::default();
+    crate::merge_when_ready::resume_after_conflict(&db, &publisher, &candidate, &MovingMerge { db: &db, id: &id })
+        .await;
+    assert!(
+        !publisher
+            .lifecycle_reasons()
+            .await
+            .contains(&"merge_conflict_continuation".into())
+    );
+    assert!(!db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
+}
+
+#[test]
+fn failed_signoff_write_rolls_back_attempt_retirement() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, id) = blocked_with_attempt(&db);
+    db.start_merge_conflict_resolution(&id, &candidate.pr_url, "main")
+        .unwrap();
+    db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "lease", "workspace")
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_signoff BEFORE UPDATE ON tasks
+         WHEN NEW.blocked_reason = 'deletion_signoff'
+         BEGIN SELECT RAISE(ABORT, 'signoff write failed'); END;",
+        )
+        .unwrap();
+    assert!(
+        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1)
+            .is_err()
+    );
+    let live = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(live.status, "pending");
+    assert_eq!(live.mechanical_rung_in_flight, Some(1));
+    db.clear_resolved_pr_signal(&id, &candidate.pr_url, false).unwrap();
+    assert_eq!(db.task_blocked_reason(&id).unwrap().as_deref(), Some("merge_conflict"));
+    assert!(db.merge_conflict_resolution_requested(&id, &candidate.pr_url).unwrap());
+}

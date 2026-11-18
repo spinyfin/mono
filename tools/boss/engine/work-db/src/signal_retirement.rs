@@ -75,6 +75,35 @@ pub(crate) fn clear_resolved_signal_in_tx(
         );
         return Ok(ClearResolvedSignal::Nothing);
     }
+    // Recover the old two-commit rejection window before a clean observation
+    // can clear its conflict block. The recorded safety verdict survives a crash.
+    if !ci {
+        let rejected: Option<String> = conn
+            .query_row(
+                "SELECT cr.id FROM conflict_resolutions cr
+             WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
+               AND cr.id = (SELECT id FROM conflict_resolutions WHERE work_item_id = ?1 AND pr_url = ?2
+                            ORDER BY created_at DESC, id DESC LIMIT 1)
+               AND EXISTS (SELECT 1 FROM json_each(COALESCE(cr.ladder_outcomes, '[]'))
+                           WHERE json_extract(value, '$.outcome') = 'halted_for_signoff')
+             ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
+                params![item, pr],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = rejected
+            && crate::blocking::mark_deletion_signoff_in_tx(conn, item, pr)?.is_some()
+        {
+            let attempt = query_conflict_resolution(conn, &id)?.expect("selected conflict attempt");
+            let rung = attempt
+                .resolved_by_rung
+                .or(attempt.mechanical_rung_in_flight)
+                .unwrap_or(0);
+            mark_conflict_resolution_succeeded_at_rung_in_tx(conn, &id, None, rung)?;
+            stage_task_board_change(pending, conn, item)?;
+            return Ok(ClearResolvedSignal::Nothing);
+        }
+    }
     let table = if ci { "ci_remediations" } else { "conflict_resolutions" };
     let ids: Vec<String> = conn
         .prepare(&format!(

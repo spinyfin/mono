@@ -444,45 +444,32 @@ impl WorkDb {
     /// row a human already moved is left alone. Idempotent: `Ok(None)`
     /// when the guard misses.
     pub fn mark_chore_blocked_deletion_signoff(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        self.halt_deletion_signoff(work_item_id, pr_url, None)
+    }
+
+    /// Retire the attempt and stop the standing merge in the same transaction.
+    /// Also repairs an older succeeded attempt with a still-blocked parent.
+    pub fn halt_conflict_resolution_for_deletion_signoff(&self, attempt_id: &str, rung: i64) -> Result<Option<Task>> {
+        let attempt = self
+            .get_conflict_resolution(attempt_id)?
+            .with_context(|| format!("unknown conflict attempt: {attempt_id}"))?;
+        self.halt_deletion_signoff(&attempt.work_item_id, &attempt.pr_url, Some((attempt_id, rung)))
+    }
+
+    fn halt_deletion_signoff(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        attempt: Option<(&str, i64)>,
+    ) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = now_string();
-        let rows = crate::task_status_audit::execute(
-            &tx,
-            "mark_chore_blocked_deletion_signoff",
-            "engine",
-            "UPDATE tasks
-                SET status             = 'blocked',
-                    blocked_reason     = 'deletion_signoff',
-                    blocked_attempt_id = NULL,
-                    pr_url             = ?2,
-                    last_status_actor  = 'engine',
-                    updated_at         = ?3
-              WHERE id = ?1
-                AND status = 'blocked'
-                AND blocked_reason = 'merge_conflict'
-                AND deleted_at IS NULL",
-            params![work_item_id, pr_url, now],
-        )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
+        if let Some((id, rung)) = attempt {
+            crate::conflict_res::mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, id, None, rung)?;
         }
-        crate::merge_conflict_merging::stop(&tx, work_item_id, "Resolution needs approval for deleted files")?;
-        // Leaving the merge_conflict state for deletion_signoff — clear the
-        // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
-        tx.execute(
-            "UPDATE task_blocked_signals
-                SET cleared_at = ?2
-              WHERE work_item_id = ?1
-                AND reason = 'merge_conflict'
-                AND cleared_at IS NULL",
-            params![work_item_id, now],
-        )?;
-        let updated = query_task(&tx, work_item_id)?
-            .with_context(|| format!("unknown task after deletion_signoff flip: {work_item_id}"))?;
+        let updated = mark_deletion_signoff_in_tx(&tx, work_item_id, pr_url)?;
         tx.commit()?;
-        Ok(Some(updated))
+        Ok(updated)
     }
 
     /// Symmetric retire path: flip a chore/project_task currently
@@ -2350,6 +2337,44 @@ pub(crate) fn clear_blocked_ci_failure_in_tx(
     )?;
     let updated = query_task(conn, work_item_id)?
         .with_context(|| format!("unknown task after ci_failure clear: {work_item_id}"))?;
+    Ok(Some(updated))
+}
+
+pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+    let now = now_string();
+    let rows = crate::task_status_audit::execute(
+        conn,
+        "mark_chore_blocked_deletion_signoff",
+        "engine",
+        "UPDATE tasks
+                SET status             = 'blocked',
+                    blocked_reason     = 'deletion_signoff',
+                    blocked_attempt_id = NULL,
+                    pr_url             = ?2,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND deleted_at IS NULL",
+        params![work_item_id, pr_url, now],
+    )?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    crate::merge_conflict_merging::stop(conn, work_item_id, "Resolution needs approval for deleted files")?;
+    // Leaving the merge_conflict state for deletion_signoff — clear the
+    // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
+    conn.execute(
+        "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = 'merge_conflict'
+                AND cleared_at IS NULL",
+        params![work_item_id, now],
+    )?;
+    let updated = query_task(conn, work_item_id)?
+        .with_context(|| format!("unknown task after deletion_signoff flip: {work_item_id}"))?;
     Ok(Some(updated))
 }
 

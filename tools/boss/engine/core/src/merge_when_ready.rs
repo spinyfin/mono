@@ -153,8 +153,14 @@ pub async fn resume_after_conflict(
         }
         match executor.execute(&candidate.pr_url).await {
             Ok(success) => {
-                if !db.finish_merge_conflict_resolution(&candidate.work_item_id, &candidate.pr_url, &success.head_sha)? {
-                    tracing::warn!(work_item_id = %candidate.work_item_id, "merge command succeeded but the card moved on before its intent was recorded");
+                let finished =
+                    db.finish_merge_conflict_resolution(&candidate.work_item_id, &candidate.pr_url, &success.head_sha)?;
+                if !finished {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        "merge command succeeded but the card moved on before its intent was recorded"
+                    );
+                    return Ok(false);
                 }
             }
             Err(err) => {

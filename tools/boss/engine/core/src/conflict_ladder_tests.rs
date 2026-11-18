@@ -39,6 +39,7 @@ struct ScriptCube {
     /// (the default via [`Self::new`]) means "clean" — no network call is
     /// made since this is a scripted double, not `CommandCubeClient`.
     tripwire_findings: Vec<String>,
+    tripwire_gate: Option<Arc<tokio::sync::Notify>>,
     /// Workspace path handed back by `lease_workspace`. Defaults to a
     /// non-existent fixed path (fine for tests that never reach rung 0's
     /// real resolvers); tests exercising a *live* rung 0 through
@@ -68,6 +69,7 @@ impl ScriptCube {
         Self {
             script,
             tripwire_findings: Vec::new(),
+            tripwire_gate: None,
             workspace_path: PathBuf::from("/tmp/ladder-ws"),
             lease_failures: 0,
             peek: None,
@@ -174,6 +176,9 @@ crate::stub_cube_client! { ScriptCube {
         _base_sha: &str,
         _pr_number: u64,
     ) -> Vec<String> {
+        if let Some(gate) = &self.tripwire_gate {
+            gate.notified().await;
+        }
         self.tripwire_findings.clone()
     }
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -1870,3 +1875,6 @@ fn conflict_rules_are_read_from_beside_the_work_database() {
     assert_eq!(rules.keep_both[0].name, "entry_list");
     assert!(rules.recipes.is_empty());
 }
+
+#[path = "conflict_ladder_merge_safety_tests.rs"]
+mod merge_safety;
