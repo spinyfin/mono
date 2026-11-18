@@ -444,8 +444,7 @@ pub enum FrontendRequest {
     /// source fields in the input. Replies with
     /// [`FrontendEvent::AttentionCreated`].
     CreateAttention {
-        /// Boxed so `FrontendRequest` stays within clippy's
-        /// `large_enum_variant` budget; serde output is identical.
+        /// Boxed for clippy `large_enum_variant`; serde output is identical.
         #[serde(flatten)]
         input: Box<CreateAttentionInput>,
     },
@@ -761,9 +760,7 @@ pub enum FrontendRequest {
     /// this flag holds. Replies with [`FrontendEvent::AutomationStateResult`].
     GetAutomationState,
 
-    /// Snapshot of Boothby's current `boothby.mode`, its in-flight pass (if
-    /// any), and its most recent finished pass. Read-only; no side effects.
-    /// Replies with [`FrontendEvent::BoothbyState`].
+    /// Read-only Boothby snapshot. Replies with [`FrontendEvent::BoothbyState`].
     GetBoothbyState,
 
     /// Read-only: snapshot a work item's CI attempt budget — the
@@ -1338,8 +1335,7 @@ pub enum FrontendRequest {
         automation_id: String,
     },
 
-    /// List `boothby_passes` history, freshest first, capped at `limit`
-    /// (default 50 when omitted). Replies with
+    /// Pass history, newest first (`limit` defaults to 50). Replies with
     /// [`FrontendEvent::BoothbyPassesList`].
     ListBoothbyPasses {
         #[serde(default)]
@@ -2358,13 +2354,9 @@ pub enum FrontendRequest {
         force: bool,
     },
 
-    /// Fire an immediate Boothby pass (`boss boothby run` / the tab's "Run
-    /// now" button). Bypasses the schedule and `boothby.min_pass_gap_secs` —
-    /// this is explicit human intent, same as `RunAutomation`'s `force` flag
-    /// bypassing the open-task cap — but still refuses if a pass is already
-    /// open (`boothby.md`'s "still one-at-a-time"). Replies with
-    /// [`FrontendEvent::BoothbyPassStarted`] on success or
-    /// [`FrontendEvent::WorkError`] when a pass is already in flight.
+    /// Fire a Boothby pass now, bypassing the schedule and
+    /// `boothby.min_pass_gap_secs`; refused if a pass is already open. Replies
+    /// with [`FrontendEvent::BoothbyPassStarted`] or [`FrontendEvent::WorkError`].
     RunBoothbyPass,
 
     /// Boss-tier RPC: write `text` into the worker pane hosting
@@ -2414,11 +2406,9 @@ pub enum FrontendRequest {
         reason: Option<String>,
     },
 
-    /// Set `boothby.mode` (`"off"` | `"propose"` | `"auto"`). Persists via
-    /// the settings text registry and wakes the scheduler immediately (so
-    /// flipping off `off` doesn't wait out the current sleep). Replies with
-    /// [`FrontendEvent::BoothbyState`] or [`FrontendEvent::WorkError`] for an
-    /// unrecognized mode string.
+    /// Set `boothby.mode` (`"off"` | `"propose"` | `"auto"`) and wake the
+    /// scheduler. Replies with [`FrontendEvent::BoothbyState`] or
+    /// [`FrontendEvent::WorkError`] for an unknown mode.
     SetBoothbyMode {
         mode: String,
     },
@@ -2951,8 +2941,7 @@ pub enum FrontendRequest {
         targets: Vec<String>,
     },
 
-    /// Apply an `IdeaPatch` to an idea. `None` fields are left unchanged.
-    /// Replies with [`FrontendEvent::IdeaUpdated`].
+    /// Apply an `IdeaPatch` (`None` fields unchanged). Replies with [`FrontendEvent::IdeaUpdated`].
     UpdateIdea {
         id: String,
         patch: IdeaPatch,
@@ -2960,26 +2949,20 @@ pub enum FrontendRequest {
 
     UpdateWorkItem {
         id: String,
-        /// Boxed so `FrontendRequest` stays within clippy's
-        /// `large_enum_variant` budget; serde output is identical.
+        /// Boxed for clippy `large_enum_variant`; serde output is identical.
         patch: Box<WorkItemPatch>,
     },
 
-    /// Snapshot every engine worker pool's (main, automation, review)
-    /// own claimed-slot bookkeeping — capacity, idle count, and each
-    /// held slot's `worker_id → execution_id` mapping — cross-referenced
-    /// against `LiveWorkerStateRegistry` so a claim with no backing live
-    /// worker is flagged. Read-only. This is the diagnostic surface for
-    /// "pool reports N/M busy but `bossctl agents list` shows fewer live
-    /// workers": before this existed, diagnosing a leaked claim required
-    /// manually diffing `agents list` against `pool_capacity` from
-    /// `dispatch.jsonl` rejections.
+    /// Snapshot every engine worker pool's (main, automation, review) claimed
+    /// slots — capacity, idle count, and each held slot's `worker_id →
+    /// execution_id` mapping — cross-referenced against
+    /// `LiveWorkerStateRegistry` so a claim with no backing live worker is
+    /// flagged. Read-only; the diagnostic for "pool reports N/M busy but
+    /// `bossctl agents list` shows fewer live workers".
     WorkerPoolSummary,
 
-    /// Snapshot the cube workspace pool. Proxies to
-    /// `cube --json workspace list`; the engine adds no editorial — the
-    /// returned vector mirrors cube's view, optionally annotated with
-    /// the engine's own knowledge of which leases back which executions.
+    /// Snapshot the cube workspace pool (proxies `cube --json workspace
+    /// list`, optionally annotated with which leases back which executions).
     WorkspacePoolSummary,
 }
 
@@ -2989,9 +2972,8 @@ pub use events::{FrontendEvent, FrontendEventWorkerVisitor};
 mod invalidation;
 pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePatchItem};
 
-// Feature-flag / setting snapshots and workspace / worker pool summary
-// rows live in the `snapshot_wire` submodule (extracted to keep this file
-// under the size limit) and are re-exported so external
+// Feature-flag / setting snapshots and pool summary rows live in
+// `snapshot_wire` (extracted for file size); re-exported so
 // `boss_protocol::{..}` paths are unchanged.
 mod snapshot_wire;
 pub use snapshot_wire::{
@@ -2999,8 +2981,7 @@ pub use snapshot_wire::{
     WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
 };
 
-// The topic-push payload enum lives in `topic_event_payload`; re-exported as
-// `boss_protocol::TopicEventPayload` next to `PaneCaptureState`.
+// Topic-push payload enum; re-exported as `boss_protocol::TopicEventPayload`.
 mod topic_event_payload;
 pub use topic_event_payload::{PaneCaptureState, TopicEventPayload};
 
