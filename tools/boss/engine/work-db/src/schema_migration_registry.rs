@@ -259,6 +259,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: comment_thread_entries::PROPOSED_EDIT_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: comment_thread_entries::migrate_proposed_edits,
+        },
+        Migration {
             id: conflict_mismatch::MIGRATION_ID.into(),
             legacy_version: None,
             apply: conflict_mismatch::migrate,

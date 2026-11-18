@@ -11,7 +11,7 @@
 //! distinct `answer_agent` capability profile.
 
 use super::*;
-use crate::comment_thread_entries::insert_comment_thread_entry_on;
+use crate::comment_thread_entries::{insert_comment_thread_entry_on, new_stored_proposal, save_proposal};
 use crate::comments::{query_comment, transition_comment_to_answered_on};
 use crate::spoke_projection::{get_spoke_applied_write_on, record_application_on};
 
@@ -255,10 +255,14 @@ impl WorkDb {
     /// Complete the execution's answer-agent reply, the thread entry, and the
     /// comment's `answered` transition in one transaction. A crash between those
     /// writes is repaired on replay. A failed or superseded attempt is refused.
+    /// An optional proposed edit is validated and stored on the answer's thread
+    /// entry in that same transaction; an invalid proposal refuses the whole
+    /// reply and leaves the run `running`.
     pub fn apply_answer_agent_reply(
         &self,
         execution_id: &str,
         body: &str,
+        proposed_edit: Option<boss_protocol::ProposedEditInput>,
         application: Option<SpokeWriteApplication<'_>>,
     ) -> std::result::Result<WorkComment, SpokeWriteError> {
         if body.trim().is_empty() {
@@ -290,6 +294,10 @@ impl WorkDb {
         else {
             return Err(SpokeWriteError::refused("no answer-agent run for this execution"));
         };
+        let stored_proposal = proposed_edit
+            .map(|proposal| new_stored_proposal(&tx, &run.comment_id, proposal))
+            .transpose()
+            .map_err(|err| SpokeWriteError::refused(err.to_string()))?;
         match run.status.as_str() {
             s if s == ANSWER_AGENT_RUN_STATUS_FAILED || s == ANSWER_AGENT_RUN_STATUS_SUPERSEDED => {
                 return Err(SpokeWriteError::refused(format!(
@@ -323,7 +331,7 @@ impl WorkDb {
             )
             .map_err(|err| SpokeWriteError::from_work(err.into()))?;
         if existing_thread == 0 {
-            insert_comment_thread_entry_on(
+            let entry = insert_comment_thread_entry_on(
                 &tx,
                 &run.comment_id,
                 THREAD_ENTRY_KIND_ANSWER,
@@ -333,6 +341,9 @@ impl WorkDb {
                 Some(run.id.as_str()),
             )
             .map_err(SpokeWriteError::from_work)?;
+            if let Some(proposal) = stored_proposal.as_ref() {
+                save_proposal(&tx, &entry.id, proposal).map_err(SpokeWriteError::from_work)?;
+            }
         }
         transition_comment_to_answered_on(&tx, &run.comment_id).map_err(SpokeWriteError::from_work)?;
         record_application_on(&tx, application).map_err(SpokeWriteError::from_work)?;
@@ -909,7 +920,7 @@ mod tests {
         db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
 
         let answered = db
-            .apply_answer_agent_reply(&execution.id, "because the retry is exponential", None)
+            .apply_answer_agent_reply(&execution.id, "because the retry is exponential", None, None)
             .unwrap();
         assert_eq!(answered.status, "answered");
         let done = db.get_answer_agent_run(&run.id).unwrap().unwrap();
@@ -921,7 +932,7 @@ mod tests {
         assert_eq!(entries[0].answer_agent_run_id.as_deref(), Some(run.id.as_str()));
 
         assert!(
-            db.apply_answer_agent_reply(&execution.id, "a second local reply", None)
+            db.apply_answer_agent_reply(&execution.id, "a second local reply", None, None)
                 .is_err()
         );
     }

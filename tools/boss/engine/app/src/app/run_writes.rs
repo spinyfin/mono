@@ -71,7 +71,9 @@ pub(super) async fn answer_reply(
             "run '{run_id}' is not an answer-agent execution"
         )));
     }
-    let comment = state.work_db.apply_answer_agent_reply(run_id, body, application)?;
+    let comment = state
+        .work_db
+        .apply_answer_agent_reply(run_id, body, None, application)?;
     boss_engine_completion::answer_agent_observability::record_replied(&state.metrics);
     let revision = publish_comment_invalidation(
         state,

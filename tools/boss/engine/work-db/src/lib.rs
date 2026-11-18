@@ -905,6 +905,8 @@ mod progression_verbs;
 mod project_postmortem;
 #[cfg(test)]
 use boss_prose_vocabulary as prose_vocabulary;
+#[cfg(test)]
+mod answer_proposed_edit_tests;
 mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;
