@@ -843,7 +843,7 @@ impl AgentDriver for ClaudeDriver {
             // Single-quote the path so a `$TMPDIR` with spaces survives
             // the pane's shell. Worker settings paths never contain a
             // single quote, so naive single-quoting is sufficient.
-            cmd.push_str(&format!(" --settings '{}'", settings.display()));
+            cmd.push_str(&format!("{CLAUDE_SETTINGS_FLAG}'{}'", settings.display()));
         }
         cmd.push('\n');
         let cmd = super::initial_prompt::launcher_command(CLAUDE_DESCRIPTOR.config_dir, &cmd);
@@ -1092,10 +1092,7 @@ impl AgentDriver for ClaudeDriver {
             // command first; it is the same parser Codex reviewers use.
             hooks.push(serde_json::json!({
                 "matcher": "Bash",
-                "hooks": [{"type": "command", "command": format!(
-                    "python3 -c {}",
-                    shell_quote(&crate::codex::codex_reviewer_publish_guard_script())
-                )}],
+                "hooks": [{"type": "command", "command": reviewer_publish_guard_command()}],
             }));
         }
 
@@ -1130,6 +1127,10 @@ impl AgentDriver for ClaudeDriver {
     /// from the driver-agnostic body that follows it.
     fn agent_rules_preamble(&self) -> &'static str {
         CLAUDE_AGENT_RULES_PREAMBLE
+    }
+
+    fn launch_fence_flag(&self) -> Option<&'static str> {
+        Some(CLAUDE_SETTINGS_FLAG)
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
@@ -1397,6 +1398,21 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
 }
+/// Launch flag (with its leading and trailing space) that passes the rendered
+/// worker settings file to `claude`.
+const CLAUDE_SETTINGS_FLAG: &str = " --settings ";
+
+/// The reviewer publication guard as a hook command. Claude Code treats any
+/// non-zero hook exit other than 2 as a non-blocking error, so a missing
+/// `python3` (exit 127) or a crashed script would leave the guard inert; the
+/// trailing `|| exit 2` turns every guard failure into a block.
+fn reviewer_publish_guard_command() -> String {
+    format!(
+        "python3 -c {} || exit 2",
+        shell_quote(&crate::codex::codex_reviewer_publish_guard_script())
+    )
+}
+
 #[cfg(test)]
 mod review_guide_recognizer_tests {
     // The recognizer must render identically in shell-embedded and standalone guards.
@@ -2239,6 +2255,41 @@ mod tests {
             ClaudeDriver.classify_error("authentication_error after request timed out"),
             WorkerErrorClass::Permanent,
         );
+    }
+
+    #[test]
+    fn reviewer_publish_guard_fails_closed_without_python3() {
+        // Rendered into the reviewer's settings as the publication hook.
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
+            data_dir: None,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+            git_store_guard_script: None,
+            is_revision: false,
+            is_standard_worker: false,
+            is_reviewer: true,
+            is_review_guide: false,
+            run_id: None,
+            workspace_path: None,
+        });
+        let command = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .filter_map(|e| e["hooks"][0]["command"].as_str())
+            .find(|c| c.starts_with("python3 -c") && c.contains("no-write/no-publish guard"))
+            .expect("reviewer publication hook present")
+            .to_owned();
+        assert!(command.ends_with("|| exit 2"), "{command}");
+        // With python3 off PATH the shell exits 127 for the interpreter; the
+        // hook must turn that into Claude's blocking exit code, 2.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PATH", "/nonexistent")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(2));
     }
 
     #[test]

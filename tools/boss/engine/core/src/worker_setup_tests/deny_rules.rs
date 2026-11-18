@@ -198,19 +198,13 @@ fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
     }
 
     let menu = &ClaudeDriver.descriptor().model_menu;
-    let models = [
-        (menu.review_model_for_tier)(ReviewModelTier::Fast),
-        (menu.review_model_for_tier)(ReviewModelTier::Balanced),
-        (menu.review_model_for_tier)(ReviewModelTier::Strong),
-        "fable",
-    ];
     const SKIP: &str = "--dangerously-skip-permissions";
     const AUTO: &str = "--permission-mode auto";
     let expected_modes = [
-        (models[0], SKIP),
-        (models[1], SKIP),
-        (models[2], AUTO),
-        (models[3], AUTO),
+        ((menu.review_model_for_tier)(ReviewModelTier::Fast), SKIP),
+        ((menu.review_model_for_tier)(ReviewModelTier::Balanced), SKIP),
+        ((menu.review_model_for_tier)(ReviewModelTier::Strong), AUTO),
+        ("fable", AUTO),
     ];
     for (model, base_mode) in expected_modes {
         for non_opus_auto_mode in [false, true] {
@@ -231,6 +225,30 @@ fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
                 plan.command.contains(expected),
                 "unverified reviewer mode: {}",
                 plan.command
+            );
+            // Fenced in every permission mode; and refused without settings
+            // in both skip-permissions and auto mode.
+            let gate = ClaudeDriver.launch_fence_flag();
+            input
+                .worker_kind
+                .verify_launch_command_fenced(gate, &plan.command)
+                .unwrap();
+            let unfenced = ClaudeDriver.spawn_invocation(SpawnRequest {
+                model,
+                effort: None,
+                settings_path: None,
+                non_opus_auto_mode,
+                permission_mode_override: input.worker_kind.forced_permission_mode(),
+                run_id: Some(&input.run_id),
+            });
+            assert!(unfenced.command.contains(expected));
+            assert!(
+                input
+                    .worker_kind
+                    .verify_launch_command_fenced(gate, &unfenced.command)
+                    .is_err(),
+                "reviewer without --settings must be refused: {}",
+                unfenced.command
             );
         }
     }
@@ -254,7 +272,10 @@ fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
     assert!(plan.command.contains("--settings '"), "{}", plan.command);
     // The launch builders' own gate accepts the fenced command and rejects the
     // same skip-permissions command without a settings file.
-    real.worker_kind.verify_launch_command_fenced(&plan.command).unwrap();
+    let gate = ClaudeDriver.launch_fence_flag();
+    real.worker_kind
+        .verify_launch_command_fenced(gate, &plan.command)
+        .unwrap();
     let unfenced = ClaudeDriver.spawn_invocation(SpawnRequest {
         model: (menu.review_model_for_tier)(ReviewModelTier::Fast),
         effort: None,
@@ -265,16 +286,16 @@ fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
     });
     assert!(
         real.worker_kind
-            .verify_launch_command_fenced(&unfenced.command)
+            .verify_launch_command_fenced(gate, &unfenced.command)
             .is_err()
     );
     assert!(
         WorkerKind::Triage
-            .verify_launch_command_fenced(&unfenced.command)
+            .verify_launch_command_fenced(gate, &unfenced.command)
             .is_err()
     );
     WorkerKind::Standard
-        .verify_launch_command_fenced(&unfenced.command)
+        .verify_launch_command_fenced(gate, &unfenced.command)
         .unwrap();
     // The referenced settings file carries the write fence as well.
     assert!(

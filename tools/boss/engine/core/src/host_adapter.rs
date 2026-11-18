@@ -1173,7 +1173,7 @@ impl HostAdapter for SshHostAdapter {
             run_id: Some(&run_id),
         });
         worker_kind
-            .verify_launch_command_fenced(&driver_spawn_plan.command)
+            .verify_launch_command_fenced(driver.launch_fence_flag(), &driver_spawn_plan.command)
             .map_err(|reason| anyhow::anyhow!(reason))?;
         let engine_socket = self.events_socket_path.display().to_string();
         let stage = async {
