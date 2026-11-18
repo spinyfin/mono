@@ -810,16 +810,20 @@ impl WorkDb {
             record_ci_failure_suppression_in_tx(&tx, id, &task.updated_at)?;
         }
 
+        if before.pr_url != task.pr_url
+            || ((previous_status != task.status || previous_blocked_reason != task.blocked_reason)
+                && task.status != TaskStatus::InReview
+                && !(task.status == TaskStatus::Blocked && task.blocked_reason.as_deref() == Some("merge_conflict")))
+        {
+            crate::merge_conflict_merging::cancel(&tx, id)?;
+        }
         let mut updated = query_task(&tx, id).require("task", id)?;
+        // Audit the stored status before applying the board presentation.
+        boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
         // Same single-item projection `get_work_item` runs, so SetStatus's
         // WorkItemUpdated does not flicker derived flags to mapper zeros
         // for the 150 ms until the invalidation refetch lands.
         project_for_work_item_updated(&tx, &mut updated, "update_task");
-        // Audit inside `tx`: the action row and the write it describes
-        // commit together or not at all. Inert unless `actor` is Boothby.
-        // Derived fields are not part of `task_image`, so projecting
-        // before capture does not journal a no-op as a mutation.
-        boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(task_to_item(updated))
     }

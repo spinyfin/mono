@@ -75,6 +75,37 @@ pub(crate) fn clear_resolved_signal_in_tx(
         );
         return Ok(ClearResolvedSignal::Nothing);
     }
+    // Complete a recorded deletion-tripwire rejection when a crash or failed
+    // write prevented the atomic halt, before a clean probe lifts the block.
+    if !ci {
+        let rejected: Option<String> = conn
+            .query_row(
+                "SELECT cr.id FROM conflict_resolutions cr
+             WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
+               AND cr.id = (SELECT id FROM conflict_resolutions WHERE work_item_id = ?1 AND pr_url = ?2
+                            ORDER BY created_at DESC, id DESC LIMIT 1)
+               AND (cr.status != 'succeeded' OR EXISTS (
+                   SELECT 1 FROM tasks t WHERE t.id = ?1
+                     AND t.status = 'blocked' AND t.blocked_reason = 'merge_conflict'))
+               AND EXISTS (SELECT 1 FROM json_each(COALESCE(cr.ladder_outcomes, '[]'))
+                           WHERE json_extract(value, '$.outcome') = 'halted_for_signoff')
+             ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
+                params![item, pr],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = rejected {
+            crate::blocking::mark_deletion_signoff_in_tx(conn, item, pr)?;
+            let attempt = query_conflict_resolution(conn, &id)?.expect("selected conflict attempt");
+            let rung = attempt
+                .resolved_by_rung
+                .or(attempt.mechanical_rung_in_flight)
+                .unwrap_or(0);
+            mark_conflict_resolution_succeeded_at_rung_in_tx(conn, &id, None, rung)?;
+            stage_task_board_change(pending, conn, item)?;
+            return Ok(ClearResolvedSignal::Nothing);
+        }
+    }
     let table = if ci { "ci_remediations" } else { "conflict_resolutions" };
     let ids: Vec<String> = conn
         .prepare(&format!(
@@ -99,6 +130,18 @@ pub(crate) fn clear_resolved_signal_in_tx(
     } else {
         None
     };
+    // A mechanical rung that has pushed its rebased head is still running its
+    // post-push safety checks (e.g. the deletion tripwire). Its resolver owns
+    // completion; a clean probe in that window must neither lift the block
+    // nor retire the attempt, or a resolution awaiting sign-off could be merged.
+    if conflict.as_ref().is_some_and(|a| a.mechanical_rung_in_flight.is_some()) {
+        tracing::info!(
+            work_item_id = item,
+            pr_url = pr,
+            "signal retirement declined: a mechanical rung is still running its post-push checks",
+        );
+        return Ok(ClearResolvedSignal::Nothing);
+    }
     let queue = attempt
         .as_ref()
         .is_some_and(|a| is_queue_side_failure_kind(a.failure_kind.as_deref()));

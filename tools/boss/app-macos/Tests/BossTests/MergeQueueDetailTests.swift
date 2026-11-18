@@ -8,6 +8,13 @@ import XCTest
 /// free of SwiftUI (mirrors `AutomationTimeTests`).
 final class MergeQueueDetailTests: XCTestCase {
 
+    func testParsesEngineProgressLabel() {
+        let detail = MergeQueueDetail.parse(#"{"source":"conflict_resolution","status_label":"Resolving conflicts with main…","section_order":500000}"#)
+        XCTAssertEqual(detail?.statusLabel, "Resolving conflicts with main…")
+        XCTAssertEqual(detail?.sectionOrder, 500_000)
+        XCTAssertNil(MergeQueueDetail.parse("{}")?.statusLabel)
+    }
+
     func testParsesFullBlob() {
         let json = #"""
         {"position":1,"state":"AWAITING_CHECKS","enqueued_at":"2026-07-10T11:54:54Z","section_order":1}

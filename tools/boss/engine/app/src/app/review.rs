@@ -264,19 +264,18 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                     resolved_at: None,
                                 });
                             }
-                            let hint = if conflict_released {
-                                " (the PR's merge conflict was waiting for a merge request and is now being \
-                                 resolved; request the merge again once the conflict has cleared)"
+                            let response = if conflict_released {
+                                FrontendEvent::MergeWhenReadyAccepted {
+                                    work_item_id: work_item_id2.clone(),
+                                    pr_url: pr_url2.clone(),
+                                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
+                                }
                             } else {
-                                ""
-                            };
-                            send_response(
-                                &sink2,
-                                &request_id2,
                                 FrontendEvent::WorkError {
-                                    message: format!("merge_when_ready failed: {message}{hint}"),
-                                },
-                            );
+                                    message: format!("merge_when_ready failed: {message}"),
+                                }
+                            };
+                            send_response(&sink2, &request_id2, response);
                         }
                     }
                 });
@@ -312,28 +311,34 @@ async fn release_deferred_conflict_for_merge(
     event_bus: &EventBus,
     (product_id, work_item_id, pr_url): (&str, &str, &str),
 ) -> bool {
-    match work_db.end_conflict_deferral(work_item_id, boss_work_db::ConflictDeferralEnd::MergeRequested) {
-        Ok(Some(deferral)) => {
-            tracing::info!(
-                %work_item_id,
-                %pr_url,
-                deferral_id = %deferral.id,
-                "merge_when_ready: merge requested for a PR with a deferred conflict; conflict released for resolution",
-            );
-            publisher
-                .publish_work_item_changed(product_id, work_item_id, "conflict_deferral_ended")
-                .await;
-            event_bus.publish(Event::PrReconcileRequested {
-                pr_url: pr_url.to_owned(),
-            });
-            true
+    let request = (|| -> anyhow::Result<bool> {
+        let Some(deferral) = work_db.open_conflict_deferral(work_item_id)? else {
+            return Ok(false);
+        };
+        if deferral.pr_url != pr_url {
+            return Ok(false);
         }
-        Ok(None) => false,
+        work_db.start_merge_conflict_resolution(work_item_id, pr_url, &deferral.base_branch)
+    })();
+    match request {
+        Ok(true) => {}
+        Ok(false) => return false,
         Err(err) => {
-            tracing::warn!(%work_item_id, %pr_url, ?err, "merge_when_ready: failed to release a deferred conflict");
-            false
+            tracing::warn!(%work_item_id, ?err, "merge_when_ready: could not retain merge request for resolution");
+            return false;
         }
     }
+    if let Err(err) = work_db.end_conflict_deferral(work_item_id, boss_work_db::ConflictDeferralEnd::MergeRequested) {
+        // The durable request also releases deferral on the next watcher pass.
+        tracing::warn!(%work_item_id, %pr_url, ?err, "merge_when_ready: deferred conflict will be released by the poller");
+    }
+    publisher
+        .publish_work_item_changed(product_id, work_item_id, "merge_conflict_resolution_requested")
+        .await;
+    event_bus.publish(Event::PrReconcileRequested {
+        pr_url: pr_url.to_owned(),
+    });
+    true
 }
 
 /// Bundles the per-call arguments [`handle_trunk_queue_merge`] needs beyond
@@ -1941,7 +1946,8 @@ mod trunk_queue_tests {
                     .expect("a response should be enqueued");
                 match envelope.payload {
                     FrontendEvent::WorkError { message } => message,
-                    other => panic!("expected WorkError, got {other:?}"),
+                    FrontendEvent::MergeWhenReadyAccepted { action, .. } => action,
+                    other => panic!("expected a merge response, got {other:?}"),
                 }
             }
         };
@@ -1951,8 +1957,7 @@ mod trunk_queue_tests {
             boss_event_bus::EventKind::PrReconcileRequested,
         ));
         let message = merge_error(deferred.clone()).await;
-        assert!(message.contains(refusal), "{message}");
-        assert!(message.contains("is now being resolved"), "{message}");
+        assert_eq!(message, "merge_requested");
         match pr_reconcile_requests.recv().await {
             Some(boss_event_bus::Event::PrReconcileRequested { pr_url }) => assert_eq!(pr_url, deferred_pr),
             other => panic!("the merge poller must be woken for the released PR, got {other:?}"),
@@ -1968,13 +1973,18 @@ mod trunk_queue_tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].status, boss_work_db::CONFLICT_STATUS_DEFERRAL_ENDED);
         assert_eq!(rows[0].deferral_end_reason.as_deref(), Some("merge_requested"));
-        // Releasing is not resolving: the task is untouched, and the conflict
-        // watcher starts the resolution on its next pass.
+        // The engine retains the merge request while the conflict watcher
+        // starts resolution on its next pass.
         let WorkItem::Chore(task) = state.work_db.get_work_item(&deferred).unwrap() else {
             panic!("expected a chore");
         };
         assert_eq!(task.status, TaskStatus::InReview);
-        assert_eq!(task.merge_queue_state, None);
+        assert_eq!(task.merge_queue_state.as_deref(), Some("resolving_conflicts"));
+        assert!(
+            task.merge_queue_detail
+                .unwrap()
+                .contains("Resolving conflicts with main")
+        );
 
         let message = merge_error(plain).await;
         assert_eq!(message, format!("merge_when_ready failed: {refusal}"));

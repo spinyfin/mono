@@ -279,7 +279,7 @@ struct WorkCardSnapshot: Equatable {
         // time-relative phrasing). Activity / last-event fall back to the
         // live worker state when the caller left them nil — matching the
         // non-pending path in `WorkBoardCardItem`.
-        let liveStatus = context.liveStatus
+        let liveStatus = MergeQueueDetail.parse(task.mergeQueueDetail)?.statusLabel ?? context.liveStatus
         let liveStatusActivity: WorkerActivity? = {
             if isDispatchPending { return nil }
             if let explicit = context.liveStatusActivity { return explicit }

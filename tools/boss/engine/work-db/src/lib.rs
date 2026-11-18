@@ -891,6 +891,7 @@ mod executions_runs;
 mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
+mod merge_conflict_merging;
 mod operator_answer_outcome;
 pub mod parking;
 pub mod parking_reconcile;

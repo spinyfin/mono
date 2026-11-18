@@ -259,6 +259,25 @@ impl WorkDb {
                 params![input.work_item_id, id, now],
             )?;
         }
+        if churn_tripped {
+            crate::merge_conflict_merging::stop(
+                &tx,
+                &input.work_item_id,
+                "Conflict resolution stopped after repeated attempts",
+            )?;
+        } else {
+            let merging: bool = tx
+                .query_row(
+                    "SELECT merge_queue_state = 'resolving_conflicts' FROM tasks WHERE id = ?1",
+                    [&input.work_item_id],
+                    |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if merging {
+                crate::merge_conflict_merging::start(&tx, &input.work_item_id, &input.pr_url, &input.base_branch)?;
+            }
+        }
         let inserted = query_conflict_resolution(&tx, &id)?
             .with_context(|| format!("unknown conflict_resolution after insert: {id}"))?;
         if churn_tripped {
@@ -531,6 +550,11 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id, revision_task_id],
         )?;
+        if rows > 0
+            && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+        {
+            crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, "Conflict resolution needs a revision")?;
+        }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
@@ -615,6 +639,11 @@ impl WorkDb {
                 retire_superseded_pending_conflict_attempts_in_tx(&tx, &updated.work_item_id, attempt_id, &now)?;
             }
             conflict_stop::surface_conflict_stop(&tx, attempt_id)?;
+        }
+        if rows > 0
+            && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+        {
+            crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, reason)?;
         }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
@@ -882,6 +911,15 @@ impl WorkDb {
         }
         if rows > 0 && reason != "superseded_stale_head" {
             conflict_stop::surface_conflict_stop(&tx, attempt_id)?;
+        }
+        if rows > 0
+            && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+        {
+            // A stale-head supersede is followed by a fresh attempt for the same
+            // request, so the card stays in Merging; terminal abandons stop it.
+            if reason != crate::merge_conflict_merging::SUPERSEDED_STALE_HEAD {
+                crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, reason)?;
+            }
         }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
@@ -1464,6 +1502,32 @@ impl WorkDb {
         let now = now_string();
         let mut recovered = Vec::new();
         for (work_item_id, product_id, pr_url, blocked_attempt_id, attempt_status, rung) in candidates {
+            if let Some(attempt_id) = blocked_attempt_id.as_deref()
+                && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+                && attempt
+                    .ladder_outcomes
+                    .as_ref()
+                    .is_some_and(|outcomes| outcomes.iter().any(|outcome| outcome.outcome == "halted_for_signoff"))
+            {
+                crate::blocking::mark_deletion_signoff_in_tx(&tx, &work_item_id, &pr_url)?;
+                mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, attempt_id, None, rung.unwrap_or(0))?;
+                recovered.push(RecoveredConflictLadderAttempt {
+                    work_item_id,
+                    product_id,
+                    pr_url,
+                    attempt_id: blocked_attempt_id,
+                    rung,
+                });
+                continue;
+            }
+            // An interrupted mechanical rung may have pushed an unverified head.
+            if rung.is_some() {
+                crate::merge_conflict_merging::stop(
+                    &tx,
+                    &work_item_id,
+                    "Resolution interrupted before safety verification",
+                )?;
+            }
             // Abandon the orphaned attempt when it still exists, freeing its
             // UNIQUE (work_item_id, base_sha_at_trigger, head_sha_before)
             // slot so the fall-through re-detect can insert a fresh attempt

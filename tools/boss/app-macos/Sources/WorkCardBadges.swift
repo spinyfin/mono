@@ -336,6 +336,8 @@ struct MergeQueueDetail: Equatable {
     /// `"switching_modes"`), distinct from this entry's own `state`. `nil`
     /// for a GitHub-native entry, which has no equivalent concept.
     var queueState: String?
+    /// Engine-authored progress text; presentation does not infer merge state.
+    var statusLabel: String? = nil
 
     /// Parse the engine's JSON blob. Returns `nil` for `nil`/empty/
     /// unparseable input so the caller can fall back to a sane default
@@ -349,7 +351,8 @@ struct MergeQueueDetail: Equatable {
             enqueuedAt: obj["enqueued_at"] as? String,
             sectionOrder: (obj["section_order"] as? NSNumber)?.int64Value,
             source: obj["source"] as? String,
-            queueState: obj["queue_state"] as? String
+            queueState: obj["queue_state"] as? String,
+            statusLabel: obj["status_label"] as? String
         )
     }
 

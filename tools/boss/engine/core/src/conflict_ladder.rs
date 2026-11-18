@@ -28,7 +28,7 @@ use boss_deterministic_resolvers::{
     ConflictRecipesStore, ConflictRules, ConflictedFile, DeclinedFile, FailedFile, RegistryResolution, ResolvedFile,
     ResolverRegistry,
 };
-use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
+use boss_protocol::FrontendEvent;
 
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
@@ -550,16 +550,18 @@ pub(crate) async fn try_mechanical_rungs_with(
     )
     .await;
 
-    // The rung has concluded (retired, halted, or fell through) — clear the
-    // in-flight marker (and the mechanical lease/workspace it stamped) now,
-    // before the lease is released, so a row only ever carries a live marker
-    // while a rung is genuinely executing.
-    if let Err(err) = work_db.clear_conflict_resolution_mechanical_rung(&attempt.id) {
-        tracing::warn!(
+    // A signoff halt clears the marker in its atomic retirement transaction.
+    // If that write failed, retain the guard until recovery can persist the
+    // rejection. Other outcomes release the marker here; a failed clear is
+    // recovered by reconcile_orphaned_conflict_ladder_attempts at engine startup.
+    if outcome != LadderOutcome::HaltedForSignoff
+        && let Err(err) = work_db.clear_conflict_resolution_mechanical_rung(&attempt.id)
+    {
+        tracing::error!(
             work_item_id = %candidate.work_item_id,
             attempt_id = %attempt.id,
             ?err,
-            "conflict_ladder: failed to clear in-flight mechanical-rung marker",
+            "failed to clear mechanical-rung marker; engine-startup reconciliation recovers it",
         );
     }
 
@@ -1309,7 +1311,7 @@ async fn verify_deletion_tripwire(
 /// `succeeded` at `rung` (it did produce a mechanical resolution — the
 /// telemetry fact stands independent of the safety gate), flip the parent
 /// from `blocked: merge_conflict` to `blocked: deletion_signoff` via
-/// [`WorkDb::mark_chore_blocked_deletion_signoff`], and file the same
+/// [`WorkDb::halt_conflict_resolution_for_deletion_signoff`], and file the same
 /// operator sign-off attention item `completion.rs`'s worker-driven
 /// `pr_review` path files for rung 2/3 — so a deletion halts identically
 /// regardless of which rung produced it. Does NOT publish
@@ -1342,53 +1344,9 @@ async fn halt_attempt_for_deletion_signoff(
         "halted_for_signoff",
         &format!("deletion tripwire: {}", deletions.join("; ")),
     );
-    if let Err(err) = work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
-        tracing::warn!(
-            attempt_id = %attempt.id,
-            rung,
-            ?err,
-            "conflict_ladder: failed to stamp attempt on deletion-signoff halt",
-        );
-    }
-
-    match work_db.mark_chore_blocked_deletion_signoff(&candidate.work_item_id, &candidate.pr_url) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                rung,
-                "conflict_ladder: could not flip task to blocked:deletion_signoff (already moved?)",
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                rung,
-                ?err,
-                "conflict_ladder: failed to flip task to blocked:deletion_signoff",
-            );
-        }
-    }
-
-    let _ = work_db.create_attention_item(CreateAttentionItemInput {
-        work_item_id: Some(candidate.work_item_id.clone()),
-        kind: crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND.to_owned(),
-        title: crate::merge_parent_deletion::SIGNOFF_ATTENTION_TITLE.to_owned(),
-        body_markdown: crate::merge_parent_deletion::render_signoff_attention_body(deletions, &candidate.pr_url),
-        execution_id: None,
-        status: None,
-        resolved_at: None,
-    });
-
-    // Clear the in-flight merge_conflict signal so `maybe_clear_blocked` does
-    // not re-fire on the next probe — mirrors `retire_attempt_at_rung`.
-    if let Err(err) = work_db.clear_merge_conflict_signal_only(&candidate.work_item_id) {
-        tracing::warn!(
-            work_item_id = %candidate.work_item_id,
-            rung,
-            ?err,
-            "conflict_ladder: failed to clear in-flight signal on deletion-signoff halt",
-        );
+    if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, rung) {
+        tracing::error!(attempt_id = %attempt.id, ?err, "could not persist atomic deletion-signoff halt");
+        return;
     }
 
     publisher

@@ -398,6 +398,24 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // A conflict encountered during an accepted merge remains part of
+        // that merge until resolution fails or requires a revision.
+        let merging: bool = tx.query_row(
+            "SELECT merge_queue_state IS NOT NULL AND COALESCE((SELECT merge_mechanism FROM products WHERE id = tasks.product_id), 'direct') = 'direct' FROM tasks WHERE id = ?1",
+            [work_item_id], |row| row.get(0),
+        )?;
+        if merging {
+            let base: Option<String> = tx.query_row(
+                "SELECT base_branch FROM conflict_resolutions WHERE work_item_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                [work_item_id], |row| row.get(0),
+            ).optional()?;
+            crate::merge_conflict_merging::start(
+                &tx,
+                work_item_id,
+                pr_url,
+                base.as_deref().filter(|s| !s.is_empty()).unwrap_or("main"),
+            )?;
+        }
         // Phase 10 #31: keep the multi-signal side table in sync with
         // the scalar flip. `attempt_id` is `None` here because
         // `insert_conflict_resolution` runs immediately after this
@@ -426,44 +444,32 @@ impl WorkDb {
     /// row a human already moved is left alone. Idempotent: `Ok(None)`
     /// when the guard misses.
     pub fn mark_chore_blocked_deletion_signoff(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        self.halt_deletion_signoff(work_item_id, pr_url, None)
+    }
+
+    /// Retire the attempt and stop the standing merge in the same transaction.
+    /// Also repairs an older succeeded attempt with a still-blocked parent.
+    pub fn halt_conflict_resolution_for_deletion_signoff(&self, attempt_id: &str, rung: i64) -> Result<Option<Task>> {
+        let attempt = self
+            .get_conflict_resolution(attempt_id)?
+            .with_context(|| format!("unknown conflict attempt: {attempt_id}"))?;
+        self.halt_deletion_signoff(&attempt.work_item_id, &attempt.pr_url, Some((attempt_id, rung)))
+    }
+
+    fn halt_deletion_signoff(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        attempt: Option<(&str, i64)>,
+    ) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = now_string();
-        let rows = crate::task_status_audit::execute(
-            &tx,
-            "mark_chore_blocked_deletion_signoff",
-            "engine",
-            "UPDATE tasks
-                SET status             = 'blocked',
-                    blocked_reason     = 'deletion_signoff',
-                    blocked_attempt_id = NULL,
-                    pr_url             = ?2,
-                    last_status_actor  = 'engine',
-                    updated_at         = ?3
-              WHERE id = ?1
-                AND status = 'blocked'
-                AND blocked_reason = 'merge_conflict'
-                AND deleted_at IS NULL",
-            params![work_item_id, pr_url, now],
-        )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
+        if let Some((id, rung)) = attempt {
+            crate::conflict_res::mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, id, None, rung)?;
         }
-        // Leaving the merge_conflict state for deletion_signoff — clear the
-        // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
-        tx.execute(
-            "UPDATE task_blocked_signals
-                SET cleared_at = ?2
-              WHERE work_item_id = ?1
-                AND reason = 'merge_conflict'
-                AND cleared_at IS NULL",
-            params![work_item_id, now],
-        )?;
-        let updated = query_task(&tx, work_item_id)?
-            .with_context(|| format!("unknown task after deletion_signoff flip: {work_item_id}"))?;
+        let updated = mark_deletion_signoff_in_tx(&tx, work_item_id, pr_url)?;
         tx.commit()?;
-        Ok(Some(updated))
+        Ok(updated)
     }
 
     /// Symmetric retire path: flip a chore/project_task currently
@@ -2331,6 +2337,73 @@ pub(crate) fn clear_blocked_ci_failure_in_tx(
     )?;
     let updated = query_task(conn, work_item_id)?
         .with_context(|| format!("unknown task after ci_failure clear: {work_item_id}"))?;
+    Ok(Some(updated))
+}
+
+pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+    let now = now_string();
+    let rows = crate::task_status_audit::execute(
+        conn,
+        "mark_chore_blocked_deletion_signoff",
+        "engine",
+        "UPDATE tasks
+                SET status             = 'blocked',
+                    blocked_reason     = 'deletion_signoff',
+                    blocked_attempt_id = NULL,
+                    pr_url             = ?2,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND deleted_at IS NULL",
+        params![work_item_id, pr_url, now],
+    )?;
+    crate::merge_conflict_merging::stop(conn, work_item_id, "Resolution needs approval for deleted files")?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    let kind = boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND;
+    if crate::attention_filing::reraise_open_work_item_attention(conn, work_item_id, kind)?.is_none() {
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(value, '$.reason') FROM conflict_resolutions cr,
+                    json_each(COALESCE(cr.ladder_outcomes, '[]'))
+             WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
+               AND json_extract(value, '$.outcome') = 'halted_for_signoff'
+             ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
+                params![work_item_id, pr_url],
+                |row| row.get(0),
+            )
+            .optional()?;
+        crate::workitems::insert_attention_item_row(
+            conn,
+            &CreateAttentionItemInput {
+                work_item_id: Some(work_item_id.to_owned()),
+                kind: kind.to_owned(),
+                title: boss_engine_storage_values::merge_parent_signoff::SIGNOFF_ATTENTION_TITLE.to_owned(),
+                body_markdown: boss_engine_storage_values::merge_parent_signoff::render_signoff_attention_body(
+                    &[reason.unwrap_or_else(|| "Deletion tripwire requires operator sign-off".to_owned())],
+                    pr_url,
+                ),
+                execution_id: None,
+                status: None,
+                resolved_at: None,
+            },
+        )?;
+    }
+    // Leaving the merge_conflict state for deletion_signoff — clear the
+    // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
+    conn.execute(
+        "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = 'merge_conflict'
+                AND cleared_at IS NULL",
+        params![work_item_id, now],
+    )?;
+    let updated = query_task(conn, work_item_id)?
+        .with_context(|| format!("unknown task after deletion_signoff flip: {work_item_id}"))?;
     Ok(Some(updated))
 }
 

@@ -39,6 +39,7 @@ pub struct CoreSweepHost {
     /// ladder inline on the sweep's task when the sweep has a cube client.
     remediation: Option<ConflictRemediationQueue>,
     design: CoreDocDetection,
+    merge_executor: Arc<dyn crate::merge_when_ready::DirectMergeExecutor>,
     /// Where the just-in-time conflict-resolution flags are read on every
     /// detection. `None` (tests, and any host built without flags) resolves
     /// every conflict on detection.
@@ -61,8 +62,18 @@ impl CoreSweepHost {
         Self {
             remediation,
             design: CoreDocDetection,
+            merge_executor: Arc::new(crate::merge_when_ready::CommandDirectMergeExecutor),
             feature_flags: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_merge_executor(
+        mut self,
+        executor: Arc<dyn crate::merge_when_ready::DirectMergeExecutor>,
+    ) -> Self {
+        self.merge_executor = executor;
+        self
     }
 
     /// Read the conflict-deferral flags from `feature_flags`, so a conflict on
@@ -119,6 +130,16 @@ impl ConflictHandling for CoreSweepHost {
             cleared.raw_merge_state_status,
         )
         .await
+    }
+
+    async fn resume_merge_after_conflict(
+        &self,
+        work_db: &WorkDb,
+        publisher: &dyn ExecutionPublisher,
+        candidate: &PendingMergeCheck,
+    ) {
+        crate::merge_when_ready::resume_after_conflict(work_db, publisher, candidate, self.merge_executor.as_ref())
+            .await;
     }
 
     fn retire_moot_conflict_revisions(

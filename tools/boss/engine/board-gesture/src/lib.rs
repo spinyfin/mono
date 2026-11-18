@@ -72,14 +72,15 @@ impl BoardRow {
 
     /// `true` when the row renders in the Done column's "Merging" group.
     ///
-    /// Gated on `in_review` for the same reason the client gates it: a
-    /// just-merged row can briefly carry a stale `merge_queue_state` if the
-    /// merge transition raced the poller's next dequeue write, and without
-    /// the gate it would look like an in-flight merge forever.
-    ///
-    /// Mirror of `WorkTask.isInMergingSection`.
+    /// A merge-triggered resolution keeps its conflict block for resolver
+    /// bookkeeping but stays in Merging. The board projection sends that row
+    /// to clients as in-review. Terminal statuses never inherit a stale queue
+    /// state, even if the merge transition raced the next poll.
     fn is_merging(&self) -> bool {
-        self.status == TaskStatus::InReview && self.merge_queue_state.is_some()
+        (self.status == TaskStatus::InReview && self.merge_queue_state.is_some())
+            || (self.status == TaskStatus::Blocked
+                && self.blocked_reason.as_deref() == Some("merge_conflict")
+                && self.merge_queue_state.as_deref() == Some("resolving_conflicts"))
     }
 
     /// Where this row currently renders.
@@ -91,7 +92,7 @@ impl BoardRow {
     pub fn position(&self) -> BoardPosition {
         match self.status {
             TaskStatus::Active => BoardPosition::column(BoardColumn::Doing),
-            TaskStatus::InReview if self.is_merging() => BoardPosition::group(BoardColumn::Done, BoardGroup::Merging),
+            _ if self.is_merging() => BoardPosition::group(BoardColumn::Done, BoardGroup::Merging),
             TaskStatus::InReview => BoardPosition::column(BoardColumn::Review),
             TaskStatus::Done => BoardPosition::group(BoardColumn::Done, BoardGroup::Completed),
             TaskStatus::Todo if self.autostart => BoardPosition::column(BoardColumn::Doing),
@@ -294,6 +295,25 @@ mod tests {
             merging_row().position(),
             BoardPosition::group(BoardColumn::Done, BoardGroup::Merging)
         );
+    }
+
+    #[test]
+    fn merge_requested_conflict_resolution_keeps_the_merging_position() {
+        let mut task = BoardRow {
+            blocked_reason: Some("merge_conflict".into()),
+            merge_queue_state: Some("resolving_conflicts".into()),
+            ..row(TaskStatus::Blocked)
+        };
+        assert_eq!(
+            task.position(),
+            BoardPosition::group(BoardColumn::Done, BoardGroup::Merging)
+        );
+        assert!(matches!(
+            resolve_drop(&task, target(BoardColumn::Review, None)),
+            DropResolution::Refused { .. }
+        ));
+        task.merge_queue_state = None;
+        assert_eq!(task.position(), BoardPosition::column(BoardColumn::Review));
     }
 
     #[test]

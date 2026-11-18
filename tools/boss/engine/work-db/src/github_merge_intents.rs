@@ -153,7 +153,8 @@ impl WorkDb {
                AND pr_url = ?2
                AND head_sha = ?3
                AND status = 'active'
-               AND CAST(created_at AS INTEGER) < ?4",
+               AND CAST(created_at AS INTEGER) < ?4
+               AND NOT EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts')",
             params![work_item_id, pr_url, head_sha, event_created_at],
         )?;
         if retired == 0 {
