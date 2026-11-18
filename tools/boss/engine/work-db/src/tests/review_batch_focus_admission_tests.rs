@@ -172,6 +172,29 @@ fn narrowing_focus_releases_never_started_out_of_scope_and_keeps_a_started_batch
         db.get_execution(&never_execs[0].id).unwrap().status,
         ExecutionStatus::Abandoned
     );
+    // The reservation release is recorded under its own cause, for the
+    // never-started leaves only.
+    let abandoned: Vec<(String, Option<String>)> = db
+        .connect()
+        .unwrap()
+        .prepare(
+            "SELECT execution_id, reason_code FROM task_status_audit
+             WHERE property = 'execution_abandoned' AND basis = 'release_unstartable_pre_merge_review_reservations'",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(!abandoned.is_empty());
+    assert!(abandoned.iter().all(|(id, code)| {
+        never_execs.iter().any(|e| &e.id == id) && code.as_deref() == Some("review_reservation_released")
+    }));
+    assert!(
+        started_execs
+            .iter()
+            .all(|e| abandoned.iter().all(|(id, _)| id != &e.id))
+    );
     let kept = db.review_batch(&started_batch.id).unwrap().unwrap();
     assert_eq!(kept.status, ReviewBatchStatus::Collecting);
     assert_eq!(
@@ -573,4 +596,31 @@ fn explicit_start_is_admitted_and_retained_under_holds() {
         );
         assert!(db.review_batch(&batch.id).unwrap().is_some());
     }
+}
+
+/// Reaping a batch whose cycle root closed abandons its still-pending leaves
+/// under the reaper's own cause.
+#[test]
+fn reaping_a_batch_of_a_closed_cycle_root_records_the_reaper_as_the_cause() {
+    let db = WorkDb::open(temp_db_path("reap-abandon-audit")).unwrap();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "Reaped root");
+    let (batch, members) = created_batch(create_batch(&db, &root.id, "head-reaped"));
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&root.id])
+        .unwrap();
+    assert_eq!(db.reap_inert_review_batches(0).unwrap(), vec![batch.id.clone()]);
+    let rows: Vec<(String, String)> = db
+        .list_task_field_audit(&root.id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.property == "execution_abandoned")
+        .map(|row| (row.execution_id.unwrap(), row.reason_code.unwrap()))
+        .collect();
+    assert_eq!(rows.len(), members.len());
+    assert!(
+        rows.iter()
+            .all(|(id, code)| { code == "review_batch_reaped" && members.iter().any(|member| &member.id == id) })
+    );
 }

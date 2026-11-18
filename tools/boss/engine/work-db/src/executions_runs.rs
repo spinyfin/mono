@@ -1895,7 +1895,11 @@ impl WorkDb {
             && execution_status.is_terminal()
             && execution_status != ExecutionStatus::Completed;
 
-        tx.execute(
+        // The caller picks the terminal status; when it is `abandoned` the
+        // ledger records this writer as the cause.
+        crate::task_status_audit::abandon(
+            &tx,
+            crate::task_status_audit::abandon_cause::RUN_FINISHED_ABANDONED,
             "UPDATE work_executions
              SET status = ?2,
                  cube_lease_id = CASE WHEN ?3 THEN NULL ELSE cube_lease_id END,

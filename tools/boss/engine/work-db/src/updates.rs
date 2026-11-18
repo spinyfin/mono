@@ -704,6 +704,9 @@ impl WorkDb {
         let reasoning_value = task.reasoning.map(|mode| mode.as_str().to_owned());
         let tags_value = encode_task_tags(&task.tags);
 
+        // One operation spans the task write and the deferral's abandonment,
+        // so the ledger ties the flag change to the executions it withdrew.
+        let operation = crate::task_status_audit::begin_operation(&tx)?;
         crate::task_status_audit::execute(
             &tx,
             basis,
@@ -774,8 +777,15 @@ impl WorkDb {
         // (`running` / `waiting_human`) is left alone — it self-retires. The
         // reconcile guard (`work_item_is_deferred`) then keeps it parked.
         if patch.deferred == Some(true) {
-            abandon_pending_executions(&mut pending, &tx, id, &task.updated_at)?;
+            abandon_pending_executions(
+                &mut pending,
+                &tx,
+                id,
+                &task.updated_at,
+                crate::task_status_audit::abandon_cause::DEFERRED.by(actor),
+            )?;
         }
+        operation.end(&tx)?;
 
         if status_changed && previous_status != task.status {
             cascade_dependents_after_prereq_status_change(

@@ -1292,7 +1292,13 @@ pub fn reconcile_revision_execution(
 
         let now = now_string();
         // Drop any not-yet-live execution row before archiving the task.
-        abandon_pending_executions(pending, conn, &task.id, &now)?;
+        abandon_pending_executions(
+            pending,
+            conn,
+            &task.id,
+            &now,
+            crate::task_status_audit::abandon_cause::PARENT_CLOSED_REVISION,
+        )?;
         resolve_revision_on_parent_close(
             pending,
             conn,
@@ -1339,7 +1345,13 @@ pub fn reconcile_revision_execution(
     // `blocked_detail` written below names that path.
     if let Some(attempt) = retired_spawning_attempt(conn, task)? {
         let now = now_string();
-        abandon_pending_item_work_executions(pending, conn, &task.id, &now)?;
+        abandon_pending_item_work_executions(
+            pending,
+            conn,
+            &task.id,
+            &now,
+            crate::task_status_audit::abandon_cause::RETIRED_SPAWNING_ATTEMPT,
+        )?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
             let attempt_status = attempt.status.clone();
             let attempt_succeeded = attempt_status.as_str() == "succeeded";
@@ -2176,7 +2188,9 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
                      abandoning it and creating a fresh ready execution",
                 );
                 let now = now_string();
-                conn.execute(
+                crate::task_status_audit::abandon(
+                    conn,
+                    crate::task_status_audit::abandon_cause::STALE_GOVERNING_REDISPATCH,
                     "UPDATE work_executions
                      SET status = 'abandoned',
                          finished_at = COALESCE(finished_at, ?2)

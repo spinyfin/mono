@@ -1103,7 +1103,9 @@ fn release_unstartable_pre_merge_review_reservations_in_tx(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        tx.execute(
+        crate::task_status_audit::abandon(
+            tx,
+            crate::task_status_audit::abandon_cause::REVIEW_RESERVATION_RELEASED,
             "UPDATE work_executions
              SET status = 'abandoned', finished_at = ?2
              WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
@@ -2601,7 +2603,9 @@ impl WorkDb {
                 stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             };
-            tx.execute(
+            crate::task_status_audit::abandon(
+                &tx,
+                crate::task_status_audit::abandon_cause::REVIEW_BATCH_REAPED,
                 "UPDATE work_executions
                  SET status = 'abandoned', finished_at = ?2
                  WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
