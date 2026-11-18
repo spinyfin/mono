@@ -196,6 +196,8 @@ fn session_id_of(canonical: &Value) -> Result<&str, NormalizeError> {
 /// session object (one hook connection) still knows the parent
 /// `conversationId` claimed by an earlier connection. The store preserves
 /// that claim across automatic continuations and engine restarts.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct AgyProgressSession {
     run_id: Option<String>,
     identity_store: Option<Arc<dyn ProgressIdentityStore>>,
