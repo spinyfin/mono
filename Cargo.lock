@@ -794,6 +794,7 @@ dependencies = [
  "boss-review-guide",
  "boss-task-scope",
  "boss-transcript-markdown",
+ "boss-transcript-tail",
  "boss-work-db",
  "chrono",
  "git-utils",

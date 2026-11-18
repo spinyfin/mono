@@ -1588,16 +1588,14 @@ must not be asked to open one",
                     // nudge rather than closing the task as done.
                     //
                     // `consume_unresolved` (not `list`) is the
-                    // right read here: it answers "has a command gone
-                    // unobserved since the last time this gate fired?", not
-                    // "has this run ever left a command unobserved?" — see
-                    // `codex_unobserved_command::UnobservedCommandTracker`'s
-                    // type doc for why the latter question, in a long-lived
-                    // multi-turn Codex session that reaches this Stop many
-                    // times, would refuse every later no-op claim for the
-                    // rest of the run over one abandoned command from turns
-                    // ago. This read also clears the flag, so a clean turn
-                    // that follows gets a fair no-changes-needed evaluation.
+                    // right read here. For Codex it answers "has a command gone
+                    // unobserved since the last time this gate fired?" and
+                    // clears that flag so a later clean turn gets a fair
+                    // no-changes-needed evaluation — see
+                    // `codex_unobserved_command::UnobservedCommandTracker`.
+                    // For Antigravity it also returns the run-long refused-tool
+                    // latch, which does not clear: a refused tool keeps
+                    // refusing every later no-changes-needed claim.
                     if self.refuse_no_op_declaration(&execution) {
                         return self.nudge_refused_no_op(&execution).await;
                     }

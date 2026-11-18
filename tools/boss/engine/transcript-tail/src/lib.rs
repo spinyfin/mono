@@ -33,6 +33,38 @@ pub mod raw {
     //! Bounded byte framing with a serializable, transaction-owned resume point.
     use super::*;
 
+    /// Read a bounded suffix for one-shot diagnostics, using the same file
+    /// identity and containment checks as incremental transcript consumers.
+    pub async fn read_tail(path: &Path, root: Option<&Path>, max_bytes: usize) -> Result<Vec<u8>, TailError> {
+        let containment = root
+            .map(|root| {
+                let (canonical_root, root_identity, file_identity) = verify_initial_containment(path, root)?;
+                Ok::<_, TailError>(TranscriptContainment {
+                    root: root.into(),
+                    canonical_root,
+                    root_identity,
+                    file_identity,
+                })
+            })
+            .transpose()?;
+        let mut file = open_no_follow(path).await?;
+        let metadata = file.metadata().await?;
+        if let Some(containment) = &containment {
+            verify_opened_containment(path, containment, &metadata).await?;
+        }
+        let named = fs::symlink_metadata(path).await?;
+        if !metadata.is_file() || !same_file_identity(&metadata, &named) {
+            return Err(TailError::Containment(
+                "transcript must be a single-link regular file".into(),
+            ));
+        }
+        file.seek(SeekFrom::Start(metadata.len().saturating_sub(max_bytes as u64)))
+            .await?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes as u64).read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, bon::Builder)]
     #[builder(on(String, into))]
     pub struct Cursor {
@@ -500,6 +532,28 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn diagnostic_tail_is_bounded_and_rejects_paths_outside_its_root() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("sessions");
+        fs::create_dir(&root).await.unwrap();
+        let path = root.join("transcript.jsonl");
+        fs::write(&path, b"older\nrecent\n").await.unwrap();
+        assert_eq!(raw::read_tail(&path, Some(&root), 7).await.unwrap(), b"recent\n");
+        let outside = dir.path().join("outside.jsonl");
+        fs::write(&outside, b"secret").await.unwrap();
+        assert!(matches!(
+            raw::read_tail(&outside, Some(&root), 7).await,
+            Err(TailError::Containment(_))
+        ));
+        #[cfg(unix)]
+        {
+            let link = root.join("link.jsonl");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(raw::read_tail(&link, None, 7).await.is_err());
+        }
+    }
 
     fn sample_path(dir: &TempDir, name: &str) -> PathBuf {
         dir.path().join(name)

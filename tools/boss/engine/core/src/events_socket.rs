@@ -147,6 +147,7 @@ pub struct HookConnection {
 
 #[derive(Debug, Clone)]
 struct DriverHookResolution {
+    preceding_events: Vec<WorkerEvent>,
     /// Deliberately private: the only way to populate it is
     /// [`IncomingHookEvent::resolve`], which derives it from a driver. A
     /// boundary that could be hand-set at a construction site is a boundary
@@ -179,6 +180,7 @@ impl IncomingHookEvent {
         peer_pid: Option<libc::pid_t>,
     ) -> Self {
         let driver_resolution = DriverHookResolution {
+            preceding_events: Vec::new(),
             turn_boundary: driver.turn_boundary(&event),
             transcript_containment_root: match run_id.as_deref() {
                 Some(run_id) => driver
@@ -200,6 +202,23 @@ impl IncomingHookEvent {
             event,
             driver_resolution,
         }
+    }
+
+    /// Expand a normalized hook batch in emission order. Internal notifications
+    /// must reach the dispatcher before the Stop whose evidence they qualify.
+    pub fn into_ordered_events(mut self) -> Vec<Self> {
+        let preceding = std::mem::take(&mut self.driver_resolution.preceding_events);
+        let mut events = Vec::with_capacity(preceding.len() + 1);
+        for event in preceding {
+            let mut incoming = self.clone();
+            incoming.event = event;
+            // Internal evidence does not consume the native hook's activity sequence.
+            incoming.connection.ingress_seq = None;
+            incoming.driver_resolution.turn_boundary = None;
+            events.push(incoming);
+        }
+        events.push(self);
+        events
     }
 
     /// Point the event at a transcript the hub itself holds for the run, read
@@ -520,6 +539,15 @@ pub async fn handle_connection(
     registry: &DriverRegistry,
     work_db: &WorkDb,
 ) -> Result<Option<IncomingHookEvent>, SocketError> {
+    handle_connection_with_sessions(stream, registry, work_db, None).await
+}
+
+async fn handle_connection_with_sessions(
+    stream: UnixStream,
+    registry: &DriverRegistry,
+    work_db: &WorkDb,
+    sessions: Option<&std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+) -> Result<Option<IncomingHookEvent>, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
@@ -553,7 +581,7 @@ pub async fn handle_connection(
         reject_connection(&mut stream, &err).await;
         return Err(err);
     }
-    match decode_incoming_event(&bytes, registry, work_db, peer_pid_value) {
+    match decode_incoming_event(&bytes, registry, work_db, peer_pid_value, sessions) {
         Ok(incoming) => {
             acknowledge_connection(&mut stream).await;
             Ok(incoming)
@@ -571,12 +599,16 @@ pub async fn handle_connection(
 
 /// Reserve a decode turn synchronously at accept time, before spawning a task.
 /// This orders identity claims even when an earlier peer is slow to finish
-/// writing, up to [`HOOK_READ_DEADLINE`]. Dispatch after decoding remains
-/// concurrent. A peer that never half-closes is retried when the deadline
-/// expires so it cannot pin every later worker's ingress.
+/// writing, up to [`HOOK_READ_DEADLINE`]. The turn stays held until the caller
+/// drops it, so internal unobserved-tool markers can be staged before a later
+/// connection's idle Stop is decoded. Dispatch of the native event after that
+/// drop remains concurrent. A peer that never half-closes is retried when the
+/// deadline expires so it cannot pin every later worker's ingress.
 #[derive(Default)]
 pub struct HookDecodeQueue {
     tail: Option<tokio::sync::oneshot::Receiver<()>>,
+    decodes: Arc<std::sync::atomic::AtomicU64>,
+    sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
 }
 
 impl HookDecodeQueue {
@@ -585,18 +617,24 @@ impl HookDecodeQueue {
         HookDecodeTurn {
             previous: self.tail.replace(next),
             completed: Some(completed),
+            sessions: self.sessions.clone(),
+            decodes: self.decodes.clone(),
         }
     }
 }
 
 pub struct HookDecodeTurn {
+    decodes: Arc<std::sync::atomic::AtomicU64>,
     previous: Option<tokio::sync::oneshot::Receiver<()>>,
     completed: Option<tokio::sync::oneshot::Sender<()>>,
+    sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
 }
 
 impl HookDecodeTurn {
+    /// Decode this connection. The turn remains held until `self` is dropped,
+    /// so callers can stage internal markers before the next decode proceeds.
     pub async fn handle(
-        mut self,
+        &mut self,
         stream: UnixStream,
         registry: &DriverRegistry,
         work_db: &WorkDb,
@@ -604,7 +642,14 @@ impl HookDecodeTurn {
         if let Some(previous) = self.previous.take() {
             let _ = previous.await;
         }
-        handle_connection(stream, registry, work_db).await
+        if self
+            .decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(64)
+        {
+            evict_terminal_progress_snapshots(&self.sessions, work_db);
+        }
+        handle_connection_with_sessions(stream, registry, work_db, Some(&self.sessions)).await
     }
 }
 
@@ -613,6 +658,29 @@ impl Drop for HookDecodeTurn {
         if let Some(completed) = self.completed.take() {
             let _ = completed.send(());
         }
+    }
+}
+
+fn lock_progress_snapshots(
+    sessions: &Mutex<std::collections::HashMap<String, serde_json::Value>>,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, serde_json::Value>> {
+    sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Reclaim finished runs even when they never send another hook. Lifecycle
+/// queries run outside the snapshot lock.
+fn evict_terminal_progress_snapshots(
+    sessions: &Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    work_db: &WorkDb,
+) {
+    let keys: Vec<_> = lock_progress_snapshots(sessions).keys().cloned().collect();
+    let terminal: Vec<_> = keys
+        .into_iter()
+        .filter(|id| !work_db.progress_run_is_non_terminal(id).unwrap_or(true))
+        .collect();
+    let mut snapshots = lock_progress_snapshots(sessions);
+    for id in terminal {
+        snapshots.remove(&id);
     }
 }
 
@@ -627,6 +695,7 @@ fn decode_incoming_event(
     registry: &DriverRegistry,
     work_db: &WorkDb,
     peer_pid_value: Option<libc::pid_t>,
+    sessions: Option<&std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
 ) -> Result<Option<IncomingHookEvent>, SocketError> {
     let raw: serde_json::Value = serde_json::from_slice(bytes)?;
     let payload_run_id = extract_run_id_from_payload(&raw);
@@ -643,32 +712,40 @@ fn decode_incoming_event(
     // TurnBoundary capability whether this event ends a turn, so the
     // dispatchers never have to re-derive that from the event's shape.
     //
-    // A driver that returns a progress session (agy conversation-id
-    // filtering) gets one per connection, seeded from the engine-owned
-    // identity store. An empty fan-out is a successful drop, not a
-    // rejection: the shim must not retry a filtered subagent boundary.
+    // Snapshot correlation across hook connections. Decode into a temporary
+    // session, committing its state only after delivery deduplication succeeds.
+    // Lifecycle queries and normalization run outside the snapshot lock.
+    let terminal = run_id
+        .as_deref()
+        .is_some_and(|id| !work_db.progress_run_is_non_terminal(id).unwrap_or(true));
+    let saved_snapshot = sessions.and_then(|sessions| {
+        let mut snapshots = lock_progress_snapshots(sessions);
+        if let Some(id) = &run_id {
+            if terminal {
+                snapshots.remove(id);
+            }
+            snapshots.get(id).cloned()
+        } else {
+            None
+        }
+    });
     let transcript_path = driver.transcript_path_for_session(&raw);
     let session_config = ProgressSessionConfig {
         run_id: run_id.clone(),
         identity_store: Some(Arc::new(work_db.clone()) as Arc<dyn ProgressIdentityStore>),
         ..ProgressSessionConfig::default()
     };
+    let mut session = driver.progress_session(&session_config);
+    if let (Some(session), Some(state)) = (&mut session, &saved_snapshot) {
+        session.restore_resume_state(state).map_err(NormalizeError::Malformed)?;
+    }
     let mut from_subagent = payload_is_from_subagent(&raw);
-    let event = if let Some(mut session) = driver.progress_session(&session_config) {
-        let mut events = session.normalize_progress_events(&raw)?;
+    let mut events = if let Some(session) = &mut session {
+        let events = session.normalize_progress_events(&raw)?;
         from_subagent |= session.last_event_from_subagent();
-        if events.is_empty() {
-            return Ok(None);
-        }
-        if events.len() > 1 {
-            tracing::warn!(
-                n = events.len(),
-                "hook-callback progress session produced more than one worker event; taking the first"
-            );
-        }
-        events.remove(0)
+        events
     } else {
-        driver.normalize_progress_event(&raw)?
+        vec![driver.normalize_progress_event(&raw)?]
     };
     if let (Some(run_id), Some(delivery_id)) = (run_id.as_deref(), extract_delivery_id_from_payload(&raw).as_deref())
         && !claim_hook_delivery(run_id, delivery_id)
@@ -676,10 +753,28 @@ fn decode_incoming_event(
         tracing::info!(run_id, delivery_id, "events socket: dropping duplicate hook delivery");
         return Ok(None);
     }
-    Ok(Some(
-        IncomingHookEvent::resolve(driver.as_ref(), event, run_id, transcript_path, peer_pid_value)
-            .with_subagent_origin(from_subagent),
-    ))
+    if let (Some(session), Some(sessions), Some(id)) = (&session, sessions, &run_id)
+        && !terminal
+        && let Some(state) = session.resume_state()
+    {
+        lock_progress_snapshots(sessions).insert(id.clone(), state);
+    }
+    let Some(event) = events.pop() else {
+        return Ok(None);
+    };
+    // Currently the only multi-event hook batch is internal Notifications
+    // followed by its qualifying Stop. Refuse other shapes rather than
+    // silently assigning the final event's boundary to earlier events.
+    if events
+        .iter()
+        .any(|event| !matches!(event, WorkerEvent::Notification { .. }))
+    {
+        return Err(NormalizeError::Malformed("hook batch prefixes must be notifications".into()).into());
+    }
+    let mut incoming = IncomingHookEvent::resolve(driver.as_ref(), event, run_id, transcript_path, peer_pid_value)
+        .with_subagent_origin(from_subagent);
+    incoming.driver_resolution.preceding_events = events;
+    Ok(Some(incoming))
 }
 
 /// Whether a hook payload names a subagent as its origin. Claude Code stamps
@@ -1810,7 +1905,7 @@ mod tests {
 
         let mut parent = UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let turn = queue.reserve();
+        let mut turn = queue.reserve();
         let parent_db = db.clone();
         let parent_registry = registry.clone();
         let parent_task = tokio::spawn(async move { turn.handle(stream, &parent_registry, &parent_db).await });
@@ -1820,7 +1915,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let mut child = UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let turn = queue.reserve();
+        let mut turn = queue.reserve();
         let child_db = db.clone();
         let child_registry = registry.clone();
         let child_task = tokio::spawn(async move { turn.handle(stream, &child_registry, &child_db).await });
@@ -1924,6 +2019,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agy_hook_connections_preserve_pending_calls_and_notification_order() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let mut queue = HookDecodeQueue::default();
+        let payloads = [
+            serde_json::json!({"hookEventName": "SessionStart", "conversationId": "parent"}),
+            serde_json::json!({"hookEventName": "PreToolUse", "conversationId": "parent",
+                "_boss_delivery_id": "original-pre", "toolCall": {"id": "call", "name": "run_command", "args": {}}}),
+            serde_json::json!({"hookEventName": "Stop", "conversationId": "parent", "fullyIdle": false}),
+            serde_json::json!({"hookEventName": "PostToolUse", "conversationId": "child",
+                "toolCall": {"id": "call", "name": "run_command", "args": {}}}),
+            serde_json::json!({"hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true}),
+            // A replayed PreToolUse must not revive a call drained at the boundary.
+            serde_json::json!({"hookEventName": "PreToolUse", "conversationId": "parent",
+                "_boss_delivery_id": "original-pre", "toolCall": {"id": "call", "name": "run_command", "args": {}}}),
+            serde_json::json!({"hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true}),
+        ];
+        for (index, mut payload) in payloads.into_iter().enumerate() {
+            payload["_boss_run_id"] = serde_json::json!(run_id);
+            let mut client = UnixStream::connect(&path).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            client.write_all(payload.to_string().as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            let incoming = queue.reserve().handle(stream, &registry, &db).await.unwrap();
+            if index == 2 || index == 5 {
+                assert!(incoming.is_none());
+                continue;
+            }
+            let events = incoming.unwrap().with_ingress_seq(index as u64).into_ordered_events();
+            if index == 4 {
+                assert_eq!(events.len(), 2);
+                assert!(matches!(&events[0].event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(crate::driver::codex::UNOBSERVED_COMMAND_MARKER)));
+                assert!(!events[0].is_turn_boundary());
+                assert_eq!(events[0].connection.ingress_seq, None);
+                assert!(events[1].is_turn_boundary());
+                assert_eq!(events[1].connection.ingress_seq, Some(4));
+            } else {
+                assert_eq!(events.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_hook_progress_snapshot_is_not_reinserted_after_a_late_hook() {
+        let (_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = DriverRegistry::default();
+        let snapshots = Mutex::default();
+        let decode = |event: &str| {
+            let payload = serde_json::json!({
+                "_boss_run_id": run_id, "hookEventName": event, "conversationId": "parent",
+                "toolCall": {"id": "pending", "name": "run_command", "args": {}}
+            });
+            decode_incoming_event(payload.to_string().as_bytes(), &registry, &db, None, Some(&snapshots)).unwrap()
+        };
+        decode("SessionStart");
+        decode("PreToolUse");
+        assert!(lock_progress_snapshots(&snapshots).contains_key(&run_id));
+        db.mark_execution_orphaned(&run_id, "finished fixture").unwrap();
+        decode("PostToolUse");
+        assert!(lock_progress_snapshots(&snapshots).is_empty());
+    }
+
+    #[test]
+    fn terminal_hook_progress_snapshot_is_evicted_without_another_hook_for_that_run() {
+        let (_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let snapshots = Mutex::default();
+        lock_progress_snapshots(&snapshots).insert(run_id.clone(), serde_json::json!({"pending_tools": {}}));
+        evict_terminal_progress_snapshots(&snapshots, &db);
+        assert!(lock_progress_snapshots(&snapshots).contains_key(&run_id));
+        db.mark_execution_orphaned(&run_id, "finished fixture").unwrap();
+        evict_terminal_progress_snapshots(&snapshots, &db);
+        assert!(lock_progress_snapshots(&snapshots).is_empty());
+    }
+
+    #[test]
+    fn hook_progress_snapshot_lock_recovers_from_poison() {
+        let queue = HookDecodeQueue::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = queue.sessions.lock().unwrap();
+            panic!("poison the hook snapshot mutex");
+        }));
+        lock_progress_snapshots(&queue.sessions).insert("run".into(), serde_json::json!({"ok": true}));
+        assert_eq!(
+            lock_progress_snapshots(&queue.sessions)
+                .get("run")
+                .and_then(|value| value.get("ok"))
+                .cloned(),
+            Some(serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_turn_is_held_after_handle_until_drop() {
+        let (_db_dir, db, run_id) = db_with_started_execution(Some("agy"));
+        let registry = Arc::new(DriverRegistry::default());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+        let mut queue = HookDecodeQueue::default();
+
+        for payload in [
+            serde_json::json!({"hookEventName": "SessionStart", "conversationId": "parent"}),
+            serde_json::json!({"hookEventName": "PreToolUse", "conversationId": "parent",
+                "toolCall": {"id": "call", "name": "run_command", "args": {}}}),
+        ] {
+            let mut payload = payload;
+            payload["_boss_run_id"] = serde_json::json!(run_id);
+            let mut client = UnixStream::connect(&path).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            client.write_all(payload.to_string().as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            queue.reserve().handle(stream, &registry, &db).await.unwrap();
+        }
+
+        let mut first_stop = serde_json::json!({
+            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true
+        });
+        first_stop["_boss_run_id"] = serde_json::json!(run_id);
+        let mut first_client = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        first_client.write_all(first_stop.to_string().as_bytes()).await.unwrap();
+        first_client.shutdown().await.unwrap();
+        let mut first_turn = queue.reserve();
+        let first = first_turn
+            .handle(stream, &registry, &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_ordered_events();
+        assert_eq!(first.len(), 2);
+
+        let mut second_stop = serde_json::json!({
+            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true,
+            "_boss_delivery_id": "second-idle-stop"
+        });
+        second_stop["_boss_run_id"] = serde_json::json!(run_id);
+        let mut second_client = UnixStream::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        second_client
+            .write_all(second_stop.to_string().as_bytes())
+            .await
+            .unwrap();
+        second_client.shutdown().await.unwrap();
+        let mut second_turn = queue.reserve();
+        let second_db = db.clone();
+        let second_registry = registry.clone();
+        let second_task = tokio::spawn(async move { second_turn.handle(stream, &second_registry, &second_db).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !second_task.is_finished(),
+            "a following idle Stop must wait until the first decode turn is dropped"
+        );
+        drop(first_turn);
+        let second = second_task.await.unwrap().unwrap().unwrap().into_ordered_events();
+        assert_eq!(second.len(), 1);
+        assert!(matches!(second[0].event, WorkerEvent::Stop { .. }));
+    }
+
+    #[tokio::test]
     async fn accept_after_shim_window_then_redeliver_dispatches_once() {
         let (_db_dir, db, run_id) = db_with_ready_execution(None);
         let registry = Arc::new(DriverRegistry::default());
@@ -1938,14 +2196,14 @@ mod tests {
 
         let _idle = UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let turn = queue.reserve();
+        let mut turn = queue.reserve();
         let idle_db = db.clone();
         let idle_registry = registry.clone();
         let idle_task = tokio::spawn(async move { turn.handle(stream, &idle_registry, &idle_db).await });
 
         let mut first = UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let turn = queue.reserve();
+        let mut turn = queue.reserve();
         let first_db = db.clone();
         let first_registry = registry.clone();
         let first_task = tokio::spawn(async move { turn.handle(stream, &first_registry, &first_db).await });
@@ -1958,7 +2216,7 @@ mod tests {
 
         let mut replay = UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let turn = queue.reserve();
+        let mut turn = queue.reserve();
         let replay_db = db.clone();
         let replay_registry = registry.clone();
         let replay_task = tokio::spawn(async move { turn.handle(stream, &replay_registry, &replay_db).await });
@@ -1997,14 +2255,14 @@ mod tests {
 
         let _idle = UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let turn = queue.reserve();
+        let mut turn = queue.reserve();
         let idle_db = db.clone();
         let idle_registry = registry.clone();
         let idle_task = tokio::spawn(async move { turn.handle(stream, &idle_registry, &idle_db).await });
 
         let mut later = UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let turn = queue.reserve();
+        let mut turn = queue.reserve();
         let later_db = db.clone();
         let later_registry = registry.clone();
         let later_task = tokio::spawn(async move { turn.handle(stream, &later_registry, &later_db).await });

@@ -98,6 +98,7 @@ pub(crate) use boss_work_db::deferred_scope;
 
 // Run-termination state and helpers the handler shares with the engine's
 // sweeps and RPC handlers. The engine re-exports each under its historical path.
+mod agy_tool_evidence;
 pub mod answer_agent_observability;
 pub mod automation_triage;
 pub mod background_children;

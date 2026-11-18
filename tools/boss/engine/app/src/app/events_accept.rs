@@ -72,6 +72,7 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
                 let server_state = server_state.clone();
                 let driver_registry = driver_registry.clone();
                 boss_task_scope::spawn(async move {
+                    let mut decode_turn = decode_turn;
                     match decode_turn
                         .handle(stream, &driver_registry, &server_state.work_db)
                         .await
@@ -85,7 +86,7 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
                                 event = ?incoming.event,
                                 "events socket: hook event received",
                             );
-                            dispatch_worker_event_fanout(&server_state, &incoming).await;
+                            dispatch_hook_events(&server_state, incoming, decode_turn).await;
                         }
                         Ok(None) => {
                             tracing::debug!(ingress_seq, "events socket: dropped a filtered hook event");
@@ -100,6 +101,22 @@ pub(super) async fn run_events_accept_loop(listener: UnixListener, server_state:
                 tracing::error!(?err, "events socket accept failed");
             }
         }
+    }
+}
+
+/// Stage once before releasing the decode turn, then dispatch the batch.
+pub(super) async fn dispatch_hook_events(
+    server_state: &Arc<ServerState>,
+    incoming: boss_engine_runtime::events_socket::IncomingHookEvent,
+    decode_turn: boss_engine_runtime::events_socket::HookDecodeTurn,
+) {
+    let events = incoming.into_ordered_events();
+    for event in &events {
+        dispatch_codex_unobserved_command_on_notification(server_state, event);
+    }
+    drop(decode_turn);
+    for event in events {
+        super::worker_events::dispatch_staged_worker_event_fanout(server_state, &event).await;
     }
 }
 
