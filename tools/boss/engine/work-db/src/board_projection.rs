@@ -41,7 +41,7 @@ impl WorkDb {
     /// Same as [`Self::refresh_board_projection`], with an injectable
     /// retained-size bound. Production uses 32 MiB; tests inject a few
     /// KiB so eviction does not allocate a 32 MiB card.
-    pub fn refresh_board_projection_limited(
+    pub(crate) fn refresh_board_projection_limited(
         &self,
         product: &str,
         projection: &mut Option<CachedProjection>,
