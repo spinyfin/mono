@@ -44,8 +44,7 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// SQLite contention or a short GitHub blip has cleared.
 pub(crate) const STUCK_FINALIZE_ATTENTION_AFTER: Duration = Duration::from_secs(10 * 60);
 
-/// Attention kind filed when a declared finalize is stuck.
-pub const RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND: &str = "run_done_finalize_stuck";
+pub use boss_engine_storage_values::attention_kinds::RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND;
 
 /// Result of one [`WorkerCompletionHandler::sweep_pending_finalizes`] pass.
 #[derive(Debug, Default, PartialEq, Eq)]

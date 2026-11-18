@@ -149,6 +149,16 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
+        FOREIGN_PR_REFUSED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "A PR belongs to another work item; a later run starting does not prove that the conflicting binding was repaired.",
+    ),
+    entry(
+        RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Finalization stalled after an accepted declaration; a later run does not prove that the earlier execution released its slot and lease. Inspect that execution before resolving.",
+    ),
+    entry(
         RUN_UNDECLARED_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "The run ended without declaring an outcome. A later run cannot establish what that earlier run delivered.",

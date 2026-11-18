@@ -422,6 +422,8 @@ async fn source_host_dispatch(full: bool, missing: bool) {
         assert_eq!(cleared.basis, "start_execution_run_on_host_with_tmux_hosting");
     }
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    // Preserved-tip recovery deliberately ignores legacy-only records, even
+    // when their host is unavailable; it neither consumes nor retires them.
     assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
     for name in [legacy_head(&record), legacy_publication(&record)] {
         assert_eq!(commit(&repo.repo, &name), old);
@@ -700,7 +702,7 @@ async fn stale_current_names_do_not_change_initialization_or_predecessor() {
 }
 
 #[tokio::test]
-async fn missing_predecessor_baseline_does_not_retry_adoption_or_file_archive_notes() {
+async fn missing_baseline_falls_back_to_trunk_and_leaves_stale_names() {
     initialize_with_stale_names(true).await;
 }
 

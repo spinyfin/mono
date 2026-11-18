@@ -514,12 +514,19 @@ pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc
 /// GitHub failures).
 pub const ATTENTION_KIND_PR_BINDING_REPAIR: &str = "pr_binding_repair";
 
+/// Completion refused a PR already bound to another work item.
+pub const FOREIGN_PR_REFUSED_ATTENTION_KIND: &str = "foreign_pr_binding_refused";
+
+/// A declared finalize has remained stuck despite retries.
+pub const RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND: &str = "run_done_finalize_stuck";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::attention_lifecycle::{ATTENTION_LIFECYCLES, lifecycle_for};
 
     /// Keep the shared producer constants and lifecycle registry in sync.
+    /// Covers the constants in this module, not constants in other crates.
     /// Naming each constant catches renames; the count catches extra entries.
     #[test]
     fn every_attention_kind_constant_in_the_crate_is_registered() {
@@ -530,6 +537,8 @@ mod tests {
             PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,
             UNOBSERVED_COMMAND_ATTENTION_KIND,
             UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND,
+            FOREIGN_PR_REFUSED_ATTENTION_KIND,
+            RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND,
             RUN_UNDECLARED_ATTENTION_KIND,
             RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND,
             RUN_DONE_BLOCKED_ATTENTION_KIND,
