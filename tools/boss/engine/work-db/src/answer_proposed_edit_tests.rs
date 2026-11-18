@@ -13,6 +13,9 @@ use std::sync::Arc;
 const REPO: &str = "https://example.test/repo.git";
 const ACTOR: &str = "user";
 
+#[path = "answer_proposed_edit_replay_tests.rs"]
+mod replay_tests;
+
 fn proposal() -> ProposedEditInput {
     ProposedEditInput {
         version: 1,
@@ -295,9 +298,11 @@ fn only_follow_up_or_reclassification_supersedes_a_proposal() {
     let (_dir, db) = open_db();
     let (_, series) = seed_published_guide(&db, 9);
 
-    let (resolved, _) = answered(&db, &series);
+    let (resolved, resolved_entry) = answered(&db, &series);
     db.set_comment_status(&resolved, COMMENT_STATUS_RESOLVED, Some("user"))
         .unwrap();
+    assert_eq!(stored(&db, &resolved).state, ProposedEditState::Proposed);
+    assert!(db.approve_proposed_edit(&resolved_entry, None, &open(), ACTOR).is_err());
     assert_eq!(stored(&db, &resolved).state, ProposedEditState::Proposed);
 
     let (followed_up, _) = answered(&db, &series);

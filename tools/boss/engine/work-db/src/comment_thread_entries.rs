@@ -29,7 +29,8 @@ pub(crate) fn migrate_proposed_edits(conn: &Connection) -> Result<()> {
     }
     // Only `answered` -> `awaiting_followup` (operator follow-up) and
     // `answered` -> `active` (reclassified to a revision) supersede. Resolving
-    // or dismissing the question leaves the proposal approvable.
+    // or dismissing the question retains the proposal, but approval still
+    // requires an answered question.
     conn.execute_batch(
         "CREATE TRIGGER IF NOT EXISTS supersede_answer_proposals
          AFTER UPDATE OF status ON work_comments
@@ -143,25 +144,56 @@ pub(crate) fn save_proposal(conn: &Connection, id: &str, proposal: &AnswerPropos
     Ok(())
 }
 
-/// Validate an answer agent's proposal against the comment it answers and
-/// build the value to store. A proposal is only meaningful on a review-guide
-/// question; one for a comment already classified as a revision is stored
-/// `Superseded`, because that comment goes straight to revision on its own.
-pub(crate) fn new_stored_proposal(
-    conn: &Connection,
-    comment_id: &str,
-    proposal: ProposedEditInput,
-) -> Result<AnswerProposedEdit> {
+/// Bound proposal input and require unambiguous repository-relative replacements.
+pub(crate) fn validate_proposal(proposal: &ProposedEditInput) -> Result<()> {
+    use boss_engine_proposal_validation::{MAX_LONG_FIELD_CHARS, MAX_SHORT_FIELD_CHARS};
+
     anyhow::ensure!(proposal.version == 1, "unsupported proposed edit version");
     anyhow::ensure!(
         !proposal.title.trim().is_empty() && !proposal.instruction.trim().is_empty(),
         "proposal title and instruction must not be empty"
     );
     anyhow::ensure!(
-        proposal.replacements.iter().all(|r| !r.path.trim().is_empty()),
-        "replacement path must not be empty"
+        proposal.title.len() <= MAX_SHORT_FIELD_CHARS && proposal.instruction.len() <= MAX_LONG_FIELD_CHARS,
+        "proposal title or instruction exceeds size limit"
     );
-    let comment = query_comment(conn, comment_id)?.context("unknown comment")?;
+    anyhow::ensure!(proposal.replacements.len() <= 100, "too many replacements");
+    let mut replacements = std::collections::HashSet::new();
+    let mut total = proposal.title.len() + proposal.instruction.len();
+    for replacement in &proposal.replacements {
+        let path = &replacement.path;
+        anyhow::ensure!(
+            !path.trim().is_empty()
+                && path.len() <= MAX_SHORT_FIELD_CHARS
+                && !path.contains(['\\', ':', '\0'])
+                && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
+            "replacement path must be a relative repository file path"
+        );
+        anyhow::ensure!(
+            !replacement.old_text.is_empty(),
+            "replacement old text must not be empty"
+        );
+        anyhow::ensure!(
+            replacement.old_text.len() <= MAX_LONG_FIELD_CHARS && replacement.new_text.len() <= MAX_LONG_FIELD_CHARS,
+            "replacement text exceeds size limit"
+        );
+        anyhow::ensure!(
+            replacements.insert((path, &replacement.old_text)),
+            "duplicate replacement for the same path and old text"
+        );
+        total += path.len() + replacement.old_text.len() + replacement.new_text.len();
+        anyhow::ensure!(total <= 1024 * 1024, "proposal exceeds total size limit");
+    }
+    Ok(())
+}
+
+/// Build a validated proposal for a review-guide question. A comment already
+/// classified as a revision goes straight to revision, so its proposal is superseded.
+pub(crate) fn new_stored_proposal(
+    comment: &boss_protocol::WorkComment,
+    proposal: ProposedEditInput,
+) -> Result<AnswerProposedEdit> {
+    validate_proposal(&proposal)?;
     anyhow::ensure!(
         comment.artifact_kind == "pr_review_guide",
         "proposed edits require a review-guide question"
@@ -194,6 +226,7 @@ pub(crate) fn prepare_approval(conn: &Connection, entry_id: &str, instruction: O
         anyhow::ensure!(!instruction.trim().is_empty(), "instruction must not be empty");
         proposal.proposal.instruction = instruction;
     }
+    validate_proposal(&proposal.proposal)?;
     // Saved before the status change so the supersede trigger sees `approved`.
     proposal.state = ProposedEditState::Approved;
     save_proposal(conn, entry_id, &proposal)?;

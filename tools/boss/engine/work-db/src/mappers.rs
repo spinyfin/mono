@@ -204,12 +204,10 @@ pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<Commen
         proposed_edit: row
             .get::<_, Option<String>>(8)?
             .filter(|raw| !raw.is_empty())
-            .map(|raw| {
-                serde_json::from_str(&raw).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
-                })
-            })
-            .transpose()?,
+            // A corrupt optional proposal must not hide the answer or the
+            // rest of the thread. It cannot be approved without hydration.
+            .and_then(|raw| serde_json::from_str::<boss_protocol::AnswerProposedEdit>(&raw).ok())
+            .filter(|stored| crate::comment_thread_entries::validate_proposal(&stored.proposal).is_ok()),
     })
 }
 

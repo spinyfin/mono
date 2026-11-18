@@ -294,8 +294,11 @@ impl WorkDb {
         else {
             return Err(SpokeWriteError::refused("no answer-agent run for this execution"));
         };
+        let comment = query_comment(&tx, &run.comment_id)
+            .map_err(SpokeWriteError::from_work)?
+            .ok_or_else(|| SpokeWriteError::refused("comment is unknown"))?;
         let stored_proposal = proposed_edit
-            .map(|proposal| new_stored_proposal(&tx, &run.comment_id, proposal))
+            .map(|proposal| new_stored_proposal(&comment, proposal))
             .transpose()
             .map_err(|err| SpokeWriteError::refused(err.to_string()))?;
         match run.status.as_str() {
@@ -345,7 +348,9 @@ impl WorkDb {
                 save_proposal(&tx, &entry.id, proposal).map_err(SpokeWriteError::from_work)?;
             }
         }
-        transition_comment_to_answered_on(&tx, &run.comment_id).map_err(SpokeWriteError::from_work)?;
+        if comment.status == boss_protocol::COMMENT_STATUS_ANSWERING {
+            transition_comment_to_answered_on(&tx, &run.comment_id).map_err(SpokeWriteError::from_work)?;
+        }
         record_application_on(&tx, application).map_err(SpokeWriteError::from_work)?;
         let comment = query_comment(&tx, &run.comment_id)
             .map_err(SpokeWriteError::from_work)?
