@@ -241,20 +241,21 @@ impl WaitRegistry {
     }
 
     /// End the active wait for `execution_id` because the worker's main
-    /// session started a new turn after `boundary`, without touching the
-    /// budget the wait has already been charged. Returns the record that
-    /// was ended, or `None` when nothing was active or the wait was declared
-    /// after `boundary` (in a later turn, so that boundary does not end it).
-    pub fn end_if_declared_before(&self, execution_id: &str, boundary_seq: Option<u64>) -> Option<WaitRecord> {
+    /// session resumed at `resume_seq`, without touching the budget the wait
+    /// has already been charged. Returns the record that was ended, or `None`
+    /// when nothing was active or the wait was declared at or after
+    /// `resume_seq` (inside the resumed turn, so this resume does not end it).
+    pub fn end_if_declared_before(&self, execution_id: &str, resume_seq: Option<u64>) -> Option<WaitRecord> {
         let mut guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
         let state = guard.get_mut(execution_id)?;
-        if let (Some(declared), Some(boundary)) = (state.active.as_ref()?.declared_after_seq, boundary_seq)
-            && declared > boundary
+        if let (Some(declared), Some(resume)) = (state.active.as_ref()?.declared_after_seq, resume_seq)
+            && declared >= resume
         {
             return None;
         }
-        // Equality means the declaration observed this Stop while the worker
-        // was already parked. It belongs to that park and ends on its resume.
+        // A declaration older than the resume was made while the worker was
+        // parked, however many hooks (its own idle notification, other
+        // workers') were accepted since the Stop. It ends on this resume.
         let ended = state.active.take()?;
         state.expiry_logged = false;
         tracing::info!(
@@ -292,8 +293,8 @@ impl WaitRegistry {
 }
 
 impl boss_engine_live_worker_state::DeclaredWaitSource for WaitRegistry {
-    fn resume(&self, run_id: &str, boundary_seq: Option<u64>) {
-        self.end_if_declared_before(run_id, boundary_seq);
+    fn resume(&self, run_id: &str, resume_seq: Option<u64>) {
+        self.end_if_declared_before(run_id, resume_seq);
     }
 
     fn declared_wait(&self, run_id: &str, now_epoch_secs: i64) -> boss_engine_live_worker_state::DeclaredWait {
@@ -451,15 +452,16 @@ mod tests {
     }
 
     #[test]
-    fn a_boundary_older_than_the_declaration_does_not_end_the_wait() {
+    fn a_resume_at_or_before_the_declaration_does_not_end_the_wait() {
         let registry = WaitRegistry::new();
         registry
             .declare_after("exec_a", "bazel".into(), None, 60, 0, Some(10))
             .unwrap();
         assert!(
-            registry.end_if_declared_before("exec_a", Some(7)).is_none(),
-            "seq 7 ended an earlier turn"
+            registry.end_if_declared_before("exec_a", Some(10)).is_none(),
+            "declared inside the resumed turn"
         );
+        assert!(registry.end_if_declared_before("exec_a", Some(7)).is_none());
         assert!(registry.active("exec_a", 0).is_some());
         assert!(registry.end_if_declared_before("exec_a", Some(11)).is_some());
     }

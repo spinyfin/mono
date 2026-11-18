@@ -46,7 +46,7 @@ impl StubWaits {
 }
 
 impl DeclaredWaitSource for StubWaits {
-    fn resume(&self, _run_id: &str, _boundary_seq: Option<u64>) {
+    fn resume(&self, _run_id: &str, _resume_seq: Option<u64>) {
         self.set(DeclaredWait::None);
     }
 

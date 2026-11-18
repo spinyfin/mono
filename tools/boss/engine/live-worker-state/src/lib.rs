@@ -1968,10 +1968,17 @@ impl LiveWorkerStateRegistry {
                      the slot already reflects what the worker did after it",
                 );
                 let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin);
-                if let Some(boundary) = resumed_after
+                if resumed_after.is_some()
                     && let Some(source) = &wait_source
                 {
-                    source.resume(&state.run_id, boundary.seq);
+                    // The Stop proves the resume only through the main-session
+                    // activity that overtook it; any other late event is itself
+                    // the resume.
+                    let resume_seq = match event {
+                        WorkerEvent::Stop { .. } => meta.last_main_activity_seq,
+                        _ => Some(ingress_seq),
+                    };
+                    source.resume(&state.run_id, resume_seq);
                 }
                 if repaired && matches!(state.activity, WorkerActivity::Idle | WorkerActivity::WaitingForInput) {
                     state.activity = settle_parked(
@@ -1992,10 +1999,10 @@ impl LiveWorkerStateRegistry {
         let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
         let before = state.clone();
 
-        if let Some(boundary) = resumed_after
+        if resumed_after.is_some()
             && let Some(source) = &wait_source
         {
-            source.resume(&state.run_id, boundary.seq);
+            source.resume(&state.run_id, ingress_seq);
         }
 
         // A replayed hook carries the time the host saw it. Both the display

@@ -45,7 +45,11 @@ pub trait DeclaredWaitSource: Send + Sync {
     fn declared_wait(&self, run_id: &str, now_epoch_secs: i64) -> DeclaredWait;
 
     /// Consume the declaration when the worker resumes from a park.
-    fn resume(&self, run_id: &str, boundary_seq: Option<u64>);
+    /// `resume_seq` is the ingress sequence of the main-session event that
+    /// proves the resume. A wait declared before it belongs to the park being
+    /// resumed from; one declared at or after it was made inside the resumed
+    /// turn and is kept.
+    fn resume(&self, run_id: &str, resume_seq: Option<u64>);
 }
 
 pub(super) type SharedWaitSource = Arc<dyn DeclaredWaitSource>;

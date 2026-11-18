@@ -897,3 +897,52 @@ async fn a_blocking_prompt_after_stop_is_not_hidden_by_snapshot_wait_normalizati
         Some(boss_engine_runtime::live_status::AWAITING_INPUT_LITERAL)
     );
 }
+
+fn idle_notification(execution_id: &str, seq: u64) -> boss_engine_runtime::events_socket::IncomingHookEvent {
+    hook(
+        WorkerEvent::Notification {
+            session_id: "claude-sess-1".into(),
+            message: "Claude is waiting for your input".into(),
+        },
+        execution_id,
+        seq,
+    )
+}
+
+#[tokio::test]
+async fn a_wait_declared_after_the_parks_idle_notification_is_consumed_by_that_parks_resume() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 2)).await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    dispatch_worker_event_fanout(&server_state, &idle_notification(&execution_id, 4)).await;
+    // Declared while parked, after the park's own idle prompt.
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 5)).await;
+    assert!(!wait_is_held(&server_state, &execution_id), "the resume consumes it");
+
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 6)).await;
+    dispatch_worker_event_fanout(&server_state, &idle_notification(&execution_id, 7)).await;
+    let parked = snapshot(&server_state);
+    assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+    assert!(parked.activity.needs_human());
+}
+
+#[tokio::test]
+async fn a_wait_declared_after_another_workers_hooks_is_consumed_by_that_parks_resume() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 2)).await;
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    // Hooks 4..=7 belong to other workers; the engine-wide counter reads 7.
+    server_state.accepted_hook_seq.store(7, Ordering::SeqCst);
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 8)).await;
+    assert!(!wait_is_held(&server_state, &execution_id));
+
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 9)).await;
+    dispatch_worker_event_fanout(&server_state, &idle_notification(&execution_id, 10)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingForInput);
+}
