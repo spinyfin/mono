@@ -2411,8 +2411,8 @@ mod tests {
             WorkerEvent::SessionStart { session_id, .. } if session_id == "thread-0160"
         ));
         assert!(matches!(&events[1], WorkerEvent::UserPromptSubmit { .. }));
-        // Static JavaScript argument objects now expose their actual shell
-        // command, including the unquoted keys in this captured rollout.
+        // The cell parser decodes static JavaScript argument objects, including
+        // unquoted keys, so the event carries the inner shell command.
         let command_1 = "echo hello-boss-qual";
         assert_eq!(
             events[2],

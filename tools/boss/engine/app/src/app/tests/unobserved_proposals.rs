@@ -114,3 +114,162 @@ async fn accepted_terminal_proposal_is_not_reprompted() {
     );
     assert!(state.pop_pending_probe(&execution_id).is_none());
 }
+
+#[tokio::test]
+async fn proposal_recovery_survives_hold_and_build_wait_narration() {
+    use boss_engine_completion::StopOutcome;
+    use boss_engine_completion::tests::{StubPrDetector, TestHarness, write_assistant_transcript};
+    use boss_observation_contracts::CompletionRequests;
+
+    let (state, dir, execution_id, _) = live_chore_execution();
+    write_assistant_transcript(
+        &state.work_db,
+        dir.path(),
+        &execution_id,
+        "Waiting for the build to finish.",
+    );
+    let TestHarness { handler, probes, .. } = TestHarness::new(state.work_db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_staged_unobserved_commands(state.staged_unobserved_commands.clone())
+        .with_hold_registry(state.hold_registry.clone());
+    state
+        .staged_unobserved_commands
+        .record(&execution_id, "boss propose wait --reason building --duration 60");
+    state.hold_registry.hold(&execution_id, None, 0);
+    assert!(matches!(handler.on_stop(&execution_id).await, StopOutcome::Held { .. }));
+    assert!(probes.snapshot().is_empty());
+    assert!(state.staged_unobserved_commands.has_unobserved_proposal(&execution_id));
+    assert!(handler.pending_background_nudge_execution_ids().contains(&execution_id));
+    state.hold_registry.release(&execution_id);
+    assert_eq!(
+        handler.recheck_background_nudge(&execution_id).await,
+        Some(StopOutcome::AwaitingInput)
+    );
+    assert_eq!(probes.snapshot().len(), 1);
+    assert!(probes.snapshot()[0].1.contains("unobserved boss propose"));
+    assert!(!state.staged_unobserved_commands.has_unobserved_proposal(&execution_id));
+    assert_eq!(state.work_db.execution_run_done_outcome(&execution_id).unwrap(), None);
+}
+
+#[tokio::test]
+async fn repeated_abandoned_proposals_through_stop_trip_visible_breaker() {
+    use boss_engine_completion::tests::{StubPrDetector, TestHarness};
+    use boss_engine_completion::{NUDGE_BREAKER_ATTENTION_KIND, StopOutcome};
+    let (state, _dir, execution_id, _) = live_chore_execution();
+    let TestHarness { handler, probes, .. } = TestHarness::new(state.work_db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_max_unproductive_nudges(2)
+        .with_staged_unobserved_commands(state.staged_unobserved_commands.clone());
+    for _ in 0..2 {
+        state
+            .staged_unobserved_commands
+            .record(&execution_id, "boss propose done --outcome delivered");
+        assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput);
+    }
+    assert_eq!(probes.snapshot().len(), 2);
+    state
+        .staged_unobserved_commands
+        .record(&execution_id, "boss propose done --outcome delivered");
+    assert!(matches!(
+        handler.on_stop(&execution_id).await,
+        StopOutcome::NudgeBreakerParked { .. }
+    ));
+    assert_eq!(
+        state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert!(
+        state
+            .work_db
+            .list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == NUDGE_BREAKER_ATTENTION_KIND)
+    );
+}
+
+#[tokio::test]
+async fn debounced_proposal_recovery_is_replayed_without_another_stop() {
+    use boss_engine_completion::StopOutcome;
+    use boss_engine_completion::nudge_breaker::{MIN_RENUDGE_INTERVAL, NudgeBreaker};
+    use boss_engine_completion::tests::{StubPrDetector, TestHarness};
+    use boss_observation_contracts::CompletionRequests;
+    let (state, _dir, execution_id, _) = live_chore_execution();
+    let TestHarness { handler, probes, .. } = TestHarness::new(state.work_db.clone(), StubPrDetector::ok(None));
+    let instant = std::time::Instant::now();
+    let clock = Arc::new(std::sync::Mutex::new(instant));
+    let clock_read = clock.clone();
+    let breaker = Arc::new(NudgeBreaker::new());
+    breaker.record(&execution_id, "codex-unobserved-proposal", 3, instant);
+    let handler = handler
+        .with_nudge_breaker(breaker)
+        .with_now_fn(Arc::new(move || *clock_read.lock().unwrap()))
+        .with_staged_unobserved_commands(state.staged_unobserved_commands.clone());
+    state
+        .staged_unobserved_commands
+        .record(&execution_id, "boss propose done --outcome delivered");
+    assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::NudgeDebounced);
+    assert!(probes.snapshot().is_empty());
+    assert!(state.staged_unobserved_commands.has_unobserved_proposal(&execution_id));
+    *clock.lock().unwrap() += MIN_RENUDGE_INTERVAL + std::time::Duration::from_secs(1);
+    assert_eq!(
+        handler.recheck_background_nudge(&execution_id).await,
+        Some(StopOutcome::AwaitingInput)
+    );
+    assert_eq!(probes.snapshot().len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_review_guide_finalizes_before_proposal_recovery() {
+    let (state, _dir) = test_server_state();
+    let db = &state.work_db;
+    let product = boss_engine_runtime::test_support::create_product(db);
+    let root = boss_engine_runtime::test_support::create_active_chore(db, &product, "guide producer");
+    let (series, comparison) = boss_engine_runtime::test_support::seed_review_guide_series(db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series, &comparison, boss_review_guide::PROMPT_VERSION)
+        .unwrap();
+    let execution = db.create_pr_review_guide_execution(&comparison, "acme/widget").unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+        .unwrap();
+    db.record_execution_launch_config(&execution.id, "codex", "gpt-6-astra", None)
+        .unwrap();
+    let pid = std::process::id() as libc::pid_t;
+    state.worker_registry.register(pid, execution.id.clone());
+    let guide = "# Guide\n## Orientation\nA change.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation results reported; no screenshots registered.";
+    // Persist the guide but stop before the handler's finalization step.
+    // A live caller must be able to replay this acknowledgement safely.
+    let validated =
+        boss_engine_proposal_validation::validate_payload(ProposalKind::ReviewGuide, &json!({"body_markdown": guide}))
+            .unwrap();
+    let key = boss_engine_proposal_validation::derive_idempotency_key(
+        &execution.id,
+        ProposalKind::ReviewGuide,
+        &validated.canonical_json,
+    );
+    let persisted = boss_engine_runtime::review_guide_validation::submit_worker_proposal(
+        db,
+        boss_work_db::SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &execution.work_item_id,
+            kind: ProposalKind::ReviewGuide,
+            payload_json: &validated.canonical_json,
+            idempotency_key: &key,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!persisted.already_submitted);
+    assert!(db.get_execution(&execution.id).unwrap().status.is_live());
+
+    state
+        .staged_unobserved_commands
+        .record(&execution.id, "boss propose review-guide");
+    state.completion_handler.on_stop(&execution.id).await;
+    assert!(db.get_execution(&execution.id).unwrap().status.is_terminal());
+    assert!(state.pop_pending_probe(&execution.id).is_none());
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+}

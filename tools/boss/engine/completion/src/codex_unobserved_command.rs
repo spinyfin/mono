@@ -178,6 +178,15 @@ impl UnobservedCommandTracker {
         RecordOutcome::Staged
     }
 
+    /// Whether proposal recovery still needs to reach the worker.
+    pub fn has_unobserved_proposal(&self, execution_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("UnobservedCommandTracker mutex poisoned")
+            .get(execution_id)
+            .is_some_and(|state| state.proposal_needs_observation)
+    }
+
     /// Consume proposal recovery independently of the capped audit trail
     /// and the no-op evidence gate.
     pub fn take_unobserved_proposal(&self, execution_id: &str) -> bool {
