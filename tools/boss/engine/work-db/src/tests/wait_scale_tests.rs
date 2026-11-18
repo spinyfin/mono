@@ -621,11 +621,12 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
         let assemble = |caches: Option<&BoardCaches>| {
             let start = Instant::now();
             let mut trace = PopulationTrace::new(product, "wait-scale", None, start);
-            let tree = match caches {
-                Some(caches) => db.get_work_tree_cached(product, &mut trace, caches),
-                None => db.get_work_tree_instrumented(product, &mut trace),
-            }
-            .unwrap();
+            // Keep projection time fixed across samples: relative-label expiry
+            // must not add refresh queries to a warm-cache cost measurement.
+            let mut connection = db.connect().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let tree =
+                WorkDb::assemble_work_tree_in(&transaction, product, &mut trace, caches, 1_800_000_000, None).unwrap();
             let total = start.elapsed().as_secs_f64() * 1000.0;
             assert_eq!(tree.tasks.len() + tree.chores.len(), cards);
             (tree, total, trace)
@@ -709,10 +710,10 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
             // time they took 1,717.
             assert_eq!(annotated, 277, "cards named on the seeded board");
             assert_eq!(annotation_statements, 23, "statements to name {annotated} cards");
-            // The epoch read, three point queries for each of the 60 cards
-            // waiting on a dependency (never cached), and the annotation:
-            // 204 statements, where naming one card at a time made it 1,898.
-            assert_eq!(statements, 1 + 180 + 23);
+            // The epoch read, three point queries plus the queued-display
+            // predecessor lookup for each of the 60 cards waiting on a
+            // dependency (never cached), and the annotation: 264 statements.
+            assert_eq!(statements, 1 + 240 + 23);
         } else {
             // 30 cards, 10 statements; one card at a time it was 141.
             assert_eq!((annotated, annotation_statements, statements), (30, 9, 10));

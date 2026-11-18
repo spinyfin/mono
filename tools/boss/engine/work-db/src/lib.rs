@@ -906,6 +906,8 @@ mod progression_verbs;
 mod project_postmortem;
 #[cfg(test)]
 use boss_prose_vocabulary as prose_vocabulary;
+mod queued_display;
+pub use queued_display::QueuedDisplaySnapshot;
 mod queued_wait;
 #[cfg(test)]
 mod read_only_tests;

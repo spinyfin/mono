@@ -3,6 +3,104 @@ import XCTest
 
 @MainActor
 final class QueuedWaitTests: XCTestCase {
+    /// Engine-selected copy is painted as given, including restart prefixes
+    /// and the absolute hover times the engine sends with the first shape.
+    func testEngineDisplayVariantsReachCardAndAbsoluteHover() throws {
+        let labels = [
+            "Unexpected state — the engine has no reason recorded for this wait",
+            "Unexpected state — the engine sent no reason for this wait",
+            "Queued — waiting for a dependency",
+            "Queued — waiting for T\(42)",
+            "Queued — waiting for P\(7)",
+            "Queued — dispatch paused",
+            "Queued — automation paused",
+            "Queued — worker pool full",
+            "Queued — Waiting for an available worker (11 working)",
+            "Queued — blocked by an earlier review",
+            "Queued — next attempt in 2 min",
+            "Retrying after error (attempt 4) — next attempt in 2 min",
+            "Queued — waiting for the host to confirm the workspace lease — next attempt in 2 min",
+            "Queued — worker pool full (1 minute ago)",
+            "Restarting after the previous run was orphaned 1 minute ago. Queued — worker pool full",
+            "Restarting after the previous run failed 1 minute ago. Queued — worker pool full",
+            "Restarting after the previous run was cancelled 1 minute ago. Queued — worker pool full"
+        ]
+        let client = EngineClient(socketPath: "/tmp/queued-display-\(UUID().uuidString).sock")
+        let model = ChatViewModel(socketPath: "/tmp/queued-display-model-\(UUID().uuidString).sock")
+        let waiting = task(status: "active")
+        let epoch: Int64 = 1_766_058_669
+        let local = Date(timeIntervalSince1970: TimeInterval(epoch))
+            .formatted(date: .abbreviated, time: .shortened)
+        for label in labels {
+            let tooltip = label + "\nPrevious run finished at \(local)"
+            let pending = try XCTUnwrap(client.parseTaskRuntime([
+                "work_item_id": waiting.id, "execution_status": "ready",
+                "dispatch_not_before": "1",
+                "dispatch_wait_reason": label.hasPrefix("Unexpected state") ? "unclassified" : "stale raw reason",
+                "queued_display": [
+                    "text": label,
+                    "tooltip_times": [["label": "Previous run finished at", "epoch": epoch]]
+                ]
+            ]))
+            model.taskRuntimesByID = [waiting.id: pending]
+            let row = try XCTUnwrap(WorkBoardCardLiveStatusRowSlice(snapshot: snapshot(model, waiting)))
+            XCTAssertFalse(row.liveStatus.lowercased().contains("unknown"))
+            XCTAssertEqual(row.liveStatus, label)
+            XCTAssertEqual(row.tooltip, tooltip)
+        }
+    }
+
+    func testNextUpEngineDisplayPreservesRestartAndLocalizedHover() throws {
+        let client = EngineClient(socketPath: "/tmp/next-up-\(UUID().uuidString).sock")
+        let model = ChatViewModel(socketPath: "/tmp/next-up-model-\(UUID().uuidString).sock")
+        let waiting = task(status: "todo")
+        let epoch: Int64 = 1_766_058_669
+        let local = Date(timeIntervalSince1970: TimeInterval(epoch))
+            .formatted(date: .abbreviated, time: .shortened)
+        for (reason, hold, next) in [
+            ("awaiting_dispatch", "ready for the dispatcher's next pass", "Next up"),
+            ("pool_exhausted", "worker pool full", "Next up — worker pool full")
+        ] {
+            let prefix = "Restarting after the previous run was orphaned 1 minute ago."
+            let text = "\(prefix) Queued — \(hold)"
+            let nextText = "\(prefix) \(next)"
+            let pending = try XCTUnwrap(client.parseTaskRuntime([
+                "work_item_id": waiting.id, "execution_status": "ready",
+                "dispatch_wait_reason": reason, "dispatch_wait_label": hold,
+                "queued_display": [
+                    "text": text, "next_up_text": nextText,
+                    "tooltip_times": [["label": "Previous run was orphaned at", "epoch": epoch]]
+                ]
+            ]))
+            model.taskRuntimesByID = [waiting.id: pending]
+            model.choresByProductID = ["product_test": [waiting]]
+            model.queuedDispatchByID = [waiting.id: QueuedDispatch(pool: .main, position: 1, nextUp: true)]
+            XCTAssertEqual(WorkCardLiveStatus.resolve(
+                task: waiting, column: .doing, runtime: pending, liveState: nil, isNextUp: true
+            ), nextText)
+            let card = snapshot(model, waiting)
+            let row = try XCTUnwrap(WorkBoardCardLiveStatusRowSlice(snapshot: card))
+            XCTAssertEqual(row.liveStatus, nextText)
+            XCTAssertEqual(row.lineLimit, 4)
+            XCTAssertEqual(row.tooltip, text + "\nPrevious run was orphaned at \(local)")
+        }
+    }
+
+    /// An elapsed or unparseable deadline is never formatted as "not before".
+    /// The card falls through to the engine's current hold phrase.
+    func testElapsedLegacyDeadlineNeverRendersNotBefore() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let label = "Waiting for an available worker (11 working)"
+        for deadline in ["1799999999", "1800000000", "bad"] {
+            var pending = runtime(reason: "pool_exhausted", label: label)
+            pending.dispatchNotBefore = deadline
+            XCTAssertEqual(WorkCardLiveStatus.queuedLabel(runtime: pending, now: now),
+                           "Queued — \(label)")
+            XCTAssertFalse(WorkCardLiveStatus.queuedLabel(runtime: pending, now: now)
+                .contains("not before"))
+        }
+    }
+
     /// The card renders the engine's phrase as given, for a wait code and
     /// for a scheduler sentence alike. It holds no code-to-text table.
     func testEnginePhraseIsRenderedAsGiven() {

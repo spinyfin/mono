@@ -905,6 +905,7 @@ mod permanent_start_failure;
 mod predecessor_hold;
 mod preserved_work;
 mod progression_spawn;
+mod queued_display_refresh;
 mod run;
 mod scheduler;
 mod spoke_in_doubt;

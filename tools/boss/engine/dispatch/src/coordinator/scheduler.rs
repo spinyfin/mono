@@ -159,8 +159,15 @@ impl ExecutionCoordinator {
             tokio::time::sleep(interval).await;
             let interval_ms = interval.as_millis() as u64;
             let mut unexplained_waits = UnexplainedWaitWatch::default();
+            let mut queued_displays = None;
             loop {
                 coordinator.spawn_in_doubt_reconcile();
+                // A deadline can pass without a DB write (including while dispatch
+                // is paused). Publish changed engine projections, never ask clients
+                // to guess the next hold or run their own countdown timers.
+                coordinator
+                    .refresh_queued_displays(&mut queued_displays, boss_engine_utils::epoch_time::now_epoch_secs())
+                    .await;
                 let ready = match coordinator.work_db.list_ready_executions() {
                     Ok(rows) => rows,
                     Err(err) => {
