@@ -1046,6 +1046,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
     use tempfile::TempDir;
 
     struct StubSpawner {
@@ -2872,6 +2873,130 @@ mod tests {
             assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 0);
             assert!(spawner.registry.slot_for_run("run-test").is_none());
         }
+    }
+
+    /// Pause the intent write so the test can orphan the execution first.
+    struct IntentWriteGate {
+        started: (Mutex<bool>, Condvar),
+        released: (Mutex<bool>, Condvar),
+    }
+
+    impl IntentWriteGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: (Mutex::new(false), Condvar::new()),
+                released: (Mutex::new(false), Condvar::new()),
+            })
+        }
+
+        fn wait_to_write(&self) {
+            *self.started.0.lock().unwrap() = true;
+            self.started.1.notify_all();
+            let mut released = self.released.0.lock().unwrap();
+            while !*released {
+                released = self.released.1.wait(released).unwrap();
+            }
+        }
+
+        fn wait_until_paused(&self) {
+            let mut started = self.started.0.lock().unwrap();
+            while !*started {
+                started = self.started.1.wait(started).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+    }
+
+    struct GatedWorkDbStore {
+        db: crate::work::WorkDb,
+        gate: Arc<IntentWriteGate>,
+    }
+
+    impl TmuxSpawnStore for GatedWorkDbStore {
+        fn record_tmux_spawn_intent(
+            &self,
+            execution_id: &str,
+            server_label: &str,
+            session_name: &str,
+            spawn_token: &str,
+        ) -> anyhow::Result<bool> {
+            self.gate.wait_to_write();
+            self.db
+                .record_tmux_spawn_intent_for_execution(execution_id, server_label, session_name, spawn_token)
+        }
+
+        fn record_tmux_session_created(
+            &self,
+            execution_id: &str,
+            spawn_token: &str,
+            pane_pid: i64,
+            session_name: &str,
+            server_label: &str,
+        ) -> anyhow::Result<bool> {
+            self.db.persist_tmux_identity_after_observation(
+                execution_id,
+                spawn_token,
+                pane_pid,
+                Some(session_name),
+                Some(server_label),
+            )
+        }
+    }
+
+    #[test]
+    fn a_late_spawn_does_not_create_a_session_after_the_execution_is_orphaned() {
+        let workspace = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = crate::work::WorkDb::open(db_dir.path().join("boss.db")).unwrap();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id.clone(), "Late spawn");
+        let execution_id = crate::test_support::create_old_execution(&db, &chore.id);
+        db.start_execution_run(
+            &execution_id,
+            "worker-1",
+            "repo",
+            "lease",
+            "workspace",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let gate = IntentWriteGate::new();
+        let store = Arc::new(GatedWorkDbStore { db, gate: gate.clone() });
+        let spawner = ok_spawner_capturing();
+        let tmux_runner = spawner.tmux_runner.clone();
+        let mut input = sample_input(&workspace, tmux_runner.clone());
+        input.run_id = execution_id.clone();
+        input.tmux_host.spawn_store = store.clone();
+
+        let spawn_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(start_worker(&spawner, input, StdDuration::from_secs(1)))
+        });
+        gate.wait_until_paused();
+        store
+            .db
+            .mark_execution_orphaned(&execution_id, "pane never attached")
+            .unwrap();
+        gate.release();
+        let result = spawn_thread.join().expect("spawn thread");
+        assert!(matches!(result, Err(StartWorkerError::Tmux(_))), "{result:?}");
+        assert!(
+            !tmux_runner
+                .calls()
+                .iter()
+                .any(|args| args.get(2).map(String::as_str) == Some("new-session")),
+            "tmux must never create a session after the execution is orphaned: {:?}",
+            tmux_runner.calls()
+        );
+        assert!(store.db.tmux_identity_for_execution(&execution_id).unwrap().is_none());
     }
 
     #[tokio::test]

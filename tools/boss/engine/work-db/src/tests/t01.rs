@@ -2667,6 +2667,34 @@ fn list_adoptable_tmux_runs_includes_finished_run_of_live_execution() {
 }
 
 #[test]
+fn tmux_spawn_intent_is_refused_once_the_execution_is_terminal() {
+    for terminal in [
+        ExecutionStatus::Orphaned,
+        ExecutionStatus::Cancelled,
+        ExecutionStatus::Failed,
+    ] {
+        let db = WorkDb::open(temp_db_path("tmux-intent-terminal")).unwrap();
+        let execution_id = start_run_on_host_for_test(&db, "local");
+        db.mark_execution_orphaned(&execution_id, "pane never attached")
+            .unwrap();
+        if terminal != ExecutionStatus::Orphaned {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                rusqlite::params![&execution_id, terminal.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(
+            !db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker", "token-late")
+                .unwrap(),
+            "a {terminal} execution must not accept a late spawn intent"
+        );
+        assert!(db.tmux_identity_for_execution(&execution_id).unwrap().is_none());
+    }
+}
+
+#[test]
 fn tmux_run_for_execution_prefers_the_newest_unfinished_run() {
     let db = WorkDb::open(temp_db_path("tmux-run-for-exec-newest")).unwrap();
     let execution_id = start_run_on_host_for_test(&db, "local");

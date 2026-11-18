@@ -793,8 +793,11 @@ impl WorkDb {
     /// current run. The tmux spawn path will call this before it invokes tmux,
     /// making a session whose token is absent from the DB unambiguously leaked.
     ///
-    /// No production path calls this yet; tmux identity is written only once
-    /// tmux-hosted spawning is enabled.
+    /// Returns `false` when the execution has already reached a terminal
+    /// status, so a spawn delayed past the pane-attach deadline cannot stamp
+    /// identity onto an orphaned or failed row and then create a session.
+    /// A finished run on a still-live execution still accepts the stamp: the
+    /// fence is the execution, not `work_runs.finished_at`.
     pub fn record_tmux_spawn_intent_for_execution(
         &self,
         execution_id: &str,
@@ -813,7 +816,12 @@ impl WorkDb {
                  tmux_spawn_token = ?4,
                  tmux_spawn_state = 'intended',
                  tmux_pane_pid = NULL
-             WHERE id = ?1",
+             WHERE id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM work_executions e
+                   WHERE e.id = work_runs.execution_id
+                     AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               )",
             params![run_id, server_label, session_name, spawn_token],
         )?;
         Ok(updated > 0)

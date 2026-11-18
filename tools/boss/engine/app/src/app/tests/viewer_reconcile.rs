@@ -131,8 +131,8 @@ fn attach_request() -> EngineToAppRequest {
 async fn lost_detach_is_reconciled_on_registration_even_without_live_candidates() {
     let (state, _dir) = test_server_state();
     let run = seed_tmux_hosted_live_run(&state, 3, "old-session", "old-token");
-    state.work_db.mark_execution_orphaned(&run, "finished offline").unwrap();
     super::tmux_stub::install_teardown(&state, &run, 4_194_303);
+    state.work_db.mark_execution_orphaned(&run, "finished offline").unwrap();
     state.worker_registry.register_run_slot(&run, 3);
     state.release_worker_pane(&run).await;
     assert!(state.live_worker_states.get(3).is_none());

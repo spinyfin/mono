@@ -1794,6 +1794,59 @@ async fn run_execution_reaps_and_signals_when_cancelled_mid_spawn() {
     );
 }
 
+/// Same fence as a mid-spawn cancel: an execution orphaned by the pane-attach
+/// deadline (or any other terminal status) while spawn is in flight must reap
+/// the pane that arrives afterwards.
+#[tokio::test]
+async fn run_execution_reaps_and_signals_when_orphaned_mid_spawn() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Sort struct definitions");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    work_db
+        .mark_execution_orphaned(&execution.id, "pane never attached")
+        .unwrap();
+
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    let outcome = runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.wait_state,
+        RunWaitState::CancelledDuringSpawn,
+        "an orphan that races the spawn window must yield CancelledDuringSpawn",
+    );
+    assert!(
+        outcome.slot_id.is_none(),
+        "the pane was reaped, so the coordinator must not keep the pool slot claimed",
+    );
+    assert_eq!(
+        spawner.reaped_run_ids().as_slice(),
+        [execution.id.as_str()],
+        "the runner must reap the just-spawned pane for the orphaned execution",
+    );
+}
+
 /// Any task whose `project_id` is set must surface the parent
 /// project's name/description/goal in its spawn prompt — the
 /// task row itself is intentionally a thin handle (the design
