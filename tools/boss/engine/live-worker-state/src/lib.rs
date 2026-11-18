@@ -1954,8 +1954,10 @@ impl LiveWorkerStateRegistry {
             };
         }
         // Late hooks cannot rewind semantic state, but their ingress still
-        // proves responsiveness. Stop only establishes a delivery boundary.
-        if !matches!(event, WorkerEvent::Stop { .. }) {
+        // proves the worker is acting. Stop only establishes a delivery
+        // boundary. A Notification is a permission prompt or idle notice,
+        // not work, so it must not restart the declaration silence clock.
+        if !matches!(event, WorkerEvent::Stop { .. } | WorkerEvent::Notification { .. }) {
             meta.declaration_activity_at = Some(iso8601_utc(now_secs));
         }
         if let Some(ingress_seq) = ingress_seq {

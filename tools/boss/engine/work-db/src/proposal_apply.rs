@@ -57,7 +57,9 @@ use rusqlite::{OptionalExtension, Transaction};
 use super::automations::query_automation;
 use super::*;
 use crate::deferred_scope::DEFERRED_SCOPE_MARKER;
-use boss_engine_storage_values::attention_kinds::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_ATTENTION_KIND};
+use boss_engine_storage_values::attention_kinds::{
+    RUN_UNDECLARED_ATTENTION_KIND, WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_ATTENTION_KIND,
+};
 use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
     CreateAttentionInput, CreateAttentionItemInput, DeferredScopeProposalPayload, EffortEscalationProposalPayload,
@@ -1107,9 +1109,12 @@ fn apply_run_done(
         None
     };
 
+    let declared_at = now_string();
     let affected = tx.execute(
-        "UPDATE work_executions SET run_done_declared_at = ?2, run_done_outcome = ?3 WHERE id = ?1",
-        params![execution_id, now_string(), payload.outcome.as_str()],
+        "UPDATE work_executions
+         SET run_done_declared_at = ?2, run_done_outcome = ?3, run_undeclared_at = NULL
+         WHERE id = ?1",
+        params![execution_id, declared_at, payload.outcome.as_str()],
     )?;
     if affected == 0 {
         return Ok(ApplyDecision::Rejected(format!(
@@ -1117,6 +1122,12 @@ fn apply_run_done(
              row has been pruned"
         )));
     }
+    tx.execute(
+        "UPDATE work_attention_items
+         SET status = 'resolved', resolved_at = ?1
+         WHERE execution_id = ?2 AND kind = ?3 AND status = 'open'",
+        params![declared_at, execution_id, RUN_UNDECLARED_ATTENTION_KIND],
+    )?;
     if progression_run {
         super::progression_done::record_disposition(tx, execution_id, payload.outcome)?;
     }
@@ -1294,6 +1305,51 @@ mod tests {
                 .contains("is not an automation"),
             "decision_reason should name the real problem, not a provenance mismatch: {:?}",
             outcome.proposal.decision_reason
+        );
+    }
+
+    #[test]
+    fn a_late_declaration_clears_the_undeclared_stamp_and_resolves_attention() {
+        use boss_engine_storage_values::attention_kinds::RUN_UNDECLARED_ATTENTION_KIND;
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id, "Late declaration");
+        let execution = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
+        db.mark_execution_run_undeclared(&execution.id).unwrap();
+        db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: RUN_UNDECLARED_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Run parked without declaring itself done".to_owned(),
+            body_markdown: "parked".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+        assert!(db.execution_run_undeclared(&execution.id).unwrap());
+
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &chore.id,
+                kind: ProposalKind::RunDone,
+                payload_json: r#"{"outcome":"delivered","summary":"the work is in the PR"}"#,
+                idempotency_key: "late-done-1",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert!(!db.execution_run_undeclared(&execution.id).unwrap());
+        let open = db
+            .list_attention_items(&execution.id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == RUN_UNDECLARED_ATTENTION_KIND && item.status != "resolved")
+            .count();
+        assert_eq!(open, 0);
+        assert_eq!(
+            db.execution_run_done_outcome(&execution.id).unwrap(),
+            Some(RunDoneOutcome::Delivered)
         );
     }
 

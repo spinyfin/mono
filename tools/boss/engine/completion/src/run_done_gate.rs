@@ -27,8 +27,11 @@ impl WorkerCompletionHandler {
         if let Some(wait) = self.wait_registry.active(&execution.id, now) {
             // This is the machine-readable answer to our question. Start a
             // fresh silence window after it, with no unanswered-ask debt.
+            // Only the declaration fingerprint's consecutive count resets:
+            // `total_count` is the absolute cap and must survive a wait.
             self.run_done_silence_tracker.forget(&execution.id);
-            self.nudge_breaker.forget(&execution.id);
+            self.nudge_breaker
+                .reset_fingerprint_count(&execution.id, &format!("run_done_undeclared:{}", execution.id));
             self.probe_queuer
                 .clear_pending_turn_boundary_probes(&execution.id, "worker answered with a declared wait");
             // Keep the bounded wait observable even if no further Stop or
@@ -60,6 +63,21 @@ impl WorkerCompletionHandler {
                 reason: "run is awaiting human direction".to_owned(),
                 waited_secs: 0,
             };
+        }
+        // A human may resolve the attention without a declaration. The
+        // stamp and the declaration-ask consecutive count must not keep
+        // the next Ask at the breaker cap, or the run re-parks without
+        // asking.
+        if self.work_db.execution_run_undeclared(&execution.id).unwrap_or(false) {
+            if let Err(err) = self.work_db.clear_execution_run_undeclared(&execution.id) {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "run_done backstop: failed to clear run_undeclared_at after the park was lifted"
+                );
+            }
+            self.nudge_breaker
+                .reset_fingerprint_count(&execution.id, &format!("run_done_undeclared:{}", execution.id));
         }
         let activity = self
             .live_worker_states
@@ -95,10 +113,20 @@ impl WorkerCompletionHandler {
             now,
         );
         match decision {
-            crate::run_done_backstop::BackstopDecision::HoldingUntilStop => StopOutcome::AwaitingRunDoneDeclaration {
-                reason: "waiting for the worker's next Stop before asking for a declaration".to_owned(),
-            },
+            crate::run_done_backstop::BackstopDecision::HoldingUntilStop => {
+                self.drop_undelivered_declaration_ask(
+                    &execution.id,
+                    "worker resumed before the completion question could be delivered",
+                );
+                StopOutcome::AwaitingRunDoneDeclaration {
+                    reason: "waiting for the worker's next Stop before asking for a declaration".to_owned(),
+                }
+            }
             crate::run_done_backstop::BackstopDecision::HoldingWorkerActive { descendant_count } => {
+                self.drop_undelivered_declaration_ask(
+                    &execution.id,
+                    "worker activity resumed before the completion question could be delivered",
+                );
                 tracing::info!(
                     execution_id = %execution.id,
                     bound_pr_url,
@@ -132,6 +160,32 @@ impl WorkerCompletionHandler {
                 waited_secs,
                 horizon_secs,
             } => {
+                if !self.probe_queuer.can_queue_turn_boundary_probe(&execution.id) {
+                    self.probe_queuer.retry_pending_turn_boundary_probe(&execution.id);
+                    let reason = if self.probe_queuer.has_pending_turn_boundary_probe(&execution.id) {
+                        tracing::debug!(
+                            execution_id = %execution.id,
+                            bound_pr_url,
+                            waited_secs,
+                            horizon_secs,
+                            kind = %execution.kind,
+                            "run_done backstop: previous declaration question still awaiting delivery"
+                        );
+                        "previous declaration question still awaiting delivery".to_owned()
+                    } else {
+                        tracing::debug!(
+                            execution_id = %execution.id,
+                            bound_pr_url,
+                            waited_secs,
+                            horizon_secs,
+                            kind = %execution.kind,
+                            "run_done backstop: silence horizon elapsed, but this pass cannot queue \
+                             a declaration question"
+                        );
+                        "waiting for a turn boundary before asking for a declaration".to_owned()
+                    };
+                    return StopOutcome::AwaitingRunDoneDeclaration { reason };
+                }
                 tracing::warn!(
                     execution_id = %execution.id,
                     bound_pr_url,
@@ -171,6 +225,17 @@ impl WorkerCompletionHandler {
         }
     }
 
+    /// Drop a completion question that never reached the pane, and hand its
+    /// strike back. A question already written stays in flight.
+    fn drop_undelivered_declaration_ask(&self, execution_id: &str, reason: &str) {
+        if self
+            .probe_queuer
+            .clear_pending_turn_boundary_probes(execution_id, reason)
+        {
+            self.nudge_breaker.revert_undelivered(execution_id);
+        }
+    }
+
     /// An unanswered completion question is not evidence of worker failure.
     /// Keep the lease and pane attached and make the missing answer visible.
     pub(super) async fn park_undeclared_run(&self, execution: &crate::work::WorkExecution, count: u32) -> StopOutcome {
@@ -199,8 +264,9 @@ impl WorkerCompletionHandler {
     ///
     /// - `work_executions.run_undeclared_at` — the durable, queryable half.
     ///   A declared run has `run_done_declared_at`/`run_done_outcome` set
-    ///   and this NULL; a backstopped run the reverse. Neither is inferred
-    ///   from the absence of the other.
+    ///   and this NULL; a backstopped run the reverse. A late declaration
+    ///   clears this stamp and resolves the matching attention item. Neither
+    ///   is inferred from the absence of the other.
     /// - a [`RUN_UNDECLARED_ATTENTION_KIND`] attention — the human half,
     ///   specific to a missing completion declaration rather than a worker
     ///   failure.

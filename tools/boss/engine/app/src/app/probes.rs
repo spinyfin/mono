@@ -96,12 +96,51 @@ async fn deliver_owned_nudge(
 }
 
 impl ProbeQueuer for ServerStateProbeQueuer {
-    fn clear_pending_turn_boundary_probes(&self, run_id: &str, reason: &str) {
-        if let Some(server) = self.server.get().and_then(Weak::upgrade) {
-            server.drain_pending_probes_matching(run_id, ProbeDeliveryState::Dropped, reason, |probe| {
-                probe.requires_turn_boundary
-            });
+    fn clear_pending_turn_boundary_probes(&self, run_id: &str, reason: &str) -> bool {
+        self.server.get().and_then(Weak::upgrade).is_some_and(|server| {
+            !server
+                .drain_pending_probes_matching(run_id, ProbeDeliveryState::Dropped, reason, |probe| {
+                    probe.requires_turn_boundary
+                })
+                .is_empty()
+        })
+    }
+
+    fn has_pending_turn_boundary_probe(&self, run_id: &str) -> bool {
+        self.server
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|server| server.has_pending_turn_boundary_probe(run_id))
+    }
+
+    fn retry_pending_turn_boundary_probe(&self, run_id: &str) {
+        let Some(server) = self.server.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        if !server.has_pending_turn_boundary_probe(run_id) {
+            return;
         }
+        if server
+            .wait_registry
+            .active(run_id, boss_engine_utils::epoch_time::now_epoch_secs())
+            .is_some()
+        {
+            return;
+        }
+        if !server
+            .live_worker_states
+            .declaration_activity_for_run(run_id)
+            .is_some_and(|activity| activity.at_turn_boundary && !activity.tool_in_flight)
+        {
+            return;
+        }
+        if server.has_blocking_probe_for_declaration(run_id) {
+            return;
+        }
+        let run_id = run_id.to_owned();
+        boss_task_scope::spawn(async move {
+            super::worker_events::dispatch_probe_now(&server, &run_id).await;
+        });
     }
 
     fn can_queue_turn_boundary_probe(&self, run_id: &str) -> bool {
@@ -860,6 +899,32 @@ impl ServerState {
             .is_some_and(|probe| probe.requires_turn_boundary)
     }
 
+    pub(super) fn has_pending_turn_boundary_probe(&self, run_id: &str) -> bool {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .is_some_and(|queue| queue.iter().any(|probe| probe.requires_turn_boundary))
+    }
+
+    pub(super) fn has_non_boundary_pending_probe(&self, run_id: &str) -> bool {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .is_some_and(|queue| queue.iter().any(|probe| !probe.requires_turn_boundary))
+    }
+
+    fn turn_boundary_probe_is_deliverable(&self, run_id: &str) -> bool {
+        self.wait_registry
+            .active(run_id, boss_engine_utils::epoch_time::now_epoch_secs())
+            .is_none()
+            && self
+                .live_worker_states
+                .declaration_activity_for_run(run_id)
+                .is_some_and(|activity| activity.at_turn_boundary)
+    }
+
     fn declaration_reply_can_yield(&self, held: &InFlightProbe) -> bool {
         held.requires_turn_boundary
             && !held.reply_reading
@@ -886,10 +951,21 @@ impl ServerState {
     }
 
     pub(super) fn probe_delivery_slot_blocked(&self, run_id: &str) -> bool {
-        if self.next_probe_requires_turn_boundary(run_id) {
-            self.has_blocking_probe_for_declaration(run_id)
-        } else {
-            self.has_in_flight_probe(run_id)
+        let boundary_ok = self.turn_boundary_probe_is_deliverable(run_id);
+        let next_is_boundary = self
+            .pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .and_then(|queue| {
+                queue
+                    .iter()
+                    .find(|probe| !probe.requires_turn_boundary || boundary_ok)
+                    .map(|probe| probe.requires_turn_boundary)
+            });
+        match next_is_boundary {
+            Some(true) => self.has_blocking_probe_for_declaration(run_id),
+            Some(false) | None => self.has_in_flight_probe(run_id),
         }
     }
 
@@ -925,24 +1001,17 @@ impl ServerState {
         let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
         let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = pending.get_mut(run_id)?;
+        let boundary_ok = self.turn_boundary_probe_is_deliverable(run_id);
+        let position = queue
+            .iter()
+            .position(|probe| !probe.requires_turn_boundary || boundary_ok)?;
+        let claiming_boundary = queue.get(position)?.requires_turn_boundary;
         if let Some(held) = in_flight.get(run_id)
-            && (!queue.front()?.requires_turn_boundary || !self.declaration_reply_can_yield(held))
+            && (!claiming_boundary || !self.declaration_reply_can_yield(held))
         {
             return None;
         }
-        if queue.front()?.requires_turn_boundary
-            && (self
-                .wait_registry
-                .active(run_id, boss_engine_utils::epoch_time::now_epoch_secs())
-                .is_some()
-                || !self
-                    .live_worker_states
-                    .declaration_activity_for_run(run_id)
-                    .is_some_and(|activity| activity.at_turn_boundary))
-        {
-            return None;
-        }
-        let probe = queue.pop_front()?;
+        let probe = queue.remove(position)?;
         if queue.is_empty() {
             pending.remove(run_id);
         }

@@ -1215,8 +1215,23 @@ pub trait ProbeQueuer: Send + Sync {
     }
 
     /// A structured wait answers pending completion questions, but must
-    /// leave ordinary human probes available for delivery.
-    fn clear_pending_turn_boundary_probes(&self, _run_id: &str, _reason: &str) {}
+    /// leave ordinary human probes available for delivery. True when at
+    /// least one queued completion question was dropped.
+    fn clear_pending_turn_boundary_probes(&self, _run_id: &str, _reason: &str) -> bool {
+        false
+    }
+
+    /// True when a completion question is still queued for `run_id` and
+    /// has not yet been written into the pane.
+    fn has_pending_turn_boundary_probe(&self, _run_id: &str) -> bool {
+        false
+    }
+
+    /// Re-attempt delivery of an already-queued completion question through
+    /// the non-interrupting, Stop-boundary-checked dispatcher. Must not
+    /// enqueue a second question or charge a strike. No-op while a turn is
+    /// open, a tool is in flight, a wait is active, or nothing is pending.
+    fn retry_pending_turn_boundary_probe(&self, _run_id: &str) {}
 
     /// Deliver whatever is queued for `run_id` **now**, without waiting for a
     /// hook boundary.
