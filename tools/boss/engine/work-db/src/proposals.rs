@@ -402,9 +402,11 @@ impl WorkDb {
                     input.payload_json,
                     input.kind,
                     &id,
-                    guide,
-                    question_worker.as_ref(),
-                    pr_created_proposals_seam_enabled,
+                    crate::proposal_apply::ApplyTransactionContext {
+                        prepared_guide: guide,
+                        question_worker: question_worker.as_ref(),
+                        pr_created_proposals_seam_enabled,
+                    },
                 )?),
                 ProposalApplyPolicy::Gated => None,
                 // Refused above before the transaction opened.

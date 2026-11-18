@@ -2140,6 +2140,8 @@ mod no_op_recovery;
 #[cfg(test)]
 mod nudge_delivery;
 #[cfg(test)]
+mod pr_created_seam;
+#[cfg(test)]
 mod revision_delivery;
 #[cfg(test)]
 mod status_ledger;
@@ -2151,8 +2153,6 @@ mod t11;
 mod t12;
 #[cfg(test)]
 mod t13;
-#[cfg(test)]
-mod pr_created_seam;
 #[cfg(test)]
 mod t14;
 #[cfg(test)]

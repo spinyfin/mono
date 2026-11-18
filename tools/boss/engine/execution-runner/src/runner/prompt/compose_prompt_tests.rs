@@ -13,6 +13,8 @@ mod blocked_recovery;
 mod invocation;
 #[path = "compose_prompt_tests/non_bazel_gate.rs"]
 mod non_bazel_gate;
+#[path = "compose_prompt_tests/pr_created_seam.rs"]
+mod pr_created_seam;
 #[path = "compose_prompt_tests/prepush_rebase.rs"]
 mod prepush_rebase;
 #[path = "compose_prompt_tests/revision_rebase.rs"]
@@ -165,41 +167,6 @@ fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
                 "prompt must stay driver-agnostic: {banned} is Claude Code-specific:\n{prompt}",
             );
         }
-    }
-}
-
-#[test]
-fn pr_created_seam_prompt_keeps_declaration_and_printed_url_in_all_pr_paths() {
-    // Cover both acceptance-criterion branches plus `pr_terminal_directive`:
-    // the declaration is the primary seam channel, while the printed URL is
-    // deliberately retained as soak-period redundancy.
-    for work_item in [
-        chore_without_pr(),
-        chore_with_pr("https://github.com/org/repo/pull/42"),
-    ] {
-        let execution = base_execution();
-        let prompt = compose_execution_prompt(
-            ExecutionPromptParams::builder()
-                .review_signal_checks(|_| &[])
-                .execution(&execution)
-                .work_item(&work_item)
-                .workspace_path(std::path::Path::new("/tmp/workspace"))
-                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-                .pr_created_proposals_seam_enabled(true)
-                .build(),
-        );
-        assert!(
-            prompt.contains("propose pr-created --url"),
-            "seam-on prompt must teach the declaration in every PR path:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("the final-response URL in the generated rules is its fallback"),
-            "seam-on prompt must retain the printed-URL redundancy:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("that declaration IS the terminal action"),
-            "seam-on prompt must update the terminal-action directive:\n{prompt}",
-        );
     }
 }
 

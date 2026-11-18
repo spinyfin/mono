@@ -170,6 +170,18 @@ pub enum ApplyDecision {
     Staged(ApplyOutcome),
 }
 
+/// Call-site extras for [`apply_in_transaction`] that would otherwise
+/// overflow clippy's argument cap. `pr_created_proposals_seam_enabled` is
+/// read only by [`apply_pr_created`] — every other kind ignores it. It is
+/// the caller's composed `worker_proposals && pr_created_proposals_seam`
+/// value, not a raw flag lookup: [`apply_in_transaction`] has no
+/// `FeatureFlagsStore` of its own to query.
+pub(crate) struct ApplyTransactionContext<'a> {
+    pub prepared_guide: Option<&'a Result<super::review_guide_submission::PreparedGuide>>,
+    pub question_worker: Option<&'a super::stuck_report::QuestionWorkerObservation>,
+    pub pr_created_proposals_seam_enabled: bool,
+}
+
 /// Auto-apply `kind` inside `tx` — the same transaction
 /// [`WorkDb::submit_worker_proposal`] inserts the `worker_proposals` row in.
 /// Only called for kinds whose [`apply_policy`] is
@@ -179,21 +191,13 @@ pub enum ApplyDecision {
 /// stamped onto (allocated by the caller before this runs, so appliers that
 /// need to reference their own proposal — e.g. to supersede a predecessor —
 /// have it available before the `INSERT`).
-///
-/// `pr_created_proposals_seam_enabled` is read only by [`apply_pr_created`]
-/// — every other kind ignores it. It is the caller's composed
-/// `worker_proposals && pr_created_proposals_seam` value, not a raw flag
-/// lookup: [`apply_in_transaction`] has no `FeatureFlagsStore` of its own to
-/// query.
 pub(super) fn apply_in_transaction(
     tx: &Transaction<'_>,
     execution_id: &str,
     payload_json: &str,
     kind: ProposalKind,
     proposal_id: &str,
-    prepared_guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
-    question_worker: Option<&super::stuck_report::QuestionWorkerObservation>,
-    pr_created_proposals_seam_enabled: bool,
+    ctx: ApplyTransactionContext<'_>,
 ) -> Result<ApplyDecision> {
     match kind {
         ProposalKind::Attention => apply_attention(tx, execution_id, payload_json).map(ApplyDecision::Applied),
@@ -203,12 +207,16 @@ pub(super) fn apply_in_transaction(
         ProposalKind::Blocked => apply_blocked(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
-        ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json, pr_created_proposals_seam_enabled),
-        ProposalKind::ReviewGuide => {
-            super::review_guide_submission::accept(tx, execution_id, prepared_guide.context("missing prepared guide")?)
+        ProposalKind::PrCreated => {
+            apply_pr_created(tx, execution_id, payload_json, ctx.pr_created_proposals_seam_enabled)
         }
+        ProposalKind::ReviewGuide => super::review_guide_submission::accept(
+            tx,
+            execution_id,
+            ctx.prepared_guide.context("missing prepared guide")?,
+        ),
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
-        ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id, question_worker),
+        ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id, ctx.question_worker),
         ProposalKind::Wait => apply_wait(payload_json).map(ApplyDecision::Applied),
         ProposalKind::ReviewVerdict => apply_review_verdict(tx, execution_id, payload_json, proposal_id),
         ProposalKind::FollowupTask => anyhow::bail!(
@@ -1667,9 +1675,11 @@ mod tests {
             "{}",
             ProposalKind::FollowupTask,
             "prp_missing",
-            None,
-            None,
-            false,
+            ApplyTransactionContext {
+                prepared_guide: None,
+                question_worker: None,
+                pr_created_proposals_seam_enabled: false,
+            },
         )
         .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
         assert!(
