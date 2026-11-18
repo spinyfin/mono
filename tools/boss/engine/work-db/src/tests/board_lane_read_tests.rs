@@ -83,16 +83,24 @@ fn lane_reads_do_not_sort_in_sqlite() {
         insert_card(&conn, &product, "plan-chore", "chore", None, "1");
         assert_no_sqlite_sort(&conn, &product, "fresh database");
     }
+}
 
-    // The production-cardinality fixture, before and after a full ANALYZE:
-    // the planner picks different access paths for the lanes once it has
-    // real statistics, and none of them may bring a sort back.
-    let (_dir, db) = super::work_tree_scale_tests::open_seeded("lane-plan");
-    let conn = db.connect().unwrap();
-    insert_card(&conn, "scale-product-0", "plan-chore", "chore", None, "1");
-    assert_no_sqlite_sort(&conn, "scale-product-0", "scale fixture");
-    conn.execute_batch("ANALYZE").unwrap();
-    assert_no_sqlite_sort(&conn, "scale-product-0", "scale fixture with full statistics");
+#[cfg(boss_scale_tests)]
+mod board_lane_scale_tests {
+    use super::*;
+
+    #[test]
+    fn lane_reads_do_not_sort_in_sqlite_with_production_statistics() {
+        // The production-cardinality fixture, before and after a full ANALYZE:
+        // the planner picks different access paths for the lanes once it has
+        // real statistics, and none of them may bring a sort back.
+        let (_dir, db) = crate::tests::work_tree_scale_tests::open_seeded("lane-plan");
+        let conn = db.connect().unwrap();
+        insert_card(&conn, "scale-product-0", "plan-chore", "chore", None, "1");
+        assert_no_sqlite_sort(&conn, "scale-product-0", "scale fixture");
+        conn.execute_batch("ANALYZE").unwrap();
+        assert_no_sqlite_sort(&conn, "scale-product-0", "scale fixture with full statistics");
+    }
 }
 
 #[test]
