@@ -7,8 +7,8 @@ use super::*;
 use crate::board_patch::{Lane, read_lane};
 use boss_metrics::population_timing::{PopulationTrace, segment};
 
-/// The `ORDER BY` each lane's read carried before ordering moved out of SQL.
-/// Kept here as the reference the board order must keep matching.
+/// The SQL `ORDER BY` equivalent of each lane's board order.
+/// Tests compare `task_order` and `chore_order` against it to detect divergence.
 fn sql_order(lane: Lane) -> &'static str {
     match lane {
         Lane::Tasks => "COALESCE(ordinal, 0) ASC, created_at ASC, id ASC",
