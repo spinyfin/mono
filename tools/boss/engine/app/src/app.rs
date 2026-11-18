@@ -2582,6 +2582,7 @@ mod dispatch;
 mod read_admission;
 mod read_coalesce;
 mod read_freshness;
+mod read_task;
 mod session_queue;
 mod session_write;
 mod work_tree_loads;
@@ -2921,74 +2922,20 @@ async fn handle_frontend_connection(
             .decode_ms(decode_ms)
             .build();
         // Name the request kind to the DB layer so a SQLite lock wait under
-        // this handler is logged against it (see `work::contention`).
+        // this handler is logged against it (see `boss_work_db::contention`).
         let dispatch_fut = boss_work_db::contention::REQUEST_KIND.scope(
             Arc::from(verb.as_str()),
             dispatch::dispatch_request(ctx, request, bulk_read),
         );
-        // A coalescing leader reports to its batch whether it is blocked on a
-        // SQLite lock, which is what keeps the batch open to followers.
-        let dispatch_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match &read_batch {
-            Some(batch) => Box::pin(boss_work_db::contention::READ_WAIT.scope(batch.wait(), dispatch_fut)),
-            None => Box::pin(dispatch_fut),
-        };
         if let Some(waiting) = waiting_read {
-            let sink = sink.clone();
-            let session_id = session_id.clone();
-            boss_task_scope::spawn(async move {
-                let permits = waiting.acquire().await;
-                // Synchronous SQLite work must not occupy the async
-                // runtime threads that serve writes and live status.
-                // Keep permits inside the blocking job even if its
-                // client disconnects; cancellation cannot inflate capacity.
-                let batch = read_batch.clone();
-                let result = boss_task_scope::spawn_blocking_future(async move {
-                    permits.started();
-                    if let Some(batch) = &batch {
-                        // From here identical reads start a new batch: this
-                        // handler's snapshot predates them.
-                        batch.start();
-                    }
-                    dispatch_fut.await;
-                    permits
-                })
-                .await;
-                match result {
-                    Ok(Some(permits)) => {
-                        // Followers are answered before the read's admission
-                        // permits are released, so a later read cannot be
-                        // admitted ahead of the replies this one owes.
-                        if let Some(batch) = &read_batch {
-                            batch.finish(&sink);
-                        }
-                        drop(permits);
-                    }
-                    // Cancelled by engine shutdown before the handler
-                    // finished: the leader never replied, so its followers
-                    // are told rather than left waiting.
-                    Ok(None) => {
-                        if let Some(batch) = &read_batch {
-                            batch.fail(&sink, "read RPC cancelled: engine shutting down");
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!(?err, %session_id, "read RPC handler failed");
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::Error {
-                                message: "read RPC handler failed".into(),
-                            },
-                        );
-                        if let Some(batch) = &read_batch {
-                            batch.fail(&sink, "read RPC handler failed");
-                        }
-                    }
-                }
-                if let Some(batch) = &read_batch {
-                    sink.untap_response(batch.leader_request_id());
-                }
-            });
+            read_task::spawn(
+                waiting,
+                read_batch,
+                dispatch_fut,
+                sink.clone(),
+                session_id.clone(),
+                request_id,
+            );
         } else {
             dispatch_fut.await;
         }

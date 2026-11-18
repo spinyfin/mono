@@ -408,7 +408,15 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
-    match server_state.work_db.spoke_projection_status() {
+    // Read through an independent WAL reader, not the shared writer
+    // connection: that connection is exactly what an engine write holds while
+    // it waits out a stuck SQLite lock, and this report has to be produced
+    // then to say so (`database_contention` above).
+    match server_state
+        .work_db
+        .reader()
+        .and_then(|reader| reader.spoke_projection_status())
+    {
         Ok(hosts) => {
             for host in hosts {
                 if let Some(reason) = host.halt_reason.as_deref() {

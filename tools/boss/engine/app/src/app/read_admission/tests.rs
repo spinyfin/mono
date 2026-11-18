@@ -79,28 +79,42 @@ async fn global_queue_and_concurrency_apply_across_connections() {
     drop((&mut third).await.unwrap());
 }
 
-/// A read that missed its deadline keeps its queue slot until the caller
-/// has queued the busy reply and dropped the rejection. The reader loop's
+/// A read still waiting for a permit past the slow-wait threshold is not
+/// rejected and keeps its queue slot until it is admitted. The reader loop's
 /// headroom reserve counts outstanding replies through these slots, so
 /// freeing one early would let it admit another request whose reply lands
 /// on top of the reserve.
-#[tokio::test]
-async fn rejected_read_holds_its_queue_slot_until_dropped() {
-    let gate = Arc::new(ReadAdmission::new(1, 1, 1, Duration::from_millis(30)));
+#[tokio::test(start_paused = true)]
+async fn waiting_read_holds_its_queue_slot_until_admitted() {
+    let gate = Arc::new(ReadAdmission::new(1, 1, 8, Duration::from_millis(30)));
     let connection = gate.connection();
-    let active = gate.enqueue(&connection).unwrap().acquire().await.unwrap();
-    let rejected = gate.enqueue(&connection).unwrap().acquire().await.unwrap_err();
-    assert_eq!(rejected, DEADLINE);
+    let active = gate.enqueue(&connection).await.acquire().await;
+    // Fill the connection's four queue slots; one of the queued reads waits
+    // for the permit `active` holds.
+    let mut queued = Vec::new();
+    for _ in 0..3 {
+        queued.push(gate.enqueue(&connection).await);
+    }
+    let mut waiting = tokio::spawn(gate.enqueue(&connection).await.acquire());
+    let mut next = tokio::spawn({
+        let (gate, connection) = (gate.clone(), connection.clone());
+        async move { gate.enqueue(&connection).await }
+    });
+    // Well past the slow-wait threshold: still waiting, slot still occupied.
+    still_pending(&mut waiting, Duration::from_millis(200)).await;
     assert!(
-        matches!(gate.enqueue(&connection), Err(QUEUE_FULL)),
-        "the slot must stay occupied while the busy reply is still unqueued"
-    );
-    drop(rejected);
-    assert!(
-        gate.enqueue(&connection).is_ok(),
-        "dropping the rejection frees the slot"
+        !next.is_finished(),
+        "the slot must stay occupied while its read is still waiting"
     );
     drop(active);
+    let admitted = (&mut waiting).await.unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(1), &mut next)
+        .await
+        .expect("admitting the waiting read frees its queue slot")
+        .unwrap();
+    drop(next);
+    drop(admitted);
+    drop(queued);
 }
 
 #[test]

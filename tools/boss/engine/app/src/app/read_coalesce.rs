@@ -30,8 +30,8 @@
 //! database, is shared engine-wide instead (see `work_tree_loads`).
 use super::read_admission::WaitingRead;
 use super::session_queue::SessionSink;
-use boss_work_db::contention::ReadWait;
 use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest};
+use boss_work_db::contention::ReadWait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

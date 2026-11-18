@@ -5,13 +5,23 @@ use rusqlite::ffi;
 use std::sync::mpsc;
 use std::thread;
 
-/// Log lines about SQLite lock waits emitted since `from`.
-fn wait_lines(buffer: &log_capture::SharedBuffer, from: usize, needle: &str) -> Vec<String> {
+/// Log lines about SQLite lock waits emitted since `from` for request kind
+/// `request`. The log buffer is shared by every test in the process, and
+/// other tests wait on locks of their own, so a test that counts lines tags
+/// its work with a request kind nobody else uses (see [`as_request`]).
+fn wait_lines(buffer: &log_capture::SharedBuffer, from: usize, needle: &str, request: &str) -> Vec<String> {
+    let request = format!("request={request} ");
     String::from_utf8_lossy(&buffer.lock()[from..])
         .lines()
-        .filter(|line| line.contains(needle))
+        .filter(|line| line.contains(needle) && line.contains(&request))
         .map(str::to_owned)
         .collect()
+}
+
+/// Run `work` as the engine does while serving a frontend request of kind
+/// `kind`.
+fn as_request<T>(kind: &str, work: impl FnOnce() -> T) -> T {
+    REQUEST_KIND.sync_scope(Arc::from(kind), work)
 }
 
 /// Take the write lock on an independent connection to `db` and hold it
@@ -63,10 +73,11 @@ fn busy_and_locked_codes_are_contention_and_others_are_not() {
     // A real failure from a live connection: the message stays intact and
     // is not contention.
     let (_dir, db) = open_db();
+    db.set_metadata("taken", "first").unwrap();
     let err = db
         .connect()
         .unwrap()
-        .execute("INSERT INTO metadata (key, value) VALUES ('schema_version', 'dup')", [])
+        .execute("INSERT INTO metadata (key, value) VALUES ('taken', 'dup')", [])
         .map_err(anyhow::Error::new)
         .unwrap_err();
     assert!(classify(&err).is_none(), "{err:#}");
@@ -86,14 +97,15 @@ fn write_under_external_write_lock_commits_once_and_logs_the_wait() {
 
     let holder = hold_write_lock(&db, Duration::from_millis(300));
     let started = Instant::now();
-    let chore = db
-        .create_chore(
+    let chore = as_request("ContendedCreate", || {
+        db.create_chore(
             CreateChoreInput::builder()
                 .product_id(product.id.clone())
                 .name("Contended create")
                 .build(),
         )
-        .expect("write under contention must succeed");
+    })
+    .expect("write under contention must succeed");
     assert!(
         started.elapsed() >= Duration::from_millis(150),
         "the write did not wait"
@@ -112,14 +124,13 @@ fn write_under_external_write_lock_commits_once_and_logs_the_wait() {
     assert_eq!(count, 1, "a retried write must be applied exactly once");
     assert_eq!(chore.name, "Contended create");
 
-    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared");
+    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared", "ContendedCreate");
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
     assert!(
         line.contains("caller=") && line.contains("create_entities.rs"),
         "{line}"
     );
-    assert!(line.contains("request=internal"), "{line}");
     assert!(line.contains("attempts=") && !line.contains("attempts=0 "), "{line}");
     assert!(line.contains("waited_ms=") && !line.contains("waited_ms=0 "), "{line}");
 
@@ -268,17 +279,18 @@ fn a_wait_on_an_independent_connection_is_attributed_and_counted() {
     let waits = db.contention_health().snapshot().waits;
     let from = buffer.lock().len();
     let holder = hold_write_lock(&db, Duration::from_millis(250));
-    db.with_independent_connection(|conn| {
-        conn.execute_batch("BEGIN IMMEDIATE; COMMIT")?;
-        Ok(())
+    as_request("IndependentWait", || {
+        db.with_independent_connection(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE; COMMIT")?;
+            Ok(())
+        })
     })
     .unwrap();
     holder.join().unwrap();
 
-    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared");
+    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared", "IndependentWait");
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("contention_tests.rs"), "{}", lines[0]);
-    assert!(lines[0].contains("request=internal"), "{}", lines[0]);
     assert_eq!(db.contention_health().snapshot().waits, waits + 1);
 }
 
@@ -290,14 +302,14 @@ fn reported_wait_excludes_work_done_after_the_lock_was_taken() {
     let (_dir, db) = open_db();
     let from = buffer.lock().len();
     let holder = hold_write_lock(&db, Duration::from_millis(200));
-    {
+    as_request("WorkAfterTheLock", || {
         let mut conn = db.connect().unwrap();
         let tx = conn.transaction().unwrap();
         thread::sleep(Duration::from_millis(900));
         tx.commit().unwrap();
-    }
+    });
     holder.join().unwrap();
-    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared");
+    let lines = wait_lines(&buffer, from, "SQLite lock wait cleared", "WorkAfterTheLock");
     assert_eq!(lines.len(), 1, "{lines:?}");
     let waited_ms: u64 = lines[0]
         .split("waited_ms=")
@@ -356,14 +368,11 @@ fn a_thread_waiting_for_its_own_write_lock_fails_loudly() {
 
     let other = db.query_connection().unwrap();
     let started = Instant::now();
-    let err = other
-        .connect()
-        .unwrap()
-        .transaction()
+    let err = as_request("SelfDeadlock", || other.connect().unwrap().transaction().map(drop))
         .expect_err("a self-deadlock must fail, not hang");
     assert!(classify_sqlite(&err).is_some(), "{err}");
     assert!(started.elapsed() >= HEALTH_THRESHOLD);
-    let errors = wait_lines(&buffer, from, "probably waiting for itself");
+    let errors = wait_lines(&buffer, from, "probably waiting for itself", "SelfDeadlock");
     assert_eq!(errors.len(), 1, "{errors:?}");
 }
 

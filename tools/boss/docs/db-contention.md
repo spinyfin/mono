@@ -8,13 +8,14 @@ replaced them.
 
 ## What happens instead
 
-- **Classification** lives in one place, `work/contention.rs`:
+- **Classification** lives in one place,
+  `tools/boss/engine/work-db/src/contention.rs`:
   `SQLITE_BUSY` and `SQLITE_LOCKED`, with every extended code
   (`BUSY_RECOVERY`, `BUSY_SNAPSHOT`, `BUSY_TIMEOUT`,
   `LOCKED_SHAREDCACHE`, …), are transient contention. Everything else is
   a real database failure and still fails loudly.
-- **Every engine-configured connection** (the engine's writer, per-query
-  read connections, the CLI's direct read-only inspection connection)
+- **Every connection the engine opens** (its writer, per-query read
+  connections, bulk readers, the backup's independent connection)
   carries a SQLite busy handler instead of a fixed `busy_timeout`. The
   handler retries the lock acquisition with SQLite's own backoff schedule
   (1 ms … 100 ms) and does not give up. Because it runs inside the
@@ -23,12 +24,26 @@ replaced them.
   autocommit statements the lock is taken before any row is touched, so a
   retried write is applied exactly once and the duplicate-create guard
   sees a consistent snapshot.
-- **Reads** are also coalesced per session (`app/read_coalesce.rs`):
-  identical requests pipelined on one socket cost one handler run, and the
-  followers are answered from the leader's responses under their own
-  request ids. A follower only joins a leader that has not started, so an
-  answer is never older than the request that received it.
-- **Read admission** (`app/read_admission.rs`) still bounds concurrency
+- **`bossctl` direct-DB connections** do not absorb: they wait a bounded
+  time (250 ms for read-only inspection, 5 s for commands that write) and
+  then fail with SQLite's own error, so an operator tool never hangs on a
+  stuck lock.
+- **Reads** are also coalesced per session
+  (`tools/boss/engine/app/src/app/read_coalesce.rs`): identical requests
+  pipelined on one socket cost one handler run, and the followers are
+  answered from the leader's responses under their own request ids. A
+  follower only joins a leader whose snapshot is not taken yet (it is
+  still queued for admission, or blocked on a SQLite lock), so an answer
+  is never older than the request that received it.
+- **`GetWorkTree`** is not coalesced that way, because each response is
+  encoded against its session's delta cache. Its database load is shared
+  engine-wide instead (`work_tree_loads`, on the `boss_single_flight`
+  crate): requests for one product share one in-flight tree scan across
+  sessions for as long as nothing has been committed since that scan
+  began, which includes the whole time it is blocked on a lock. A failed
+  load answers every request that joined it.
+- **Read admission** (`tools/boss/engine/app/src/app/read_admission.rs`)
+  still bounds concurrency
   and queue depth, but it never rejects: a read that finds its queue full
   or every permit taken waits, and the reader loop stops taking requests
   off that socket until a slot frees.
@@ -40,7 +55,7 @@ connection, the frontend request kind being served (`internal` for
 sweeps and pollers), the attempt count and the total wait:
 
 ```
-work DB contention: SQLite lock wait cleared caller=…/work/create_entities.rs:231 request=CreateChore attempts=7 waited_ms=312
+work DB contention: SQLite lock wait cleared caller=…/work-db/src/create_entities.rs:231 request=CreateChore attempts=7 waited_ms=312
 ```
 
 A wait still in flight logs `work DB contention: still waiting for the

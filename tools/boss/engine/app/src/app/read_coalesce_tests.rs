@@ -1,8 +1,8 @@
 use super::*;
 use crate::app::read_admission::ReadAdmission;
 use crate::app::{ServerState, ServerStateOverrides, handle_frontend_connection};
-use boss_work_db::contention::HEALTH_THRESHOLD;
 use boss_protocol::{CreateChoreInput, FrontendRequestEnvelope};
+use boss_work_db::contention::HEALTH_THRESHOLD;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
@@ -203,7 +203,7 @@ fn work_tree_reads_keep_their_own_handler_run() {
 
 fn sink() -> SessionSink {
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-    SessionSink::new(shutdown_tx)
+    SessionSink::new(shutdown_tx, crate::app::frontend_metrics::test_registry())
 }
 
 fn queued(sink: &SessionSink) -> Vec<FrontendEventEnvelope> {
@@ -328,7 +328,7 @@ async fn followers_receive_the_leaders_responses_or_its_failure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_under_an_external_write_lock_waits_and_is_answered_with_data() {
     let (state, _dir) = crate::app::tests::test_server_state();
-    let product = crate::test_support::create_test_product(&state.work_db);
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
     let mut session = Session::open(state.clone());
     let holder = hold_write_lock(&state.work_db, Duration::from_millis(400));
     let started = std::time::Instant::now();
@@ -359,8 +359,8 @@ async fn read_under_an_external_write_lock_waits_and_is_answered_with_data() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_under_an_external_write_lock_commits_once_and_is_answered_with_the_item() {
     let (state, _dir) = crate::app::tests::test_server_state();
-    let product = crate::test_support::create_test_product(&state.work_db);
-    crate::test_support::create_test_chore_manual(&state.work_db, product.id.clone(), "Seed");
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id.clone(), "Seed");
     let mut session = Session::open(state.clone());
     let holder = hold_write_lock(&state.work_db, Duration::from_millis(400));
     let started = std::time::Instant::now();
@@ -400,22 +400,11 @@ async fn create_under_an_external_write_lock_commits_once_and_is_answered_with_t
     session.close().await;
 }
 
-/// Log lines containing `needle` emitted since `from`.
-fn log_lines(buffer: &crate::test_support::log_capture::SharedBuffer, from: usize, needle: &str) -> Vec<String> {
-    String::from_utf8_lossy(&buffer.lock()[from..])
-        .lines()
-        .filter(|line| line.contains(needle))
-        .map(str::to_owned)
-        .collect()
-}
-
 /// A read that fails for a reason that is not lock contention is answered
 /// with the error, promptly, to the request and to every request coalesced
-/// behind it — never retried, never swallowed, never logged as a lock wait.
+/// behind it — never retried, never swallowed, never counted as a lock wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_non_contention_database_failure_still_answers_every_request_with_an_error() {
-    let buffer = crate::test_support::log_capture::install();
-    let from = buffer.lock().len();
     let (state, gate, _dir) = small_gate_state();
     // A real SQLite failure: the table the handler reads is gone.
     state
@@ -450,8 +439,11 @@ async fn a_non_contention_database_failure_still_answers_every_request_with_an_e
             other => panic!("{id}: expected the database error, got {other:?}"),
         }
     }
-    assert!(
-        log_lines(&buffer, from, "work DB contention").is_empty(),
+    // Every lock wait is recorded against its database as it is logged; the
+    // registry, unlike the process-wide log, is this test's alone.
+    assert_eq!(
+        state.work_db.contention_health().snapshot().waits,
+        0,
         "a real failure must not look like contention"
     );
     assert_eq!(state.read_coalescing.leaders(), 1);
@@ -562,7 +554,12 @@ async fn identical_reads_join_a_leader_blocked_on_a_sqlite_lock_and_cost_one_run
             runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             runtime.block_on(boss_work_db::contention::READ_WAIT.scope(batch.wait(), async move {
                 // Opening the transaction waits behind the external lock.
-                db.connect().unwrap().transaction().unwrap().commit().unwrap();
+                db.connect()
+                    .unwrap()
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap()
+                    .commit()
+                    .unwrap();
                 sink.enqueue(envelope("lead", 1));
             }));
         }

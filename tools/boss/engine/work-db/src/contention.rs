@@ -42,9 +42,9 @@ use rusqlite::{Connection, ErrorCode};
 
 /// A SQLite failure that is transient lock contention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Contention {
-    pub(crate) code: ErrorCode,
-    pub(crate) extended_code: i32,
+pub struct Contention {
+    pub code: ErrorCode,
+    pub extended_code: i32,
 }
 
 /// Classify one rusqlite error. `SQLITE_BUSY` and `SQLITE_LOCKED` — with
@@ -66,7 +66,7 @@ pub(crate) fn classify_sqlite(err: &rusqlite::Error) -> Option<Contention> {
 }
 
 /// Classify an `anyhow` error by the rusqlite error anywhere in its chain.
-pub(crate) fn classify(err: &anyhow::Error) -> Option<Contention> {
+pub fn classify(err: &anyhow::Error) -> Option<Contention> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<rusqlite::Error>().and_then(classify_sqlite))
 }
@@ -102,7 +102,7 @@ impl LockWait {
 /// transactions took p50 1.1 ms, p90 4.5 ms, p99 436 ms, max 751 ms; 200
 /// `set_metadata` autocommit writes took p50 18 µs, p99 189 µs, max 1.0 ms.
 /// The worst engine transaction is under a second.
-pub(crate) const HEALTH_THRESHOLD: Duration = Duration::from_secs(5);
+pub const HEALTH_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// First progress line for a wait still in flight, then every
 /// `PROGRESS_INTERVAL` after it, so a wait that never clears keeps logging.
@@ -122,10 +122,10 @@ const STALE_AFTER: Duration = Duration::from_secs(2);
 tokio::task_local! {
     /// The frontend request kind being served by the current task, set by
     /// the dispatch loop so the DB layer can name it in contention logs.
-    pub(crate) static REQUEST_KIND: Arc<str>;
+    pub static REQUEST_KIND: Arc<str>;
     /// Whether the read being served is blocked in the busy handler, set for
-    /// reads that coalesce (see `app::read_coalesce`).
-    pub(crate) static READ_WAIT: Arc<ReadWait>;
+    /// reads that coalesce (see `read_coalesce` in the app crate).
+    pub static READ_WAIT: Arc<ReadWait>;
 }
 
 /// Request kind for the current task, or `"internal"` outside a frontend
@@ -142,10 +142,10 @@ pub(crate) fn current_request_kind() -> Arc<str> {
 /// that arrives meanwhile can be answered from it without being answered
 /// from older data.
 #[derive(Debug, Default)]
-pub(crate) struct ReadWait(AtomicBool);
+pub struct ReadWait(AtomicBool);
 
 impl ReadWait {
-    pub(crate) fn is_waiting(&self) -> bool {
+    pub fn is_waiting(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 
@@ -408,7 +408,7 @@ fn sleep_yielding(delay: Duration) {
 /// handle's lifetime; `stuck` holds only waits currently past
 /// [`HEALTH_THRESHOLD`] that are still retrying.
 #[derive(Debug, Default)]
-pub(crate) struct Health {
+pub struct Health {
     waits: AtomicU64,
     long_waits: AtomicU64,
     longest_ms: AtomicU64,
@@ -416,21 +416,21 @@ pub(crate) struct Health {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StuckWait {
-    pub(crate) caller: String,
-    pub(crate) request: String,
-    pub(crate) since: Instant,
-    pub(crate) attempts: u32,
+pub struct StuckWait {
+    pub caller: String,
+    pub request: String,
+    pub since: Instant,
+    pub attempts: u32,
     last_attempt: Instant,
 }
 
 /// Point-in-time copy for the health report.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Snapshot {
-    pub(crate) waits: u64,
-    pub(crate) long_waits: u64,
-    pub(crate) longest_ms: u64,
-    pub(crate) stuck: Vec<StuckWait>,
+pub struct Snapshot {
+    pub waits: u64,
+    pub long_waits: u64,
+    pub longest_ms: u64,
+    pub stuck: Vec<StuckWait>,
 }
 
 impl Health {
@@ -460,7 +460,7 @@ impl Health {
         self.stuck.lock().expect("contention health lock poisoned").remove(&id);
     }
 
-    pub(crate) fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> Snapshot {
         let mut stuck = self.stuck.lock().expect("contention health lock poisoned");
         // A wait that stopped retrying has ended even if nothing has
         // recorded that yet (its thread has not released its guard).
