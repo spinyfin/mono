@@ -184,6 +184,7 @@ impl GrokProcessEnvironment {
             process_home: PathBuf::from("/tmp/process-home"),
             auth_path: PathBuf::from("/host/auth.json"),
             host_tools: HostToolPaths {
+                bazelrc: None,
                 gh_config_dir: PathBuf::from("/host/gh"),
                 cube_data_dir: PathBuf::from("/host/cube"),
                 cube_config_dir: PathBuf::from("/host/cube-config"),

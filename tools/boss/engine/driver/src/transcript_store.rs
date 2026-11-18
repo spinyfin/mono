@@ -405,6 +405,11 @@ mod tests {
 
     #[test]
     fn transcript_store_root_defaults_to_boss_executions_directory() {
+        // Scoped-home fixtures temporarily clear TEST_TMPDIR. Keep the wrapper's
+        // isolated root available while the default resolver reads it.
+        let _home = crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _override = crate::test_support::TranscriptStoreOverride::unset();
         assert_eq!(
             transcript_store_root().unwrap(),
