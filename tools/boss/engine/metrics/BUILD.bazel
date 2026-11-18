@@ -22,6 +22,7 @@ rust_library(
         "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/metrics-registry:metrics_registry",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -42,6 +43,7 @@ rust_library(
         "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/metrics-registry:metrics_registry",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -59,6 +61,7 @@ rust_test(
         "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/metrics-registry:metrics_registry",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

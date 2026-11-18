@@ -643,6 +643,7 @@ mod wait_scale_fixture;
 mod wait_scale_tests;
 mod work_tree_scale_tests;
 
+mod board_lane_read_tests;
 mod board_patch_tests;
 
 mod design_doc_contention_tests;

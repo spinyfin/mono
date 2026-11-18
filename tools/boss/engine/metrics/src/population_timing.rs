@@ -13,6 +13,7 @@
 //!
 //! ```text
 //!   decode           request envelope deserialization
+//!   db.snapshot      connection + the first read that pins the snapshot
 //!   db.product       one SELECT per named DB query …
 //!   db.projects
 //!   db.tasks
@@ -37,6 +38,24 @@
 //! (rows returned / items iterated) and, for the N+1 stages, `db_queries`
 //! (the number of SQL statements executed) so a per-row subquery fan-out is
 //! unmistakable in the log.
+//!
+//! # Waiting versus executing
+//!
+//! `duration_ms` is wall clock, so on its own it cannot say whether a slow
+//! stage was computing or was stuck. A stage announced with
+//! [`PopulationTrace::enter_stage`] therefore also carries `cpu_ms`: the CPU
+//! time its thread used between the announcement and the record. The
+//! remainder, `duration_ms - cpu_ms`, is time the thread was not running:
+//! blocked on a file read or write (including SQLite's temporary files),
+//! waiting for a database or connection lock, or runnable while the host had
+//! no core free for it. A stage whose `cpu_ms` is close to its `duration_ms`
+//! was executing; one with a large remainder was waiting, and a profile of
+//! the engine taken while it waits names what it waited on.
+//!
+//! `db.snapshot` covers what happens before the first query of a board
+//! read: taking the connection and the read that pins the snapshot. Time
+//! queued behind another user of the connection, or behind a lock while the
+//! read transaction starts, shows up there and not in a query stage.
 //!
 //! # Output
 //!
@@ -89,6 +108,9 @@ pub const DIAGNOSTICS_DIR_ENV: &str = "BOSS_ENGINE_DIAGNOSTICS_DIR";
 pub mod segment {
     /// Request envelope deserialization (reader loop).
     pub const DECODE: &str = "decode";
+    /// Taking the connection and pinning the read snapshot, before any of
+    /// the board's own queries. Lock and connection waits land here.
+    pub const DB_SNAPSHOT: &str = "db.snapshot";
     /// `SELECT` for the product row.
     pub const DB_PRODUCT: &str = "db.product";
     /// `SELECT` for the product's projects.
@@ -174,6 +196,12 @@ pub struct EnginePopulationRecord {
     /// Segment name (see [`segment`]).
     pub segment: &'static str,
     pub duration_ms: f64,
+    /// CPU time the stage's thread used during the segment. Present on
+    /// stages announced with [`PopulationTrace::enter_stage`];
+    /// `duration_ms - cpu_ms` is the time that thread spent not running
+    /// (blocked on file I/O or a lock, or waiting for a core).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<f64>,
     /// Rows returned by the segment's query, or items iterated by an N+1
     /// loop.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +244,7 @@ struct PendingSegment {
     ts_epoch_ms: u128,
     segment: &'static str,
     duration_ms: f64,
+    cpu_ms: Option<f64>,
     rows: Option<i64>,
     db_queries: Option<i64>,
     payload_bytes: Option<i64>,
@@ -236,6 +265,51 @@ struct TraceContext {
     items: Option<i64>,
 }
 
+/// The thread CPU clock at the last [`PopulationTrace::enter_stage`], so the
+/// record that closes the stage can say how much of it was spent running.
+#[derive(Debug, Clone, Copy)]
+struct StageClock {
+    stage: &'static str,
+    /// CPU clocks are per thread: a reading is only comparable with a later
+    /// one taken on this same thread.
+    thread: std::thread::ThreadId,
+    cpu: std::time::Duration,
+}
+
+impl StageClock {
+    fn start(stage: &'static str) -> Option<Self> {
+        Some(Self {
+            stage,
+            thread: std::thread::current().id(),
+            cpu: boss_engine_utils::thread_cpu::thread_cpu_time()?,
+        })
+    }
+
+    /// CPU milliseconds this thread used since the stage was announced, or
+    /// `None` when the record is being made on a different thread.
+    fn cpu_ms(self) -> Option<f64> {
+        if self.thread != std::thread::current().id() {
+            return None;
+        }
+        let now = boss_engine_utils::thread_cpu::thread_cpu_time()?;
+        Some(now.saturating_sub(self.cpu).as_secs_f64() * 1_000.0)
+    }
+}
+
+/// Instants a trace remembers between calls. Kept as a sub-struct so
+/// [`PopulationTrace`] stays under the giant-structs field threshold.
+#[derive(Debug, Default)]
+struct TraceMarks {
+    /// Set by [`PopulationTrace::mark_enqueued`] when the handler hands the
+    /// trace to the writer task's session queue.
+    /// [`PopulationTrace::record_queue_wait`] turns the gap between that
+    /// instant and its own call into the `queue_wait` segment, then clears
+    /// this so a repeat call is a no-op.
+    enqueued_at: Option<Instant>,
+    /// The stage most recently announced and not yet recorded.
+    stage: Option<StageClock>,
+}
+
 /// Accumulator for one `GetWorkTree` fetch. Built at the reader/handler
 /// boundary, filled as the request flows through decode → DB → assemble,
 /// then handed to the writer task (via the per-session registry) which
@@ -252,11 +326,7 @@ pub struct PopulationTrace {
     /// decode. `None` marks a disabled trace.
     started: Option<Instant>,
     segments: Vec<PendingSegment>,
-    /// Set by [`Self::mark_enqueued`] when the handler hands the trace to
-    /// the writer task's session queue. [`Self::record_queue_wait`] turns
-    /// the gap between that instant and its own call into the `queue_wait`
-    /// segment, then clears this so a repeat call is a no-op.
-    enqueued_at: Option<Instant>,
+    marks: TraceMarks,
     /// Live cold-build progress; inert unless a sink was installed with
     /// [`Self::set_progress_sink`].
     progress: ProgressReporter,
@@ -280,7 +350,7 @@ impl PopulationTrace {
             },
             started: Some(started),
             segments: Vec::new(),
-            enqueued_at: None,
+            marks: TraceMarks::default(),
             progress: ProgressReporter::default(),
         }
     }
@@ -297,7 +367,7 @@ impl PopulationTrace {
             },
             started: None,
             segments: Vec::new(),
-            enqueued_at: None,
+            marks: TraceMarks::default(),
             progress: ProgressReporter::default(),
         }
     }
@@ -308,9 +378,21 @@ impl PopulationTrace {
         self.started.is_some()
     }
 
-    /// Announce a stage before beginning its work, separately from duration logging.
-    pub fn enter_stage(&self, name: &'static str) {
+    /// Announce a stage before beginning its work, separately from duration
+    /// logging. Also starts the stage's CPU clock: the record that closes the
+    /// stage carries the CPU time this thread used in between as `cpu_ms`.
+    pub fn enter_stage(&mut self, name: &'static str) {
         self.progress.stage(name, self.elapsed_ms(), self.ctx.items);
+        if self.is_enabled() {
+            self.marks.stage = StageClock::start(name);
+        }
+    }
+
+    /// CPU time used since `segment` was announced, when it is the stage in
+    /// progress. Sub-segments recorded inside a stage leave its clock running.
+    fn take_stage_cpu_ms(&mut self, segment: &'static str) -> Option<f64> {
+        let clock = self.marks.stage.take_if(|clock| clock.stage == segment)?;
+        clock.cpu_ms()
     }
 
     /// Writer stages go directly to the socket ahead of the snapshot.
@@ -350,11 +432,13 @@ impl PopulationTrace {
         if !self.is_enabled() {
             return;
         }
+        let cpu_ms = self.take_stage_cpu_ms(segment::DB_AI_REVIEW_STATE);
         self.segments.push(
             PendingSegment::builder()
                 .ts_epoch_ms(boss_engine_day_rotated_log::now_ms())
                 .segment(segment::DB_AI_REVIEW_STATE)
                 .duration_ms(duration_ms)
+                .maybe_cpu_ms(cpu_ms)
                 .rows(cards as i64)
                 .db_queries(db_queries as i64)
                 .cache_hits(cache_hits as i64)
@@ -478,7 +562,7 @@ impl PopulationTrace {
     /// No-op on a disabled trace.
     pub fn mark_enqueued(&mut self) {
         if self.is_enabled() {
-            self.enqueued_at = Some(Instant::now());
+            self.marks.enqueued_at = Some(Instant::now());
         }
     }
 
@@ -487,7 +571,7 @@ impl PopulationTrace {
     /// session queue before being dequeued for serialization. No-op if
     /// `mark_enqueued` was never called (or the trace is disabled).
     pub fn record_queue_wait(&mut self) {
-        if let Some(enqueued_at) = self.enqueued_at.take() {
+        if let Some(enqueued_at) = self.marks.enqueued_at.take() {
             self.record_plain(segment::QUEUE_WAIT, elapsed_ms(enqueued_at));
         }
     }
@@ -503,11 +587,13 @@ impl PopulationTrace {
         if !self.is_enabled() {
             return;
         }
+        let cpu_ms = self.take_stage_cpu_ms(segment);
         self.segments.push(
             PendingSegment::builder()
                 .ts_epoch_ms(boss_engine_day_rotated_log::now_ms())
                 .segment(segment)
                 .duration_ms(duration_ms)
+                .maybe_cpu_ms(cpu_ms)
                 .maybe_rows(rows)
                 .maybe_db_queries(db_queries)
                 .maybe_payload_bytes(payload_bytes)
@@ -529,6 +615,7 @@ impl PopulationTrace {
                     .maybe_fetch_seq(self.ctx.fetch_seq)
                     .segment(seg.segment)
                     .duration_ms(seg.duration_ms)
+                    .maybe_cpu_ms(seg.cpu_ms)
                     .maybe_rows(seg.rows)
                     .maybe_db_queries(seg.db_queries)
                     .maybe_payload_bytes(seg.payload_bytes)
@@ -552,6 +639,12 @@ impl PopulationTrace {
             .iter()
             .find(|s| s.segment == name)
             .map(|s| (s.duration_ms, s.rows, s.db_queries))
+    }
+
+    /// `cpu_ms` of the first recorded segment named `name`, when it has one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn segment_cpu_ms(&self, name: &str) -> Option<f64> {
+        self.segments.iter().find(|s| s.segment == name)?.cpu_ms
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -883,6 +976,131 @@ mod tests {
         assert_eq!(by_segment("serialize")["payload_bytes"], 2_500_000);
     }
 
+    /// Spin until this thread has used at least `cpu` of CPU time.
+    fn burn_cpu(cpu: std::time::Duration) {
+        let clock = || boss_engine_utils::thread_cpu::thread_cpu_time().expect("thread CPU clock");
+        let before = clock();
+        let mut mix = 0u64;
+        while clock() - before < cpu {
+            for i in 0..10_000u64 {
+                mix = std::hint::black_box(mix.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i));
+            }
+        }
+    }
+
+    #[test]
+    fn a_stage_that_waits_reports_far_less_cpu_than_wall_time() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.enter_stage(segment::DB_TASKS);
+        let started = Instant::now();
+        // Blocked, as a query stuck on a file write or a lock would be.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        trace.record_query(segment::DB_TASKS, elapsed_ms(started), 10);
+
+        let (wall_ms, _, _) = trace.segment_counts(segment::DB_TASKS).unwrap();
+        let cpu_ms = trace
+            .segment_cpu_ms(segment::DB_TASKS)
+            .expect("an announced stage carries cpu_ms");
+        assert!(wall_ms >= 200.0, "{wall_ms}");
+        assert!(
+            cpu_ms < wall_ms / 4.0,
+            "waited {wall_ms} ms but reported {cpu_ms} ms of CPU"
+        );
+    }
+
+    #[test]
+    fn a_stage_that_computes_reports_the_cpu_it_used() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.enter_stage(segment::ASSEMBLE);
+        let started = Instant::now();
+        burn_cpu(std::time::Duration::from_millis(30));
+        trace.record_plain(segment::ASSEMBLE, elapsed_ms(started));
+
+        let cpu_ms = trace.segment_cpu_ms(segment::ASSEMBLE).expect("cpu_ms");
+        assert!(cpu_ms >= 30.0, "{cpu_ms}");
+    }
+
+    #[test]
+    fn sub_segments_leave_the_enclosing_stage_clock_running() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.enter_stage(segment::DB_AI_REVIEW_STATE);
+        burn_cpu(std::time::Duration::from_millis(10));
+        // Recorded inside the stage, before the stage itself.
+        trace.record_plain(segment::DB_AI_REVIEW_STATE_FAMILY_KEYS, 4.0);
+        burn_cpu(std::time::Duration::from_millis(10));
+        trace.record_ai_review_state(25.0, 80, 4, 10, 20, 30);
+
+        assert_eq!(trace.segment_cpu_ms(segment::DB_AI_REVIEW_STATE_FAMILY_KEYS), None);
+        let cpu_ms = trace.segment_cpu_ms(segment::DB_AI_REVIEW_STATE).expect("cpu_ms");
+        assert!(cpu_ms >= 20.0, "the stage covers both halves: {cpu_ms}");
+    }
+
+    #[test]
+    fn a_segment_recorded_without_an_announcement_has_no_cpu_time() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.record_query(segment::DB_TASKS, 12.0, 10);
+        assert_eq!(trace.segment_cpu_ms(segment::DB_TASKS), None);
+
+        // A stage is closed by its first record: a second one is unannounced.
+        trace.enter_stage(segment::DB_CHORES);
+        trace.record_query(segment::DB_CHORES, 1.0, 1);
+        trace.record_query(segment::DB_CHORES, 1.0, 1);
+        let chores: Vec<_> = trace
+            .segments
+            .iter()
+            .filter(|s| s.segment == segment::DB_CHORES)
+            .map(|s| s.cpu_ms.is_some())
+            .collect();
+        assert_eq!(chores, vec![true, false]);
+    }
+
+    #[test]
+    fn a_stage_recorded_on_another_thread_has_no_cpu_time() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.enter_stage(segment::DB_TASKS);
+        // Thread CPU clocks are not comparable across threads.
+        let trace = std::thread::spawn(move || {
+            trace.record_query(segment::DB_TASKS, 3.0, 10);
+            trace
+        })
+        .join()
+        .unwrap();
+        assert_eq!(trace.segment_cpu_ms(segment::DB_TASKS), None);
+        assert!(trace.segment_counts(segment::DB_TASKS).is_some());
+    }
+
+    #[test]
+    fn disabled_trace_starts_no_stage_clock() {
+        let mut trace = PopulationTrace::disabled();
+        trace.enter_stage(segment::DB_TASKS);
+        assert!(trace.marks.stage.is_none());
+    }
+
+    #[test]
+    fn cpu_time_is_written_only_for_segments_that_have_it() {
+        let record = |cpu_ms| EnginePopulationRecord {
+            ts_epoch_ms: 1,
+            product_id: "prod-1".to_owned(),
+            request_id: "req-1".to_owned(),
+            fetch_seq: None,
+            segment: segment::DB_TASKS,
+            duration_ms: 8475.0,
+            cpu_ms,
+            rows: Some(4606),
+            db_queries: None,
+            payload_bytes: None,
+            items: None,
+            cache_hits: None,
+            cache_misses: None,
+            owners: None,
+        };
+        let waited: serde_json::Value = serde_json::to_value(record(Some(160.5))).unwrap();
+        assert_eq!(waited["duration_ms"], 8475.0);
+        assert_eq!(waited["cpu_ms"], 160.5);
+        let unannounced: serde_json::Value = serde_json::to_value(record(None)).unwrap();
+        assert!(unannounced.get("cpu_ms").is_none());
+    }
+
     #[test]
     fn record_serializes_to_expected_json_shape() {
         let rec = EnginePopulationRecord {
@@ -892,6 +1110,7 @@ mod tests {
             fetch_seq: Some(7),
             segment: segment::DB_TASK_RUNTIMES,
             duration_ms: 6000.0,
+            cpu_ms: None,
             rows: Some(1949),
             db_queries: Some(4200),
             payload_bytes: None,
@@ -918,6 +1137,7 @@ mod tests {
             fetch_seq: None,
             segment: segment::DECODE,
             duration_ms: 0.4,
+            cpu_ms: None,
             rows: None,
             db_queries: None,
             payload_bytes: None,
@@ -953,6 +1173,7 @@ mod tests {
             fetch_seq: None,
             segment: segment::DB_AI_REVIEW_STATE,
             duration_ms: 12.5,
+            cpu_ms: None,
             rows: Some(80),
             db_queries: Some(4),
             payload_bytes: None,
@@ -979,6 +1200,7 @@ mod tests {
             fetch_seq: Some(3),
             segment: segment::TOTAL,
             duration_ms: 7100.0,
+            cpu_ms: None,
             rows: None,
             db_queries: None,
             payload_bytes: None,

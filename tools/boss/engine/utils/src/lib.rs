@@ -16,6 +16,7 @@ pub mod local_time;
 pub mod process_args;
 pub mod quoted_field;
 pub mod string_clip;
+pub mod thread_cpu;
 pub mod token;
 
 pub mod atomic_blob;

@@ -36,22 +36,53 @@ const BOARD_CHORES_LANE: &str = "(kind IN ('chore', 'followup') AND project_id I
 /// elsewhere but never appear as cards.
 const BOARD_LIVE: &str = "deleted_at IS NULL AND status != 'archived'";
 
-/// The product's tasks-lane rows, in board order.
-pub(super) fn tasks_lane_query() -> String {
-    format!(
-        "SELECT {BOARD_TASK_COLUMNS} FROM tasks \
-         WHERE product_id = ?1 AND {BOARD_TASKS_LANE} AND {BOARD_LIVE} \
-         ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC, id ASC"
-    )
+/// One lane of a product's board.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Lane {
+    /// Every project-member kind, plus chores and follow-ups carrying a
+    /// project id.
+    Tasks,
+    /// Project-less chores and follow-ups.
+    Chores,
 }
 
-/// The product's chores-lane rows, in board order.
-pub(super) fn chores_lane_query() -> String {
-    format!(
-        "SELECT {BOARD_TASK_COLUMNS} FROM tasks \
-         WHERE product_id = ?1 AND {BOARD_CHORES_LANE} AND {BOARD_LIVE} \
-         ORDER BY created_at ASC, id ASC"
-    )
+impl Lane {
+    /// Selects the lane's live rows for product `?1`, in no particular order.
+    ///
+    /// Deliberately without `ORDER BY`. A row carries the card's whole
+    /// description, so ordering in SQL makes SQLite sort tens of megabytes
+    /// on a large product. Its sorter holds about as much as the
+    /// connection's page cache (2 MB by default) and writes the rest to a
+    /// temporary file, so every complete board read wrote most of the lane to
+    /// disk and read it back. Those writes wait behind whatever else is
+    /// writing to the disk; on a host busy with builds a lane that sorts in
+    /// milliseconds took seconds. [`read_lane`] orders the rows after they
+    /// are read instead, which touches no file.
+    pub(super) fn query(self) -> String {
+        let lane = match self {
+            Lane::Tasks => BOARD_TASKS_LANE,
+            Lane::Chores => BOARD_CHORES_LANE,
+        };
+        format!("SELECT {BOARD_TASK_COLUMNS} FROM tasks WHERE product_id = ?1 AND {lane} AND {BOARD_LIVE}")
+    }
+
+    /// The lane's board order.
+    fn order(self) -> fn(&Task, &Task) -> std::cmp::Ordering {
+        match self {
+            Lane::Tasks => boss_board_projection::task_order,
+            Lane::Chores => boss_board_projection::chore_order,
+        }
+    }
+}
+
+/// The lane's cards for `product_id`, in board order.
+pub(super) fn read_lane(conn: &Connection, product_id: &str, lane: Lane) -> Result<Vec<Task>> {
+    let mut stmt = conn.prepare(&lane.query())?;
+    let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
+    let mut cards = collect_rows(rows)?;
+    // Ids are unique, so the order is total and stability buys nothing.
+    cards.sort_unstable_by(lane.order());
+    Ok(cards)
 }
 
 #[derive(Clone, Copy)]
@@ -269,7 +300,7 @@ pub(super) fn read_cards(
     }
 
     tasks.sort_by(boss_board_projection::task_order);
-    chores.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    chores.sort_by(boss_board_projection::chore_order);
     let mut queries = 0u64;
     let mut validity = HashMap::new();
     let mut computed = Vec::with_capacity(tasks.len() + chores.len());
