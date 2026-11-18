@@ -63,10 +63,8 @@ impl WorkspaceOccupancy for HostOccupancy {
             if !result.owners.is_empty() {
                 result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
             }
-            let report = boss_execution_contracts::WorkspaceOccupied {
-                occupants: result.occupants.clone(),
-                unreadable: result.unknown.clone(),
-                owners: result.owners.clone(),
+            let Some(report) = boss_worker_processes::Occupied::of(&result) else {
+                return Ok(Occupancy::Empty);
             };
             // A scan on another host is classified by the same function, so a
             // run id the engine has never heard of is bounded here as it is
@@ -94,14 +92,7 @@ impl WorkspaceOccupancy for HostOccupancy {
                 );
                 return Ok(Occupancy::Empty);
             }
-            anyhow::ensure!(
-                result.empty(),
-                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
-                result.occupants,
-                result.owners,
-                result.unknown
-            );
-            Ok(Occupancy::Empty)
+            Err(report.into())
         }))
     }
 

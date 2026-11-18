@@ -90,13 +90,20 @@ impl Cleanup {
     }
 }
 
-/// A workspace scan that found processes still inside it, kept as data so a
-/// caller can forward the occupants and their owners instead of prose. Its
-/// message is the wording older hubs parse, so it stays compatible with them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What an owning host's workspace scan found still inside a leased workspace,
+/// as data. The hub classifies it exactly as it classifies a scan of its own
+/// host: occupants nobody owns, processes a run owns, unreadable ones, and
+/// this run's processes that survived signalling. Its message is the wording
+/// older hubs parse, so it stays compatible with them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Occupied {
+    /// Every process inside the workspace, owned or not.
     pub occupants: Vec<u32>,
+    /// Processes whose identity could not be read.
     pub unknown: Vec<u32>,
+    /// This run's processes that were signalled and were still alive.
+    pub remaining: Vec<u32>,
+    /// Occupant pids by the run id they carry.
     pub owners: std::collections::BTreeMap<String, Vec<u32>>,
 }
 
@@ -106,21 +113,37 @@ impl Occupied {
         (!cleanup.empty()).then(|| Self {
             occupants: cleanup.occupants.clone(),
             unknown: cleanup.unknown.clone(),
+            remaining: cleanup.remaining.clone(),
             owners: cleanup.owners.clone(),
         })
+    }
+
+    /// Occupants that carry no run identity.
+    pub fn unowned(&self) -> Vec<u32> {
+        let owned: std::collections::BTreeSet<u32> = self.owners.values().flatten().copied().collect();
+        self.occupants
+            .iter()
+            .copied()
+            .filter(|pid| !owned.contains(pid))
+            .collect()
     }
 }
 
 impl std::fmt::Display for Occupied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.unknown.is_empty() && self.owners.is_empty() && !self.occupants.is_empty() {
+        if self.unknown.is_empty() && self.owners.is_empty() && self.remaining.is_empty() && !self.occupants.is_empty()
+        {
             write!(f, "unowned workspace occupants {:?}", self.occupants)
         } else {
             write!(
                 f,
                 "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
                 self.occupants, self.owners, self.unknown
-            )
+            )?;
+            if !self.remaining.is_empty() {
+                write!(f, "; remaining {:?}", self.remaining)?;
+            }
+            Ok(())
         }
     }
 }
@@ -405,5 +428,22 @@ unittest.main(argv=["worker-processes"], verbosity=2)
         };
         assert!(!owned.stray_only());
         assert!(!owned.empty());
+    }
+
+    #[test]
+    fn occupied_carries_remaining_and_subtracts_owners_from_occupants() {
+        let cleanup = super::Cleanup {
+            terminated: vec![],
+            killed: vec![],
+            remaining: vec![9],
+            occupants: vec![7, 8],
+            unknown: vec![],
+            owners: [("run-a".into(), vec![8])].into(),
+            elapsed_ms: 0,
+        };
+        let occupied = super::Occupied::of(&cleanup).expect("remaining keeps the report");
+        assert_eq!(occupied.remaining, vec![9]);
+        assert_eq!(occupied.unowned(), vec![7]);
+        assert!(occupied.to_string().contains("remaining [9]"));
     }
 }

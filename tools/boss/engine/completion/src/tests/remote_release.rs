@@ -410,11 +410,11 @@ fn unowned_remote_occupants_are_released_only_after_the_bound_and_owned_ones_nev
 
 /// A structured occupancy report is classified like a local scan: a run id the
 /// engine has no record of uses the unowned bound, a run it knows keeps the
-/// lease, and nothing is released while an occupant is unreadable.
+/// lease, and nothing is released while an occupant is unreadable or remaining.
 #[test]
 fn structured_occupancy_report_is_classified_like_a_local_scan() {
     use crate::workspace_lease_release::{Occupancy, UNOWNED_OCCUPANT_BOUND_SECS, bound_unowned_occupants};
-    use boss_execution_contracts::WorkspaceOccupied;
+    use boss_execution_contracts::Occupied;
     let (_dir, db, id) = remote_fixture();
     let set_finished_ago = |secs: i64| {
         db.connect()
@@ -426,10 +426,11 @@ fn structured_occupancy_report_is_classified_like_a_local_scan() {
             .unwrap();
         db.get_execution(&id).unwrap()
     };
-    let report = |owner: &str, unreadable: Vec<u32>| -> Result<Occupancy> {
-        Err(WorkspaceOccupied {
+    let report = |owner: &str, unknown: Vec<u32>| -> Result<Occupancy> {
+        Err(Occupied {
             occupants: vec![7, 8],
-            unreadable,
+            unknown,
+            remaining: vec![],
             owners: [(owner.to_owned(), vec![8])].into(),
         }
         .into())
@@ -461,4 +462,74 @@ fn structured_occupancy_report_is_classified_like_a_local_scan() {
     assert!(bound_unowned_occupants(&db, &settled, report(&other.id, vec![])).is_err());
     // So does an occupant whose identity could not be read.
     assert!(bound_unowned_occupants(&db, &settled, report("exec_never_seen", vec![9])).is_err());
+    // A process of this run that survived signalling is never bounded.
+    let remaining: Result<Occupancy> = Err(Occupied {
+        occupants: vec![7],
+        remaining: vec![7],
+        ..Occupied::default()
+    }
+    .into());
+    assert!(
+        bound_unowned_occupants(&db, &settled, remaining).is_err(),
+        "remaining processes keep the lease"
+    );
+}
+
+/// A leftover of a terminal other run pins the lease until that other run has
+/// itself been settled for the leftover bound, then is released loudly and
+/// never signalled.
+#[test]
+fn terminal_other_run_is_held_inside_the_bound_then_released() {
+    use crate::workspace_lease_release::{Occupancy, UNOWNED_OCCUPANT_BOUND_SECS, bound_unowned_occupants};
+    use boss_execution_contracts::Occupied;
+    let (_dir, db, id) = remote_fixture();
+    let set_finished_ago = |execution_id: &str, secs: i64| {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    execution_id,
+                    (boss_engine_utils::epoch_time::now_epoch_secs() - secs).to_string()
+                ],
+            )
+            .unwrap();
+        db.get_execution(execution_id).unwrap()
+    };
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "other terminal run");
+    let other = create_ready_chore_execution(&db, chore.id);
+    db.start_execution_run(&other.id, "worker", "mono", "lease-other", "ws-other", "/tmp/ws-other")
+        .unwrap();
+    db.cancel_running_execution(&other.id).unwrap();
+    let current = set_finished_ago(&id, UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    let report = || -> Result<Occupancy> {
+        Err(Occupied {
+            occupants: vec![8],
+            owners: [(other.id.clone(), vec![8])].into(),
+            ..Occupied::default()
+        }
+        .into())
+    };
+
+    set_finished_ago(&other.id, 5);
+    assert!(
+        bound_unowned_occupants(&db, &current, report()).is_err(),
+        "a recently terminal owner keeps the lease"
+    );
+
+    set_finished_ago(&other.id, UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    assert_eq!(
+        bound_unowned_occupants(&db, &current, report()).unwrap(),
+        Occupancy::Empty
+    );
+    let released = db
+        .list_attention_items(&id)
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND
+        })
+        .expect("the release is loud");
+    assert!(released.body_markdown.contains("[8]"), "{}", released.body_markdown);
 }

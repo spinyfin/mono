@@ -195,7 +195,8 @@ message CommandResult {
 // What a host's workspace scan found, as data rather than prose so the hub
 // can classify it exactly as it classifies a scan of its own host.
 message WorkspaceOccupancy {
-  // Processes inside the workspace that carry no run identity.
+  // Every process inside the workspace, owned or not. `owners` names the
+  // ones that carry a run id; the rest have no run identity.
   repeated uint32 occupants = 1;
   // Processes whose identity could not be read.
   repeated uint32 unreadable = 2;

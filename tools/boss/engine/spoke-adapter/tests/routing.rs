@@ -811,7 +811,7 @@ async fn a_second_occupancy_check_is_a_new_command_and_sees_new_occupants() {
         .await
         .unwrap_err();
     let report = occupied
-        .downcast_ref::<boss_execution_contracts::WorkspaceOccupied>()
+        .downcast_ref::<boss_execution_contracts::Occupied>()
         .expect("the host's report arrives as data");
     assert_eq!(report.unowned(), vec![4242]);
     assert_eq!(report.owners["exec_unknown"], vec![4243]);

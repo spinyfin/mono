@@ -53,10 +53,11 @@ use boss_work_db::{Host, HostTransport, SpokeAssignment, WorkDb};
 use prost::Message;
 
 /// The structured report a host sent in place of prose.
-fn occupied_from(report: &WorkspaceOccupancy) -> boss_execution_contracts::WorkspaceOccupied {
-    boss_execution_contracts::WorkspaceOccupied {
+fn occupied_from(report: &WorkspaceOccupancy) -> boss_execution_contracts::Occupied {
+    boss_execution_contracts::Occupied {
         occupants: report.occupants.clone(),
-        unreadable: report.unreadable.clone(),
+        unknown: report.unreadable.clone(),
+        remaining: Vec::new(),
         owners: report
             .owners
             .iter()

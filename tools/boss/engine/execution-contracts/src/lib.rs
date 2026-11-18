@@ -2006,42 +2006,10 @@ impl std::fmt::Display for UnownedOccupants {
 
 impl std::error::Error for UnownedOccupants {}
 
-/// What an owning host's workspace scan found still inside a leased workspace,
-/// as data. The hub classifies it exactly as it classifies a scan of its own
-/// host: occupants nobody owns, processes a run owns, and unreadable ones.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorkspaceOccupied {
-    /// Every process inside the workspace, owned or not.
-    pub occupants: Vec<u32>,
-    /// Processes whose identity could not be read.
-    pub unreadable: Vec<u32>,
-    /// Occupant pids by the run id they carry.
-    pub owners: std::collections::BTreeMap<String, Vec<u32>>,
-}
-
-impl WorkspaceOccupied {
-    /// Occupants that carry no run identity.
-    pub fn unowned(&self) -> Vec<u32> {
-        let owned: std::collections::BTreeSet<u32> = self.owners.values().flatten().copied().collect();
-        self.occupants
-            .iter()
-            .copied()
-            .filter(|pid| !owned.contains(pid))
-            .collect()
-    }
-}
-
-impl std::fmt::Display for WorkspaceOccupied {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
-            self.occupants, self.owners, self.unreadable
-        )
-    }
-}
-
-impl std::error::Error for WorkspaceOccupied {}
+/// Occupancy report produced by an owning-host scan. Defined once in
+/// `boss_worker_processes` so local cleanup, spoke `ctl_cleanup`, and hub
+/// classification share one type.
+pub use boss_worker_processes::Occupied;
 
 /// A spawn whose outcome is unknown: the host may have started the worker.
 /// The execution keeps its assignment and workspace and a retry reuses the
