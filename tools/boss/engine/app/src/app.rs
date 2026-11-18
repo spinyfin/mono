@@ -77,6 +77,7 @@ mod attentions;
 mod automations;
 mod blocking_dialog;
 mod board_progress;
+mod boothby;
 mod broadcasts;
 mod ci_remediation;
 mod comments;
@@ -911,6 +912,13 @@ struct ServerState {
     /// the revalidating body cache, so it lives on `ServerState`
     /// (process lifetime) rather than being constructed per request.
     design_docs: Arc<boss_engine_design_docs::DesignDocsService>,
+    /// The single choke point for every Boothby mutation — caps,
+    /// guards, two-pass confirmation, fingerprint refusal, journal.
+    /// Lives here rather than on a pass because its two-pass gate has
+    /// to outlive any one pass: that is the whole mechanism by which
+    /// an irreversible verb proves itself across two of them. See
+    /// [`boss_engine_boothby_executor`].
+    boothby_executor: Arc<boss_engine_boothby_executor::BoothbyExecutor>,
     /// In-flight auto-retry ladders for design-doc revalidation, keyed
     /// by `(repo, path, ref)`. One ladder per triple — a later open or
     /// Retry restarts the existing schedule instead of stacking another.
@@ -1970,6 +1978,15 @@ impl ServerState {
                 .maybe_guidance_fetches(guidance_fetches_override)
                 .maybe_org_recheck(org_recheck_override)
                 .design_docs(design_docs_for_state)
+                // Default policy = `propose` mode: nothing Boothby asks for
+                // mutates anything until an operator turns it up. The
+                // Boothby scheduler supplies the settings-derived policy once
+                // `boothby.*` keys exist; taxonomy and operational verb
+                // handlers register their effects. Until both land this executor refuses every call, which is the
+                // intended shipping-dark state.
+                .boothby_executor(Arc::new(boss_engine_boothby_executor::BoothbyExecutor::new(
+                    boss_engine_boothby_executor::BoothbyPolicy::default(),
+                )))
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
                 .staged_proposal_channel_errors(staged_proposal_channel_errors)

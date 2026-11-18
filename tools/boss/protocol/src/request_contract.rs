@@ -568,6 +568,8 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         // workflow; the worker may reply, but cannot resolve or rewrite it.
         R::AnswerOperatorQuestion { .. }
         | R::DismissOperatorQuestion { .. }
+        // Boothby's mutation choke point: an app/Boss-tier verb, never a worker's.
+        | R::BoothbyAct { .. }
         | R::CommentsCreate { .. }
         | R::CommentsDismiss { .. }
         | R::CommentsPostFollowup { .. }

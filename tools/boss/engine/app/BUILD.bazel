@@ -18,6 +18,7 @@ APP_DEPS = [
     "//tools/boss/engine/execution-contracts",
     "//tools/boss/comment_anchor",
     "//tools/boss/engine/attachments",
+    "//tools/boss/engine/boothby-executor",
     "//tools/boss/engine/board-gesture",
     "//tools/boss/engine/comment-classifier",
     "//tools/boss/engine/completion",
@@ -86,6 +87,8 @@ rust_test(
     aliases = TEST_ALIASES | {
         "//tools/boss/engine/spoke-adapter": "boss_spoke_adapter_production",
         "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support": "boss_spoke_adapter",
+        "//tools/boss/engine/boothby-executor": "boss_engine_boothby_executor_production",
+        "//tools/boss/engine/boothby-executor:boothby_executor_test_support": "boss_engine_boothby_executor",
         "//tools/boss/engine/core:runtime": "boss_engine_runtime_production",
         "//tools/boss/engine/core:runtime_test_support": "boss_engine_runtime",
     },
@@ -111,6 +114,7 @@ rust_test(
     shard_count = 4,
     visibility = ["//tools/boss/engine/core:__pkg__"],
     deps = TEST_DEPS + [
+        "//tools/boss/engine/boothby-executor:boothby_executor_test_support",
         "//tools/boss/engine/core:runtime_test_support",
         "//tools/boss/engine/prose-vocabulary",
         "//tools/boss/engine/spoke-adapter:spoke_adapter_test_support",
