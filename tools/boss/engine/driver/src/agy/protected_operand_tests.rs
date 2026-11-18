@@ -654,6 +654,17 @@ fn dynamic_execution_is_denied_without_enumerating_spellings() {
             "x='a[$(cat README.md)]'; y=abc; echo ${y:x}".to_string(),
             "x='a[`cat README.md`]'; echo $[x]".to_string(),
             "declare -i n; n='a[$(cat README.md)]'".to_string(),
+            "x='a[$(cat README.md)]'; y=x; echo ${!y}".to_string(),
+            "x='$(cat README.md)'; echo ${x@P}".to_string(),
+            "x='a[$(cat README.md)]'; [ -v \"$x\" ]".to_string(),
+            "x='a[$(cat README.md)]'; test -R \"$x\"".to_string(),
+            "x='a[$(cat README.md)]'; 'let' x".to_string(),
+            "x='a[$(cat README.md)]'; l'e't x".to_string(),
+            "x='a[$(cat README.md)]'; 'declare' -i x".to_string(),
+            "x=BASH_; env \"${x}ENV=./startup.sh\" bash -c true".to_string(),
+            "x=BASH_; \"${x}ENV=./startup.sh\" bash -c true".to_string(),
+            "env \"$x=1\" bash -c 'cat README.md'".to_string(),
+            format!("set -a; opt=-v; printf \"$opt\" 'BASH_ENV' '%s' {startup}; bash -c true"),
         ] {
             deny_at(&fx, &command, &fx.workspace());
         }

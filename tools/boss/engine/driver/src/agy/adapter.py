@@ -390,15 +390,48 @@ def reject_dynamic_text(command):
     # arithmetic context, integer attribute or subscript evaluates it.
     if ("$(" in command or chr(96) in command) and ARITHMETIC_EVAL_RE.search(text):
         fail_closed("arithmetic evaluation of text containing a substitution cannot be inspected")
+    if "$(" in command or chr(96) in command:
+        # A literal substitution is data until bash evaluates it. Evaluation
+        # is reachable through indirect/prompt expansion, `test -v`, and
+        # evaluator builtins whose name may be quoted, so deny every
+        # non-plain `${...}` and every evaluator after quote removal.
+        if re.search(r"\$\{(?![A-Za-z_][A-Za-z0-9_]*\})", text):
+            fail_closed("non-plain parameter expansion beside a literal substitution cannot be inspected")
+        for group in command_groups(command):
+            rest = strip_prefixes(group)
+            if not rest:
+                continue
+            program = os.path.basename(rest[0])
+            flags = [a for a in rest[1:] if a.startswith("-") and not a.startswith("--")]
+            if program in ("let", "test", "[", "[[", "((", "eval"):
+                fail_closed("evaluator beside a literal substitution cannot be inspected")
+            if program in ("declare", "typeset", "local") and any("i" in a for a in flags):
+                fail_closed("integer attribute beside a literal substitution cannot be inspected")
+
+
+def reject_dynamic_assignment_word(token):
+    if token.startswith("-") or "=" not in token:
+        return
+    name = token.split("=", 1)[0]
+    if not LITERAL_NAME_RE.fullmatch(name) and re.search(r"[$`*?\[{~]", name):
+        fail_closed("assignment word with a non-literal name cannot be inspected")
 
 
 def reject_dynamic_bindings(group):
-    for token in without_redirections(group):
+    tokens = without_redirections(group)
+    for token in tokens:
         if DYNAMIC_ASSIGN_RE.match(token):
             fail_closed("dynamic shell command assignment is denied")
+    after_env = False
+    for token in tokens:
+        if after_env:
+            reject_dynamic_assignment_word(token)
+        if os.path.basename(token) == "env":
+            after_env = True
     rest = strip_prefixes(group)
     if not rest:
         return
+    reject_dynamic_assignment_word(rest[0])
     program = os.path.basename(rest[0])
     args = rest[1:]
     if program == "hash" and any(a.startswith("-") and not a.startswith("--") and "p" in a for a in args):
@@ -414,6 +447,8 @@ def reject_dynamic_bindings(group):
         targets = [a for a in args if not a.startswith("-")]
     elif program == "printf":
         targets = []
+        if args and re.search(r"[$`*?\[{~]", args[0]):
+            fail_closed("printf option or format must be statically known")
         for index, a in enumerate(args):
             if a == "-v" and index + 1 < len(args):
                 targets.append(args[index + 1])
