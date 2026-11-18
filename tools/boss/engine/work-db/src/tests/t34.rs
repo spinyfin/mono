@@ -575,3 +575,78 @@ fn explicit_start_reopens_succeeded_attempt() {
     assert_eq!(exec.status, ExecutionStatus::Ready);
     assert_eq!(db.get_ci_remediation(&rem_id).unwrap().unwrap().status, "pending");
 }
+
+/// A revision blocked on a question while another revision on the same PR
+/// gates it: answering records the answer and leaves the row parked behind
+/// its gate instead of failing to start it, and the cascade dispatches it once
+/// the gate clears.
+#[test]
+fn answering_a_gated_revision_records_the_answer_and_waits_for_its_gate() {
+    for (answer, split_question) in [(true, false), (false, false), (true, true), (false, true)] {
+        let db = WorkDb::open(temp_db_path("gated-revision-answer")).unwrap();
+        let product_id = make_revision_product(&db, "gated-answer");
+        let pr_url = "https://github.com/spinyfin/mono/pull/3150";
+        let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+        let asking = insert_revision_row(&db, &product_id, &chore_id);
+        let gate = insert_revision_row(&db, &product_id, &chore_id);
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&asking)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .repo_remote_url(crate::test_support::TEST_REPO_REMOTE_URL)
+                    .build(),
+            )
+            .unwrap();
+        let question = if split_question {
+            boss_protocol::OperatorQuestion {
+                text: "Split the change or bypass the file limit?".into(),
+                answer_type: boss_protocol::OperatorAnswerType::CreatePrerequisiteTask {
+                    name: "Land the first part".into(),
+                    brief: "Land the first part of the change.".into(),
+                    file_count_bypass: Some(boss_protocol::FileCountBypassSpec { files: 40, limit: 30 }),
+                    option_labels: None,
+                    existing_id: None,
+                    existing_pr: None,
+                },
+                explanation: "Context:\nToo many files.".into(),
+            }
+        } else {
+            fixture_timeout_question()
+        };
+        let conn = db.connect().unwrap();
+        crate::pr_flow::insert_question(&conn, &execution.id, "prop_gated", &question).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_operator_answer' WHERE id = ?1",
+            [&asking],
+        )
+        .unwrap();
+        deps::insert_edge(&conn, &asking, &gate, RELATION_BLOCKS, &now_string()).unwrap();
+        drop(conn);
+
+        let outcome = db
+            .answer_operator_question(&asking, boss_protocol::OperatorAnswer::YesNo { value: answer })
+            .unwrap_or_else(|err| panic!("answer {answer} on a gated row must be recorded: {err:#}"));
+        assert!(!outcome.minted_execution, "the gate decides when it starts");
+        assert!(outcome.dispatch_work_item_id.is_none());
+        assert_eq!(task_status(&db, &asking), "blocked");
+        assert_eq!(blocked_fields(&db, &asking).0.as_deref(), Some("dependency"));
+        assert_eq!(
+            db.list_operator_questions(&asking).unwrap()[0].status,
+            boss_protocol::OperatorQuestionStatus::Answered
+        );
+        let conn = db.connect().unwrap();
+        let gating = deps::gating_prereqs_for(&conn, &asking).unwrap();
+        assert!(gating.contains(&gate), "the gate keeps holding the row: {gating:?}");
+        // Approving a split adds its own prerequisite; the row then also waits for it.
+        let only_gate = gating.len() == 1;
+        drop(conn);
+
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&gate])
+            .unwrap();
+        assert_eq!(db.try_unblock_dependency_if_resolved(&asking).unwrap(), only_gate);
+        assert_eq!(task_status(&db, &asking), if only_gate { "todo" } else { "blocked" });
+    }
+}
