@@ -1238,7 +1238,7 @@ struct ContentView: View {
             }
         }
         .modifier(BoardDiagnosticColumn(trace: model.boardDiagnostics, column: column.rawValue,
-            sections: model.boardDiagnostics.sections(sections)))
+            sections: sections))
         .padding(14)
         .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)

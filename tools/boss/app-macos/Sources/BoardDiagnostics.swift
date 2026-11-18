@@ -13,8 +13,10 @@ final class BoardDiagnostics {
     }
 
     private let salt = UUID().uuidString
+    private var tokens: [String: String] = [:]
     private(set) var entries: [Entry] = []
     private var sequence = 0
+    private var appliedRows: [Int: WorkTask] = [:]
     private let capacity: Int
     private let probes = NSMapTable<NSString, NSView>.strongToWeakObjects()
     private(set) var presented: [String: [[String: String]]] = [:]
@@ -24,15 +26,35 @@ final class BoardDiagnostics {
     // Session-local tokens preserve relationships without exporting identifiers.
     func token(_ id: String?) -> String {
         guard let id else { return "none" }
-        return SHA256.hash(data: Data((salt + id).utf8)).prefix(8)
+        if let cached = tokens[id] { return cached }
+        let value = SHA256.hash(data: Data((salt + id).utf8)).prefix(8)
             .map { String(format: "%02x", $0) }.joined()
+        if tokens.count >= 2048 { tokens.removeAll(keepingCapacity: true) }
+        tokens[id] = value
+        return value
     }
 
     func record(_ event: String, _ fields: [String: String] = [:]) {
         sequence += 1
         entries.append(Entry(sequence: sequence, uptime: ProcessInfo.processInfo.systemUptime,
                              event: event, fields: fields))
-        if entries.count > capacity { entries.removeFirst(entries.count - capacity) }
+        if entries.count > capacity {
+            let removed = entries.removeFirst()
+            appliedRows.removeValue(forKey: removed.sequence)
+        }
+    }
+
+    func recordAppliedRow(_ task: WorkTask) {
+        record("item-apply")
+        appliedRows[sequence] = task
+    }
+
+    func exportEntries() -> [Entry] {
+        entries.map { entry in
+            guard let task = appliedRows[entry.sequence] else { return entry }
+            return Entry(sequence: entry.sequence, uptime: entry.uptime,
+                         event: entry.event, fields: row(task))
+        }
     }
 
     func row(_ task: WorkTask) -> [String: String] {
@@ -99,7 +121,7 @@ extension ChatViewModel {
             + productLevelTasksByProductID.values.flatMap { $0 }
             + productLevelRevisionsByProductID.values.flatMap { $0 })
             .filter { $0.productID == productID }
-        let events = try JSONSerialization.jsonObject(with: JSONEncoder().encode(trace.entries))
+        let events = try JSONSerialization.jsonObject(with: JSONEncoder().encode(trace.exportEntries()))
         let snapshot: [String: Any] = [
             "schema": 1, "events": events,
             "appVersion": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
@@ -147,12 +169,22 @@ extension ChatViewModel {
 struct BoardDiagnosticColumn: ViewModifier {
     let trace: BoardDiagnostics
     let column: String
-    let sections: [[String: String]]
+    let sections: [WorkBoardSection]
+
+    private struct Identity: Equatable {
+        let id: String
+        let cards: [String]
+        let collapsible: Bool
+        let defaultExpanded: Bool
+    }
 
     func body(content: Content) -> some View {
         content
-            .onAppear { trace.present(column: column, sections: sections) }
-            .onChange(of: sections) { _, value in trace.present(column: column, sections: value) }
+            .onAppear { trace.present(column: column, sections: trace.sections(sections)) }
+            .onChange(of: sections.map {
+                Identity(id: $0.id, cards: $0.items.map(\.id),
+                         collapsible: $0.isCollapsible, defaultExpanded: $0.defaultExpanded)
+            }) { _, _ in trace.present(column: column, sections: trace.sections(sections)) }
             .onDisappear { trace.disappear(column: column) }
     }
 }

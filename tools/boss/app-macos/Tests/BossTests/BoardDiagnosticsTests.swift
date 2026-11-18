@@ -14,6 +14,20 @@ final class BoardDiagnosticsTests: XCTestCase {
         XCTAssertNotEqual(trace.token("private-id"), trace.token("another-id"))
     }
 
+    func testAppliedRowsAreTokenizedAtExportAndRetainEventState() {
+        let trace = BoardDiagnostics(capacity: 2)
+        var item = task("private-card", kind: "project_task", status: "active")
+        trace.recordAppliedRow(item)
+        item.status = "in_review"
+        trace.recordAppliedRow(item)
+        XCTAssertTrue(trace.entries.allSatisfy { $0.fields.isEmpty })
+        XCTAssertEqual(trace.exportEntries().map { $0.fields["status"] }, ["active", "in_review"])
+        XCTAssertEqual(trace.exportEntries().first?.fields["id"], trace.token(item.id))
+        trace.record("invalidate")
+        XCTAssertEqual(trace.exportEntries().count, 2)
+        XCTAssertEqual(trace.exportEntries().first?.fields["status"], "in_review")
+    }
+
     func testCapturePreservesStaleCacheAndPresentedEvidence() throws {
         let model = ChatViewModel(socketPath: "/tmp/boss-board-diagnostic-\(UUID()).sock")
         let product = WorkProduct(id: "private-product", name: "Secret product", slug: "secret",
@@ -101,17 +115,55 @@ final class BoardDiagnosticsTests: XCTestCase {
         let host = NSHostingView(rootView: DiagnosticReviewFixture(model: model))
         host.frame = NSRect(x: 0, y: 0, width: 340, height: 800)
         host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(200))
+        try await waitUntil { model.boardDiagnostics.presented["review"] != nil }
         parent.status = "in_review"
         parent.hasInProgressRevision = true
         model.applyEventForTest(.workItemUpdated(item: .task(parent)))
         host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(200))
+        try await waitUntil {
+            model.boardDiagnostics.presented["review"]?.first?["cards"] == model.boardDiagnostics.token(parent.id)
+                && model.boardDiagnostics.geometry(board: nil).contains {
+                    $0["id"] == model.boardDiagnostics.token(parent.id)
+                }
+        }
         host.layoutSubtreeIfNeeded()
         let trace = model.boardDiagnostics
         XCTAssertEqual(trace.presented["review"]?.first?["cards"], trace.token(parent.id))
         XCTAssertTrue(trace.geometry(board: nil).contains { $0["id"] == trace.token(parent.id) })
         XCTAssertNil(model.revealScrollTarget, "Diagnostics must work without revealing a card")
+    }
+
+    func testMountedCardStartsRevealWhenTargetArrivesInSameGeneration() async throws {
+        let model = ChatViewModel(socketPath: "/tmp/boss-board-reveal-\(UUID()).sock")
+        model.revealGeneration = UUID()
+        let generation = model.revealGeneration
+        let host = NSHostingView(rootView: DeferredRevealFixture(model: model))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.alphaValue = 0
+        window.contentView = host
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+        host.layoutSubtreeIfNeeded()
+        try await waitUntil { !model.boardDiagnostics.geometry(board: model.revealBoardViewport).isEmpty }
+        XCTAssertNil(model.revealHighlightID)
+        var confirmed = false
+        model.revealCompletion = { result in
+            if case .success = result { confirmed = true }
+        }
+        model.revealScrollTarget = "deferred-card"
+        try await waitUntil { confirmed }
+        XCTAssertEqual(model.revealGeneration, generation)
+        XCTAssertEqual(model.revealHighlightID, "deferred-card")
+        XCTAssertNil(model.revealScrollTarget)
+    }
+
+    private func waitUntil(_ predicate: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !predicate(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(predicate(), "Timed out waiting for mounted view callbacks")
     }
 
     private func task(_ id: String, kind: String, status: String) -> WorkTask {
@@ -132,6 +184,20 @@ private struct DiagnosticReviewFixture: View {
                 boardStyle: .classic, model: model, liveStates: model.liveWorkerStates)
         }
         .modifier(BoardDiagnosticColumn(trace: model.boardDiagnostics, column: "review",
-            sections: model.boardDiagnostics.sections(sections)))
+            sections: sections))
+    }
+}
+
+private struct DeferredRevealFixture: View {
+    @ObservedObject var model: ChatViewModel
+
+    var body: some View {
+        Color.clear
+            .background(RevealBoardViewport(model: model))
+            .overlay {
+                RevealCardViewport(cardID: "deferred-card", generation: model.revealGeneration,
+                    isTarget: model.revealScrollTarget == "deferred-card", model: model)
+                    .frame(width: 200, height: 100)
+            }
     }
 }

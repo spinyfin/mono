@@ -17,12 +17,14 @@ struct RevealBoardViewport: NSViewRepresentable {
 struct RevealCardViewport: NSViewRepresentable {
     let cardID: String
     let generation: UUID
+    let isTarget: Bool
     let model: ChatViewModel
 
     func makeNSView(context: Context) -> NSView { NSView() }
 
     func updateNSView(_ view: NSView, context: Context) {
-        if context.coordinator.cardID != cardID {
+        let cardChanged = context.coordinator.cardID != cardID
+        if cardChanged {
             context.coordinator.trace?.unregister(view, id: context.coordinator.cardID)
         }
         model.boardDiagnostics.register(view, id: cardID)
@@ -31,11 +33,13 @@ struct RevealCardViewport: NSViewRepresentable {
         if BossRevealCapture.viewportTargetID == cardID {
             BossRevealCapture.targetViewport = view
         }
-        guard context.coordinator.generation != generation else { return }
+        guard cardChanged || context.coordinator.generation != generation
+            || context.coordinator.isTarget != isTarget else { return }
         context.coordinator.generation = generation
+        context.coordinator.isTarget = isTarget
         context.coordinator.poll?.cancel()
         // Ordinary cards only register geometry; polling belongs to an explicit reveal.
-        guard model.revealScrollTarget == cardID else { return }
+        guard isTarget else { return }
         context.coordinator.poll = Task { @MainActor [weak view, weak model] in
             for attempt in 0..<50 {
                 if attempt > 0 {
@@ -82,6 +86,7 @@ struct RevealCardViewport: NSViewRepresentable {
     final class Coordinator {
         weak var trace: BoardDiagnostics?
         var cardID = ""
+        var isTarget = false
         var generation: UUID?
         var poll: Task<Void, Never>?
     }

@@ -278,7 +278,7 @@ extension ChatViewModel {
     /// on a revision row). Project-membership, kind, or unknown-previous
     /// updates still full-invalidate.
     func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
-        boardDiagnostics.record("item-apply", boardDiagnostics.row(updatedTask))
+        boardDiagnostics.recordAppliedRow(updatedTask)
         // Fan-out regression counter (design entry 2): single-task board update.
         UIUpdateCounters.shared.recordIncrementalTaskUpdate()
         let previous = task(withID: updatedTask.id)

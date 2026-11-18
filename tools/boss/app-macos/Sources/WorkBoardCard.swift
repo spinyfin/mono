@@ -113,7 +113,8 @@ struct WorkBoardSectionItemsView: View {
                 )
                 .id(task.id)
                 .background {
-                    RevealCardViewport(cardID: task.id, generation: model.revealGeneration, model: model)
+                    RevealCardViewport(cardID: task.id, generation: model.revealGeneration,
+                        isTarget: model.revealScrollTarget == task.id, model: model)
                         .allowsHitTesting(false)
                 }
             }
