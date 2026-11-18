@@ -1,0 +1,3142 @@
+I want you to provide me a guided summary of the changes in https://github.com/spinyfin/mono/pull/2886. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: spinyfin/mono
+- PR title: Preserve healthy engines on inconclusive checks
+- Base revision: 6f8ca35153d0fcae9aea5e9852894ea549989ca0
+- Head revision: 68e51b6cfd5cb8ccac6473273d04d57fe972d7a4
+- The accompanying source context and available read tools provide the PR description, diff, before/after files, related source and tests, and validated GitHub link targets.
+
+## Source context
+
+The paths, diff hunks, and pinned before/after content below are the complete set of files available for this task — every citable path and line range. Do not reference a path, line range, or repository location that is not reproduced below, even one you believe you know from general familiarity with this kind of codebase. If a claim would need support from a file that is not listed below, state the claim without a source link, or say the supporting source was not available, rather than link to it.
+
+Comparison: `https://github.com/spinyfin/mono/pull/2886` base `6f8ca35153d0fcae9aea5e9852894ea549989ca0` (merge base `6f8ca35153d0fcae9aea5e9852894ea549989ca0`) to head `68e51b6cfd5cb8ccac6473273d04d57fe972d7a4`.
+
+### PR description
+
+## Summary
+- Keep a reachable engine attached when its fingerprint RPC is inconclusive, while still replacing positively mismatched builds.
+- Debounce unreachable supervision ticks and emit production logs that identify the liveness source and restart evidence.
+- Add regression coverage for unresponsive fingerprint RPCs and consecutive-failure restart scheduling.
+
+## Validation
+- `bazel build //tools/boss/app-macos:boss_mac_app_lib //tools/boss/app-macos:BossTestsShard3`
+- `bazel test //tools/boss/app-macos:BossTestsShard3`
+- `bazel build //tools/boss/app-macos:Boss //tools/boss/installer:release`
+- `checkleft run`
+
+
+### `tools/boss/app-macos/Sources/EngineProcessController.swift` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -11,24 +11,28 @@ struct EngineRestartPolicy: Equatable, Sendable {
+         backoffSchedule: [1, 2, 4, 8, 16, 30],
+         maximumAttempts: 6,
+         pollInterval: 1,
+-        healthyResetInterval: 60
++        healthyResetInterval: 60,
++        consecutiveFailureThreshold: 3
+     )
+ 
+     let backoffSchedule: [TimeInterval]
+     let maximumAttempts: Int
+     let pollInterval: TimeInterval
+     let healthyResetInterval: TimeInterval
++    let consecutiveFailureThreshold: Int
+ 
+     init(
+         backoffSchedule: [TimeInterval],
+         maximumAttempts: Int,
+         pollInterval: TimeInterval = Self.default.pollInterval,
+-        healthyResetInterval: TimeInterval = Self.default.healthyResetInterval
++        healthyResetInterval: TimeInterval = Self.default.healthyResetInterval,
++        consecutiveFailureThreshold: Int = Self.default.consecutiveFailureThreshold
+     ) {
+         self.backoffSchedule = backoffSchedule.isEmpty ? Self.default.backoffSchedule : backoffSchedule
+         self.maximumAttempts = max(1, maximumAttempts)
+         self.pollInterval = max(0.1, pollInterval)
+         self.healthyResetInterval = max(0, healthyResetInterval)
++        self.consecutiveFailureThreshold = max(1, consecutiveFailureThreshold)
+     }
+ 
+     func delay(forAttempt attempt: Int) -> TimeInterval {
+@@ -188,16 +192,15 @@ final class EngineProcessController: @unchecked Sendable {
+                     if runningFP != nil { break }
+                 }
+ 
+-                if let runningFP, bundledFP == runningFP {
+-                    emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
++                guard let runningFP else {
++                    emit("[engine version-check inconclusive] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — keeping reachable \(describe(running))")
+                     return
+                 }
+-
+-                if runningFP == nil {
+-                    emit("[engine upgrade] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — replacing \(describe(running))")
+-                } else {
+-                    emit("[engine upgrade] running=\(runningFP ?? "unavailable") bundled=\(bundledFP) — replacing \(describe(running))")
++                if bundledFP == runningFP {
++                    emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
++                    return
+                 }
++                emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing \(describe(running))")
+                 try stopRunningEngine(running)
+                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
+             }
+@@ -389,19 +392,27 @@ final class EngineProcessController: @unchecked Sendable {
+ 
+     private func checkEngineLiveness() {
+         guard !isSupervisionStopped, pendingRestart == nil else { return }
+-        let isAlive = livenessProbe?() ?? (discoverRunningEngine() != nil)
+-        let action = supervisor.tick(isAlive: isAlive, now: Date())
++        let liveness: (isReachable: Bool, source: String)
++        if let livenessProbe {
++            liveness = (livenessProbe(), "engine client connection")
++        } else {
++            liveness = (discoverRunningEngine() != nil, "socket probe")
++        }
++        let action = supervisor.tick(isAlive: liveness.isReachable, now: Date())
+         switch action {
+         case .running:
+             lastLaunchError = nil
+             emitSupervisionState(.running)
+             return
++        case let .unreachable(consecutiveFailures, requiredFailures):
++            emit("[engine supervision] \(liveness.source) reported engine unreachable; failed liveness tick \(consecutiveFailures)/\(requiredFailures), keeping engine running")
++            return
+         case let .gaveUp(attempts):
+             emit("[engine supervision] gave up after \(attempts) restart attempts; use Restart engine to try again")
+             emitSupervisionState(.gaveUp(attempts: attempts, lastError: lastLaunchError))
+             return
+         case let .restart(attempt, delay):
+-            emit("[engine supervision] engine exited; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
++            emit("[engine supervision] engine remained unreachable for \(restartPolicy.consecutiveFailureThreshold) consecutive ticks; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
+             emitSupervisionState(.restarting(attempt: attempt, retryAfter: delay))
+             let work = DispatchWorkItem { [weak self] in
+                 self?.relaunchAfterUnexpectedExit(attempt: attempt)
+```
+
+**Before (merge base)** (`tools/boss/app-macos/Sources/EngineProcessController.swift` @ `6f8ca35153d0fcae9aea5e9852894ea549989ca0`):
+
+```
+import CryptoKit
+import Darwin
+import Foundation
+
+/// Bounded restart policy for an app-managed engine. The schedule is indexed
+/// from one, and stays at its final value when callers allow more attempts
+/// than explicit delays. Keeping this policy separate from process launching
+/// makes the operational limits straightforward to test and tune.
+struct EngineRestartPolicy: Equatable, Sendable {
+    static let `default` = EngineRestartPolicy(
+        backoffSchedule: [1, 2, 4, 8, 16, 30],
+        maximumAttempts: 6,
+        pollInterval: 1,
+        healthyResetInterval: 60
+    )
+
+    let backoffSchedule: [TimeInterval]
+    let maximumAttempts: Int
+    let pollInterval: TimeInterval
+    let healthyResetInterval: TimeInterval
+
+    init(
+        backoffSchedule: [TimeInterval],
+        maximumAttempts: Int,
+        pollInterval: TimeInterval = Self.default.pollInterval,
+        healthyResetInterval: TimeInterval = Self.default.healthyResetInterval
+    ) {
+        self.backoffSchedule = backoffSchedule.isEmpty ? Self.default.backoffSchedule : backoffSchedule
+        self.maximumAttempts = max(1, maximumAttempts)
+        self.pollInterval = max(0.1, pollInterval)
+        self.healthyResetInterval = max(0, healthyResetInterval)
+    }
+
+    func delay(forAttempt attempt: Int) -> TimeInterval {
+        backoffSchedule[min(max(0, attempt - 1), backoffSchedule.count - 1)]
+    }
+
+    static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> Self {
+        let schedule = environment["BOSS_ENGINE_RESTART_BACKOFF_SECONDS"]?
+            .split(separator: ",")
+            .compactMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 > 0 && $0.isFinite }
+        let attempts = environment["BOSS_ENGINE_RESTART_MAX_ATTEMPTS"].flatMap(Int.init)
+        return Self(
+            backoffSchedule: schedule ?? [],
+            maximumAttempts: attempts.map { max(1, $0) } ?? Self.default.maximumAttempts
+        )
+    }
+}
+
+/// State sent to the app chrome while the controller is recovering from an
+/// unexpected engine exit. A manual restart resets the policy and returns to
+/// `.running` once a socket is reachable.
+enum EngineSupervisionState: Equatable, Sendable {
+    case running
+    case restarting(attempt: Int, retryAfter: TimeInterval)
+    case restartFailed(attempt: Int?, message: String)
+    case gaveUp(attempts: Int, lastError: String?)
+}
+
+final class EngineProcessController: @unchecked Sendable {
+    private struct RunningEngine {
+        let socketPath: String
+        let pidPath: String
+        let pid: pid_t?
+    }
+
+    private let paths: BossEnginePaths
+    private let lockFilePath: String
+    private let launchDirectory: String
+    private let forceRestart: Bool
+    private let stopOnExit: Bool
+    private let restartPolicy: EngineRestartPolicy
+    private let supervisionQueue = DispatchQueue(label: "Boss.EngineProcessController.supervision")
+    private var supervisionTimer: DispatchSourceTimer?
+    private var pendingRestart: DispatchWorkItem?
+    private var supervisor: EngineSupervisor
+    private var lastSupervisionState: EngineSupervisionState = .running
+    private var lastLaunchError: String?
+    private let socketControl: any EngineSocketControlling
+    private let bundledEnginePathOverride: String?
+    private let launchHandler: (@Sendable (String, String?, String) throws -> pid_t)?
+    private let supervisionStopLock = NSLock()
+    private var supervisionStopped = false
+
+    var onOutputLine: (@MainActor @Sendable (String) -> Void)?
+    var onSupervisionStateChange: (@MainActor @Sendable (EngineSupervisionState) -> Void)?
+
+    /// Liveness signal for the per-`pollInterval` supervision tick. When set
+    /// (normally to `EngineClient.isReachable`, which reflects the app's
+    /// existing long-lived connection), the tick reuses that connection's
+    /// state instead of opening and closing a fresh socket to the engine's
+    /// frontend listener every tick — each such probe drives a full
+    /// `handle_frontend_connection` session setup/teardown on the engine
+    /// side. Falls back to a raw socket probe (`discoverRunningEngine`) when
+    /// unset, e.g. in tests that exercise supervision without an
+    /// `EngineClient`.
+    var livenessProbe: (@Sendable () -> Bool)?
+
+    init(
+        paths: BossEnginePaths,
+        launchDirectory: String = ProcessInfo.processInfo.environment["BUILD_WORKSPACE_DIRECTORY"]
+            ?? FileManager.default.currentDirectoryPath,
+        forceRestart: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_FORCE_RESTART"] == "1",
+        stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1",
+        restartPolicy: EngineRestartPolicy = .fromEnvironment(),
+        socketControl: any EngineSocketControlling = EngineSocketControl(),
+        bundledEnginePathOverride: String? = nil,
+        launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil,
+        livenessProbe: (@Sendable () -> Bool)? = nil
+    ) {
+        self.paths = paths
+        self.lockFilePath = "\(paths.pidPath).lock"
+        self.launchDirectory = launchDirectory
+        self.forceRestart = forceRestart
+        self.stopOnExit = stopOnExit
+        self.restartPolicy = restartPolicy
+        self.supervisor = EngineSupervisor(policy: restartPolicy)
+        self.socketControl = socketControl
+        self.bundledEnginePathOverride = bundledEnginePathOverride
+        self.launchHandler = launchHandler
+        self.livenessProbe = livenessProbe
+    }
+
+    deinit {
+        supervisionTimer?.cancel()
+        pendingRestart?.cancel()
+    }
+
+    func start() throws {
+        do {
+            try start(resetRestartBudget: true)
+        } catch {
+            reportLaunchFailure(error, attempt: nil)
+            throw error
+        }
+    }
+
+    private func start(resetRestartBudget: Bool) throws {
+        let socketPath = paths.socketPath
+        try withStartLock {
+            if forceRestart, let running = discoverRunningEngine() {
+                emit("[engine restart] terminating existing engine \(describe(running))")
+                try stopRunningEngine(running)
+            }
+
+            if let running = discoverRunningEngine() {
+                // An engine is already running. Check if its binary matches
+                // the app's bundled engine. If not, replace it so the user
+                // always gets the version that shipped with this app launch.
+                //
+                // Each branch emits a distinct log line so a user reporting
+                // "engine wasn't restarted after I updated Boss" can grep
+                // the system messages and tell exactly which path fired:
+                //   [engine version-check skipped: <reason>] — check didn't run
+                //   [engine version-check ok] — ran, fingerprints matched
+                //   [engine upgrade] — ran, fingerprints differed, restarting
+                //
+                // BOSS_ENGINE_CMD wins unconditionally (see
+                // resolveEngineCommand): a dev running against a custom
+                // engine binary has nothing bundled to compare it to, and
+                // fingerprinting the *bundled* binary against it would
+                // always mismatch and tear down the dev's own engine.
+                if ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] != nil {
+                    emit("[engine version-check skipped: BOSS_ENGINE_CMD is set (developer custom engine)] attaching to \(describe(running))")
+                    return
+                }
+                guard let bundledPath = bundledEnginePath() else {
+                    emit("[engine version-check skipped: no bundled engine in app resources (dev/bazel-run mode)] attaching to \(describe(running))")
+                    return
+                }
+                guard let bundledFP = computeBinaryFingerprint(path: bundledPath) else {
+                    throw controllerError("could not fingerprint bundled engine at \(bundledPath)")
+                }
+
+                // A single missed 3s deadline can mean "the engine is busy",
+                // not "the engine is stale" — retry a couple of times before
+                // treating non-response as a mismatch, so a slow-but-healthy
+                // engine isn't torn down and replaced (and doesn't then hit
+                // the SIGTERM/SIGKILL fallback if the follow-on shutdown RPC
+                // also times out).
+                var runningFP: String?
+                var fingerprintAttempts = 0
+                let maxFingerprintAttempts = 3
+                while fingerprintAttempts < maxFingerprintAttempts {
+                    fingerprintAttempts += 1
+                    runningFP = socketControl.fingerprint(socketPath: running.socketPath, timeoutSeconds: 3.0)
+                    if runningFP != nil { break }
+                }
+
+                if let runningFP, bundledFP == runningFP {
+                    emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
+                    return
+                }
+
+                if runningFP == nil {
+                    emit("[engine upgrade] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — replacing \(describe(running))")
+                } else {
+                    emit("[engine upgrade] running=\(runningFP ?? "unavailable") bundled=\(bundledFP) — replacing \(describe(running))")
+                }
+                try stopRunningEngine(running)
+                emit("[engine upgrade] old engine stopped — launching new engine from bundle")
+            }
+
+            let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
+
+            let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+            lastLaunchError = nil
+            emit("[engine launch] detached pid=\(pid) socket=\(socketPath) \(command)")
+        }
+        // `disableSupervision()` may be called while a supervised relaunch is
+        // waiting on filesystem or socket I/O above. It sets this lock-backed
+        // flag without waiting for this queue, so do not reactivate polling
+        // after that cancellation has won.
+        guard !isSupervisionStopped else { return }
+        enableSupervision(resetRestartBudget: resetRestartBudget)
+    }
+
+    // MARK: - Version-check helpers
+
+    /// Path to the engine binary shipped inside the current app bundle.
+    /// Returns `nil` in dev/bazel-run mode where no bundle engine exists.
+    private func bundledEnginePath() -> String? {
+        if let bundledEnginePathOverride {
+            return bundledEnginePathOverride
+        }
+        guard let resourcePath = Bundle.main.resourcePath else { return nil }
+        let path = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        return path
+    }
+
+    /// Compute a binary fingerprint of `path` using the same algorithm
+    /// as `boss_engine::build_info::binary_fingerprint`:
+    ///   SHA-256 of up to 64 MiB of file content → first 6 bytes as
+    ///   12 lowercase hex digits, optionally suffixed "-truncated".
+    private func computeBinaryFingerprint(path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+
+        let cap: Int = 64 * 1024 * 1024
+        var hasher = SHA256()
+        var readTotal = 0
+        var truncated = false
+        let chunkSize = 64 * 1024
+
+        while true {
+            let remaining = cap - readTotal
+            guard remaining > 0 else {
+                // Probe for more bytes to set the truncated flag.
+                let probe = (try? fh.read(upToCount: 1)) ?? Data()
+                if !probe.isEmpty { truncated = true }
+                break
+            }
+            let toRead = min(chunkSize, remaining)
+            guard let chunk = try? fh.read(upToCount: toRead), !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+            readTotal += chunk.count
+            if chunk.count < toRead {
+                // EOF before cap.
+                break
+            }
+        }
+
+        let digest = hasher.finalize()
+        let firstSixBytes = digest.prefix(6)
+        let hex = firstSixBytes.map { String(format: "%02x", $0) }.joined()
+        return truncated ? "\(hex)-truncated" : hex
+    }
+
+    /// Resolve the engine command and the BOSS_BIN_DIR to export.
+    ///
+    /// Resolution order (per design doc Q3):
+    ///   1. BOSS_ENGINE_CMD env override — wins unconditionally so a dev
+    ///      running `bazel run //tools/boss/app-macos:Boss` against a custom
+    ///      engine still works.
+    ///   2. Bundle-relative path: `<Bundle.main.resourcePath>/bin/<engine>` —
+    ///      the installed app path; BOSS_BIN_DIR is set to the bin/ dir so
+    ///      the engine can resolve its sibling CLIs.
+    ///   3. `bazel run` fallback — dev mode for when the bundle lacks the
+    ///      pre-built engine (e.g. iterating on just the Swift side).
+    private func resolveEngineCommand(socketPath: String) -> (command: String, bossBinDir: String?) {
+        if let override = ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] {
+            return (override, nil)
+        }
+        if let resourcePath = Bundle.main.resourcePath {
+            let enginePath = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
+            if FileManager.default.fileExists(atPath: enginePath) {
+                let bossBinDir = "\(resourcePath)/bin"
+                return ("\(shellQuote(enginePath)) --socket-path \(shellQuote(socketPath))", bossBinDir)
+            }
+        }
+        return ("\(BossEngineBinary.bazelRunCommand) -- --socket-path \(shellQuote(socketPath))", nil)
+    }
+
+    func stop() {
+        disableSupervision()
+        guard stopOnExit else {
+            return
+        }
+
+        guard let running = discoverRunningEngine() else {
+            return
+        }
+
+        do {
+            try stopRunningEngine(running)
+            emit("[engine stop] terminated \(describe(running))")
+        } catch {
+            emit("[engine stop] failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// User-initiated recovery for a stale engine: discover the reachable
+    /// engine by socket (token-auth RPC first, then a validated peer/pid-file
+    /// SIGTERM/SIGKILL fallback) and relaunch
+    /// from the same binary `start()` would. Used by the "Restart
+    /// engine" affordance on the unreachable banner so a hung or
+    /// orphaned engine no longer requires a shell `pkill` (issue #697).
+    ///
+    /// Holds the start lock for the whole terminate + launch sequence
+    /// so a concurrent `start()` can't race and end up with two
+    /// engines fighting over the same socket. Safe to call when no
+    /// engine is running — falls through to the launch step.
+    func restart() throws {
+        disableSupervision()
+        do {
+            try withStartLock {
+                if let running = discoverRunningEngine() {
+                    emit("[engine restart] terminating existing engine \(describe(running))")
+                    try stopRunningEngine(running)
+                }
+
+                let socketPath = paths.socketPath
+                let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
+                let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+                lastLaunchError = nil
+                emit("[engine restart] detached pid=\(pid) socket=\(socketPath) \(command)")
+            }
+            enableSupervision(resetRestartBudget: true)
+        } catch {
+            reportLaunchFailure(error, attempt: nil)
+            throw error
+        }
+    }
+
+    // MARK: - Unexpected-exit supervision
+
+    /// The engine is deliberately detached from the app so it survives an app
+    /// restart. That also means `Process.terminationHandler` cannot observe
+    /// it. Polling socket reachability gives the controller the same answer
+    /// without making the engine an app child, and serializing this work
+    /// prevents two timer ticks from launching competing replacements.
+    private func enableSupervision(resetRestartBudget: Bool) {
+        // Set this before hopping onto the supervision queue so a later
+        // `stop()` always wins, even if this queued block has not run yet.
+        setSupervisionStopped(false)
+        supervisionQueue.async { [weak self] in
+            guard let self else { return }
+            if resetRestartBudget {
+                self.supervisor.reset()
+            }
+            if self.supervisionTimer == nil {
+                let timer = DispatchSource.makeTimerSource(queue: self.supervisionQueue)
+                timer.schedule(
+                    deadline: .now() + self.restartPolicy.pollInterval,
+                    repeating: self.restartPolicy.pollInterval
+                )
+                timer.setEventHandler { [weak self] in
+                    self?.checkEngineLiveness()
+                }
+                self.supervisionTimer = timer
+                timer.resume()
+            }
+            self.emitSupervisionState(.running)
+        }
+    }
+
+    private func disableSupervision() {
+        setSupervisionStopped(true)
+        supervisionQueue.async { [weak self] in
+            guard let self else { return }
+            pendingRestart?.cancel()
+            pendingRestart = nil
+            supervisionTimer?.cancel()
+            supervisionTimer = nil
+        }
+    }
+
+    private func checkEngineLiveness() {
+        guard !isSupervisionStopped, pendingRestart == nil else { return }
+        let isAlive = livenessProbe?() ?? (discoverRunningEngine() != nil)
+        let action = supervisor.tick(isAlive: isAlive, now: Date())
+        switch action {
+        case .running:
+            lastLaunchError = nil
+            emitSupervisionState(.running)
+            return
+        case let .gaveUp(attempts):
+            emit("[engine supervision] gave up after \(attempts) restart attempts; use Restart engine to try again")
+            emitSupervisionState(.gaveUp(attempts: attempts, lastError: lastLaunchError))
+            return
+        case let .restart(attempt, delay):
+            emit("[engine supervision] engine exited; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
+            emitSupervisionState(.restarting(attempt: attempt, retryAfter: delay))
+            let work = DispatchWorkItem { [weak self] in
+                self?.relaunchAfterUnexpectedExit(attempt: attempt)
+            }
+            pendingRestart = work
+            supervisionQueue.asyncAfter(deadline: .now() + delay, execute: work)
+        case .wait:
+            return
+        }
+    }
+
+    private func relaunchAfterUnexpectedExit(attempt: Int) {
+        pendingRestart = nil
+        guard !isSupervisionStopped else { return }
+        do {
+            try start(resetRestartBudget: false)
+        } catch {
+            lastLaunchError = error.localizedDescription
+            emit("[engine supervision] restart launch failed: \(error.localizedDescription)")
+            emitSupervisionState(.restartFailed(attempt: attempt, message: error.localizedDescription))
+            // The next timer tick applies the next backoff slot.
+        }
+    }
+
+    private func launchEngine(command: String, bossBinDir: String?, socketPath: String) throws -> pid_t {
+        if let launchHandler {
+            return try launchHandler(command, bossBinDir, socketPath)
+        }
+        return try launchDetached(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+    }
+
+    private func launchDetached(command: String, bossBinDir: String?, socketPath: String) throws -> pid_t {
+        let launchErrorPath = URL(fileURLWithPath: paths.pidPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("engine-launch.log")
+            .path
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        // zsh's BG_NICE option (on by default) reduces the priority of any
+        // job started with `&` by a non-interactive shell — nice(5) rather
+        // than the caller's own nice(0) — because a `zsh -c` script has no
+        // job control (monitor mode) active. That silently demoted the
+        // detached engine, and everything it forks (the private tmux
+        // server, then the coordinator's `claude` pane inside it) inherit
+        // that nice(5) by plain fork inheritance. `NO_BG_NICE` keeps the
+        // backgrounded engine at the same priority as this app.
+        //
+        // This only reaches a tmux server started by a post-fix engine: a
+        // private server already running under the durable state-root socket
+        // is never killed by this codebase, so on an existing install it
+        // keeps the nice(5) it was born with even after this fix ships. After
+        // upgrading, `tmux -S "$HOME/Library/Application Support/Boss/tmux.sock"
+        // kill-server` (or a reboot) once so the next engine launch creates a
+        // fresh server under this corrected priority. A leftover `-L boss`
+        // server is drained at boot rather than relocated.
+        let script = """
+        setopt NO_BG_NICE
+        : > \(shellQuote(launchErrorPath))
+        nohup \(command) >/dev/null 2>\(shellQuote(launchErrorPath)) &
+        child=$!
+        print -r -- $child
+        sleep 0.25
+        if ! kill -0 $child 2>/dev/null; then
+          wait $child
+          exit $?
+        fi
+        """
+        proc.arguments = ["-c", script]
+        proc.currentDirectoryURL = URL(fileURLWithPath: launchDirectory, isDirectory: true)
+        // Tell the engine the app's pid explicitly. `bazel run`
+        // daemonizes its server, which reparents the engine binary
+        // away from the app's process tree, so `getppid()` and any
+        // ancestor walk both miss the real app. The engine reads
+        // BOSS_APP_PID to set its trust root for `RegisterAppSession`.
+        var env = ProcessInfo.processInfo.environment
+        env["BOSS_APP_PID"] = String(getpid())
+        // The engine's tracing layer continues writing its bounded text log,
+        // while direct startup failures from Rust's main function land in the
+        // launch-error file above for this controller to surface verbatim.
+        env["BOSS_ENGINE_STDERR_LOGGING"] = "0"
+        // BOSS_BIN_DIR tells the engine where its sibling CLIs live
+        // (boss, bossctl, boss-event) in installed mode. The engine
+        // propagates this to workers so they resolve the bundled copies
+        // rather than any PATH match. Unset in dev mode (no bundle bin/).
+        if let dir = bossBinDir {
+            env["BOSS_BIN_DIR"] = dir
+        }
+        // When launched from Finder/Dock/launchctl, the app inherits a minimal
+        // launchd GUI session PATH (/usr/bin:/bin:/usr/sbin:/sbin) that omits
+        // developer tool directories. The engine and its cube subprocesses need
+        // jj, mint, and other tools that live outside that minimal set.
+        //
+        // We prepend well-known locations rather than shelling out to read the
+        // user's login-shell PATH (which would be more accurate but brittle — a
+        // misbehaving shell init could hang the app or print garbage). Extra
+        // segments that don't exist on a given machine are ignored by the kernel.
+        env["PATH"] = augmentedPATH(current: env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        // If the user pasted an ANTHROPIC_API_KEY into Settings → Engine,
+        // override whatever the launchd parent inherited so the Settings
+        // value always wins (work item #735). When no Settings value is
+        // stored, leave the inherited env entry untouched so a shell
+        // `export ANTHROPIC_API_KEY=…` followed by `boss` from a terminal
+        // continues to work for users who prefer that path.
+        if let stored = APIKeyStore.readAnthropicApiKey() {
+            env["ANTHROPIC_API_KEY"] = stored
+        }
+        proc.environment = env
+        let output = Pipe()
+        let shellError = Pipe()
+        proc.standardOutput = output
+        proc.standardError = shellError
+
+        try proc.run()
+        proc.waitUntilExit()
+        let outputData = output.fileHandleForReading.readDataToEndOfFile()
+        let shellErrorData = shellError.fileHandleForReading.readDataToEndOfFile()
+        let childPID = String(data: outputData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\n")
+            .first
+            .flatMap { pid_t($0) }
+        if proc.terminationStatus != 0 {
+            let shellMessage = String(data: shellErrorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw controllerError(
+                launchFailureMessage(
+                    prefix: "engine process exited during launch with status \(proc.terminationStatus)",
+                    launchErrorPath: launchErrorPath,
+                    fallback: shellMessage
+                ),
+                code: Int(proc.terminationStatus)
+            )
+        }
+        guard let childPID, childPID > 1 else {
+            throw controllerError("detached engine launcher did not report the child pid")
+        }
+
+        // The frontend socket binds late in engine startup — after
+        // `WorkDb::open`, the tmux preflight probe (which shells out to
+        // tmux), and planner-run recovery — so a slow-but-healthy start can
+        // legitimately outlast this window, especially the `bazel run`
+        // command shape used in dev mode, where a cold build alone can
+        // exceed it. Only the child actually exiting (checked every
+        // iteration above) is treated as a launch failure; a still-running
+        // child that simply hasn't bound its socket yet is not killed —
+        // supervision (`checkEngineLiveness`) observes the outcome once the
+        // socket comes up, or once the process actually exits.
+        let readinessWindow: TimeInterval = command.contains(BossEngineBinary.bazelRunCommand) ? 120 : 30
+        let deadline = Date().addingTimeInterval(readinessWindow)
+        while Date() < deadline {
+            if socketControl.isReachable(socketPath: socketPath, timeoutSeconds: 0.5) {
+                return childPID
+            }
+            if !isProcessRunning(childPID) {
+                throw controllerError(
+                    launchFailureMessage(
+                        prefix: "engine process pid=\(childPID) exited before its socket became reachable",
+                        launchErrorPath: launchErrorPath,
+                        fallback: nil
+                    )
+                )
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        emit(
+            "[engine launch] pid=\(childPID) socket \(socketPath) not yet reachable after \(Int(readinessWindow))s; still running, leaving it to supervision rather than killing it"
+        )
+        return childPID
+    }
+
+    private func launchFailureMessage(prefix: String, launchErrorPath: String, fallback: String?) -> String {
+        let data = try? Data(contentsOf: URL(fileURLWithPath: launchErrorPath))
+        let tail = data.map { Data($0.suffix(32 * 1024)) }
+        let engineError = tail.flatMap { String(data: $0, encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = [engineError, fallback]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+        return detail.map { "\(prefix): \($0)" } ?? prefix
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
+    }
+
+    /// Prepend standard developer-tool directories to PATH so the engine and its
+    /// subprocesses (cube, jj, mint, cargo binaries) can be found when the app is
+    /// launched from Finder/Dock/launchctl with a minimal launchd PATH.
+    ///
+    /// Order matches typical shell precedence: Apple Silicon Homebrew, Intel/manual
+    /// Homebrew, LinkedIn corporate tools, Rust/Cargo, then user-local directories.
+    /// Segments that don't exist on the current machine are harmless — the kernel
+    /// skips non-existent PATH entries. The original launchd PATH is preserved at the
+    /// end so system tools continue to resolve normally.
+    private func augmentedPATH(current: String) -> String {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let extra = [
+            "/opt/homebrew/bin",        // Apple Silicon Homebrew (jj, etc.)
+            "/usr/local/bin",           // Intel Homebrew, manual installs
+            "/usr/local/linkedin/bin",  // LinkedIn corporate tools (mint, etc.)
+            "\(home)/.cargo/bin",       // Rust binaries (jj commonly installed here)
+            "\(home)/bin",              // user-local binaries
+            "\(home)/.local/bin",       // XDG-style user-local binaries
+        ]
+        // Deduplicate: keep the first occurrence of each segment.
+        var seen = Set(current.split(separator: ":").map(String.init))
+        let unique = extra.filter { seen.insert($0).inserted }
+        let prefix = unique.joined(separator: ":")
+        return prefix.isEmpty ? current : "\(prefix):\(current)"
+    }
+
+    private func discoverRunningEngine() -> RunningEngine? {
+        for endpoint in paths.endpointPaths {
+            guard socketControl.isReachable(socketPath: endpoint.socketPath) else {
+                continue
+            }
+            // Peer credentials are direct, unforgeable proof of which
+            // process owns the socket we just connected to; the pid file is
+            // the deletable, potentially stale artefact this discovery step
+            // otherwise leans on. Prefer the peer pid and only fall back to
+            // the file when peer credentials aren't available.
+            let pid = socketControl.peerPID(socketPath: endpoint.socketPath, timeoutSeconds: 1)
+                ?? currentEnginePID(pidPath: endpoint.pidPath)
+            return RunningEngine(
+                socketPath: endpoint.socketPath,
+                pidPath: endpoint.pidPath,
+                pid: pid
+            )
+        }
+        return nil
+    }
+
+    private func currentEnginePID(pidPath: String) -> pid_t? {
+        guard let pid = readPIDFile(pidPath: pidPath) else {
+            return nil
+        }
+
+        if !isProcessRunning(pid) {
+            clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
+            return nil
+        }
+
+        guard isLikelyEngineProcess(pid) else {
+            emit("[engine pid] pid file points to non-engine process pid=\(pid)")
+            return nil
+        }
+
+        return pid
+    }
+
+    private func readPIDFile(pidPath: String) -> pid_t? {
+        guard let content = try? String(contentsOfFile: pidPath, encoding: .utf8) else {
+            return nil
+        }
+
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Int32(trimmed), value > 1 else {
+            return nil
+        }
+        return value
+    }
+
+    private func clearPIDFileIfOwned(pid: pid_t, pidPath: String) {
+        guard let owner = readPIDFile(pidPath: pidPath), owner == pid else {
+            return
+        }
+        try? FileManager.default.removeItem(atPath: pidPath)
+    }
+
+    private func isProcessRunning(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+
+    private func isLikelyEngineProcess(_ pid: pid_t) -> Bool {
+        guard let command = commandLine(for: pid) else {
+            return false
+        }
+
+        return command.contains(BossEngineBinary.bazelOutputPathFragment)
+            || command.contains(BossEngineBinary.bazelRunCommand)
+            || command.contains(BossEngineBinary.bundlePathFragment)
+    }
+
+    private func commandLine(for pid: pid_t) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-p", "\(pid)", "-o", "command="]
+        let output = Pipe()
+        proc.standardOutput = output
+        proc.standardError = Pipe()
+
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard proc.terminationStatus == 0 else {
+            return nil
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let text, !text.isEmpty {
+            return text
+        }
+        return nil
+    }
+
+    private func stopRunningEngine(_ running: RunningEngine) throws {
+        var fallbackPID = running.pid
+        var rpcFailure: Error?
+        do {
+            fallbackPID = try socketControl.shutdown(
+                socketPath: running.socketPath,
+                tokenPath: paths.controlTokenPath,
+                timeoutSeconds: 5
+            ) ?? fallbackPID
+            if socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 8) {
+                if let fallbackPID {
+                    clearPIDFileIfOwned(pid: fallbackPID, pidPath: running.pidPath)
+                }
+                return
+            }
+            rpcFailure = controllerError(
+                "shutdown RPC was accepted, but socket \(running.socketPath) remained reachable after 8 seconds"
+            )
+        } catch {
+            rpcFailure = error
+        }
+
+        guard let pid = fallbackPID else {
+            throw controllerError(
+                "engine is reachable at \(running.socketPath), but graceful shutdown failed and no pid is available: \(rpcFailure?.localizedDescription ?? "unknown error")"
+            )
+        }
+        guard isProcessRunning(pid), isLikelyEngineProcess(pid) else {
+            throw controllerError(
+                "engine is reachable at \(running.socketPath), but graceful shutdown failed and pid \(pid) is not a running Boss engine: \(rpcFailure?.localizedDescription ?? "unknown error")"
+            )
+        }
+
+        emit("[engine stop] rpc unavailable (\(rpcFailure?.localizedDescription ?? "unknown error")); falling back to SIGTERM pid=\(pid)")
+        _ = kill(pid, SIGTERM)
+        for _ in 0..<50 {
+            if !isProcessRunning(pid) {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if isProcessRunning(pid) {
+            emit("[engine stop] pid=\(pid) still alive after 5s; sending SIGKILL")
+            _ = kill(pid, SIGKILL)
+        }
+        guard socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 3) else {
+            throw controllerError("engine socket \(running.socketPath) remained reachable after stopping pid=\(pid)")
+        }
+        clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+    }
+
+    private func describe(_ running: RunningEngine) -> String {
+        if let pid = running.pid {
+            return "pid=\(pid) socket=\(running.socketPath)"
+        }
+        return "socket=\(running.socketPath) (pid file absent)"
+    }
+
+    private func controllerError(_ message: String, code: Int = 1) -> NSError {
+        NSError(
+            domain: "Boss.EngineProcessController",
+            code: code,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private func reportLaunchFailure(_ error: Error, attempt: Int?) {
+        let message = error.localizedDescription
+        lastLaunchError = message
+        emit("[engine launch] failed: \(message)")
+        supervisionQueue.async { [weak self] in
+            self?.emitSupervisionState(.restartFailed(attempt: attempt, message: message))
+        }
+    }
+
+    private func withStartLock<T>(_ body: () throws -> T) throws -> T {
+        let lockDirectory = URL(fileURLWithPath: lockFilePath).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+        let fd = open(lockFilePath, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else {
+            throw NSError(
+                domain: "Boss.EngineProcessController",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "failed to open lock file: \(lockFilePath)"]
+            )
+        }
+
+        defer {
+            close(fd)
+        }
+
+        guard flock(fd, LOCK_EX) == 0 else {
+            throw NSError(
+                domain: "Boss.EngineProcessController",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "failed to acquire engine start lock"]
+            )
+        }
+
+        defer {
+            _ = flock(fd, LOCK_UN)
+        }
+
+        return try body()
+    }
+
+    private func emit(_ line: String) {
+        Task { @MainActor in
+            self.onOutputLine?(line)
+        }
+    }
+
+    private var isSupervisionStopped: Bool {
+        supervisionStopLock.lock()
+        defer { supervisionStopLock.unlock() }
+        return supervisionStopped
+    }
+
+    private func setSupervisionStopped(_ stopped: Bool) {
+        supervisionStopLock.lock()
+        supervisionStopped = stopped
+        supervisionStopLock.unlock()
+    }
+
+    /// Must be called from `supervisionQueue`, which serializes state changes.
+    private func emitSupervisionState(_ state: EngineSupervisionState) {
+        guard state != lastSupervisionState else { return }
+        lastSupervisionState = state
+        Task { @MainActor in
+            self.onSupervisionStateChange?(state)
+        }
+    }
+}
+```
+
+**After (head)** (`tools/boss/app-macos/Sources/EngineProcessController.swift` @ `68e51b6cfd5cb8ccac6473273d04d57fe972d7a4`):
+
+```
+import CryptoKit
+import Darwin
+import Foundation
+
+/// Bounded restart policy for an app-managed engine. The schedule is indexed
+/// from one, and stays at its final value when callers allow more attempts
+/// than explicit delays. Keeping this policy separate from process launching
+/// makes the operational limits straightforward to test and tune.
+struct EngineRestartPolicy: Equatable, Sendable {
+    static let `default` = EngineRestartPolicy(
+        backoffSchedule: [1, 2, 4, 8, 16, 30],
+        maximumAttempts: 6,
+        pollInterval: 1,
+        healthyResetInterval: 60,
+        consecutiveFailureThreshold: 3
+    )
+
+    let backoffSchedule: [TimeInterval]
+    let maximumAttempts: Int
+    let pollInterval: TimeInterval
+    let healthyResetInterval: TimeInterval
+    let consecutiveFailureThreshold: Int
+
+    init(
+        backoffSchedule: [TimeInterval],
+        maximumAttempts: Int,
+        pollInterval: TimeInterval = Self.default.pollInterval,
+        healthyResetInterval: TimeInterval = Self.default.healthyResetInterval,
+        consecutiveFailureThreshold: Int = Self.default.consecutiveFailureThreshold
+    ) {
+        self.backoffSchedule = backoffSchedule.isEmpty ? Self.default.backoffSchedule : backoffSchedule
+        self.maximumAttempts = max(1, maximumAttempts)
+        self.pollInterval = max(0.1, pollInterval)
+        self.healthyResetInterval = max(0, healthyResetInterval)
+        self.consecutiveFailureThreshold = max(1, consecutiveFailureThreshold)
+    }
+
+    func delay(forAttempt attempt: Int) -> TimeInterval {
+        backoffSchedule[min(max(0, attempt - 1), backoffSchedule.count - 1)]
+    }
+
+    static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> Self {
+        let schedule = environment["BOSS_ENGINE_RESTART_BACKOFF_SECONDS"]?
+            .split(separator: ",")
+            .compactMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 > 0 && $0.isFinite }
+        let attempts = environment["BOSS_ENGINE_RESTART_MAX_ATTEMPTS"].flatMap(Int.init)
+        return Self(
+            backoffSchedule: schedule ?? [],
+            maximumAttempts: attempts.map { max(1, $0) } ?? Self.default.maximumAttempts
+        )
+    }
+}
+
+/// State sent to the app chrome while the controller is recovering from an
+/// unexpected engine exit. A manual restart resets the policy and returns to
+/// `.running` once a socket is reachable.
+enum EngineSupervisionState: Equatable, Sendable {
+    case running
+    case restarting(attempt: Int, retryAfter: TimeInterval)
+    case restartFailed(attempt: Int?, message: String)
+    case gaveUp(attempts: Int, lastError: String?)
+}
+
+final class EngineProcessController: @unchecked Sendable {
+    private struct RunningEngine {
+        let socketPath: String
+        let pidPath: String
+        let pid: pid_t?
+    }
+
+    private let paths: BossEnginePaths
+    private let lockFilePath: String
+    private let launchDirectory: String
+    private let forceRestart: Bool
+    private let stopOnExit: Bool
+    private let restartPolicy: EngineRestartPolicy
+    private let supervisionQueue = DispatchQueue(label: "Boss.EngineProcessController.supervision")
+    private var supervisionTimer: DispatchSourceTimer?
+    private var pendingRestart: DispatchWorkItem?
+    private var supervisor: EngineSupervisor
+    private var lastSupervisionState: EngineSupervisionState = .running
+    private var lastLaunchError: String?
+    private let socketControl: any EngineSocketControlling
+    private let bundledEnginePathOverride: String?
+    private let launchHandler: (@Sendable (String, String?, String) throws -> pid_t)?
+    private let supervisionStopLock = NSLock()
+    private var supervisionStopped = false
+
+    var onOutputLine: (@MainActor @Sendable (String) -> Void)?
+    var onSupervisionStateChange: (@MainActor @Sendable (EngineSupervisionState) -> Void)?
+
+    /// Liveness signal for the per-`pollInterval` supervision tick. When set
+    /// (normally to `EngineClient.isReachable`, which reflects the app's
+    /// existing long-lived connection), the tick reuses that connection's
+    /// state instead of opening and closing a fresh socket to the engine's
+    /// frontend listener every tick — each such probe drives a full
+    /// `handle_frontend_connection` session setup/teardown on the engine
+    /// side. Falls back to a raw socket probe (`discoverRunningEngine`) when
+    /// unset, e.g. in tests that exercise supervision without an
+    /// `EngineClient`.
+    var livenessProbe: (@Sendable () -> Bool)?
+
+    init(
+        paths: BossEnginePaths,
+        launchDirectory: String = ProcessInfo.processInfo.environment["BUILD_WORKSPACE_DIRECTORY"]
+            ?? FileManager.default.currentDirectoryPath,
+        forceRestart: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_FORCE_RESTART"] == "1",
+        stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1",
+        restartPolicy: EngineRestartPolicy = .fromEnvironment(),
+        socketControl: any EngineSocketControlling = EngineSocketControl(),
+        bundledEnginePathOverride: String? = nil,
+        launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil,
+        livenessProbe: (@Sendable () -> Bool)? = nil
+    ) {
+        self.paths = paths
+        self.lockFilePath = "\(paths.pidPath).lock"
+        self.launchDirectory = launchDirectory
+        self.forceRestart = forceRestart
+        self.stopOnExit = stopOnExit
+        self.restartPolicy = restartPolicy
+        self.supervisor = EngineSupervisor(policy: restartPolicy)
+        self.socketControl = socketControl
+        self.bundledEnginePathOverride = bundledEnginePathOverride
+        self.launchHandler = launchHandler
+        self.livenessProbe = livenessProbe
+    }
+
+    deinit {
+        supervisionTimer?.cancel()
+        pendingRestart?.cancel()
+    }
+
+    func start() throws {
+        do {
+            try start(resetRestartBudget: true)
+        } catch {
+            reportLaunchFailure(error, attempt: nil)
+            throw error
+        }
+    }
+
+    private func start(resetRestartBudget: Bool) throws {
+        let socketPath = paths.socketPath
+        try withStartLock {
+            if forceRestart, let running = discoverRunningEngine() {
+                emit("[engine restart] terminating existing engine \(describe(running))")
+                try stopRunningEngine(running)
+            }
+
+            if let running = discoverRunningEngine() {
+                // An engine is already running. Check if its binary matches
+                // the app's bundled engine. If not, replace it so the user
+                // always gets the version that shipped with this app launch.
+                //
+                // Each branch emits a distinct log line so a user reporting
+                // "engine wasn't restarted after I updated Boss" can grep
+                // the system messages and tell exactly which path fired:
+                //   [engine version-check skipped: <reason>] — check didn't run
+                //   [engine version-check ok] — ran, fingerprints matched
+                //   [engine upgrade] — ran, fingerprints differed, restarting
+                //
+                // BOSS_ENGINE_CMD wins unconditionally (see
+                // resolveEngineCommand): a dev running against a custom
+                // engine binary has nothing bundled to compare it to, and
+                // fingerprinting the *bundled* binary against it would
+                // always mismatch and tear down the dev's own engine.
+                if ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] != nil {
+                    emit("[engine version-check skipped: BOSS_ENGINE_CMD is set (developer custom engine)] attaching to \(describe(running))")
+                    return
+                }
+                guard let bundledPath = bundledEnginePath() else {
+                    emit("[engine version-check skipped: no bundled engine in app resources (dev/bazel-run mode)] attaching to \(describe(running))")
+                    return
+                }
+                guard let bundledFP = computeBinaryFingerprint(path: bundledPath) else {
+                    throw controllerError("could not fingerprint bundled engine at \(bundledPath)")
+                }
+
+                // A single missed 3s deadline can mean "the engine is busy",
+                // not "the engine is stale" — retry a couple of times before
+                // treating non-response as a mismatch, so a slow-but-healthy
+                // engine isn't torn down and replaced (and doesn't then hit
+                // the SIGTERM/SIGKILL fallback if the follow-on shutdown RPC
+                // also times out).
+                var runningFP: String?
+                var fingerprintAttempts = 0
+                let maxFingerprintAttempts = 3
+                while fingerprintAttempts < maxFingerprintAttempts {
+                    fingerprintAttempts += 1
+                    runningFP = socketControl.fingerprint(socketPath: running.socketPath, timeoutSeconds: 3.0)
+                    if runningFP != nil { break }
+                }
+
+                guard let runningFP else {
+                    emit("[engine version-check inconclusive] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — keeping reachable \(describe(running))")
+                    return
+                }
+                if bundledFP == runningFP {
+                    emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
+                    return
+                }
+                emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing \(describe(running))")
+                try stopRunningEngine(running)
+                emit("[engine upgrade] old engine stopped — launching new engine from bundle")
+            }
+
+            let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
+
+            let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+            lastLaunchError = nil
+            emit("[engine launch] detached pid=\(pid) socket=\(socketPath) \(command)")
+        }
+        // `disableSupervision()` may be called while a supervised relaunch is
+        // waiting on filesystem or socket I/O above. It sets this lock-backed
+        // flag without waiting for this queue, so do not reactivate polling
+        // after that cancellation has won.
+        guard !isSupervisionStopped else { return }
+        enableSupervision(resetRestartBudget: resetRestartBudget)
+    }
+
+    // MARK: - Version-check helpers
+
+    /// Path to the engine binary shipped inside the current app bundle.
+    /// Returns `nil` in dev/bazel-run mode where no bundle engine exists.
+    private func bundledEnginePath() -> String? {
+        if let bundledEnginePathOverride {
+            return bundledEnginePathOverride
+        }
+        guard let resourcePath = Bundle.main.resourcePath else { return nil }
+        let path = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        return path
+    }
+
+    /// Compute a binary fingerprint of `path` using the same algorithm
+    /// as `boss_engine::build_info::binary_fingerprint`:
+    ///   SHA-256 of up to 64 MiB of file content → first 6 bytes as
+    ///   12 lowercase hex digits, optionally suffixed "-truncated".
+    private func computeBinaryFingerprint(path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+
+        let cap: Int = 64 * 1024 * 1024
+        var hasher = SHA256()
+        var readTotal = 0
+        var truncated = false
+        let chunkSize = 64 * 1024
+
+        while true {
+            let remaining = cap - readTotal
+            guard remaining > 0 else {
+                // Probe for more bytes to set the truncated flag.
+                let probe = (try? fh.read(upToCount: 1)) ?? Data()
+                if !probe.isEmpty { truncated = true }
+                break
+            }
+            let toRead = min(chunkSize, remaining)
+            guard let chunk = try? fh.read(upToCount: toRead), !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+            readTotal += chunk.count
+            if chunk.count < toRead {
+                // EOF before cap.
+                break
+            }
+        }
+
+        let digest = hasher.finalize()
+        let firstSixBytes = digest.prefix(6)
+        let hex = firstSixBytes.map { String(format: "%02x", $0) }.joined()
+        return truncated ? "\(hex)-truncated" : hex
+    }
+
+    /// Resolve the engine command and the BOSS_BIN_DIR to export.
+    ///
+    /// Resolution order (per design doc Q3):
+    ///   1. BOSS_ENGINE_CMD env override — wins unconditionally so a dev
+    ///      running `bazel run //tools/boss/app-macos:Boss` against a custom
+    ///      engine still works.
+    ///   2. Bundle-relative path: `<Bundle.main.resourcePath>/bin/<engine>` —
+    ///      the installed app path; BOSS_BIN_DIR is set to the bin/ dir so
+    ///      the engine can resolve its sibling CLIs.
+    ///   3. `bazel run` fallback — dev mode for when the bundle lacks the
+    ///      pre-built engine (e.g. iterating on just the Swift side).
+    private func resolveEngineCommand(socketPath: String) -> (command: String, bossBinDir: String?) {
+        if let override = ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] {
+            return (override, nil)
+        }
+        if let resourcePath = Bundle.main.resourcePath {
+            let enginePath = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
+            if FileManager.default.fileExists(atPath: enginePath) {
+                let bossBinDir = "\(resourcePath)/bin"
+                return ("\(shellQuote(enginePath)) --socket-path \(shellQuote(socketPath))", bossBinDir)
+            }
+        }
+        return ("\(BossEngineBinary.bazelRunCommand) -- --socket-path \(shellQuote(socketPath))", nil)
+    }
+
+    func stop() {
+        disableSupervision()
+        guard stopOnExit else {
+            return
+        }
+
+        guard let running = discoverRunningEngine() else {
+            return
+        }
+
+        do {
+            try stopRunningEngine(running)
+            emit("[engine stop] terminated \(describe(running))")
+        } catch {
+            emit("[engine stop] failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// User-initiated recovery for a stale engine: discover the reachable
+    /// engine by socket (token-auth RPC first, then a validated peer/pid-file
+    /// SIGTERM/SIGKILL fallback) and relaunch
+    /// from the same binary `start()` would. Used by the "Restart
+    /// engine" affordance on the unreachable banner so a hung or
+    /// orphaned engine no longer requires a shell `pkill` (issue #697).
+    ///
+    /// Holds the start lock for the whole terminate + launch sequence
+    /// so a concurrent `start()` can't race and end up with two
+    /// engines fighting over the same socket. Safe to call when no
+    /// engine is running — falls through to the launch step.
+    func restart() throws {
+        disableSupervision()
+        do {
+            try withStartLock {
+                if let running = discoverRunningEngine() {
+                    emit("[engine restart] terminating existing engine \(describe(running))")
+                    try stopRunningEngine(running)
+                }
+
+                let socketPath = paths.socketPath
+                let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
+                let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+                lastLaunchError = nil
+                emit("[engine restart] detached pid=\(pid) socket=\(socketPath) \(command)")
+            }
+            enableSupervision(resetRestartBudget: true)
+        } catch {
+            reportLaunchFailure(error, attempt: nil)
+            throw error
+        }
+    }
+
+    // MARK: - Unexpected-exit supervision
+
+    /// The engine is deliberately detached from the app so it survives an app
+    /// restart. That also means `Process.terminationHandler` cannot observe
+    /// it. Polling socket reachability gives the controller the same answer
+    /// without making the engine an app child, and serializing this work
+    /// prevents two timer ticks from launching competing replacements.
+    private func enableSupervision(resetRestartBudget: Bool) {
+        // Set this before hopping onto the supervision queue so a later
+        // `stop()` always wins, even if this queued block has not run yet.
+        setSupervisionStopped(false)
+        supervisionQueue.async { [weak self] in
+            guard let self else { return }
+            if resetRestartBudget {
+                self.supervisor.reset()
+            }
+            if self.supervisionTimer == nil {
+                let timer = DispatchSource.makeTimerSource(queue: self.supervisionQueue)
+                timer.schedule(
+                    deadline: .now() + self.restartPolicy.pollInterval,
+                    repeating: self.restartPolicy.pollInterval
+                )
+                timer.setEventHandler { [weak self] in
+                    self?.checkEngineLiveness()
+                }
+                self.supervisionTimer = timer
+                timer.resume()
+            }
+            self.emitSupervisionState(.running)
+        }
+    }
+
+    private func disableSupervision() {
+        setSupervisionStopped(true)
+        supervisionQueue.async { [weak self] in
+            guard let self else { return }
+            pendingRestart?.cancel()
+            pendingRestart = nil
+            supervisionTimer?.cancel()
+            supervisionTimer = nil
+        }
+    }
+
+    private func checkEngineLiveness() {
+        guard !isSupervisionStopped, pendingRestart == nil else { return }
+        let liveness: (isReachable: Bool, source: String)
+        if let livenessProbe {
+            liveness = (livenessProbe(), "engine client connection")
+        } else {
+            liveness = (discoverRunningEngine() != nil, "socket probe")
+        }
+        let action = supervisor.tick(isAlive: liveness.isReachable, now: Date())
+        switch action {
+        case .running:
+            lastLaunchError = nil
+            emitSupervisionState(.running)
+            return
+        case let .unreachable(consecutiveFailures, requiredFailures):
+            emit("[engine supervision] \(liveness.source) reported engine unreachable; failed liveness tick \(consecutiveFailures)/\(requiredFailures), keeping engine running")
+            return
+        case let .gaveUp(attempts):
+            emit("[engine supervision] gave up after \(attempts) restart attempts; use Restart engine to try again")
+            emitSupervisionState(.gaveUp(attempts: attempts, lastError: lastLaunchError))
+            return
+        case let .restart(attempt, delay):
+            emit("[engine supervision] engine remained unreachable for \(restartPolicy.consecutiveFailureThreshold) consecutive ticks; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
+            emitSupervisionState(.restarting(attempt: attempt, retryAfter: delay))
+            let work = DispatchWorkItem { [weak self] in
+                self?.relaunchAfterUnexpectedExit(attempt: attempt)
+            }
+            pendingRestart = work
+            supervisionQueue.asyncAfter(deadline: .now() + delay, execute: work)
+        case .wait:
+            return
+        }
+    }
+
+    private func relaunchAfterUnexpectedExit(attempt: Int) {
+        pendingRestart = nil
+        guard !isSupervisionStopped else { return }
+        do {
+            try start(resetRestartBudget: false)
+        } catch {
+            lastLaunchError = error.localizedDescription
+            emit("[engine supervision] restart launch failed: \(error.localizedDescription)")
+            emitSupervisionState(.restartFailed(attempt: attempt, message: error.localizedDescription))
+            // The next timer tick applies the next backoff slot.
+        }
+    }
+
+    private func launchEngine(command: String, bossBinDir: String?, socketPath: String) throws -> pid_t {
+        if let launchHandler {
+            return try launchHandler(command, bossBinDir, socketPath)
+        }
+        return try launchDetached(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+    }
+
+    private func launchDetached(command: String, bossBinDir: String?, socketPath: String) throws -> pid_t {
+        let launchErrorPath = URL(fileURLWithPath: paths.pidPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("engine-launch.log")
+            .path
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        // zsh's BG_NICE option (on by default) reduces the priority of any
+        // job started with `&` by a non-interactive shell — nice(5) rather
+        // than the caller's own nice(0) — because a `zsh -c` script has no
+        // job control (monitor mode) active. That silently demoted the
+        // detached engine, and everything it forks (the private tmux
+        // server, then the coordinator's `claude` pane inside it) inherit
+        // that nice(5) by plain fork inheritance. `NO_BG_NICE` keeps the
+        // backgrounded engine at the same priority as this app.
+        //
+        // This only reaches a tmux server started by a post-fix engine: a
+        // private server already running under the durable state-root socket
+        // is never killed by this codebase, so on an existing install it
+        // keeps the nice(5) it was born with even after this fix ships. After
+        // upgrading, `tmux -S "$HOME/Library/Application Support/Boss/tmux.sock"
+        // kill-server` (or a reboot) once so the next engine launch creates a
+        // fresh server under this corrected priority. A leftover `-L boss`
+        // server is drained at boot rather than relocated.
+        let script = """
+        setopt NO_BG_NICE
+        : > \(shellQuote(launchErrorPath))
+        nohup \(command) >/dev/null 2>\(shellQuote(launchErrorPath)) &
+        child=$!
+        print -r -- $child
+        sleep 0.25
+        if ! kill -0 $child 2>/dev/null; then
+          wait $child
+          exit $?
+        fi
+        """
+        proc.arguments = ["-c", script]
+        proc.currentDirectoryURL = URL(fileURLWithPath: launchDirectory, isDirectory: true)
+        // Tell the engine the app's pid explicitly. `bazel run`
+        // daemonizes its server, which reparents the engine binary
+        // away from the app's process tree, so `getppid()` and any
+        // ancestor walk both miss the real app. The engine reads
+        // BOSS_APP_PID to set its trust root for `RegisterAppSession`.
+        var env = ProcessInfo.processInfo.environment
+        env["BOSS_APP_PID"] = String(getpid())
+        // The engine's tracing layer continues writing its bounded text log,
+        // while direct startup failures from Rust's main function land in the
+        // launch-error file above for this controller to surface verbatim.
+        env["BOSS_ENGINE_STDERR_LOGGING"] = "0"
+        // BOSS_BIN_DIR tells the engine where its sibling CLIs live
+        // (boss, bossctl, boss-event) in installed mode. The engine
+        // propagates this to workers so they resolve the bundled copies
+        // rather than any PATH match. Unset in dev mode (no bundle bin/).
+        if let dir = bossBinDir {
+            env["BOSS_BIN_DIR"] = dir
+        }
+        // When launched from Finder/Dock/launchctl, the app inherits a minimal
+        // launchd GUI session PATH (/usr/bin:/bin:/usr/sbin:/sbin) that omits
+        // developer tool directories. The engine and its cube subprocesses need
+        // jj, mint, and other tools that live outside that minimal set.
+        //
+        // We prepend well-known locations rather than shelling out to read the
+        // user's login-shell PATH (which would be more accurate but brittle — a
+        // misbehaving shell init could hang the app or print garbage). Extra
+        // segments that don't exist on a given machine are ignored by the kernel.
+        env["PATH"] = augmentedPATH(current: env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        // If the user pasted an ANTHROPIC_API_KEY into Settings → Engine,
+        // override whatever the launchd parent inherited so the Settings
+        // value always wins (work item #735). When no Settings value is
+        // stored, leave the inherited env entry untouched so a shell
+        // `export ANTHROPIC_API_KEY=…` followed by `boss` from a terminal
+        // continues to work for users who prefer that path.
+        if let stored = APIKeyStore.readAnthropicApiKey() {
+            env["ANTHROPIC_API_KEY"] = stored
+        }
+        proc.environment = env
+        let output = Pipe()
+        let shellError = Pipe()
+        proc.standardOutput = output
+        proc.standardError = shellError
+
+        try proc.run()
+        proc.waitUntilExit()
+        let outputData = output.fileHandleForReading.readDataToEndOfFile()
+        let shellErrorData = shellError.fileHandleForReading.readDataToEndOfFile()
+        let childPID = String(data: outputData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\n")
+            .first
+            .flatMap { pid_t($0) }
+        if proc.terminationStatus != 0 {
+            let shellMessage = String(data: shellErrorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw controllerError(
+                launchFailureMessage(
+                    prefix: "engine process exited during launch with status \(proc.terminationStatus)",
+                    launchErrorPath: launchErrorPath,
+                    fallback: shellMessage
+                ),
+                code: Int(proc.terminationStatus)
+            )
+        }
+        guard let childPID, childPID > 1 else {
+            throw controllerError("detached engine launcher did not report the child pid")
+        }
+
+        // The frontend socket binds late in engine startup — after
+        // `WorkDb::open`, the tmux preflight probe (which shells out to
+        // tmux), and planner-run recovery — so a slow-but-healthy start can
+        // legitimately outlast this window, especially the `bazel run`
+        // command shape used in dev mode, where a cold build alone can
+        // exceed it. Only the child actually exiting (checked every
+        // iteration above) is treated as a launch failure; a still-running
+        // child that simply hasn't bound its socket yet is not killed —
+        // supervision (`checkEngineLiveness`) observes the outcome once the
+        // socket comes up, or once the process actually exits.
+        let readinessWindow: TimeInterval = command.contains(BossEngineBinary.bazelRunCommand) ? 120 : 30
+        let deadline = Date().addingTimeInterval(readinessWindow)
+        while Date() < deadline {
+            if socketControl.isReachable(socketPath: socketPath, timeoutSeconds: 0.5) {
+                return childPID
+            }
+            if !isProcessRunning(childPID) {
+                throw controllerError(
+                    launchFailureMessage(
+                        prefix: "engine process pid=\(childPID) exited before its socket became reachable",
+                        launchErrorPath: launchErrorPath,
+                        fallback: nil
+                    )
+                )
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        emit(
+            "[engine launch] pid=\(childPID) socket \(socketPath) not yet reachable after \(Int(readinessWindow))s; still running, leaving it to supervision rather than killing it"
+        )
+        return childPID
+    }
+
+    private func launchFailureMessage(prefix: String, launchErrorPath: String, fallback: String?) -> String {
+        let data = try? Data(contentsOf: URL(fileURLWithPath: launchErrorPath))
+        let tail = data.map { Data($0.suffix(32 * 1024)) }
+        let engineError = tail.flatMap { String(data: $0, encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = [engineError, fallback]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+        return detail.map { "\(prefix): \($0)" } ?? prefix
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
+    }
+
+    /// Prepend standard developer-tool directories to PATH so the engine and its
+    /// subprocesses (cube, jj, mint, cargo binaries) can be found when the app is
+    /// launched from Finder/Dock/launchctl with a minimal launchd PATH.
+    ///
+    /// Order matches typical shell precedence: Apple Silicon Homebrew, Intel/manual
+    /// Homebrew, LinkedIn corporate tools, Rust/Cargo, then user-local directories.
+    /// Segments that don't exist on the current machine are harmless — the kernel
+    /// skips non-existent PATH entries. The original launchd PATH is preserved at the
+    /// end so system tools continue to resolve normally.
+    private func augmentedPATH(current: String) -> String {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let extra = [
+            "/opt/homebrew/bin",        // Apple Silicon Homebrew (jj, etc.)
+            "/usr/local/bin",           // Intel Homebrew, manual installs
+            "/usr/local/linkedin/bin",  // LinkedIn corporate tools (mint, etc.)
+            "\(home)/.cargo/bin",       // Rust binaries (jj commonly installed here)
+            "\(home)/bin",              // user-local binaries
+            "\(home)/.local/bin",       // XDG-style user-local binaries
+        ]
+        // Deduplicate: keep the first occurrence of each segment.
+        var seen = Set(current.split(separator: ":").map(String.init))
+        let unique = extra.filter { seen.insert($0).inserted }
+        let prefix = unique.joined(separator: ":")
+        return prefix.isEmpty ? current : "\(prefix):\(current)"
+    }
+
+    private func discoverRunningEngine() -> RunningEngine? {
+        for endpoint in paths.endpointPaths {
+            guard socketControl.isReachable(socketPath: endpoint.socketPath) else {
+                continue
+            }
+            // Peer credentials are direct, unforgeable proof of which
+            // process owns the socket we just connected to; the pid file is
+            // the deletable, potentially stale artefact this discovery step
+            // otherwise leans on. Prefer the peer pid and only fall back to
+            // the file when peer credentials aren't available.
+            let pid = socketControl.peerPID(socketPath: endpoint.socketPath, timeoutSeconds: 1)
+                ?? currentEnginePID(pidPath: endpoint.pidPath)
+            return RunningEngine(
+                socketPath: endpoint.socketPath,
+                pidPath: endpoint.pidPath,
+                pid: pid
+            )
+        }
+        return nil
+    }
+
+    private func currentEnginePID(pidPath: String) -> pid_t? {
+        guard let pid = readPIDFile(pidPath: pidPath) else {
+            return nil
+        }
+
+        if !isProcessRunning(pid) {
+            clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
+            return nil
+        }
+
+        guard isLikelyEngineProcess(pid) else {
+            emit("[engine pid] pid file points to non-engine process pid=\(pid)")
+            return nil
+        }
+
+        return pid
+    }
+
+    private func readPIDFile(pidPath: String) -> pid_t? {
+        guard let content = try? String(contentsOfFile: pidPath, encoding: .utf8) else {
+            return nil
+        }
+
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Int32(trimmed), value > 1 else {
+            return nil
+        }
+        return value
+    }
+
+    private func clearPIDFileIfOwned(pid: pid_t, pidPath: String) {
+        guard let owner = readPIDFile(pidPath: pidPath), owner == pid else {
+            return
+        }
+        try? FileManager.default.removeItem(atPath: pidPath)
+    }
+
+    private func isProcessRunning(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+
+    private func isLikelyEngineProcess(_ pid: pid_t) -> Bool {
+        guard let command = commandLine(for: pid) else {
+            return false
+        }
+
+        return command.contains(BossEngineBinary.bazelOutputPathFragment)
+            || command.contains(BossEngineBinary.bazelRunCommand)
+            || command.contains(BossEngineBinary.bundlePathFragment)
+    }
+
+    private func commandLine(for pid: pid_t) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-p", "\(pid)", "-o", "command="]
+        let output = Pipe()
+        proc.standardOutput = output
+        proc.standardError = Pipe()
+
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard proc.terminationStatus == 0 else {
+            return nil
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let text, !text.isEmpty {
+            return text
+        }
+        return nil
+    }
+
+    private func stopRunningEngine(_ running: RunningEngine) throws {
+        var fallbackPID = running.pid
+        var rpcFailure: Error?
+        do {
+            fallbackPID = try socketControl.shutdown(
+                socketPath: running.socketPath,
+                tokenPath: paths.controlTokenPath,
+                timeoutSeconds: 5
+            ) ?? fallbackPID
+            if socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 8) {
+                if let fallbackPID {
+                    clearPIDFileIfOwned(pid: fallbackPID, pidPath: running.pidPath)
+                }
+                return
+            }
+            rpcFailure = controllerError(
+                "shutdown RPC was accepted, but socket \(running.socketPath) remained reachable after 8 seconds"
+            )
+        } catch {
+            rpcFailure = error
+        }
+
+        guard let pid = fallbackPID else {
+            throw controllerError(
+                "engine is reachable at \(running.socketPath), but graceful shutdown failed and no pid is available: \(rpcFailure?.localizedDescription ?? "unknown error")"
+            )
+        }
+        guard isProcessRunning(pid), isLikelyEngineProcess(pid) else {
+            throw controllerError(
+                "engine is reachable at \(running.socketPath), but graceful shutdown failed and pid \(pid) is not a running Boss engine: \(rpcFailure?.localizedDescription ?? "unknown error")"
+            )
+        }
+
+        emit("[engine stop] rpc unavailable (\(rpcFailure?.localizedDescription ?? "unknown error")); falling back to SIGTERM pid=\(pid)")
+        _ = kill(pid, SIGTERM)
+        for _ in 0..<50 {
+            if !isProcessRunning(pid) {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if isProcessRunning(pid) {
+            emit("[engine stop] pid=\(pid) still alive after 5s; sending SIGKILL")
+            _ = kill(pid, SIGKILL)
+        }
+        guard socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 3) else {
+            throw controllerError("engine socket \(running.socketPath) remained reachable after stopping pid=\(pid)")
+        }
+        clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+    }
+
+    private func describe(_ running: RunningEngine) -> String {
+        if let pid = running.pid {
+            return "pid=\(pid) socket=\(running.socketPath)"
+        }
+        return "socket=\(running.socketPath) (pid file absent)"
+    }
+
+    private func controllerError(_ message: String, code: Int = 1) -> NSError {
+        NSError(
+            domain: "Boss.EngineProcessController",
+            code: code,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private func reportLaunchFailure(_ error: Error, attempt: Int?) {
+        let message = error.localizedDescription
+        lastLaunchError = message
+        emit("[engine launch] failed: \(message)")
+        supervisionQueue.async { [weak self] in
+            self?.emitSupervisionState(.restartFailed(attempt: attempt, message: message))
+        }
+    }
+
+    private func withStartLock<T>(_ body: () throws -> T) throws -> T {
+        let lockDirectory = URL(fileURLWithPath: lockFilePath).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+        let fd = open(lockFilePath, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else {
+            throw NSError(
+                domain: "Boss.EngineProcessController",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "failed to open lock file: \(lockFilePath)"]
+            )
+        }
+
+        defer {
+            close(fd)
+        }
+
+        guard flock(fd, LOCK_EX) == 0 else {
+            throw NSError(
+                domain: "Boss.EngineProcessController",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "failed to acquire engine start lock"]
+            )
+        }
+
+        defer {
+            _ = flock(fd, LOCK_UN)
+        }
+
+        return try body()
+    }
+
+    private func emit(_ line: String) {
+        Task { @MainActor in
+            self.onOutputLine?(line)
+        }
+    }
+
+    private var isSupervisionStopped: Bool {
+        supervisionStopLock.lock()
+        defer { supervisionStopLock.unlock() }
+        return supervisionStopped
+    }
+
+    private func setSupervisionStopped(_ stopped: Bool) {
+        supervisionStopLock.lock()
+        supervisionStopped = stopped
+        supervisionStopLock.unlock()
+    }
+
+    /// Must be called from `supervisionQueue`, which serializes state changes.
+    private func emitSupervisionState(_ state: EngineSupervisionState) {
+        guard state != lastSupervisionState else { return }
+        lastSupervisionState = state
+        Task { @MainActor in
+            self.onSupervisionStateChange?(state)
+        }
+    }
+}
+```
+
+### `tools/boss/app-macos/Sources/EngineSupervisor.swift` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -6,13 +6,15 @@ import Foundation
+ struct EngineSupervisor: Sendable {
+     enum Action: Equatable, Sendable {
+         case running
++        case unreachable(consecutiveFailures: Int, requiredFailures: Int)
+         case restart(attempt: Int, delay: TimeInterval)
+         case gaveUp(attempts: Int)
+         case wait
+     }
+ 
+     private let policy: EngineRestartPolicy
+     private var restartAttempts = 0
++    private var consecutiveFailures = 0
+     private var engineBecameHealthyAt: Date?
+     private var restartBudgetExhausted = false
+ 
+@@ -22,12 +24,14 @@ struct EngineSupervisor: Sendable {
+ 
+     mutating func reset() {
+         restartAttempts = 0
++        consecutiveFailures = 0
+         engineBecameHealthyAt = nil
+         restartBudgetExhausted = false
+     }
+ 
+     mutating func tick(isAlive: Bool, now: Date) -> Action {
+         if isAlive {
++            consecutiveFailures = 0
+             if engineBecameHealthyAt == nil {
+                 engineBecameHealthyAt = now
+             }
+@@ -41,9 +45,17 @@ struct EngineSupervisor: Sendable {
+         }
+ 
+         engineBecameHealthyAt = nil
++        consecutiveFailures += 1
+         guard !restartBudgetExhausted else {
+             return .wait
+         }
++        guard consecutiveFailures >= policy.consecutiveFailureThreshold else {
++            return .unreachable(
++                consecutiveFailures: consecutiveFailures,
++                requiredFailures: policy.consecutiveFailureThreshold
++            )
++        }
++        consecutiveFailures = 0
+         let attempt = restartAttempts + 1
+         guard attempt <= policy.maximumAttempts else {
+             restartBudgetExhausted = true
+```
+
+**Before (merge base)** (`tools/boss/app-macos/Sources/EngineSupervisor.swift` @ `6f8ca35153d0fcae9aea5e9852894ea549989ca0`):
+
+```
+import Foundation
+
+/// Pure decision logic for detached-engine liveness supervision. Process
+/// launching remains in `EngineProcessController`; this type only accounts
+/// for the retry budget and reports the next action.
+struct EngineSupervisor: Sendable {
+    enum Action: Equatable, Sendable {
+        case running
+        case restart(attempt: Int, delay: TimeInterval)
+        case gaveUp(attempts: Int)
+        case wait
+    }
+
+    private let policy: EngineRestartPolicy
+    private var restartAttempts = 0
+    private var engineBecameHealthyAt: Date?
+    private var restartBudgetExhausted = false
+
+    init(policy: EngineRestartPolicy) {
+        self.policy = policy
+    }
+
+    mutating func reset() {
+        restartAttempts = 0
+        engineBecameHealthyAt = nil
+        restartBudgetExhausted = false
+    }
+
+    mutating func tick(isAlive: Bool, now: Date) -> Action {
+        if isAlive {
+            if engineBecameHealthyAt == nil {
+                engineBecameHealthyAt = now
+            }
+            if restartAttempts > 0,
+               let healthySince = engineBecameHealthyAt,
+               now.timeIntervalSince(healthySince) >= policy.healthyResetInterval {
+                restartAttempts = 0
+                restartBudgetExhausted = false
+            }
+            return .running
+        }
+
+        engineBecameHealthyAt = nil
+        guard !restartBudgetExhausted else {
+            return .wait
+        }
+        let attempt = restartAttempts + 1
+        guard attempt <= policy.maximumAttempts else {
+            restartBudgetExhausted = true
+            return .gaveUp(attempts: restartAttempts)
+        }
+        restartAttempts = attempt
+        return .restart(attempt: attempt, delay: policy.delay(forAttempt: attempt))
+    }
+}
+```
+
+**After (head)** (`tools/boss/app-macos/Sources/EngineSupervisor.swift` @ `68e51b6cfd5cb8ccac6473273d04d57fe972d7a4`):
+
+```
+import Foundation
+
+/// Pure decision logic for detached-engine liveness supervision. Process
+/// launching remains in `EngineProcessController`; this type only accounts
+/// for the retry budget and reports the next action.
+struct EngineSupervisor: Sendable {
+    enum Action: Equatable, Sendable {
+        case running
+        case unreachable(consecutiveFailures: Int, requiredFailures: Int)
+        case restart(attempt: Int, delay: TimeInterval)
+        case gaveUp(attempts: Int)
+        case wait
+    }
+
+    private let policy: EngineRestartPolicy
+    private var restartAttempts = 0
+    private var consecutiveFailures = 0
+    private var engineBecameHealthyAt: Date?
+    private var restartBudgetExhausted = false
+
+    init(policy: EngineRestartPolicy) {
+        self.policy = policy
+    }
+
+    mutating func reset() {
+        restartAttempts = 0
+        consecutiveFailures = 0
+        engineBecameHealthyAt = nil
+        restartBudgetExhausted = false
+    }
+
+    mutating func tick(isAlive: Bool, now: Date) -> Action {
+        if isAlive {
+            consecutiveFailures = 0
+            if engineBecameHealthyAt == nil {
+                engineBecameHealthyAt = now
+            }
+            if restartAttempts > 0,
+               let healthySince = engineBecameHealthyAt,
+               now.timeIntervalSince(healthySince) >= policy.healthyResetInterval {
+                restartAttempts = 0
+                restartBudgetExhausted = false
+            }
+            return .running
+        }
+
+        engineBecameHealthyAt = nil
+        consecutiveFailures += 1
+        guard !restartBudgetExhausted else {
+            return .wait
+        }
+        guard consecutiveFailures >= policy.consecutiveFailureThreshold else {
+            return .unreachable(
+                consecutiveFailures: consecutiveFailures,
+                requiredFailures: policy.consecutiveFailureThreshold
+            )
+        }
+        consecutiveFailures = 0
+        let attempt = restartAttempts + 1
+        guard attempt <= policy.maximumAttempts else {
+            restartBudgetExhausted = true
+            return .gaveUp(attempts: restartAttempts)
+        }
+        restartAttempts = attempt
+        return .restart(attempt: attempt, delay: policy.delay(forAttempt: attempt))
+    }
+}
+```
+
+### `tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -221,6 +221,22 @@ final class EngineProcessControllerTests: XCTestCase {
+         XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+     }
+ 
++    func testUnresponsiveReachableEngineIsKeptWithoutReplacement() throws {
++        let fixture = try Fixture(reachableSocket: .primary, fingerprintAvailable: false)
++        let launchRecorder = LaunchRecorder()
++        let controller = fixture.makeController { _, _, socketPath in
++            launchRecorder.record(socketPath)
++            return 4242
++        }
++        defer { controller.stop() }
++
++        try controller.start()
++
++        XCTAssertEqual(fixture.socketControl.fingerprintRequests, Array(repeating: fixture.paths.socketPath, count: 3))
++        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
++        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
++    }
++
+     func testFailedEngineStartPropagatesTheLaunchErrorToTheBannerState() throws {
+         let fixture = try Fixture(reachableSocket: .none)
+         let controller = fixture.makeController { _, _, _ in
+@@ -275,11 +291,11 @@ private extension EngineProcessControllerTests {
+     final class FakeSocketControl: EngineSocketControlling, @unchecked Sendable {
+         private let lock = NSLock()
+         private let reachableSocket: String
+-        private let expectedFingerprint: String
++        private let expectedFingerprint: String?
+         private var requests: [String] = []
+         private var shutdowns: [String] = []
+ 
+-        init(reachableSocket: String, expectedFingerprint: String) {
++        init(reachableSocket: String, expectedFingerprint: String?) {
+             self.reachableSocket = reachableSocket
+             self.expectedFingerprint = expectedFingerprint
+         }
+@@ -334,7 +350,11 @@ private extension EngineProcessControllerTests {
+         let bundledEnginePath: String
+         let socketControl: FakeSocketControl
+ 
+-        init(reachableSocket: ReachableSocket, runningFingerprint: String? = nil) throws {
++        init(
++            reachableSocket: ReachableSocket,
++            runningFingerprint: String? = nil,
++            fingerprintAvailable: Bool = true
++        ) throws {
+             let testRoot = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                 .map { URL(fileURLWithPath: $0, isDirectory: true) }
+                 ?? FileManager.default.temporaryDirectory
+@@ -364,7 +384,7 @@ private extension EngineProcessControllerTests {
+             }
+             socketControl = FakeSocketControl(
+                 reachableSocket: reachablePath,
+-                expectedFingerprint: runningFingerprint ?? fingerprint
++                expectedFingerprint: fingerprintAvailable ? (runningFingerprint ?? fingerprint) : nil
+             )
+         }
+ 
+```
+
+**Before (merge base)** (`tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift` @ `6f8ca35153d0fcae9aea5e9852894ea549989ca0`):
+
+```
+import AppKit
+import CryptoKit
+import XCTest
+
+@testable import Boss
+
+/// Unit pins for the agent-capture helpers.
+///
+/// Full-app e2e still covers the live chrome path
+/// (`BOSS_SOCKET_PATH=… BOSS_ENGINE_AUTOSTART=0 bazel run
+/// //tools/boss/app-macos:Boss -- --capture-to …`). Creating an
+/// `NSWindow` + `cacheDisplay` from this XCTest host under the bazel
+/// macOS runner segfaults (reproduced 4/4); the hermetic pin below
+/// exercises `cacheDisplay` on a detached `NSView` hierarchy instead —
+/// same AppKit paint path, no window host.
+final class BossCaptureTests: XCTestCase {
+    func testParseCaptureArgs() {
+        let parsed = BossCaptureArgs.parse([
+            "Boss",
+            "--capture-to", "/tmp/shot.png",
+            "--capture-after", "3",
+        ])
+        XCTAssertEqual(parsed.captureTo, "/tmp/shot.png")
+        XCTAssertEqual(parsed.captureAfter, 3, accuracy: 0.001)
+        XCTAssertTrue(parsed.isCaptureMode)
+
+        let equals = BossCaptureArgs.parse([
+            "Boss",
+            "--capture-to=/tmp/eq.png",
+            "--capture-after=1.5",
+        ])
+        XCTAssertEqual(equals.captureTo, "/tmp/eq.png")
+        XCTAssertEqual(equals.captureAfter, 1.5, accuracy: 0.001)
+
+        let empty = BossCaptureArgs.parse(["Boss"])
+        XCTAssertNil(empty.captureTo)
+        XCTAssertFalse(empty.isCaptureMode)
+        XCTAssertEqual(empty.captureAfter, BossCaptureArgs.defaultCaptureAfter, accuracy: 0.001)
+    }
+
+    func testSampleNonBlankPixelsDetectsSolidFill() {
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 64,
+            pixelsHigh: 64,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )!
+        // Mid blue via raw bytes (avoids setColor colour-space surprises).
+        fill(rep, r: 30, g: 60, b: 200)
+        let (nonBlank, total) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertGreaterThan(total, 0)
+        XCTAssertEqual(nonBlank, total)
+
+        // Near-white must score zero non-blank.
+        fill(rep, r: 250, g: 250, b: 250)
+        let (whiteNonBlank, _) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertEqual(whiteNonBlank, 0)
+
+        // Near-black also zero.
+        fill(rep, r: 5, g: 5, b: 5)
+        let (blackNonBlank, _) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertEqual(blackNonBlank, 0)
+    }
+
+    /// Pins the design contract that `cacheDisplay` paints real mid-tone
+    /// content (including a badge-sized capsule region) into a bitmap —
+    /// the same primitive the production capture path relies on — without
+    /// constructing an `NSWindow` (which segfaults in this XCTest host).
+    func testCacheDisplayOnDetachedViewProducesNonBlankBadgeRegion() {
+        // Canvas large enough to mirror a toolbar strip; mid-blue fill is
+        // "content" for sampleNonBlankPixels (not near-white / near-black).
+        let root = SolidFillView(frame: NSRect(x: 0, y: 0, width: 320, height: 80))
+        root.fillColor = NSColor(srgbRed: 0.12, green: 0.18, blue: 0.28, alpha: 1)
+
+        // Badge-sized capsule region (~caption + horizontal/vertical padding
+        // of the live "AGENT CAPTURE — isolated instance" toolbar badge).
+        let badge = SolidFillView(frame: NSRect(x: 12, y: 24, width: 220, height: 28))
+        badge.fillColor = NSColor(srgbRed: 0.95, green: 0.55, blue: 0.10, alpha: 1)
+        root.addSubview(badge)
+
+        root.layoutSubtreeIfNeeded()
+        let bounds = root.bounds
+        guard let rep = root.bitmapImageRepForCachingDisplay(in: bounds) else {
+            XCTFail("bitmapImageRepForCachingDisplay returned nil")
+            return
+        }
+        root.cacheDisplay(in: bounds, to: rep)
+
+        let (nonBlank, total) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertGreaterThan(total, 0, "sampler must visit pixels")
+        let fraction = Double(nonBlank) / Double(total)
+        // Production capture fails below 1% non-blank; a solid fill + badge
+        // must clear that bar with room to spare.
+        XCTAssertGreaterThan(
+            fraction, 0.5,
+            "cacheDisplay must paint mid-tone content (nonBlank fraction \(fraction))"
+        )
+
+        // Direct sample of the badge rect: every coarse-grid hit inside the
+        // orange capsule must be non-white (the live capture badge is the
+        // only chrome we can rely on under the glass-control blanking bug).
+        let badgeNonWhite = countNonWhiteInRegion(
+            rep,
+            rect: NSRect(x: 12, y: 24, width: 220, height: 28)
+        )
+        XCTAssertGreaterThan(
+            badgeNonWhite, 0,
+            "badge-sized region must contain non-white pixels after cacheDisplay"
+        )
+    }
+
+    private func fill(_ rep: NSBitmapImageRep, r: UInt8, g: UInt8, b: UInt8) {
+        guard let bytes = rep.bitmapData else {
+            XCTFail("bitmapData nil")
+            return
+        }
+        let spp = rep.samplesPerPixel
+        let bpr = rep.bytesPerRow
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide {
+                let o = y * bpr + x * spp
+                bytes[o] = r
+                bytes[o + 1] = g
+                bytes[o + 2] = b
+                if spp >= 4 { bytes[o + 3] = 255 }
+            }
+        }
+    }
+
+    /// Count coarse-grid samples inside `rect` that are not near-white.
+    private func countNonWhiteInRegion(_ rep: NSBitmapImageRep, rect: NSRect) -> Int {
+        let spp = rep.samplesPerPixel
+        let bpr = rep.bytesPerRow
+        guard let bytes = rep.bitmapData, spp >= 3, bpr > 0 else { return 0 }
+        let x0 = max(0, Int(rect.minX.rounded(.down)))
+        let y0 = max(0, Int(rect.minY.rounded(.down)))
+        let x1 = min(rep.pixelsWide, Int(rect.maxX.rounded(.up)))
+        let y1 = min(rep.pixelsHigh, Int(rect.maxY.rounded(.up)))
+        guard x1 > x0, y1 > y0 else { return 0 }
+        let step = max(1, min(x1 - x0, y1 - y0) / 16)
+        var count = 0
+        for y in stride(from: y0, to: y1, by: step) {
+            for x in stride(from: x0, to: x1, by: step) {
+                let o = y * bpr + x * spp
+                let r = bytes[o]
+                let g = bytes[o + 1]
+                let b = bytes[o + 2]
+                // Near-white threshold mirrors sampleNonBlankPixels (~0.92).
+                if r < 235 || g < 235 || b < 235 {
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    func testDefaultProductionSocketConstant() {
+        XCTAssertEqual(BossEnginePaths.defaultProductionSocket, "/tmp/boss-engine.sock")
+    }
+
+    func testCaptureSuiteName() {
+        XCTAssertEqual(BossDefaults.captureSuiteName, "dev.spinyfin.bossmacapp.capture")
+    }
+}
+
+/// Opaque fill view used only by the cacheDisplay hermetic pin.
+private final class SolidFillView: NSView {
+    var fillColor: NSColor = .systemBlue
+
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        fillColor.setFill()
+        bounds.fill()
+    }
+}
+final class EngineProcessControllerTests: XCTestCase {
+    func testReachableSocketRunsVersionCheckWhenPIDFileIsMissing() throws {
+        let fixture = try Fixture(reachableSocket: .primary)
+        let controller = fixture.makeController()
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, [fixture.paths.socketPath])
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+    }
+
+    func testLegacySocketRunsVersionCheckWhenStateRootSocketIsMissing() throws {
+        let fixture = try Fixture(reachableSocket: .legacy)
+        let controller = fixture.makeController()
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, [fixture.paths.legacySocketPath!])
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacyPIDPath!))
+    }
+
+    func testStaleLegacyEngineIsStoppedBeforeReplacementUsesStateRootSocket() throws {
+        let fixture = try Fixture(reachableSocket: .legacy, runningFingerprint: "stale-engine")
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.shutdownRequests, [fixture.paths.legacySocketPath!])
+        XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+    }
+
+    func testFailedEngineStartPropagatesTheLaunchErrorToTheBannerState() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        let controller = fixture.makeController { _, _, _ in
+            throw NSError(
+                domain: "EngineFixture",
+                code: 23,
+                userInfo: [NSLocalizedDescriptionKey: "refusing-to-start-events-socket-owned"]
+            )
+        }
+        defer { controller.stop() }
+        let surfaced = expectation(description: "launch error surfaced")
+        controller.onSupervisionStateChange = { state in
+            if state == .restartFailed(attempt: nil, message: "refusing-to-start-events-socket-owned") {
+                surfaced.fulfill()
+            }
+        }
+
+        XCTAssertThrowsError(try controller.start()) { error in
+            XCTAssertEqual(error.localizedDescription, "refusing-to-start-events-socket-owned")
+        }
+        wait(for: [surfaced], timeout: 1)
+    }
+
+    func testConnectedEngineAlwaysClearsUnreachableBanner() {
+        XCTAssertFalse(
+            shouldShowEngineUnreachableBanner(
+                isConnected: true,
+                showConnectionLostBanner: true,
+                supervisionState: .gaveUp(attempts: 6, lastError: "refused to start")
+            )
+        )
+    }
+
+    func testFailedRestartHasAnUnreachableBannerSurface() {
+        XCTAssertTrue(
+            shouldShowEngineUnreachableBanner(
+                isConnected: false,
+                showConnectionLostBanner: false,
+                supervisionState: .restartFailed(attempt: 2, message: "refused to start")
+            )
+        )
+    }
+}
+
+private extension EngineProcessControllerTests {
+    enum ReachableSocket: Equatable {
+        case primary
+        case legacy
+        case none
+    }
+
+    final class FakeSocketControl: EngineSocketControlling, @unchecked Sendable {
+        private let lock = NSLock()
+        private let reachableSocket: String
+        private let expectedFingerprint: String
+        private var requests: [String] = []
+        private var shutdowns: [String] = []
+
+        init(reachableSocket: String, expectedFingerprint: String) {
+            self.reachableSocket = reachableSocket
+            self.expectedFingerprint = expectedFingerprint
+        }
+
+        var fingerprintRequests: [String] {
+            lock.withLock { requests }
+        }
+
+        var shutdownRequests: [String] {
+            lock.withLock { shutdowns }
+        }
+
+        func isReachable(socketPath: String, timeoutSeconds _: Double) -> Bool {
+            socketPath == reachableSocket
+        }
+
+        func peerPID(socketPath _: String, timeoutSeconds _: Double) -> pid_t? {
+            nil
+        }
+
+        func fingerprint(socketPath: String, timeoutSeconds _: Double) -> String? {
+            lock.withLock { requests.append(socketPath) }
+            return expectedFingerprint
+        }
+
+        func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double) throws -> pid_t? {
+            lock.withLock { shutdowns.append(socketPath) }
+            return nil
+        }
+
+        func waitForClose(socketPath _: String, timeoutSeconds _: Double) -> Bool {
+            true
+        }
+    }
+
+    final class LaunchRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recordedSocketPaths: [String] = []
+
+        var socketPaths: [String] {
+            lock.withLock { recordedSocketPaths }
+        }
+
+        func record(_ socketPath: String) {
+            lock.withLock { recordedSocketPaths.append(socketPath) }
+        }
+    }
+
+    struct Fixture {
+        let temp: URL
+        let paths: BossEnginePaths
+        let bundledEnginePath: String
+        let socketControl: FakeSocketControl
+
+        init(reachableSocket: ReachableSocket, runningFingerprint: String? = nil) throws {
+            let testRoot = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                .map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? FileManager.default.temporaryDirectory
+            temp = testRoot
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+            let primarySocket = temp.appendingPathComponent("engine.sock").path
+            let legacySocket = temp.appendingPathComponent("legacy.sock").path
+            paths = BossEnginePaths(
+                socketPath: primarySocket,
+                pidPath: temp.appendingPathComponent("engine.pid").path,
+                controlTokenPath: temp.appendingPathComponent("engine-control.token").path,
+                legacySocketPath: legacySocket,
+                legacyPIDPath: temp.appendingPathComponent("legacy.pid").path
+            )
+            bundledEnginePath = temp.appendingPathComponent("bundled-engine").path
+            let contents = Data("bundled engine fixture".utf8)
+            try contents.write(to: URL(fileURLWithPath: bundledEnginePath))
+            let fingerprint = SHA256.hash(data: contents).prefix(6)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            let reachablePath: String
+            switch reachableSocket {
+            case .primary: reachablePath = primarySocket
+            case .legacy: reachablePath = legacySocket
+            case .none: reachablePath = temp.appendingPathComponent("unreachable.sock").path
+            }
+            socketControl = FakeSocketControl(
+                reachableSocket: reachablePath,
+                expectedFingerprint: runningFingerprint ?? fingerprint
+            )
+        }
+
+        func makeController(
+            launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil
+        ) -> EngineProcessController {
+            EngineProcessController(
+                paths: paths,
+                launchDirectory: temp.path,
+                forceRestart: false,
+                stopOnExit: false,
+                restartPolicy: .default,
+                socketControl: socketControl,
+                bundledEnginePathOverride: bundledEnginePath,
+                launchHandler: launchHandler
+            )
+        }
+    }
+}
+```
+
+**After (head)** (`tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift` @ `68e51b6cfd5cb8ccac6473273d04d57fe972d7a4`):
+
+```
+import AppKit
+import CryptoKit
+import XCTest
+
+@testable import Boss
+
+/// Unit pins for the agent-capture helpers.
+///
+/// Full-app e2e still covers the live chrome path
+/// (`BOSS_SOCKET_PATH=… BOSS_ENGINE_AUTOSTART=0 bazel run
+/// //tools/boss/app-macos:Boss -- --capture-to …`). Creating an
+/// `NSWindow` + `cacheDisplay` from this XCTest host under the bazel
+/// macOS runner segfaults (reproduced 4/4); the hermetic pin below
+/// exercises `cacheDisplay` on a detached `NSView` hierarchy instead —
+/// same AppKit paint path, no window host.
+final class BossCaptureTests: XCTestCase {
+    func testParseCaptureArgs() {
+        let parsed = BossCaptureArgs.parse([
+            "Boss",
+            "--capture-to", "/tmp/shot.png",
+            "--capture-after", "3",
+        ])
+        XCTAssertEqual(parsed.captureTo, "/tmp/shot.png")
+        XCTAssertEqual(parsed.captureAfter, 3, accuracy: 0.001)
+        XCTAssertTrue(parsed.isCaptureMode)
+
+        let equals = BossCaptureArgs.parse([
+            "Boss",
+            "--capture-to=/tmp/eq.png",
+            "--capture-after=1.5",
+        ])
+        XCTAssertEqual(equals.captureTo, "/tmp/eq.png")
+        XCTAssertEqual(equals.captureAfter, 1.5, accuracy: 0.001)
+
+        let empty = BossCaptureArgs.parse(["Boss"])
+        XCTAssertNil(empty.captureTo)
+        XCTAssertFalse(empty.isCaptureMode)
+        XCTAssertEqual(empty.captureAfter, BossCaptureArgs.defaultCaptureAfter, accuracy: 0.001)
+    }
+
+    func testSampleNonBlankPixelsDetectsSolidFill() {
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 64,
+            pixelsHigh: 64,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )!
+        // Mid blue via raw bytes (avoids setColor colour-space surprises).
+        fill(rep, r: 30, g: 60, b: 200)
+        let (nonBlank, total) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertGreaterThan(total, 0)
+        XCTAssertEqual(nonBlank, total)
+
+        // Near-white must score zero non-blank.
+        fill(rep, r: 250, g: 250, b: 250)
+        let (whiteNonBlank, _) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertEqual(whiteNonBlank, 0)
+
+        // Near-black also zero.
+        fill(rep, r: 5, g: 5, b: 5)
+        let (blackNonBlank, _) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertEqual(blackNonBlank, 0)
+    }
+
+    /// Pins the design contract that `cacheDisplay` paints real mid-tone
+    /// content (including a badge-sized capsule region) into a bitmap —
+    /// the same primitive the production capture path relies on — without
+    /// constructing an `NSWindow` (which segfaults in this XCTest host).
+    func testCacheDisplayOnDetachedViewProducesNonBlankBadgeRegion() {
+        // Canvas large enough to mirror a toolbar strip; mid-blue fill is
+        // "content" for sampleNonBlankPixels (not near-white / near-black).
+        let root = SolidFillView(frame: NSRect(x: 0, y: 0, width: 320, height: 80))
+        root.fillColor = NSColor(srgbRed: 0.12, green: 0.18, blue: 0.28, alpha: 1)
+
+        // Badge-sized capsule region (~caption + horizontal/vertical padding
+        // of the live "AGENT CAPTURE — isolated instance" toolbar badge).
+        let badge = SolidFillView(frame: NSRect(x: 12, y: 24, width: 220, height: 28))
+        badge.fillColor = NSColor(srgbRed: 0.95, green: 0.55, blue: 0.10, alpha: 1)
+        root.addSubview(badge)
+
+        root.layoutSubtreeIfNeeded()
+        let bounds = root.bounds
+        guard let rep = root.bitmapImageRepForCachingDisplay(in: bounds) else {
+            XCTFail("bitmapImageRepForCachingDisplay returned nil")
+            return
+        }
+        root.cacheDisplay(in: bounds, to: rep)
+
+        let (nonBlank, total) = BossWindowCapture.sampleNonBlankPixels(rep)
+        XCTAssertGreaterThan(total, 0, "sampler must visit pixels")
+        let fraction = Double(nonBlank) / Double(total)
+        // Production capture fails below 1% non-blank; a solid fill + badge
+        // must clear that bar with room to spare.
+        XCTAssertGreaterThan(
+            fraction, 0.5,
+            "cacheDisplay must paint mid-tone content (nonBlank fraction \(fraction))"
+        )
+
+        // Direct sample of the badge rect: every coarse-grid hit inside the
+        // orange capsule must be non-white (the live capture badge is the
+        // only chrome we can rely on under the glass-control blanking bug).
+        let badgeNonWhite = countNonWhiteInRegion(
+            rep,
+            rect: NSRect(x: 12, y: 24, width: 220, height: 28)
+        )
+        XCTAssertGreaterThan(
+            badgeNonWhite, 0,
+            "badge-sized region must contain non-white pixels after cacheDisplay"
+        )
+    }
+
+    private func fill(_ rep: NSBitmapImageRep, r: UInt8, g: UInt8, b: UInt8) {
+        guard let bytes = rep.bitmapData else {
+            XCTFail("bitmapData nil")
+            return
+        }
+        let spp = rep.samplesPerPixel
+        let bpr = rep.bytesPerRow
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide {
+                let o = y * bpr + x * spp
+                bytes[o] = r
+                bytes[o + 1] = g
+                bytes[o + 2] = b
+                if spp >= 4 { bytes[o + 3] = 255 }
+            }
+        }
+    }
+
+    /// Count coarse-grid samples inside `rect` that are not near-white.
+    private func countNonWhiteInRegion(_ rep: NSBitmapImageRep, rect: NSRect) -> Int {
+        let spp = rep.samplesPerPixel
+        let bpr = rep.bytesPerRow
+        guard let bytes = rep.bitmapData, spp >= 3, bpr > 0 else { return 0 }
+        let x0 = max(0, Int(rect.minX.rounded(.down)))
+        let y0 = max(0, Int(rect.minY.rounded(.down)))
+        let x1 = min(rep.pixelsWide, Int(rect.maxX.rounded(.up)))
+        let y1 = min(rep.pixelsHigh, Int(rect.maxY.rounded(.up)))
+        guard x1 > x0, y1 > y0 else { return 0 }
+        let step = max(1, min(x1 - x0, y1 - y0) / 16)
+        var count = 0
+        for y in stride(from: y0, to: y1, by: step) {
+            for x in stride(from: x0, to: x1, by: step) {
+                let o = y * bpr + x * spp
+                let r = bytes[o]
+                let g = bytes[o + 1]
+                let b = bytes[o + 2]
+                // Near-white threshold mirrors sampleNonBlankPixels (~0.92).
+                if r < 235 || g < 235 || b < 235 {
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    func testDefaultProductionSocketConstant() {
+        XCTAssertEqual(BossEnginePaths.defaultProductionSocket, "/tmp/boss-engine.sock")
+    }
+
+    func testCaptureSuiteName() {
+        XCTAssertEqual(BossDefaults.captureSuiteName, "dev.spinyfin.bossmacapp.capture")
+    }
+}
+
+/// Opaque fill view used only by the cacheDisplay hermetic pin.
+private final class SolidFillView: NSView {
+    var fillColor: NSColor = .systemBlue
+
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        fillColor.setFill()
+        bounds.fill()
+    }
+}
+final class EngineProcessControllerTests: XCTestCase {
+    func testReachableSocketRunsVersionCheckWhenPIDFileIsMissing() throws {
+        let fixture = try Fixture(reachableSocket: .primary)
+        let controller = fixture.makeController()
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, [fixture.paths.socketPath])
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+    }
+
+    func testLegacySocketRunsVersionCheckWhenStateRootSocketIsMissing() throws {
+        let fixture = try Fixture(reachableSocket: .legacy)
+        let controller = fixture.makeController()
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, [fixture.paths.legacySocketPath!])
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacyPIDPath!))
+    }
+
+    func testStaleLegacyEngineIsStoppedBeforeReplacementUsesStateRootSocket() throws {
+        let fixture = try Fixture(reachableSocket: .legacy, runningFingerprint: "stale-engine")
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.shutdownRequests, [fixture.paths.legacySocketPath!])
+        XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+    }
+
+    func testUnresponsiveReachableEngineIsKeptWithoutReplacement() throws {
+        let fixture = try Fixture(reachableSocket: .primary, fingerprintAvailable: false)
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, Array(repeating: fixture.paths.socketPath, count: 3))
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
+    func testFailedEngineStartPropagatesTheLaunchErrorToTheBannerState() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        let controller = fixture.makeController { _, _, _ in
+            throw NSError(
+                domain: "EngineFixture",
+                code: 23,
+                userInfo: [NSLocalizedDescriptionKey: "refusing-to-start-events-socket-owned"]
+            )
+        }
+        defer { controller.stop() }
+        let surfaced = expectation(description: "launch error surfaced")
+        controller.onSupervisionStateChange = { state in
+            if state == .restartFailed(attempt: nil, message: "refusing-to-start-events-socket-owned") {
+                surfaced.fulfill()
+            }
+        }
+
+        XCTAssertThrowsError(try controller.start()) { error in
+            XCTAssertEqual(error.localizedDescription, "refusing-to-start-events-socket-owned")
+        }
+        wait(for: [surfaced], timeout: 1)
+    }
+
+    func testConnectedEngineAlwaysClearsUnreachableBanner() {
+        XCTAssertFalse(
+            shouldShowEngineUnreachableBanner(
+                isConnected: true,
+                showConnectionLostBanner: true,
+                supervisionState: .gaveUp(attempts: 6, lastError: "refused to start")
+            )
+        )
+    }
+
+    func testFailedRestartHasAnUnreachableBannerSurface() {
+        XCTAssertTrue(
+            shouldShowEngineUnreachableBanner(
+                isConnected: false,
+                showConnectionLostBanner: false,
+                supervisionState: .restartFailed(attempt: 2, message: "refused to start")
+            )
+        )
+    }
+}
+
+private extension EngineProcessControllerTests {
+    enum ReachableSocket: Equatable {
+        case primary
+        case legacy
+        case none
+    }
+
+    final class FakeSocketControl: EngineSocketControlling, @unchecked Sendable {
+        private let lock = NSLock()
+        private let reachableSocket: String
+        private let expectedFingerprint: String?
+        private var requests: [String] = []
+        private var shutdowns: [String] = []
+
+        init(reachableSocket: String, expectedFingerprint: String?) {
+            self.reachableSocket = reachableSocket
+            self.expectedFingerprint = expectedFingerprint
+        }
+
+        var fingerprintRequests: [String] {
+            lock.withLock { requests }
+        }
+
+        var shutdownRequests: [String] {
+            lock.withLock { shutdowns }
+        }
+
+        func isReachable(socketPath: String, timeoutSeconds _: Double) -> Bool {
+            socketPath == reachableSocket
+        }
+
+        func peerPID(socketPath _: String, timeoutSeconds _: Double) -> pid_t? {
+            nil
+        }
+
+        func fingerprint(socketPath: String, timeoutSeconds _: Double) -> String? {
+            lock.withLock { requests.append(socketPath) }
+            return expectedFingerprint
+        }
+
+        func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double) throws -> pid_t? {
+            lock.withLock { shutdowns.append(socketPath) }
+            return nil
+        }
+
+        func waitForClose(socketPath _: String, timeoutSeconds _: Double) -> Bool {
+            true
+        }
+    }
+
+    final class LaunchRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recordedSocketPaths: [String] = []
+
+        var socketPaths: [String] {
+            lock.withLock { recordedSocketPaths }
+        }
+
+        func record(_ socketPath: String) {
+            lock.withLock { recordedSocketPaths.append(socketPath) }
+        }
+    }
+
+    struct Fixture {
+        let temp: URL
+        let paths: BossEnginePaths
+        let bundledEnginePath: String
+        let socketControl: FakeSocketControl
+
+        init(
+            reachableSocket: ReachableSocket,
+            runningFingerprint: String? = nil,
+            fingerprintAvailable: Bool = true
+        ) throws {
+            let testRoot = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                .map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? FileManager.default.temporaryDirectory
+            temp = testRoot
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+            let primarySocket = temp.appendingPathComponent("engine.sock").path
+            let legacySocket = temp.appendingPathComponent("legacy.sock").path
+            paths = BossEnginePaths(
+                socketPath: primarySocket,
+                pidPath: temp.appendingPathComponent("engine.pid").path,
+                controlTokenPath: temp.appendingPathComponent("engine-control.token").path,
+                legacySocketPath: legacySocket,
+                legacyPIDPath: temp.appendingPathComponent("legacy.pid").path
+            )
+            bundledEnginePath = temp.appendingPathComponent("bundled-engine").path
+            let contents = Data("bundled engine fixture".utf8)
+            try contents.write(to: URL(fileURLWithPath: bundledEnginePath))
+            let fingerprint = SHA256.hash(data: contents).prefix(6)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            let reachablePath: String
+            switch reachableSocket {
+            case .primary: reachablePath = primarySocket
+            case .legacy: reachablePath = legacySocket
+            case .none: reachablePath = temp.appendingPathComponent("unreachable.sock").path
+            }
+            socketControl = FakeSocketControl(
+                reachableSocket: reachablePath,
+                expectedFingerprint: fingerprintAvailable ? (runningFingerprint ?? fingerprint) : nil
+            )
+        }
+
+        func makeController(
+            launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil
+        ) -> EngineProcessController {
+            EngineProcessController(
+                paths: paths,
+                launchDirectory: temp.path,
+                forceRestart: false,
+                stopOnExit: false,
+                restartPolicy: .default,
+                socketControl: socketControl,
+                bundledEnginePathOverride: bundledEnginePath,
+                launchHandler: launchHandler
+            )
+        }
+    }
+}
+```
+
+### `tools/boss/app-macos/Tests/BossTests/EngineRestartPolicyTests.swift` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -31,7 +31,8 @@ final class EngineRestartPolicyTests: XCTestCase {
+ 
+     func testExhaustsBudgetAcrossDeadTicks() {
+         var supervisor = EngineSupervisor(policy: .init(
+-            backoffSchedule: [1, 2], maximumAttempts: 2, pollInterval: 1, healthyResetInterval: 60
++            backoffSchedule: [1, 2], maximumAttempts: 2, pollInterval: 1, healthyResetInterval: 60,
++            consecutiveFailureThreshold: 1
+         ))
+         let now = Date()
+ 
+@@ -43,7 +44,8 @@ final class EngineRestartPolicyTests: XCTestCase {
+ 
+     func testHealthyIntervalReplenishesExhaustedBudget() {
+         var supervisor = EngineSupervisor(policy: .init(
+-            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60
++            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60,
++            consecutiveFailureThreshold: 1
+         ))
+         let now = Date()
+ 
+@@ -59,7 +61,8 @@ final class EngineRestartPolicyTests: XCTestCase {
+ 
+     func testResetRestoresRestartBudgetImmediately() {
+         var supervisor = EngineSupervisor(policy: .init(
+-            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60
++            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60,
++            consecutiveFailureThreshold: 1
+         ))
+         let now = Date()
+ 
+@@ -68,4 +71,21 @@ final class EngineRestartPolicyTests: XCTestCase {
+         supervisor.reset()
+         XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+     }
++
++    func testDebouncesSingleUnreachableTickBeforeSchedulingRestart() {
++        var supervisor = EngineSupervisor(policy: .init(
++            backoffSchedule: [1], maximumAttempts: 1, consecutiveFailureThreshold: 3
++        ))
++        let now = Date()
++
++        XCTAssertEqual(
++            supervisor.tick(isAlive: false, now: now),
++            .unreachable(consecutiveFailures: 1, requiredFailures: 3)
++        )
++        XCTAssertEqual(
++            supervisor.tick(isAlive: false, now: now),
++            .unreachable(consecutiveFailures: 2, requiredFailures: 3)
++        )
++        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
++    }
+ }
+```
+
+**Before (merge base)** (`tools/boss/app-macos/Tests/BossTests/EngineRestartPolicyTests.swift` @ `6f8ca35153d0fcae9aea5e9852894ea549989ca0`):
+
+```
+import XCTest
+@testable import Boss
+
+final class EngineRestartPolicyTests: XCTestCase {
+    func testUsesFinalBackoffDelayForLaterAttempts() {
+        let policy = EngineRestartPolicy(backoffSchedule: [1, 3], maximumAttempts: 5)
+
+        XCTAssertEqual(policy.delay(forAttempt: 1), 1)
+        XCTAssertEqual(policy.delay(forAttempt: 2), 3)
+        XCTAssertEqual(policy.delay(forAttempt: 5), 3)
+    }
+
+    func testEnvironmentOverridesPolicyKnobs() {
+        let policy = EngineRestartPolicy.fromEnvironment([
+            "BOSS_ENGINE_RESTART_BACKOFF_SECONDS": "0.5, 2, 5",
+            "BOSS_ENGINE_RESTART_MAX_ATTEMPTS": "4",
+        ])
+
+        XCTAssertEqual(policy.backoffSchedule, [0.5, 2, 5])
+        XCTAssertEqual(policy.maximumAttempts, 4)
+    }
+
+    func testInvalidEnvironmentValuesFallBackToDefaults() {
+        let policy = EngineRestartPolicy.fromEnvironment([
+            "BOSS_ENGINE_RESTART_BACKOFF_SECONDS": "0, nope",
+            "BOSS_ENGINE_RESTART_MAX_ATTEMPTS": "nope",
+        ])
+
+        XCTAssertEqual(policy, .default)
+    }
+
+    func testExhaustsBudgetAcrossDeadTicks() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1, 2], maximumAttempts: 2, pollInterval: 1, healthyResetInterval: 60
+        ))
+        let now = Date()
+
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 2, delay: 2))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 2))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .wait)
+    }
+
+    func testHealthyIntervalReplenishesExhaustedBudget() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60
+        ))
+        let now = Date()
+
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 1))
+        XCTAssertEqual(supervisor.tick(isAlive: true, now: now), .running)
+        XCTAssertEqual(supervisor.tick(isAlive: true, now: now.addingTimeInterval(60)), .running)
+        XCTAssertEqual(
+            supervisor.tick(isAlive: false, now: now.addingTimeInterval(60)),
+            .restart(attempt: 1, delay: 1)
+        )
+    }
+
+    func testResetRestoresRestartBudgetImmediately() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60
+        ))
+        let now = Date()
+
+        _ = supervisor.tick(isAlive: false, now: now)
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 1))
+        supervisor.reset()
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+    }
+}
+```
+
+**After (head)** (`tools/boss/app-macos/Tests/BossTests/EngineRestartPolicyTests.swift` @ `68e51b6cfd5cb8ccac6473273d04d57fe972d7a4`):
+
+```
+import XCTest
+@testable import Boss
+
+final class EngineRestartPolicyTests: XCTestCase {
+    func testUsesFinalBackoffDelayForLaterAttempts() {
+        let policy = EngineRestartPolicy(backoffSchedule: [1, 3], maximumAttempts: 5)
+
+        XCTAssertEqual(policy.delay(forAttempt: 1), 1)
+        XCTAssertEqual(policy.delay(forAttempt: 2), 3)
+        XCTAssertEqual(policy.delay(forAttempt: 5), 3)
+    }
+
+    func testEnvironmentOverridesPolicyKnobs() {
+        let policy = EngineRestartPolicy.fromEnvironment([
+            "BOSS_ENGINE_RESTART_BACKOFF_SECONDS": "0.5, 2, 5",
+            "BOSS_ENGINE_RESTART_MAX_ATTEMPTS": "4",
+        ])
+
+        XCTAssertEqual(policy.backoffSchedule, [0.5, 2, 5])
+        XCTAssertEqual(policy.maximumAttempts, 4)
+    }
+
+    func testInvalidEnvironmentValuesFallBackToDefaults() {
+        let policy = EngineRestartPolicy.fromEnvironment([
+            "BOSS_ENGINE_RESTART_BACKOFF_SECONDS": "0, nope",
+            "BOSS_ENGINE_RESTART_MAX_ATTEMPTS": "nope",
+        ])
+
+        XCTAssertEqual(policy, .default)
+    }
+
+    func testExhaustsBudgetAcrossDeadTicks() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1, 2], maximumAttempts: 2, pollInterval: 1, healthyResetInterval: 60,
+            consecutiveFailureThreshold: 1
+        ))
+        let now = Date()
+
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 2, delay: 2))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 2))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .wait)
+    }
+
+    func testHealthyIntervalReplenishesExhaustedBudget() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60,
+            consecutiveFailureThreshold: 1
+        ))
+        let now = Date()
+
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 1))
+        XCTAssertEqual(supervisor.tick(isAlive: true, now: now), .running)
+        XCTAssertEqual(supervisor.tick(isAlive: true, now: now.addingTimeInterval(60)), .running)
+        XCTAssertEqual(
+            supervisor.tick(isAlive: false, now: now.addingTimeInterval(60)),
+            .restart(attempt: 1, delay: 1)
+        )
+    }
+
+    func testResetRestoresRestartBudgetImmediately() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60,
+            consecutiveFailureThreshold: 1
+        ))
+        let now = Date()
+
+        _ = supervisor.tick(isAlive: false, now: now)
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 1))
+        supervisor.reset()
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+    }
+
+    func testDebouncesSingleUnreachableTickBeforeSchedulingRestart() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1], maximumAttempts: 1, consecutiveFailureThreshold: 3
+        ))
+        let now = Date()
+
+        XCTAssertEqual(
+            supervisor.tick(isAlive: false, now: now),
+            .unreachable(consecutiveFailures: 1, requiredFailures: 3)
+        )
+        XCTAssertEqual(
+            supervisor.tick(isAlive: false, now: now),
+            .unreachable(consecutiveFailures: 2, requiredFailures: 3)
+        )
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+    }
+}
+```
+

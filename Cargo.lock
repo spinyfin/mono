@@ -1677,11 +1677,15 @@ dependencies = [
 name = "boss-review-guide"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bon",
  "boss-pr-review-sources",
  "boss-pr-template",
  "regex",
+ "serde",
+ "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

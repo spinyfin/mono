@@ -1,0 +1,13 @@
+{
+  "case_id": "mono-2860",
+  "variant": "baseline",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "started_at_epoch": 1793150456.8941782,
+  "ended_at_epoch": 1793151398.563554,
+  "wall_seconds": 941.6693758964539,
+  "exit_code": 1,
+  "turn_failed": true,
+  "usage": null,
+  "accepted_submissions": 0
+}
