@@ -25,7 +25,7 @@ Both completion paths record the head the run finished at before they take the h
 
 `work_executions.pr_head_after` is written by the same completion on both paths.
 
-A declared delivery whose head cannot be read from either source does not complete. The run fails as a delivery the engine could not confirm: the task goes to `blocked` with `blocked_reason = worker_failed` and a `blocked_detail` that names the unreadable head, the status ledger records the basis `delivered_without_pr`, and a `run_done_audit_flagged` attention item is filed on the run. `bossctl dispatch stuck` lists the row as a worker failure with that basis. Start the revision again once the pull request can be read.
+A delivery whose head cannot be read does not complete, at either boundary: a declared delivery when both of its reads fail, a Stop-boundary completion when its read fails, GitHub's mergeability answer carried no head and the Stop boundary stamped none. The run fails as a delivery the engine could not confirm: the task goes to `blocked` with `blocked_reason = worker_failed` and a `blocked_detail` that names the unreadable head, the status ledger records the basis `delivered_without_pr`, and a `run_done_audit_flagged` attention item is filed on the run. `bossctl dispatch stuck` lists the row as a worker failure with that basis. Start the revision again once the pull request can be read.
 
 ## What releases it
 

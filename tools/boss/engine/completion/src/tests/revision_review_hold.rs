@@ -523,3 +523,59 @@ async fn a_stop_completion_with_no_batch_holds_for_the_head_the_run_finished_at(
     assert_eq!(scene.run().pr_head_after.as_deref(), Some(PUSHED));
     assert_eq!(scene.awaited_head().as_deref(), Some(PUSHED));
 }
+
+/// The Stop boundary could read no head either: it stamped none, the direct
+/// read fails and GitHub's answer carried none. It fails the same way a
+/// declared delivery does, before any review is admitted.
+#[tokio::test]
+async fn a_stop_completion_with_an_unreadable_head_fails_visibly_instead_of_holding() {
+    let workspace = tempdir().unwrap();
+    let scene = scene(workspace.path());
+    let enqueuer = AdmitAtHead::at(PUSHED);
+    let handler = scene.handler(Err("gh api: 502 Bad Gateway"), HeadProbe(None), enqueuer.clone());
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &scene.execution_id,
+            PR.into(),
+            WorkerPrCompletionTarget::InReview,
+            "stop_sha_delta",
+        )
+        .await;
+
+    let StopOutcome::RunDoneDeclaredWithoutDelivery { detail } = outcome else {
+        panic!("an unreadable head must fail the delivery, got {outcome:?}");
+    };
+    assert!(detail.contains("head commit could not be read"), "{detail}");
+    assert_eq!(scene.run().status, ExecutionStatus::Failed);
+    let task = scene.task();
+    assert_eq!(task.status, TaskStatus::Blocked, "not left `active` with nothing live");
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+    assert_eq!(enqueuer.calls.load(Ordering::SeqCst), 0);
+}
+
+/// The head the Stop boundary stamped is a head. With it the completion can
+/// say what the hold is for even when its own reads fail, so it proceeds.
+#[tokio::test]
+async fn a_stop_completion_proceeds_on_the_head_the_stop_boundary_stamped() {
+    let workspace = tempdir().unwrap();
+    let scene = scene(workspace.path());
+    scene
+        .db
+        .set_revision_stop_contributed_head(&scene.execution_id, PUSHED)
+        .unwrap();
+    let handler = scene.handler(Err("gh api: 502 Bad Gateway"), HeadProbe(None), AdmitAtHead::at(PUSHED));
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &scene.execution_id,
+            PR.into(),
+            WorkerPrCompletionTarget::InReview,
+            "stop_sha_delta",
+        )
+        .await;
+
+    assert_eq!(outcome, StopOutcome::ReviewerEnqueued { pr_url: PR.into() });
+    assert_eq!(scene.status(), TaskStatus::Active);
+    assert_eq!(scene.awaited_head().as_deref(), Some(PUSHED));
+}

@@ -16,7 +16,8 @@
 //! hold against the batch for it.
 //!
 //! - [`WorkerCompletionHandler::delivered_revision_head`] reads the head a
-//!   delivery finished at. A declared delivery whose head cannot be read
+//!   declared delivery finished at. The Stop boundary has its own reads.
+//!   On either path a delivery whose head cannot be read from any source
 //!   does not complete: it fails with a named diagnostic
 //!   ([`WorkerCompletionHandler::fail_delivery_with_unreadable_head`]),
 //!   because a hold with no head is one nothing can release.
@@ -68,7 +69,8 @@ impl WorkerCompletionHandler {
         }
     }
 
-    /// Fail a declared delivery whose pull-request head cannot be read.
+    /// Fail a revision's delivery whose pull-request head cannot be read,
+    /// at either completion boundary.
     ///
     /// The run is over either way. What cannot be decided is which review
     /// its push is held for, so completing it would leave the revision
@@ -82,12 +84,12 @@ impl WorkerCompletionHandler {
         pr_url: &str,
     ) -> StopOutcome {
         let detail = format!(
-            "Execution `{}` declared `boss propose done --outcome delivered` for {pr_url}, but the pull \
-             request's head commit could not be read: GitHub's mergeability answer carried no head and the \
-             direct read of the head failed or timed out. A finished revision is held for the review of one \
-             specific head, so without it nothing could release the hold. The declaration is still terminal: \
-             the run has ended and its slot and lease are released. Check that the pull request can be read \
-             (`gh pr view {pr_url} --json headRefOid`), then start this revision again.",
+            "Execution `{}` finished its run delivering to {pr_url}, but the pull request's head commit \
+             could not be read: GitHub's mergeability answer carried no head and the direct read of the head \
+             failed or timed out. A finished revision is held for the review of one specific head, so without \
+             it nothing could release the hold. The run has ended and its slot and lease are released. Check \
+             that the pull request can be read (`gh pr view {pr_url} --json headRefOid`), then start this \
+             revision again.",
             execution.id
         );
         if !self
@@ -100,7 +102,7 @@ impl WorkerCompletionHandler {
             .file_execution_attention(
                 execution,
                 RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND,
-                "Declared `delivered` but the pull request's head could not be read",
+                "Revision delivered but the pull request's head could not be read",
                 detail.clone(),
             )
             .await
@@ -108,7 +110,7 @@ impl WorkerCompletionHandler {
             tracing::warn!(
                 execution_id = %execution.id,
                 ?err,
-                "run_done finalize (delivered, head unreadable): failed to file attention item",
+                "revision delivery (head unreadable): failed to file attention item",
             );
         }
         tracing::warn!(
@@ -116,8 +118,8 @@ impl WorkerCompletionHandler {
             work_item_id = %execution.work_item_id,
             pr_url,
             pr_head_before = execution.pr_head_before.as_deref().unwrap_or("(none recorded)"),
-            "run_done finalize: declared `delivered` but the pull request's head could not be read; \
-             failed the run with a durable task failure instead of holding the revision for an unknown head",
+            "revision delivery: the pull request's head could not be read; failed the run with a durable \
+             task failure instead of holding the revision for an unknown head",
         );
         StopOutcome::RunDoneDeclaredWithoutDelivery { detail }
     }

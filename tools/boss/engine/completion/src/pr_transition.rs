@@ -236,6 +236,26 @@ impl WorkerCompletionHandler {
         // `super::revision_review_hold`.
         let mut review_hold_head: Option<String> = None;
 
+        // A revision's review hold rests on a head. When neither the read
+        // above nor the Stop boundary's own stamp has one, this completion
+        // cannot say which review the push would be held for, and a hold
+        // taken anyway is one nothing releases. It fails here, before
+        // anything is admitted, the way a declared delivery does. Every
+        // other kind keeps the fail-open behaviour described above.
+        if !merged
+            && matches!(target, WorkerPrCompletionTarget::InReview)
+            && pr_head_after.is_none()
+            && self.enable_revision_triggered_reviews
+            && let Ok(execution) = execution_result.as_ref()
+            && execution.kind == ExecutionKind::RevisionImplementation
+            && !matches!(
+                self.work_db.get_revision_stop_contributed_head(execution_id),
+                Ok(Some(ref stamped)) if !stamped.is_empty()
+            )
+        {
+            return self.fail_delivery_with_unreadable_head(execution, &pr_url).await;
+        }
+
         // For reviewer-triggering executions with a fresh
         // (non-merged) PR, try to enqueue an independent reviewer pass
         // instead of immediately advancing to human Review.
@@ -688,23 +708,14 @@ impl WorkerCompletionHandler {
             None if holds_revision && !stamped_at_stop => pr_head_after.as_deref(),
             None => None,
         };
-        if let Some(head) = head_to_record {
-            if let Err(err) = self.work_db.set_revision_stop_contributed_head(execution_id, head) {
-                tracing::warn!(
-                    execution_id,
-                    head,
-                    ?err,
-                    "pr completion: failed to record the head this revision is held for",
-                );
-            }
-        } else if holds_revision && !stamped_at_stop {
+        if let Some(head) = head_to_record
+            && let Err(err) = self.work_db.set_revision_stop_contributed_head(execution_id, head)
+        {
             tracing::warn!(
                 execution_id,
-                pr_url = %pr_url,
-                source,
-                "pr completion: holding a revision for review with no pull-request head recorded: neither \
-                 the Stop boundary nor this completion could read one. The deferred-admission sweep \
-                 records it when it next reads the pull request",
+                head,
+                ?err,
+                "pr completion: failed to record the head this revision is held for",
             );
         }
 
