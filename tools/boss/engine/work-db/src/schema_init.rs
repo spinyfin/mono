@@ -53,6 +53,8 @@ impl WorkDb {
     /// Bootstrap integer history once, then apply missing named migrations.
     /// Schema changes and their ledger entries commit atomically.
     pub fn init(&self) -> Result<()> {
+        #[cfg(test)]
+        maybe_install_peak_memory_report();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let has_schema: bool = tx.query_row(
@@ -661,6 +663,40 @@ pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 }
 
 #[cfg(test)]
+fn maybe_install_peak_memory_report() {
+    if std::env::var_os("BOSS_TEST_PEAK_MEMORY").is_none() {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn report() {
+            let filter = std::env::var("TESTBRIDGE_TEST_ONLY").unwrap_or_else(|_| "all".to_owned());
+            let self_rss = rusage_max_rss(libc::RUSAGE_SELF);
+            let child_rss = rusage_max_rss(libc::RUSAGE_CHILDREN);
+            eprintln!(
+                "peak_memory filter={filter} test_process_rss_bytes={self_rss} \
+                 child_process_rss_bytes={child_rss}"
+            );
+        }
+        let _ = unsafe { libc::atexit(report) };
+    });
+}
+
+#[cfg(test)]
+fn rusage_max_rss(who: i32) -> i64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    if cfg!(target_os = "macos") {
+        usage.ru_maxrss
+    } else {
+        usage.ru_maxrss.saturating_mul(1024)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn assert_all_migrations_applied(conn: &Connection) {
     let expected = registry::all().into_iter().map(|m| m.id).collect();
     assert_eq!(migrations::applied(conn).unwrap(), expected);
@@ -1155,12 +1191,12 @@ mod floor_tests {
         let upgrade = |version: i32| {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("supported.db");
+            copy_floor_schema(&path);
             let conn = Connection::open(&path).unwrap();
             // Preparing historical input is fixture work, not the upgrade under test.
             conn.execute_batch("BEGIN").unwrap();
             // Construct an existing DB from the independent released-chain
             // golden, rather than opening through the implementation under test.
-            seed_released_schema(&conn);
             if version >= 33 {
                 project_postmortem::migrate_project_postmortem_signals(&conn).unwrap();
             }
@@ -1348,6 +1384,18 @@ mod floor_tests {
                 .unwrap();
             assert_eq!(hosts, 0, "rejection must precede local-host initialization");
         }
+    }
+
+    fn copy_floor_schema(path: &std::path::Path) {
+        static TEMPLATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = TEMPLATE.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = Connection::open(dir.path().join("floor.db")).unwrap();
+            seed_released_schema(&conn);
+            drop(conn);
+            dir
+        });
+        std::fs::copy(dir.path().join("floor.db"), path).unwrap();
     }
 
     fn seed_released_schema(conn: &Connection) {

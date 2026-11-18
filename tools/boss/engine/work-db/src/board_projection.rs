@@ -35,6 +35,21 @@ impl WorkDb {
         caches: &board_caches::BoardCaches,
         now: i64,
     ) -> Result<(WorkTree, Refresh)> {
+        self.refresh_board_projection_limited(product, projection, trace, caches, now, MAX_RETAINED_BYTES)
+    }
+
+    /// Same as [`Self::refresh_board_projection`], with an injectable
+    /// retained-size bound. Production uses 32 MiB; tests inject a few
+    /// KiB so eviction does not allocate a 32 MiB card.
+    pub fn refresh_board_projection_limited(
+        &self,
+        product: &str,
+        projection: &mut Option<CachedProjection>,
+        trace: &mut PopulationTrace,
+        caches: &board_caches::BoardCaches,
+        now: i64,
+        max_retained_bytes: usize,
+    ) -> Result<(WorkTree, Refresh)> {
         // Everything before the board's own queries: the connection, and the
         // first read, which is what pins this transaction's snapshot. A wait
         // for the connection or for a database lock is spent here, so it is
@@ -57,7 +72,7 @@ impl WorkDb {
                 Ok(count) => {
                     let tree = model.tree().clone();
                     trace.set_items(tree.tasks.len() + tree.chores.len());
-                    if !retainable(&tree, model.retained_bytes) {
+                    if !retainable(&tree, model.retained_bytes, max_retained_bytes) {
                         *projection = None;
                     }
                     return Ok((tree, Refresh::Incremental(count)));
@@ -81,7 +96,7 @@ impl WorkDb {
         // runtimes. Updating each record's size plus one then stays a
         // conservative bound (within six bytes) even across empty lanes.
         let retained_bytes = serde_json::to_vec(&tree)?.len() + 3;
-        *projection = if retainable(&tree, retained_bytes) {
+        *projection = if retainable(&tree, retained_bytes, max_retained_bytes) {
             Some(CachedProjection {
                 model: Projection::snapshot(revision, tree.clone()),
                 validity,
@@ -94,8 +109,8 @@ impl WorkDb {
     }
 }
 
-fn retainable(tree: &WorkTree, bytes: usize) -> bool {
-    tree.tasks.len() + tree.chores.len() <= MAX_CARDS && bytes <= MAX_RETAINED_BYTES
+fn retainable(tree: &WorkTree, bytes: usize, max_retained_bytes: usize) -> bool {
+    tree.tasks.len() + tree.chores.len() <= MAX_CARDS && bytes <= max_retained_bytes
 }
 
 fn record_bytes(record: &impl serde::Serialize) -> Result<usize> {
