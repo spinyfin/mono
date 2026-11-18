@@ -34,6 +34,21 @@ pub fn parse_jj_resolve_list(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Validate the command result before interpreting stdout as conflicted paths.
+pub fn checked_jj_resolve_list(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<String>, String> {
+    if code == Some(0) {
+        return Ok(parse_jj_resolve_list(stdout));
+    }
+    // jj uses exit 2 for the explicit no-conflicts diagnostic.
+    if code == Some(2) && stdout.trim().is_empty() && stderr.trim() == "Error: No conflicts found at this revision" {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "\x60jj resolve --list\x60 failed (exit {code:?}): {}",
+        stderr.trim()
+    ))
+}
+
 /// Regenerates every generated lockfile in `conflicted` under `workspace`
 /// from `base_ref` (e.g. `main@origin`).
 pub async fn regenerate_conflicted_lockfiles(
@@ -81,6 +96,25 @@ mod tests {
     use boss_deterministic_resolvers::{ConflictClass, DeterministicResolver, ResolveOutcome};
 
     use super::*;
+
+    #[test]
+    fn resolve_list_checks_failures_and_explicit_no_conflicts() {
+        assert_eq!(
+            checked_jj_resolve_list(Some(0), "Cargo.lock    2-sided conflict\n", "").unwrap(),
+            ["Cargo.lock"]
+        );
+        assert!(checked_jj_resolve_list(Some(0), "", "").unwrap().is_empty());
+        assert!(
+            checked_jj_resolve_list(Some(2), "", "Error: No conflicts found at this revision\n")
+                .unwrap()
+                .is_empty()
+        );
+        for code in [Some(1), Some(2), None] {
+            let error = checked_jj_resolve_list(code, "", "working copy is stale").unwrap_err();
+            assert!(error.contains("working copy is stale"));
+        }
+        assert!(checked_jj_resolve_list(Some(2), "Cargo.lock", "Error: No conflicts found at this revision").is_err());
+    }
 
     /// Stands in for the real lockfile tools: rewrites the file, proving the
     /// regenerated content comes from engine-invoked code.
