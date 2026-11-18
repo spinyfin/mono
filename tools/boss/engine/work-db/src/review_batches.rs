@@ -1253,7 +1253,7 @@ fn fail_review_batch_with_attention(
     now: &str,
     title: &str,
     body_markdown: String,
-) -> Result<()> {
+) -> Result<PendingEvents> {
     tx.execute(
         "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
         params![batch.id, now],
@@ -1271,8 +1271,19 @@ fn fail_review_batch_with_attention(
     // revision held `active` for exactly this immutable target. A revision
     // that admission later re-pointed at a newer head (see
     // `record_awaited_review_head_in_tx`) is not matched and stays held.
-    release_held_revision_after_terminal_batch_in_tx(tx, &batch.cycle_root_id, &batch.target_sha, now)?;
-    Ok(())
+    //
+    // The revisions queued behind a released one are cascaded in the same
+    // transaction. The staged events are returned: a caller that owns the
+    // commit publishes them with `commit_and_publish`; the quorum state
+    // machine runs inside its caller's transaction, which has no event
+    // channel, so it drops them and the cascaded state is what dispatch reads.
+    let mut pending = PendingEvents::new();
+    for released_id in
+        release_held_revision_after_terminal_batch_in_tx(tx, &batch.cycle_root_id, &batch.target_sha, now)?
+    {
+        super::cascade_dependents_after_prereq_status_change(&mut pending, tx, &released_id, "in_review", now)?;
+    }
+    Ok(pending)
 }
 
 /// Release every revision of `cycle_root_id` held for `target_sha`, once the
@@ -1574,7 +1585,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                     Ok(ReviewBatchQuorumOutcome::Applying)
                 }
                 Some(member) if member_attempt_is_settled(member) => {
-                    fail_review_batch_with_attention(
+                    let _unpublished = fail_review_batch_with_attention(
                         tx,
                         &batch,
                         &now,
@@ -1636,7 +1647,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 Ok(ReviewBatchQuorumOutcome::SupervisorDispatched)
             } else {
                 let (title, body) = insufficient_quorum_attention(tx, &batch, &members)?;
-                fail_review_batch_with_attention(tx, &batch, &now, &title, body)?;
+                let _unpublished = fail_review_batch_with_attention(tx, &batch, &now, &title, body)?;
                 Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
             }
         }
@@ -1655,7 +1666,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 Ok(ReviewBatchQuorumOutcome::Applying)
             }
             Some(member) if member_attempt_is_settled(member) => {
-                fail_review_batch_with_attention(
+                let _unpublished = fail_review_batch_with_attention(
                     tx,
                     &batch,
                     &now,
@@ -1846,10 +1857,10 @@ impl WorkDb {
     /// (see [`Self::advance_held_pending_review_task_to_in_review`]). Returns
     /// whether the item moved to `in_review`.
     ///
-    /// Those two move the row only. A revision queued behind the released
-    /// one then stayed in `waiting_dependency` until the dependency-unblock
-    /// sweep's next pass. Paths that release a hold outside a batch's own
-    /// decision use this, so the next revision is dispatchable at once.
+    /// Those two move the row only; this also cascades to the revisions
+    /// queued behind the released one in the same transaction, so the next
+    /// revision is dispatchable immediately. Paths that release a hold outside
+    /// a batch's own decision use this.
     pub fn release_review_hold(&self, work_item_id: &str, verdict_source_id: Option<&str>) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2611,7 +2622,7 @@ impl WorkDb {
              WHERE id = ?2 AND status IN ('pending', 'running')",
             params![now, member.id],
         )?;
-        fail_review_batch_with_attention(
+        let pending = fail_review_batch_with_attention(
             &tx,
             &batch,
             &now,
@@ -2625,7 +2636,7 @@ impl WorkDb {
                 batch.pr_url, batch.id, batch.target_sha,
             ),
         )?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(true)
     }
 
@@ -2658,7 +2669,7 @@ impl WorkDb {
              WHERE id = ?2 AND status IN ('pending', 'running')",
             params![now, member.id],
         )?;
-        fail_review_batch_with_attention(
+        let pending = fail_review_batch_with_attention(
             &tx,
             &batch,
             &now,
@@ -2670,7 +2681,7 @@ impl WorkDb {
                 batch.pr_url, batch.id,
             ),
         )?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(true)
     }
 

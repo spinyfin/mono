@@ -116,9 +116,8 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                     // which is always admitted against the root.
                     //
                     // A revision is released by the batch's decision itself,
-                    // whichever it was. Asking for a verdict row left one held
-                    // for a failed batch here on every pass, with nothing
-                    // logged and nothing that would ever change the answer.
+                    // whichever it was. A failed batch has no verdict row, so a
+                    // verdict is not required to release here.
                     let settled = if candidate.task_id == candidate.cycle_root_id {
                         Ok(false)
                     } else {

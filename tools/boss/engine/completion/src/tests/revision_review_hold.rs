@@ -252,10 +252,9 @@ impl Scene {
     }
 }
 
-/// A declared delivery used to finish the run with no head recorded and hold
-/// the revision for a head only a later admission could name. It now records
-/// the head it finished at, on the run and as the head the hold is for,
-/// before anything else has a chance to run.
+/// A declared delivery records the head it finished at, on the run and as the
+/// head the hold is for, before anything else runs, so the hold never waits
+/// on a later admission to name its head.
 #[tokio::test]
 async fn a_declared_delivery_records_the_head_it_finished_at_and_holds_for_it() {
     let workspace = tempdir().unwrap();
@@ -355,6 +354,32 @@ async fn a_declared_delivery_with_an_unreadable_head_fails_visibly_instead_of_ho
         0,
         "no review is admitted for a failed delivery"
     );
+}
+
+/// A parked revision goes straight to `in_review` with no review hold, so it
+/// needs no head: an unreadable head does not fail its delivery.
+#[tokio::test]
+async fn a_parked_revision_with_an_unreadable_head_completes_without_a_hold() {
+    let workspace = tempdir().unwrap();
+    let scene = scene(workspace.path());
+    scene
+        .db
+        .park_work_item_as_actor(&scene.root_id(), true, Some("not now"), "human")
+        .unwrap();
+    let enqueuer = AdmitAtHead::at(PUSHED);
+    let handler = scene.handler(Err("gh api: 502 Bad Gateway"), HeadProbe(None), enqueuer.clone());
+
+    let outcome = handler
+        .finalize_declared_run_done(&scene.execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+
+    assert!(
+        !matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { .. }),
+        "a revision that takes no hold is not failed for lack of a head: {outcome:?}"
+    );
+    assert_ne!(scene.run().status, ExecutionStatus::Failed);
+    assert_ne!(scene.status(), TaskStatus::Blocked);
+    assert_eq!(enqueuer.calls.load(Ordering::SeqCst), 0, "a parked row is not reviewed");
 }
 
 /// The batch for the pushed head was admitted for another row and reached its

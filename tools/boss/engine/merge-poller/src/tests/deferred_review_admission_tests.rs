@@ -492,8 +492,7 @@ async fn sweep_releases_a_revision_whose_head_was_reviewed_under_its_root() {
 /// The batch for the head the revision pushed failed for good: both
 /// automatic generations ended without a verdict, so no replacement will be
 /// minted and no verdict row exists. A failed batch is a terminal decision,
-/// so the revision leaves its hold on the sweep's next pass. Asking for a
-/// verdict here left it `active` with nothing live on every pass.
+/// so the revision leaves its hold on the sweep's next pass without a verdict.
 #[tokio::test]
 async fn sweep_releases_a_revision_whose_heads_batch_failed_without_a_verdict() {
     let dir = tempdir().unwrap();
