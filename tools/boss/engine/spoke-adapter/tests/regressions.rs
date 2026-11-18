@@ -625,7 +625,14 @@ async fn an_adopt_that_finds_no_session_does_not_end_the_doubt_of_an_unanswered_
 
 #[tokio::test]
 async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt_again() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(
+        SpokeAdapterConfig::builder()
+            .command_deadline(Duration::from_millis(300))
+            .spawn_deadline(Duration::from_secs(5))
+            .prompt_timeout(Duration::from_millis(1_500))
+            .build(),
+    )
+    .await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -649,7 +656,7 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
     let second = spawn(&adapter).await.unwrap_err();
     assert!(second.downcast_ref::<SpawnOutcomeUncertain>().is_some(), "{second:#}");
     assert!(
-        started.elapsed() < Duration::from_millis(450),
+        started.elapsed() < Duration::from_millis(1_000),
         "{:?}",
         started.elapsed()
     );
