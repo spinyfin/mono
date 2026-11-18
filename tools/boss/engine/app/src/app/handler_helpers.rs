@@ -179,7 +179,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
             title: "Bundled cube could not be found".to_owned(),
             body: format!(
                 "Boss could not locate its cube binary, so workers cannot be started. \
-                 Reinstall Boss, or set BOSS_CUBE_CMD or CUBE_CLI_BIN to an executable cube path. Details: {error}"
+                 Reinstall Boss, or set CUBE_CLI_BIN to an executable cube path. Details: {error}"
             ),
         });
     }

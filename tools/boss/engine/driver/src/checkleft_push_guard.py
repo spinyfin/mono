@@ -11,20 +11,20 @@ back so the worker can fix them and retry. A genuine false positive that
 needs a human decision is escalated with propose blocked -- workers do not
 add BYPASS_ directives themselves.
 
-All policy lives in checkleft: this script shells out and trusts the exit code
-(0 = allow, non-zero = block). It is fail-open by construction -- a non-push
-command, a repo with no checkleft binary, or any error resolving/running
-checkleft all approve -- so the gate can never wedge a session; its only
-deterministic action is to block a push that checkleft itself rejected.
+All policy lives in checkleft: zero allows the push; non-zero blocks it,
+including internal errors and the pinned launcher's exit-127 failure stub.
+Non-push commands, missing checkleft commands, and execution exceptions
+(including timeouts) approve. The pinned launcher is not probed or replaced
+when it exits non-zero: that path deliberately fails closed.
 
 The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
-stdout. The checkleft invocation is resolved from (in order) the
-BOSS_CHECKLEFT_BIN env var (used as-is), `repobin exec checkleft` via a
-`repobin` found at `<repo-root>/bin/repobin` or on PATH -- gated on a
-`repobin exec checkleft --version` probe succeeding first -- then
-`<repo-root>/bin/checkleft` (a repobin-installed tool symlink), and finally a
-bare `checkleft` on PATH. See resolve_checkleft_command()'s docstring for why
-repobin is preferred and why it is probed rather than trusted outright.
+stdout. Resolution order is BOSS_CHECKLEFT_BIN (used as-is), the executable
+$BOSS_WORKER_BIN_DIR/checkleft launcher (unprobed), then repobin exec checkleft
+using $BOSS_BIN_DIR/repobin or <repo-root>/bin/repobin, in that order, without a
+repobin PATH search. The selected legacy repobin must pass an
+exec checkleft --version probe; otherwise resolution falls through to
+<repo-root>/bin/checkleft and finally checkleft on PATH. See
+resolve_checkleft_command() for the rationale behind these fallbacks.
 """
 import json
 import os
@@ -172,8 +172,9 @@ def resolve_checkleft_command(root):
        launcher is an exit-127 stub, so the gate fails closed (the push is
        blocked as a checkleft internal error) rather than silently running
        some other checkleft.
-    3. The workspace repobin (`repobin exec checkleft`), used only after
-       `probe_repobin_checkleft` confirms it can dispatch; a repobin whose
+    3. The bundle repobin at `$BOSS_BIN_DIR/repobin`, or otherwise
+       `<root>/bin/repobin` (never PATH), running `repobin exec checkleft`
+       only after `probe_repobin_checkleft` confirms it can dispatch. A repobin whose
        bazel dispatch is broken falls through instead of taking the whole
        push gate down with it.
     4. `<root>/bin/checkleft`, then a `checkleft` on PATH. The PATH lookup is

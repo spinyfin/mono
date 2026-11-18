@@ -1226,46 +1226,24 @@ if __name__ == "__main__":
 /// If checkleft reports errors the push is blocked and the findings (plus
 /// the `BYPASS_` guidance) are echoed back so the worker can act.
 ///
-/// All policy lives in checkleft: the script shells out and trusts the
-/// exit code (0 = allow, non-zero = block). It is fail-open by
-/// construction — a non-push command, a repo with no checkleft binary
-/// (e.g. no `bin/checkleft` and none on PATH), or any error
-/// resolving/running checkleft all *approve* — so the gate can never
-/// wedge a session; its only deterministic action is to block a push that
-/// checkleft itself rejected. checkleft's own "no CHECKS.yaml → exit 0"
-/// behaviour means repos without convention checks are transparently
-/// allowed.
+/// All policy lives in checkleft: zero allows the push; non-zero blocks it,
+/// including internal errors and the pinned launcher's exit-127 failure stub.
+/// Non-push commands, missing checkleft commands, and execution exceptions
+/// (including timeouts) approve. Repos without `CHECKS.yaml` are allowed by
+/// checkleft itself.
 ///
-/// The checkleft invocation is resolved from (in order): `BOSS_CHECKLEFT_BIN`
-/// (an override used by tests, used as-is); `repobin exec checkleft` via a
-/// `repobin` binary found at `$BOSS_BIN_DIR/repobin` (the Boss-bundled copy),
-/// `<repo-root>/bin/repobin` or on `PATH`, in that order, but
-/// only once a cheap `repobin exec checkleft --version` probe confirms the
-/// dispatch actually works (see `probe_repobin_checkleft` below);
-/// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
-/// bare `checkleft` on `PATH`.
+/// Resolution order is `BOSS_CHECKLEFT_BIN` (used as-is), then the executable
+/// `$BOSS_WORKER_BIN_DIR/checkleft` launcher (unprobed), then `repobin exec checkleft`.
+/// Legacy repobin resolution checks `$BOSS_BIN_DIR/repobin` before
+/// `<repo-root>/bin/repobin`, never PATH. The selected repobin must pass an
+/// `exec checkleft --version` probe; otherwise resolution falls through to
+/// `<repo-root>/bin/checkleft` and finally checkleft on PATH.
 ///
-/// repobin is preferred over a direct `checkleft` lookup because a bare
-/// `checkleft` on `PATH` can silently resolve to an unrelated, stale build —
-/// e.g. an old `cargo install checkleft` from crates.io — that predates
-/// checks the repo's current `CHECKS.yaml` configures. That binary still
-/// runs and still exits non-zero, so the gate does not fail open; it fails
-/// *closed* with `error[...]: configured check references unknown
-/// implementation`, blocking every push. `repobin exec` sidesteps this by
-/// dispatching a binary that `bazel build` produces from the current source
-/// tree (repobin's dispatch cache is keyed by a content hash of that
-/// target's build witnesses, so a stale build is never served).
-///
-/// The probe step matters because that same `bazel build` can itself fail —
-/// a broken crate elsewhere in the tree, a toolchain problem — and a failed
-/// `repobin exec checkleft run` looks identical, from the gate's point of
-/// view, to a policy failure with no findings on stdout: both exit non-zero
-/// with nothing checkleft-shaped on stdout. Without the probe that reads as
-/// a checkleft internal error and hard-blocks every push with no `BYPASS_`
-/// escape, even though the failure has nothing to do with the change being
-/// pushed. Probing with `--version` first, and falling back to the legacy
-/// `<repo-root>/bin/checkleft` / PATH resolution when it fails, keeps a
-/// broken repobin dispatch from taking down the push gate.
+/// Repobin dispatches the repository's current checkleft build, avoiding a
+/// stale PATH binary that may reject newer configured checks. The version
+/// probe protects only the legacy fallback from dispatch failures. The pinned
+/// worker launcher is deliberately unprobed: its non-zero exit fails closed
+/// rather than falling back to another checkleft.
 use boss_engine_driver::CHECKLEFT_PUSH_GUARD_SCRIPT;
 
 /// Directory holding all per-workspace worker settings files. The
