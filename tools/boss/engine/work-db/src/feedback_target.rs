@@ -38,17 +38,31 @@ impl WorkDb {
     /// maps the series to its owner-root task of any kind. Unresolved or
     /// unknown kinds return `None`.
     pub fn resolve_feedback_target(&self, artifact_kind: &str, artifact_id: &str) -> Result<Option<FeedbackTarget>> {
-        match artifact_kind {
-            "pr_doc" => Ok(self
-                .resolve_doc_owner(artifact_kind, artifact_id)?
-                .map(FeedbackTarget::RepositoryDocument)),
-            "pr_review_guide" => self.resolve_guide_implementation_target(artifact_id),
-            _ => Ok(None),
-        }
-    }
-
-    fn resolve_guide_implementation_target(&self, series_id: &str) -> Result<Option<FeedbackTarget>> {
         let conn = self.connect()?;
+        resolve_feedback_target_on(&conn, artifact_kind, artifact_id)
+    }
+}
+
+/// [`WorkDb::resolve_feedback_target`] against an open connection or
+/// transaction. The single authority for which task owns a commented
+/// artifact, shared with dispatch focus scope resolution.
+pub(crate) fn resolve_feedback_target_on(
+    conn: &Connection,
+    artifact_kind: &str,
+    artifact_id: &str,
+) -> Result<Option<FeedbackTarget>> {
+    match artifact_kind {
+        "pr_doc" => Ok(
+            super::products_design::resolve_doc_owner_on(conn, artifact_kind, artifact_id)?
+                .map(FeedbackTarget::RepositoryDocument),
+        ),
+        "pr_review_guide" => resolve_guide_implementation_target(conn, artifact_id),
+        _ => Ok(None),
+    }
+}
+
+fn resolve_guide_implementation_target(conn: &Connection, series_id: &str) -> Result<Option<FeedbackTarget>> {
+    {
         let Some((root_task_id, canonical_pr)) = conn
             .query_row(
                 "SELECT root_task_id, canonical_pr_url FROM pr_review_guide_source_series WHERE id = ?1",
@@ -59,14 +73,14 @@ impl WorkDb {
         else {
             return Ok(None);
         };
-        let Some(task) = query_task(&conn, &root_task_id)? else {
+        let Some(task) = query_task(conn, &root_task_id)? else {
             return Ok(None);
         };
         if task.deleted_at.is_some() {
             return Ok(None);
         }
-        let chain_root_id = chain_root(&conn, &task.id)?;
-        let root = query_task(&conn, &chain_root_id)?.unwrap_or(task);
+        let chain_root_id = chain_root(conn, &task.id)?;
+        let root = query_task(conn, &chain_root_id)?.unwrap_or(task);
         let pr_url = root.pr_url.clone().or_else(|| {
             if canonical_pr.is_empty() {
                 None

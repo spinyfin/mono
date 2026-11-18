@@ -1000,3 +1000,18 @@ mod artifact_tests;
 #[cfg(test)]
 #[path = "review_guide_sources_tests.rs"]
 mod upstream_tests;
+
+/// `(series root task id, head sha)` of one comparison, against an open
+/// connection. Shared with dispatch focus scope resolution so a comparison is
+/// attributed to the same root task everywhere.
+pub(crate) fn comparison_root_and_head_on(conn: &Connection, comparison_id: &str) -> Result<Option<(String, String)>> {
+    conn.query_row(
+        "SELECT s.root_task_id, c.head_sha FROM pr_review_guide_source_comparisons c
+         JOIN pr_review_guide_source_series s ON s.id = c.series_id
+         WHERE c.id = ?1",
+        [comparison_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}

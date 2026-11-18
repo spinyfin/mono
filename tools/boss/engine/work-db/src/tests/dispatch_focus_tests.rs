@@ -539,16 +539,3 @@ fn answer_agent_on_a_review_guide_comment_follows_the_series_root_task() {
     assert!(in_focus(&db, &in_comment.id, &focus));
     assert!(!in_focus(&db, &out_comment.id, &focus));
 }
-
-#[test]
-fn answer_agent_on_a_work_item_comment_follows_the_work_item() {
-    let db = WorkDb::open(temp_db_path("focus-answer-work-item")).unwrap();
-    let product = create_test_product(&db);
-    let focused = project(&db, &product.id, "Focused", false);
-    let other = project(&db, &product.id, "Other", false);
-    let inside = project_task(&db, &product.id, &focused.id, "Inside");
-    let outside = project_task(&db, &product.id, &other.id, "Outside");
-    let focus = focus_on_project(&focused.id);
-    assert!(in_focus(&db, &comment_on(&db, "work_item", &inside.id).id, &focus));
-    assert!(!in_focus(&db, &comment_on(&db, "work_item", &outside.id).id, &focus));
-}

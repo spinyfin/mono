@@ -44,7 +44,8 @@
 use anyhow::Context;
 use boss_protocol::{DispatchFocus, DispatchFocusTarget, DispatchFocusTargetKind, ExecutionKind, TaskKind};
 
-use super::products_design::resolve_doc_owner_on;
+use super::feedback_target::resolve_feedback_target_on;
+use super::review_guide_sources::comparison_root_and_head_on;
 use super::*;
 
 /// Metadata KV key holding the JSON-encoded [`DispatchFocus`].
@@ -161,16 +162,7 @@ impl<'a> ScopeResolver<'a> {
             };
         }
         if id.starts_with("prgc_") {
-            let comparison: Option<(String, String)> = self
-                .conn
-                .query_row(
-                    "SELECT s.root_task_id, c.head_sha FROM pr_review_guide_source_comparisons c
-                     JOIN pr_review_guide_source_series s ON s.id = c.series_id
-                     WHERE c.id = ?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
+            let comparison = comparison_root_and_head_on(self.conn, id)?;
             return match comparison {
                 // The guide describes one head of the root's PR, so it
                 // follows the review of that head.
@@ -181,13 +173,8 @@ impl<'a> ScopeResolver<'a> {
             };
         }
         // An automation triage run is keyed by the automation id.
-        let automation_product: Option<String> = self
-            .conn
-            .query_row("SELECT product_id FROM automations WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        Ok(automation_product.is_some_and(|product_id| self.focus.product_ids.contains(&product_id)))
+        let automation = crate::automations::query_automation(self.conn, id)?;
+        Ok(automation.is_some_and(|automation| self.focus.product_ids.contains(&automation.product_id)))
     }
 
     fn project_in_scope(&self, project_id: &str) -> Result<bool> {
@@ -251,10 +238,11 @@ impl<'a> ScopeResolver<'a> {
     }
 }
 
-/// The work item that owns the artifact a comment is on. Answer agents only
-/// spawn for design/investigation-owned `pr_doc` comments, `pr_review_guide`
-/// comments and work-item comments; every other artifact has no owner. Shared
-/// by focus scope resolution and the explicit answer-agent launch so both
+/// The task that owns the artifact a comment is on, through the same
+/// feedback-target resolution the answer-agent spawn path uses. Answer agents
+/// only spawn for design/investigation-owned `pr_doc` comments and
+/// `pr_review_guide` comments; every other artifact has no owner. Shared by
+/// focus scope resolution and the explicit answer-agent launch so both
 /// attribute a comment to the same task.
 fn comment_owner_on(conn: &Connection, comment_id: &str) -> Result<Option<String>> {
     let comment: Option<(String, String)> = conn
@@ -267,18 +255,7 @@ fn comment_owner_on(conn: &Connection, comment_id: &str) -> Result<Option<String
     let Some((kind, artifact_id)) = comment else {
         return Ok(None);
     };
-    Ok(match kind.as_str() {
-        "work_item" if artifact_id != comment_id => Some(artifact_id),
-        "pr_doc" => resolve_doc_owner_on(conn, &kind, &artifact_id)?.map(|owner| owner.task_id),
-        "pr_review_guide" => conn
-            .query_row(
-                "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ?1",
-                [&artifact_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?,
-        _ => None,
-    })
+    Ok(resolve_feedback_target_on(conn, &kind, &artifact_id)?.map(|target| target.owner_task_id().to_owned()))
 }
 
 /// The persisted focus set against an open connection or transaction.
