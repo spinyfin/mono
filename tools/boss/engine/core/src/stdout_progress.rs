@@ -462,9 +462,9 @@ mod tests {
         assert_eq!(
             *sink.seen.lock().unwrap(),
             vec![
-                WorkerActivity::Idle,    // SessionStart(startup) leaves Spawning
-                WorkerActivity::Working, // PreToolUse
-                WorkerActivity::Idle,    // Stop
+                WorkerActivity::Idle,            // SessionStart(startup) leaves Spawning
+                WorkerActivity::Working,         // PreToolUse
+                WorkerActivity::WaitingForInput, // Stop without a declared job
             ],
         );
         assert_eq!(stats.events_emitted, 3);
@@ -816,7 +816,7 @@ mod tests {
 
         assert_eq!(stats.events_emitted, 1);
         assert_eq!(stats.unrecognised_envelopes, 1);
-        assert_eq!(*sink.seen.lock().unwrap(), vec![WorkerActivity::Idle]);
+        assert_eq!(*sink.seen.lock().unwrap(), vec![WorkerActivity::WaitingForInput]);
     }
 
     // ─── checkpoint ordering ────────────────────────────────────────────────

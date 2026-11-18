@@ -550,7 +550,7 @@ async fn process_state(
             // session: if it didn't clear the error by the next
             // sweep, fall through to orphan+respawn.
             let already_nudged = nudged_executions.remove(&execution_id);
-            let try_nudge = !already_nudged && state.activity == WorkerActivity::Idle;
+            let try_nudge = !already_nudged && can_nudge(state.activity);
 
             if try_nudge {
                 let msg = if stall_reason == "no_activity" {
@@ -844,10 +844,22 @@ fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {
     }
 }
 
+fn can_nudge(activity: WorkerActivity) -> bool {
+    matches!(
+        activity,
+        WorkerActivity::Idle | WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue
+    )
+}
+
 fn should_inspect(activity: WorkerActivity) -> bool {
     matches!(
         activity,
-        WorkerActivity::Idle | WorkerActivity::WaitingForInput | WorkerActivity::Errored | WorkerActivity::Terminated
+        WorkerActivity::Idle
+            | WorkerActivity::WaitingForInput
+            | WorkerActivity::WaitingOnWork
+            | WorkerActivity::WaitOverdue
+            | WorkerActivity::Errored
+            | WorkerActivity::Terminated
     )
 }
 
@@ -1269,15 +1281,8 @@ mod tests {
                 execution_id: execution_id.to_owned(),
             }),
         );
-        // Drive Spawning → Idle via a Stop event (no pending notification).
-        live_states.apply_event(
-            slot_id,
-            &boss_protocol::WorkerEvent::Stop {
-                session_id: "s".to_owned(),
-                stop_hook_active: false,
-                stop_reason: boss_protocol::StopReason::Completed,
-            },
-        );
+        // Seed legacy Idle explicitly; a no-wait Stop now requires input.
+        live_states.set_activity_for_test(slot_id, WorkerActivity::Idle);
     }
 
     const SOCKET_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: The socket connection was closed unexpectedly."}]}}"#;
@@ -2348,6 +2353,22 @@ mod tests {
     }
 
     #[test]
+    fn nudge_only_non_human_parked_workers() {
+        for (activity, expected) in [
+            (WorkerActivity::Spawning, false),
+            (WorkerActivity::Working, false),
+            (WorkerActivity::Idle, true),
+            (WorkerActivity::WaitingForInput, false),
+            (WorkerActivity::WaitingOnWork, true),
+            (WorkerActivity::WaitOverdue, true),
+            (WorkerActivity::Errored, false),
+            (WorkerActivity::Terminated, false),
+        ] {
+            assert_eq!(can_nudge(activity), expected, "{activity:?}");
+        }
+    }
+
+    #[test]
     fn should_inspect_covers_every_worker_activity_variant() {
         // Exhaustive over WorkerActivity so adding a variant forces a
         // deliberate decision here rather than silently defaulting.
@@ -2355,6 +2376,8 @@ mod tests {
             WorkerActivity::Spawning,
             WorkerActivity::Working,
             WorkerActivity::WaitingForInput,
+            WorkerActivity::WaitingOnWork,
+            WorkerActivity::WaitOverdue,
             WorkerActivity::Idle,
             WorkerActivity::Errored,
             WorkerActivity::Terminated,
@@ -2362,6 +2385,8 @@ mod tests {
             let expected = match activity {
                 WorkerActivity::Idle
                 | WorkerActivity::WaitingForInput
+                | WorkerActivity::WaitingOnWork
+                | WorkerActivity::WaitOverdue
                 | WorkerActivity::Errored
                 | WorkerActivity::Terminated => true,
                 WorkerActivity::Spawning | WorkerActivity::Working => false,

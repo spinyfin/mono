@@ -42,16 +42,32 @@ The two statuses now mean what they say, and both are `is_live()`:
 
 ### A worker is busy for the whole turn, including while it waits on its own background command
 
-`activity` is `Working` from the first turn activity the driver reports (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`) until the driver reports the turn boundary (`Stop`). Nothing in between lowers it: not a balanced tool call, not a long think, not minutes of silence. `Idle` means one thing — the driver said the turn ended — and the only honest way to get there is a `Stop` the driver actually emitted.
+`activity` is `Working` from the first turn activity the driver reports (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`) until the driver reports the turn boundary (`Stop`). Nothing in between lowers it: not a balanced tool call, not a long think, not minutes of silence. A `Stop` establishes that the turn ended. For drivers that support input detection, the parked activity then distinguishes a declared job (`WaitingOnWork` or `WaitOverdue`) from a worker requiring input (`WaitingForInput`); legacy drivers retain `Idle`.
 
 Two driver facts make this matter more than it sounds:
 
-- **A Codex background-terminal wait is silent by design.** The rollout translator (`engine/driver/src/codex/progress.rs`) announces a command once, when its cell starts (`PreToolUse`), and treats every `wait`/`write_stdin` poll of that cell as a continuation of the announced command: no `PreToolUse` for the poll, no `PostToolUse` while the command is still running. `• Waiting for background terminal (12m 49s • esc to interrupt)` on the TUI is a chain of 30-second polls inside one turn, and the engine sees no event for any of them. The command's own `PreToolUse` is the last tool-boundary event, so the slot stays `Working` with `current_tool` set — correctly — until the command's real output or the turn's `task_complete` arrives. A Claude worker's equivalent is a long foreground `Bash` call (one `PreToolUse`, then nothing); a Claude worker that backgrounds a command _ends its turn_ (`Stop`) and is woken by Claude Code when the command finishes, so `Idle` there is the truth, not this bug.
+- **A Codex background-terminal wait is silent by design.** The rollout translator (`engine/driver/src/codex/progress.rs`) announces a command once, when its cell starts (`PreToolUse`), and treats every `wait`/`write_stdin` poll of that cell as a continuation of the announced command: no `PreToolUse` for the poll, no `PostToolUse` while the command is still running. `• Waiting for background terminal (12m 49s • esc to interrupt)` on the TUI is a chain of 30-second polls inside one turn, and the engine sees no event for any of them. The command's own `PreToolUse` is the last tool-boundary event, so the slot stays `Working` with `current_tool` set — correctly — until the command's real output or the turn's `task_complete` arrives. A Claude worker's equivalent is a long foreground `Bash` call (one `PreToolUse`, then nothing); a Claude worker that backgrounds a command _ends its turn_ (`Stop`) and is woken by Claude Code when the command finishes, so its parked activity follows the declared-wait classification below.
 - **The durable checkpoint carries the turn, not just the tool.** `work_runs.semantic_tool_condition` (`in_flight` / `idle` / `unknown`) answers only "is a tool call unbalanced right now?", which is `idle` for most of a live turn — between tools, during a think, and for the whole of a background wait whose polls emit nothing after an earlier command completed. `work_runs.semantic_turn_condition` (`in_turn` / `ended` / `unknown`, schema 50) mirrors the reducer's turn gate: set to `in_turn` by the main session's turn-activity events, to `ended` by `Stop`, and left alone by everything else. Both columns are persisted from the reducer's latest post-apply state, captured under a dedicated persistence lock (the registry mutex is released before the database write, so the registry and database locks are never nested) (`WorkDb::record_semantic_checkpoint`, `tools/boss/engine/work-db/src/semantic_progress.rs`), so an event the reducer refuses as stale (a `Stop` that arrives after the next turn's tool hook) or does not count (a subagent's tool hooks) never changes them. Both are restored to the slot by `LiveWorkerStateRegistry::seed_semantic_progress` on re-adoption, where the turn condition decides busy-vs-idle: `in_turn` seeds `Working`; `ended` seeds `Idle`; a row from before the column (`unknown`) seeds `Working` only when a tool was in flight and otherwise leaves the slot unknown (`Spawning`) until the next driver event. A balanced last tool call is not evidence that the turn ended, so no `Idle` is inferred from it. This is a one-time gap at upgrade: a worker that was mid-turn in a silent background wait remains unknown (`Spawning`) until its next driver event, for either driver. Checkpoint-seeded slots are exempt from startup-stall promotion, so the 30-second timer cannot turn this uncertainty into `Idle` or `WaitingForInput`.
 
 A re-adopted slot seeded from the tool condition alone reads `Idle` over a worker that is mid-turn in a background wait: the last tool boundary was an earlier command completing, and the polls since emit nothing. Seeding from the turn condition, and re-establishing the rollout tail on adoption (below), is what keeps the pane header at `Working` for such a worker.
 
 A pane going `Terminated`/`Errored` is deliberately NOT mirrored. That is a death signal, and death detection has its own owners with their own corroboration rules — see Convergence below.
+
+### A worker parked on its own work is not "needs input"
+
+`WaitingForInput` / the app's "Needs input" count mean exactly one thing: a person must answer. A worker that ended its turn while a build or command it started is still running (and said so with `boss propose wait`) is not that — the driver still emits an idle-prompt `Notification` after the `Stop`, which by itself does not distinguish autonomous waiting from a human prompt. The engine folds the worker's declared wait into the parked activity, in one place (`apply_hook_event` in `engine/live-worker-state/src/lib.rs`, classification in `engine/live-worker-state/src/declared_wait.rs`), so the pill, the header subtitle, the top-bar count, the durable `waiting_human` mirror and `bossctl` all read one value:
+
+| Parked worker                                                        | `activity`          | Counts as "Needs input"      |
+| -------------------------------------------------------------------- | ------------------- | ---------------------------- |
+| Blocking prompt (permission, elicitation, …), with or without a wait | `waiting_for_input` | yes                          |
+| `Stop` or idle prompt, declared wait still live                      | `waiting_on_work`   | no                           |
+| Declared wait expired while parked, no re-wake                       | `wait_overdue`      | no (but surfaced as stalled) |
+| Idle prompt, no wait                                                 | `waiting_for_input` | yes                          |
+| `Stop`, no wait, awaiting-input capable driver                       | `waiting_for_input` | yes                          |
+
+The wait is read from `WaitRegistry` (the `boss propose wait` declaration) — never from pane or footer text. A periodic pass on the 10s honesty tick (`reconcile_declared_waits`) covers what hooks cannot: a wait declared after the worker parked, and a deadline passing on a silent worker. Expiry is a one-way move to `wait_overdue` (never back to `waiting_for_input`). Accepted waits survive main-session status replies, coordinator prompts, wakeups and subagent activity until their bounded deadline; resuming does not prove that the job finished. The snapshot hides wait captions during an active turn, while blocking prompts always require input. A wait that expires before Stop or the first reconcile tick also gives `wait_overdue`. Renewing a wait returns the worker to `waiting_on_work`. Only `WorkerActivity::needs_human()` (Rust) / `WorkerActivity.needsHuman` (Swift) feed the count, so the app has no second definition to drift.
+
+Undeclared background shells and monitors are not covered: Claude's hooks carry no completion signal for them, so the engine cannot tell "still running" from "forgotten", and pane/footer text is not an authoritative lifecycle signal: inferring background work from it can mask a real human prompt.
 
 ### `live_status` is not the indicator's input
 
@@ -263,21 +279,18 @@ Three things close the ordering hole:
   writes, so an older handler that stalls can never leave `waiting_human`
   over a pane that has since moved on.
 - **A declared wait survives turns until its bounded deadline.** A wait
-  (`boss propose wait`) reserves time for a background job. A human asking
-  for status, a coordinator prompt, or an autonomous wakeup does not prove
-  that job finished. Main-session hooks, including late or reordered hooks,
-  therefore neither revoke nor extend the grant. The live snapshot hides
-  its wait caption during an active turn (and keeps permission prompts
-  visible); after Stop the unexpired wait is visible again. The declaration
-  still records hook order so a Stop before the declaration cannot turn a
-  current permission prompt into a job wait.
+  (`boss propose wait`) reserves time for a background job. Status replies,
+  coordinator prompts and wakeups do not consume it or extend its deadline.
+  The worker renews only when the job needs more time. The live snapshot
+  hides the wait caption during an active turn and keeps blocking prompts
+  visible.
 
-  Completion checks the active wait before recording a nudge: status replies
-  consume no consecutive or total breaker strikes, and do not clear earlier
-  legitimate strikes. A renewal replaces the deadline and charges its full
-  duration against the existing per-execution cap. The two-hour declaration
-  limit, cumulative cap, expiry, teardown cleanup, and other safety checks
-  are unchanged. Workers need to renew only when the job needs more time.
+  Completion checks the active wait before recording a nudge: while the
+  declaration is active, checks consume no consecutive or total breaker
+  strikes and do not clear earlier legitimate strikes. A renewal replaces
+  the deadline and charges its full duration against the existing
+  per-execution cap. The two-hour declaration limit, cumulative cap, expiry,
+  teardown cleanup, and other safety checks still apply.
 
   Expiry does not itself run a timer callback or fail the execution. The
   merge poller retains a `WorkerWait` nudge intent and calls

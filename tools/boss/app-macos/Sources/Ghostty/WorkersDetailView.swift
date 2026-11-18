@@ -496,11 +496,13 @@ struct WorkerSlotView: View, @MainActor Equatable {
     }
 
     private func liveActivityColor(_ live: WorkerSlotLiveSlice?) -> Color {
-        if live?.isWaitingOnJob == true { return .secondary }
         if live?.hungSince != nil { return .orange }
+        if live?.activity == .idle, live?.isWaitingOnJob == true { return .secondary }
         switch live?.activity {
         case .working: return .blue
         case .waitingForInput: return .orange
+        case .waitingOnWork: return .teal
+        case .waitOverdue: return .yellow
         case .idle: return .green
         case .spawning: return .secondary
         case .errored: return .red

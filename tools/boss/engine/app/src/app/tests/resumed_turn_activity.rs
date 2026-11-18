@@ -139,7 +139,7 @@ async fn a_background_wakeup_turn_reads_as_working_and_preserves_the_bounded_wai
 
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
     let idle = snapshot(&server_state);
-    assert_eq!(idle.activity, WorkerActivity::Idle);
+    assert_eq!(idle.activity, WorkerActivity::WaitingOnWork);
     assert!(idle.current_tool.is_none());
     assert_eq!(
         idle.wait_reason.as_deref(),
@@ -180,7 +180,7 @@ async fn a_background_wakeup_turn_reads_as_working_and_preserves_the_bounded_wai
     dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 9)).await;
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 10)).await;
     let idle_again = snapshot(&server_state);
-    assert_eq!(idle_again.activity, WorkerActivity::Idle);
+    assert_eq!(idle_again.activity, WorkerActivity::WaitingOnWork);
     assert!(idle_again.current_tool.is_none());
     assert_eq!(idle_again.wait_reason.as_deref(), Some(WAIT_REASON));
 }
@@ -221,7 +221,7 @@ async fn a_stop_whose_ingress_finishes_after_the_next_turns_tool_hook_does_not_r
     dispatch_worker_event_fanout(&server_state, &post_tool_use(&execution_id, "Bash", 5)).await;
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 6)).await;
     let idle = snapshot(&server_state);
-    assert_eq!(idle.activity, WorkerActivity::Idle);
+    assert_eq!(idle.activity, WorkerActivity::WaitingForInput);
     assert!(idle.current_tool.is_none());
 }
 
@@ -636,9 +636,10 @@ async fn a_notification_overtaken_by_its_stop_still_parks_the_worker_on_the_huma
     // that ended on a permission prompt: WaitingForInput, `waiting_human`.
     let (server_state, _dir) = test_server_state();
     let execution_id = spawned_worker(&server_state);
+    declare_wait(&server_state, &execution_id);
     dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
-    assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle);
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingOnWork);
 
     dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
     assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingForInput);
@@ -694,6 +695,7 @@ async fn consumed_late_notifications_do_not_park_running_executions() {
     for repeated_stop in [false, true] {
         let (server_state, _dir) = test_server_state();
         let execution_id = spawned_worker(&server_state);
+        declare_wait(&server_state, &execution_id);
         if repeated_stop {
             dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
         } else {
@@ -702,7 +704,7 @@ async fn consumed_late_notifications_do_not_park_running_executions() {
         }
         dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
         dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
-        assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle);
+        assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingOnWork);
         assert_eq!(
             server_state.work_db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Running
@@ -716,6 +718,7 @@ async fn late_notification_consumers_arriving_afterwards_leave_executions_runnin
     for arrival in [[5u64, 2, 3, 4], [4, 2, 3, 5]] {
         let (server_state, _dir) = test_server_state();
         let execution_id = spawned_worker(&server_state);
+        declare_wait(&server_state, &execution_id);
         for seq in arrival {
             let event = match seq {
                 2 => notification(&execution_id, 2),
@@ -725,7 +728,11 @@ async fn late_notification_consumers_arriving_afterwards_leave_executions_runnin
             };
             dispatch_worker_event_fanout(&server_state, &event).await;
         }
-        assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle, "{arrival:?}");
+        assert_eq!(
+            snapshot(&server_state).activity,
+            WorkerActivity::WaitingOnWork,
+            "{arrival:?}"
+        );
         assert_eq!(
             server_state.work_db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Running,
@@ -739,6 +746,7 @@ async fn late_notifications_preserve_non_hook_terminal_states() {
     for activity in [WorkerActivity::Errored, WorkerActivity::Terminated] {
         let (server_state, _dir) = test_server_state();
         let execution_id = spawned_worker(&server_state);
+        declare_wait(&server_state, &execution_id);
         dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
         server_state.live_worker_states.set_activity_for_test(SLOT, activity);
         dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
@@ -809,9 +817,12 @@ async fn a_declared_wait_overrides_waiting_for_input_while_a_bare_prompt_keeps_i
         .live_worker_states
         .set_activity_for_test(SLOT, WorkerActivity::WaitingForInput);
     let waiting = snapshot(&server_state);
-    assert_eq!(waiting.activity, WorkerActivity::Idle);
+    assert_eq!(waiting.activity, WorkerActivity::WaitingOnWork);
     assert_eq!(waiting.wait_reason.as_deref(), Some(WAIT_REASON));
-    assert!(waiting.live_status.is_none(), "no generic 'awaiting input' subtitle");
+    assert_eq!(
+        waiting.live_status.as_deref(),
+        Some(boss_engine_runtime::live_status::WAITING_ON_WORK_LITERAL)
+    );
 }
 
 #[tokio::test]
@@ -842,7 +853,7 @@ async fn a_stop_from_a_turn_before_the_wait_was_declared_keeps_waiting_for_input
 }
 
 #[tokio::test]
-async fn an_expired_wait_reverts_a_normalized_idle_worker_to_waiting_for_input() {
+async fn snapshot_normalizes_a_legacy_input_state_to_waiting_on_work() {
     let (server_state, _dir) = test_server_state();
     let execution_id = spawned_worker(&server_state);
 
@@ -856,7 +867,7 @@ async fn an_expired_wait_reverts_a_normalized_idle_worker_to_waiting_for_input()
     server_state
         .live_worker_states
         .set_activity_for_test(SLOT, WorkerActivity::WaitingForInput);
-    assert_eq!(snapshot(&server_state).activity, WorkerActivity::Idle);
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingOnWork);
 
     // Once the deadline passes the registry no longer reports the wait, so
     // the snapshot stops normalizing and the pending prompt asks the owner.
@@ -867,4 +878,21 @@ async fn an_expired_wait_reverts_a_normalized_idle_worker_to_waiting_for_input()
     let expired = snapshot(&server_state);
     assert_eq!(expired.activity, WorkerActivity::WaitingForInput);
     assert!(expired.wait_reason.is_none());
+}
+
+#[tokio::test]
+async fn a_blocking_prompt_after_stop_is_not_hidden_by_snapshot_wait_normalization() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 3)).await;
+    dispatch_worker_event_fanout(&server_state, &notification(&execution_id, 2)).await;
+    let asking = snapshot(&server_state);
+    assert_eq!(asking.activity, WorkerActivity::WaitingForInput);
+    assert_eq!(asking.wait_reason.as_deref(), Some(WAIT_REASON));
+    assert_eq!(
+        asking.live_status.as_deref(),
+        Some(boss_engine_runtime::live_status::AWAITING_INPUT_LITERAL)
+    );
 }

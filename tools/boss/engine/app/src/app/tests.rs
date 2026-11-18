@@ -255,19 +255,14 @@ pub(super) fn make_session_sink() -> Arc<SessionSink> {
 /// until the first SessionStart/Stop; tests that only exercise the
 /// pane-write path skip that lifecycle and park the worker at Idle.
 pub(super) fn register_idle_worker(server_state: &ServerState, run_id: &str, slot_id: u8) {
-    use boss_protocol::{WorkerActivity, WorkerEvent};
+    use boss_protocol::WorkerActivity;
     server_state.worker_registry.register_run_slot(run_id, slot_id);
     server_state
         .live_worker_states
         .register_spawn(slot_id, run_id.to_owned(), "claude-opus-4-7", 0, None);
-    server_state.live_worker_states.apply_event(
-        slot_id,
-        &WorkerEvent::Stop {
-            session_id: "test-sess".into(),
-            stop_hook_active: false,
-            stop_reason: boss_protocol::StopReason::Completed,
-        },
-    );
+    server_state
+        .live_worker_states
+        .set_activity_for_test(slot_id, WorkerActivity::Idle);
     assert_eq!(
         server_state.live_worker_states.get(slot_id).unwrap().activity,
         WorkerActivity::Idle,

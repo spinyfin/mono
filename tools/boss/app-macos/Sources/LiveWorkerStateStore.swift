@@ -16,7 +16,7 @@ final class LiveWorkerStateStore: ObservableObject {
     /// `terminated` are excluded; an `idle` worker still holds its slot
     /// and conversation state.
     private static let aliveActivities: Set<WorkerActivity> = [
-        .idle, .spawning, .working, .waitingForInput,
+        .idle, .spawning, .working, .waitingForInput, .waitingOnWork, .waitOverdue,
     ]
 
     /// Count of currently alive workers. Used by the quit-confirmation

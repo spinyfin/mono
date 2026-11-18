@@ -52,7 +52,7 @@ struct WorkNavigatorActivity: View {
         let runId = selected.runId ?? selected.executionId
         guard let live = model.liveWorkerStates.byRunID[runId] else { return false }
         switch live.activity {
-        case .spawning, .working, .waitingForInput, .idle: return true
+        case .spawning, .working, .waitingForInput, .waitingOnWork, .waitOverdue, .idle: return true
         case .errored, .terminated: return false
         }
     }
@@ -104,7 +104,7 @@ struct WorkNavigatorActivity: View {
         }
         switch live.activity {
         case .errored, .terminated: return true
-        case .spawning, .working, .waitingForInput, .idle: return false
+        case .spawning, .working, .waitingForInput, .waitingOnWork, .waitOverdue, .idle: return false
         }
     }
 

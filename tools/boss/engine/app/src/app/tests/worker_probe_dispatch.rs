@@ -512,7 +512,7 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
 /// first.
 #[tokio::test]
 async fn probe_queued_for_idle_worker_dispatches_immediately() {
-    use boss_protocol::{RequestExecutionInput, WorkerActivity, WorkerEvent};
+    use boss_protocol::{RequestExecutionInput, WorkerActivity};
 
     let (server_state, _dir) = test_server_state();
 
@@ -543,15 +543,10 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
     server_state
         .live_worker_states
         .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 0, None);
-    // Apply a Stop event to transition Spawning → Idle.
-    server_state.live_worker_states.apply_event(
-        1,
-        &WorkerEvent::Stop {
-            session_id: "sess-1".into(),
-            stop_hook_active: false,
-            stop_reason: boss_protocol::StopReason::Completed,
-        },
-    );
+    // Seed the legacy Idle state explicitly; Stop without a wait needs input.
+    server_state
+        .live_worker_states
+        .set_activity_for_test(1, WorkerActivity::Idle);
     assert_eq!(
         server_state.live_worker_states.get(1).unwrap().activity,
         WorkerActivity::Idle,

@@ -853,12 +853,11 @@ pub(super) async fn dispatch_live_worker_state(
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
     let new_activity = new_state.as_ref().map(|s| s.activity);
-    // A resumed turn can be a status question while the declared job is
-    // still running. Keep the bounded wait until its deadline; turn activity
-    // neither renews it nor changes breaker counts. The snapshot hides the
-    // wait caption during the turn without revoking nudge suppression. A
-    // main-session resume can change that overlay even when a subagent
-    // already made the raw slot read Working with the same tool.
+    // Wait consumption is part of the main-session turn reduction. A late
+    // Stop can prove a resume without changing activity, but the cleared
+    // wait caption still needs publication. A main-session resume can change
+    // that overlay even when a subagent already made the raw slot read
+    // Working with the same tool.
     if changed || applied.resumed_after.is_some() {
         server_state.broadcast_live_worker_states().await;
     }

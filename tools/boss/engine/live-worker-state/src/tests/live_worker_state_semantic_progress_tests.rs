@@ -272,5 +272,5 @@ fn apply_event_tracks_the_turn_condition_alongside_the_tool_condition() {
     reg.apply_event(1, &stop_event());
     let after_stop = reg.semantic_progress_for_slot(1).unwrap();
     assert_eq!(after_stop.turn_condition, SemanticTurnCondition::Ended);
-    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Idle);
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
 }
