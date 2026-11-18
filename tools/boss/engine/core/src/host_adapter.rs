@@ -58,18 +58,46 @@ const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 /// scanned (another user's cwd is unreadable and cannot be a workspace
 /// occupant); an unreadable same-user process, or an unavailable probe tool,
 /// is `UNKNOWN`. A workspace directory that does not exist is `EMPTY`.
+///
+/// A process that exits while it is being scanned is not an unreadable one.
+/// Its cwd stops resolving as soon as it starts to exit, and its `/proc` entry
+/// disappears when its parent reaps it, so "the cwd did not resolve" has to be
+/// followed by a check that the process is still there and still running.
+/// `leaving` makes that check from one read of `/proc/<pid>/stat` by the shell
+/// itself. The earlier form ran `grep` on `status` after an existence test: a
+/// process reaped between the two made `grep` fail, which read as "not a
+/// zombie", and a host with ordinary process churn reported `UNKNOWN` for an
+/// empty workspace.
+///
+/// `$2` replaces `/proc` as the directory to scan. Callers never pass it; the
+/// tests do, to put processes in states a real one holds for microseconds.
 const REMOTE_OCCUPANCY_SCRIPT: &str = r#"
 ws="$1"
+proc="${2:-/proc}"
 if [ ! -e "$ws" ] && [ ! -L "$ws" ]; then echo EMPTY; exit 0; fi
 ws=$(cd "$ws" 2>/dev/null && pwd -P) || { echo UNKNOWN; exit 0; }
 inside() { case "$1" in "$ws"|"$ws"/*) return 0;; esac; return 1; }
-if [ -d /proc/self ]; then
+# leaving <proc dir>: succeeds when the process can no longer hold a cwd. It is
+# gone (stat cannot be read), a zombie or dead (state Z or X), or exiting
+# (PF_EXITING, 0x4 in the flags field, set before the cwd is released).
+# After "pid (comm) " the fields are state ppid pgrp session tty tpgid flags;
+# comm may itself contain ") ", so everything up to the last one is dropped.
+# A stat line that does not parse is not proof, and fails.
+leaving() {
+  { read -r st < "$1/stat"; } 2>/dev/null || return 0
+  st=${st##*") "}
+  set -- $st
+  case "$1" in Z|X) return 0;; esac
+  case "$7" in ''|*[!0-9]*) return 1;; esac
+  [ $(( $7 & 4 )) -ne 0 ]
+}
+if [ -d "$proc/self" ]; then
   unknown=0
-  for p in /proc/[0-9]*; do
+  for p in "$proc"/[0-9]*; do
     [ -O "$p" ] || continue
     if c=$(readlink "$p/cwd" 2>/dev/null); then
       if inside "$c"; then echo OCCUPIED; exit 0; fi
-    elif [ -e "$p" ] && ! grep -q '^State:[[:space:]]*[ZX]' "$p/status" 2>/dev/null; then
+    elif ! leaving "$p"; then
       # Same-uid unreadable cwd (sandbox init, non-dumpable helper). Keep
       # scanning: an occupant later in /proc still makes this OCCUPIED, matching
       # the local ProcessSnapshot probe. UNKNOWN only if nothing was inside.
@@ -1885,11 +1913,18 @@ mod tests {
     }
 
     fn run_occupancy_script(workspace: &Path) -> String {
-        let output = std::process::Command::new("sh")
-            .args(["-c", REMOTE_OCCUPANCY_SCRIPT, "sh"])
-            .arg(workspace)
-            .output()
-            .expect("run the occupancy script");
+        run_occupancy_script_scanning(workspace, None)
+    }
+
+    /// Runs the script the way the adapter does, or against `proc_root` in
+    /// place of `/proc` when one is given.
+    fn run_occupancy_script_scanning(workspace: &Path, proc_root: Option<&Path>) -> String {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", REMOTE_OCCUPANCY_SCRIPT, "sh"]).arg(workspace);
+        if let Some(proc_root) = proc_root {
+            command.arg(proc_root);
+        }
+        let output = command.output().expect("run the occupancy script");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
@@ -1957,6 +1992,136 @@ mod tests {
             return;
         }
         assert_eq!(seen, "OCCUPIED");
+    }
+
+    /// What the script concludes about a process whose cwd does not resolve,
+    /// pinned against a directory laid out like `/proc`. A real process is in
+    /// most of these states for microseconds, and the script used to answer
+    /// `UNKNOWN` when it met one: the first test in this group failed about
+    /// once in six runs of this binary wherever a complete scan was possible,
+    /// because the other tests' children were exiting during its scans.
+    ///
+    /// Linux only: this is the `/proc` branch of the script, and the stat
+    /// lines are in the Linux format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_occupancy_script_classifies_processes_without_a_readable_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let elsewhere = root.path().join("elsewhere");
+        let proc_root = root.path().join("proc");
+        std::fs::create_dir_all(workspace.join("nested")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(proc_root.join("self")).unwrap();
+        // The script compares against the workspace's physical path.
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let elsewhere = std::fs::canonicalize(&elsewhere).unwrap();
+
+        // process <pid> <cwd> <stat line>: a `/proc/<pid>` with those entries,
+        // each of them optional.
+        let process = |pid: &str, cwd: Option<&Path>, stat: Option<&str>| {
+            let dir = proc_root.join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(cwd) = cwd {
+                std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+            }
+            if let Some(stat) = stat {
+                std::fs::write(dir.join("stat"), format!("{stat}\n")).unwrap();
+            }
+        };
+        let verdict = || run_occupancy_script_scanning(&workspace, Some(&proc_root));
+
+        // Flags are decimal in stat. 4194560 is 0x400100, an ordinary process;
+        // 4194564 adds 0x4, PF_EXITING.
+        process(
+            "101",
+            Some(&elsewhere),
+            Some("101 (sleep) S 1 101 101 0 -1 4194560 0 0"),
+        );
+        assert_eq!(verdict(), "EMPTY", "a readable cwd outside the workspace");
+
+        // Reaped after the script saw its directory: nothing left to read. This
+        // is the state the old `grep` took for a live, unreadable process.
+        process("102", None, None);
+        // A zombie, with a name chosen to break a naive parse of the line.
+        process("103", None, Some("103 (a) b) Z 1 103 103 0 -1 4194560 0 0"));
+        // Exiting: the cwd is already released, the state is still running.
+        process("104", None, Some("104 (sh) R 1 104 104 0 -1 4194564 0 0"));
+        assert_eq!(verdict(), "EMPTY", "processes that are gone, zombies or exiting");
+
+        // Alive, not exiting, and unreadable: the scan cannot vouch for it.
+        process("105", None, Some("105 (init) S 0 105 105 0 -1 4194560 0 0"));
+        assert_eq!(verdict(), "UNKNOWN", "a live process with an unreadable cwd");
+        std::fs::remove_dir_all(proc_root.join("105")).unwrap();
+        assert_eq!(verdict(), "EMPTY");
+
+        // A stat line that does not parse proves nothing about the process.
+        process("106", None, Some("not a stat line"));
+        assert_eq!(verdict(), "UNKNOWN", "an unparseable stat line");
+
+        // An occupant outranks an unknown, wherever it comes in the scan.
+        process(
+            "107",
+            Some(&workspace.join("nested")),
+            Some("107 (sleep) S 1 107 107 0 -1 4194560 0 0"),
+        );
+        assert_eq!(verdict(), "OCCUPIED");
+    }
+
+    /// The same property against the real `/proc`: processes that start and
+    /// exit while the script scans must not turn an empty workspace into
+    /// `UNKNOWN`. The test above pins the script's reading of each state; this
+    /// one checks that a real kernel presents an exiting process the way that
+    /// test assumes. It supplies the churn itself, so it does not depend on
+    /// what else is running. It is a weak detector on its own (the old script
+    /// failed it in about one run in twenty), which is why the states are also
+    /// pinned directly.
+    ///
+    /// Under Bazel's `linux-sandbox` the sandbox's init process has a cwd this
+    /// test cannot read, every scan is `UNKNOWN`, and the test has nothing to
+    /// observe; it does its work where the scan is complete, as on a remote
+    /// worker or a real host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_occupancy_script_ignores_processes_that_exit_during_the_scan() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        if run_occupancy_script(&workspace) == "UNKNOWN" {
+            return;
+        }
+
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // Spawn, exit and reap as fast as possible, outside the
+                        // workspace. A spawn that fails must fail the test: with
+                        // no churn it would pass without testing anything.
+                        std::process::Command::new("sleep")
+                            .arg("0")
+                            .current_dir(&elsewhere)
+                            .status()
+                            .expect("spawn a short-lived process");
+                    }
+                });
+            }
+            let verdicts: Vec<String> = (0..40).map(|_| run_occupancy_script(&workspace)).collect();
+            stop.store(true, Ordering::Relaxed);
+            let wrong: Vec<&String> = verdicts.iter().filter(|verdict| *verdict != "EMPTY").collect();
+            assert!(
+                wrong.is_empty(),
+                "{} of {} scans of an empty workspace were not EMPTY while unrelated processes came and went: {wrong:?}",
+                wrong.len(),
+                verdicts.len()
+            );
+        });
     }
 
     /// A `WorkerSetupInput` shaped like the one the remote spawn builds.
