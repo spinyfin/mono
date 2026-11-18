@@ -310,7 +310,7 @@ mod git_store_guard_tests {
         // not reference a path that does not exist there.
         let input = sample_input();
         let parsed: serde_json::Value =
-            serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+            serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver).unwrap()).unwrap();
         assert!(
             git_store_guard_command(&parsed).is_none(),
             "remote settings must not carry the local gate script: {parsed}"

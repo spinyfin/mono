@@ -204,8 +204,17 @@ fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
         (menu.review_model_for_tier)(ReviewModelTier::Strong),
         "fable",
     ];
-    for model in models {
+    const SKIP: &str = "--dangerously-skip-permissions";
+    const AUTO: &str = "--permission-mode auto";
+    let expected_modes = [
+        (models[0], SKIP),
+        (models[1], SKIP),
+        (models[2], AUTO),
+        (models[3], AUTO),
+    ];
+    for (model, base_mode) in expected_modes {
         for non_opus_auto_mode in [false, true] {
+            let expected = if non_opus_auto_mode { AUTO } else { base_mode };
             let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
                 model,
                 effort: None,
@@ -218,13 +227,6 @@ fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
                 plan.command
                     .contains(&format!("--settings '{}'", settings_path.display()))
             );
-            let expected = if matches!(model, m if m == (menu.review_model_for_tier)(ReviewModelTier::Strong) || m == "fable")
-                || non_opus_auto_mode
-            {
-                "--permission-mode auto"
-            } else {
-                "--dangerously-skip-permissions"
-            };
             assert!(
                 plan.command.contains(expected),
                 "unverified reviewer mode: {}",
@@ -250,6 +252,35 @@ fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
     });
     assert!(plan.command.contains("--dangerously-skip-permissions"));
     assert!(plan.command.contains("--settings '"), "{}", plan.command);
+    // The launch builders' own gate accepts the fenced command and rejects the
+    // same skip-permissions command without a settings file.
+    real.worker_kind.verify_launch_command_fenced(&plan.command).unwrap();
+    let unfenced = ClaudeDriver.spawn_invocation(SpawnRequest {
+        model: (menu.review_model_for_tier)(ReviewModelTier::Fast),
+        effort: None,
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: real.worker_kind.forced_permission_mode(),
+        run_id: Some(&real.run_id),
+    });
+    assert!(
+        real.worker_kind
+            .verify_launch_command_fenced(&unfenced.command)
+            .is_err()
+    );
+    assert!(
+        WorkerKind::Triage
+            .verify_launch_command_fenced(&unfenced.command)
+            .is_err()
+    );
+    WorkerKind::Standard
+        .verify_launch_command_fenced(&unfenced.command)
+        .unwrap();
+    // The referenced settings file carries the write fence as well.
+    assert!(
+        written_deny_has_fence(&written.settings_path),
+        "reviewer settings must carry the absolute write fence"
+    );
     // Publication is fenced by a PreToolUse guard, not only by prefix rules.
     let written_settings: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&written.settings_path).unwrap()).unwrap();
@@ -724,4 +755,12 @@ fn review_guide_hook_chain_masks_literal_body_and_still_rejects_wrappers() {
             "{decision}"
         );
     }
+}
+
+fn written_deny_has_fence(path: &Path) -> bool {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["permissions"]["deny"].as_array().unwrap().iter().any(|r| {
+        r.as_str()
+            .is_some_and(|r| r.starts_with("Edit(//") && r.ends_with("/**)"))
+    })
 }

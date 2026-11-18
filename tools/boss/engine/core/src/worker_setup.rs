@@ -228,9 +228,16 @@ pub fn render_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) 
 /// the worker-visible *forwarded* socket path on the remote (e.g.
 /// `/tmp/boss-events-<run>.sock`) and `boss_event_path` with the remote
 /// shim (typically the bare `boss-event` resolved on the remote PATH).
-pub fn render_remote_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> String {
+///
+/// A Reviewer whose workspace path is relative is rejected with the same
+/// typed error as the local write path: its absolute `Edit(//...)` write
+/// fence cannot be expressed, so shipping settings would fail open.
+pub fn render_remote_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> io::Result<String> {
+    if input.worker_kind == WorkerKind::Reviewer {
+        validate_reviewer_workspace(&input.workspace_path)?;
+    }
     let value = settings_value(input, EngineDataDirSandbox::Disabled, driver);
-    serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
+    Ok(serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable"))
 }
 
 /// Whether `driver` reports its progress through hooks that this module

@@ -336,7 +336,7 @@ pub(crate) fn prepare_remote_launch(input: RemoteLaunchInput<'_>) -> Result<Remo
         )
         .build();
     crate::host_adapter::reject_unobservable_remote_driver(driver.as_ref(), driver_slug, &settings_input, host)?;
-    let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
+    let settings_json = render_remote_settings_json(&settings_input, driver.as_ref())?;
 
     let structured_output_kind = embedded_output_path
         .and_then(|_| crate::runner::designated_output_kind(execution, item))

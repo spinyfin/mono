@@ -84,6 +84,27 @@ impl WorkerKind {
 }
 
 impl WorkerKind {
+    /// Fail loudly when a launch command would run this kind without its
+    /// settings file. `--dangerously-skip-permissions` bypasses permission
+    /// prompts, so for every kind other than [`WorkerKind::Standard`] the
+    /// only enforcement left is the `--settings` file's deny rules and
+    /// PreToolUse hooks; a command that skips permissions without
+    /// `--settings` would run that kind completely unfenced.
+    pub fn verify_launch_command_fenced(&self, command: &str) -> Result<(), String> {
+        if *self == WorkerKind::Standard {
+            return Ok(());
+        }
+        if command.contains("--dangerously-skip-permissions") && !command.contains("--settings ") {
+            return Err(format!(
+                "refusing to launch a {} worker with --dangerously-skip-permissions and no --settings file: its write/publish fence would be inert",
+                self.label()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl WorkerKind {
     /// Short display label for alerts and bossctl output.
     pub fn label(&self) -> &'static str {
         match self {
