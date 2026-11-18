@@ -146,10 +146,9 @@ impl WorkDb {
                 // dispatches, and that must still win when the gate accepts
                 // it — "an explicit driver on the row always wins" is about
                 // the row, not about the instant the execution was created.
-                // Only the *allocation* is frozen at insert time (see
-                // `work::driver_allocation`), which is what keeps a row from
-                // flipping driver between attempts of one dispatch and keeps
-                // a split change off already-dispatched work.
+                // Allocation is revalidated at claim and launch composition
+                // (see `work::driver_allocation`). Hook reads use that saved
+                // decision so split changes do not reroute a running worker.
                 //
                 // A pin the gate refuses for this execution kind is dropped
                 // here exactly as at spawn: honouring it would point the
@@ -198,11 +197,10 @@ impl WorkDb {
                     .filter(|d| matches!(d.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
                     .and_then(|d| d.driver)
                 {
-                    // Mirrors the substitution `resolve_spawn_config_in` applies
-                    // for a `TrafficAllocation`/`EngineDefault`-sourced driver
-                    // on a tier row: an allocation-recorded driver with no
-                    // dedicated tier model (grok) never actually spawned —
-                    // the worker ran on the engine default instead.
+                    // Compatibility for workers launched before allocation
+                    // revalidation: the old spawn resolver substituted the
+                    // default for an allocated driver without a tier model.
+                    // New launches persist an eligible allocation first.
                     if design_or_investigation_tier && !driver_has_design_investigation_model(&allocated) {
                         return Ok(Some(boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned()));
                     }
@@ -478,14 +476,9 @@ mod tests {
         );
     }
 
-    /// A row's driver decision is frozen at insert time and can outlive a
-    /// later change to the row that makes it retroactively a
-    /// design/investigation-tier row. If that frozen decision recorded
-    /// `grok` (a driver with no dedicated tier model), the events-socket
-    /// lookup must substitute the engine default exactly as
-    /// `resolve_spawn_config_in` does for a `TrafficAllocation`-sourced
-    /// driver on a tier row — never return `grok` verbatim, which is not
-    /// the driver the worker actually ran on.
+    /// Legacy workers may retain a Grok decision even though the old spawn
+    /// resolver substituted the default for their design/investigation tier.
+    /// Preserve hook routing for those workers; new launches revalidate first.
     #[test]
     fn tier_row_with_recorded_grok_allocation_resolves_engine_default() {
         use boss_protocol::{DRIVER_SLUG_GROK, DriverTrafficSplit};

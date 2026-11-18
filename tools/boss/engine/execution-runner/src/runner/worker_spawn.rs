@@ -7,6 +7,8 @@ use std::path::Path;
 #[cfg(test)]
 #[path = "worker_spawn/tests.rs"]
 mod tests;
+#[cfg(test)]
+mod traffic_split_tests;
 
 use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
@@ -687,9 +689,7 @@ pub async fn compose_worker_spawn(
     };
     let allocated_driver = if is_task_or_chore {
         work_db
-            .get_execution_driver_decision(&execution.id)
-            .ok()
-            .flatten()
+            .refresh_execution_driver_decision(&execution.id)?
             .filter(|decision| matches!(decision.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
             .and_then(|decision| decision.driver)
     } else {

@@ -3,7 +3,8 @@
 //! The end-to-end cases deliberately go through `create_ready_chore_execution`
 //! (which funnels into `insert_execution`) rather than calling
 //! `decide_execution_driver` directly, so they exercise the same path real
-//! dispatch takes: decide once at insert, persist, read back.
+//! insertion takes: decide, persist, read back. `dispatch_tests` covers
+//! revalidation when a queued execution is claimed or launched.
 
 use super::*;
 use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
@@ -101,11 +102,9 @@ fn set_rejects_splits_that_do_not_sum_to_one_hundred() {
     }
 }
 
-/// A hand-edited `state.db` holding garbage falls back to the default split
-/// rather than wedging every execution insert — and never to a repaired
-/// version of the garbage.
+/// Invalid persisted data cannot silently revive a disabled default driver.
 #[test]
-fn unparseable_or_invalid_persisted_split_falls_back_to_the_default() {
+fn unparseable_or_invalid_persisted_split_fails_loudly() {
     for raw in [
         r#"{"grok":50,"claude":50,"codex":50,"agy":0}"#,
         "not json",
@@ -113,10 +112,12 @@ fn unparseable_or_invalid_persisted_split_falls_back_to_the_default() {
     ] {
         let (_dir, db) = open_db();
         db.set_metadata(METADATA_KEY_DRIVER_TRAFFIC_SPLIT, raw).unwrap();
-        assert_eq!(
-            db.get_driver_traffic_split().unwrap(),
-            DriverTrafficSplit::default(),
-            "raw {raw:?}",
+        assert!(
+            db.get_driver_traffic_split()
+                .unwrap_err()
+                .to_string()
+                .contains("persisted split"),
+            "raw {raw:?}"
         );
     }
 }
@@ -647,7 +648,7 @@ fn allocation_fails_loudly_when_no_eligible_driver_holds_a_share() {
 }
 
 #[test]
-fn design_tier_falls_back_to_the_default_when_only_grok_is_funded() {
+fn design_tier_fails_when_only_grok_is_funded() {
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0, 0))
         .unwrap();
@@ -655,10 +656,8 @@ fn design_tier_falls_back_to_the_default_when_only_grok_is_funded() {
     let task = create_test_chore(&db, &product.id, "design tier fallback");
     set_task_kind(&db, &task.id, &TaskKind::Design);
 
-    let execution = create_ready_chore_execution(&db, &task.id);
-    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.reason, REASON_DEFAULT);
-    assert_eq!(decision.driver, None);
+    let err = decide_execution_driver(&db.connect().unwrap(), &task.id, ExecutionKind::TaskImplementation).unwrap_err();
+    assert!(err.to_string().contains("0 share"), "{err}");
 }
 
 /// An empty eligible set is an error too, never the engine default.
@@ -750,33 +749,33 @@ fn conflict_resolution_and_ci_remediation_fail_loudly_when_claude_is_at_zero_eve
 }
 
 #[test]
-fn whole_share_sits_on_unavailable_drivers_requires_eligible_set_and_all_registered_at_zero() {
+fn unavailable_driver_shares_never_enable_zero_share_candidates() {
     let agy_partial = DriverTrafficSplit::new(0, 0, 90, 10);
     let agy_all = DriverTrafficSplit::new(0, 0, 0, 100);
     let no_agy = DriverTrafficSplit::new(0, 0, 100, 0);
 
     assert!(
-        !whole_share_sits_on_unavailable_drivers(&agy_partial, &[DRIVER_SLUG_CLAUDE]),
+        allocate_among(agy_partial, "task_partial", &TaskKind::Chore, &[DRIVER_SLUG_CLAUDE]).is_err(),
         "a leftover agy share with funded registered drivers is not the whole-share fallback",
     );
     assert!(
-        !whole_share_sits_on_unavailable_drivers(&agy_partial, &[]),
+        allocate_among(agy_partial, "task_empty", &TaskKind::Chore, &[]).is_err(),
         "an empty eligible set is NoEligibleDriver, not a fallback",
     );
     assert!(
-        !whole_share_sits_on_unavailable_drivers(&agy_all, &[]),
+        allocate_among(agy_all, "task_empty", &TaskKind::Chore, &[]).is_err(),
         "agy = 100 must not convert an empty eligible set into default routing",
     );
     assert!(
-        whole_share_sits_on_unavailable_drivers(&agy_all, &[DRIVER_SLUG_CLAUDE]),
-        "agy cannot launch, so its whole share falls back",
+        allocate_among(agy_all, "task_unavailable", &TaskKind::Chore, &[DRIVER_SLUG_CLAUDE]).is_err(),
+        "agy cannot launch, and the default driver has no share",
     );
-    assert!(!whole_share_sits_on_unavailable_drivers(&no_agy, &[DRIVER_SLUG_CLAUDE]));
+    assert!(allocate_among(no_agy, "task_zero", &TaskKind::Chore, &[DRIVER_SLUG_CLAUDE]).is_err());
 }
 
-/// An old agy-only share falls through to the engine default.
+/// An old agy-only share fails instead of selecting a zero-share default.
 #[test]
-fn agy_at_one_hundred_uses_engine_default() {
+fn agy_at_one_hundred_fails_when_not_launch_ready() {
     assert!(
         boss_engine_driver::DriverRegistry::default()
             .get(DRIVER_SLUG_AGY)
@@ -787,10 +786,10 @@ fn agy_at_one_hundred_uses_engine_default() {
     db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
         .unwrap();
     let product = create_test_product(&db);
-    let chore = create_test_chore(&db, &product.id, "agy 100 registered");
-    let execution = create_ready_chore_execution(&db, &chore.id);
-    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision, DriverDecision::default_no_override());
+    let chore = crate::test_support::create_test_chore_manual(&db, &product.id, "agy 100 registered");
+    let err =
+        decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap_err();
+    assert!(err.to_string().contains("0 share"), "{err}");
 }
 
 /// Restricting to a subset keeps allocation inside that subset for every
@@ -850,12 +849,12 @@ fn sole_funded_driver_is_allocated_only_when_launch_ready() {
         db.set_driver_traffic_split(split).unwrap();
         let product = create_test_product(&db);
         for i in 0..50 {
-            let chore = create_test_chore(&db, &product.id, format!("sole share {i}"));
-            let execution = create_ready_chore_execution(&db, &chore.id);
-            let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+            let chore = crate::test_support::create_test_chore_manual(&db, &product.id, format!("sole share {i}"));
+            let result = decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation);
             if expected == DRIVER_SLUG_AGY {
-                assert_eq!(decision, DriverDecision::default_no_override());
+                assert!(result.unwrap_err().to_string().contains("0 share"));
             } else {
+                let decision = result.unwrap();
                 assert_eq!(decision.reason, REASON_ALLOCATION);
                 assert_eq!(decision.driver.as_deref(), Some(expected), "under {split:?}");
             }
@@ -974,7 +973,7 @@ fn design_row_with_grok_product_default_yields_to_allocation_instead_of_wedging(
 }
 
 #[test]
-fn incompatible_model_override_falls_back_to_the_engine_default_driver() {
+fn incompatible_model_override_fails_instead_of_reviving_zero_share_driver() {
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
         .unwrap();
@@ -989,10 +988,9 @@ fn incompatible_model_override_falls_back_to_the_engine_default_driver() {
     )
     .unwrap();
 
-    let execution = create_ready_chore_execution(&db, &chore.id);
-    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.driver, None);
-    assert_eq!(decision.reason, REASON_DEFAULT);
+    let err =
+        decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap_err();
+    assert!(err.to_string().contains("0 share"), "{err}");
 }
 
 /// Same work item id → same decision, deterministically, across repeated
@@ -1036,7 +1034,7 @@ fn changing_the_split_does_not_rewrite_an_existing_decision() {
 }
 
 /// A driver pinned on the row AFTER its execution already exists still wins.
-/// The allocation is frozen at insert time, but the pin is read live —
+/// Before dispatch revalidation, the pin is still read live —
 /// "an explicit driver on the row always wins" is about the row, not about
 /// the instant the execution was created.
 #[test]

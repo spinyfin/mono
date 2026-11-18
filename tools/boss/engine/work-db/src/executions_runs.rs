@@ -886,6 +886,12 @@ impl WorkDb {
             "UPDATE work_executions SET status = 'claimed' WHERE id = ?1 AND status = 'ready'",
             [execution_id],
         )?;
+        if updated > 0 {
+            // Queued executions may predate a driver being set to zero.
+            // An allocation error rolls back the claim instead of spawning
+            // on an excluded driver or leaving a stranded claimed row.
+            crate::driver_allocation::dispatch::refresh_execution_driver_decision_conn(&tx, execution_id)?;
+        }
         tx.commit()?;
         if updated > 0 {
             return Ok(DispatchClaimOutcome::Won);

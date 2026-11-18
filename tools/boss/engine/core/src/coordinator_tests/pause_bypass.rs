@@ -30,10 +30,22 @@ async fn force_start_dispatches_past_operator_pause_and_records_override_event()
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
     let chore = create_test_chore(&db, product.id.clone(), "Held by pause");
     db.reconcile_product_executions(&product.id).unwrap();
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
     assert_eq!(execution.status, ExecutionStatus::Ready);
+    assert_eq!(
+        db.get_execution_driver_decision(&execution.id)
+            .unwrap()
+            .unwrap()
+            .driver
+            .as_deref(),
+        Some("grok")
+    );
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 100, 0, 0))
+        .unwrap();
 
     let cube = Arc::new(FakeCubeClient::default());
     let runner = Arc::new(FakeExecutionRunner::default());
@@ -60,6 +72,9 @@ async fn force_start_dispatches_past_operator_pause_and_records_override_event()
     // `dispatch_with_pause_bypass`'s doc on why this doesn't wait for it.
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert_eq!(runner.calls.lock().await.len(), 1, "the worker must actually spawn");
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.driver.as_deref(), Some("claude"));
+    assert_eq!(decision.reason, "allocation");
 
     // The pause itself is untouched — force overrides admission for this
     // one row only, never the global switch.
@@ -77,6 +92,41 @@ async fn force_start_dispatches_past_operator_pause_and_records_override_event()
     let details = &override_event.details;
     assert_eq!(details["entry_point"], "cli");
     assert_eq!(details["pause_origin"], "operator");
+}
+
+#[tokio::test]
+async fn automatic_dispatch_reallocates_a_driver_disabled_while_queued() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Queued allocation");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    assert_eq!(
+        db.get_execution_driver_decision(&execution.id)
+            .unwrap()
+            .unwrap()
+            .driver
+            .as_deref(),
+        Some("grok")
+    );
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 100, 0, 0))
+        .unwrap();
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        runner.clone(),
+    ));
+    coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+    assert_eq!(runner.calls.lock().await.len(), 1);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.driver.as_deref(), Some("claude"));
+    assert_eq!(decision.reason, "allocation");
 }
 
 /// A breaker-originated pause is never overridable: force-start must

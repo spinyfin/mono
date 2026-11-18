@@ -59,11 +59,10 @@
 //! attempt — so the same row under the same split always lands on the same
 //! driver across retries, redispatch, and recovery. Changing the split moves
 //! the boundaries and therefore reallocates some rows that have not been
-//! dispatched yet; that is deliberate, and it cannot make a row flip
-//! *between attempts of one dispatch* because the decision is computed once,
-//! at [`crate::revision_helpers::insert_execution`] time, and
-//! persisted per-execution in `execution_driver_decisions` (see
-//! [`record_execution_driver_decision`]).
+//! dispatched yet. Decisions are persisted per-execution in
+//! `execution_driver_decisions`. Before a claim or a new launch, allocation
+//! is revalidated against the current split and row constraints. Unchanged
+//! inputs stay stable across retries; running workers keep their driver.
 //!
 //! An explicit driver pin wins over allocation when the pin clears the
 //! dispatch capability gate for the execution: the work item's own `driver`
@@ -87,14 +86,15 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+pub(crate) mod dispatch;
 pub(super) mod traffic_split_migration;
 
 /// Metadata KV key for the persisted split, stored as the JSON encoding of
 /// [`DriverTrafficSplit`]. Same shape as `dispatch_concurrency_limit` (see
 /// `app/handler_helpers.rs`): read fresh at each decision point rather than
-/// cached, so a change takes effect on the very next execution created —
-/// without disturbing any execution already dispatched (a decision already
-/// recorded on an existing row is never recomputed).
+/// cached. New executions use it immediately; queued allocations are
+/// revalidated before dispatch and launch. Already-running workers retain
+/// their recorded routing for hook decoding.
 ///
 /// Deliberately ONE row holding the whole split rather than four rows: an
 /// operator edit is a single atomic write, so a concurrent dispatch can
@@ -213,20 +213,6 @@ fn eligible_drivers_for(
         .collect()
 }
 
-/// Fall back when all persisted shares sit on unavailable drivers, including
-/// registered skeletons. Funded launchable drivers excluded by capability or
-/// model constraints must still fail loudly.
-fn whole_share_sits_on_unavailable_drivers(split: &DriverTrafficSplit, eligible: &[&str]) -> bool {
-    if eligible.is_empty() {
-        return false;
-    }
-    let registry = boss_engine_driver::DriverRegistry::default();
-    DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
-        .iter()
-        .filter(|driver| registry.get(driver).is_some_and(|driver| driver.launch_ready()))
-        .all(|driver| split.share_for(driver) == Some(0))
-}
-
 /// Deterministic hash of `work_item_id` into `[0, 100)`. SHA-256 rather
 /// than `std::hash::Hasher` so the mapping is stable across engine
 /// versions/restarts, not just within one process — the whole point is
@@ -254,14 +240,8 @@ fn hash_bucket(work_item_id: &str) -> u8 {
 /// always did. `agy` starting at 0 also means shipping this sends nothing
 /// to the Antigravity driver until its configured share is explicitly increased.
 ///
-/// A value that is present but does not parse, or parses to a split that
-/// fails [`DriverTrafficSplit::validate`], can only come from a hand-edited
-/// `state.db` — [`WorkDb::set_driver_traffic_split`] refuses to persist one.
-/// It is logged at ERROR and the default is used. Note what this is NOT: the
-/// corrupt value is discarded whole, never clamped or normalised into a
-/// nearby valid-looking split. Failing the read outright would wedge every
-/// subsequent execution insert, which is a far worse outcome than routing to
-/// the default driver with a loud log line.
+/// Present but invalid data fails closed: choosing a default could revive a
+/// driver the operator disabled. The CLI and Settings surface the same error.
 pub(crate) fn load_driver_traffic_split_conn(conn: &Connection) -> Result<DriverTrafficSplit> {
     let raw: Option<String> = conn
         .query_row(
@@ -273,27 +253,12 @@ pub(crate) fn load_driver_traffic_split_conn(conn: &Connection) -> Result<Driver
     let Some(raw) = raw else {
         return Ok(DriverTrafficSplit::default());
     };
-    match serde_json::from_str::<DriverTrafficSplit>(&raw) {
-        Ok(split) => match split.validate() {
-            Ok(()) => Ok(split),
-            Err(err) => {
-                tracing::error!(
-                    raw = %raw,
-                    %err,
-                    "driver_traffic_split: persisted split is invalid — discarding it, allocating on the default split",
-                );
-                Ok(DriverTrafficSplit::default())
-            }
-        },
-        Err(err) => {
-            tracing::error!(
-                raw = %raw,
-                %err,
-                "driver_traffic_split: persisted split is unparseable — discarding it, allocating on the default split",
-            );
-            Ok(DriverTrafficSplit::default())
-        }
-    }
+    let split: DriverTrafficSplit = serde_json::from_str(&raw)
+        .map_err(|err| anyhow::anyhow!("driver_traffic_split: persisted split is unparseable: {err}"))?;
+    split
+        .validate()
+        .map_err(|err| anyhow::anyhow!("driver_traffic_split: persisted split is invalid: {err}"))?;
+    Ok(split)
 }
 
 #[work_db_boundary::instrument]
@@ -311,10 +276,9 @@ impl WorkDb {
     /// — an invalid split is the caller's error to surface, and
     /// all-four-zero is rejected by the same rule as every other bad total.
     ///
-    /// Takes effect on the next execution created — never touches an
-    /// execution already dispatched, exactly like the interactive
-    /// concurrency cap. Written as one metadata row, so no concurrent
-    /// dispatch can observe a partially-applied edit.
+    /// Takes effect on new allocations and prevents queued allocations to
+    /// zero-share drivers from launching. Running workers are unaffected.
+    /// Written as one metadata row, so dispatch never reads a partial edit.
     pub fn set_driver_traffic_split(&self, split: DriverTrafficSplit) -> Result<DriverTrafficSplit> {
         split.validate()?;
         self.set_metadata(METADATA_KEY_DRIVER_TRAFFIC_SPLIT, &serde_json::to_string(&split)?)?;
@@ -414,7 +378,7 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
 }
 
 /// Decide which driver governs a newly-created execution row and why.
-/// Called once, from `insert_execution`, using the same open `Connection`
+/// Called from insertion and dispatch revalidation, using the open `Connection`
 /// (never `WorkDb::connect()` — see `load_driver_traffic_split_conn`).
 ///
 /// Precedence:
@@ -454,18 +418,9 @@ pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
 ///    [`TaskKind`] ([`eligible_drivers_for`]).
 /// 5. Not a `tasks` row at all — no override.
 ///
-/// Errors (failing the execution insert) when the row's kind is
-/// unrecognised, or when the eligible drivers hold no share between them
-/// and that is not because the whole share sits on unregistered drivers.
-/// Remaining failures are loud on purpose: falling back to the engine
-/// default would hand an eligibility failure to a driver whose gate refuses
-/// it, or revive a registered driver that was set to 0. Zero means zero.
-/// A Settings-reachable split that puts the whole share on unregistered
-/// drivers (today: `agy = 100` with no Antigravity implementation) falls
-/// through to the engine default instead of failing every unpinned insert.
-/// A leftover unregistered share next to a funded registered driver does
-/// not: ConflictResolution / CiRemediation with `claude = 0` still fails
-/// the insert, as does an empty eligible set.
+/// Errors when the kind is unrecognised, no driver is eligible, or eligible
+/// drivers hold no share. Model, reasoning and launch-readiness restrictions
+/// never turn that failure into an engine-default fallback: zero means zero.
 pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: ExecutionKind) -> Result<DriverDecision> {
     let row = conn
         .query_row(
@@ -562,19 +517,8 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         .map(str::trim)
         .filter(|model| !model.is_empty());
     let eligible = eligible_drivers_for(&task_kind, &kind, model_override, design_or_investigation_tier);
-    if eligible.is_empty() && model_override.is_some() {
-        return Ok(DriverDecision::default_no_override());
-    }
     let split = load_driver_traffic_split_conn(conn)?;
-    let driver = match allocate_among(split, work_item_id, &task_kind, &eligible) {
-        Ok(driver) => driver,
-        Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
-        Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
-        Err(_) if whole_share_sits_on_unavailable_drivers(&split, &eligible) => {
-            return Ok(DriverDecision::default_no_override());
-        }
-        Err(err) => return Err(err),
-    };
+    let driver = allocate_among(split, work_item_id, &task_kind, &eligible)?;
     Ok(DriverDecision::allocated(driver, split))
 }
 
@@ -616,10 +560,9 @@ fn allocate_among(
         })
 }
 
-/// Persist `decision` for `execution_id`. Called once, right after the
-/// `work_executions` row is inserted, in the same transaction — this is
-/// the durable, queryable record the task requires ("how much went to each
-/// driver", "did one driver's rows fail more"), not just a log line.
+/// Persist `decision` in the transaction that inserts or claims the
+/// execution, and refresh it if launch composition finds changed inputs.
+/// This durable record also routes subsequent worker hook events.
 pub(crate) fn record_execution_driver_decision(
     conn: &Connection,
     execution_id: &str,
@@ -1184,3 +1127,6 @@ pub(super) mod sol_selection {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dispatch_tests;

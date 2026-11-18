@@ -715,9 +715,8 @@ pub(super) async fn handle_set_driver_traffic_split(ctx: Dispatch, req: Frontend
     // and persists to `state.db` itself — see its doc comment. A split that
     // does not validate is rejected here as a `WorkError`, never repaired
     // into something valid-looking. Nothing in-memory to update: every
-    // dispatch reads the metadata KV fresh at `insert_execution` time, so an
-    // accepted split takes effect on the very next execution created,
-    // without disturbing anything already dispatched.
+    // allocation reads the metadata KV fresh at insertion, dispatch claim,
+    // and launch composition. Running workers retain their saved routing.
     match work_db.set_driver_traffic_split(split) {
         Ok(applied) => {
             tracing::info!(

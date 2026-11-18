@@ -113,7 +113,12 @@ mod tests {
             db.set_metadata("driver_traffic_split", raw).unwrap();
             mark_pending(&db);
             db.init().unwrap();
-            assert_eq!(db.get_driver_traffic_split().unwrap(), DriverTrafficSplit::default());
+            assert!(
+                db.get_driver_traffic_split()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("persisted split")
+            );
         }
     }
 
