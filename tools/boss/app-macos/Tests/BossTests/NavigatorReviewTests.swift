@@ -124,7 +124,7 @@ final class NavigatorReviewTests: XCTestCase {
             NavigatorTestFixture.snapshot(model, [task])
             XCTAssertEqual(model.navigator.selectedRootID, "root")
             XCTAssertEqual(model.navigator.tab, .review)
-            XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model, root: task).contains(.review))
+            XCTAssertTrue(WorkNavigatorDetail.visibleTabs(model: model).contains(.review))
             XCTAssertEqual(model.navigatorBriefText(for: task), "Unsaved original")
             XCTAssertEqual(WorkNavigatorReview.diffURL(task.prURL)?.path, "/spinyfin/mono/pull/3629/files")
         }
