@@ -4,7 +4,7 @@
 //! two cannot drift.
 use super::*;
 
-/// What failed and how it reads to an operator.
+/// The failure and the error text shown on the attention item.
 pub(super) struct StartFailureDetail<'a> {
     pub error: &'a anyhow::Error,
     pub error_text: &'a str,
@@ -61,9 +61,8 @@ impl ExecutionCoordinator {
             "recorded execution start failure"
         );
 
-        // Maint task 6 — transient-retry wiring on `dispatch_not_before`:
-        // an `automation_triage` execution that exhausts its pre-start
-        // retries is the design's `failed_gave_up` terminal state.
+        // An `automation_triage` execution that exhausts its pre-start
+        // retries reaches the `failed_gave_up` terminal state.
         // Finalise the matching `automation_runs` row so the Automations
         // tab shows the occurrence was abandoned (the schedule already
         // advanced past it when the scheduler fired the triage). Until

@@ -214,3 +214,31 @@ fn attention_sweep_keeps_the_banner_of_a_pre_start_failure_until_a_real_run_star
     db.reconcile_stale_attention_signals().unwrap();
     assert_eq!(banner(&db), None);
 }
+
+#[test]
+fn work_resumed_attention_survives_a_later_pre_start_failure() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, &product.id, "terminal error then refusal");
+    let first = create_ready_chore_execution(&db, &chore.id);
+    let second = create_ready_chore_execution(&db, &chore.id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_attention_items(id,execution_id,kind,status,title,body_markdown,created_at)
+             VALUES ('att1',?1,'driver_terminal_error','open','fixture','','1')",
+            rusqlite::params![first.id],
+        )
+        .unwrap();
+    db.record_pre_start_failure(&second.id, "engine", None, "refused", &[])
+        .unwrap();
+    db.reconcile_stale_attention_signals().unwrap();
+    let status: String = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT status FROM work_attention_items WHERE id='att1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "open", "a failed bookkeeping run is not a resumed run");
+}
