@@ -1,4 +1,4 @@
-//! Storage for the blocked-PR sweep (`crate::blocked_pr_sweep`): the
+//! Storage for the blocked-PR sweep (`boss_engine_merge_poller::blocked_pr_sweep`): the
 //! per-card diagnosis the Review column renders, the remediation ledger
 //! that bounds every automatic action, and the fact-gathering query the
 //! sweep feeds to `boss_blocked_pr_diagnosis::diagnose`.
@@ -27,6 +27,26 @@ pub(super) const MIGRATION_ID: &str = "20261118_1417_blocked_pr_diagnoses";
 /// Creates the blocked-PR sweep's tables. Depends on no other migration.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(BLOCKED_PR_TABLES)?;
+    install_journal_triggers(conn)
+}
+
+/// Journal every change to a card's stored diagnosis as a board input:
+/// board assembly reads `pr_blocked_diagnoses` for the card's reason, so a
+/// reader that only follows `board_changes` must see the write. The
+/// remediation ledger is not journaled; no card derivation reads it.
+pub(super) fn install_journal_triggers(conn: &Connection) -> Result<()> {
+    // Older migrations rebuild board triggers before this table exists.
+    if !table_exists(conn, "pr_blocked_diagnoses")? {
+        return Ok(());
+    }
+    for (operation, row) in [("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")] {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS board_changes_pr_blocked_diagnoses_{operation}
+             AFTER {operation} ON pr_blocked_diagnoses BEGIN
+             INSERT INTO board_changes(item_id, source) VALUES ({row}.work_item_id, 'pr_blocked_diagnoses');
+             END;"
+        ))?;
+    }
     Ok(())
 }
 
@@ -158,11 +178,18 @@ impl WorkDb {
     /// `active` (PendingReview) whether or not a reviewer is live, so a
     /// reviewer stuck in dispatch, an admission hold and a reaped batch all
     /// get a reason.
+    ///
+    /// A parked card is never a candidate: the sweep is upkeep (it stores a
+    /// reason and may re-dispatch a dead revision), and parking sets the card
+    /// aside from all of it. A diagnosis stored before the card was parked is
+    /// pruned on the next pass, like any other card that left the candidate set.
     pub fn list_blocked_pr_sweep_candidates(&self) -> Result<Vec<PendingMergeCheck>> {
+        let upkeep = super::parking::upkeep_eligible_task_sql("t");
         self.query_pending_merge_checks(&format!(
             "(t.status = 'in_review'
                OR (t.status = 'blocked' AND t.blocked_reason IN {REVIEW_PHASE_BLOCKED_REASONS_SQL})
-               OR {PENDING_REVIEW_HELD_SQL})"
+               OR {PENDING_REVIEW_HELD_SQL})
+             AND {upkeep}"
         ))
     }
 
@@ -499,9 +526,7 @@ impl WorkDb {
                     outcome: row.outcome,
                     age_secs: now - row.created_at.parse::<i64>().unwrap_or(now),
                     attempt: used.map(|(a, _)| a).unwrap_or(0),
-                    budget: used
-                        .map(|(_, b)| b)
-                        .unwrap_or(TRANSIENT_RETRY_FALLBACK_BUDGET),
+                    budget: used.map(|(_, b)| b).unwrap_or(TRANSIENT_RETRY_FALLBACK_BUDGET),
                 }
             });
         let auto_maintenance_enabled = self.product_auto_pr_maintenance_enabled(&product_id).unwrap_or(true);
@@ -675,10 +700,14 @@ impl WorkDb {
                 if !v.has_successor_revision
                     && v.gate_outcome == review_verdicts::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS =>
             {
-                let states = super::review_badge::current_head_review_states(&conn, &[work_item_id.to_owned()])?;
-                v.has_successor_revision = states
+                let heads = super::review_badge::fetch_current_heads(
+                    &conn,
+                    &[work_item_id.to_owned()],
+                    super::review_badge::ReviewKey::Card,
+                )?;
+                v.has_successor_revision = heads
                     .get(work_item_id)
-                    .is_some_and(|(state, _)| *state != AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS);
+                    .is_some_and(|head| head.state != AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS);
                 Some(v)
             }
             other => other,

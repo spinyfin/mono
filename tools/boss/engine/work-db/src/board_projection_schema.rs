@@ -141,6 +141,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     }
     super::merge_evidence::install_journal_triggers(conn)?;
     super::merge_intent::install_journal_triggers(conn)?;
+    super::blocked_pr::install_journal_triggers(conn)?;
     Ok(())
 }
 

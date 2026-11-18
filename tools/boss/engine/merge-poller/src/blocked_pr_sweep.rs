@@ -24,11 +24,11 @@
 use boss_blocked_pr_diagnosis::{Action, diagnose};
 use boss_protocol::RequestExecutionInput;
 
-use boss_execution_contracts::ExecutionPublisher;
 use crate::work::{
     BlockedPrRemediationInput, PendingMergeCheck, REMEDIATION_CATEGORY_REVISION_REDISPATCH,
     REMEDIATION_OUTCOME_PENDING, REMEDIATION_OUTCOME_REQUEST_FAILED, REMEDIATION_OUTCOME_REQUESTED, WorkDb,
 };
+use boss_execution_contracts::ExecutionPublisher;
 
 /// Per-pass counters, folded into the merge poller's `SweepOutcome`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -328,9 +328,24 @@ mod tests {
                 .contains(&"blocked_pr_diagnosed".to_owned())
         );
 
-        // Unchanged facts: no second publish.
+        // The stored reason is a board input: a reader following only the
+        // board-change journal sees the card change.
+        let journaled = |db: &WorkDb| -> i64 {
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM board_changes WHERE item_id = ?1 AND source = 'pr_blocked_diagnoses'",
+                    [&c.work_item_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(journaled(&db), 1);
+
+        // Unchanged facts: no second publish, and nothing journaled.
         let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.diagnosed, 0);
+        assert_eq!(journaled(&db), 1);
 
         db.connect()
             .unwrap()
@@ -341,6 +356,7 @@ mod tests {
             .unwrap();
         let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
         assert_eq!(outcome.cleared, 1);
+        assert_eq!(journaled(&db), 2, "clearing the reason is journaled too");
         assert!(task(&db, &c.work_item_id).review_blocked_reason.is_none());
         assert!(
             publisher

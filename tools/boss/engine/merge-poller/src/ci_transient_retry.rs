@@ -52,13 +52,13 @@ use boss_ci_log_reader::{
     parse_buildkite_pipeline_slug, retry_buildkite_job,
 };
 
-use boss_execution_contracts::ExecutionPublisher;
-use crate::{CiProvider, PrLifecycleProbe, RequiredCheckFailure};
 use crate::work::{
     BlockedPrRemediationInput, PendingMergeCheck, REMEDIATION_CATEGORY_CI_TRANSIENT_RETRY,
     REMEDIATION_OUTCOME_BUDGET_EXHAUSTED, REMEDIATION_OUTCOME_PENDING, REMEDIATION_OUTCOME_RETRIED,
     REMEDIATION_OUTCOME_RETRY_FAILED, REMEDIATION_OUTCOME_RETRY_UNCONFIRMED, WorkDb, transient_retry_signal,
 };
+use crate::{CiProvider, PrLifecycleProbe, RequiredCheckFailure};
+use boss_execution_contracts::ExecutionPublisher;
 
 /// Upper bound on each `bk` invocation. The retry runs inside the merge
 /// poller's serial pass, so a hung CLI must not stall every other PR.
@@ -619,12 +619,12 @@ mod tests {
 
     use super::*;
     use crate::ci_watch::on_ci_failure_detected_with;
-    use crate::{OpenPrCiStatus, OpenPrStatus, PrLifecycleState, PrReviewState};
     use crate::test_support::*;
     use crate::work::{
         BlockedPrRemediation, FakePrStateChecker, PrOpenState, REMEDIATION_OUTCOME_BUDGET_EXHAUSTED, TaskStatus,
         WorkItem, WorkItemPatch,
     };
+    use crate::{OpenPrCiStatus, OpenPrStatus, PrLifecycleState, PrReviewState};
 
     fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
         let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
@@ -908,6 +908,12 @@ INFO: Build completed, 1 test FAILED, 2012 total actions
         assert!(bk.retried.lock().unwrap().is_empty());
         let rows = ledger(&db, &chore, "head-506");
         assert_eq!(rows.len() as u32, TRANSIENT_RETRY_BUDGET_PER_HEAD + 1);
+        // The card's fallback for a ledger row with no "<attempt>/<budget>"
+        // token must name the same budget this step enforces.
+        assert_eq!(
+            crate::work::TRANSIENT_RETRY_FALLBACK_BUDGET,
+            TRANSIENT_RETRY_BUDGET_PER_HEAD
+        );
         assert_eq!(rows[0].outcome, REMEDIATION_OUTCOME_BUDGET_EXHAUSTED);
         assert!(rows[0].detail.as_deref().unwrap().starts_with("2/2"));
 
