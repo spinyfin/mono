@@ -625,7 +625,8 @@ const GUARD_SCRIPT_PRUNE_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60)
 /// whether the session model notices the path string.
 ///
 /// The data dir is supplied via the `BOSS_DATA_DIR` env var (set by the
-/// hook command). For a tool the script has nothing to say about (a read,
+/// hook command on the guard process; worker shells never inherit it). For a
+/// tool the script has nothing to say about (a read,
 /// an image view, a plan update) it approves — there is no path to check,
 /// so silence is correct. For the two tools it *does* reason about
 /// (`Bash`, and Codex's `apply_patch`) a payload it cannot read is
@@ -680,8 +681,11 @@ variables and .. , and resolving symlinks -- then rejects on a component-wise
 prefix match against the data directory.
 
 The data directory is supplied via the BOSS_DATA_DIR environment variable,
-set by the engine in the hook command. The PreToolUse payload arrives as JSON
-on stdin; a decision JSON is written to stdout.
+set by the engine on the guard process. Worker shells never inherit that
+value, so a Bash expansion of $BOSS_DATA_DIR is empty or attacker-controlled
+while this process's expandvars would still resolve the real directory.
+The PreToolUse payload arrives as JSON on stdin; a decision JSON is written
+to stdout.
 
 Tools this gate has nothing to say about are approved: there is no candidate
 path to resolve, so silence is the right answer. The two tools it does read --
@@ -1136,25 +1140,14 @@ def main():
         except Exception:
             tokens = command.split()
         candidates.extend(tokens)
-        # Arithmetic, subscripts and `[[ ]]` rebind BOSS_DATA_DIR without an
-        # assignment word. Bash joins backslash-newline first. In a command
-        # that expands the name, an arithmetic context that names it or holds
-        # any other expansion (which could compose the name) would make
-        # expandvars check the inherited path while bash opens another.
+        # Worker shells do not inherit BOSS_DATA_DIR. Any expansion of
+        # $BOSS_DATA_DIR or ${BOSS_DATA_DIR} is therefore empty or
+        # attacker-controlled, while expandvars still resolves this process's
+        # value. Block every such expansion, including a plain assignment that
+        # splits the path across the variable and a suffix.
         joined = raw_command.replace("\\\n", "")
-        data_dir_expansion = re.compile(r"\$(?:BOSS_DATA_DIR\b|\{BOSS_DATA_DIR\})")
-        data_dir_name = re.compile(r"(?<![A-Za-z0-9_])BOSS_DATA_DIR(?![A-Za-z0-9_])")
-        if data_dir_expansion.search(joined):
-            masked = data_dir_expansion.sub("", joined)
-            for context in (
-                r"\(\((.*?)(?:\)\)|\Z)",
-                r"\$\[(.*?)(?:\]|\Z)",
-                r"\[\[(.*?)(?:\]\]|\Z)",
-                r"\$\{[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[0-9]+|[@*])\]\})(.*?)(?:\]\}|\Z)",
-            ):
-                for found in re.finditer(context, masked, re.S):
-                    if "$" in found.group(1) or data_dir_name.search(found.group(1)):
-                        emit("block", RECOVERY)
+        if re.search(r"\$(?:BOSS_DATA_DIR\b|\{BOSS_DATA_DIR\})", joined):
+            emit("block", RECOVERY)
     elif tool == "apply_patch":
         # Codex's freeform apply_patch: the patch body is the "command".
         patch = tool_input.get("command")

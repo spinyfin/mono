@@ -325,6 +325,28 @@ fn path_guard_blocks_arithmetic_rebinding_of_the_data_dir() {
 }
 
 #[test]
+fn path_guard_blocks_plain_assignment_split_read_of_the_data_dir() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("Application Support").join("Boss");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("state.db"), b"x").unwrap();
+    let prefix = root.path().join("Application");
+    let command = format!(
+        r#"BOSS_DATA_DIR={}; cat "$BOSS_DATA_DIR Support/Boss/state.db""#,
+        prefix.display()
+    );
+    let (decision, reason) = run_path_guard(
+        &data,
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
+    );
+    assert_eq!(
+        decision, "block",
+        "plain assignment split-read of BOSS_DATA_DIR must be blocked: {reason}"
+    );
+    assert!(reason.contains("engine-owned"), "{reason}");
+}
+
+#[test]
 fn path_guard_blocks_a_bash_command_with_a_hash_in_an_earlier_word() {
     // Pins the `lexer.commenters = ""` fix above: `shlex.shlex`'s default
     // `commenters='#'` treats `#` as a comment introducer anywhere inside a

@@ -541,3 +541,66 @@ fn mention_of_a_trusted_name_outside_arithmetic_is_not_a_rebinding() {
         assert_ne!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
 }
+
+fn install_reviewer(run_id: &str) -> Fixture {
+    let fx = Fixture::new(run_id);
+    fx.install_with(WorkerKind::Reviewer, |c| {
+        c.is_standard_worker = false;
+        c.is_reviewer = true;
+    });
+    fx
+}
+
+#[test]
+fn reviewer_denies_trusted_names_composed_across_quote_or_escape() {
+    let fx = install_reviewer("run-quote-boundary");
+    let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    for command in [
+        format!(r#"BOSS_STRUCTURED_OUTPU=/tmp/; cat "$BOSS_STRUCTURED_OUTPU"T/{relative}"#),
+        format!(r#"BOSS_STRUCTURED_OUTPU=/tmp/; cat "$BOSS_STRUCTURED_OUTPU""T"/{relative}"#),
+        format!(r#"BOSS_STRUCTURED_OUTPU=/tmp/; cat $BOSS_STRUCTURED_OUTPU\T/{relative}"#),
+        "cat $'BOSS_STRUCTURED_OUTPUT'/x".into(),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn reviewer_denies_env_exec_substring_subscript_and_wait_rebinding() {
+    let fx = install_reviewer("run-rebind-forms");
+    let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let read = format!(r#"cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#);
+    for command in [
+        format!(r#"env -u BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env --unset=BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env -i bash -c '{read}'"#),
+        format!(r#"exec -c bash -c '{read}'"#),
+        format!(r#"x=a; echo ${{x:BOSS_STRUCTURED_OUTPUT=0}}; {read}"#),
+        format!(r#"a[BOSS_STRUCTURED_OUTPUT=0]=v; {read}"#),
+        format!(r#"coproc BOSS_STRUCTURED_OUTPUT (echo 1); {read}"#),
+        format!(r#"wait -p BOSS_STRUCTURED_OUTPUT; {read}"#),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn reviewer_denies_alias_mapfile_and_compgen_callbacks() {
+    let fx = install_reviewer("run-dynamic-exec");
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let protected = protected.display();
+    fs::write(fx.workspace().join("README.md"), "x").unwrap();
+    for command in [
+        format!("shopt -s expand_aliases\nalias c='cat {protected}'\nc"),
+        "shopt -s expand_aliases\nalias j='jj describe -m x'\nj".into(),
+        format!("mapfile -C 'cat {protected}' -c 1 a < README.md"),
+        format!("readarray -C 'cat {protected}' -c 1 a < README.md"),
+        format!("compgen -C 'cat {protected}' x"),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+}
