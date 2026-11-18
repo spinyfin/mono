@@ -129,75 +129,99 @@ def heredoc_delim(line):
     return None
 
 class CommandGroup(list):
-    def __init__(self, tokens, body='', boundary=None, error=None, literal_chars=None):
+    def __init__(self, tokens, body='', boundary=None, error=None, literal_chars=None, quote_segments=None):
         super().__init__(tokens)
         self.body = body
         self.body_span = None
         self.literal_chars = literal_chars or [[] for _ in tokens]
+        # Parallel to literal_chars: integer ids of the quote/escape run each
+        # character came from. None means provenance did not match shlex, so
+        # unbraced expansions cannot be verified.
+        self.quote_segments = quote_segments
         self.expanding_body = False
         self.boundary = boundary
         self.error = error
 
 
-def split_punct_word(word, mask):
+def split_punct_word(word, mask, segs):
     if word and all(c in '();&|' for c in word):
-        parts, masks, offset = [], [], 0
+        parts, masks, part_segs, offset = [], [], [], 0
         for part in re.findall(r'[()]|[;&|]+', word):
             parts.append(part)
             masks.append(mask[offset:offset + len(part)])
+            part_segs.append(segs[offset:offset + len(part)])
             offset += len(part)
-        return parts, masks
-    return [word], [mask]
+        return parts, masks, part_segs
+    return [word], [mask], [segs]
 
 
 def quote_provenance(text, tokens):
-    # Mirror shlex boundaries while retaining each literal character.
-    words, masks, word, mask = [], [], [], []
-    quote, index, active = None, 0, False
+    # Mirror shlex boundaries while retaining each literal character and the
+    # quote/escape run it came from. Adjacent quoted strings concatenate into
+    # one shlex word ("$A""B" -> $AB) but must not share a segment id.
+    words, masks, segs, word, mask, segm = [], [], [], [], [], []
+    quote, index, active, segment = None, 0, False, 0
+    def new_segment():
+        nonlocal segment
+        segment += 1
     def finish():
-        nonlocal word, mask, active
+        nonlocal word, mask, segm, active
         if active:
-            parts, part_masks = split_punct_word(''.join(word), mask)
+            parts, part_masks, part_segs = split_punct_word(''.join(word), mask, segm)
             words.extend(parts)
             masks.extend(part_masks)
-        word, mask, active = [], [], False
+            segs.extend(part_segs)
+        word, mask, segm, active = [], [], [], False
     while index < len(text):
         char = text[index]
         if quote == ANSI:
             if char == chr(92) and index + 1 < len(text):
                 word.append(text[index + 1])
                 mask.append(True)
+                segm.append(segment)
                 active = True
                 index += 2
                 continue
             if char == chr(39):
                 quote = None
+                new_segment()
                 index += 1
                 continue
             word.append(char)
             mask.append(True)
+            segm.append(segment)
             active = True
             index += 1
             continue
         if quote != chr(39) and char == chr(92) and index + 1 < len(text):
             following = text[index + 1]
             if quote != chr(34) or following in (chr(34), chr(92)):
+                new_segment()
                 word.append(following)
                 mask.append(True)
+                segm.append(segment)
+                new_segment()
                 active = True
                 index += 2
                 continue
         if char == quote:
             quote = None
+            new_segment()
         elif is_ansi_open(text, index, quote):
+            # The $ of $'...' is not an expansion. Keep it as its own run so
+            # it cannot join the ANSI body into a trusted name.
+            new_segment()
             word.append(char)
             mask.append(False)
+            segm.append(segment)
+            new_segment()
             quote = ANSI
             active = True
             index += 2
             continue
         elif quote is None and char in (chr(39), chr(34)):
             quote = char
+            new_segment()
             active = True
         elif quote is None and char in SHLEX_WS:
             finish()
@@ -209,6 +233,7 @@ def quote_provenance(text, tokens):
             for part in re.findall(r'[()]|[;&|]+', text[index:end]):
                 words.append(part)
                 masks.append([False] * len(part))
+                segs.append([segment] * len(part))
             index = end
             continue
         else:
@@ -219,6 +244,7 @@ def quote_provenance(text, tokens):
                 mask.append('d')
             else:
                 mask.append(False)
+            segm.append(segment)
             active = True
         index += 1
     finish()
@@ -228,11 +254,12 @@ def quote_provenance(text, tokens):
             while marker in word:
                 start = word.index(marker)
                 masks[position][start:start + len(marker)] = [masks[position][start]]
+                segs[position][start:start + len(marker)] = [segs[position][start]]
                 word = word[:start] + value + word[start + len(marker):]
         restored.append(word)
     if restored != tokens:
-        return [[False] * len(token) for token in tokens]
-    return masks
+        return [[False] * len(token) for token in tokens], None
+    return masks, segs
 
 
 def open_quote(text):
@@ -439,24 +466,32 @@ def command_records(command, stripped=False):
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
         try:
-            literal = quote_provenance(logical_line, tokens)
+            literal, segments = quote_provenance(logical_line, tokens)
         except Exception:
             literal = [[False] * len(token) for token in tokens]
-        if len(literal) != len(tokens):
+            segments = None
+        if literal is None or len(literal) != len(tokens):
             literal = [[False] * len(token) for token in tokens]
+            segments = None
+        elif segments is not None and len(segments) != len(tokens):
+            segments = None
         current_literal = []
+        current_segments = [] if segments is not None else None
         for index, token in enumerate(tokens):
             if token in DELIMS or (token and all(c in '()' for c in token)):
                 if current:
-                    groups.append(CommandGroup(current, literal_chars=current_literal))
+                    groups.append(CommandGroup(current, literal_chars=current_literal, quote_segments=current_segments))
                 current = []
                 current_literal = []
+                current_segments = [] if segments is not None else None
                 groups.append(CommandGroup([], boundary=token))
             else:
                 current.append(token)
                 current_literal.append(literal[index])
+                if current_segments is not None:
+                    current_segments.append(segments[index])
         if current:
-            groups.append(CommandGroup(current, literal_chars=current_literal))
+            groups.append(CommandGroup(current, literal_chars=current_literal, quote_segments=current_segments))
         delim = heredoc_delim(logical_line)
         if delim is False:
             groups.append(CommandGroup([], error='incomplete shell syntax'))
@@ -479,7 +514,7 @@ def command_groups(command):
                 for part in re.split(r'[;&|()]', line) if part.split()]
     return [group for group in records if group]
 
-def without_redirections(group):
+def without_redirection_indices(group):
     result = []
     index = 0
     while index < len(group):
@@ -489,12 +524,24 @@ def without_redirections(group):
             if redirect.group(1) in ('', '&'):
                 index += 1
         else:
-            result.append(token)
+            result.append(index)
         index += 1
     return result
 
-def strip_prefixes(group):
-    group = without_redirections(group)
+def without_redirections(group):
+    return [group[i] for i in without_redirection_indices(group)]
+
+WRAPPER_VALUE_OPTIONS = {
+    'env': {'-u', '--unset', '-C', '--chdir'},
+    'sudo': {'-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt'},
+    'nice': {'-n', '--adjustment'},
+    'ionice': {'-c', '--class', '-n', '--classdata', '-p', '--pid'},
+    'stdbuf': {'-i', '-o', '-e', '--input', '--output', '--error'},
+    'timeout': {'-k', '--kill-after', '-s', '--signal'},
+    'xargs': {'-n', '-L', '-P', '-I', '-d', '--max-args', '--max-lines', '--max-procs', '--replace', '--delimiter'},
+}
+
+def strip_prefix_offset(group):
     index = 0
     while index < len(group):
         token = group[index]
@@ -504,20 +551,12 @@ def strip_prefixes(group):
             continue
         if base in WRAPPERS or base == 'timeout':
             index += 1
-            value_options = {
-                'env': {'-u', '--unset', '-C', '--chdir'},
-                'sudo': {'-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt'},
-                'nice': {'-n', '--adjustment'},
-                'ionice': {'-c', '--class', '-n', '--classdata', '-p', '--pid'},
-                'stdbuf': {'-i', '-o', '-e', '--input', '--output', '--error'},
-                'timeout': {'-k', '--kill-after', '-s', '--signal'},
-                'xargs': {'-n', '-L', '-P', '-I', '-d', '--max-args', '--max-lines', '--max-procs', '--replace', '--delimiter'},
-            }.get(base, set())
+            value_options = WRAPPER_VALUE_OPTIONS.get(base, set())
             while index < len(group) and group[index].startswith('-'):
                 option = group[index]
                 index += 1
                 if base == 'command' and option in ('-v', '-V'):
-                    return []
+                    return len(group)
                 if option == '--':
                     break
                 if option in value_options and index < len(group):
@@ -526,7 +565,16 @@ def strip_prefixes(group):
                 index += 1
             continue
         break
-    return group[index:]
+    return index
+
+def strip_prefixes(group):
+    stripped = without_redirections(group)
+    return stripped[strip_prefix_offset(stripped):]
+
+def strip_prefix_indices(group):
+    kept = without_redirection_indices(group)
+    start = strip_prefix_offset([group[i] for i in kept])
+    return kept[start:]
 "#, $after) };
 }
 pub const CODEX_COMMAND_TOKENIZER_PY: &str = crate::render_command_tokenizer!("", "");
@@ -600,6 +648,63 @@ command = line + chr(10) + "cat /etc/passwd" + chr(10) + "X"
 records = [list(g) for g in command_records(command) if list(g)]
 assert any(g[:1] == ['cat'] for g in records), records
 assert not any(getattr(g, 'expanding_body', False) for g in command_records(command))
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn quote_provenance_records_segment_boundaries() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+def token_segs(command, index=1):
+    groups = [g for g in command_records(command) if list(g)]
+    assert groups, command
+    return groups[0][index], groups[0].quote_segments[index]
+word, segs = token_segs('echo "$A""B"')
+assert word == '$AB', word
+assert segs[0] == segs[1] != segs[2], segs
+word, segs = token_segs('echo "$AB"')
+assert word == '$AB', word
+assert len(set(segs)) == 1, segs
+word, segs = token_segs(r'echo $A\B')
+assert word == '$AB', word
+assert segs[0] == segs[1] != segs[2], segs
+word, segs = token_segs("cat $'FOO'/x")
+assert word.startswith('$FOO'), word
+assert segs[0] != segs[1], segs
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn strip_prefix_indices_match_strip_prefixes() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+for command in (
+    'echo x > y',
+    'FOO=bar env -u SECRET sudo -u nobody cat f > out',
+    'command -v cube',
+    'timeout 1 echo x 2>/dev/null',
+):
+    group = next(g for g in command_records(command) if list(g))
+    stripped = strip_prefixes(group)
+    kept = strip_prefix_indices(group)
+    assert [group[i] for i in kept] == stripped, (command, kept, stripped)
+    assert without_redirections(group) == [group[i] for i in without_redirection_indices(group)]
 "#,
         );
         let output = std::process::Command::new("python3")

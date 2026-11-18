@@ -294,6 +294,8 @@ fn path_guard_blocks_arithmetic_rebinding_of_the_data_dir() {
     let data = TempDir::new().unwrap();
     std::fs::write(data.path().join("state.db"), b"x").unwrap();
     for command in [
+        r#"rg '\$BOSS_DATA_DIR' tools/"#,
+        r#"echo \$BOSS_DATA_DIR"#,
         r#"(( BOSS_DATA_DIR = 0 )); cat "${BOSS_DATA_DIR}/../T/state.db""#,
         r#"$[BOSS_DATA_DIR=0]; cat "${BOSS_DATA_DIR}/../T/state.db""#,
         r#"echo "${a[BOSS_DATA_DIR=0]}"; cat "${BOSS_DATA_DIR}/../T/state.db""#,
@@ -322,6 +324,28 @@ fn path_guard_blocks_arithmetic_rebinding_of_the_data_dir() {
         decision, "approve",
         "a bare name used as search text must not be treated as a rebinding: {reason}"
     );
+}
+
+#[test]
+fn path_guard_blocks_plain_assignment_split_read_of_the_data_dir() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("Application Support").join("Boss");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("state.db"), b"x").unwrap();
+    let prefix = root.path().join("Application");
+    let command = format!(
+        r#"BOSS_DATA_DIR={}; cat "$BOSS_DATA_DIR Support/Boss/state.db""#,
+        prefix.display()
+    );
+    let (decision, reason) = run_path_guard(
+        &data,
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
+    );
+    assert_eq!(
+        decision, "block",
+        "plain assignment split-read of BOSS_DATA_DIR must be blocked: {reason}"
+    );
+    assert!(reason.contains("engine-owned"), "{reason}");
 }
 
 #[test]

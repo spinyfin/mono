@@ -541,3 +541,158 @@ fn mention_of_a_trusted_name_outside_arithmetic_is_not_a_rebinding() {
         assert_ne!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
 }
+
+fn install_reviewer(run_id: &str) -> Fixture {
+    let fx = Fixture::new(run_id);
+    fx.install_with(WorkerKind::Reviewer, |c| {
+        c.is_standard_worker = false;
+        c.is_reviewer = true;
+    });
+    fx
+}
+
+#[test]
+fn reviewer_denies_trusted_names_composed_across_quote_or_escape() {
+    let fx = install_reviewer("run-quote-boundary");
+    let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    for command in [
+        format!(r#"BOSS_STRUCTURED_OUTPU=/tmp/; cat "$BOSS_STRUCTURED_OUTPU"T/{relative}"#),
+        format!(r#"BOSS_STRUCTURED_OUTPU=/tmp/; cat "$BOSS_STRUCTURED_OUTPU""T"/{relative}"#),
+        format!(r#"BOSS_STRUCTURED_OUTPU=/tmp/; cat $BOSS_STRUCTURED_OUTPU\T/{relative}"#),
+        "cat $'BOSS_STRUCTURED_OUTPUT'/x".into(),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn reviewer_denies_env_exec_substring_subscript_and_wait_rebinding() {
+    let fx = install_reviewer("run-rebind-forms");
+    let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let read = format!(r#"cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#);
+    for command in [
+        format!(r#"env -u BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env --unset=BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env -i bash -c '{read}'"#),
+        format!(r#"env -C /tmp -u BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env -C /tmp --unset=BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env -C /tmp -i bash -c '{read}'"#),
+        format!(r#"env - bash -c '{read}'"#),
+        format!(r#"wait -np BOSS_STRUCTURED_OUTPUT; {read}"#),
+        format!(r#"a[ BOSS_STRUCTURED_OUTPUT=0 ]=v; {read}"#),
+        format!(r#"BOSS_STRUCTURED_OUTPUT[ 0 ]=/x; {read}"#),
+        format!(r#"exec -c bash -c '{read}'"#),
+        format!(r#"x=a; echo ${{x:BOSS_STRUCTURED_OUTPUT=0}}; {read}"#),
+        format!(r#"a[BOSS_STRUCTURED_OUTPUT=0]=v; {read}"#),
+        format!(r#"coproc BOSS_STRUCTURED_OUTPUT (echo 1); {read}"#),
+        format!(r#"wait -p BOSS_STRUCTURED_OUTPUT; {read}"#),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn reviewer_denies_alias_mapfile_and_compgen_callbacks() {
+    let fx = install_reviewer("run-dynamic-exec");
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let protected = protected.display();
+    fs::write(fx.workspace().join("README.md"), "x").unwrap();
+    for command in [
+        format!("shopt -s expand_aliases\nalias c='cat {protected}'\nc"),
+        "shopt -s expand_aliases\nalias j='jj describe -m x'\nj".into(),
+        format!("mapfile -C 'cat {protected}' -c 1 a < README.md"),
+        format!("readarray -C 'cat {protected}' -c 1 a < README.md"),
+        format!("compgen -C 'cat {protected}' x"),
+        format!("BASH_ALIASES[c]='cat {protected}'; c"),
+        "BASH_CMDS[c]=/tmp/command; c".into(),
+        "BASH_ENV=/tmp/startup bash -c true".into(),
+        "jobs -x bossctl status".into(),
+        "env -S 'bossctl status'".into(),
+        "shopt -s expand_aliases".into(),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+}
+
+#[test]
+fn dynamic_execution_is_denied_without_enumerating_spellings() {
+    for kind in [WorkerKind::Standard, WorkerKind::Reviewer] {
+        let fx = Fixture::new("run-dynamic-fail-closed");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+        });
+        // Harmless startup-file fixture: it is never executed because the guard denies first.
+        let startup = fx.workspace().join("startup.sh");
+        fs::write(&startup, "true\n").unwrap();
+        let startup = startup.display();
+        for command in [
+            "hash -p /usr/bin/true j; j describe -m x".to_string(),
+            "hash -p /usr/bin/true bossctl; bossctl status".to_string(),
+            "declare -n r=BASH_CMDS; r[c]=/usr/bin/true; c".to_string(),
+            "declare -n r=x; r=1".to_string(),
+            "x=BASH_ALI; printf -v \"${x}ASES[c]\" '%s' y; c".to_string(),
+            "x=BASH_CMDS; read \"$x\" <<< y".to_string(),
+            "x=BASH_C; export \"${x}MDS=/usr/bin/true\"".to_string(),
+            format!("export BASH_ENV; printf -v BASH_ENV '%s' {startup}; bash -c true"),
+            format!("BASH_E\"\"NV={startup} bash -c true"),
+            format!("printf -v BASH_E\"\"NV '%s' {startup}"),
+            "echo $'BASH_\\x45NV'".to_string(),
+            "set -x; true".to_string(),
+            "set -o xtrace; true".to_string(),
+            "PS4='$(cat README.md)' true".to_string(),
+            "export PS4; printf -v PS4 x".to_string(),
+            "PROMPT_COMMAND=true true".to_string(),
+            "SHELLOPTS=xtrace true".to_string(),
+            "x='a[$(cat README.md)]'; (( x ))".to_string(),
+            "x='a[$(cat README.md)]'; [[ $x -eq 0 ]]".to_string(),
+            "x='a[$(cat README.md)]'; let x".to_string(),
+            "x='a[$(cat README.md)]'; y=abc; echo ${y:x}".to_string(),
+            "x='a[`cat README.md`]'; echo $[x]".to_string(),
+            "declare -i n; n='a[$(cat README.md)]'".to_string(),
+            "x='a[$(cat README.md)]'; y=x; echo ${!y}".to_string(),
+            "x='$(cat README.md)'; echo ${x@P}".to_string(),
+            "x='a[$(cat README.md)]'; [ -v \"$x\" ]".to_string(),
+            "x='a[$(cat README.md)]'; test -R \"$x\"".to_string(),
+            "x='a[$(cat README.md)]'; 'let' x".to_string(),
+            "x='a[$(cat README.md)]'; l'e't x".to_string(),
+            "x='a[$(cat README.md)]'; 'declare' -i x".to_string(),
+            "x=BASH_; env \"${x}ENV=./startup.sh\" bash -c true".to_string(),
+            "x=BASH_; \"${x}ENV=./startup.sh\" bash -c true".to_string(),
+            "env \"$x=1\" bash -c 'cat README.md'".to_string(),
+            format!("set -a; opt=-v; printf \"$opt\" 'BASH_ENV' '%s' {startup}; bash -c true"),
+        ] {
+            deny_at(&fx, &command, &fx.workspace());
+        }
+    }
+}
+
+#[test]
+fn braced_names_cannot_cross_quote_segments() {
+    for kind in [WorkerKind::Standard, WorkerKind::Reviewer] {
+        let fx = Fixture::new("run-braced-boundary");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+        });
+        for literal_name in ["${BOSS_STRUCTURED_OUTPUT}", "{BOSS_STRUCTURED_OUTPUT}"] {
+            std::os::unix::fs::symlink(
+                fx.process_home.join(".gemini/config"),
+                fx.workspace().join(literal_name),
+            )
+            .unwrap();
+        }
+        let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+        for command in [
+            r#"cat "$""{BOSS_STRUCTURED_OUTPUT}"/hooks.json"#,
+            r#"cat $'{BOSS_STRUCTURED_OUTPUT}'/hooks.json"#,
+        ] {
+            let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(command), &env);
+            assert_eq!(decision(&body), "deny", "{kind:?} {command}: {body} {stderr}");
+        }
+    }
+}
