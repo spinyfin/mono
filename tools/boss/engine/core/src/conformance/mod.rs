@@ -6,7 +6,7 @@
 //! 1. **Byte-for-byte goldens** — Claude's spawn line, settings.json,
 //!    CLAUDE.md, and deny rules (`claude_goldens`), Grok's pane spawn
 //!    command (`grok_goldens`), and Antigravity's session-settings posture
-//!    plus captured hook payloads (`agy_goldens`), all produced *through the
+//!    plus published 1.5.5 samples and synthetic regression timelines (`agy_goldens`), all produced *through the
 //!    driver interface* (or a pure builder the real driver method delegates
 //!    to) — never by reaching past the trait into driver-only helpers.
 //! 2. **Ingress equivalence** — stdout-JSONL (Codex) and hook ingress

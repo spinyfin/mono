@@ -634,12 +634,12 @@ fn grok_models_menu_matches_pinned_descriptor() {
 // are the non-test `agy_rules_probe` binary, which cannot run under
 // `bazel test`'s mandatory sandbox.
 
-// Boss driver maintainers own qualification; the deployment operator owns
-// replacing the installed pin. Before adoption, maintainers run the pane,
+// Boss driver maintainers own qualification; replacing the installed pin
+// is a deployment step. Before adoption, maintainers run the pane,
 // hook-surface and permission recipes, commit sanitized captures with version
 // and hash provenance, and run conformance with BOSS_REQUIRE_AGY_CLI=1.
-// The operator stops Boss and all workers, archives homes-root bin/agy for
-// rollback, removes that copy, and provisions with BOSS_AGY_BIN pointing at
+// To replace it, stop Boss and all workers, archive homes-root bin/agy for
+// rollback, remove that copy, and provision with BOSS_AGY_BIN pointing at
 // the qualified signed candidate. First-install copying verifies identity
 // and version and protects the copy. Restart only after provisioning succeeds.
 // Overrides cannot replace an existing pin; bumping the floor is not an upgrade.
