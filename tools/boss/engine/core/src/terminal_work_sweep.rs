@@ -1133,7 +1133,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         for _ in 0..3 {
             let outcome = run_one_pass(
@@ -1144,6 +1144,7 @@ mod tests {
                 sink.as_ref(),
                 &teardown,
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             assert_eq!(
@@ -1159,7 +1160,7 @@ mod tests {
     /// `done` cycle root. A confirmed-deleted root is still an orphan and
     /// must be reaped via `work_item_missing` — folding membership into
     /// `never_bound_work_item` would skip this recovery path entirely.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reaps_a_live_post_merge_reviewer_whose_cycle_root_was_deleted() {
         let (_dir, db, product_id) = setup();
         let (cycle_root_id, execution_id) = spawn_post_merge_reviewer(&db, &product_id);
@@ -1177,7 +1178,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         let first = run_one_pass(
             db.as_ref(),
@@ -1187,12 +1188,14 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
         assert_eq!(first.pending_confirmation, 1);
         assert!(reaper.reaped().is_empty());
 
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let second = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -1201,6 +1204,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
@@ -1233,7 +1237,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         for _ in 0..3 {
             let outcome = run_one_pass(
@@ -1244,6 +1248,7 @@ mod tests {
                 sink.as_ref(),
                 &teardown,
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             assert_eq!(outcome.reaped, 0);
@@ -1336,7 +1341,7 @@ mod tests {
             let cube = RecordingCubeClient::default();
             let sink = Arc::new(RecordingDispatchEventSink::new());
             let teardown = TeardownRegistry::new();
-            let mut seen = HashSet::new();
+            let mut seen = HashMap::new();
 
             let first = run_one_pass(
                 db.as_ref(),
@@ -1346,6 +1351,7 @@ mod tests {
                 sink.as_ref(),
                 &teardown,
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             let second = run_one_pass(
@@ -1356,6 +1362,7 @@ mod tests {
                 sink.as_ref(),
                 &teardown,
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             assert_eq!(first.active_skipped, 1, "{state} answer agent must be ignored");
