@@ -3,7 +3,7 @@
 //! changes do, including writes by another connection before event publication.
 use super::*;
 use boss_board_projection::{Change, MAX_AFFECTED, MAX_CARDS, Projection};
-use boss_metrics::population_timing::PopulationTrace;
+use boss_metrics::population_timing::{PopulationTrace, elapsed_ms, segment};
 use std::collections::BTreeSet;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,6 +35,12 @@ impl WorkDb {
         caches: &board_caches::BoardCaches,
         now: i64,
     ) -> Result<(WorkTree, Refresh)> {
+        // Everything before the board's own queries: the connection, and the
+        // first read, which is what pins this transaction's snapshot. A wait
+        // for the connection or for a database lock is spent here, so it is
+        // timed apart from the query stages that follow.
+        trace.enter_stage(segment::DB_SNAPSHOT);
+        let opening = std::time::Instant::now();
         let mut connection = self.connect()?;
         let conn = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let (first, revision): (u64, u64) = conn.query_row(
@@ -42,6 +48,7 @@ impl WorkDb {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        trace.record_plain(segment::DB_SNAPSHOT, elapsed_ms(opening));
         let reason = match projection.as_mut() {
             None => "cold",
             Some(model) if model.tree().product.id != product => "product",

@@ -1211,29 +1211,21 @@ impl WorkDb {
 
         trace.enter_stage(segment::DB_TASKS);
         let t = Instant::now();
-        let tasks = {
-            // The tasks lane holds every project-member kind plus chores and
-            // follow-ups carrying a project_id; the chores lane holds only
-            // project-less rows. Sorting on ordinal ASC puts the design task
-            // (ordinal 0) first in the project's task chain.
-            let mut stmt = conn.prepare(&super::board_patch::tasks_lane_query())?;
-            let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
-            collect_rows(rows)?
-        };
+        // The tasks lane holds every project-member kind plus chores and
+        // follow-ups carrying a project_id; the chores lane holds only
+        // project-less rows. Board order puts the design task (ordinal 0)
+        // first in the project's task chain.
+        let tasks = super::board_patch::read_lane(conn, product_id, super::board_patch::Lane::Tasks)?;
         trace.record_query(segment::DB_TASKS, elapsed_ms(t), tasks.len());
 
         trace.enter_stage(segment::DB_CHORES);
         let t = Instant::now();
-        let mut chores = {
-            // `project_id IS NULL` keeps project members out of the backlog.
-            // `status != 'archived'` keeps archived leaf items off the
-            // kanban board (same treatment as archived projects), while
-            // leaving them queryable/listable via `boss task|chore list
-            // --include-archived` (they are NOT tombstoned, unlike delete).
-            let mut stmt = conn.prepare(&super::board_patch::chores_lane_query())?;
-            let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
-            collect_rows(rows)?
-        };
+        // `project_id IS NULL` keeps project members out of the backlog.
+        // `status != 'archived'` keeps archived leaf items off the
+        // kanban board (same treatment as archived projects), while
+        // leaving them queryable/listable via `boss task|chore list
+        // --include-archived` (they are NOT tombstoned, unlike delete).
+        let mut chores = super::board_patch::read_lane(conn, product_id, super::board_patch::Lane::Chores)?;
         trace.record_query(segment::DB_CHORES, elapsed_ms(t), chores.len());
 
         // Carry the total item count on every aggregate segment so cost

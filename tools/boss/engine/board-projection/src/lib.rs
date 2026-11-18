@@ -96,9 +96,7 @@ impl Projection {
             }
         }
         self.tree.tasks.sort_by(task_order);
-        self.tree
-            .chores
-            .sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        self.tree.chores.sort_by(chore_order);
         let mut runtimes: HashMap<_, _> = std::mem::take(&mut self.tree.task_runtimes)
             .into_iter()
             .filter(|r| !change.affected.contains(&r.work_item_id))
@@ -138,8 +136,20 @@ pub fn is_chore(task: &Task) -> bool {
     matches!(task.kind, TaskKind::Chore | TaskKind::Followup) && task.project_id.is_none()
 }
 
+/// The order of the board's tasks lane: by ordinal (a card without one sorts
+/// as 0, which puts a project's design task first), then by creation time,
+/// then by id. Ids are unique, so this is a total order.
+///
+/// This and [`chore_order`] are the only definitions of board order. A
+/// complete read and an incremental change both order their cards with them,
+/// so the two cannot disagree.
 pub fn task_order(a: &Task, b: &Task) -> std::cmp::Ordering {
     (a.ordinal.unwrap_or(0), &a.created_at, &a.id).cmp(&(b.ordinal.unwrap_or(0), &b.created_at, &b.id))
+}
+
+/// The order of the board's chores lane: by creation time, then by id.
+pub fn chore_order(a: &Task, b: &Task) -> std::cmp::Ordering {
+    (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id))
 }
 
 #[cfg(test)]
@@ -183,6 +193,38 @@ mod board_projection_tests {
                 .ideas(vec![])
                 .build(),
         )
+    }
+
+    #[test]
+    fn lane_orders_break_ties_by_creation_time_then_id() {
+        let card = |id: &str, ordinal: Option<i64>, created_at: &str| {
+            Task::builder()
+                .id(id)
+                .product_id("p")
+                .name(id)
+                .description("")
+                .created_at(created_at)
+                .updated_at("1")
+                .kind(TaskKind::Investigation)
+                .status(TaskStatus::Todo)
+                .maybe_ordinal(ordinal)
+                .build()
+        };
+        let mut cards = vec![
+            card("late", Some(1), "9"),
+            card("b", Some(1), "5"),
+            card("a", Some(1), "5"),
+            card("unordered", None, "7"),
+            card("negative", Some(-1), "8"),
+        ];
+        let ids = |cards: &[Task]| cards.iter().map(|card| card.id.clone()).collect::<Vec<_>>();
+
+        // A card with no ordinal sorts as ordinal 0.
+        cards.sort_by(task_order);
+        assert_eq!(ids(&cards), ["negative", "unordered", "a", "b", "late"]);
+        // Chores have no ordinal to sort by.
+        cards.sort_by(chore_order);
+        assert_eq!(ids(&cards), ["a", "b", "unordered", "negative", "late"]);
     }
 
     #[test]
