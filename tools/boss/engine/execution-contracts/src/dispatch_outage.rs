@@ -302,7 +302,7 @@ impl DispatchOutageTracker {
 /// "13 minutes ago"-style phrase for an outage instant, from the shared
 /// relative-time helper; `"just now"` when the instant is not in the past.
 pub fn outage_elapsed_phrase(epoch_secs: i64, now_epoch_secs: i64) -> String {
-    boss_engine_utils::iso8601::format_elapsed_ago(epoch_secs, now_epoch_secs).unwrap_or_else(|| "just now".to_owned())
+    boss_dispatch_events::format_elapsed_ago(epoch_secs, now_epoch_secs).unwrap_or_else(|| "just now".to_owned())
 }
 
 /// Render the active outage as the engine-health issue the app banner and
@@ -311,7 +311,7 @@ pub fn outage_elapsed_phrase(epoch_secs: i64, now_epoch_secs: i64) -> String {
 /// The title carries the duration; the body names each host's cause and the
 /// recovery action for it, and says what ends the outage.
 pub fn health_issue_for(outage: &DispatchOutage, now_epoch_secs: i64) -> EngineHealthIssue {
-    let started = boss_engine_utils::iso8601::format_paused_since_phrase(outage.started_epoch_s, now_epoch_secs);
+    let started = boss_dispatch_events::format_paused_since_phrase(outage.started_epoch_s, now_epoch_secs);
     let started = if started.is_empty() {
         "just now".to_owned()
     } else {

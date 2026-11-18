@@ -44,6 +44,11 @@ use boss_engine_jsonl_append::JsonlAppender;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+/// Relative-time helpers used by outage replay consumers that already depend
+/// on this crate, so they share the pause-banner buckets without a second
+/// `boss-engine-utils` edge.
+pub use boss_engine_utils::iso8601::{format_elapsed_ago, format_paused_since_phrase};
+
 /// Synthetic execution id for dispatch events that describe engine boot rather
 /// than a single durable execution.
 pub const ENGINE_BOOT_EXECUTION_ID: &str = "engine-boot";

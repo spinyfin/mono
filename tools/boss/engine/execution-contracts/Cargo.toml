@@ -16,7 +16,6 @@ boss-engine-metrics-registry = { path = "../metrics-registry" }
 boss-engine-recovery = { path = "../recovery" }
 boss-engine-storage-values = { path = "../storage-values" }
 boss-engine-structured-output = { path = "../structured-output" }
-boss-engine-utils = { path = "../utils" }
 boss-host-execution = { path = "../host-execution" }
 boss-protocol = { path = "../../protocol" }
 serde_json = { workspace = true }
