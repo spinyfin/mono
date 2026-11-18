@@ -524,8 +524,9 @@ impl PersistedPause {
     }
 
     /// Whether this pause holds `id`, with the same exemptions as coordinator
-    /// admission. The per-item reference [`Self::held_among`] is tested against.
-    #[cfg(test)]
+    /// admission. The per-item reference [`Self::held_among`] is tested against
+    /// on the seeded board, so it is built only with the scale tests.
+    #[cfg(all(test, boss_scale_tests))]
     pub(crate) fn holds(&self, conn: &Connection, id: &str) -> Result<bool> {
         use boss_engine_storage_values::dispatch_pause::exempts_work;
         if !self.overridable {

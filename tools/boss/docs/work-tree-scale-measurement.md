@@ -7,8 +7,10 @@ This PR implements session-local work-tree deltas and pins the recursive review-
 Run the deterministic fixture through the real database assembly and serialization path:
 
 ```sh
-bazel test //tools/boss/engine/core:engine_lib_test --test_filter=work_tree_production_scale_measurement --test_output=all --test_arg=--nocapture --test_timeout=1800 --test_env=BOSS_BENCH_SAMPLES=20
+bazel test //tools/boss/engine/work-db:work_db_scale_test --test_filter=work_tree_production_scale_measurement --test_output=all --test_timeout=1800 --test_env=BOSS_BENCH_SAMPLES=20
 ```
+
+The measurement lives in `work_db_scale_test`, the target for the seeded-board scale tests; `work_db_test` does not build them. Without `--test_filter` and `BOSS_BENCH_SAMPLES` the target runs every scale test once, side by side, which is what `bazel test //...` and CI do: those figures include one another's load. It never captures test output, so they are in the test log of every run.
 
 For an explicitly authorized consistent SQLite snapshot, change the filter to `work_tree_authorized_snapshot_measurement` and add `--test_env=BOSS_BENCH_SNAPSHOT=/absolute/path/to/snapshot.db`. The measurement opens that source with `immutable=1` and read-only flags, copies it into the test's private temporary directory with `VACUUM INTO`, and initializes only the copy. Tests never contact the production engine. The optional snapshot test emits aggregate counts, sizes, and durations only.
 
