@@ -242,6 +242,11 @@ fn decorated_stored_pr_url_still_matches_the_qualified_selector() {
     let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
     let owner = crate::test_support::create_test_chore(&db, product.id, "Land the wiring");
     bind_pr(&db, &owner.id, "https://github.com/Acme/Widget/pull/9/files");
+    assert_eq!(
+        db.other_work_item_bound_to_pr("https://github.com/acme/widget/pull/9", &asking.id)
+            .unwrap(),
+        Some(owner.id.clone())
+    );
     let conn = db.connect().unwrap();
     assert_eq!(
         stored_owner_id(ready(&conn, &asking, &link_pr("https://github.com/acme/widget/pull/9"))),
@@ -422,6 +427,7 @@ fn slug_pr_at_survives_multibyte_delimiters() {
     scan_pr_refs("Finish “acme/widget#9” next.", &mut found);
     scan_pr_refs("See—acme/widget#9 for the rest.", &mut found);
     scan_pr_refs("See\u{00a0}acme/widget#9 after that.", &mut found);
+    scan_pr_refs("Finish acme/widget #9 on main.", &mut found);
     found.sort();
     found.dedup();
     assert_eq!(found, vec!["https://github.com/acme/widget/pull/9".to_owned()]);
@@ -458,8 +464,6 @@ fn ambiguous_owners_reject_explicit_and_scanned_create_and_link_questions() {
         create_pr(url),
         create_with_text("Land wiring", &format!("Finish {url}."), "Need it."),
         link_pr(url),
-        link_pr("9"),
-        create_pr("9"),
     ] {
         let reason = rejected(&conn, Some(&asking), &q);
         assert!(reason.contains("more than one open task"), "{reason}");
@@ -475,6 +479,10 @@ fn ambiguous_owners_reject_explicit_and_scanned_create_and_link_questions() {
     set_repo(&db, &asking.id, "git@github.com:acme/widget.git");
     let conn = db.connect().unwrap();
     let asking = query_task(&conn, &asking.id).unwrap().unwrap();
+    for q in [link_pr("9"), create_pr("9")] {
+        let reason = rejected(&conn, Some(&asking), &q);
+        assert!(reason.contains("more than one open task"), "{reason}");
+    }
     assert!(rejected(&conn, Some(&asking), &link_pr("9")).contains("in this repository"));
 }
 
@@ -526,7 +534,9 @@ fn finished_historical_owners_do_not_make_an_open_owner_ambiguous() {
     }
     let owner = crate::test_support::create_test_chore(&db, product.id, "Open owner");
     bind_pr(&db, &owner.id, url);
+    set_repo(&db, &asking.id, "git@github.com:acme/widget.git");
     let conn = db.connect().unwrap();
+    let asking = query_task(&conn, &asking.id).unwrap().unwrap();
     for q in [
         link_pr(url),
         link_pr("9"),
@@ -631,15 +641,318 @@ fn bare_number_without_an_asking_repo_requires_a_unique_open_owner() {
         bind_pr(&db, &owner.id, url);
     }
     let conn = db.connect().unwrap();
-    assert!(
-        asking
-            .repo_remote_url
-            .as_deref()
-            .and_then(git_utils::repo_slug::parse_github_slug)
-            .is_none()
-    );
+    conn.execute(
+        "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
+        [&product.id],
+    )
+    .unwrap();
+    assert!(asking.repo_remote_url.is_none());
+    assert!(resolve_repo_for_work_item(&conn, &asking.id).unwrap().is_none());
     for q in [link_pr("9"), create_pr("9")] {
         let reason = rejected(&conn, Some(&asking), &q);
         assert!(reason.contains("pass the full GitHub URL"), "{reason}");
+    }
+}
+
+fn yes_on_stored_link(db: &WorkDb, asking: &Task, target: &Task) {
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&asking.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .repo_remote_url(crate::test_support::TEST_REPO_REMOTE_URL)
+                .build(),
+        )
+        .unwrap();
+    let mut q = link_id(&target.id);
+    if let OperatorAnswerType::LinkPrerequisiteTask { work_item_id, .. } = &mut q.answer_type {
+        *work_item_id = target.id.clone();
+    }
+    let conn = db.connect().unwrap();
+    crate::pr_flow::insert_question(&conn, &execution.id, "prop_link", &q).unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_operator_answer' WHERE id = ?1",
+        [&asking.id],
+    )
+    .unwrap();
+    drop(conn);
+    db.answer_operator_question(&asking.id, boss_protocol::OperatorAnswer::YesNo { value: true })
+        .unwrap();
+}
+
+fn assert_parked_behind(db: &WorkDb, asking_id: &str, target_id: &str) {
+    let conn = db.connect().unwrap();
+    let asking = query_task(&conn, asking_id).unwrap().unwrap();
+    assert_eq!(asking.status, TaskStatus::Blocked);
+    assert_eq!(asking.blocked_reason.as_deref(), Some("dependency"));
+    let prereqs = deps::prerequisites_of(&conn, asking_id, Some(RELATION_BLOCKS)).unwrap();
+    assert_eq!(prereqs.len(), 1);
+    assert_eq!(prereqs[0].prerequisite_id, target_id);
+}
+
+fn open_question_count(db: &WorkDb, work_item_id: &str) -> usize {
+    db.list_operator_questions(work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|q| q.status == boss_protocol::OperatorQuestionStatus::Open)
+        .count()
+}
+
+fn ready_execution_count(db: &WorkDb, work_item_id: &str) -> usize {
+    db.list_executions(Some(work_item_id))
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.status == ExecutionStatus::Ready)
+        .count()
+}
+
+#[test]
+fn linking_to_a_task_waiting_on_its_own_question_does_not_restart_it() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product(&db);
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let target = crate::test_support::create_test_chore_manual(&db, product.id, "Shared fixture");
+    let target_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&target.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .repo_remote_url(crate::test_support::TEST_REPO_REMOTE_URL)
+                .build(),
+        )
+        .unwrap();
+    let target_q = OperatorQuestion {
+        text: "Continue with the shared fixture?".into(),
+        answer_type: OperatorAnswerType::YesNo,
+        explanation: "Need a decision before this work can proceed.".into(),
+    };
+    let conn = db.connect().unwrap();
+    crate::pr_flow::insert_question(&conn, &target_exec.id, "prop_target", &target_q).unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'failed', finished_at = ?2 WHERE id = ?1",
+        rusqlite::params![target_exec.id, now_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_operator_answer' WHERE id = ?1",
+        [&target.id],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(open_question_count(&db, &target.id), 1);
+    yes_on_stored_link(&db, &asking, &target);
+    assert_parked_behind(&db, &asking.id, &target.id);
+    assert_eq!(open_question_count(&db, &target.id), 1);
+    let target = query_task(&db.connect().unwrap(), &target.id).unwrap().unwrap();
+    assert_eq!(target.status, TaskStatus::Blocked);
+    assert_eq!(target.blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+    assert_eq!(ready_execution_count(&db, &target.id), 0);
+}
+
+#[test]
+fn linking_to_question_dismissed_human_driven_or_deferred_is_wait_only() {
+    for state in ["question_dismissed", "human_driven", "deferred"] {
+        let (_tmp, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+        let target = crate::test_support::create_test_chore_manual(&db, product.id, "Shared fixture");
+        let conn = db.connect().unwrap();
+        match state {
+            "question_dismissed" => {
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', blocked_reason = 'question_dismissed' WHERE id = ?1",
+                    [&target.id],
+                )
+                .unwrap();
+            }
+            "human_driven" => {
+                conn.execute("UPDATE tasks SET human_driven = 1 WHERE id = ?1", [&target.id])
+                    .unwrap();
+            }
+            "deferred" => {
+                conn.execute("UPDATE tasks SET deferred = 1 WHERE id = ?1", [&target.id])
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(conn);
+        yes_on_stored_link(&db, &asking, &target);
+        assert_parked_behind(&db, &asking.id, &target.id);
+        let target = query_task(&db.connect().unwrap(), &target.id).unwrap().unwrap();
+        match state {
+            "question_dismissed" => {
+                assert_eq!(target.status, TaskStatus::Blocked);
+                assert_eq!(target.blocked_reason.as_deref(), Some("question_dismissed"));
+            }
+            "human_driven" => {
+                assert!(target.human_driven);
+                assert_eq!(target.status, TaskStatus::Todo);
+            }
+            "deferred" => {
+                assert!(target.deferred);
+                assert_eq!(target.status, TaskStatus::Todo);
+            }
+            _ => unreachable!(),
+        }
+        assert!(!target.autostart);
+        assert_eq!(ready_execution_count(&db, &target.id), 0);
+        let asking = query_task(&db.connect().unwrap(), &asking.id).unwrap().unwrap();
+        assert!(
+            asking
+                .description
+                .contains("This task now waits for the named existing task.")
+        );
+        assert!(!asking.description.contains("has been scheduled for dispatch"));
+    }
+}
+
+#[test]
+fn linking_to_a_runnable_backlog_task_still_schedules_it() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product(&db);
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let target = crate::test_support::create_test_chore_manual(&db, product.id, "Shared fixture");
+    yes_on_stored_link(&db, &asking, &target);
+    assert_parked_behind(&db, &asking.id, &target.id);
+    let target = query_task(&db.connect().unwrap(), &target.id).unwrap().unwrap();
+    assert!(target.autostart);
+    assert_eq!(target.status, TaskStatus::Todo);
+    assert_eq!(ready_execution_count(&db, &target.id), 1);
+    let asking = query_task(&db.connect().unwrap(), &asking.id).unwrap().unwrap();
+    assert!(asking.description.contains("has been scheduled for dispatch"));
+}
+
+#[test]
+fn inherited_product_repo_does_not_bind_a_foreign_owner_of_the_same_number() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product(&db);
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let owner = crate::test_support::create_test_chore(&db, product.id, "Foreign wiring");
+    bind_pr(&db, &owner.id, "https://github.com/other/repo/pull/9");
+    let conn = db.connect().unwrap();
+    assert!(asking.repo_remote_url.is_none());
+    assert_eq!(
+        resolve_repo_for_work_item(&conn, &asking.id).unwrap().as_deref(),
+        Some(crate::test_support::TEST_REPO_REMOTE_URL)
+    );
+    assert!(rejected(&conn, Some(&asking), &link_pr("9")).contains("no open task owns"));
+    assert!(matches!(
+        ready(&conn, &asking, &create_pr("9")).answer_type,
+        OperatorAnswerType::CreatePrerequisiteTask { .. }
+    ));
+}
+
+#[test]
+fn two_products_sharing_a_pr_stay_in_their_own_product() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product_a = crate::test_support::create_test_product_named(&db, "Alpha");
+    let product_b = crate::test_support::create_test_product_named(&db, "Beta");
+    let asking = crate::test_support::create_test_chore(&db, product_a.id.clone(), "Startup check");
+    let local = crate::test_support::create_test_chore(&db, product_a.id.clone(), "Local wiring");
+    let foreign = crate::test_support::create_test_chore(&db, product_b.id, "Foreign wiring");
+    let url = "https://github.com/acme/widget/pull/9";
+    bind_pr(&db, &local.id, url);
+    bind_pr(&db, &foreign.id, url);
+    let conn = db.connect().unwrap();
+    assert_eq!(stored_owner_id(ready(&conn, &asking, &link_pr(url))), local.id);
+    assert_eq!(
+        stored_owner_id(ready(
+            &conn,
+            &asking,
+            &create_with_text("Land wiring", &format!("Finish {url}."), "Need it."),
+        )),
+        local.id
+    );
+    let reason = rejected(&conn, Some(&asking), &link_id(&foreign.id));
+    assert!(reason.contains("belongs to another product"), "{reason}");
+    assert!(reason.contains("Foreign wiring"), "{reason}");
+}
+
+#[test]
+fn a_pr_owned_only_in_another_product_stays_a_create_and_rejects_an_explicit_link() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product_a = crate::test_support::create_test_product_named(&db, "Alpha");
+    let product_b = crate::test_support::create_test_product_named(&db, "Beta");
+    let asking = crate::test_support::create_test_chore(&db, product_a.id, "Startup check");
+    let foreign = crate::test_support::create_test_chore(&db, product_b.id, "Foreign wiring");
+    let url = "https://github.com/acme/widget/pull/9";
+    bind_pr(&db, &foreign.id, url);
+    let conn = db.connect().unwrap();
+    match ready(
+        &conn,
+        &asking,
+        &create_with_text("Land wiring", &format!("Finish {url}."), "Need it."),
+    )
+    .answer_type
+    {
+        OperatorAnswerType::CreatePrerequisiteTask { .. } => {}
+        other => panic!("expected create form, got {other:?}"),
+    }
+    let reason = rejected(&conn, Some(&asking), &link_pr(url));
+    assert!(reason.contains("belongs to another product"), "{reason}");
+}
+
+#[test]
+fn create_brief_with_one_bound_and_one_unbound_pr_converts_to_the_bound_owner() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product(&db);
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let owner = crate::test_support::create_test_chore(&db, product.id, "Land the wiring");
+    bind_pr(&db, &owner.id, "https://github.com/spinyfin/mono/pull/3639");
+    let q = create_with_text(
+        "Finish the wiring",
+        "Finish spinyfin/mono #3639; it builds on spinyfin/mono#3600, which merged.",
+        "Details: see also rust-lang/rust#1.",
+    );
+    assert_eq!(stored_owner_id(ready(&db.connect().unwrap(), &asking, &q)), owner.id);
+}
+
+#[test]
+fn create_brief_with_two_bound_prs_asks_for_an_explicit_prerequisite_pr() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product(&db);
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let first = crate::test_support::create_test_chore(&db, product.id.clone(), "First wiring");
+    let second = crate::test_support::create_test_chore(&db, product.id, "Second wiring");
+    bind_pr(&db, &first.id, "https://github.com/acme/widget/pull/9");
+    bind_pr(&db, &second.id, "https://github.com/acme/widget/pull/10");
+    let reason = rejected(
+        &db.connect().unwrap(),
+        Some(&asking),
+        &create_with_text(
+            "Land wiring",
+            "Finish acme/widget#9; it builds on acme/widget#10.",
+            "Need it.",
+        ),
+    );
+    assert!(reason.contains("more than one pull request"), "{reason}");
+    assert!(reason.contains("--prerequisite-pr"), "{reason}");
+}
+
+#[test]
+fn foreign_only_ambiguous_pr_holders_do_not_reject_create_questions() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product_named(&db, "Asking");
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let url = "https://github.com/acme/widget/pull/9";
+    for name in ["Alpha", "Beta"] {
+        let foreign = crate::test_support::create_test_product_named(&db, name);
+        let owner = crate::test_support::create_test_chore(&db, foreign.id, "Foreign wiring");
+        bind_pr(&db, &owner.id, url);
+    }
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
+        [&product.id],
+    )
+    .unwrap();
+    assert!(resolve_repo_for_work_item(&conn, &asking.id).unwrap().is_none());
+    for q in [
+        create_with_text("Land wiring", &format!("Finish {url}."), "Need it."),
+        create_pr(url),
+        create_pr("acme/widget#9"),
+        create_pr("9"),
+    ] {
+        assert_eq!(ready(&conn, &asking, &q), q);
     }
 }

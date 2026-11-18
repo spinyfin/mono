@@ -226,10 +226,22 @@ fn park_behind(
     // dispatched, leaving the dependent waiting with no signal. A task that
     // already owns a PR must not get a new primary execution — that path
     // refuses with "use a revision to change it" and would roll the Yes back.
+    // The create path only ever links to a task `find_equivalent_open_task`
+    // would accept (todo, or blocked on a dependency, and not human-driven
+    // or deferred). The link path reuses this helper without that filter, so
+    // a restart here would withdraw the target's own open question or fail
+    // the Yes for a human-driven / question-dismissed row. Wait-only then.
     let schedulable = matches!(prerequisite.status, TaskStatus::Todo | TaskStatus::Blocked);
     let eligible = parking::upkeep_eligible(conn, &prerequisite.id)?;
     let owns_pr = prerequisite.pr_url.as_deref().is_some_and(|url| !url.is_empty());
-    let needs_fresh_run = eligible && !created && schedulable && !owns_pr;
+    let create_path_runnable = !prerequisite.human_driven
+        && !prerequisite.deferred
+        && match prerequisite.status {
+            TaskStatus::Todo => true,
+            TaskStatus::Blocked => prerequisite.blocked_reason.as_deref() == Some("dependency"),
+            _ => false,
+        };
+    let needs_fresh_run = eligible && !created && schedulable && !owns_pr && (!from_link || create_path_runnable);
     let enabled_dispatch = needs_fresh_run && !prerequisite.autostart;
     let actor = attribution.actor;
     let basis = attribution.basis("approve_in_tx");

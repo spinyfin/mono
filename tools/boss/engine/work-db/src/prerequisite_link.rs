@@ -54,7 +54,10 @@ pub(crate) fn resolve_stored_question(
             ..
         } if file_count_bypass.is_none() => {
             let scanned = if existing_id.is_none() && existing_pr.is_none() {
-                unique_pr_from_create_text(conn, asking, question)?
+                match unique_pr_from_create_text(conn, asking, question)? {
+                    Ok(scanned) => scanned,
+                    Err(reason) => return Ok(ResolvedQuestion::Rejected(reason)),
+                }
             } else {
                 None
             };
@@ -97,20 +100,53 @@ fn link_question(question: &OperatorQuestion, existing: &Task) -> OperatorQuesti
     }
 }
 
-fn unique_pr_from_create_text(conn: &Connection, asking: &Task, question: &OperatorQuestion) -> Result<Option<String>> {
+fn unique_pr_from_create_text(
+    conn: &Connection,
+    asking: &Task,
+    question: &OperatorQuestion,
+) -> Result<Result<Option<String>, String>> {
     let OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } = &question.answer_type else {
-        return Ok(None);
+        return Ok(Ok(None));
     };
     let mut found = Vec::new();
     for text in [name.as_str(), brief.as_str(), question.explanation.as_str()] {
         scan_pr_refs(text, &mut found);
     }
-    if let Some(own) = asking_chain_pr_url(conn, asking)? {
-        found.retain(|url| !same_pr(url, &own));
-    }
     found.sort();
     found.dedup();
-    Ok((found.len() == 1).then(|| found.pop().unwrap()))
+    let own = asking_chain_pr_url(conn, asking)?;
+    let mut bound = Vec::new();
+    for url in found {
+        if own.as_ref().is_some_and(|own| same_pr(&url, own)) {
+            continue;
+        }
+        match lookup_pr_owner(conn, asking, &url, false)? {
+            Ok(Some(owner))
+                if owner.product_id == asking.product_id
+                    && !matches!(owner.status, TaskStatus::Done | TaskStatus::Archived) =>
+            {
+                if !in_askers_revision_chain(conn, asking, &owner)? {
+                    bound.push(url);
+                }
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                return Ok(Err(format!(
+                    "Cited PR {}: {reason}",
+                    boss_github::pr_url::compact_pr_label(&url).unwrap_or_else(|| url.clone())
+                )));
+            }
+        }
+    }
+    match bound.len() {
+        0 => Ok(Ok(None)),
+        1 => Ok(Ok(Some(bound.pop().unwrap()))),
+        _ => Ok(Err(
+            "the brief names more than one pull request that already has an open owner; \
+             pass --prerequisite-pr to choose which this task should wait for"
+                .into(),
+        )),
+    }
 }
 
 fn scan_pr_refs(text: &str, out: &mut Vec<String>) {
@@ -144,7 +180,11 @@ fn slug_pr_at(text: &str, hash: usize) -> Option<(String, u64)> {
         return None;
     }
     let number: u64 = after[..digits_end].parse().ok()?;
-    let before = &text[..hash];
+    let before = text.get(..hash)?;
+    // One space between the slug and '#' ("owner/repo #12") is a common
+    // written form; more whitespace still fails so "#12" on its own is not
+    // pulled into an earlier word.
+    let before = before.strip_suffix(' ').unwrap_or(before);
     let slug_start = before
         .char_indices()
         .rev()
@@ -213,7 +253,7 @@ fn resolve_existing(
         None => None,
     };
     let by_pr = match existing_pr {
-        Some(raw) => match resolve_named_pr(conn, asking, raw)? {
+        Some(raw) => match resolve_named_pr(conn, asking, raw, required)? {
             Ok(Some(task)) => Some(task),
             Ok(None) if required => {
                 return Ok(Err(ExistingError::missing(format!(
@@ -239,6 +279,17 @@ fn resolve_existing(
             )));
         }
     };
+    if existing.product_id != asking.product_id {
+        let reason = format!(
+            "'{}' belongs to another product; cross-product prerequisites are not supported",
+            existing.name
+        );
+        return Ok(Err(if required {
+            ExistingError::invalid(reason)
+        } else {
+            ExistingError::missing(reason)
+        }));
+    }
     if existing.id == asking.id {
         return Ok(Err(ExistingError::invalid("a task cannot wait on itself")));
     }
@@ -281,18 +332,23 @@ fn resolve_named_task(conn: &Connection, selector: &str) -> Result<Option<Task>>
     Ok(Some(task))
 }
 
-fn resolve_named_pr(conn: &Connection, asking: &Task, raw: &str) -> Result<Result<Option<Task>, ExistingError>> {
+fn resolve_named_pr(
+    conn: &Connection,
+    asking: &Task,
+    raw: &str,
+    required: bool,
+) -> Result<Result<Option<Task>, ExistingError>> {
     let trimmed = raw.trim();
     if let Some(url) = canonical_pr_url(trimmed)
         .or_else(|| parse_slug_pr(trimmed).and_then(|(slug, number)| canonical_slug_pr(&slug, number)))
     {
-        return match lookup_pr_owner(conn, asking, &url)? {
+        return match lookup_pr_owner(conn, asking, &url, required)? {
             Ok(found) => Ok(Ok(found)),
             Err(reason) => Ok(Err(ExistingError::invalid(reason))),
         };
     }
     if let Some(number) = parse_pr_number_only(trimmed) {
-        return match lookup_pr_number(conn, asking, number)? {
+        return match lookup_pr_number(conn, asking, number, required)? {
             Ok(found) => Ok(Ok(found)),
             Err(reason) => Ok(Err(ExistingError::invalid(reason))),
         };
@@ -336,25 +392,32 @@ pub(crate) fn in_askers_revision_chain(conn: &Connection, asking: &Task, existin
     Ok(chain_identity(conn, asking)? == chain_identity(conn, existing)?)
 }
 
-fn pr_owner_rows(conn: &Connection, asking_id: &str) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, pr_url FROM tasks
-         WHERE pr_url IS NOT NULL AND pr_url != '' AND deleted_at IS NULL
-           AND kind != 'revision' AND id != ?1
-         ORDER BY created_at ASC, id ASC",
-    )?;
-    stmt.query_map([asking_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?
-    .collect::<rusqlite::Result<Vec<_>>>()
-    .map_err(Into::into)
+fn prefer_asking_product(asking: &Task, rows: Vec<(String, String, String)>, required: bool) -> Vec<(String, String)> {
+    let in_product: Vec<_> = rows
+        .iter()
+        .filter(|(_, _, product_id)| product_id == &asking.product_id)
+        .map(|(id, url, _)| (id.clone(), url.clone()))
+        .collect();
+    // Foreign holders are useful only for explicit-link diagnostics. They cannot
+    // turn a create question into a link or make it ambiguous.
+    if !required || !in_product.is_empty() {
+        in_product
+    } else {
+        rows.into_iter().map(|(id, url, _)| (id, url)).collect()
+    }
 }
 
-fn lookup_pr_owner(conn: &Connection, asking: &Task, url: &str) -> Result<Result<Option<Task>, String>> {
-    let matches = pr_owner_rows(conn, &asking.id)?
-        .into_iter()
-        .filter(|(_, stored)| same_pr(stored, url))
-        .collect();
+fn lookup_pr_owner(
+    conn: &Connection,
+    asking: &Task,
+    url: &str,
+    required: bool,
+) -> Result<Result<Option<Task>, String>> {
+    let matches = prefer_asking_product(
+        asking,
+        super::pr_binding::query_live_holders_of_pr(conn, url, &asking.id)?,
+        required,
+    );
     select_pr_owner(conn, matches, "more than one open task owns that pull request")
 }
 
@@ -382,38 +445,41 @@ fn select_pr_owner(
     }
 }
 
-fn lookup_pr_number(conn: &Connection, asking: &Task, number: u64) -> Result<Result<Option<Task>, String>> {
-    let rows = pr_owner_rows(conn, &asking.id)?;
+fn lookup_pr_number(
+    conn: &Connection,
+    asking: &Task,
+    number: u64,
+    required: bool,
+) -> Result<Result<Option<Task>, String>> {
     let mut matches = Vec::new();
-    for (id, pr_url) in rows {
+    for (id, pr_url, product_id) in super::pr_binding::query_live_pr_holders(conn, &asking.id)? {
         if stored_pr_number(&pr_url) == Some(number as i64) {
-            matches.push((id, pr_url));
+            matches.push((id, pr_url, product_id));
         }
     }
     if matches.is_empty() {
         return Ok(Ok(None));
     }
-    let asking_repo = asking
-        .repo_remote_url
+    let resolved_repo = resolve_repo_for_work_item(conn, &asking.id)?;
+    let asking_repo = resolved_repo
         .as_deref()
         .and_then(git_utils::repo_slug::parse_github_slug);
-    if let Some(repo) = asking_repo.as_deref() {
-        let same_repo: Vec<_> = matches
-            .iter()
-            .filter(|(_, url)| {
-                boss_github::pr_url::repo_from_pr_url_lenient(url).is_some_and(|bound| bound.eq_ignore_ascii_case(repo))
-            })
-            .cloned()
-            .collect();
+    if let Some(repo) = asking_repo {
+        matches.retain(|(_, url, _)| {
+            boss_github::pr_url::repo_from_pr_url_lenient(url).is_some_and(|bound| bound.eq_ignore_ascii_case(&repo))
+        });
+        if matches.is_empty() {
+            return Ok(Ok(None));
+        }
         return select_pr_owner(
             conn,
-            same_repo,
+            prefer_asking_product(asking, matches, required),
             "more than one open task owns that pull request number in this repository",
         );
     }
     select_pr_owner(
         conn,
-        matches,
+        prefer_asking_product(asking, matches, required),
         "more than one open task owns that pull request number; pass the full GitHub URL",
     )
 }
