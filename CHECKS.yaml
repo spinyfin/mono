@@ -43,17 +43,6 @@ checks:
             - "bazel-*/**"
 
   - id: file/size
-    # Fixed comparison evidence: approved by the repo owner on 2026-10-27.
-    # Preserve the original prompt bytes; implementation remains size-checked.
-    exclude:
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/flunge-1605/prompt-baseline.txt
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/flunge-1605/prompt-production.txt
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2860/prompt-baseline.txt
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2860/prompt-production.txt
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2886/prompt-baseline.txt
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2886/prompt-production.txt
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2890/prompt-baseline.txt
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2890/prompt-production.txt
     config:
       max_lines: 3000
       exclude_files:
@@ -82,12 +71,6 @@ checks:
   # CI context, including the merge queue, with no network dependency.
   # Distinct from file/size, which limits lines per file, not file count.
   - id: change/file-count
-    # One six-comparison evaluation, approved by the repo owner on 2026-10-27.
-    # Only fixed evidence is exempt; the recipe and Rust changes still count.
-    exclude:
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/cases/**
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/runs/2026-10-27/**
-      - tools/boss/docs/evaluations/automatic-pr-review-guides/runs/2026-11-18/**
     config:
       max_files: 30
     policy:

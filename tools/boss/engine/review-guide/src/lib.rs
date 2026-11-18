@@ -18,7 +18,11 @@ use std::fmt;
 
 use boss_pr_template::{HeadingToken, parse_all_headings};
 
+mod composition;
 mod context;
+mod reference_links;
+
+pub use composition::{compose_prompt, linked_range_ok, valid_linked_path};
 
 pub use context::{
     GuideContext, Project, RelatedWork, Relation, Revision, RevisionOrigin, RootTask, render_guide_context,
@@ -215,32 +219,6 @@ pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
         .replace("{{GIT_DIR}}", metadata.git_dir)
 }
 
-/// Historical four-section request, preserved independently of production revisions.
-const BASELINE_PROMPT: &str = r#"I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
-
-1. a general overview of the problem being solved.
-2. a general overview of the core fix / implementation.
-3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
-4. a summary of what tests were added, and what test infrastructure was modified to support it.
-
-This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
-
-Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code."#;
-
-/// Render the historical baseline with the current pinned-workspace access context.
-pub fn render_baseline_prompt(metadata: &PromptMetadata<'_>) -> String {
-    let full = render_prompt(metadata);
-    let context = full.split_once("\n\nReview context:").expect("review context").1;
-    let context = context
-        .split_once("\n\nGround the guide")
-        .expect("production additions")
-        .0;
-    format!(
-        "{}\n\nReview context:{context}",
-        BASELINE_PROMPT.replace("{{PR_URL}}", metadata.pr_url)
-    )
-}
-
 /// Render the small read-only comparison manifest appended after
 /// [`render_prompt`]: the comparison identity, PR description, and a
 /// change-kind/line-count entry for every changed file. The driver reads full
@@ -309,47 +287,6 @@ fn render_file_manifest_line(file: &boss_pr_review_sources::SourceFile) -> Strin
     }
     line.push('\n');
     line
-}
-
-/// Observed hard input-size ceiling of the actual `gpt-6-astra` turn API,
-/// independent of any shell/OS argument-length limit — a real turn against
-/// this backend is flatly refused ("Input exceeds the maximum length of
-/// 1048576 characters") once the combined prompt text crosses this many
-/// characters, however it is delivered (argv or stdin). Confirmed against
-/// two of the six saved comparisons in the "Validate the production prompt
-/// on the six saved comparisons" sample — the 34-file `flunge-1605` case
-/// (1,562,064 rendered characters) and the 24-file `mono-2860` case
-/// (2,295,728) — see
-/// `tools/boss/docs/evaluations/automatic-pr-review-guides/README.md`.
-pub const BACKEND_INPUT_CHAR_LIMIT: usize = 1_048_576;
-
-/// The budget this crate enforces for [`render_prompt`] +
-/// [`render_source_context`] combined, kept safely under
-/// [`BACKEND_INPUT_CHAR_LIMIT`] to leave headroom for tokenizer/whitespace
-/// variance. [`MAX_PINNED_SOURCE_BYTES`] bounds one file's own size, not a
-/// packet's aggregate rendered size across every changed file, so a
-/// sufficiently wide (many-file) PR can still overflow a single turn even
-/// though no individual file trips its own cap. A comparison whose full
-/// rendering exceeds this is not one this crate can silently truncate into
-/// a valid guide — see [`exceeds_prompt_budget`]: callers must treat this as
-/// an explicit, non-retryable generation failure, since retrying the same
-/// model/effort/packet always fails identically, rather than spending an
-/// attempt on it at all.
-pub const MAX_PROMPT_CHARS: usize = 1_000_000;
-
-/// The character count [`render_prompt`] + [`render_source_context`] would
-/// together produce for `metadata`/`packet` — what the driver actually
-/// sends the model in one turn.
-pub fn rendered_prompt_char_count(metadata: &PromptMetadata<'_>, packet: &SourcePacket) -> usize {
-    render_prompt(metadata).chars().count() + render_source_context(packet).chars().count()
-}
-
-/// Whether the combined production prompt for `metadata`/`packet` would
-/// exceed [`MAX_PROMPT_CHARS`]. See its doc for why a caller should treat
-/// this as a pre-flight gate rather than just attempting the call and
-/// handling whatever error comes back.
-pub fn exceeds_prompt_budget(metadata: &PromptMetadata<'_>, packet: &SourcePacket) -> bool {
-    rendered_prompt_char_count(metadata, packet) > MAX_PROMPT_CHARS
 }
 
 /// A guide that passed structural and reference validation, ready to become
@@ -532,7 +469,6 @@ fn section_body<'a>(raw: &'a str, headings: &[HeadingToken], heading: &HeadingTo
 
 /// Every `https://github.com/...` href inside a Markdown link or bare
 /// autolink in `text`.
-///
 fn github_links(text: &str) -> Vec<String> {
     let link_re = regex::Regex::new(r#"(https://github\.com/[^\s<>\)\]`*"']+)"#).expect("static regex");
     let mut hrefs: Vec<String> = link_re
@@ -544,33 +480,19 @@ fn github_links(text: &str) -> Vec<String> {
     hrefs
 }
 
-/// One `https://github.com/...` reference found in a rendered guide,
-/// together with the nearest preceding `##`-or-deeper section heading it
-/// appeared under. Powers the navigation/grounding review template a human
-/// works through against each case's `guide-production.md` — see the
-/// "Human review" section of
-/// `tools/boss/docs/evaluations/automatic-pr-review-guides/README.md`. This
-/// is a positional signal, not a semantic classification: it reports where
-/// the model placed the link, not whether it is the core fix, the worked
-/// example, or a test reference per [`PROMPT_TEMPLATE`]'s "Link the core
-/// fix, worked example, and important test changes" instruction — the
-/// guide's Markdown structure does not separately mark those three
-/// categories, so distinguishing them is left to the human reviewer.
+/// A Markdown target or bare GitHub reference and its nearest section.
+/// Both baseline and production guides contribute human-review rows.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GuideReference {
     pub section: String,
     pub href: String,
 }
 
-/// Every distinct section/`github.com` reference pair, in document order,
-/// paired with the section heading it appears under (or
-/// `"(before any heading)"` for a reference above the first heading).
-/// Reuses the same extraction [`github_links`] performs for validation, so
-/// the reference set a reviewer works through is guaranteed identical to
-/// the set [`validate_guide_output`] already checked mechanically.
+/// Every distinct section/reference pair, including non-GitHub Markdown links.
 pub fn guide_references(markdown: &str) -> Vec<GuideReference> {
     let mut out: Vec<GuideReference> = Vec::new();
     let mut section = "(before any heading)".to_owned();
+    let definitions = reference_links::definitions(markdown);
     for line in markdown.lines() {
         let trimmed_start = line.trim_start();
         let hashes = trimmed_start.chars().take_while(|c| *c == '#').count();
@@ -580,7 +502,9 @@ pub fn guide_references(markdown: &str) -> Vec<GuideReference> {
                 section = rest.trim().to_owned();
             }
         }
-        for href in github_links(line) {
+        let mut hrefs = reference_links::targets(line, &definitions);
+        hrefs.extend(github_links(line));
+        for href in hrefs {
             if !out
                 .iter()
                 .any(|existing| existing.href == href && existing.section == section)
@@ -1186,107 +1110,20 @@ mod tests {
     }
 
     #[test]
-    fn baseline_prompt_keeps_shared_prefix_and_context_but_drops_the_production_addition() {
-        let metadata = PromptMetadata {
-            pr_url: "https://github.com/acme/widget/pull/4",
-            repository: "acme/widget",
-            pr_title: "Fix retry backoff",
-            base_sha: &"a".repeat(40),
-            head_sha: &"c".repeat(40),
-            git_dir: "/repo/.git",
-        };
-        let baseline = render_baseline_prompt(&metadata);
-        let full = render_prompt(&metadata);
-
-        assert!(baseline.starts_with("I want you to provide me a guided summary"));
-        assert!(baseline.contains("Make the core fix concrete with one worked example."));
-        assert!(baseline.contains(&format!("Head revision: {}", "c".repeat(40))));
-        assert!(baseline.contains("git --git-dir /repo/.git show"));
-        assert!(baseline.contains("Check every step against the actual code."));
-        assert!(!baseline.contains("5. a section"));
-
-        assert!(!baseline.contains("Ground the guide in those revisions."));
-        assert!(!baseline.contains("Organize the walkthrough"));
-        assert!(!baseline.contains("Return only the finished Markdown guide"));
-        assert!(full.contains("Ground the guide in those revisions."));
-        assert!(full.contains("Submit the finished Markdown guide"));
-    }
-
-    #[test]
-    fn small_packet_is_well_under_the_prompt_budget() {
-        let metadata = PromptMetadata {
-            pr_url: "https://github.com/acme/widget/pull/4",
-            repository: "acme/widget",
-            pr_title: "Fix retry backoff",
-            base_sha: &"a".repeat(40),
-            head_sha: &"c".repeat(40),
-            git_dir: "/repo/.git",
-        };
-        assert!(!exceeds_prompt_budget(&metadata, &packet()));
-        assert!(rendered_prompt_char_count(&metadata, &packet()) < MAX_PROMPT_CHARS / 10);
-    }
-
-    #[test]
-    fn rendered_prompt_char_count_matches_the_actual_concatenation() {
-        let metadata = PromptMetadata {
-            pr_url: "https://github.com/acme/widget/pull/4",
-            repository: "acme/widget",
-            pr_title: "Fix retry backoff",
-            base_sha: &"a".repeat(40),
-            head_sha: &"c".repeat(40),
-            git_dir: "/repo/.git",
-        };
-        let expected = render_prompt(&metadata).chars().count() + render_source_context(&packet()).chars().count();
-        assert_eq!(rendered_prompt_char_count(&metadata, &packet()), expected);
-    }
-
-    #[test]
-    fn oversized_manifest_is_rejected_without_inlining_source() {
-        // Large PR descriptions still need a bounded input check.
-        let mut big_packet = packet();
-        let per_file_content = "x".repeat(20_000);
-        big_packet.files = (0..60)
-            .map(|i| {
-                SourceFile::builder()
-                    .path(format!("src/file_{i}.rs"))
-                    .change_kind(ChangeKind::Modified)
-                    .additions(1u64)
-                    .deletions(1u64)
-                    .before(
-                        PinnedSource::builder()
-                            .repository("acme/widget")
-                            .sha("b".repeat(40))
-                            .path(format!("src/file_{i}.rs"))
-                            .content(per_file_content.clone())
-                            .content_hash(sha256_hex(&per_file_content))
-                            .byte_count(per_file_content.len() as u64)
-                            .build(),
-                    )
-                    .after(
-                        PinnedSource::builder()
-                            .repository("acme/widget")
-                            .sha("c".repeat(40))
-                            .path(format!("src/file_{i}.rs"))
-                            .content(per_file_content.clone())
-                            .content_hash(sha256_hex(&per_file_content))
-                            .byte_count(per_file_content.len() as u64)
-                            .build(),
-                    )
-                    .build()
-            })
-            .collect();
-
-        let metadata = PromptMetadata {
-            pr_url: "https://github.com/acme/widget/pull/4",
-            repository: "acme/widget",
-            pr_title: "Fix retry backoff",
-            base_sha: &"a".repeat(40),
-            head_sha: &"c".repeat(40),
-            git_dir: "/repo/.git",
-        };
-        assert!(!exceeds_prompt_budget(&metadata, &big_packet));
-        big_packet.body = Some("x".repeat(MAX_PROMPT_CHARS));
-        assert!(exceeds_prompt_budget(&metadata, &big_packet));
+    fn shared_composition_preserves_template_context_and_screenshots() {
+        let packet = packet();
+        let context = primary_context();
+        let screenshots = "[{\"caption\":\"verified view\"}]\n";
+        for template in ["primary template", "incremental update template"] {
+            assert_eq!(
+                compose_prompt(template.to_owned(), &packet, &context, screenshots),
+                format!(
+                    "{template}\n\n{}\n{}\n### Registered screenshots\n\n{screenshots}",
+                    render_source_context(&packet),
+                    render_guide_context(&context)
+                )
+            );
+        }
     }
 
     #[test]
@@ -1449,12 +1286,7 @@ mod tests {
 
     #[test]
     fn markdown_link_followed_by_a_colon_is_not_also_captured_as_a_mangled_bare_link() {
-        // A real pattern from the six saved comparisons: a Markdown list
-        // item that links a test file, then describes it after a colon —
-        // `- [Page suite](url): four added scenarios...`. The bare-autolink
-        // fallback used to treat the `(` that opens the Markdown link's own
-        // URL as a second, separate bare autolink, running past the closing
-        // `)` and swallowing the trailing `):` into a mangled duplicate href.
+        // A colon after a Markdown link is prose, not part of its target.
         let href = format!(
             "https://github.com/acme/widget/blob/{}/src/retry_test.rs#L1-L2",
             "c".repeat(40)

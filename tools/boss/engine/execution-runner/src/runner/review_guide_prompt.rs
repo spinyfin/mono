@@ -76,12 +76,10 @@ pub(super) fn compose_review_guide_prompt(
         .head_sha(&packet.head_sha)
         .git_dir(&git_dir)
         .build();
-    let mut prompt = match work_db.review_guide_update_context(&execution.id)? {
+    let template = match work_db.review_guide_update_context(&execution.id)? {
         Some((old_head, previous)) => boss_review_guide::render_update_prompt(&metadata, &old_head, &previous),
         None => boss_review_guide::render_prompt(&metadata),
     };
-    prompt.push_str("\n\n");
-    prompt.push_str(&boss_review_guide::render_source_context(&packet));
     // Every guide opens with an orientation built from the originating task,
     // its revisions and its project. A guide without those inputs cannot
     // orient anyone, so a missing one aborts the run with the reason instead
@@ -94,17 +92,15 @@ pub(super) fn compose_review_guide_prompt(
                 execution.id, packet.canonical_pr_url
             )
         })?;
-    prompt.push('\n');
-    prompt.push_str(&boss_review_guide::render_guide_context(&context));
     // Guide executions point to a comparison, not a task. The captured
     // series already carries the canonical root resolved at source capture.
     // Reuse the gallery's chain-wide query so revisions contribute evidence.
     let attachments = work_db.list_work_attachments_for_chain(&capture.root_task_id)?;
-    prompt.push_str("\n### Registered screenshots\n\n");
+    let mut screenshots = String::new();
     if attachments.is_empty() {
-        prompt.push_str("No screenshots are registered for this task or its revisions.\n");
+        screenshots.push_str("No screenshots are registered for this task or its revisions.\n");
     } else {
-        prompt.push_str("Screenshots registered for this task and its revisions:\n\n");
+        screenshots.push_str("Screenshots registered for this task and its revisions:\n\n");
         // Serialize only review metadata, never local paths or evidence URLs.
         // JSON quoting also keeps multiline captions from creating headings.
         let manifest: Vec<_> = attachments
@@ -119,8 +115,13 @@ pub(super) fn compose_review_guide_prompt(
                 })
             })
             .collect();
-        prompt.push_str(&serde_json::to_string_pretty(&manifest)?);
-        prompt.push('\n');
+        screenshots.push_str(&serde_json::to_string_pretty(&manifest)?);
+        screenshots.push('\n');
     }
-    Ok(prompt)
+    Ok(boss_review_guide::compose_prompt(
+        template,
+        &packet,
+        &context,
+        &screenshots,
+    ))
 }

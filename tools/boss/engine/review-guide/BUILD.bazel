@@ -23,7 +23,11 @@ rust_library(
     deps = [
         "//tools/boss/engine/pr-review-sources",
         "//tools/boss/engine/pr-template",
-    ] + all_crate_deps(normal = True),
+    ] + [
+        "@mono_crates//:bon",
+        "@mono_crates//:regex",
+        "@mono_crates//:serde",
+    ],
 )
 
 # Standalone CLI for the six-PR validation recipe (see

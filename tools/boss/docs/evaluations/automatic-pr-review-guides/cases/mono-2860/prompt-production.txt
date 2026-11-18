@@ -1019,7 +1019,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     ## Referring to chores and tasks in chat
 
-    When referring to a chore or task in chat, always use the `T<short_id>` form (e.g. `T19`, `T30`). Never invent a `C<short_id>` form for chores — chores and tasks share one id space and one short-id counter, and the `T` prefix is canonical for both (the CLI, docs, and `boss task create-revision --help` all use `T<n>`). There is no `chore_*` id type and no `C<n>` short-id format anywhere in the CLI surface.
+    When referring to a chore or task in chat, always use the `T<short_id>` form (e.g. `[internal-id-redacted]`, `[internal-id-redacted]`). Never invent a `C<short_id>` form for chores — chores and tasks share one id space and one short-id counter, and the `T` prefix is canonical for both (the CLI, docs, and `boss task create-revision --help` all use `T<n>`). There is no `chore_*` id type and no `C<n>` short-id format anywhere in the CLI surface.
 
     ## Project creation
 
@@ -1800,7 +1800,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     ## Referring to chores and tasks in chat
 
-    When referring to a chore or task in chat, always use the `T<short_id>` form (e.g. `T19`, `T30`). Never invent a `C<short_id>` form for chores — chores and tasks share one id space and one short-id counter, and the `T` prefix is canonical for both (the CLI, docs, and `boss task create-revision --help` all use `T<n>`). There is no `chore_*` id type and no `C<n>` short-id format anywhere in the CLI surface.
+    When referring to a chore or task in chat, always use the `T<short_id>` form (e.g. `[internal-id-redacted]`, `[internal-id-redacted]`). Never invent a `C<short_id>` form for chores — chores and tasks share one id space and one short-id counter, and the `T` prefix is canonical for both (the CLI, docs, and `boss task create-revision --help` all use `T<n>`). There is no `chore_*` id type and no `C<n>` short-id format anywhere in the CLI surface.
 
     ## Project creation
 
@@ -2381,7 +2381,7 @@ pub(crate) enum TaskCommand {
     /// inverse of `delete`. Clears the `deleted_at` tombstone so the
     /// item is visible again. Idempotent on an already-live item.
     /// Accepts the canonical id (`task_…`) or a friendly short id
-    /// (`T43`). Find tombstoned ids with `boss task list --deleted`.
+    /// (`[internal-id-redacted]`). Find tombstoned ids with `boss task list --deleted`.
     #[command(alias = "undelete")]
     Restore(TaskRestoreArgs),
     Reorder(TaskReorderArgs),
@@ -2526,11 +2526,11 @@ pub(crate) struct PrStatusArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskExecutionsArgs {
     /// Work item id whose execution history to list (task/chore/project
-    /// id, or a friendly short id like `T42`). Globally unique short ids
+    /// id, or a friendly short id like `[internal-id-redacted]`). Globally unique short ids
     /// resolve without `--product`.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
-    /// Product slug/id used to resolve a friendly short id (`T42`).
+    /// Product slug/id used to resolve a friendly short id (`[internal-id-redacted]`).
     /// Optional when `id` is already a canonical `task_…` id, or when
     /// the short id is globally unique.
     #[arg(long)]
@@ -2563,7 +2563,7 @@ pub(crate) struct DependAddArgs {
     /// Edge type. Only `blocks` is supported in v1.
     #[arg(long, default_value = "blocks")]
     pub(crate) relation: String,
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`[internal-id-redacted]`, `42`, `#42`) against this product
     /// (slug or id). Applies to both `dependent` and `prerequisite`. Ignored
     /// for a selector that already embeds a product slug (`boss/42`) or is a
     /// primary id.
@@ -2579,7 +2579,7 @@ pub(crate) struct DependRmArgs {
     pub(crate) prerequisite: String,
     #[arg(long, default_value = "blocks")]
     pub(crate) relation: String,
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`[internal-id-redacted]`, `42`, `#42`) against this product
     /// (slug or id). Applies to both `dependent` and `prerequisite`. Ignored
     /// for a selector that already embeds a product slug (`boss/42`) or is a
     /// primary id.
@@ -2595,7 +2595,7 @@ pub(crate) struct DependListArgs {
     /// Which side(s) of the edge to return. Defaults to `both`.
     #[arg(long, value_enum, default_value_t = DependDirectionArg::Both)]
     pub(crate) direction: DependDirectionArg,
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`[internal-id-redacted]`, `42`, `#42`) against this product
     /// (slug or id). Ignored for a selector that already embeds a product
     /// slug (`boss/42`) or is a primary id.
     #[arg(long)]
@@ -3891,7 +3891,7 @@ pub(crate) struct ProjectListArgs {
 
     /// Filter to specific id(s). Comma-separated, or repeat the flag.
     /// Accepts the same forms as `boss task show`: friendly short ids
-    /// (`P7`, `7`, `#7`), primary ids (`proj_…`), and the cross-product
+    /// (`[internal-id-redacted]`, `7`, `#7`), primary ids (`proj_…`), and the cross-product
     /// form (`boss/7`). An id that names no row in the product errors
     /// rather than being silently dropped. Composes with the other
     /// filters below as an AND — a row excluded by e.g. `--status` is
@@ -4122,7 +4122,7 @@ pub(crate) struct TaskCreateArgs {
 
     /// Gate this task on one or more prerequisites, declared atomically
     /// with creation. Repeatable (or comma-separated). Each value is a
-    /// work-item selector (`T42`, a canonical `task_…` id) in the same
+    /// work-item selector (`[internal-id-redacted]`, a canonical `task_…` id) in the same
     /// product; the task is created `blocked` and is never dispatched
     /// until every prerequisite is satisfied. Unlike a follow-up `task
     /// depend add`, this leaves no window where the task could autostart
@@ -4217,7 +4217,7 @@ pub(crate) struct TaskListArgs {
 
     /// Filter to specific id(s). Comma-separated, or repeat the flag.
     /// Accepts the same forms as `boss task show`: friendly short ids
-    /// (`T42`, `42`, `#42`), primary ids (`task_…`), and the
+    /// (`[internal-id-redacted]`, `42`, `#42`), primary ids (`task_…`), and the
     /// cross-product form (`boss/42`). An id that names no row in the
     /// product errors rather than being silently dropped. Composes with
     /// the other filters below as an AND — a row excluded by e.g.
@@ -4437,7 +4437,7 @@ pub(crate) struct InvestigationCreateArgs {
 #[derive(Debug, Args)]
 pub(crate) struct RevisionCreateArgs {
     /// The parent task whose PR this revision will commit to. Accepts
-    /// `T<n>` short ids (e.g. `T651`) or full `task_<hex>` ids.
+    /// `T<n>` short ids (e.g. `[internal-id-redacted]`) or full `task_<hex>` ids.
     /// May itself be a revision task; the gate is evaluated against
     /// the chain root's PR.
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
@@ -4546,7 +4546,7 @@ pub(crate) struct RevisionListArgs {
     pub(crate) include_archived: bool,
 
     /// Restrict to revisions whose parent is this task. Accepts `T<n>` short
-    /// ids (e.g. `T651`) or full `task_<hex>` ids.
+    /// ids (e.g. `[internal-id-redacted]`) or full `task_<hex>` ids.
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) parent: Option<String>,
 
@@ -4651,7 +4651,7 @@ pub(crate) struct ChoreListArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskIdArg {
     /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
-    /// (`T441`, `t441`, `42`, or `#42`), or cross-product form
+    /// (`[internal-id-redacted]`, `t441`, `42`, or `#42`), or cross-product form
     /// (`boss/42` or `boss/#42`). Globally unique short ids resolve
     /// without `--product`; ambiguous ones error listing every candidate.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
@@ -4760,10 +4760,10 @@ pub(crate) struct TaskDeleteArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskRestoreArgs {
     /// Task/chore id to restore. Accepts the canonical primary id
-    /// (`task_…`) or a friendly short id (`T43` / `t43`). Bare `#43` /
+    /// (`task_…`) or a friendly short id (`[internal-id-redacted]` / `t43`). Bare `#43` /
     /// `43` and cross-product `boss/43` forms are not accepted here —
     /// a soft-deleted row is hidden from the per-product short-id
-    /// resolver, so pass the globally-unique `T43` or canonical id.
+    /// resolver, so pass the globally-unique `[internal-id-redacted]` or canonical id.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 }
@@ -5375,7 +5375,7 @@ pub(crate) enum TaskCommand {
     /// inverse of `delete`. Clears the `deleted_at` tombstone so the
     /// item is visible again. Idempotent on an already-live item.
     /// Accepts the canonical id (`task_…`) or a friendly short id
-    /// (`T43`). Find tombstoned ids with `boss task list --deleted`.
+    /// (`[internal-id-redacted]`). Find tombstoned ids with `boss task list --deleted`.
     #[command(alias = "undelete")]
     Restore(TaskRestoreArgs),
     Reorder(TaskReorderArgs),
@@ -5520,11 +5520,11 @@ pub(crate) struct PrStatusArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskExecutionsArgs {
     /// Work item id whose execution history to list (task/chore/project
-    /// id, or a friendly short id like `T42`). Globally unique short ids
+    /// id, or a friendly short id like `[internal-id-redacted]`). Globally unique short ids
     /// resolve without `--product`.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
-    /// Product slug/id used to resolve a friendly short id (`T42`).
+    /// Product slug/id used to resolve a friendly short id (`[internal-id-redacted]`).
     /// Optional when `id` is already a canonical `task_…` id, or when
     /// the short id is globally unique.
     #[arg(long)]
@@ -5557,7 +5557,7 @@ pub(crate) struct DependAddArgs {
     /// Edge type. Only `blocks` is supported in v1.
     #[arg(long, default_value = "blocks")]
     pub(crate) relation: String,
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`[internal-id-redacted]`, `42`, `#42`) against this product
     /// (slug or id). Applies to both `dependent` and `prerequisite`. Ignored
     /// for a selector that already embeds a product slug (`boss/42`) or is a
     /// primary id.
@@ -5573,7 +5573,7 @@ pub(crate) struct DependRmArgs {
     pub(crate) prerequisite: String,
     #[arg(long, default_value = "blocks")]
     pub(crate) relation: String,
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`[internal-id-redacted]`, `42`, `#42`) against this product
     /// (slug or id). Applies to both `dependent` and `prerequisite`. Ignored
     /// for a selector that already embeds a product slug (`boss/42`) or is a
     /// primary id.
@@ -5589,7 +5589,7 @@ pub(crate) struct DependListArgs {
     /// Which side(s) of the edge to return. Defaults to `both`.
     #[arg(long, value_enum, default_value_t = DependDirectionArg::Both)]
     pub(crate) direction: DependDirectionArg,
-    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// Resolve a friendly short id (`[internal-id-redacted]`, `42`, `#42`) against this product
     /// (slug or id). Ignored for a selector that already embeds a product
     /// slug (`boss/42`) or is a primary id.
     #[arg(long)]
@@ -6885,7 +6885,7 @@ pub(crate) struct ProjectListArgs {
 
     /// Filter to specific id(s). Comma-separated, or repeat the flag.
     /// Accepts the same forms as `boss task show`: friendly short ids
-    /// (`P7`, `7`, `#7`), primary ids (`proj_…`), and the cross-product
+    /// (`[internal-id-redacted]`, `7`, `#7`), primary ids (`proj_…`), and the cross-product
     /// form (`boss/7`). An id that names no row in the product errors
     /// rather than being silently dropped. Composes with the other
     /// filters below as an AND — a row excluded by e.g. `--status` is
@@ -7116,7 +7116,7 @@ pub(crate) struct TaskCreateArgs {
 
     /// Gate this task on one or more prerequisites, declared atomically
     /// with creation. Repeatable (or comma-separated). Each value is a
-    /// work-item selector (`T42`, a canonical `task_…` id) in the same
+    /// work-item selector (`[internal-id-redacted]`, a canonical `task_…` id) in the same
     /// product; the task is created `blocked` and is never dispatched
     /// until every prerequisite is satisfied. Unlike a follow-up `task
     /// depend add`, this leaves no window where the task could autostart
@@ -7211,7 +7211,7 @@ pub(crate) struct TaskListArgs {
 
     /// Filter to specific id(s). Comma-separated, or repeat the flag.
     /// Accepts the same forms as `boss task show`: friendly short ids
-    /// (`T42`, `42`, `#42`), primary ids (`task_…`), and the
+    /// (`[internal-id-redacted]`, `42`, `#42`), primary ids (`task_…`), and the
     /// cross-product form (`boss/42`). An id that names no row in the
     /// product errors rather than being silently dropped. Composes with
     /// the other filters below as an AND — a row excluded by e.g.
@@ -7431,7 +7431,7 @@ pub(crate) struct InvestigationCreateArgs {
 #[derive(Debug, Args)]
 pub(crate) struct RevisionCreateArgs {
     /// The parent task whose PR this revision will commit to. Accepts
-    /// `T<n>` short ids (e.g. `T651`) or full `task_<hex>` ids.
+    /// `T<n>` short ids (e.g. `[internal-id-redacted]`) or full `task_<hex>` ids.
     /// May itself be a revision task; the gate is evaluated against
     /// the chain root's PR.
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
@@ -7540,7 +7540,7 @@ pub(crate) struct RevisionListArgs {
     pub(crate) include_archived: bool,
 
     /// Restrict to revisions whose parent is this task. Accepts `T<n>` short
-    /// ids (e.g. `T651`) or full `task_<hex>` ids.
+    /// ids (e.g. `[internal-id-redacted]`) or full `task_<hex>` ids.
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) parent: Option<String>,
 
@@ -7645,7 +7645,7 @@ pub(crate) struct ChoreListArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskIdArg {
     /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
-    /// (`T441`, `t441`, `42`, or `#42`), or cross-product form
+    /// (`[internal-id-redacted]`, `t441`, `42`, or `#42`), or cross-product form
     /// (`boss/42` or `boss/#42`). Globally unique short ids resolve
     /// without `--product`; ambiguous ones error listing every candidate.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
@@ -7754,10 +7754,10 @@ pub(crate) struct TaskDeleteArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskRestoreArgs {
     /// Task/chore id to restore. Accepts the canonical primary id
-    /// (`task_…`) or a friendly short id (`T43` / `t43`). Bare `#43` /
+    /// (`task_…`) or a friendly short id (`[internal-id-redacted]` / `t43`). Bare `#43` /
     /// `43` and cross-product `boss/43` forms are not accepted here —
     /// a soft-deleted row is hidden from the per-product short-id
-    /// resolver, so pass the globally-unique `T43` or canonical id.
+    /// resolver, so pass the globally-unique `[internal-id-redacted]` or canonical id.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 }
@@ -8507,7 +8507,7 @@ pub(crate) fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
             "Project selectors accept a project id, slug, short id (#42 or 42), or 1-based interactive index within the selected product. For agent use, prefer slug, short id, or primary id; avoid numeric indexes.",
-            "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `T441` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `P7` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
+            "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `[internal-id-redacted]` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `[internal-id-redacted]` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
             "Kind-agnostic verbs (show, update, move, delete, restore, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
@@ -8980,7 +8980,7 @@ pub(crate) fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
             "Project selectors accept a project id, slug, short id (#42 or 42), or 1-based interactive index within the selected product. For agent use, prefer slug, short id, or primary id; avoid numeric indexes.",
-            "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `T441` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `P7` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
+            "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `[internal-id-redacted]` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `[internal-id-redacted]` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
             "Kind-agnostic verbs (show, update, move, delete, restore, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
@@ -9924,7 +9924,7 @@ struct ServerState {
     /// without standing up a second broker.
     publisher: Arc<dyn ExecutionPublisher>,
     /// Live-CI probe shared by the `MarkCiRemediationNoop` and
-    /// `MarkCiRemediationSucceededViaRebase` validation gates (T2764
+    /// `MarkCiRemediationSucceededViaRebase` validation gates ([internal-id-redacted]
     /// postmortem, PR spinyfin/mono#2023). Both handlers read this
     /// instead of constructing their own `CommandMergeProbe`, so tests can
     /// inject a fake and exercise the green/pending/red classification
@@ -10546,7 +10546,7 @@ impl ServerState {
         // *new* bytes. The macOS app would see "fingerprint matches
         // bundled engine" and silently attach to the stale engine
         // instead of triggering the version-mismatch restart from
-        // T460. See `build_info::binary_fingerprint` doc comment.
+        // [internal-id-redacted]. See `build_info::binary_fingerprint` doc comment.
         crate::build_info::init();
         tracing::info!(
             engine_build_sha = crate::build_info::git_sha(),
@@ -12828,7 +12828,7 @@ struct ServerState {
     /// without standing up a second broker.
     publisher: Arc<dyn ExecutionPublisher>,
     /// Live-CI probe shared by the `MarkCiRemediationNoop` and
-    /// `MarkCiRemediationSucceededViaRebase` validation gates (T2764
+    /// `MarkCiRemediationSucceededViaRebase` validation gates ([internal-id-redacted]
     /// postmortem, PR spinyfin/mono#2023). Both handlers read this
     /// instead of constructing their own `CommandMergeProbe`, so tests can
     /// inject a fake and exercise the green/pending/red classification
@@ -13450,7 +13450,7 @@ impl ServerState {
         // *new* bytes. The macOS app would see "fingerprint matches
         // bundled engine" and silently attach to the stale engine
         // instead of triggering the version-mismatch restart from
-        // T460. See `build_info::binary_fingerprint` doc comment.
+        // [internal-id-redacted]. See `build_info::binary_fingerprint` doc comment.
         crate::build_info::init();
         tracing::info!(
             engine_build_sha = crate::build_info::git_sha(),
@@ -36806,7 +36806,7 @@ pub enum FrontendRequest {
     },
 
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
-    /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
+    /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / [internal-id-redacted]):
     /// per-file frequency, per-file-pair co-conflict frequency, per-class
     /// counts. `top` caps each ranked list. Replies with
     /// [`FrontendEvent::ConflictHotspots`].
@@ -37217,7 +37217,7 @@ pub enum FrontendRequest {
     /// Feeds the Notifications UI's merge-provenance affordance ("edited by
     /// merge" marker + "folded N duplicate reports" detail). Replies with
     /// [`FrontendEvent::AttentionMergesList`]. Empty until the dedup
-    /// creation/sweep paths (P1203 tasks 5/7) start writing rows.
+    /// creation/sweep paths ([internal-id-redacted] tasks 5/7) start writing rows.
     ListAttentionMerges {
         attention_id: String,
     },
@@ -37583,7 +37583,7 @@ pub enum FrontendRequest {
 
     /// Worker → engine, *validated* terminal signal (Phase 9 #30,
     /// reconciled 2026-05-17 layered design call; re-validated per the
-    /// T2764 postmortem, PR spinyfin/mono#2023): the worker claims it
+    /// [internal-id-redacted] postmortem, PR spinyfin/mono#2023): the worker claims it
     /// rebased onto base HEAD, force-pushed, and CI came back green
     /// without changing any code. Unlike a trust-the-worker marker, the
     /// engine does NOT honor this claim on say-so: it independently
@@ -37758,7 +37758,7 @@ pub enum FrontendRequest {
     },
 
     /// Operator entry point for the auto-populate Planner/Materializer
-    /// (design P783 §2 "Reusability" #2 — "plan this project now" /
+    /// (design [internal-id-redacted] §2 "Reusability" #2 — "plan this project now" /
     /// replan). Builds the same `PlannerInput` the design-PR-merge
     /// trigger builds — from the project's stored `design_doc_path`,
     /// fetched live from GitHub — and runs the identical claim →
@@ -37901,7 +37901,7 @@ pub enum FrontendRequest {
     /// Worker-facing telemetry surface closing the producer-side
     /// blind spot in `conflict_resolutions`
     /// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
-    /// T1): a normal (non-conflict-resolution) worker's own `cube
+    /// [internal-id-redacted]): a normal (non-conflict-resolution) worker's own `cube
     /// workspace rebase` reported `REBASED_WITH_CONFLICTS` mid-task —
     /// resolved inline and never surfaced to `conflict_watch`. The CLI
     /// surface is `boss engine conflicts record-producer`. The engine
@@ -38061,7 +38061,7 @@ pub enum FrontendRequest {
     /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task, making it visible again. The
     /// `id` accepts a canonical `task_…` id or a friendly short id
-    /// (`T43`); the engine resolves the friendly form against
+    /// (`[internal-id-redacted]`); the engine resolves the friendly form against
     /// soft-deleted rows too, so a tombstoned task is still findable.
     /// Idempotent — restoring an already-live row succeeds as a no-op.
     /// Replies with [`FrontendEvent::WorkItemRestored`] on success.
@@ -38122,7 +38122,7 @@ pub enum FrontendRequest {
     /// Boss-tier RPC: ask the macOS app to scroll the kanban to a
     /// specific work item's card and play a short transient highlight.
     /// `id` accepts a canonical id (`task_…`, `proj_…`) or a
-    /// short-id form (`T607`). Idempotent — repeat calls re-pulse
+    /// short-id form (`[internal-id-redacted]`). Idempotent — repeat calls re-pulse
     /// without animation overlap. Replies with [`FrontendEvent::WorkItemRevealed`]
     /// on success or [`FrontendEvent::WorkError`] on failure (item not
     /// found, item deleted, app not running, unknown id format).
@@ -39588,7 +39588,7 @@ pub enum FrontendRequest {
     },
 
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
-    /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
+    /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / [internal-id-redacted]):
     /// per-file frequency, per-file-pair co-conflict frequency, per-class
     /// counts. `top` caps each ranked list. Replies with
     /// [`FrontendEvent::ConflictHotspots`].
@@ -40008,7 +40008,7 @@ pub enum FrontendRequest {
     /// Feeds the Notifications UI's merge-provenance affordance ("edited by
     /// merge" marker + "folded N duplicate reports" detail). Replies with
     /// [`FrontendEvent::AttentionMergesList`]. Empty until the dedup
-    /// creation/sweep paths (P1203 tasks 5/7) start writing rows.
+    /// creation/sweep paths ([internal-id-redacted] tasks 5/7) start writing rows.
     ListAttentionMerges {
         attention_id: String,
     },
@@ -40374,7 +40374,7 @@ pub enum FrontendRequest {
 
     /// Worker → engine, *validated* terminal signal (Phase 9 #30,
     /// reconciled 2026-05-17 layered design call; re-validated per the
-    /// T2764 postmortem, PR spinyfin/mono#2023): the worker claims it
+    /// [internal-id-redacted] postmortem, PR spinyfin/mono#2023): the worker claims it
     /// rebased onto base HEAD, force-pushed, and CI came back green
     /// without changing any code. Unlike a trust-the-worker marker, the
     /// engine does NOT honor this claim on say-so: it independently
@@ -40549,7 +40549,7 @@ pub enum FrontendRequest {
     },
 
     /// Operator entry point for the auto-populate Planner/Materializer
-    /// (design P783 §2 "Reusability" #2 — "plan this project now" /
+    /// (design [internal-id-redacted] §2 "Reusability" #2 — "plan this project now" /
     /// replan). Builds the same `PlannerInput` the design-PR-merge
     /// trigger builds — from the project's stored `design_doc_path`,
     /// fetched live from GitHub — and runs the identical claim →
@@ -40692,7 +40692,7 @@ pub enum FrontendRequest {
     /// Worker-facing telemetry surface closing the producer-side
     /// blind spot in `conflict_resolutions`
     /// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
-    /// T1): a normal (non-conflict-resolution) worker's own `cube
+    /// [internal-id-redacted]): a normal (non-conflict-resolution) worker's own `cube
     /// workspace rebase` reported `REBASED_WITH_CONFLICTS` mid-task —
     /// resolved inline and never surfaced to `conflict_watch`. The CLI
     /// surface is `boss engine conflicts record-producer`. The engine
@@ -40852,7 +40852,7 @@ pub enum FrontendRequest {
     /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task, making it visible again. The
     /// `id` accepts a canonical `task_…` id or a friendly short id
-    /// (`T43`); the engine resolves the friendly form against
+    /// (`[internal-id-redacted]`); the engine resolves the friendly form against
     /// soft-deleted rows too, so a tombstoned task is still findable.
     /// Idempotent — restoring an already-live row succeeds as a no-op.
     /// Replies with [`FrontendEvent::WorkItemRestored`] on success.
@@ -40913,7 +40913,7 @@ pub enum FrontendRequest {
     /// Boss-tier RPC: ask the macOS app to scroll the kanban to a
     /// specific work item's card and play a short transient highlight.
     /// `id` accepts a canonical id (`task_…`, `proj_…`) or a
-    /// short-id form (`T607`). Idempotent — repeat calls re-pulse
+    /// short-id form (`[internal-id-redacted]`). Idempotent — repeat calls re-pulse
     /// without animation overlap. Replies with [`FrontendEvent::WorkItemRevealed`]
     /// on success or [`FrontendEvent::WorkError`] on failure (item not
     /// found, item deleted, app not running, unknown id format).
@@ -42296,7 +42296,7 @@ pub enum FrontendEvent {
     /// still-pending, PR closed). The attempt row is untouched and
     /// stays actionable — no budget refund, no `CiRemediationSucceeded`
     /// event. The CLI surfaces this as a non-zero exit so the receipt is
-    /// an honest pass/fail (T2764 postmortem: a worker calling this verb
+    /// an honest pass/fail ([internal-id-redacted] postmortem: a worker calling this verb
     /// before CI has settled must get a rejection, not a recorded lie).
     CiRemediationSucceededViaRebaseRejected {
         attempt_id: String,
@@ -42412,7 +42412,7 @@ pub enum FrontendEvent {
         pr_url: String,
         failure_reason: String,
     },
-    /// Advisory push (Layer 4 / T11, `stacked-pr-auto-structuring`): two
+    /// Advisory push (Layer 4 / [internal-id-redacted], `stacked-pr-auto-structuring`): two
     /// *in-flight* PR branches are predicted to conflict with each other —
     /// their changed-file sets overlap on non-mechanical files — so the
     /// engine offers to restack the newer PR (`dependent`) on top of the
@@ -43095,7 +43095,7 @@ pub enum FrontendEvent {
         action: String,
     },
 
-    // --- Automation replies (maintenance-tasks.md T2) ---
+    // --- Automation replies (maintenance-tasks.md [internal-id-redacted]) ---
     /// Response to [`FrontendRequest::CreateAutomation`].
     AutomationCreated {
         automation: Automation,
@@ -43856,7 +43856,7 @@ pub enum FrontendEvent {
     /// still-pending, PR closed). The attempt row is untouched and
     /// stays actionable — no budget refund, no `CiRemediationSucceeded`
     /// event. The CLI surfaces this as a non-zero exit so the receipt is
-    /// an honest pass/fail (T2764 postmortem: a worker calling this verb
+    /// an honest pass/fail ([internal-id-redacted] postmortem: a worker calling this verb
     /// before CI has settled must get a rejection, not a recorded lie).
     CiRemediationSucceededViaRebaseRejected {
         attempt_id: String,
@@ -43972,7 +43972,7 @@ pub enum FrontendEvent {
         pr_url: String,
         failure_reason: String,
     },
-    /// Advisory push (Layer 4 / T11, `stacked-pr-auto-structuring`): two
+    /// Advisory push (Layer 4 / [internal-id-redacted], `stacked-pr-auto-structuring`): two
     /// *in-flight* PR branches are predicted to conflict with each other —
     /// their changed-file sets overlap on non-mechanical files — so the
     /// engine offers to restack the newer PR (`dependent`) on top of the
@@ -44666,7 +44666,7 @@ pub enum FrontendEvent {
         action: String,
     },
 
-    // --- Automation replies (maintenance-tasks.md T2) ---
+    // --- Automation replies (maintenance-tasks.md [internal-id-redacted]) ---
     /// Response to [`FrontendRequest::CreateAutomation`].
     AutomationCreated {
         automation: Automation,

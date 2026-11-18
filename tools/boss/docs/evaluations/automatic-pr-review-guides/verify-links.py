@@ -7,6 +7,8 @@ whether the link supports the claim next to it; that remains a human judgement.
 Run from the repository root after `run-corpus.sh` has created the pinned clones.
 """
 
+import argparse
+import os
 import collections
 from pathlib import Path
 import re
@@ -15,10 +17,6 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[4]
-CLONES = {
-    "brianduff/flunge": ROOT / ".codex/corpus-work/pinned-repos/brianduff-flunge",
-    "spinyfin/mono": ROOT / ".codex/corpus-work/pinned-repos/spinyfin-mono",
-}
 BLOB = re.compile(r"https://github\.com/([^/]+/[^/]+)/blob/([0-9a-f]{40})/([^#]+)(?:#L(\d+)(?:-L(\d+))?)?$")
 
 
@@ -32,21 +30,27 @@ def file_lines(clone, sha, path, cache):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--work-dir", type=Path, default=Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "boss-review-guide-corpus")
+    parser.add_argument("--template", type=Path, default=HERE / "grounding-review-template.md")
+    args = parser.parse_args()
+    clones = {repo: args.work_dir / "pinned-repos" / repo.replace("/", "-")
+              for repo in ["brianduff/flunge", "spinyfin/mono"]}
     counts, problems, cache = collections.Counter(), [], {}
-    for line in (HERE / "grounding-review-template.md").read_text().splitlines():
-        if not line.startswith("| [ ]"):
+    for line in args.template.read_text().splitlines():
+        if not line.startswith("| ["):
             continue
-        columns = [column.strip() for column in line.split("|")]
+        columns = [column.strip() for column in re.split(r"(?<!\\)\|", line)]
         source, href = columns[3], columns[6]
         match = BLOB.match(href)
         if not match:
-            counts["not a blob link (not line-checked)"] += 1
+            counts["non-GitHub link (not navigable)" if not href.startswith("https://github.com/") else "not a blob link (not line-checked)"] += 1
             continue
         repository, sha, path, first, last = match.groups()
-        if repository not in CLONES:
+        if repository not in clones:
             counts["repository not pinned locally (not checked)"] += 1
             continue
-        length = file_lines(CLONES[repository], sha, path, cache)
+        length = file_lines(clones[repository], sha, path, cache)
         if length is None:
             counts["revision or file missing"] += 1
             problems.append((source, href, "revision or file missing"))

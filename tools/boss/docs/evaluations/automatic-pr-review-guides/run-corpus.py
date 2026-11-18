@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 
@@ -18,7 +19,7 @@ TARGET = "//tools/boss/engine/review-guide:corpus-tool"
 
 
 def command(args, **kwargs):
-    return subprocess.run([str(arg) for arg in args], check=True, timeout=1800, **kwargs)
+    return subprocess.run([str(arg) for arg in args], check=True, **kwargs)
 
 
 def output(args):
@@ -26,6 +27,57 @@ def output(args):
         return command(args, capture_output=True, text=True).stdout.strip()
     except subprocess.CalledProcessError as error:
         raise RuntimeError(error.stderr) from error
+
+
+def publication_text(text):
+    """Deterministically redact internal identifiers while preserving source line numbers."""
+    return re.sub(r"\b[TP]\d+\b", "[internal-id-redacted]", text)
+
+
+def publish_tree(root):
+    """Publish redacted evidence with hashes of the original and published bytes."""
+    manifest_path = root / "publication.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {
+        "algorithm": "internal-id-redaction-v1", "files": {}}
+
+    def value(item):
+        if isinstance(item, str):
+            return publication_text(item)
+        if isinstance(item, list):
+            return [value(child) for child in item]
+        if isinstance(item, dict):
+            return {key: value(child) for key, child in item.items()}
+        return item
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path == manifest_path or path.suffix not in {".json", ".jsonl", ".md", ".txt"}:
+            continue
+        original = path.read_bytes()
+        text = original.decode()
+        if path.suffix == ".json":
+            parsed = json.loads(text)
+            redacted = value(parsed)
+            published = json.dumps(redacted, indent=2) + "\n" if redacted != parsed else text
+        elif path.suffix == ".jsonl":
+            lines = []
+            for line in text.splitlines(keepends=True):
+                if not line.strip():
+                    lines.append(line)
+                    continue
+                parsed = json.loads(line)
+                redacted = value(parsed)
+                lines.append(json.dumps(redacted) + "\n" if redacted != parsed else line)
+            published = "".join(lines)
+        else:
+            published = publication_text(text)
+        key = str(path.relative_to(root))
+        if published != text:
+            manifest["files"].setdefault(key, {"original_sha256": hashlib.sha256(original).hexdigest()})
+            path.write_text(published)
+        if key in manifest["files"]:
+            # Formatting can change publication bytes without changing redaction or source lines.
+            manifest["files"][key]["published_sha256"] = hashlib.sha256(published.encode()).hexdigest()
+    write_json(manifest_path, manifest)
 
 
 def write_json(path, value):
@@ -87,7 +139,9 @@ def verify_sources(packet_path, workspace):
                 continue
             result = command(["jj", "--ignore-working-copy", "-R", workspace, "file", "show",
                               "-r", source["sha"], workspace / source["path"]], capture_output=True)
-            if result.stdout != source["content"].encode():
+            if hashlib.sha256(result.stdout).hexdigest() != source["content_hash"]:
+                raise ValueError(f"Pinned source hash differs from capture: {source['sha']}:{source['path']}")
+            if publication_text(result.stdout.decode()) != publication_text(source["content"]):
                 raise ValueError(f"Saved source differs from pinned GitHub object: {source['sha']}:{source['path']}")
             checked += 1
     return checked
@@ -115,7 +169,7 @@ def run_variant(tool, case, directory, workspace, variant):
     with prompt.open() as source, events.open("w") as event_file, stderr.open("w") as errors:
         try:
             result = subprocess.run(argv, stdin=source, stdout=event_file, stderr=errors,
-                                    env=env, timeout=900)
+                                    env=env, timeout=7200)
             exit_code = result.returncode
         except subprocess.TimeoutExpired:
             exit_code = 124
@@ -151,13 +205,15 @@ def run_variant(tool, case, directory, workspace, variant):
         with (directory / "validation-production.txt").open("w") as validation:
             result = subprocess.run([str(tool), "validate", "--packet", env["CORPUS_PACKET"],
                                      "--workspace", str(workspace), "--markdown", str(guide)],
-                                    stdout=validation, stderr=subprocess.STDOUT, timeout=120)
+                                    stdout=validation, stderr=subprocess.STDOUT)
         success = success and result.returncode == 0
     print(f"{case['id']}/{variant}: {'completed' if success else 'FAILED'} ({ended-started:.1f}s)", flush=True)
     return success
 
 
 def reference_kind(section, href):
+    if not href.startswith("https://github.com/"):
+        return "non-GitHub link (not navigable)"
     # Positional labels help humans navigate; these are not grounding verdicts.
     if re.search(r"example|before.after|scenario|trace|worked", section, re.I):
         return "example (heading)"
@@ -168,13 +224,21 @@ def reference_kind(section, href):
     return "source/context" if "/blob/" in href else "PR/diff/context"
 
 
-def template(tool, output_path, guide_roots):
+def template(tool, output_path, guide_roots, force=False):
+    if output_path.exists() and not force:
+        for line in output_path.read_text().splitlines():
+            if re.search(r"\[[xX]\]", line):
+                raise ValueError("Template has human review; use --force-template to replace it")
+            if line.startswith("| [") and any(cell.strip() for cell in line.split("|")[-3:-1]):
+                raise ValueError("Template has verdicts/notes; use --force-template to replace it")
+            if line.startswith("Reviewer:") and line != "Reviewer: (name) Date: (YYYY-MM-DD) Prompt acceptance: (pending)":
+                raise ValueError("Template has a sign-off; use --force-template to replace it")
     lines = ["# Human navigation and grounding review", "",
              "Every extracted reference is unchecked. Verdict and notes are reserved for a human.",
              "Open each generated link in GitHub and check the intended file, revision, side, lines, and supporting claim.",
              "Kind is a mechanical heading-based navigation hint, not a judgement of support. Repeated links in different sections remain separate rows.",
              "The source column distinguishes saved evidence from fresh runs. Missing outputs have no invented references.", "",
-             "Reviewer: __________  Date: __________  Prompt acceptance: __________", ""]
+             "Reviewer: (name) Date: (YYYY-MM-DD) Prompt acceptance: (pending)", ""]
     count = 0
     for case in MANIFEST["cases"]:
         lines += [f"## {case['id']}", "",
@@ -184,16 +248,35 @@ def template(tool, output_path, guide_roots):
         for root in guide_roots:
             for guide in sorted((root / case["id"]).glob("guide-*.md")):
                 refs = json.loads(output([tool, "refs", "--markdown", guide, "--out", "/dev/stdout"]))
-                source = str(guide.relative_to(HERE))
+                source = os.path.relpath(guide, HERE) if guide.is_relative_to(HERE) else guide.as_uri()
                 for ref in refs:
                     section = ref["section"].replace("|", "\\|")
                     kind = reference_kind(section, ref["href"])
+                    for suffix, length in [("jest.config.cjs#L1-L8", 7), ("BossCaptureTests.swift#L347-L408", 406),
+                                           ("MarkdownFindState.swift#L169-L189", 173), ("MarkdownFindState.swift#L104-L182", 173)]:
+                        if ref["href"].endswith(suffix) and root == HERE / "cases":
+                            kind += f"; mechanical failure: range exceeds {length} lines (pinned object line count)"
                     lines.append(f"| [ ] | {case['id']} | `{source}` | {kind} | {section} | {ref['href']} | | |")
                     count += 1
                     case_count += 1
         if not case_count:
             lines += ["", "No guide output exists for this case; generation is still required."]
         lines.append("")
+    # Emit aligned tables so the repository formatter does not change regenerated rows.
+    start = 0
+    while start < len(lines):
+        if not lines[start].startswith("| "):
+            start += 1
+            continue
+        end = start
+        while end < len(lines) and lines[end].startswith("| "):
+            end += 1
+        rows = [[cell.strip() for cell in re.split(r"(?<!\\)\|", line)[1:-1]] for line in lines[start:end]]
+        widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+        for index, row in enumerate(rows):
+            cells = ["-" * width if index == 1 else cell.ljust(width) for cell, width in zip(row, widths)]
+            lines[start + index] = "| " + " | ".join(cells) + " |"
+        start = end
     output_path.write_text("\n".join(lines))
     print(f"Wrote {count} unchecked reference rows to {output_path}")
 
@@ -202,9 +285,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cases", nargs="*")
     parser.add_argument("--run-dir", type=Path, default=HERE / "runs" / datetime.date.today().isoformat())
-    parser.add_argument("--work-dir", type=Path, default=ROOT / ".codex/corpus-work")
+    parser.add_argument("--work-dir", type=Path, default=Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "boss-review-guide-corpus")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--template-only", action="store_true")
+    parser.add_argument("--force-template", action="store_true")
     parser.add_argument("--recollect", action="store_true", help="Collect a separate fresh packet from pinned GitHub revisions")
     args = parser.parse_args()
     ids = {case["id"] for case in MANIFEST["cases"]}
@@ -216,15 +300,30 @@ def main():
         parser.error("The saved cases are immutable; choose a separate run directory")
     if Path.cwd().resolve() != ROOT:
         parser.error(f"Invoke from the Bazel workspace {ROOT}")
-    command(["bazel", "build", TARGET])
+    command(["bazel", "build", "--remote_download_outputs=toplevel", TARGET])
     tool = ROOT / output(["bazel", "cquery", TARGET, "--output=files"]).splitlines()[-1]
+    # Other Bazel invocations may evict a minimally downloaded output during a long run.
+    digest = hashlib.sha256(tool.read_bytes()).hexdigest()
+    stable_tool = args.work_dir / "tools" / digest / "corpus-tool"
+    stable_tool.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(tool, stable_tool)
+    tool = stable_tool
     if args.template_only:
-        template(tool, HERE / "grounding-review-template.md", [HERE / "cases", args.run_dir])
+        roots = [HERE / "cases", HERE / "runs/2026-11-18", *sorted((HERE / "runs").glob("*/")), args.run_dir]
+        template(tool, HERE / "grounding-review-template.md", list(dict.fromkeys(roots)), args.force_template)
         return
     if not args.prepare_only:
         command(["codex", "login", "status"])
     args.run_dir.mkdir(parents=True, exist_ok=True)
     command([tool, "metadata", "--out", args.run_dir / "generator.json"])
+    generator_path = args.run_dir / "generator.json"
+    generator = json.loads(generator_path.read_text())
+    generator["binary_sha256"] = digest
+    generator["renderer_sources"] = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted((ROOT / "tools/boss/engine/review-guide/src").rglob("*.rs"))
+    }
+    write_json(generator_path, generator)
     failures = []
     for case in MANIFEST["cases"]:
         if args.cases and case["id"] not in args.cases:
@@ -243,7 +342,9 @@ def main():
             "renderer_source_sha256": hashlib.sha256((ROOT / "tools/boss/engine/review-guide/src/lib.rs").read_bytes()).hexdigest(),
             "model": "gpt-6-astra", "effort": "high",
             "saved_sources_matching_pinned_objects": source_count,
-            "checkout": str(workspace), "git_dir": str(git_dir),
+            "checkout": str(workspace.relative_to(args.work_dir)), "git_dir": str(git_dir.relative_to(args.work_dir)),
+            "task_context": {"source": "saved packet PR title and body", "revisions": [],
+                             "project": None, "limitation": "Historical engine task and project records are unavailable; PR metadata is an explicit substitute."},
             "submission": "local stdout capture with production validation; no live engine binding",
         })
         if args.recollect:
@@ -260,7 +361,8 @@ def main():
                 raise ValueError(f"{case['id']}/{variant}: {rendered}")
             if not args.prepare_only and not run_variant(tool, case, directory, workspace, variant):
                 failures.append(f"{case['id']}/{variant}")
-    template(tool, HERE / "grounding-review-template.md", [HERE / "cases", args.run_dir])
+    publish_tree(args.run_dir)
+    template(tool, args.run_dir / "grounding-review-template.md", [args.run_dir], args.force_template)
     if failures:
         raise SystemExit("Generation failed: " + ", ".join(failures))
 
