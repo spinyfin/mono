@@ -99,6 +99,18 @@ pub(crate) fn clear_resolved_signal_in_tx(
     } else {
         None
     };
+    // A mechanical rung that has pushed its rebased head is still running its
+    // post-push safety checks (e.g. the deletion tripwire). Its resolver owns
+    // completion; a clean probe in that window must neither lift the block
+    // nor retire the attempt, or a resolution awaiting sign-off could be merged.
+    if conflict.as_ref().is_some_and(|a| a.mechanical_rung_in_flight.is_some()) {
+        tracing::info!(
+            work_item_id = item,
+            pr_url = pr,
+            "signal retirement declined: a mechanical rung is still running its post-push checks",
+        );
+        return Ok(ClearResolvedSignal::Nothing);
+    }
     let queue = attempt
         .as_ref()
         .is_some_and(|a| is_queue_side_failure_kind(a.failure_kind.as_deref()));

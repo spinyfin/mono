@@ -3,6 +3,30 @@ use super::*;
 
 pub const RESOLVING_MERGE_CONFLICT: &str = "resolving_conflicts";
 
+/// Abandon reason for an attempt replaced by a fresh one; the merge request survives it.
+pub(crate) const SUPERSEDED_STALE_HEAD: &str = "superseded_stale_head";
+
+/// Short human wording for the machine reason codes callers pass to [`stop`].
+/// Text that is already prose is shown as written.
+fn human_reason(reason: &str) -> String {
+    let code = reason.split(':').next().unwrap_or(reason).trim();
+    let is_code = !code.is_empty()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !is_code {
+        return reason.to_owned();
+    }
+    match code {
+        "revision_create_failed" => "couldn't start a revision to fix the conflict",
+        "manual_abandon" => "conflict resolution was stopped manually",
+        SUPERSEDED_STALE_HEAD => "the branch changed during conflict resolution",
+        "lockfile_regeneration_failed" => "couldn't regenerate the lockfile",
+        _ => "conflict resolution didn't finish",
+    }
+    .to_owned()
+}
+
 pub(crate) fn start(conn: &Connection, id: &str, pr_url: &str, base: &str) -> Result<bool> {
     let detail = serde_json::json!({
         "source": "conflict_resolution",
@@ -21,7 +45,7 @@ pub(crate) fn start(conn: &Connection, id: &str, pr_url: &str, base: &str) -> Re
 pub(crate) fn stop(conn: &Connection, id: &str, reason: &str) -> Result<bool> {
     let detail = serde_json::json!({
         "source": "conflict_resolution",
-        "status_label": format!("Merge paused: {reason}"),
+        "status_label": format!("Merge paused: {}", human_reason(reason)),
     })
     .to_string();
     let changed = conn.execute(
@@ -99,9 +123,21 @@ impl WorkDb {
         )?)
     }
 
+    /// Whether the request is ready to continue: the card is back in review
+    /// (the resolver has released the conflict block), not merely requested.
+    pub fn merge_conflict_resolution_ready(&self, id: &str, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND pr_url = ?2 AND status = 'in_review'
+             AND deleted_at IS NULL AND merge_queue_state = 'resolving_conflicts')",
+            params![id, pr_url],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Replace the old, pre-rebase head with the head GitHub accepted. The
     /// transaction never exposes a gap in the card's Merging state.
-    pub fn finish_merge_conflict_resolution(&self, id: &str, pr_url: &str, head: &str) -> Result<()> {
+    pub fn finish_merge_conflict_resolution(&self, id: &str, pr_url: &str, head: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current: bool = tx.query_row(
@@ -111,7 +147,7 @@ impl WorkDb {
             |row| row.get(0),
         )?;
         if !current {
-            return Ok(());
+            return Ok(false);
         }
         tx.execute(
             "UPDATE github_merge_intents SET status = 'head_advanced' WHERE work_item_id = ?1 AND status = 'active'",
@@ -128,7 +164,7 @@ impl WorkDb {
             params![id, pr_url],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -360,5 +396,79 @@ mod tests {
         .unwrap();
         assert_eq!(card(&db, &product, &id).merge_queue_state, None);
         assert!(!db.merge_conflict_resolution_requested(&id, PR).unwrap());
+    }
+
+    #[test]
+    fn a_clean_probe_waits_for_an_in_flight_mechanical_rung() {
+        let (db, product, id, attempt) = fixture(true);
+        db.stamp_conflict_resolution_mechanical_rung(&attempt, 1, "lease", "ws")
+            .unwrap();
+        db.clear_resolved_pr_signal(&id, PR, false).unwrap();
+        let live = db.get_conflict_resolution(&attempt).unwrap().unwrap();
+        assert_eq!(live.status, "pending", "the resolver owns completion");
+        assert_eq!(db.task_blocked_reason(&id).unwrap().as_deref(), Some("merge_conflict"));
+        assert!(db.active_conflict_resolution_for_work_item(&id).unwrap().is_some());
+        assert_eq!(
+            card(&db, &product, &id).merge_queue_state.as_deref(),
+            Some(RESOLVING_MERGE_CONFLICT)
+        );
+        assert!(!db.merge_conflict_resolution_ready(&id, PR).unwrap());
+        // Once the rung concludes, a clean probe may retire it as before.
+        db.clear_conflict_resolution_mechanical_rung(&attempt).unwrap();
+        db.clear_resolved_pr_signal(&id, PR, false).unwrap();
+        assert!(db.active_conflict_resolution_for_work_item(&id).unwrap().is_none());
+        assert!(db.merge_conflict_resolution_ready(&id, PR).unwrap());
+    }
+
+    #[test]
+    fn a_stale_head_supersede_keeps_the_merge_request_but_other_abandons_stop_it() {
+        let (db, product, id, attempt) = fixture(true);
+        db.mark_conflict_resolution_abandoned(&attempt, "superseded_stale_head")
+            .unwrap();
+        assert_eq!(
+            card(&db, &product, &id).merge_queue_state.as_deref(),
+            Some(RESOLVING_MERGE_CONFLICT)
+        );
+        assert!(db.get_active_github_merge_intent(&id, PR).unwrap().is_some());
+        let fresh = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(&product)
+                    .work_item_id(&id)
+                    .pr_url(PR)
+                    .pr_number(42)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger("base-2")
+                    .head_sha_before("old-head")
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            card(&db, &product, &id).merge_queue_state.as_deref(),
+            Some(RESOLVING_MERGE_CONFLICT)
+        );
+        db.mark_conflict_resolution_abandoned(&fresh.id, "manual_abandon")
+            .unwrap();
+        let task = card(&db, &product, &id);
+        assert_eq!(task.merge_queue_state, None);
+        let label = task.merge_queue_detail.unwrap();
+        assert!(label.contains("stopped manually"), "{label}");
+        assert!(!label.contains("manual_abandon"), "{label}");
+    }
+
+    #[test]
+    fn reason_codes_become_short_prose() {
+        assert_eq!(
+            human_reason("revision_create_failed"),
+            "couldn't start a revision to fix the conflict"
+        );
+        assert_eq!(
+            human_reason("lockfile_regeneration_failed: cargo exploded"),
+            "couldn't regenerate the lockfile"
+        );
+        assert_eq!(human_reason("some_new_code"), "conflict resolution didn't finish");
+        assert_eq!(human_reason("Rebase failed"), "Rebase failed");
     }
 }

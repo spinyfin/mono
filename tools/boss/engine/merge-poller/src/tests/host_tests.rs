@@ -42,6 +42,7 @@ struct RecordingHost {
     conflict_flagged: bool,
     conflict_retired: bool,
     moot_closed: usize,
+    resumes: StdMutex<Vec<String>>,
 }
 
 impl RecordingHost {
@@ -85,6 +86,10 @@ impl ConflictHandling for RecordingHost {
             raw_merge_state_status: cleared.raw_merge_state_status.to_owned(),
         });
         self.conflict_retired
+    }
+
+    async fn resume_merge_after_conflict(&self, _: &WorkDb, _: &dyn ExecutionPublisher, candidate: &PendingMergeCheck) {
+        self.resumes.lock().unwrap().push(candidate.pr_url.clone());
     }
 
     fn retire_moot_conflict_revisions(&self, _: &WorkDb, _: &PendingMergeCheck, _: &[String]) -> usize {
@@ -482,6 +487,36 @@ async fn a_parked_row_with_a_conflicting_pr_is_not_handed_to_the_host_until_unpa
         }],
         "the same PR is handed to the host once the row is un-parked",
     );
+}
+
+#[tokio::test]
+async fn merge_resumption_is_offered_only_for_clean_unparked_prs() {
+    for (label, state, parked, expected) in [
+        ("clean", PrLifecycleState::Open(OpenPrStatus::clean()), false, 1),
+        (
+            "conflicting",
+            PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+            false,
+            0,
+        ),
+        ("parked", PrLifecycleState::Open(OpenPrStatus::clean()), true, 0),
+    ] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/7110";
+        let (_product, chore) = make_chore_in_review(&db, "C-resume-gate", pr);
+        if parked {
+            park(&db, &chore);
+        }
+        let probe = StubProbe::new();
+        probe.set_with_base_head(pr, state, "base-1", "head-1");
+        let publisher = Arc::new(RecordingPublisher::default());
+        let host = RecordingHost::default();
+
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, Some(&host)).await;
+
+        assert_eq!(host.resumes.lock().unwrap().len(), expected, "{label}");
+    }
 }
 
 #[tokio::test]

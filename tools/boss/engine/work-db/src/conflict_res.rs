@@ -915,7 +915,11 @@ impl WorkDb {
         if rows > 0
             && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
         {
-            crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, reason)?;
+            // A stale-head supersede is followed by a fresh attempt for the same
+            // request, so the card stays in Merging; terminal abandons stop it.
+            if reason != crate::merge_conflict_merging::SUPERSEDED_STALE_HEAD {
+                crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, reason)?;
+            }
         }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }

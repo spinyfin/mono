@@ -147,9 +147,15 @@ pub async fn resume_after_conflict(
         if !db.open_merge_revisions(&candidate.work_item_id)?.is_empty() {
             return db.stop_merge_conflict_resolution(&candidate.work_item_id, "Conflict resolution needs a revision");
         }
+        // Never run the merge command unless the intent can be recorded for it.
+        if !db.merge_conflict_resolution_ready(&candidate.work_item_id, &candidate.pr_url)? {
+            return Ok(false);
+        }
         match executor.execute(&candidate.pr_url).await {
             Ok(success) => {
-                db.finish_merge_conflict_resolution(&candidate.work_item_id, &candidate.pr_url, &success.head_sha)?;
+                if !db.finish_merge_conflict_resolution(&candidate.work_item_id, &candidate.pr_url, &success.head_sha)? {
+                    tracing::warn!(work_item_id = %candidate.work_item_id, "merge command succeeded but the card moved on before its intent was recorded");
+                }
             }
             Err(err) => {
                 db.stop_merge_conflict_resolution(
