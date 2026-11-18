@@ -443,7 +443,6 @@ struct WorkerSlotView: View, @MainActor Equatable {
             } else if let session = snapshot.session {
                 WorkerSlotFallbackMonitorPill(session: session)
             }
-
         }
         .padding(.horizontal, 8)
         .padding(.vertical, snapshot.headerWorkLinks == nil ? 6 : 4)

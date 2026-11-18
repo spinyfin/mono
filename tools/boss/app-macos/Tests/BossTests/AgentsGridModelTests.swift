@@ -363,17 +363,15 @@ final class AgentsGridModelTests: XCTestCase {
         XCTAssertEqual(grid.layout.geometry.cell, PaneSize(width: 9, height: 20))
     }
 
-    func testPlaceholderSnapshotsDoNotOfferLiveStatusToggle() {
+    func testPlaceholderSnapshotsUseHistoricalBody() {
         func snapshot(placeholder: Bool) -> WorkerSlotSnapshot {
             WorkerSlotSnapshot(
                 slotId: 1, runId: "run-a", summary: nil, taskTitle: nil, session: nil,
-                liveStatusEnabled: true, live: nil, isPlaceholder: placeholder, cachedPersona: nil, viewerAttachFailure: nil
+                live: nil, isPlaceholder: placeholder, cachedPersona: nil, viewerAttachFailure: nil
             )
         }
-        XCTAssertTrue(snapshot(placeholder: false).offersLiveStatusToggle)
-        XCTAssertFalse(snapshot(placeholder: true).offersLiveStatusToggle)
-        XCTAssertEqual(snapshot(placeholder: false).showsLiveStatusToggle, snapshot(placeholder: false).offersLiveStatusToggle)
-        XCTAssertEqual(snapshot(placeholder: true).showsLiveStatusToggle, snapshot(placeholder: true).offersLiveStatusToggle)
+        XCTAssertEqual(snapshot(placeholder: false).bodyKind, .viewerMissing)
+        XCTAssertEqual(snapshot(placeholder: true).bodyKind, .placeholder)
     }
 
     func testAgentTypeFromWire() {

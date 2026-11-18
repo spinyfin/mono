@@ -42,10 +42,9 @@ final class WorkerSlotViewLifecycleTests: XCTestCase {
                     snapshot: WorkerSlotSnapshot(
                         slotId: 1, runId: runId, summary: nil, taskTitle: nil,
                         session: workspace.viewersByRunId[runId]?.session,
-                        liveStatusEnabled: true, live: nil,
+                        live: nil,
                         isPlaceholder: placeholder, cachedPersona: nil, viewerAttachFailure: nil
                     ),
-                    onToggleLiveStatus: { _ in },
                     terminalContent: { _, session, _ in
                         AnyView(TerminalProbe(sessionId: session.id, recorder: recorder))
                     }
