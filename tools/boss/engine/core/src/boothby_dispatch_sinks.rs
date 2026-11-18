@@ -34,8 +34,26 @@ impl DispatchEventSink for FanOutDispatchEventSink {
     }
 }
 
+/// Dispatch stages that arm a Boothby pass when they fire — each represents
+/// a state a sweep flagged but could not fully resolve (design table,
+/// §"Activation model"). Any other stage is a silent no-op by construction:
+/// it is simply absent from this list, so future `Stage` variants never need
+/// to touch this file to stay harmless. Typed as `&[Stage]` (rather than
+/// re-hardcoded strings) so renaming a `Stage` variant's `as_str()` output is
+/// a compile error here instead of a silently-disabled trigger.
+pub const BOOTHBY_TRIGGER_STAGES: &[Stage] = &[
+    Stage::DeadPidReconcile,
+    Stage::StaleWorkerReconcile,
+    Stage::OrphanActiveRedispatch,
+    Stage::LostWorkspaceReconcile,
+    Stage::RemoteLeaseReconcile,
+    Stage::HuskPaneReconcile,
+    Stage::PoolClaimReconcile,
+    Stage::SpawnAckTimeout,
+];
+
 /// Arms Boothby's event-trigger queue ([`crate::boothby_events::BoothbyEventQueue`])
-/// when a dispatch stage in [`crate::boothby_events::BOOTHBY_TRIGGER_STAGES`]
+/// when a dispatch stage in [`BOOTHBY_TRIGGER_STAGES`]
 /// fires. Any other stage — including every stage that exists today outside
 /// that list, and any stage added in the future — is a silent no-op, per the
 /// design's "unknown stages are no-ops" rule (`boothby.md` §"Risks" #6).
@@ -52,7 +70,10 @@ impl BoothbyEventSink {
 #[async_trait]
 impl DispatchEventSink for BoothbyEventSink {
     async fn emit(&self, event: DispatchEvent) {
-        if crate::boothby_events::BOOTHBY_TRIGGER_STAGES.contains(&event.stage.as_str()) {
+        let is_trigger_stage = BOOTHBY_TRIGGER_STAGES
+            .iter()
+            .any(|stage| stage.as_str() == event.stage);
+        if is_trigger_stage {
             let now = boss_engine_utils::epoch_time::now_epoch_secs();
             self.queue.arm(
                 now,

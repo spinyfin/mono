@@ -168,8 +168,24 @@ pub enum BoothbyTickOutcome {
 /// creation time and then only ever advancing it forward from a real fire.
 fn scheduled_next_due(work_db: &WorkDb, settings: &SettingsStore, _now: i64) -> Option<i64> {
     let cron_expr = settings.get_text(SETTING_SCHEDULE)?;
-    let schedule = parse_cron(&cron_expr).ok()?;
-    let tz = parse_timezone("UTC").ok()?;
+    let schedule = match parse_cron(&cron_expr) {
+        Ok(schedule) => schedule,
+        Err(err) => {
+            tracing::warn!(
+                cron = %cron_expr,
+                %err,
+                "boothby: invalid boothby.schedule cron; scheduled passes disabled until fixed"
+            );
+            return None;
+        }
+    };
+    let tz = match parse_timezone("UTC") {
+        Ok(tz) => tz,
+        Err(err) => {
+            tracing::warn!(%err, "boothby: invalid hardcoded UTC timezone; scheduled passes disabled");
+            return None;
+        }
+    };
     let anchor = work_db
         .last_boothby_schedule_pass_started_at()
         .ok()
@@ -178,21 +194,22 @@ fn scheduled_next_due(work_db: &WorkDb, settings: &SettingsStore, _now: i64) -> 
     next_occurrence_after(&schedule, tz, anchor)
 }
 
-/// Run the placed pass to completion (racing it against
-/// `boothby.pass_timeout_secs`) and finish the row. Shared by the scheduler
-/// tick and the manual `RunBoothbyPass` RPC handler, so a manual fire
-/// records exactly the same lifecycle a scheduled one does.
+/// Open a pass for `trigger` and notify the activity sink. Shared by the
+/// scheduler tick and the manual `RunBoothbyPass` RPC handler, so a manual
+/// fire records exactly the same lifecycle a scheduled one does.
 ///
 /// Returns `None` (rather than erroring) when a pass is already open — an
 /// ordinary race with another caller, not a failure — or when the DB layer
-/// itself errors (logged).
-pub async fn run_and_finish_pass(
+/// itself errors (logged). Split out from [`run_and_finish_pass`] so the RPC
+/// handler can reply as soon as the pass opens instead of blocking its
+/// caller for the whole pass (`boothby.md` design task 3; see
+/// `FrontendEvent::BoothbyPassStarted`'s doc comment for the contract this
+/// enables).
+pub async fn open_and_announce_pass(
     work_db: &WorkDb,
-    runner: &dyn BoothbyPassRunner,
     activity: &dyn BoothbyActivitySink,
     trigger: &str,
     now_epoch: i64,
-    pass_timeout_secs: i64,
 ) -> Option<BoothbyPass> {
     let opened = match work_db.open_boothby_pass(trigger, &now_epoch.to_string()) {
         Ok(Some(pass)) => pass,
@@ -203,7 +220,20 @@ pub async fn run_and_finish_pass(
         }
     };
     activity.pass_changed(&opened).await;
+    Some(opened)
+}
 
+/// Run an already-opened pass to completion (racing it against
+/// `boothby.pass_timeout_secs`) and finish the row, notifying the activity
+/// sink of the terminal state.
+pub async fn run_and_finish_opened_pass(
+    work_db: &WorkDb,
+    runner: &dyn BoothbyPassRunner,
+    activity: &dyn BoothbyActivitySink,
+    opened: BoothbyPass,
+    pass_timeout_secs: i64,
+) -> Option<BoothbyPass> {
+    let trigger = opened.trigger.clone();
     let run_result = tokio::time::timeout(
         Duration::from_secs(pass_timeout_secs.max(1) as u64),
         runner.run_pass(&opened),
@@ -215,7 +245,7 @@ pub async fn run_and_finish_pass(
         Ok(BoothbyRunOutcome::Completed { summary }) => (BOOTHBY_OUTCOME_COMPLETED, summary),
         Ok(BoothbyRunOutcome::Failed { detail }) => (BOOTHBY_OUTCOME_FAILED, Some(detail)),
         Err(_elapsed) => {
-            tracing::warn!(pass_id = %opened.id, trigger, pass_timeout_secs, "boothby: pass timed out");
+            tracing::warn!(pass_id = %opened.id, trigger = %trigger, pass_timeout_secs, "boothby: pass timed out");
             (BOOTHBY_OUTCOME_TIMED_OUT, None)
         }
     };
@@ -231,6 +261,24 @@ pub async fn run_and_finish_pass(
             None
         }
     }
+}
+
+/// Open a pass and run it to completion — the composition [`run_one_tick`]
+/// uses, where blocking the caller until the pass finishes is correct (the
+/// scheduler loop has no client waiting on it). The manual `RunBoothbyPass`
+/// RPC handler instead calls [`open_and_announce_pass`] and
+/// [`run_and_finish_opened_pass`] directly, `tokio::spawn`ing the latter so
+/// it can reply the moment the pass opens.
+pub async fn run_and_finish_pass(
+    work_db: &WorkDb,
+    runner: &dyn BoothbyPassRunner,
+    activity: &dyn BoothbyActivitySink,
+    trigger: &str,
+    now_epoch: i64,
+    pass_timeout_secs: i64,
+) -> Option<BoothbyPass> {
+    let opened = open_and_announce_pass(work_db, activity, trigger, now_epoch).await?;
+    run_and_finish_opened_pass(work_db, runner, activity, opened, pass_timeout_secs).await
 }
 
 /// One scheduler tick, pure of wall-clock reads so it's deterministically
@@ -407,9 +455,8 @@ mod tests {
         let (_d, db) = open_db();
         let tmp = TempDir::new().unwrap();
         let settings = settings_store(&tmp);
-        // Cron far in the future relative to `now` below: use a schedule
-        // anchored at `now` itself, so the "next" occurrence is strictly
-        // after it and not yet due.
+        // Annual cron; against the epoch-0 anchor the next occurrence is
+        // 1971-01-01, far past this tick's `now` of 1_000, so nothing is due.
         settings.set_text("boothby.schedule", "0 0 1 1 *".to_owned()).unwrap(); // once a year
         let events = queue();
 
