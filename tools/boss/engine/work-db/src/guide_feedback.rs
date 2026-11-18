@@ -38,6 +38,27 @@ impl WorkDb {
         pr_checker: &dyn PrStateChecker,
         actor: &str,
     ) -> Result<ReviseDocOutcome> {
+        self.revise_guide_pr_with_approval(input, pr_checker, actor, None)
+    }
+
+    /// [`Self::revise_guide_pr`], optionally approving an answer proposal
+    /// `(entry_id, edited instruction)` in the same transaction that claims
+    /// the comment and inserts the revision. Any outcome other than `Created`
+    /// rolls the approval back.
+    pub(crate) fn revise_guide_pr_with_approval(
+        &self,
+        input: ReviseDocInput,
+        pr_checker: &dyn PrStateChecker,
+        actor: &str,
+        approval: Option<(&str, Option<String>)>,
+    ) -> Result<ReviseDocOutcome> {
+        // A retry of an approved proposal answers with its revision even after
+        // the PR has since closed.
+        if let Some((entry_id, _)) = &approval
+            && let Some(task_id) = self.approved_proposal_revision(entry_id)?
+        {
+            return Ok(ReviseDocOutcome::AlreadyInFlight { task_id });
+        }
         let Some(FeedbackTarget::PullRequestImplementation {
             series_id,
             canonical_pr,
@@ -62,6 +83,19 @@ impl WorkDb {
 
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((entry_id, instruction)) = &approval {
+            // Re-check under the write lock: two approvals may both have seen
+            // the proposal as open before either took it.
+            let entry = comment_thread_entries::load_entry(&tx, entry_id)?;
+            if let Some(proposal) = entry.proposed_edit
+                && proposal.state == boss_protocol::ProposedEditState::Approved
+            {
+                return Ok(ReviseDocOutcome::AlreadyInFlight {
+                    task_id: proposal.revision_id.context("approved proposal has no revision")?,
+                });
+            }
+            comment_thread_entries::prepare_approval(&tx, entry_id, instruction.clone())?;
+        }
         let candidates = comments::query_revisable_comments(
             &tx,
             &input.artifact_kind,
@@ -107,6 +141,12 @@ impl WorkDb {
                         .filter(|id| !addressed_comment_ids.contains(id))
                         .collect::<Vec<_>>();
                 let task_id = task.id.clone();
+                if let Some((entry_id, _)) = &approval {
+                    let entry = comment_thread_entries::load_entry(&tx, entry_id)?;
+                    let mut proposal = entry.proposed_edit.context("approved answer has no proposal")?;
+                    proposal.revision_id = Some(task_id.clone());
+                    comment_thread_entries::save_proposal(&tx, entry_id, &proposal)?;
+                }
                 commit_and_publish(tx, pending, self.event_bus())?;
                 Ok(ReviseDocOutcome::Created {
                     task_id,
@@ -127,6 +167,19 @@ impl WorkDb {
                 Ok(ReviseDocOutcome::NoUnresolvedComments)
             }
         }
+    }
+
+    /// The revision an already-approved proposal created, if any.
+    fn approved_proposal_revision(&self, entry_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let entry = comment_thread_entries::load_entry(&conn, entry_id)?;
+        let Some(proposal) = entry.proposed_edit else {
+            return Ok(None);
+        };
+        if proposal.state != boss_protocol::ProposedEditState::Approved {
+            return Ok(None);
+        }
+        Ok(Some(proposal.revision_id.context("approved proposal has no revision")?))
     }
 
     /// Record a grounded per-comment outcome for a guide-feedback revision.

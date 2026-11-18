@@ -190,7 +190,7 @@ pub(crate) fn map_answer_agent_run(row: &Row<'_>) -> rusqlite::Result<AnswerAgen
 /// Maps a `comment_thread_entries` row. Column order must match the SELECT
 /// in `work/comment_thread_entries.rs`:
 /// `id, comment_id, entry_kind, author, body, revise_task_id,
-///  answer_agent_run_id, created_at`.
+///  answer_agent_run_id, created_at, proposed_edit`.
 pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<CommentThreadEntry> {
     Ok(CommentThreadEntry {
         id: row.get(0)?,
@@ -201,6 +201,13 @@ pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<Commen
         revise_task_id: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
         answer_agent_run_id: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
         created_at: row.get(7)?,
+        proposed_edit: row
+            .get::<_, Option<String>>(8)?
+            .filter(|raw| !raw.is_empty())
+            // A corrupt optional proposal must not hide the answer or the
+            // rest of the thread. It cannot be approved without hydration.
+            .and_then(|raw| serde_json::from_str::<boss_protocol::AnswerProposedEdit>(&raw).ok())
+            .filter(|stored| crate::comment_thread_entries::validate_proposal(&stored.proposal).is_ok()),
     })
 }
 
