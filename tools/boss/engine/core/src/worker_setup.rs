@@ -1145,6 +1145,9 @@ def main():
         # attacker-controlled, while expandvars still resolves this process's
         # value. Block every such expansion, including a plain assignment that
         # splits the path across the variable and a suffix.
+        # Conservatively reject quoted/escaped literal mentions too: this raw
+        # scan covers nested shell bodies whose outer quotes are literal.
+        # Search for the bare name BOSS_DATA_DIR when editing guard sources.
         joined = raw_command.replace("\\\n", "")
         if re.search(r"\$(?:BOSS_DATA_DIR\b|\{BOSS_DATA_DIR\})", joined):
             emit("block", RECOVERY)

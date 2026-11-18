@@ -294,6 +294,8 @@ fn path_guard_blocks_arithmetic_rebinding_of_the_data_dir() {
     let data = TempDir::new().unwrap();
     std::fs::write(data.path().join("state.db"), b"x").unwrap();
     for command in [
+        r#"rg '\$BOSS_DATA_DIR' tools/"#,
+        r#"echo \$BOSS_DATA_DIR"#,
         r#"(( BOSS_DATA_DIR = 0 )); cat "${BOSS_DATA_DIR}/../T/state.db""#,
         r#"$[BOSS_DATA_DIR=0]; cat "${BOSS_DATA_DIR}/../T/state.db""#,
         r#"echo "${a[BOSS_DATA_DIR=0]}"; cat "${BOSS_DATA_DIR}/../T/state.db""#,

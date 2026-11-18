@@ -577,6 +577,13 @@ fn reviewer_denies_env_exec_substring_subscript_and_wait_rebinding() {
         format!(r#"env -u BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
         format!(r#"env --unset=BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
         format!(r#"env -i bash -c '{read}'"#),
+        format!(r#"env -C /tmp -u BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env -C /tmp --unset=BOSS_STRUCTURED_OUTPUT bash -c '{read}'"#),
+        format!(r#"env -C /tmp -i bash -c '{read}'"#),
+        format!(r#"env - bash -c '{read}'"#),
+        format!(r#"wait -np BOSS_STRUCTURED_OUTPUT; {read}"#),
+        format!(r#"a[ BOSS_STRUCTURED_OUTPUT=0 ]=v; {read}"#),
+        format!(r#"BOSS_STRUCTURED_OUTPUT[ 0 ]=/x; {read}"#),
         format!(r#"exec -c bash -c '{read}'"#),
         format!(r#"x=a; echo ${{x:BOSS_STRUCTURED_OUTPUT=0}}; {read}"#),
         format!(r#"a[BOSS_STRUCTURED_OUTPUT=0]=v; {read}"#),
@@ -600,7 +607,39 @@ fn reviewer_denies_alias_mapfile_and_compgen_callbacks() {
         format!("mapfile -C 'cat {protected}' -c 1 a < README.md"),
         format!("readarray -C 'cat {protected}' -c 1 a < README.md"),
         format!("compgen -C 'cat {protected}' x"),
+        format!("BASH_ALIASES[c]='cat {protected}'; c"),
+        "BASH_CMDS[c]=/tmp/command; c".into(),
+        "BASH_ENV=/tmp/startup bash -c true".into(),
+        "jobs -x bossctl status".into(),
+        "env -S 'bossctl status'".into(),
+        "shopt -s expand_aliases".into(),
     ] {
         deny_at(&fx, &command, &fx.workspace());
+    }
+}
+
+#[test]
+fn braced_names_cannot_cross_quote_segments() {
+    for kind in [WorkerKind::Standard, WorkerKind::Reviewer] {
+        let fx = Fixture::new("run-braced-boundary");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+        });
+        for literal_name in ["${BOSS_STRUCTURED_OUTPUT}", "{BOSS_STRUCTURED_OUTPUT}"] {
+            std::os::unix::fs::symlink(
+                fx.process_home.join(".gemini/config"),
+                fx.workspace().join(literal_name),
+            )
+            .unwrap();
+        }
+        let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+        for command in [
+            r#"cat "$""{BOSS_STRUCTURED_OUTPUT}"/hooks.json"#,
+            r#"cat $'{BOSS_STRUCTURED_OUTPUT}'/hooks.json"#,
+        ] {
+            let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(command), &env);
+            assert_eq!(decision(&body), "deny", "{kind:?} {command}: {body} {stderr}");
+        }
     }
 }

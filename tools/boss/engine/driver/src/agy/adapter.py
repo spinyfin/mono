@@ -310,7 +310,19 @@ def authorized(policy, overwrite=None):
 
 
 def nested_shell_bodies(group):
+    for token in without_redirections(group):
+        if re.match(r"^(?:BASH_ALIASES|BASH_CMDS|BASH_ENV)(?:\[|\+?=)", token):
+            fail_closed("dynamic shell command assignment is denied")
+    normalized = without_redirections(group)
+    for index, token in enumerate(normalized):
+        if os.path.basename(token) == "env" and any(
+                option.startswith("--split-string") or
+                (option.startswith("-") and not option.startswith("--") and "S" in option)
+                for option in normalized[index + 1:]):
+            fail_closed("env split-string execution cannot be inspected")
     rest = strip_prefixes(group)
+    if rest and os.path.basename(rest[0]) in ("jobs", "shopt"):
+        fail_closed("shell execution and option builtins cannot be inspected")
     if rest and any(c in rest[0] for c in "<>"):
         fail_closed("unsupported redirection attached to an executable")
     base = os.path.basename(rest[0]) if rest else ""
@@ -459,29 +471,12 @@ def prefix_clears_environment(group):
     normalized = without_redirections(group)
     rest = strip_prefixes(group)
     prefix = normalized[:len(normalized) - len(rest)] if rest else list(normalized)
-    index = 0
-    while index < len(prefix):
-        token = prefix[index]
-        base = os.path.basename(token)
-        index += 1
-        if base == "env":
-            while index < len(prefix) and prefix[index].startswith("-"):
-                option = prefix[index]
-                index += 1
-                if option == "--":
-                    break
-                if option.startswith("--unset") or option in ("-i", "--ignore-environment"):
-                    return True
-                if option.startswith("-") and not option.startswith("--") and any(c in option[1:] for c in "iu"):
-                    return True
-        elif base == "exec":
-            while index < len(prefix) and prefix[index].startswith("-"):
-                option = prefix[index]
-                index += 1
-                if option == "--":
-                    break
-                if option == "-c" or (option.startswith("-") and not option.startswith("--") and "c" in option[1:]):
-                    return True
+    # Unknown wrapper options may alter the environment or working directory.
+    # Only option-free env/exec prefixes are safe for inherited substitution.
+    for index, token in enumerate(prefix):
+        if os.path.basename(token) in ("env", "exec"):
+            if index + 1 < len(prefix) and prefix[index + 1].startswith("-") and prefix[index + 1] != "--":
+                return True
     return False
 
 
@@ -492,7 +487,7 @@ def wait_binds_pid_variable(group):
     for token in rest[1:]:
         if token in ("-p", "--pid") or token.startswith("--pid="):
             return True
-        if token.startswith("-p") and not token.startswith("--"):
+        if token.startswith("-") and not token.startswith("--") and "p" in token[1:]:
             return True
     return False
 
@@ -522,7 +517,7 @@ def reject_trusted_rebinding(command, groups):
         assigned = list(normalized[:len(normalized) - len(rest)] if rest else normalized)
         # `NAME+=v` and `NAME[i]=v` are assignments too, though strip_prefixes
         # only recognizes `NAME=`.
-        while rest and ANY_ASSIGN_RE.match(rest[0]):
+        while rest and (ANY_ASSIGN_RE.match(rest[0]) or SUBSCRIPT_ASSIGN_RE.match(rest[0])):
             assigned.append(rest.pop(0))
         for token in assigned:
             if TRUSTED_VAR_ASSIGN_RE.match(token):
@@ -568,6 +563,10 @@ def expand_exported(path, literal=None, segments=None, shell_token=False):
             if close != -1:
                 name = path[index + 2:close]
                 if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) and name in values:
+                    if (segments is None or close >= len(segments)
+                            or any(segment != segments[index] for segment in segments[index:close + 1])
+                            or any(quoted is True for quoted in (literal or [])[index:close + 1])):
+                        fail_closed("braced path variable expansion crosses a quote or escape boundary")
                     out.append(values[name])
                     index = close + 1
                     continue
@@ -584,8 +583,6 @@ def expand_exported(path, literal=None, segments=None, shell_token=False):
                 cursor += 1
         name = path[index + 1:cursor]
         if name in values:
-            if cursor < length and cursor < len(segments) and segments[cursor] == seg and (path[cursor].isalnum() or path[cursor] == "_"):
-                fail_closed("unbraced path variable expansion crosses a quote or escape boundary")
             out.append(values[name])
             index = cursor
             continue

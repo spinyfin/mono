@@ -809,6 +809,8 @@ fn render_sandbox_workspace_write_toml_grants_store_root_git_dir() {
 
 #[test]
 fn codex_progress_ingress_is_run_correlated_rollout_jsonl() {
+    let tmp = TempDir::new().unwrap();
+    let _transcripts = crate::test_support::transcript_store_override(&tmp.path().join("transcripts"));
     let config = ProgressObservationConfig {
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         lease_id: "lease".into(),
