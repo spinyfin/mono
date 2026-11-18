@@ -283,7 +283,9 @@ impl FileAction {
 ///   its siblings' checkouts. It is scoped rather than blanket, as the
 ///   Reviewer's is on Claude, so a result file written outside the checkout
 ///   stays possible; Claude's blanket `Edit(**)` has no measured `agy`
-///   spelling, and the hook denies every native write for these kinds anyway.
+///   spelling. The hook denies Reviewer and Triage native writes, except a
+///   Reviewer write_file to its engine-owned ReviewResult artifact; the other
+///   non-writing kinds rely on deny_unless_prior_grant and this fence.
 fn file_fences(plan: &SettingsPlan<'_>) -> Vec<(FileAction, PathBuf)> {
     let mut fences = Vec::new();
     if let Some(dir) = plan.boss_data_dir {

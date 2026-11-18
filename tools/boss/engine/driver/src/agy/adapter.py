@@ -123,14 +123,6 @@ def load_policy():
     paths = policy.get("protected_paths")
     if not isinstance(paths, list) or not paths or any(not isinstance(p, str) or not os.path.isabs(p) for p in paths):
         fail_closed("authorization policy has malformed protected paths")
-    exported = policy.get("exported_paths")
-    if exported is None:
-        exported = {}
-    if not isinstance(exported, dict):
-        fail_closed("authorization policy has malformed exported paths")
-    for key, value in exported.items():
-        if key not in EXPORTED_PATH_VARS or not isinstance(value, str) or not os.path.isabs(value):
-            fail_closed("authorization policy has malformed exported path %r" % (key,))
     artifacts = policy.get("artifact_write_paths")
     if artifacts is None:
         artifacts = []
@@ -322,7 +314,7 @@ def nested_shell_bodies(group):
     if rest and any(c in rest[0] for c in "<>"):
         fail_closed("unsupported redirection attached to an executable")
     base = os.path.basename(rest[0]) if rest else ""
-    if base in {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "case", "esac", "{", "}", "!", "eval", "source", "."}:
+    if base in {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "case", "esac", "{", "}", "!", "eval", "source", ".", "trap"}:
         fail_closed("unsupported shell control or dynamic execution")
     if rest and os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
         for index, arg in enumerate(rest[1:], 1):
@@ -352,13 +344,23 @@ def has_substitution(command):
             start, end = group.body_span
             masked[start:end] = ' ' * (end - start)
     masked = ''.join(masked)
-    quote, escaped = None, False
+    quote, escaped, skip = None, False, False
     for index, char in enumerate(masked):
+        if skip:
+            skip = False
+            continue
         if escaped:
             escaped = False
             continue
         if char == chr(92) and quote != chr(39):
             escaped = True
+            continue
+        if is_ansi_open(masked, index, quote):
+            quote, skip = ANSI, True
+            continue
+        if quote == ANSI:
+            if char == chr(39):
+                quote = None
             continue
         if char in (chr(34), chr(39)):
             if quote == char:
@@ -409,42 +411,84 @@ def has_redirect(command):
 
 # Resolve the exact environment inherited from the worker at spawn.
 # Commands cannot rebind these variables and use the trusted resolution.
-TRUSTED_EXECUTABLE_VARS = ("BOSS_BIN", "CUBE_BIN")
-TRUSTED_NAMES = "|".join(TRUSTED_EXECUTABLE_VARS)
+# Every name expand_exported substitutes is rebound-protected: assignments,
+# binding builtins, printf -v, and any non-expansion mention of the name
+# (arithmetic, subscripts, `[[ ]]`) in a command that also expands one.
+TRUSTED_PATH_VARS = EXPORTED_PATH_VARS
+TRUSTED_NAMES = "|".join(TRUSTED_PATH_VARS)
 TRUSTED_VAR_RE = re.compile(r"\$(?:(%s)\b|\{(%s)\})" % (TRUSTED_NAMES, TRUSTED_NAMES))
 TRUSTED_VAR_ASSIGN_RE = re.compile(r"^(?:%s)(?:\+?=|\[)" % TRUSTED_NAMES)
+TRUSTED_NAME_IN_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_])" % TRUSTED_NAMES)
 # Builtins that bind or unbind variables by name. Their name arguments can be
 # spelled indirectly (brace expansion, namerefs, "$name"), so with a trusted
 # variable in play they are denied whatever their arguments look like.
 BINDING_BUILTINS = {"export", "declare", "typeset", "local", "readonly", "unset", "read", "getopts", "mapfile", "readarray", "let"}
 
 
+ANY_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+
+
+# Contexts bash evaluates arithmetically after expansion: `(( ))`, `$[ ]`,
+# `[[ ]]`, and non-trivial `${name[subscript]}` subscripts. An assignment
+# inside one rebinds a variable without any assignment word.
+ARITHMETIC_CONTEXT_RES = (
+    re.compile(r"\(\((.*?)(?:\)\)|\Z)", re.S),
+    re.compile(r"\$\[(.*?)(?:\]|\Z)", re.S),
+    re.compile(r"\[\[(.*?)(?:\]\]|\Z)", re.S),
+    re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[0-9]+|[@*])\]\})(.*?)(?:\]\}|\Z)", re.S),
+)
+
+
+def arithmetic_context_rebinds(command):
+    masked = TRUSTED_VAR_RE.sub("", command)
+    for pattern in ARITHMETIC_CONTEXT_RES:
+        for match in pattern.finditer(masked):
+            body = match.group(1)
+            if "$" in body or TRUSTED_NAME_IN_TOKEN_RE.search(body):
+                return True
+    return False
+
+
 def reject_trusted_rebinding(command, groups):
+    # Bash joins backslash-newline before parsing, so test the joined text.
+    command = strip_line_continuations(command)
     uses_trusted = TRUSTED_VAR_RE.search(command) is not None
+    # In a command that expands a trusted name, an arithmetic context that
+    # names a trusted variable or contains any other expansion (which could
+    # compose the name) may assign it; expand_exported would then substitute
+    # the stale inherited value. Names outside such contexts, including
+    # quoted message text and search patterns, are plain data.
+    if uses_trusted and arithmetic_context_rebinds(command):
+        fail_closed("an arithmetic context in a command using an engine-provided path variable could reassign it")
     for group in groups:
         normalized = without_redirections(group)
-        rest = strip_prefixes(group)
-        # Only assignment-prefix positions bind a variable; the same words as
-        # ordinary arguments (`rg BOSS_BIN`) are plain data.
-        for token in normalized[:len(normalized) - len(rest)]:
+        rest = list(strip_prefixes(group))
+        # Prefix and standalone assignment positions bind a variable; the same
+        # words as ordinary arguments (`rg BOSS_BIN`) are plain data.
+        assigned = list(normalized[:len(normalized) - len(rest)] if rest else normalized)
+        # `NAME+=v` and `NAME[i]=v` are assignments too, though strip_prefixes
+        # only recognizes `NAME=`.
+        while rest and ANY_ASSIGN_RE.match(rest[0]):
+            assigned.append(rest.pop(0))
+        for token in assigned:
             if TRUSTED_VAR_ASSIGN_RE.match(token):
-                fail_closed("reassigning an engine-provided executable variable is denied")
+                fail_closed("reassigning an engine-provided path variable is denied")
         if not rest:
             continue
         program = os.path.basename(rest[0])
         binds = program in BINDING_BUILTINS or (program == "printf" and "-v" in rest[1:])
-        if binds and (uses_trusted or any(re.search(TRUSTED_NAMES, token) for token in rest[1:])):
-            fail_closed("rebinding variables is denied when an engine-provided executable variable is in use")
+        if binds and (uses_trusted or any(TRUSTED_NAME_IN_TOKEN_RE.search(token) for token in rest[1:])):
+            fail_closed("rebinding variables is denied when an engine-provided path variable is in use")
 
 
-def exported_paths(policy):
+def exported_paths():
     return {name: value for name in EXPORTED_PATH_VARS
             if (value := os.environ.get(name)) and os.path.isabs(value)
             and not any(c in value for c in "\n\0")}
 
 
-def expand_exported(path, policy):
-    values = exported_paths(policy)
+def expand_exported(path):
+    values = exported_paths()
 
     def replacer(match):
         name = match.group(1) or match.group(2)
@@ -459,7 +503,7 @@ def resolve_path(path, policy, cwd=None, pre_expanded=False):
     if pre_expanded:
         expanded = path
     else:
-        expanded = expand_exported(path, policy)
+        expanded = expand_exported(path)
         if re.match(r"^~[^/]", expanded):
             fail_closed("unresolved shell path expansion")
         if "$" in expanded:
@@ -490,13 +534,28 @@ def path_is_protected(path, policy, cwd=None, pre_expanded=False):
     return False
 
 
-def glob_touches_protected(expanded, policy):
-    static = re.split(r"[\*\?\[]", os.path.normpath(expanded), 1)[0].rstrip(os.sep) or os.sep
-    prefixes = [static, os.path.realpath(static)]
+def glob_prefix_spellings(static):
+    prefixes = [static, os.path.normpath(static), os.path.realpath(static)]
     existing = static
     while not os.path.exists(existing) and os.path.dirname(existing) != existing:
         existing = os.path.dirname(existing)
     prefixes.append(os.path.realpath(existing))
+    normalized = os.path.normpath(static)
+    if normalized != static:
+        existing = normalized
+        while not os.path.exists(existing) and os.path.dirname(existing) != existing:
+            existing = os.path.dirname(existing)
+        prefixes.append(os.path.realpath(existing))
+        prefixes.append(os.path.realpath(normalized))
+    return prefixes
+
+
+def glob_touches_protected(expanded, policy):
+    # Keep the un-normalized static prefix so a symlink-then-`..` glob is
+    # compared after physical resolution, matching bash, not after lexically
+    # collapsing `link/../` away from the protected root.
+    static = re.split(r"[\*\?\[]", expanded, 1)[0].rstrip(os.sep) or os.sep
+    prefixes = glob_prefix_spellings(static)
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
             root_abs = spelling.rstrip(os.sep)
@@ -543,9 +602,18 @@ def operand_path_texts(token, role, program):
         return [token.split('=', 1)[1] if '=' in token else token]
     if role == 'redirect_attached':
         return [re.sub(r'^(?:[0-9]+|&)?[<>|]+', '', token)]
-    if role == 'attached':
+    if role == 'dynamic_short':
+        flags = FILE_FLAGS.get(program, ()) + TEXT_FLAGS.get(program, ())
+        candidates = [token]
         for i, char in enumerate(token[1:], 1):
-            if '-' + char in FILE_FLAGS.get(program, ()):
+            if '-' + char in flags and token[i + 1:]:
+                candidates.append(token[i + 1:])
+                break
+        return candidates
+    if role == 'attached':
+        flags = FILE_FLAGS.get(program, ()) + TEXT_FLAGS.get(program, ())
+        for i, char in enumerate(token[1:], 1):
+            if '-' + char in flags:
                 return [token[i + 1:] or token]
     return [token]
 
@@ -567,9 +635,74 @@ def stdin_argv_program(group):
     return None
 
 
+def without_redirection_indices(group):
+    result = []
+    index = 0
+    while index < len(group):
+        token = group[index]
+        redirect = re.match(r'^(?:[0-9]+|&)?(?:>\||>>?|<>|<<-?|<)(.*)$', token)
+        if redirect:
+            if redirect.group(1) in ('', '&'):
+                index += 1
+        else:
+            result.append(index)
+        index += 1
+    return result
+
+
+def strip_prefix_indices(group):
+    kept = without_redirection_indices(group)
+    stripped = strip_prefixes(group)
+    if not stripped:
+        return []
+    return kept[len(kept) - len(stripped):]
+
+
+MULTI_WORD_EXPANSION_RE = re.compile(r"^\$(?:@|\{(?:@[^}]*|[^}]*\[@\][^}]*|![^}]*@)\})")
+
+
+def has_brace_expansion(token, literal, start):
+    depth, comma = 0, False
+    for j in range(start, len(token)):
+        if j < len(literal) and literal[j]:
+            continue
+        char = token[j]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return comma or '..' in token[start:j]
+        elif char == ',' and depth == 1:
+            comma = True
+    return False
+
+
+def has_unquoted_glob_or_expansion(token, literal):
+    for i, char in enumerate(token):
+        quoted = literal[i] if i < len(literal) else False
+        if quoted == 'd':
+            # "$@" and "${a[@]}" still expand to one word per element.
+            if char == '$' and MULTI_WORD_EXPANSION_RE.match(token[i:]):
+                return True
+            continue
+        if quoted:
+            continue
+        if char == '$' or char in '*?[':
+            return True
+        if char == '{' and has_brace_expansion(token, literal, i):
+            return True
+    return False
+
+
+def token_literal(group, index):
+    return group.literal_chars[index] if index < len(group.literal_chars) else []
+
+
 def path_operand_positions(group):
     # Default operands to paths; exclude known text and script positions.
     # Returns {token index: syntactic role}.
+    rest_ids = set(strip_prefix_indices(group))
     rest = strip_prefixes(group)
     program = os.path.basename(rest[0]) if rest else ''
     text_flags = TEXT_FLAGS.get(program, ())
@@ -577,6 +710,14 @@ def path_operand_positions(group):
     operand, skip_next, skip_as_path, pattern_seen, end_of_options = 0, False, False, False, False
     positions = {}
     value_flags = GREP_VALUE_FLAGS if program in ('grep', 'rg') else frozenset()
+
+    def keep_redirect(index):
+        return str(positions.get(index, '')).startswith('redirect')
+
+    def mark_text_slot(index, token, role='operand'):
+        if has_unquoted_glob_or_expansion(token, token_literal(group, index)):
+            positions[index] = role
+
     for index, token in enumerate(group):
         redirect = re.match(r'^(?:[0-9]+|&)?(?:>\||>>?|<>|<<-?|<)(.*)$', token)
         if redirect:
@@ -588,11 +729,14 @@ def path_operand_positions(group):
                 positions[index + 1] = 'redirect_target'
             continue
         if skip_next:
-            if skip_as_path:
-                positions[index] = 'operand'
+            if not keep_redirect(index):
+                if skip_as_path or has_unquoted_glob_or_expansion(token, token_literal(group, index)):
+                    positions[index] = 'operand'
             skip_next, skip_as_path = False, False
             continue
-        if token not in rest:
+        if keep_redirect(index):
+            continue
+        if index not in rest_ids:
             if not token.startswith('-'):
                 positions.setdefault(index, 'assignment' if ASSIGNMENT_RE.match(token) else 'operand')
             continue
@@ -613,43 +757,56 @@ def path_operand_positions(group):
                 name, eq, _value = token.partition('=')
                 if name in text_flags:
                     pattern_seen = True
-                    skip_next, skip_as_path = not eq, False
+                    if eq:
+                        mark_text_slot(index, token, 'option')
+                    else:
+                        skip_next, skip_as_path = True, False
                 elif name in file_flags:
                     pattern_seen = True
                     if eq:
                         positions[index] = 'option'
                     else:
                         skip_next, skip_as_path = True, True
+                elif has_unquoted_glob_or_expansion(token, token_literal(group, index)):
+                    positions[index] = 'operand'
                 elif eq:
                     positions[index] = 'option'
                 elif name in value_flags:
                     skip_next, skip_as_path = True, False
             else:
-                consumed = False
-                for i, char in enumerate(token[1:], 1):
-                    flag = '-' + char
-                    if flag in text_flags or flag in file_flags:
-                        attached = token[i + 1:]
-                        pattern_seen = True
-                        if attached:
-                            if flag in file_flags:
-                                positions[index] = 'attached'
-                        elif flag in file_flags:
-                            skip_next, skip_as_path = True, True
-                        else:
+                if has_unquoted_glob_or_expansion(token, token_literal(group, index)):
+                    # Keep the whole word, and also check any value a
+                    # recognized file or text flag carries attached.
+                    positions[index] = 'dynamic_short'
+                else:
+                    consumed = False
+                    for i, char in enumerate(token[1:], 1):
+                        flag = '-' + char
+                        if flag in text_flags or flag in file_flags:
+                            attached = token[i + 1:]
+                            pattern_seen = True
+                            if attached:
+                                if flag in file_flags:
+                                    positions[index] = 'attached'
+                                else:
+                                    mark_text_slot(index, token, 'attached')
+                            elif flag in file_flags:
+                                skip_next, skip_as_path = True, True
+                            else:
+                                skip_next, skip_as_path = True, False
+                            consumed = True
+                            break
+                        if flag in value_flags and i + 1 == len(token):
                             skip_next, skip_as_path = True, False
-                        consumed = True
-                        break
-                    if flag in value_flags and i + 1 == len(token):
-                        skip_next, skip_as_path = True, False
-                        consumed = True
-                        break
-                if not consumed and '=' in token:
-                    positions[index] = 'option'
+                            consumed = True
+                            break
+                    if not consumed and '=' in token:
+                        positions[index] = 'option'
         elif program in NON_PATH_PROGRAMS:
             pass
         elif program in GREP_FAMILY and not pattern_seen:
             pattern_seen = True
+            mark_text_slot(index, token)
         else:
             positions[index] = 'operand'
         operand += 1
@@ -657,7 +814,7 @@ def path_operand_positions(group):
 
 
 def operand_touches_protected(candidate, policy, current, program, is_redirect):
-    expanded = expand_exported(candidate, policy)
+    expanded = expand_exported(candidate)
     if '$' in expanded or re.match(r"^~[^/]", expanded):
         # echo/printf argv text is data; a redirect target is always opened.
         if is_redirect or program not in PATH_TEXT_PROGRAMS:
@@ -687,16 +844,23 @@ def command_touches_protected(command, policy, cwd):
             token = group[index]
             literal = group.literal_chars[index] if index < len(group.literal_chars) else []
             # Preserve quoted/escaped expansion characters during resolution.
-            protected_text = ''.join({'$': chr(1), '~': chr(3)}.get(c, c) if i < len(literal) and literal[i] else c
+            # True is single-quoted or escaped (literal $); double-quoted
+            # characters are recorded as a distinct truthy marker so pattern
+            # slots can tell unquoted expansions from "$X".
+            protected_text = ''.join({'$': chr(1), '~': chr(3)}.get(c, c) if i < len(literal) and literal[i] is True else c
                                      for i, c in enumerate(token))
             is_redirect = role.startswith('redirect')
+            if (is_redirect or program not in PATH_TEXT_PROGRAMS) and any(
+                    char == '{' and not (i < len(literal) and literal[i]) and has_brace_expansion(token, literal, i)
+                    for i, char in enumerate(token)):
+                fail_closed("unresolved shell brace expansion")
             for candidate in operand_path_texts(protected_text, role, program):
                 if candidate and not candidate.startswith('&') and operand_touches_protected(candidate, policy, current, program, is_redirect):
                     return True
         if rest and rest[0] in ("cd", "pushd", "popd"):
             if len(rest) != 2 or rest[1] == "-" or re.match(r"^~[^/]", rest[1]) or any(c in rest[1] for c in "`*?["):
                 return True
-            if "$" in rest[1] and expand_exported(rest[1], policy) == rest[1]:
+            if "$" in rest[1] and expand_exported(rest[1]) == rest[1]:
                 return True
             current = resolve_path(rest[1], policy, current)
             if path_is_protected(current, policy, pre_expanded=True):
@@ -879,10 +1043,6 @@ def guard_applies(matcher, canonical_name):
     return matcher == canonical_name
 
 
-def guard_env(policy):
-    return os.environ.copy()
-
-
 def run_bounded(argv, **kwargs):
     data = kwargs.pop("input")
     timeout = kwargs.pop("timeout")
@@ -949,7 +1109,6 @@ def run_guards(policy, canonical, rewrites=0, synthetic=False):
                 capture_output=True,
                 text=True,
                 timeout=guard.get("timeout_sec", 30),
-                env=guard_env(policy),
             )
         except Exception as exc:
             fail_closed("failed to exec guard command: %r" % (exc,))

@@ -1,4 +1,5 @@
 use super::*;
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -279,4 +280,264 @@ fn operands_after_end_of_options_are_checked_verbatim() {
     }
     deny_at(&fx, "grep -e . -- -falias", &fx.workspace());
     deny_at(&fx, "cat -- name=alias", &fx.workspace());
+}
+
+#[test]
+fn exported_path_variables_cannot_be_rebound_then_expanded() {
+    let fx = Fixture::new("run-exported-rebind");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/boss-agy-auth-policy.json");
+    let protected = protected.to_str().unwrap();
+    let split = protected.len() / 2;
+    let prefix = &protected[..split];
+    let suffix = &protected[split..];
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let hooks = hooks.to_str().unwrap();
+    let hooks_split = hooks.len() / 2;
+    let hooks_prefix = &hooks[..hooks_split];
+    let hooks_suffix = &hooks[hooks_split..];
+    let data = fx.tmp.path().join("boss-data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("secret"), "x").unwrap();
+    let data_str = data.to_str().unwrap();
+    let data_split = data_str.len() / 2;
+    let data_prefix = &data_str[..data_split];
+    let data_suffix = &data_str[data_split..];
+    let env = [
+        ("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json"),
+        ("BOSS_BIN_DIR", "/opt/boss-tools"),
+    ];
+    for command in [
+        format!("BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!("BOSS_STRUCTURED_OUTPUT={hooks_prefix}; printf '{{}}' > \"${{BOSS_STRUCTURED_OUTPUT}}{hooks_suffix}\""),
+        "read BOSS_STRUCTURED_OUTPUT < f".into(),
+        "builtin read BOSS_STRUCTURED_OUTPUT < f".into(),
+        format!("builtin export BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!("builtin command export BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!(
+            "command builtin command export BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""
+        ),
+        format!("BOSS_STRUCTURED_OUTPUT[0]={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!("BOSS_BIN_DIR+={data_prefix}; cat \"$BOSS_BIN_DIR{data_suffix}/secret\""),
+        "export BOSS_STRUCTURED_OUTPUT=/tmp/agy-ho".into(),
+        "printf -v BOSS_STRUCTURED_OUTPUT %s /tmp/agy-ho".into(),
+        format!("BOSS_BIN_DIR={data_prefix}; cat \"$BOSS_BIN_DIR{data_suffix}/secret\""),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn unquoted_grep_pattern_globs_and_expansions_are_denied() {
+    let fx = Fixture::new("run-grep-pattern-slots");
+    fx.install(WorkerKind::Standard);
+    let config = fx.process_home.join(".gemini/config");
+    let config = config.display();
+    for command in ["grep $X f".into(), "grep -e $X f".into(), format!("grep -v {config}/*")] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+    for command in ["grep \"$X\" f", "grep -n 'x$' f"] {
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn redirect_targets_matching_argv_words_keep_redirect_role() {
+    let fx = Fixture::new("run-redirect-same-word");
+    fx.install(WorkerKind::Standard);
+    for command in [
+        r#"echo "$P" > "$P""#,
+        r#"printf %s "$P" > "$P""#,
+        r#"echo -- "$P" > "$P""#,
+    ] {
+        deny_at(&fx, command, &fx.workspace());
+    }
+}
+
+#[test]
+fn ansi_c_quoting_cannot_hide_a_later_live_line() {
+    let fx = Fixture::new("run-ansi-c-heredoc");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let command = format!("echo $'\\' <<X #'\ncat {}\nX", protected.display());
+    deny_at(&fx, &command, &fx.workspace());
+}
+
+#[test]
+fn ansi_c_escaped_quote_cannot_hide_a_live_command_or_substitution() {
+    let fx = Fixture::new("run-ansi-c-escaped-quote");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    deny_at(
+        &fx,
+        &format!("echo $'\\'' ; cat {} ; echo \\'", protected.display()),
+        &fx.workspace(),
+    );
+    deny_at(&fx, "echo $'\\'' $(jj describe -m x) \\'", &fx.workspace());
+}
+
+#[test]
+fn multi_word_expansions_option_bundles_and_braces_are_denied() {
+    let fx = Fixture::new("run-multi-word-expansions");
+    fx.install(WorkerKind::Standard);
+    let config = fx.process_home.join(".gemini/config");
+    let hooks = config.join("hooks.json");
+    let hooks = hooks.display();
+    for command in [
+        "grep \"$@\" f".to_string(),
+        "grep -e \"${a[@]}\" f".to_string(),
+        "set -- x /tmp/y; grep \"$@mes/z\"".to_string(),
+        "grep -v$X f".to_string(),
+        "grep -e . -A$X f".to_string(),
+        "grep -${X}e f".to_string(),
+        "grep -${X}A f".to_string(),
+        format!("grep {{x,{hooks}}}"),
+        format!("cat {{{hooks},}}"),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+    for command in ["grep \"$X\" f", "grep -n 'x$' f"] {
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn symlink_parent_glob_is_denied_after_physical_dotdot() {
+    let fx = Fixture::new("run-symlink-dotdot-glob");
+    fx.install(WorkerKind::Standard);
+    let sibling = fx.tmp.path().join("other");
+    fs::create_dir_all(&sibling).unwrap();
+    std::os::unix::fs::symlink(&sibling, fx.workspace().join("link")).unwrap();
+    let leaf = format!("{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let body = deny_at(&fx, &format!("cat link/../hom?s/{leaf}"), &fx.workspace());
+    assert!(body["reason"].as_str().unwrap().contains("protected"), "{body}");
+}
+
+#[test]
+fn builtin_and_trap_cannot_hide_eval_source_cd_or_export() {
+    {
+        let fx = Fixture::new("run-builtin-wrappers");
+        fx.install(WorkerKind::Standard);
+        let protected = fx.process_home.join(".gemini/config/hooks.json");
+        let protected = protected.display();
+        let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+        for command in [
+            format!("builtin eval 'cat {protected}'"),
+            "builtin source ./f".into(),
+            "builtin . ./f".into(),
+            format!("builtin cd {}; cat {relative}", fx.tmp.path().display()),
+            format!("trap 'cat {protected}' EXIT"),
+            "trap 'rm -rf ~' EXIT".into(),
+        ] {
+            deny_at(&fx, &command, &fx.workspace());
+        }
+    }
+    let reviewer = Fixture::new("run-builtin-reviewer");
+    reviewer.install_with(WorkerKind::Reviewer, |c| {
+        c.is_standard_worker = false;
+        c.is_reviewer = true;
+    });
+    deny_at(&reviewer, "builtin eval 'jj describe -m x'", &reviewer.workspace());
+}
+
+#[test]
+fn option_bundle_expansions_before_a_recognized_flag_are_denied() {
+    let fx = Fixture::new("run-option-bundle-prefix");
+    fx.install(WorkerKind::Standard);
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    fs::write(
+        fx.workspace().join("input"),
+        format!("v NEVERMATCH {} junk", hooks.display()),
+    )
+    .unwrap();
+    for command in [
+        "grep -${X}e f".to_string(),
+        "grep -${X}A f".to_string(),
+        "read X < input; grep -${X}e f".to_string(),
+        "read X < input; grep -${X}A f".to_string(),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+}
+
+#[test]
+fn arithmetic_contexts_cannot_rebind_trusted_path_variables() {
+    let fx = Fixture::new("run-arithmetic-rebind");
+    fx.install(WorkerKind::Standard);
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let env = [
+        ("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json"),
+        ("BOSS_BIN_DIR", "/opt/boss-tools"),
+    ];
+    for command in [
+        format!(r#"(( BOSS_STRUCTURED_OUTPUT = 0 )); cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"$[BOSS_STRUCTURED_OUTPUT=0]; cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"echo "${{a[BOSS_STRUCTURED_OUTPUT=0]}}"; cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"[[ 1 -eq BOSS_STRUCTURED_OUTPUT=0 ]]; cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"(( BOSS_STRUCTURED_OUTPUT = 0 )); echo x > "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"(( HOME = 0 )); cat "${{HOME}}/../T/{relative}""#),
+        format!(r#"(( BOSS_BIN_DIR = 0 )); cat "${{BOSS_BIN_DIR}}/../T/{relative}""#),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn attached_file_flag_values_behind_a_trusted_expansion_are_checked() {
+    for kind in [WorkerKind::Standard, WorkerKind::Reviewer] {
+        let fx = Fixture::new("run-attached-dynamic-flag");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+        });
+        let home = fx.process_home.display().to_string();
+        let env = [("HOME", home.as_str())];
+        for command in [
+            "grep -f$HOME/.gemini/config/hooks.json f",
+            "grep -vf$HOME/.gemini/config/hooks.json f",
+            "grep -f${HOME}/.gemini/config/hooks.json f",
+        ] {
+            let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(command), &env);
+            assert_eq!(decision(&body), "deny", "{kind:?} {command}: {body} {stderr}");
+        }
+    }
+}
+
+#[test]
+fn split_or_composed_trusted_names_cannot_rebind_in_arithmetic() {
+    let fx = Fixture::new("run-composed-rebind");
+    fx.install(WorkerKind::Standard);
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+    let read = format!(r#"cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#);
+    for command in [
+        format!("(( BOSS_STRUC\\\nTURED_OUTPUT = 0 )); {read}"),
+        format!(r#"n=BOSS_STRUCTURED; echo "${{a[${{n}}_OUTPUT=0]}}"; {read}"#),
+        format!(r#"n=BOSS_STRUCTURED; echo $[${{n}}_OUTPUT=0]; {read}"#),
+        format!(r#"n=BOSS_STRUCTURED; printf '%s' "${{a[${{n}}_OUTPUT=0]}}"; {read}"#),
+        format!(
+            r#"n=BOSS_STRUCTURED; echo $[${{n}}_OUTPUT=0]; echo x > "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#
+        ),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn mention_of_a_trusted_name_outside_arithmetic_is_not_a_rebinding() {
+    let fx = Fixture::new("run-mention-scope");
+    fx.install(WorkerKind::Standard);
+    let env = [("BOSS_BIN", "/opt/boss/boss")];
+    for command in [
+        r#""$BOSS_BIN" propose done --summary "read HOME before exporting""#,
+        r#"cat "$BOSS_BIN" ; rg BOSS_BIN_DIR ."#,
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(command), &env);
+        assert_ne!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
 }

@@ -17,7 +17,7 @@ pub const REVIEWER_BLOCKED_PROGRAMS_PY: &str = crate::render_reviewer_blocked_pr
 macro_rules! render_command_tokenizer {
     ($before:expr, $after:expr) => { concat!($before, r#"
 DELIMS = {'&&', '||', ';', '|', '&'}
-WRAPPERS = {'env', 'command', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic'}
+WRAPPERS = {'env', 'command', 'builtin', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic'}
 ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
 SHLEX_WS = ' \t\r\n'
@@ -37,6 +37,13 @@ def skip_arithmetic(line, index):
             depth -= 1
         end += 1
     return None if depth else end
+
+
+ANSI = 'ansi'
+
+
+def is_ansi_open(text, index, quote):
+    return quote is None and text.startswith(chr(36) + chr(39), index)
 
 
 def heredoc_word(rest):
@@ -81,6 +88,14 @@ def heredoc_delim(line):
         if escaped:
             escaped, index = False, index + 1
             continue
+        if quote == ANSI:
+            if char == chr(92):
+                escaped, index = True, index + 1
+                continue
+            if char == chr(39):
+                quote = None
+            index += 1
+            continue
         if quote != chr(39) and char == chr(92):
             escaped, index = True, index + 1
             continue
@@ -88,6 +103,10 @@ def heredoc_delim(line):
             if char == quote:
                 quote = None
             index += 1
+            continue
+        if is_ansi_open(line, index, quote):
+            quote = ANSI
+            index += 2
             continue
         if char in (chr(39), chr(34)):
             quote = char
@@ -144,6 +163,22 @@ def quote_provenance(text, tokens):
         word, mask, active = [], [], False
     while index < len(text):
         char = text[index]
+        if quote == ANSI:
+            if char == chr(92) and index + 1 < len(text):
+                word.append(text[index + 1])
+                mask.append(True)
+                active = True
+                index += 2
+                continue
+            if char == chr(39):
+                quote = None
+                index += 1
+                continue
+            word.append(char)
+            mask.append(True)
+            active = True
+            index += 1
+            continue
         if quote != chr(39) and char == chr(92) and index + 1 < len(text):
             following = text[index + 1]
             if quote != chr(34) or following in (chr(34), chr(92)):
@@ -154,6 +189,13 @@ def quote_provenance(text, tokens):
                 continue
         if char == quote:
             quote = None
+        elif is_ansi_open(text, index, quote):
+            word.append(char)
+            mask.append(False)
+            quote = ANSI
+            active = True
+            index += 2
+            continue
         elif quote is None and char in (chr(39), chr(34)):
             quote = char
             active = True
@@ -171,7 +213,12 @@ def quote_provenance(text, tokens):
             continue
         else:
             word.append(char)
-            mask.append(quote == chr(39) or char == chr(2))
+            if quote == chr(39) or char == chr(2):
+                mask.append(True)
+            elif quote == chr(34):
+                mask.append('d')
+            else:
+                mask.append(False)
             active = True
         index += 1
     finish()
@@ -193,16 +240,61 @@ def open_quote(text):
     quote, index = None, 0
     while index < len(text):
         char = text[index]
+        if quote == ANSI:
+            if char == chr(92):
+                index += 2
+                continue
+            if char == chr(39):
+                quote = None
+            index += 1
+            continue
         if quote != chr(39) and char == chr(92):
             index += 2
             continue
         if quote:
             if char == quote:
                 quote = None
+        elif is_ansi_open(text, index, quote):
+            quote = ANSI
+            index += 2
+            continue
         elif char in (chr(39), chr(34)):
             quote = char
         index += 1
     return quote
+
+
+def ansi_escapes_quote(text):
+    # True when an unquoted $'...' string holds an escaped quote. Bash pairs
+    # that quote inside the string while shlex closes the string there, so the
+    # words shlex reports are not the words bash runs.
+    quote, index = None, 0
+    while index < len(text):
+        char = text[index]
+        if quote == ANSI:
+            if char == chr(92):
+                if text[index + 1:index + 2] == chr(39):
+                    return True
+                index += 2
+                continue
+            if char == chr(39):
+                quote = None
+            index += 1
+            continue
+        if quote != chr(39) and char == chr(92):
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+        elif is_ansi_open(text, index, quote):
+            quote = ANSI
+            index += 2
+            continue
+        elif char in (chr(39), chr(34)):
+            quote = char
+        index += 1
+    return False
 
 
 def odd_trailing_backslashes(text):
@@ -248,12 +340,15 @@ def strip_line_continuations(text):
 def shell_text(text):
     # Comments cannot open quotes. Protect fd redirections from punctuation
     # splitting, while preserving quoted data exactly.
-    out, quote, escaped, comment = [], None, False, False
-    for index, char in enumerate(text):
+    out, quote, escaped, comment, index = [], None, False, False, 0
+    while index < len(text):
+        char = text[index]
         if comment:
-            if char != chr(10):
-                continue
-            comment = False
+            if char == chr(10):
+                comment = False
+                out.append(char)
+            index += 1
+            continue
         if escaped:
             # shlex preserves these escapes inside double quotes, while the
             # shell consumes them before executing an extracted -c body.
@@ -263,16 +358,27 @@ def shell_text(text):
                     char = chr(2)
             out.append(char)
             escaped = False
+            index += 1
             continue
         if char == chr(92) and quote != chr(39):
             escaped = True
+        elif quote == ANSI:
+            if char == chr(39):
+                quote = None
         elif quote:
             if char == quote:
                 quote = None
+        elif is_ansi_open(text, index, quote):
+            quote = ANSI
+            out.append(char)
+            out.append(text[index + 1])
+            index += 2
+            continue
         elif char in (chr(39), chr(34)):
             quote = char
         elif char == '#' and (index == 0 or text[index - 1].isspace() or text[index - 1] in ';|&()<>'):
             comment = True
+            index += 1
             continue
         elif char == '&':
             before = text[index - 1:index]
@@ -280,10 +386,12 @@ def shell_text(text):
             if before in ('>', '<') or after == '>':
                 char = '__GUARD_FD_AMP__'
             elif before == '|':
+                index += 1
                 continue
         elif char == '|' and text[index - 1:index] == '>':
             char = '__GUARD_REDIRECT_PIPE__'
         out.append(char)
+        index += 1
     return ''.join(out)
 
 
@@ -307,14 +415,24 @@ def command_records(command, stripped=False):
                 receiver.body_span = (start, min(offset, len(command)))
             continue
         pending = shell_text(pending + line + chr(10))
+        if ansi_escapes_quote(pending):
+            groups.append(CommandGroup([], error='incomplete shell syntax'))
+            pending = ''
+            continue
         try:
             lexer = shlex.shlex(pending, posix=True, punctuation_chars=';&|()')
             lexer.whitespace_split = True
             lexer.commenters = ''
             tokens = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|').replace(chr(2), '$') for token in lexer]
         except ValueError:
-            # A quote can span physical lines. Never reinterpret failed lexing
-            # as whitespace-separated argv.
+            # A quote can span physical lines. If our tracker says every quote
+            # is closed, shlex failed on a construct it does not model (ANSI-C
+            # escaped quotes). Keep later lines visible instead of swallowing
+            # them as continuation of an opener shlex invented.
+            if open_quote(pending):
+                continue
+            groups.append(CommandGroup([], error='incomplete shell syntax'))
+            pending = ''
             continue
         logical_line = pending
         pending = ''
@@ -433,6 +551,55 @@ for command in ('command -v cube', 'command -V boss', 'command -v bossctl',
     assert strip_prefixes(shlex.split(command)) == [], command
 assert strip_prefixes(shlex.split('command cube')) == ['cube']
 assert strip_prefixes(shlex.split('command -- bossctl')) == ['bossctl']
+for command, expected in (
+    ('builtin eval', ['eval']),
+    ('builtin source ./f', ['source', './f']),
+    ('builtin cd /tmp', ['cd', '/tmp']),
+    ('builtin command export NAME=x', ['export', 'NAME=x']),
+    ('command builtin command export NAME=x', ['export', 'NAME=x']),
+    ('builtin -- cd /tmp', ['cd', '/tmp']),
+):
+    assert strip_prefixes(shlex.split(command)) == expected, command
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn ansi_c_escaped_quote_yields_an_error_group() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+command = "echo $'\\'' ; cat /etc/passwd ; echo \\'"
+assert any(g.error for g in command_records(command)), [list(g) for g in command_records(command)]
+assert not any(g.error for g in command_records("echo $'a\\nb' x"))
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn ansi_c_quoting_does_not_open_a_heredoc() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+line = "echo $'\\' <<X #'"
+assert heredoc_delim(shell_text(line)) is None, heredoc_delim(shell_text(line))
+assert open_quote(line) is None
+command = line + chr(10) + "cat /etc/passwd" + chr(10) + "X"
+records = [list(g) for g in command_records(command) if list(g)]
+assert any(g[:1] == ['cat'] for g in records), records
+assert not any(getattr(g, 'expanding_body', False) for g in command_records(command))
 "#,
         );
         let output = std::process::Command::new("python3")
