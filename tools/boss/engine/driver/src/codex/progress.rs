@@ -2872,6 +2872,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn argv_shaped_exec_without_output_is_flagged_abandoned() {
+        for input in [json!(["sleep", "999"]), json!({"argv": ["sleep", "999"]})] {
+            let mut session = CodexRolloutProgressSession::new(None, None, None);
+            session
+                .normalize_progress_events(&json!({"type":"session_meta","payload":{"id":"t","cwd":"/w"}}))
+                .unwrap();
+            session
+                .normalize_progress_events(&json!({
+                    "type":"response_item",
+                    "payload":{"type":"function_call","name":"exec_command","call_id":"c","arguments":input}
+                }))
+                .unwrap();
+            let events = session
+                .normalize_progress_events(&json!({"type":"event_msg","payload":{"type":"task_complete"}}))
+                .unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    WorkerEvent::Notification { message, .. } if message.contains("sleep")
+                )),
+                "{events:?}"
+            );
+        }
+    }
+
     /// At the driver boundary: a Codex worker ran
     /// `timeout 1800 checkleft run` as a background terminal and sat in
     /// `Waiting for background terminal (12m 49s • esc to interrupt)`: a chain

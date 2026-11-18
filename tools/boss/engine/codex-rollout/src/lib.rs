@@ -157,20 +157,25 @@ fn exec_input_issues_command(parsed_input: &Value) -> bool {
 /// continuation) returns `None`: putting the script in `tool_input.command`
 /// would make abandoned-command detection treat the poll as a brand-new
 /// shell command. The session id, when the script names one, is carried on
-/// [`continuation_cell_input`] instead. A plain argv/string `exec` input
-/// (`echo hi`) is not a continuation: it is the command itself.
+/// [`continuation_cell_input`] instead. `None` is reserved for that
+/// positively identified continuation: a plain argv/string `exec` input
+/// (`echo hi`, `["sleep","999"]`, `{"argv":[…]}`) is the command itself.
 fn exec_command(parsed_input: &Value) -> Option<String> {
     if let Some(command) = parsed_input.get("cmd").or_else(|| parsed_input.get("command")) {
         return Some(coerce_command_to_string(command));
     }
-    let source = parsed_input.as_str()?;
-    if let Some(command) = cell::cell_script_command(source) {
-        return Some(command);
+    match parsed_input.as_str() {
+        Some(source) => {
+            if let Some(command) = cell::cell_script_command(source) {
+                return Some(command);
+            }
+            if cell::script_is_continuation_only(source) {
+                return None;
+            }
+            Some(source.to_owned())
+        }
+        None => Some(coerce_command_to_string(parsed_input)),
     }
-    if cell::script_is_continuation_only(source) {
-        return None;
-    }
-    Some(source.to_owned())
 }
 
 /// Canonical input for a cell that did not start a command: never a
@@ -462,6 +467,33 @@ mod tests {
         // would let `observe_output` silently subsume its output into
         // someone else's session.
         assert!(exec_input_issues_command(&json!({"argv": ["echo", "hi"]})));
+        assert!(exec_input_issues_command(&json!(["sleep", "999"])));
+    }
+
+    #[test]
+    fn argv_shaped_exec_input_keeps_the_command_field() {
+        let array = json!({
+            "name": "exec_command",
+            "call_id": "c-argv",
+            "arguments": ["sleep", "999"]
+        });
+        let call = canonical_rollout_tool_call("function_call", array.as_object().unwrap()).expect("call");
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
+
+        let object = json!({
+            "name": "exec",
+            "call_id": "c-argv-obj",
+            "input": {"argv": ["sleep", "999"]}
+        });
+        let call = canonical_rollout_tool_call("custom_tool_call", object.as_object().unwrap()).expect("call");
+        assert!(call.issues_command);
+        let command = call.tool_input.get("command").and_then(Value::as_str).expect("command");
+        assert!(command.contains("sleep"), "{command}");
+        assert!(command.contains("999"), "{command}");
     }
 
     #[test]
