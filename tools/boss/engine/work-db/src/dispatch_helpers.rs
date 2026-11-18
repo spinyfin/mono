@@ -19,6 +19,21 @@ impl std::fmt::Display for BoundPrRefusal {
 
 impl std::error::Error for BoundPrRefusal {}
 
+/// Typed marker for "the submitted order does not cover the project's live
+/// task set". Distinguishes a request built from a stale task list from other
+/// reorder failures (a missing project, a database error) so a board refusal
+/// only blames staleness when that is what happened.
+#[derive(Debug)]
+pub struct ReorderSetMismatch;
+
+impl std::fmt::Display for ReorderSetMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reorder request must include the full active task set for the project")
+    }
+}
+
+impl std::error::Error for ReorderSetMismatch {}
+
 /// Shared per-product short-id read-modify-write. Reads the current
 /// `next_value` from `table` for `product_id` (defaulting to 1 when no
 /// row exists yet), writes back `next_value + 1`, and returns the value

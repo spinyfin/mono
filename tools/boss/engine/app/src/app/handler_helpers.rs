@@ -816,34 +816,33 @@ impl BoardRefusal {
     /// points at revisions only when `create_revision` would accept one; a
     /// missing repo says which item needs one; anything else keeps the
     /// engine's own text under `fallback`. `prior_status` is the item's status
-    /// before the refused move, if known. `pr_checker` is the same live probe
-    /// `create_revision`'s gate uses.
+    /// before the refused move, if known. `live_pr_state` is the result of the
+    /// same live probe `create_revision`'s gate uses (see
+    /// [`board_dispatch_refusal`]).
     pub(super) fn from_dispatch_error(
         work_db: &WorkDb,
         id: &str,
         err: &anyhow::Error,
         fallback: boss_protocol::BoardRefusalCode,
         prior_status: Option<boss_protocol::TaskStatus>,
-        pr_checker: &dyn boss_work_db::PrStateChecker,
+        live_pr_state: Option<boss_work_db::PrOpenState>,
     ) -> Self {
         if err.downcast_ref::<boss_work_db::BoundPrRefusal>().is_some() {
             let pr_url = match work_db.get_work_item(id) {
                 Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => task.pr_url,
                 _ => None,
             };
-            let pr_number = pr_url
-                .as_deref()
-                .and_then(|url| url.trim_end_matches('/').rsplit('/').next())
-                .filter(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()));
+            let pr_number = pr_url.as_deref().and_then(boss_github::pr_url::pr_number_from_url);
             let pr_phrase = pr_number.map_or_else(|| "a PR".to_owned(), |number| format!("a PR (#{number})"));
             // Mirror `assert_parent_revisable_and_insert`: a Done item's PR has
             // merged (the move has already flipped the stored status, so the
-            // pre-move status is the signal); otherwise the live probe decides
-            // between Open, Merged and ClosedUnmerged.
+            // pre-move status is the signal); otherwise the caller's live probe
+            // (`live_pr_state`, `None` when unread) decides between Open,
+            // Merged and ClosedUnmerged.
             let state = if prior_status == Some(boss_protocol::TaskStatus::Done) {
                 Some(boss_work_db::PrOpenState::Merged)
             } else {
-                pr_url.as_deref().and_then(|url| pr_checker.check(url).ok())
+                live_pr_state
             };
             let not_revisable = |what: &str| Self {
                 code: boss_protocol::BoardRefusalCode::BoundPrNotRevisable,
@@ -888,6 +887,40 @@ impl BoardRefusal {
             err,
         )
     }
+}
+
+/// Longest a board refusal waits on GitHub for the bound PR's state.
+const PR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Build the refusal for a failed dispatch. Call it after the status patch
+/// has been reverted: the live PR-state probe (only run for a board gesture
+/// refused over a bound PR, off the async thread, bounded by
+/// [`PR_PROBE_TIMEOUT`]) can be slow. A probe error or timeout leaves the
+/// state unknown, which the refusal words without promising a revision.
+pub(super) async fn board_dispatch_refusal(
+    server_state: &ServerState,
+    work_db: &WorkDb,
+    id: &str,
+    err: &anyhow::Error,
+    fallback: boss_protocol::BoardRefusalCode,
+    prior_status: Option<boss_protocol::TaskStatus>,
+    board_gesture: bool,
+) -> BoardRefusal {
+    let mut live_pr_state = None;
+    if board_gesture
+        && prior_status != Some(boss_protocol::TaskStatus::Done)
+        && err.downcast_ref::<boss_work_db::BoundPrRefusal>().is_some()
+        && let Ok(WorkItem::Task(task) | WorkItem::Chore(task)) = work_db.get_work_item(id)
+        && let Some(pr_url) = task.pr_url
+    {
+        let checker = server_state.pr_state_checker.clone();
+        let probe = tokio::task::spawn_blocking(move || checker.check(&pr_url));
+        live_pr_state = match tokio::time::timeout(PR_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(Ok(state))) => Some(state),
+            _ => None,
+        };
+    }
+    BoardRefusal::from_dispatch_error(work_db, id, err, fallback, prior_status, live_pr_state)
 }
 
 fn item_name(work_db: &WorkDb, id: &str) -> Option<String> {

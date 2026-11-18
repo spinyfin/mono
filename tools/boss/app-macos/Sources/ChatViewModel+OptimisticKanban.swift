@@ -11,6 +11,9 @@ private let kanbanSameColumnDropLog = Logger(
 
 extension ChatViewModel {
     struct DragRefusalNotice: Equatable {
+        /// Identity of this notice, so a dismiss timer only clears the notice
+        /// it was started for, not a newer one for the same card.
+        let id = UUID()
         let taskID: String
         let message: String
         /// Machine-readable engine reason (`bound_pr`, …); nil for refusals
@@ -267,12 +270,16 @@ extension ChatViewModel {
         dragRefusalNotice = nil
     }
 
+    /// Dismiss the notice currently shown for `taskID` after 5s, unless it
+    /// has been replaced by a newer one in the meantime. Call right after
+    /// setting `dragRefusalNotice`.
     func scheduleDragRefusalDismiss(for taskID: String) {
+        guard let scheduledID = dragRefusalNotice?.id else { return }
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             await MainActor.run { [weak self] in
                 guard let self,
-                      self.dragRefusalNotice?.taskID == taskID
+                      self.dragRefusalNotice?.id == scheduledID
                 else { return }
                 self.dragRefusalNotice = nil
             }
@@ -362,6 +369,11 @@ extension ChatViewModel {
             engine.finishAdmissionRetry(taskID: id)
         }
         bounceBackOptimisticMoves(message: message, taskID: id, code: code, suggestedAction: suggestedAction)
+        // A reorder refused as stale has no optimistic move to bounce, so
+        // nothing else would refresh the list the retry is built from.
+        if code == "reorder_rejected", let productID = task(withID: id)?.productID ?? currentSelectedProductID {
+            scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
+        }
     }
 
     /// Follow the engine's suggested next step from a refusal notice.

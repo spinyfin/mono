@@ -126,10 +126,15 @@ fn send_reorder_error(sink: &SessionSink, request_id: &str, moved_task_id: Optio
         send_work_error(sink, request_id, err);
         return;
     };
-    let mut refusal = BoardRefusal::new(
-        BoardRefusalCode::ReorderRejected,
-        "Couldn't move that task: the project's task list has changed since the board last loaded. Try the move again.",
-    );
+    // Only a request built from an out-of-date task list is worth retrying
+    // (the app refetches on this refusal); anything else keeps the engine's text.
+    let stale = err.downcast_ref::<boss_work_db::ReorderSetMismatch>().is_some();
+    let message = if stale {
+        "Couldn't move that task: the project's task list has changed since the board last loaded. The board is refreshing; try the move again.".to_owned()
+    } else {
+        format!("Couldn't move that task: {err:#}")
+    };
+    let mut refusal = BoardRefusal::new(BoardRefusalCode::ReorderRejected, message);
     refusal.raw = Some(format!("{err:#}"));
     send_refusal(sink, request_id, true, moved_task_id, refusal);
 }
