@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use tokio::task::JoinHandle;
 
+use crate::HostSample;
 use crate::probe::HostProbe;
-use crate::sample::HostSample;
 use crate::sampler::HostSampler;
 
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 60;
