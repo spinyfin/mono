@@ -149,6 +149,11 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
+        CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Conflict remediation clears the signal when a retry resumes or the PR becomes clean.",
+    ),
+    entry(
         WORKSPACE_POSITIONING_REFUSED,
         ClearedBy::ProducerReconciles,
         "The positioning-refusal recheck sweep probes the live PR state each pass and clears the hold with its attention once cube would accept it; an explicit launch also clears both.",

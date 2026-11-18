@@ -440,6 +440,9 @@ pub const WORKSPACE_POSITIONING_REFUSED: &str = "workspace_positioning_refused";
 /// `merge_conflict` blocked signal is cleared or the attempt is retried.
 pub const LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND: &str = "conflict_lockfile_regeneration_failed";
 
+/// Conflict remediation stopped without a live fix vehicle.
+pub const CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND: &str = "conflict_remediation_stopped";
+
 /// `work_attention_items.kind` raised by `dispatch_stall_escalation`
 /// when a dispatch timeline sits stuck in one stage past
 /// `dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`. The

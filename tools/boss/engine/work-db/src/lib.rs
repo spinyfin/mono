@@ -858,6 +858,8 @@ pub use conflict_deferral::{
 mod conflict_ladder_telemetry;
 mod conflict_mismatch;
 mod conflict_res;
+mod conflict_stop;
+pub use boss_engine_storage_values::attention_kinds::CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND;
 mod coordinator_guidance_cache;
 mod coordinator_handoff_store;
 mod coordinator_tmux;

@@ -504,6 +504,7 @@ impl WorkDb {
             "UPDATE tasks
                 SET status             = 'in_review',
                     blocked_reason     = NULL,
+                    blocked_detail     = NULL,
                     blocked_attempt_id = NULL,
                     last_status_actor  = 'engine',
                     updated_at         = ?4
@@ -535,6 +536,11 @@ impl WorkDb {
             &tx,
             work_item_id,
             crate::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+        )?;
+        super::dispatch_helpers::resolve_attention_kind_in_tx(
+            &tx,
+            work_item_id,
+            CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
         )?;
         tx.commit()?;
         Ok(Some(updated))
@@ -2239,6 +2245,7 @@ pub(crate) fn clear_blocked_merge_conflict_in_tx(
         "UPDATE tasks
             SET status             = 'in_review',
                 blocked_reason     = NULL,
+                blocked_detail     = NULL,
                 blocked_attempt_id = NULL,
                 last_status_actor  = ?4,
                 updated_at         = ?3
@@ -2269,6 +2276,11 @@ pub(crate) fn clear_blocked_merge_conflict_in_tx(
         conn,
         work_item_id,
         crate::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,
+    )?;
+    super::dispatch_helpers::resolve_attention_kind_in_tx(
+        conn,
+        work_item_id,
+        CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
     )?;
     Ok(Some(updated))
 }

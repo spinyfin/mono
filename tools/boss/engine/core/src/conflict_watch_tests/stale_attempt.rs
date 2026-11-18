@@ -351,7 +351,15 @@ async fn full_sequence_stale_attempt_collision_then_mergeable_unblocks_task() {
     let stale_row = db.get_conflict_resolution(&stale.id).unwrap().unwrap();
     assert!(stale_row.revision_task_id.is_none());
     assert_ne!(blocked_attempt_id(&db, &chore).as_deref(), Some(stale.id.as_str()));
-    assert_ne!(blocked_attempt_id(&db, &chore).as_deref(), Some(holder.id.as_str()));
+    // The churn-stopped holder is now named by `blocked_attempt_id` as the
+    // explanation for the stop; it stays abandoned with no revision.
+    let holder_row = db.get_conflict_resolution(&holder.id).unwrap().unwrap();
+    assert_eq!(holder_row.status, "abandoned");
+    assert_eq!(
+        holder_row.failure_reason.as_deref(),
+        Some(crate::work::CHURN_GUARD_REASON)
+    );
+    assert!(holder_row.revision_task_id.is_none());
 
     // Re-assert the "blocked on a conflict" state the poller would observe,
     // whatever the detection step did with the parent, then resolve.
