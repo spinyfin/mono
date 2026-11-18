@@ -1199,6 +1199,9 @@ struct ContentView: View {
             HStack {
                 Text(column.title)
                     .font(.headline)
+                    .contextMenu {
+                        Button("Copy Board Diagnostics") { model.copyBoardDiagnostics() }
+                    }
                 Spacer()
                 Text("\(itemCount)")
                     .font(.caption.weight(.semibold))
@@ -1234,6 +1237,8 @@ struct ContentView: View {
                 }
             }
         }
+        .modifier(BoardDiagnosticColumn(trace: model.boardDiagnostics, column: column.rawValue,
+            sections: model.boardDiagnostics.sections(sections)))
         .padding(14)
         .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)

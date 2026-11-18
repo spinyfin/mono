@@ -331,6 +331,8 @@ final class ChatViewModel: ObservableObject {
     }
     @Published var selectedProjectFilterIDs: Set<String> = [] {
         didSet {
+            boardDiagnostics.record("project-filter", ["projects": selectedProjectFilterIDs.sorted()
+                .map { boardDiagnostics.token($0) }.joined(separator: ",")])
             if !isRestoringWorkSelection, let productID = selectedWorkProductID {
                 selectionHistory.useProjects(selectedProjectFilterIDs.subtracting(oldValue), productID: productID)
             }
@@ -1251,6 +1253,7 @@ final class ChatViewModel: ObservableObject {
     var cachedNavigatorCompatibility: (message: String?, computed: Bool)?
     var cachedVisibleItems: [WorkTask]?
     var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
+    let boardDiagnostics = BoardDiagnostics()
     var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
     var cachedAmbiguousRepoNames: Set<String>?
     /// O(1) id → work-item index over every task/chore/revision bucket.
@@ -1322,6 +1325,7 @@ final class ChatViewModel: ObservableObject {
     /// updates so a status flip does not rebuild the dependency graph or
     /// the full id index when bucket membership is unchanged.
     func invalidateWorkCache(_ keys: WorkCacheInvalidation) {
+        boardDiagnostics.record("invalidate", ["keys": String(keys.rawValue)])
         if keys.contains(.boardLayout) {
             cachedNavigatorSections = nil
             cachedNavigatorCompatibility = nil
