@@ -709,10 +709,10 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
             // time they took 1,717.
             assert_eq!(annotated, 277, "cards named on the seeded board");
             assert_eq!(annotation_statements, 23, "statements to name {annotated} cards");
-            // The epoch read, three point queries for each of the 60 cards
-            // waiting on a dependency (never cached), and the annotation:
-            // 204 statements, where naming one card at a time made it 1,898.
-            assert_eq!(statements, 1 + 180 + 23);
+            // The epoch read, three point queries plus the queued-display
+            // predecessor lookup for each of the 60 cards waiting on a
+            // dependency (never cached), and the annotation: 264 statements.
+            assert_eq!(statements, 1 + 240 + 23);
         } else {
             // 30 cards, 10 statements; one card at a time it was 141.
             assert_eq!((annotated, annotation_statements, statements), (30, 9, 10));

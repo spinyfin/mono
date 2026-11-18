@@ -1040,6 +1040,10 @@ mod floor_tests {
                         .unwrap();
                 }),
             ),
+            (
+                "20261118_0918_board_runtime_epoch_run_finished",
+                Box::new(|c| super::super::queued_display::migrate(c).unwrap()),
+            ),
         ];
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
