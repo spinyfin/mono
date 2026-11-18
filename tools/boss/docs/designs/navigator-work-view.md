@@ -1,11 +1,16 @@
 # Navigator Work: one task row across every revision
 
-- Date: 2026-11-14
-- Status: proposed design; implementation waits for design review
+- Date: 2026-11-14 (design); 2026-11-17 (as-built)
+- Status: shipped; Kanban remains the other Work mode
 - Product: Boss macOS; alternative presentation of Work
-- Related designs: [Work Kanban](work-kanban.md), [revisions](revision-tasks.md), [review guides](automatic-pr-review-guides.md)
+- Related designs: [Work Kanban](work-kanban.md), [revisions](revision-tasks.md), [review guides](automatic-pr-review-guides.md), [board projection](../board-projection.md)
+- Shipped as: [mono#3623](https://github.com/spinyfin/mono/pull/3623), [mono#3625](https://github.com/spinyfin/mono/pull/3625), [mono#3629](https://github.com/spinyfin/mono/pull/3629), [mono#3634](https://github.com/spinyfin/mono/pull/3634), [mono#3635](https://github.com/spinyfin/mono/pull/3635), [mono#3661](https://github.com/spinyfin/mono/pull/3661), [mono#3662](https://github.com/spinyfin/mono/pull/3662), [mono#3671](https://github.com/spinyfin/mono/pull/3671), [mono#3674](https://github.com/spinyfin/mono/pull/3674), [mono#3675](https://github.com/spinyfin/mono/pull/3675)
 
 The central choice is a single stable row for the original task, whose section reflects the whole revision family. A dense navigator sits beside a persistent detail area; Kanban remains available over the same work.
+
+## Verdict
+
+The view is live in the Work toolbar as `Kanban | Navigator`. The engine owns section membership, family identity, ordering, and action readiness on each work-tree card; the app renders that projection and never re-derives it. A diff viewer is still a static placeholder with a GitHub files link.
 
 ## Goals
 
@@ -17,7 +22,9 @@ The central choice is a single stable row for the original task, whose section r
 
 ## Non-goals
 
-Replace Kanban; change dispatch, merge, or review policy; give revisions separate navigator rows; implement a diff viewer; create a new terminal emulator or markdown engine; change project lifecycle; add drag-to-change-status in the navigator. No implementation is part of this document's PR.
+Replace Kanban; change dispatch, merge, or review policy; give revisions separate navigator rows; implement a diff viewer; create a new terminal emulator or markdown engine; change project lifecycle; add drag-to-change-status in the navigator.
+
+The diff region remains a static placeholder. Historical merge evidence is not backfilled from GitHub.
 
 ## Alternatives considered
 
@@ -28,47 +35,53 @@ Replace Kanban; change dispatch, merge, or review policy; give revisions separat
 | Separate or nested revision rows                   | Kanban currently folds some revisions after review while active revisions can remain cards | A revision would change row identity or create multiple entries for one PR. The chosen invariant explicitly requires one original-task row, including active revisions. Revision history belongs in detail.             |
 | Derive sections in Swift from existing task badges | Some existing lane routing lives in the app                                                | Badges do not distinguish queued repair from running repair or provide all family/question inputs atomically. Adding another client reconciliation path would violate engine ownership. Reuse inputs, not that routing. |
 
-This is a design choice supported by source inspection, not a usability study comparing measured outcomes. Later captures and interaction tests validate the chosen design; they do not establish its superiority over alternatives.
+This was a design choice supported by source inspection, not a usability study comparing measured outcomes. Isolated captures and interaction tests later validated the chosen design; they do not establish its superiority over alternatives.
 
 ## Chosen approach
 
-### Existing foundations and gaps
+### Existing foundations
 
-Paths below are relative to the repository root. Observations describe the inspected source, not guarantees about future revisions.
+Paths below are relative to the repository root.
 
-| Source                                                                                                                          | Reuse and implication                                                                                                                                                                                                                                                                         |
-| ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tools/boss/protocol/src/types/task.rs`, `execution.rs`, `review_section.rs`                                                    | Typed task/execution statuses, runtime waits, revision attribution, CI/review projections. `ready_for_review` alone does not exclude an AI review; do not equate it with permission to merge.                                                                                                 |
-| `tools/boss/engine/work-db/src/workitems.rs`, `revision_helpers.rs`, `review_section.rs`                                        | Full-tree assembly and family enrichment. Existing review sections deliberately put blocked above revision; Navigator needs running revision above passive PR blockers.                                                                                                                       |
-| `tools/boss/engine/board-projection/src/lib.rs`, [board projection contract](../board-projection.md)                            | Atomic family refresh, old/new relationship closure, incremental/full parity and snapshot recovery. Extend this path instead of creating another cache or subscription.                                                                                                                       |
-| `tools/boss/app-macos/Sources/ChatViewModel+WorkBoardSections.swift`                                                            | Existing lanes and partial revision folding are not the proposed Navigator classifier. Kanban remains unchanged.                                                                                                                                                                              |
-| `tools/boss/app-macos/Sources/DesignsView.swift`, `MarkdownDocumentChrome.swift`, `WorkFormSheets.swift`                        | Markdown rendering and existing task-description editing/save flow. Inspection found a markdown viewer and description form fields, not a standalone embeddable full markdown editor. Add a small inline edit/preview adapter over these facilities; do not claim a ready-made editor exists. |
-| `tools/boss/app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift`, `TerminalPaneSession.swift`, `BossPaneTerminalView.swift`   | Existing pane/session ownership and Ghostty rendering; embed a selected session without spawning another worker.                                                                                                                                                                              |
-| `tools/boss/app-macos/Sources/WorkBoardCardOperatorQuestion.swift`, `AttentionsView.swift`, `ChatViewModel+Attentions.swift`    | Typed questions, explanations, choices and attention-group actions. Extract reusable bodies with existing callers retained.                                                                                                                                                                   |
-| `tools/boss/app-macos/Sources/ChatViewModel+ReviewGuide.swift`, `ReviewGuideViewerHeader.swift`, `ReviewGuideAttachments.swift` | Versioned guide loading, review actions, attachments and stale-response guards. Current loading targets a singleton viewer; inline detail needs an independently keyed request destination.                                                                                                   |
-| `tools/boss/engine/work-db/src/pr_flow.rs`, `pr_state.rs`                                                                       | A merge observation drives completion, but `done`/`completed_at` are not proof of merge. Human completion and other terminal paths exist. Persist explicit merge evidence for the current PR binding.                                                                                         |
-
-No recorded Navigator precedence decision was found in these sources. The rules below are new decisions, not a reconstruction of an assumed old policy.
+| Source                                                                                                                             | Role as shipped                                                                                                                                                                                                                                                                                   |
+| ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tools/boss/protocol/src/types/navigator.rs`, `task.rs`                                                                            | Versioned `Task.navigator` projection (`NAVIGATOR_PROJECTION_VERSION = 1`). Client-facing enums include an `Unknown` catch-all so adding a variant stays additive and does not bump the version. The field is a `Box` because an inline copy overflowed the stack of a deeply nested engine test. |
+| `tools/boss/engine/work-navigator/`                                                                                                | Pure family classifier (`boss_work_navigator`). Depends on no engine crates; Bazel visibility is `//tools/boss/engine/work-db:__pkg__` only.                                                                                                                                                      |
+| `tools/boss/engine/work-db/src/navigator_projection.rs`, `merge_evidence.rs`                                                       | Adapter and confirmed-merge store. `attach_navigator` is the last derivation of both full assembly and incremental card reads.                                                                                                                                                                    |
+| `tools/boss/engine/board-projection/src/lib.rs`, [board projection contract](../board-projection.md)                               | Atomic family refresh, old/new relationship closure, incremental/full parity. Navigator reuses this path; there is no second cache or RPC.                                                                                                                                                        |
+| `tools/boss/app-macos/Sources/ChatViewModel+WorkBoardSections.swift`                                                               | Kanban lanes are unchanged. Navigator does not call this classifier.                                                                                                                                                                                                                              |
+| `tools/boss/app-macos/Sources/WorkNavigatorBrief.swift`, `MarkdownDocumentChrome.swift`, `WorkFormSheets.swift`                    | Inline brief adapter: preview plus plain-markdown edit with explicit Save/Cancel over existing description mutation.                                                                                                                                                                              |
+| `tools/boss/app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift`, `WorkNavigatorActivity.swift`                                  | Embeds the selected execution's existing Ghostty session, or the remote-pane viewer for a spoke-hosted worker. Does not spawn a second worker.                                                                                                                                                    |
+| `tools/boss/app-macos/Sources/WorkBoardCardOperatorQuestion.swift`, `AttentionsView.swift`, `WorkNavigatorAttention.swift`         | Shared question and attention-group bodies; existing Kanban and Notifications callers remain.                                                                                                                                                                                                     |
+| `tools/boss/app-macos/Sources/ChatViewModel+ReviewGuide.swift`, `NavigatorReviewGuideStore.swift`, `ReviewGuideViewerHeader.swift` | Independently keyed inline guide reader beside the standalone window. Merge-when-ready lives on the shared header, gated by the same eligibility as Kanban.                                                                                                                                       |
 
 ### Population, identity and scope
 
-A row represents a non-deleted original task plus every recursively linked revision, regardless of revision origin or status. The engine emits its root ID; the app never walks parent links to decide membership. A malformed revision chain is surfaced by the engine as one diagnostic fallback row for the unresolved item in Backlog, with an unavailable-parent explanation; it is never silently dropped. Such a row is an integrity exception, not normal revision presentation.
+A row represents a non-deleted original task plus every recursively linked revision, regardless of revision origin or status. The engine emits its root ID; the app never walks parent links to decide membership.
 
-Task, project task, chore, design, investigation, design postmortem and accepted follow-up all use the same rules. Follow-ups have independent deliverables and are independent rows, with an origin link in detail. An unaccepted follow-up proposal is an attention, not yet a task. Engine-minted PR-review, merge-conflict and CI-fix revisions fold into the original row. Independent review executions are activity on that row, never work items themselves.
+A chain that cannot be resolved (deleted, missing or cross-product parent, depth or cycle overflow) becomes a diagnostic fallback row in Backlog with `UnavailableParent`, never silently dropped. When the break sits beneath an archived revision, the nearest visible revision becomes that diagnostic root. Revisions under a valid archived non-revision owner stay with that owner and never become independent rows. Archived roots are excluded from the Work population; restoring one recomputes its section.
 
-Product scope includes project tasks and unprojected chores/investigations/follow-ups, retaining the existing Work population exclusions for automation-owned work and deleted items. Project scope selects roots in that project; their revisions remain included even if child metadata differs. Dependency links outside scope remain visible in detail and offer an explicit scope-changing navigation action. No project rows appear inside the four sections. The scope header has a project-information button opening existing project information/design-doc surfaces; project-only attentions remain accessible through an attention count in that header and the existing attention surface, not duplicated onto every task.
+Task, project task, chore, design, investigation, design postmortem and accepted follow-up all use the same rules. Follow-ups have independent deliverables and are independent rows, with an origin link in History. An unaccepted follow-up proposal is an attention, not yet a task. Engine-minted PR-review, merge-conflict and CI-fix revisions fold into the original row. Independent review executions are activity on that row, never work items themselves. Automation-owned families get no projection.
 
-Every included root has exactly one section. Archived roots are outside the default Work population, matching existing archive behavior; restoring one recomputes its section. A selected item archived or deleted elsewhere remains as a read-only detail with an explanatory banner until the user navigates away. A root whose merge is known is Landed even if an old child still says running; cleanup belongs to engine reconciliation and an independently converted follow-up gets its own row.
+Product scope includes project tasks and unprojected chores/investigations/follow-ups, retaining the existing Work population exclusions. Project scope selects roots in that project; their revisions remain included even if child metadata differs. Dependency links outside scope remain visible in detail and navigate by changing scope or revealing the Kanban card. No project rows appear inside the four sections.
+
+The navigator header is a project-within-product picker (plus "No project"), not a second product switcher: product selection stays the existing Work chrome. A project-information button opens the existing project editor. Project-only attentions stay on a header bell that opens Notifications; they are not duplicated onto every task.
+
+A selected item archived or deleted elsewhere remains as a read-only detail with an explanatory banner until the user navigates away. A root whose merge is known is Landed even if an old child still says running.
 
 ### Engine contract
 
-Add an optional, versioned `navigator` projection to each task in the existing work-tree snapshot/delta protocol. Roots carry `section`, engine-sorted `sort_key`, `reason`, `default_detail`, ordered current activity references (task/execution/run IDs), revision summary, actionable attention references, confirmed merge evidence, and available action descriptors. Folded revisions carry only their owning root reference. Use builder defaults for additive fields. A missing projection from an older engine disables Navigator with an inline compatibility message and leaves Kanban usable; Swift must not guess membership.
+Each work-tree task may carry an optional `navigator` projection. A family root carries `section`, engine-sorted `sort_key`, `reason` plus an engine-authored `reason_label`, `default_detail`, ordered current activity references, revision summary, actionable attention references, confirmed merge evidence, and advisory command descriptors. A folded revision carries only `root_task_id`. Additive fields use builder defaults.
 
-Implement the bounded pure family classifier in a small `engine/work-navigator` crate depending only on protocol types. The existing work-db assembly adapts authoritative inputs and invokes it, including the real full-tree and incremental paths in the same PR. It must not depend upwards on engine core. Bazel visibility is restricted to its consumers. No new RPC or parallel work subscription is needed; existing question, review-guide, brief-edit and mutation RPCs remain the action paths.
+A missing projection, a version other than 1, or an unknown section disables Navigator with an inline compatibility message and a route to Kanban. Swift must not guess membership. Unfamiliar reason or wait variants still decode (`Unknown`) and still have a `reason_label`.
 
-Introduce durable merge evidence keyed by root and canonical PR binding, written by the real merge-observation path, including observations of already-terminal tasks. Never infer it from a URL plus `done`, or from a successful merge-request response. Use the existing PR classification helper. Rebinding to a different PR cannot inherit evidence. Legacy rows without evidence stay Backlog with `Completed; merge unverified` (or `Completed without PR`); do not issue GitHub requests during board reads or invent a historical backfill. Historical exactness is disclosed rather than fabricated. This requires a small independent schema migration before the projection; use a unique UTC registry ID with `legacy_version: None` and upgrade tests.
+The classifier lives in `boss-work-navigator` and takes one flattened family snapshot. `work-db` resolves membership, loads off-board archived relatives with one recursive set-based query pinned to the parent index, maps runtimes/questions/PR/merge evidence, and invokes it. Full and incremental assembly share that path. No new RPC or parallel subscription exists; existing question, review-guide, brief-edit and mutation RPCs remain the action paths.
 
-Projection reads use one database snapshot for family, activity, actionable questions, PR and merge evidence. Add these inputs to durable journal coverage or the existing full-snapshot invalidation class. Runtime-only changes must refresh the family even if `tasks.status` did not change. Attention-answer and merge-evidence transactions must invalidate the owning family. Full and incremental output must agree on every navigator field; bounded closure overflow and sequence gaps recover using the existing full snapshot.
+Confirmed merge evidence is the table `pr_merge_evidence`, keyed by `(root_task_id, canonical_pr_url)`, written by the merge-poller and worker-completion observations, including already-terminal and human-driven tasks. The timestamp is observation time: callers do not retain GitHub's merge timestamp, so the wire's optional `merged_at` is unused. Rebinding to a different PR hides the previous evidence; rebinding back restores it. A stale worker observation of a mismatched PR terminalizes that execution without recording evidence. Legacy rows without evidence stay Backlog (`Completed; merge unverified` or `Completed without PR`). Board reads never call GitHub.
+
+Projection reads use one database snapshot. Inputs reuse existing journal coverage: `tasks` (including parent links), `board_runtime_epoch`, `operator_questions`, `attention_groups`/`attentions` (full-snapshot class), and `pr_merge_evidence`. Runtime-only changes refresh the family even if `tasks.status` did not change.
+
+The crate shipped first and inert ([mono#3623](https://github.com/spinyfin/mono/pull/3623)); the adapter that publishes `Task.navigator` followed ([mono#3629](https://github.com/spinyfin/mono/pull/3629)). That split kept each PR reviewable. The original plan named both in one change.
 
 ### Membership: first matching rule wins
 
@@ -79,15 +92,19 @@ Projection reads use one database snapshot for family, activity, actionable ques
 | 3        | Unresolved human action: question, live input wait, review request, merge decision, or explicit operator intervention | Needs attention | Answer / Input needed / Review / Ready to merge / Intervention                   |
 | 4        | Everything else                                                                                                       | Backlog         | Engine reason for waiting, failure, parking or completion without merge evidence |
 
-“Progressing” means a current, nonterminal execution/run whose authoritative engine state is running and not awaiting human input, suspended, or proven exited. Driver thinking/tool-use/output changes decorate that state; silence alone does not remove it. Claimed workspace setup is Backlog `Starting`, not an active agent. Running review agents count as Working; an `ai_reviewing` hold that is only waiting for consolidation admission does not. Deterministic verdict application without an agent is Backlog `Applying review`. The engine must resolve activity from run/execution state; the app must not reinterpret a stale terminal surface as a live worker.
+“Progressing” means a current, nonterminal execution whose latest run is live: execution `running`, run `active`, and not awaiting human input, suspended, or proven exited (`failed` / `orphaned`). A `completed` run under a still-live execution is the production spawn shape (the WorkRun tracks the spawn action, not the worker lifetime) and stays Running, including spawn and re-adoption. Driver thinking/tool-use/output changes decorate that state; silence alone does not remove it.
+
+Claimed workspace setup with no live run is Backlog `Starting`, not an active agent. Running review agents count as Working; an `ai_reviewing` hold that is only waiting for consolidation admission does not. Deterministic verdict application without an agent is Backlog `Applying review`. Kinds that are not work on the row (answer agent, automation triage, review-guide generation, administrative progression) are not family activity.
 
 Working wins over a concurrent question from another family member. Keep a visible question count and an attention banner in detail so that human work remains discoverable without double-listing. If all active agents are waiting for input, rule 2 no longer matches and the row moves to Needs attention. Confirmed merge wins over everything; remaining questions are still accessible in Landed detail and the attention surface.
 
 A passive failing check, conflict or failed run alone is not a request to a human. Automatic remediation remains Backlog until running. A persisted operator-intervention signal or exhausted remediation requiring a decision matches rule 3. Review-required PRs match rule 3 when a human review can usefully proceed against the current head and no automatic review/repair is pending; merge actions still obey the engine's stricter gates. Unknown CI or mergeability never implies readiness. An optional “Generate guide” button is not itself a reason to put a row in Needs attention.
 
+Default detail follows the winning rule: Working → Activity; Needs attention → Attention for questions/interventions, Activity for input waits, Review for human review/merge; Backlog → Review when the wait is an automatic PR wait and a PR exists, otherwise Activity; Landed → History. Review still appears as a tab whenever the root has a PR URL, including during Working and after Landed.
+
 ### Exhaustive status and signal mapping
 
-The following table supplies inputs to the ordered rules above, not a second competing classifier. All current enum variants are listed; future variants must fail exhaustive engine matches until a meaning is chosen.
+The following table supplies inputs to the ordered rules above, not a second competing classifier. Engine matches remain exhaustive on current enum variants; the wire adds `Unknown` so an older client can still decode a newer card.
 
 | Status/signal                                                                           | Mapping absent a higher-priority fact                                                                                                                           |
 | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -99,7 +116,7 @@ The following table supplies inputs to the ordered rules above, not a second com
 | Task `archived`                                                                         | Excluded by population filter; if restored, normal classification applies. Its historical child records remain available to its root                            |
 | Execution `queued`, `ready`, `waiting_dependency`                                       | Backlog `Queued` / `Ready` / `Waiting on dependency`; eligibility is not activity                                                                               |
 | Execution `claimed`                                                                     | Backlog `Starting`; no fake terminal                                                                                                                            |
-| Execution `running`                                                                     | Working when current run is progressing; ended, suspended or inconsistent run state yields Backlog explanation until reconciled                                 |
+| Execution `running`                                                                     | Working when the latest run is progressing as above; ended, suspended or inconsistent run state yields Backlog explanation until reconciled                     |
 | Execution `waiting_human`                                                               | Needs attention `Input needed`, with question or existing terminal input route                                                                                  |
 | Execution `waiting_review`, `waiting_merge`                                             | Needs attention only if a human action is due; otherwise Backlog `Waiting for review` / `Merging` / `Waiting for checks`                                        |
 | Execution `completed`                                                                   | Does not establish merge; classify remaining family/PR facts                                                                                                    |
@@ -118,15 +135,15 @@ The following table supplies inputs to the ordered rules above, not a second com
 | Open/partly answered task attention or blocked signal                                   | Needs attention when still actionable; answered/actioned/dismissed/cleared records are history only. Project-only groups stay in scope-header attention surface |
 | Unknown string reason or missing PR observation                                         | Backlog with literal diagnostic label, never silently dropped or presented as ready                                                                             |
 
-For conflicting facts, the engine returns one winning reason plus secondary indicators. Tests must cover running revision + CI fail + question, deferred conflict + focus hold, merge + stale running child, and completed execution + open PR. These combinations are more important than tests of isolated status labels.
+For conflicting facts, the engine returns one winning reason plus secondary indicators. Tests cover running revision + CI fail + question, deferred conflict + focus hold, merge + stale running child, and completed execution + open PR.
 
 ### Navigator rows and ordering
 
-Default navigator width is 360 points, resizable from 260 to 520. Rows are 30 points high; accessibility text sizing can use a second line and a larger hit target. No cards, paragraph previews or per-row button strips.
+Default navigator width is 360 points, resizable from 260 to 520. Rows are 30 points high; accessibility text sizing uses a second line (reason) and a 52-point hit target. No cards, paragraph previews or per-row button strips.
 
 ```text
 Work                           [ Kanban | Navigator ]
-[ Product: Boss v ] [ Project: All v ]  [Search work...]
+[ Project: All v ]  [Search tasks and revision asks]
 +--------------------------------------+----------------------------------+
 | v Working                         3 | Improve startup                  |
 | > <> Improve startup   [rev 2] ~ !1 | Working: revision 2, fixing CI    |
@@ -141,11 +158,13 @@ Work                           [ Kanban | Navigator ]
 +--------------------------------------+----------------------------------+
 ```
 
-Indicators from leading to trailing: task-kind glyph; title; optional project label in product scope; revision count; one activity/PR-health summary glyph; actionable-question count. The question count always survives narrowing. Health summary priority is conflict, failed CI, requested review changes, pending checks, approved/green; tooltips and accessibility labels enumerate all underlying facts rather than hiding suppressed failures. Activity has its own leading animated dot beside kind when working, with an accessible textual label. Never use color alone.
+The mode control lives in the existing Work toolbar. Product selection stays the existing Work product switcher; the navigator header picks project-within-product (or No project). Search is the existing work search field, labelled for tasks and revision asks, and matches title and description.
 
-At widths below 340, drop project label and revision count into tooltip/detail; below 300 retain kind/activity, truncated title, highest-priority health glyph and question count. Effort, driver name, review-cycle count, all CI checks and timestamps live in detail, not the row. A two-line accessibility layout carries title then reason; no third line. Tooltips are supplementary, not the only accessible route to information.
+Indicators from leading to trailing: animated activity dot when Working; task-kind glyph; title; optional project label in product scope; open revision count; one PR-health summary glyph; actionable-question count. The question count always survives narrowing. Health summary priority is conflict, failed CI, requested review changes, pending checks, approved/green; the glyph is derived in the app from the same card fields Kanban already carries, while membership stays engine-owned. Tooltips and accessibility labels enumerate all underlying facts. Never use color alone.
 
-Fixed section order: Working, Needs attention, Backlog, Landed. Counts represent roots, not revisions or matching attention members. Working/Needs attention/Backlog start expanded; Landed starts collapsed. Preserve expansion per product/project scope. Empty sections retain a zero-count header and a short empty message when expanded.
+At widths below 340, drop project label and revision count into tooltip/detail; below that retain kind/activity, truncated title, highest-priority health glyph and question count. Effort, driver name, review-cycle count, all CI checks and timestamps live in detail, not the row. A two-line accessibility layout carries title then reason; no third line.
+
+Fixed section order: Working, Needs attention, Backlog, Landed. Counts represent roots, not revisions or matching attention members. Working/Needs attention/Backlog start expanded; Landed starts collapsed. Preserve expansion per product/project scope. Empty sections retain a zero-count header and “No tasks” when expanded. Filtered counts read “shown / total.”
 
 Engine ordering, with root ID as final tie-breaker:
 
@@ -154,13 +173,13 @@ Engine ordering, with root ID as final tie-breaker:
 - Backlog: failed/interrupted first, then queued/starting, automatic PR waits including merging, dependency/focus holds, parked/deferred, and completed-without-merge-evidence last; within group use priority, project ordinal where present, creation time and root ID. No implied dispatch-order guarantee.
 - Landed: confirmed merge time descending, using observation time labelled as such when actual merge time is unavailable.
 
-Project scope hides project labels, but keeps the same membership and sorting rules. Search filters projected roots by root title and revision ask; a revision match selects its root and opens that ask. Filtered counts read “shown / total.” No automatic project grouping interrupts the four sections.
+Project scope hides project labels, but keeps the same membership and sorting rules. Search filters projected roots by root title/description and revision ask; a revision match selects its root and opens that ask. No automatic project grouping interrupts the four sections.
 
 ### Detail shell and variants
 
-Every detail has a stable root title and project breadcrumb, engine status/reason, PR link and CI/conflict/review summary when applicable. Tabs are **Activity**, **Review** (when a PR exists), **Attention** (when questions/actions exist), and **History**. Initial tab follows `default_detail`; subsequent updates never switch the user's tab. A newly required action appears as a banner and tab badge. The tabs remain stable for a selected root until it is deselected, even if an attention is answered.
+Every detail has a stable root title and project breadcrumb, engine status/reason, PR link and CI/conflict/review summary when applicable. Tabs are **Activity**, **Review** (when a PR exists), **Attention** (when questions/actions exist or already appeared for this selection), and **History**. Initial tab follows `default_detail`; subsequent updates never switch the user's tab. A newly required action appears as a banner and tab badge. Tabs remain listed for a selected root until it is deselected, even if an attention is answered: the empty Attention body stays reachable. A newly selected root whose default was Attention with nothing to render falls back to Activity.
 
-Working Activity uses a vertically resizable brief/terminal split. “Original brief” and “Current ask” are distinct labelled document choices. A running revision defaults to Current ask; root implementation defaults to Original brief. Show revision sequence, source (review findings, CI, conflict or manual), and the execution identity beside Current ask. Multiple simultaneous agents use an activity picker, stable by execution ID; the engine orders actionable waits then progressing activities, with creation time/ID tie-breaks. Changing that picker does not change the root selection or overwrite the user's document choice.
+Working Activity uses a vertically resizable brief/terminal split. “Original brief” and “Current ask” are distinct labelled document choices. A running revision defaults to Current ask unless Original holds a draft. Show revision sequence, source (review findings, CI, conflict or manual), and the execution identity beside Current ask. Multiple simultaneous agents use an activity picker, sticky by execution ID; the engine orders actionable waits then progressing activities. Changing that picker does not change the root selection or overwrite the user's document choice. Spoke-hosted workers use the existing remote-pane viewer; local workers reuse the Agents session registry so Work and Agents never create duplicate PTYs.
 
 ```text
 WORKING — Activity
@@ -174,7 +193,7 @@ Revision 2 · Fix CI · Agent: Codex [activity v]
 | Agent running tests...                                      |
 ```
 
-The inline brief adapter reuses existing markdown rendering and task-description mutation; edit mode is plain markdown text with explicit Save/Cancel. Retain per-document dirty drafts across row/tab moves. Background updates never overwrite a draft: show “Brief changed remotely” and require reload or an explicit save after reviewing the latest content. Editing the stored brief does not imply delivery to the already-running agent; label that fact and retain the existing agent input route. Never repurpose the original brief field as the revision's ask.
+The inline brief adapter reuses existing markdown rendering and task-description mutation; edit mode is plain markdown text with explicit Save/Cancel. Retain per-document dirty drafts across row/tab moves, including a retiring ask kept as Historical while another root is selected. Background updates never overwrite a draft: show “Brief changed remotely” and require reload or an explicit save after reviewing the latest content. Editing the stored brief does not imply delivery to the already-running agent; label that fact and retain the existing agent input route. Never repurpose the original brief field as the revision's ask. Landed briefs reject edit/save.
 
 ```text
 QUESTION — Attention
@@ -188,7 +207,7 @@ Recommendation: Preview for this trial.
 > Technical details        Answer status: not sent
 ```
 
-Use engine-provided labels for yes/no, multiple-choice and free-text prompts; do not synthesize Yes/No for split decisions. Reuse existing group semantics: distinguish saving an answer from accepting/actioning a group. Submission binds to attention ID/generation; an already-answered response replaces controls with the recorded answer without resubmitting. Errors are inline, the draft remains, and a waiting-human execution without a structured question offers “Open agent input” and the selected terminal instead. Follow-up proposals use existing edit/accept/dismiss controls in this tab.
+Use engine-provided labels for yes/no, multiple-choice and free-text prompts; do not synthesize Yes/No for split decisions. Reuse existing group semantics: distinguish saving an answer from accepting/actioning a group. Submission binds to attention ID/generation; an already-answered response replaces controls with the recorded answer without resubmitting. A replaced question is refused inline (“This question was replaced. Review the current question.”). Errors are inline, the draft remains, and a waiting-human execution without a structured question offers “Open agent input” and the selected terminal instead. Follow-up proposals use existing edit/accept/dismiss controls in this tab. Intervention entries render read-only with the action's own reason label.
 
 ```text
 REVIEW — also reachable while Working
@@ -203,7 +222,7 @@ Guide: version 3 · older head · [Generate/Retry when available]
 [Review actions from engine]   Merge unavailable: revision active
 ```
 
-Reuse guide rendering, attachments, comments and action handlers. Fetch by root, version and request identity so a late response cannot overwrite another task or a newly selected version. Show not-generated, generating, failed, stale-source and readable states distinctly. A readable stale guide stays readable with its comparison/head label. The diff region is a static placeholder with an external PR-files link; no diff parsing, fetching or implementation task. At narrow detail widths stack guide and placeholder vertically. Merge/merge-when-ready stays subject to existing engine checks and confirmations; a tab never confers readiness.
+Reuse guide rendering, attachments, comments and action handlers. Fetch by root, PR binding, version and request identity so a late response cannot overwrite another task or a newly selected version. Guides remain pinned until explicitly switched. Show not-generated, generating, failed, stale-source and readable states distinctly. A readable stale guide stays readable with its comparison/head label. The diff region is a static placeholder with an external PR-files link; at detail widths below 780 points it stacks above the guide. Merge-when-ready is the shared header control, gated by the same eligibility as Kanban and hidden once merge evidence exists; guide freshness never grants approval. Inline comments load and submit through the engine bridge; read-only follows durable conditions (deleted, archived, missing root), not a connection blip. Leaving Review closes the composer so keystrokes cannot keep flowing into a hidden tab.
 
 ```text
 BACKLOG — Activity
@@ -216,7 +235,7 @@ Dependencies: [Land shared selection]  [Protocol update]
 [Existing Start/Park/Edit actions, when allowed]
 ```
 
-Todo/queued/parked/deferred/blocked share this layout with an exact reason, retry/not-before time if known, dependency completion and links. A dependency link does not silently change scope. Starting shows workspace setup and “Agent pane not available yet.” Completed-without-PR and merge-unverified rows use the same shell with a completion summary, no Start implied by their section, and history links.
+Todo/queued/parked/deferred/blocked share this layout with an exact reason, retry/not-before time if known, dependency completion and links. A dependency link does not silently change scope. Starting shows “Agent pane not available yet.” Completed-without-PR and merge-unverified rows use the same shell with a completion summary, no Start implied by their section, and history links. Advisory engine commands that the Activity slot renders are Start, Retry, Park and Edit brief.
 
 ```text
 FAILED / INTERRUPTED — Activity
@@ -228,7 +247,7 @@ Brief [Preview | Edit]       Dependencies: none
 [Retry when permitted]       [Open last transcript]
 ```
 
-Failure is an execution outcome, not a new task status. Reuse existing dispatch failure diagnostics and mutation paths. Do not render a dead pane as working; retain transcript/history access. A separate human intervention can put this same variant in Needs attention.
+Failure is an execution outcome, not a new task status. Reuse existing dispatch failure diagnostics and mutation paths. Do not render a dead pane as working; retain transcript/history access. Failure diagnostics resolve the failed current revision first, then the latest failed/interrupted family attempt. A separate human intervention can put this same variant in Needs attention.
 
 ```text
 MERGING / AUTOMATIC WAIT — Review
@@ -237,251 +256,71 @@ Cleanup                                Merging · queue position 2
 PR / required CI / queue status / last observation
 Review guide                        [Diff placeholder]
 Waiting for queue checks; no action required
-[Existing cancel-merge action when available]
 ```
 
-Merge request/queue wait is Backlog until merge is confirmed. A running conflict resolver or CI fixer instead uses Working Activity with Current ask and Ghostty; Review remains accessible with a banner identifying the repair. A deferred conflict uses Backlog Activity with the sibling blocker and resumes only when the engine changes state. No timer in Swift predicts that it has cleared.
+Merge request/queue wait is Backlog until merge is confirmed. A running conflict resolver or CI fixer instead uses Working Activity with Current ask and Ghostty; Review remains accessible with a banner identifying the repair. A deferred conflict uses Backlog Activity with the sibling blocker and resumes only when the engine changes state. No timer in Swift predicts that it has cleared. The engine may emit a `cancel_merge` command descriptor while a merge flow is live; there is no separate Navigator mutation for it, matching Kanban (queue cancel is engine-internal).
 
 ```text
-LANDED — Review (or completion summary when guide absent)
+LANDED — History (Review remains available when a PR exists)
 Cleanup                                Merged · Nov 14, 10:32
-[Activity] [Review*] [Attention if any] [History]
+[Activity] [Review] [Attention if any] [History*]
 Merged PR / confirmed timestamp / completion summary
-Final readable guide (head/version labelled) [Diff placeholder]
 Revision history: initial work -> CI fix -> merged
 [Open PR] [Open related follow-up]
 ```
 
-Landed is read-only for the completed attempt, retains remaining attention actions, and never shows a live terminal by default. New work uses existing follow-up actions rather than editing a historical attempt into apparent activity. History in all variants lists revisions, asks, execution outcomes and review versions, with links to transcripts. No PR means no Review tab. No selected task means “Select a task to see its brief, activity and review”; loading/error/disconnected states keep the last coherent detail and label its freshness, without a modal.
+Landed is read-only for the completed attempt, retains remaining attention actions, and never shows a live terminal by default. New work uses existing follow-up actions rather than editing a historical attempt into apparent activity. History lists revisions, asks, execution outcomes and review versions viewed in the session, with links to transcripts. No PR means no Review tab. No selected task means “Select a task to see its brief, activity and review”; loading/error/disconnected states keep the last coherent detail and label its freshness, without a modal.
 
 ### Live updates, selection and switching
 
-Root ID is the selection key, never a list index, section or execution ID. Applying a work-tree delta changes section membership and counts atomically. A selected row can move to a collapsed section without changing detail, terminal attachment, document scroll, tab, dirty text or keyboard focus. Show a quiet “Moved to Needs attention — Reveal” banner; Reveal explicitly expands/scrolls. Do not expand or scroll on background events. Maintain the top visible row's anchor where possible as other rows move.
+Root ID is the selection key, never a list index, section or execution ID. Applying a work-tree delta changes section membership and counts atomically. A selected row can move to a collapsed section without changing detail, terminal attachment, document scroll, tab, dirty text or keyboard focus. Show a quiet “Moved to Needs attention” banner with Reveal, which expands/scrolls. Do not expand or scroll on background events. Maintain the top visible row's anchor where possible as other rows move.
 
-When a current execution ends, keep its terminal/transcript selected and show “Execution ended; new revision available” rather than attaching a different agent under the user's typing. Selecting the new activity is explicit. Reuse the terminal session registry; moving between Work and Agents must not create duplicate PTYs or steal an existing first responder. Surface unavailable/remote sessions through the existing session availability rules.
+When a current execution ends, keep its terminal/transcript selected. Announce “Execution ended; new revision available” only when another live activity exists; otherwise “Execution ended.” Selecting the new activity is explicit. Surface unavailable/remote sessions through the existing session availability rules. Attach-request episodes belong to each surface, so Navigator cleanup cannot erase the Agents view's request for the same run.
 
-Up/Down moves among visible rows, Home/End to first/last visible row, Left/Right collapses/expands a focused section, Return focuses detail, Escape returns focus to the selected row, and Tab traverses controls normally. These shortcuts apply only when the navigator owns focus; terminal/editor keystrokes pass through unchanged. VoiceOver announces section, root title, activity, question count and health summary. Background movement may be announced politely but never changes focus.
+Up/Down moves among visible rows, Home/End to first/last visible row, Left/Right collapses/expands a focused section, Return focuses detail, Escape returns focus to the selected row, and Tab traverses controls normally. These shortcuts apply only when the navigator owns focus; terminal/editor keystrokes pass through unchanged. VoiceOver announces section, root title, activity, question count and health summary.
 
-Add a labelled `Kanban | Navigator` control in the existing Work toolbar. Kanban remains the initial default; persist the chosen mode per window restoration state. Shared product/project scope and root selection carry both ways; Kanban reveals the root's existing card, and opening Navigator from a revision selection resolves its root via the engine projection. Keep each mode's independent scroll/expansion state. Existing Kanban grouping and lane filters remain mode-specific; do not silently carry a lane filter into Navigator. Shared text search may carry across with an explicit visible search field.
+A labelled `Kanban | Navigator` control lives in the existing Work toolbar. Kanban is the initial default; the chosen mode is persisted in `boss.work.viewMode`. Shared product/project scope and root selection carry both ways; Kanban reveals the root's existing card without clearing search, No-project scope, or Kanban toggles, and without refetching the work tree unless the card is hidden. Opening Navigator from a revision selection resolves its root via the engine projection. Keep each mode's independent scroll/expansion state. Existing Kanban grouping and lane filters remain mode-specific. Shared text search carries across.
 
-Changing scope is a user action: preserve selection if included, otherwise show an empty selection and retain the previous root in per-scope history. Switching mode preserves unsaved drafts and terminal sessions. If a root is excluded by a search or archive event, detail explicitly says why it is absent and offers clear-search/reveal where applicable. Disconnect disables mutations, labels data stale, and reconnect uses the existing snapshot/delta-base recovery. No speculative row movement on an action acknowledgement; authoritative updates determine membership.
+Changing scope is a user action: preserve selection if included, otherwise show an empty selection and retain the previous root in per-scope history. Switching mode preserves unsaved drafts and terminal sessions. If a root is excluded by a search or archive event, detail explicitly says why it is absent and offers clear-search/reveal where applicable. Disconnect disables mutations (Review comments stay composable across a blip), labels data stale, and reconnect uses the existing snapshot/delta-base recovery. No speculative row movement on an action acknowledgement; authoritative updates determine membership.
 
-### Acceptance evidence for implementation
+Reveal requests expand and scroll to projected roots in Navigator; tasks without a projection use Kanban. Revealing a revision under an already-selected root sets that revision as the current ask.
 
-Engine tests must enumerate every task/execution enum and family precedence case above. Exercise the actual work-db assembly and incremental projection after question answers, runtime transitions, review admission, conflict deferral, PR rebinding and merge; compare full output, including removal/reparenting and reconnect recovery. A synthetic Swift-only classifier fixture is insufficient evidence of engine ownership.
+### Acceptance evidence
 
-App tests and isolated captures must cover all mockup variants at 260/360/520-point navigator widths, large text, multiple activities, stale guide responses and answer-generation races. Use an isolated real engine/app path for the full sequence: original implementation -> PR -> running CI revision -> question -> answer -> review -> merge. Verify that the same root stays selected, Current ask names the revision, Review stays available during work, and typing is not redirected when a run changes. Record limitations if an external PR/merge cannot be exercised; do not present fixture success as real GitHub integration evidence. Tests run via Bazel with the existing sandbox; captures never launch the production app/engine.
+Engine tests enumerate task/execution combinations, family precedence, revision folding, follow-ups, deferred conflict, focus hold, merge queue, rebinding and action routing. Work-db assembly and incremental projection compare full output after question answers, runtime transitions, review admission, conflict deferral, PR rebinding and merge, including removal/reparenting, reconnect recovery, and an archived-revision broken chain. The family query plan is pinned to the parent index.
 
-## Risks / open questions
+App tests cover row widths 260/360/520, large text, selection/mode/scope, collapsed destinations, reconnect, draft/session identity, attention generation races, follow-up groups, independently keyed review replies, and comment read-only. Isolated captures exist for Activity, Attention and Review. An isolated real-engine path exercises original implementation → PR → running CI revision → question → answer → review → merge-queue wait → confirmed merge, asserting the same root stays selected, Current ask names the revision, Review stays available during work, and a new run does not redirect the previously selected terminal. Worker and GitHub observations are injected into a private database; that path is not live GitHub integration evidence.
 
-- **Review choice: terminal work without merge evidence.** Proposed behavior is Backlog with an explicit completed/unverified label, sorted last. This preserves the literal meaning of Landed and does not lose non-PR work, but may surprise users accustomed to Kanban Done. The alternative requires changing the section's meaning/name, not silently equating completion with merge.
-- **Review choice: Working precedence.** A running family member keeps the root Working even when another member asks a question. The always-visible question count and Attention tab are essential. The alternative would contradict the agreed running-revision placement.
-- **Historical merge coverage.** Existing terminal records may lack explicit merge evidence. The first implementation writes new evidence and leaves unknown history honest; it does not promise a mass historical GitHub reconciliation.
-- **Editor integration.** The requested editing experience is supported as edit/preview over existing rendering and description mutation. A richer standalone editor was not found in source and is not assumed. Review should confirm this interaction is sufficient before implementation.
-- **Density and terminal ownership.** Dimensions are design targets, not measured accessibility or usability results. Embedded Ghostty must preserve session ownership and input focus; validate through the real app path before enabling the mode.
-- **Scope boundary.** Automation-owned work, archived roots and project-only questions keep their existing dedicated surfaces. The header must make project attentions reachable so absence of project rows does not hide them.
+## Decisions
 
-## Proposed implementation task breakdown
+These were the review choices in the original design. Shipping kept them:
 
-Breakdown size: 6 entries (6 in-scope, 0 deferred) — explicit merge evidence, engine family projection, navigator navigation, activity details, attention actions and inline PR review are six reviewable capabilities reusing the existing transport and UI components.
+- **Terminal work without merge evidence is Backlog**, labelled `Completed; merge unverified` or `Completed without PR`, sorted last. Landed means confirmed merge of the current PR binding.
+- **Working precedence.** A running family member keeps the root Working even when another member asks a question. The question count, Attention tab and banner keep that work discoverable.
+- **Historical merge coverage is honest.** New observations are written going forward. Unknown history is not fabricated and is not backfilled from GitHub.
+- **Brief editing is preview plus plain markdown**, not a new standalone editor.
+- **Embedded Ghostty preserves session ownership.** The selected execution stays put when a new revision appears; remote workers use the existing remote-pane viewer.
+- **Automation-owned work, archived roots and project-only questions keep their existing surfaces.** The header bell is the route to project attentions.
 
-All entries await design approval. There is no diff-viewer implementation entry. After the navigator shell, Activity and Attention may run in parallel: they use separate detail bodies and narrow registered slots. Review follows both because it integrates their shared detail tabs and request ownership; it must forward-port those changes preservingly. Every entry includes its own tests rather than deferring correctness to a final gate.
+## Remaining
 
-### Record confirmed merge evidence
+The diff viewer is still a placeholder: “Not available in this view” plus “Open PR diff on GitHub.” That was never an implementation entry.
 
-Persist a PR-binding-specific merge observation through the existing merge path and expose it to engine readers. This independently useful capability distinguishes actual merge from manual completion, including already-terminal observations, without querying GitHub while assembling work.
+The engine may emit advisory `cancel_merge` / `generate_guide` / `open_pr` command descriptors. Generate guide and Open PR have dedicated Review and header controls. There is no user-facing cancel-merge control in Navigator or Kanban; queue cancel stays engine-internal.
 
-Major deliverables:
+## Shipped breakdown
 
-1. Unique UTC schema migration and typed reader/writer for root/PR merge evidence; no guessed legacy backfill.
-2. Real merge-observation caller integration, binding-change behavior and transactional invalidation.
-3. Bazel upgrade/merge-path tests for manual completion, repeated observations and rebinding.
+Six reviewable capabilities, plus three follow-on fixes found in post-merge review. There is no diff-viewer implementation entry.
 
-Likely changed files:
-
-- `tools/boss/engine/work-db/src/merge_evidence.rs` (new)
-- `tools/boss/engine/work-db/src/lib.rs`
-- `tools/boss/engine/work-db/src/schema_migration_registry.rs`
-- `tools/boss/engine/work-db/src/schema_init.rs`
-- `tools/boss/engine/work-db/src/board_projection_schema.rs`
-- `tools/boss/engine/work-db/src/pr_flow.rs`
-- `tools/boss/engine/work-db/src/tests/merge_evidence_tests.rs` (new)
-- `tools/boss/engine/work-db/src/tests.rs`
-- `tools/boss/engine/merge-poller/src/sweep.rs`
-- `tools/boss/engine/merge-poller/src/tests/sweep_tests.rs`
-- `tools/boss/engine/work-db/BUILD.bazel`
-
-Estimated size: ~11 files / ~550 changed lines
-
-Effort: medium
-
-Dependencies: none
-
-Scope: in-scope
-
-### Project navigator families through the work tree
-
-Add engine-owned section, detail reason, actions, activity references and sort keys to the existing tree, implementing the precedence table in a small pure crate with real work-db callers in the same PR. Preserve Kanban fields and behavior; wire fields are additive and unused by older clients.
-
-Major deliverables:
-
-1. Typed projection and family classifier with exhaustive status/combination tests, including all revisions and independent follow-ups.
-2. Full/incremental assembly integration, durable input invalidation and confirmed merge consumption.
-3. Real work-tree/delta parity tests for attention, runtime, PR and relationship changes; no separate RPC/cache.
-
-Likely changed files:
-
-- `tools/boss/protocol/src/types/navigator.rs` (new)
-- `tools/boss/protocol/src/types.rs`
-- `tools/boss/protocol/src/types/task.rs`
-- `tools/boss/engine/work-navigator/src/lib.rs` (new)
-- `tools/boss/engine/work-navigator/src/tests.rs` (new)
-- `tools/boss/engine/work-navigator/Cargo.toml` (new)
-- `tools/boss/engine/work-navigator/BUILD.bazel` (new)
-- `tools/boss/engine/work-db/Cargo.toml`
-- `tools/boss/engine/work-db/BUILD.bazel`
-- `tools/boss/engine/work-db/src/lib.rs`
-- `tools/boss/engine/work-db/src/navigator_projection.rs` (new)
-- `tools/boss/engine/work-db/src/workitems.rs`
-- `tools/boss/engine/work-db/src/revision_helpers.rs`
-- `tools/boss/engine/work-db/src/mappers.rs`
-- `tools/boss/engine/work-db/src/board_projection_schema.rs`
-- `tools/boss/engine/work-db/src/board_patch.rs`
-- `tools/boss/engine/work-db/src/tests/board_projection_tests.rs`
-- `tools/boss/engine/board-projection/src/lib.rs`
-- `Cargo.toml`
-- `Cargo.lock`
-
-Estimated size: ~20 files / ~1400 changed lines
-
-Effort: large
-
-Dependencies: Record confirmed merge evidence
-
-Scope: in-scope
-
-### Add the navigator shell and shared selection
-
-Render the engine projection as four compact expandable sections, with scope/search, root selection and mode switching. Provide the persistent detail shell and registered content slots, using a basic brief/reason fallback until richer bodies land; the mode is usable and clearly labels unavailable detail integrations.
-
-Major deliverables:
-
-1. Projection decoding, compact accessible rows, engine ordering and scoped counts with compatibility handling.
-2. Kanban/Navigator switch and persistent selection, per-mode scroll, atomic movement, keyboard and disconnected behavior.
-3. Bazel UI/model tests for narrowed rows, collapsed destinations, reconnect and mode/scope changes.
-
-Likely changed files:
-
-- `tools/boss/app-macos/Sources/Models+Navigator.swift` (new)
-- `tools/boss/app-macos/Sources/Models.swift`
-- `tools/boss/app-macos/Sources/WorkNavigatorView.swift` (new)
-- `tools/boss/app-macos/Sources/WorkNavigatorRow.swift` (new)
-- `tools/boss/app-macos/Sources/WorkNavigatorDetail.swift` (new)
-- `tools/boss/app-macos/Sources/ChatViewModel+Navigator.swift` (new)
-- `tools/boss/app-macos/Sources/ChatViewModel+WorkSelection.swift`
-- `tools/boss/app-macos/Sources/ChatViewModel+WorkItemEvents.swift`
-- `tools/boss/app-macos/Sources/WorkSelectionHistory.swift`
-- `tools/boss/app-macos/Sources/WorkBoardToolbar.swift`
-- `tools/boss/app-macos/Sources/ContentView.swift`
-- `tools/boss/app-macos/Tests/BossTests/NavigatorSelectionTests.swift` (new)
-- `tools/boss/app-macos/Tests/BossTests/NavigatorRowTests.swift` (new)
-- `tools/boss/app-macos/BUILD.bazel`
-
-Estimated size: ~14 files / ~1200 changed lines
-
-Effort: large
-
-Dependencies: Project navigator families through the work tree
-
-Scope: in-scope
-
-### Embed briefs and current agent activity
-
-Fill the Activity slot with original/revision document choices, inline edit/preview, existing Ghostty sessions and backlog/failure/completion variants. Preserve draft and terminal identity independently from section movement, and expose history/dependencies using existing models and actions.
-
-Major deliverables:
-
-1. Brief adapter with labelled current ask, explicit save, remote-change handling and per-document draft retention.
-2. Current-activity picker and existing session embedding, plus dependency/failure/history states without false live indicators.
-3. Bazel focus/draft/session tests and isolated working/backlog/failure/landed captures, including a real revision transition.
-
-Likely changed files:
-
-- `tools/boss/app-macos/Sources/WorkNavigatorActivity.swift` (new)
-- `tools/boss/app-macos/Sources/WorkNavigatorBrief.swift` (new)
-- `tools/boss/app-macos/Sources/WorkNavigatorHistory.swift` (new)
-- `tools/boss/app-macos/Sources/WorkFormSheets.swift`
-- `tools/boss/app-macos/Sources/WorkCardPopover.swift`
-- `tools/boss/app-macos/Sources/ChatViewModel+WorkMutations.swift`
-- `tools/boss/app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift`
-- `tools/boss/app-macos/Sources/Ghostty/BossPaneTerminalView.swift`
-- `tools/boss/app-macos/Tests/BossTests/NavigatorActivityTests.swift` (new)
-- `tools/boss/app-macos/Sources/BossNavigatorActivityCapture.swift` (new)
-- `tools/boss/app-macos/BUILD.bazel`
-
-Estimated size: ~11 files / ~1100 changed lines
-
-Effort: large
-
-Dependencies: Add the navigator shell and shared selection
-
-Scope: in-scope
-
-### Embed actionable questions and attention groups
-
-Fill the Attention slot with existing typed question and group workflows, including revision-owned questions and terminal-only input waits. Reuse existing answer/action handlers and scope-header project attention routing; do not introduce a second question lifecycle.
-
-Major deliverables:
-
-1. Reusable question/group body retaining existing board and attention callers, with generation-safe submission and inline errors.
-2. Navigator tab/banner/count integration and project-attention access without duplicate task rows.
-3. Bazel tests and isolated question captures for all answer types, concurrent answer changes and Working-plus-question precedence.
-
-Likely changed files:
-
-- `tools/boss/app-macos/Sources/WorkNavigatorAttention.swift` (new)
-- `tools/boss/app-macos/Sources/WorkBoardCardOperatorQuestion.swift`
-- `tools/boss/app-macos/Sources/AttentionsView.swift`
-- `tools/boss/app-macos/Sources/ChatViewModel+Attentions.swift`
-- `tools/boss/app-macos/Tests/BossTests/NavigatorAttentionTests.swift` (new)
-- `tools/boss/app-macos/Sources/BossNavigatorAttentionCapture.swift` (new)
-- `tools/boss/app-macos/BUILD.bazel`
-
-Estimated size: ~7 files / ~700 changed lines
-
-Effort: medium
-
-Dependencies: Add the navigator shell and shared selection
-
-Scope: in-scope
-
-### Embed PR review alongside ongoing work
-
-Fill the Review slot with independently keyed guide loading, existing PR actions and a static diff placeholder. Complete shared detail integration for working revisions, review-ready work, automatic merge waits and landed history, preserving the prior Activity and Attention integrations.
-
-Major deliverables:
-
-1. Inline guide/version/attachment presentation with source-staleness labels and race-safe request ownership alongside the existing standalone viewer.
-2. Existing review/merge controls and gate explanations, static diff placeholder and external link for every PR-bearing state.
-3. Bazel tests and isolated review/merging captures; exercise the genuine engine-to-app lifecycle from revision through question and merge, documenting any external-service validation limits.
-
-Likely changed files:
-
-- `tools/boss/app-macos/Sources/WorkNavigatorReview.swift` (new)
-- `tools/boss/app-macos/Sources/WorkNavigatorDetail.swift`
-- `tools/boss/app-macos/Sources/ChatViewModel+ReviewGuide.swift`
-- `tools/boss/app-macos/Sources/DesignsView.swift`
-- `tools/boss/app-macos/Sources/ReviewGuideViewerHeader.swift`
-- `tools/boss/app-macos/Sources/ReviewGuideAttachments.swift`
-- `tools/boss/app-macos/Sources/ChatViewModel+ReviewActions.swift`
-- `tools/boss/app-macos/Tests/BossTests/NavigatorReviewTests.swift` (new)
-- `tools/boss/app-macos/Sources/BossNavigatorReviewCapture.swift` (new)
-- `tools/boss/app-macos/BUILD.bazel`
-
-Estimated size: ~10 files / ~1000 changed lines
-
-Effort: large
-
-Dependencies: Embed briefs and current agent activity; Embed actionable questions and attention groups
-
-Scope: in-scope
+| Change                                         | PR                                                      | What it delivered                                                                                                                   |
+| ---------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Pure family classifier                         | [mono#3623](https://github.com/spinyfin/mono/pull/3623) | `boss-work-navigator` crate, private visibility, no production consumers at merge.                                                  |
+| Confirmed merge evidence                       | [mono#3625](https://github.com/spinyfin/mono/pull/3625) | `pr_merge_evidence` migration `20261115_0110_merge_evidence`, poller and completion writers, snapshot reader with no GitHub access. |
+| Work-tree projection                           | [mono#3629](https://github.com/spinyfin/mono/pull/3629) | `Task.navigator` on full and incremental assembly; diagnostic fallback rows; Kanban unchanged.                                      |
+| Live activity, project questions, family query | [mono#3634](https://github.com/spinyfin/mono/pull/3634) | Spawn/re-adoption stay Working; project-associated worker questions on the asking family; one recursive family query.               |
+| Navigator shell                                | [mono#3635](https://github.com/spinyfin/mono/pull/3635) | Four sections, compact rows, scope/search, mode switch, persistent detail slots, compatibility message.                             |
+| Attention bodies                               | [mono#3661](https://github.com/spinyfin/mono/pull/3661) | Shared question/group workflows, generation-safe submit, Open agent input, Working-plus-question precedence.                        |
+| Briefs and activity                            | [mono#3662](https://github.com/spinyfin/mono/pull/3662) | Original/current-ask editor, Ghostty embed, backlog/failure/landed variants, History.                                               |
+| Attention tab stability and follow-ups         | [mono#3671](https://github.com/spinyfin/mono/pull/3671) | Tab stays mounted after the last question; follow-up proposals in Attention.                                                        |
+| Brief/activity lifecycle                       | [mono#3674](https://github.com/spinyfin/mono/pull/3674) | Draft retention, sticky execution, remote panes, failure-target resolution.                                                         |
+| Inline PR review                               | [mono#3675](https://github.com/spinyfin/mono/pull/3675) | Independently keyed guide reader, comments, merge-when-ready header, static diff placeholder.                                       |
