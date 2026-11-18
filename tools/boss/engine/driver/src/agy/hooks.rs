@@ -174,7 +174,6 @@ fn private_forwarder_config(process_home: &Path, config: &ProgressObservationCon
     }
 }
 
-
 fn artifact_write_paths_json(worker_kind: WorkerKind, run_id: &str) -> Value {
     match worker_kind {
         WorkerKind::Reviewer => json!([boss_engine_structured_output::default_path_string(
@@ -184,7 +183,6 @@ fn artifact_write_paths_json(worker_kind: WorkerKind, run_id: &str) -> Value {
         _ => json!([]),
     }
 }
-
 
 fn authorization_command(process_home: &Path, config: &ProgressObservationConfig) -> String {
     let adapter_config = ProgressObservationConfig {

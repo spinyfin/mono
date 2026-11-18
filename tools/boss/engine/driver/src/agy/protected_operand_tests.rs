@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 fn deny_at(fx: &Fixture, command: &str, cwd: &Path) -> Value {
     let mut payload = run_command_payload(command);
     payload["toolCall"]["args"]["Cwd"] = json!(cwd);
-    let (_, body, stderr) = authorize(&fx.process_home, &payload, true);
+    let (_, body, stderr) = authorize(&fx.process_home, &payload);
     assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
     body
 }
@@ -138,7 +138,6 @@ fn quoted_text_is_not_a_heredoc_and_continuations_keep_span() {
     let (_, body, stderr) = authorize(
         &fx.process_home,
         &run_command_payload("cat <<'EOF'\n`cat /protected/x`\nEOF"),
-        true,
     );
     assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
 }
@@ -159,7 +158,7 @@ fn quote_segments_preserve_literal_dollars_in_path_operands() {
         r"echo \(\)",
         "echo foo\u{00a0}bar",
     ] {
-        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), true);
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
     deny_at(&fx, "cat \"$HOME_CONFIG\"", &fx.workspace());
@@ -177,7 +176,6 @@ fn guards_receive_the_workers_exact_environment() {
     let (_, body, stderr) = authorize_with_env(
         &fx.process_home,
         &run_command_payload("\"$BOSS_BIN\" pr status"),
-        true,
         &[
             ("BOSS_BIN", "/workspace/bin/boss"),
             ("CUBE_BIN", "/workspace/bin/cube"),
@@ -190,7 +188,6 @@ fn guards_receive_the_workers_exact_environment() {
     let (_, body, stderr) = authorize_with_env(
         &fx.process_home,
         &run_command_payload("cat \"$BOSS_STRUCTURED_OUTPUT\""),
-        true,
         &[("BOSS_STRUCTURED_OUTPUT", protected.to_str().unwrap())],
     );
     assert_eq!(decision(&body), "deny", "{body} {stderr}");
@@ -215,7 +212,7 @@ fn value_flags_of_other_programs_do_not_hide_protected_operands() {
         deny_at(&fx, &command, &fx.workspace());
     }
     for command in ["grep -A 3 pat f", "rg -t rust pat", "grep -m 2 pat f"] {
-        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), true);
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
 }
@@ -243,7 +240,6 @@ fn heredoc_delimiter_words_and_arithmetic_do_not_hide_live_lines() {
     let (_, body, stderr) = authorize(
         &fx.process_home,
         &run_command_payload("cat <<'E'OF\n`cat /protected/x`\nEOF"),
-        true,
     );
     assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
 }
@@ -269,7 +265,7 @@ fn redirect_targets_with_unresolved_expansions_are_denied() {
     for command in ["T=/x; echo x > \"${T}y\"", "printf x >> \"$T\"", "echo x > ~root/y"] {
         deny_at(&fx, command, &fx.workspace());
     }
-    let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo cost$"), true);
+    let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload("echo cost$"));
     assert_eq!(decision(&body), "auto_approve", "{body} {stderr}");
 }
 

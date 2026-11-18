@@ -246,7 +246,6 @@ fn engine_executable_variables_cannot_evade_structural_denies() {
         );
         assert_eq!(decision(&body), "deny", "{body} {stderr}");
     }
-
 }
 
 #[test]
@@ -484,11 +483,11 @@ fn quoted_worker_clis_and_literal_dollar_operands_are_not_fail_closed() {
         r#"awk '{print $1}' f"#,
         "cat <<'EOF'\n`whoami` $(id)\nEOF",
     ] {
-        let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(command), true);
+        let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
         assert_eq!(code, 0, "{command} stderr={stderr}");
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
-    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(r#"cat "$HOME_CONFIG""#), true);
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(r#"cat "$HOME_CONFIG""#));
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body} {stderr}");
     assert!(
@@ -518,7 +517,6 @@ fn cube_pr_create_reaches_pr_redirect_and_checkleft() {
     let (code, body, stderr) = authorize(
         &fx.process_home,
         &run_command_payload(r#""$CUBE_BIN" pr create --title x --body-file f"#),
-        true,
     );
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body} {stderr}");
@@ -539,7 +537,7 @@ fn protected_tilde_user_and_symlink_glob_are_denied() {
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "root".into());
     let tilde = format!("cat ~{user}/.gemini/config/hooks.json");
-    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&tilde), true);
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&tilde));
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{tilde}: {body} {stderr}");
     assert!(
@@ -563,7 +561,7 @@ fn protected_tilde_user_and_symlink_glob_are_denied() {
     rebind(&fx);
     let globbed = format!("{}/lin?/protected/hooks.json", fx.tmp.path().display());
     let glob_cmd = format!("cat {globbed}");
-    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&glob_cmd), true);
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&glob_cmd));
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{glob_cmd}: {body} {stderr}");
     assert!(

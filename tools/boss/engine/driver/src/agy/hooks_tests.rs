@@ -178,7 +178,6 @@ fn authorize_with_env(process_home: &Path, payload: &Value, env: &[(&str, &str)]
         .env("HOME", process_home)
         .env("BOSS_BIN", "/opt/boss-tools/boss")
         .env("CUBE_BIN", "/opt/boss-tools/cube")
-
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -571,7 +570,7 @@ fn reviewer_may_write_the_engine_owned_review_result_artifact() {
             "args": {"Path": artifact, "Contents": "{\"findings\":[]}"},
         }
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &write, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &write);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "auto_approve", "{body} stderr={stderr}");
 
@@ -582,7 +581,7 @@ fn reviewer_may_write_the_engine_owned_review_result_artifact() {
             "args": {"Path": sibling.display().to_string(), "Contents": "{}"},
         }
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &sibling_write, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &sibling_write);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
     assert!(
@@ -599,7 +598,7 @@ fn reviewer_may_write_the_engine_owned_review_result_artifact() {
             "args": {"Path": fx.workspace().join("lib.rs").display().to_string(), "Contents": "x"},
         }
     });
-    let (code, body, stderr) = authorize(&fx.process_home, &workspace_write, true);
+    let (code, body, stderr) = authorize(&fx.process_home, &workspace_write);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
 }
@@ -660,7 +659,7 @@ fn measured_parent_child_subagent_flow_is_approved() {
             "toolCall": {"name": "send_message", "args": {"text": "done"}},
         }),
     ] {
-        let (code, body, stderr) = authorize(&fx.process_home, &payload, true);
+        let (code, body, stderr) = authorize(&fx.process_home, &payload);
         assert_eq!(code, 0, "{payload} stderr={stderr}");
         assert_eq!(decision(&body), "auto_approve", "{payload}: {body} {stderr}");
     }
@@ -801,4 +800,3 @@ mod startup_tests;
 
 #[path = "protected_operand_tests.rs"]
 mod protected_operand_tests;
-

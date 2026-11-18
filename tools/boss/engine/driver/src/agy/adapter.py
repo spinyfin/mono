@@ -856,8 +856,11 @@ def structural_reason(native_name, args, canonical, policy):
 
 
 def is_artifact_write(path, policy, cwd=None):
-    allowed = policy.get("artifact_write_paths") or []
-    if not isinstance(allowed, list):
+    allowed = list(policy.get("artifact_write_paths") or [])
+    env_path = os.environ.get("BOSS_STRUCTURED_OUTPUT")
+    if isinstance(env_path, str) and env_path and os.path.isabs(env_path):
+        allowed.append(env_path)
+    if not allowed:
         return False
     resolved = resolve_path(path, policy, cwd)
     for artifact in allowed:
