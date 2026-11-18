@@ -328,6 +328,79 @@ fn unexplained_wait_log_uses_the_given_execution_never_the_newest_row() {
 }
 
 #[test]
+fn heartbeat_and_card_log_the_same_non_abandoned_execution() {
+    let logs = crate::test_support::log_capture::install();
+    let db = WorkDb::open(temp_db_path("unexplained-log-abandoned")).unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore(&db, &product.id, "Abandoned duplicate");
+    let mut ids = Vec::new();
+    for (status, kind) in [
+        (ExecutionStatus::Completed, ExecutionKind::ChoreImplementation),
+        (ExecutionStatus::Abandoned, ExecutionKind::ChoreImplementation),
+        (ExecutionStatus::Completed, ExecutionKind::Progression),
+    ] {
+        ids.push(
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&task.id)
+                    .kind(kind)
+                    .status(status)
+                    .build(),
+            )
+            .unwrap()
+            .id,
+        );
+    }
+    {
+        let conn = db.connect().unwrap();
+        for (offset, id) in ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+                rusqlite::params![id, format!("{}", 1_000 + offset)],
+            )
+            .unwrap();
+        }
+        conn.execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&task.id])
+            .unwrap();
+    }
+    let runtime = db.get_task_runtime(&task.id).unwrap();
+    assert_eq!(
+        runtime.execution_id.as_deref(),
+        Some(ids[0].as_str()),
+        "card skips the abandoned duplicate"
+    );
+    db.list_unexplained_dispatch_waits().unwrap();
+    for shadow in [&ids[1], &ids[2]] {
+        assert!(
+            anomaly_records(&logs, shadow).is_empty(),
+            "logged a shadowing row {shadow}"
+        );
+    }
+    let logged = anomaly_records(&logs, &task.id);
+    assert!(!logged.is_empty(), "the heartbeat should report this item");
+    assert!(
+        logged
+            .iter()
+            .all(|line| line.contains(&format!("execution_id=\"{}\"", ids[0]))),
+        "{logged:?}"
+    );
+}
+
+#[test]
+fn persistent_anomaly_is_reported_again_after_the_ttl_despite_reads_in_between() {
+    let key = "ttl-test-item";
+    assert!(crate::wait_diagnostics::report_due_for_test(key, 1_000));
+    for now in [1_100, 2_000, 3_000, 4_000] {
+        assert!(
+            !crate::wait_diagnostics::report_due_for_test(key, now),
+            "suppressed at {now}"
+        );
+    }
+    assert!(crate::wait_diagnostics::report_due_for_test(key, 4_600));
+    assert!(!crate::wait_diagnostics::report_due_for_test(key, 4_700));
+}
+
+#[test]
 fn stale_startup_phase_on_a_ready_row_is_not_rendered_as_a_hold() {
     let db = WorkDb::open(temp_db_path("stale-startup-phase")).unwrap();
     let product = create_test_product(&db);

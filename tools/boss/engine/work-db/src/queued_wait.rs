@@ -678,11 +678,11 @@ impl WorkDb {
                 "SELECT {columns},
                         (SELECT e.status FROM work_executions e
                          WHERE e.work_item_id = tasks.id AND e.kind <> 'progression'
-                         ORDER BY e.created_at DESC, e.id DESC
+                         ORDER BY e.status = 'abandoned', e.created_at DESC, e.id DESC
                          LIMIT 1),
                         (SELECT e.id FROM work_executions e
                          WHERE e.work_item_id = tasks.id AND e.kind <> 'progression'
-                         ORDER BY e.created_at DESC, e.id DESC
+                         ORDER BY e.status = 'abandoned', e.created_at DESC, e.id DESC
                          LIMIT 1)
                  FROM tasks
                  WHERE deleted_at IS NULL

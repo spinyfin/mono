@@ -50,21 +50,46 @@ pub(super) struct Unclassified<'a> {
 
 type AnomalyKey = (String, Option<String>, Option<String>);
 
-static REPORTED: LazyLock<Mutex<HashMap<AnomalyKey, i64>>> = LazyLock::new(Mutex::default);
+static REPORTED: LazyLock<Mutex<HashMap<AnomalyKey, (i64, i64)>>> = LazyLock::new(Mutex::default);
 
-/// Whether this anomaly has not been reported within the TTL. Keys not seen
-/// for a full TTL are pruned, so the set cannot grow without bound.
+/// Whether this anomaly is due a report: never reported, or last emitted at
+/// least a TTL ago. The emission time moves only on emission, so a persistent
+/// anomaly seen constantly is still re-reported hourly. Keys not seen for a full
+/// TTL are pruned, so the set cannot grow without bound.
 fn first_report(item: &Unclassified<'_>, now: i64) -> bool {
     let key = (
         item.work_item_id.to_owned(),
         item.execution_id.map(str::to_owned),
         item.execution_status.map(str::to_owned),
     );
+    report_due(key, now)
+}
+
+fn report_due(key: AnomalyKey, now: i64) -> bool {
     let Ok(mut reported) = REPORTED.lock() else {
         return true;
     };
-    reported.retain(|_, last| now.saturating_sub(*last) < REPORT_TTL_SECS);
-    reported.insert(key, now).is_none()
+    reported.retain(|_, (_, last_seen)| now.saturating_sub(*last_seen) < REPORT_TTL_SECS);
+    match reported.get_mut(&key) {
+        Some((last_reported, last_seen)) => {
+            *last_seen = now;
+            if now.saturating_sub(*last_reported) >= REPORT_TTL_SECS {
+                *last_reported = now;
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            reported.insert(key, (now, now));
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn report_due_for_test(work_item_id: &str, now: i64) -> bool {
+    report_due((work_item_id.to_owned(), None, None), now)
 }
 
 /// Log each distinct anomaly once, on first exposure. Read as a set so logging
