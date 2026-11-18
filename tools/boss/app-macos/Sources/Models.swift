@@ -126,6 +126,9 @@ struct WorkTask: Identifiable, Hashable {
     /// `mergeQueueState` is non-nil. Parsed by `MergeQueueDetail.parse(json:)`
     /// for the Merging section's compact badge and sort order.
     var mergeQueueDetail: String? = nil
+    /// The standing merge request on this card, when one says something about
+    /// it. Mirrors `Task.merge_intent`; see `WorkMergeIntent`.
+    var mergeIntent: WorkMergeIntent? = nil
     /// Raw GitHub mergeability at last poll, independent of CI, review, and
     /// merge-queue state. One of `"mergeable"`, `"conflicting"`, or
     /// `"unknown"`; `nil` until the first probe completes. This is the only
@@ -827,4 +830,73 @@ struct WorkDependencyRow: Identifiable, Hashable {
         case project
         case unknown
     }
+}
+
+/// A person's standing request to merge this card's PR, as the engine
+/// reports it on `Task.merge_intent`. The request outlives the merge attempt
+/// it started: it stays `active` while CI is fixed or a conflict is resolved,
+/// and the engine ends it with a sentence saying why. The engine decides what
+/// it means; this type only chooses which of the engine's words go where.
+struct WorkMergeIntent: Hashable {
+    /// `active`, or how it ended: `needs_review`, `lapsed`, `invalidated`.
+    var status: String
+    /// The PR head the merge was requested for.
+    var approvedHeadSha: String? = nil
+    /// The PR head the engine last compared against the approved one.
+    var decidedHeadSha: String? = nil
+    /// Engine code for why it ended.
+    var reason: String? = nil
+    /// Engine-authored sentence: why it ended and what to do.
+    var detail: String? = nil
+    /// Merges the engine re-requested under this request on its own.
+    var automaticMerges: Int = 0
+
+    /// Parse the engine's `merge_intent` object. `nil` for a missing key or a
+    /// payload without a status, so an older engine simply shows nothing.
+    static func parse(_ payload: Any?) -> WorkMergeIntent? {
+        guard let object = payload as? [String: Any], let status = object["status"] as? String else {
+            return nil
+        }
+        return WorkMergeIntent(
+            status: status,
+            approvedHeadSha: object["approved_head_sha"] as? String,
+            decidedHeadSha: object["decided_head_sha"] as? String,
+            reason: object["reason"] as? String,
+            detail: object["detail"] as? String,
+            automaticMerges: (object["automatic_merges"] as? NSNumber)?.intValue ?? 0
+        )
+    }
+
+    var isActive: Bool { status == "active" }
+
+    /// The engine's explanation of a request that ended. It outranks a live
+    /// worker status on the card, because it is why the card is back.
+    var endedDetail: String? { isActive ? nil : detail }
+
+    /// The fallback line for a request that still stands on a card that is
+    /// not in the Merging section, where the section itself already says so.
+    func standingLabel(inMergingSection: Bool) -> String? {
+        isActive && !inMergingSection ? "Merge requested" : nil
+    }
+
+    /// The popover's "Merge request" row: the engine's sentence for an ended
+    /// request, or the head a standing one was made for, then the two heads
+    /// when a decision compared them and any automatic re-merges.
+    var popoverText: String {
+        var lines: [String] = []
+        if isActive {
+            lines.append(approvedHeadSha.map { "Requested for \(Self.short($0)), still standing" } ?? "Requested, still standing")
+        } else {
+            lines.append(detail ?? "Ended: \(status.replacingOccurrences(of: "_", with: " "))")
+        }
+        if let approved = approvedHeadSha, let decided = decidedHeadSha, approved != decided {
+            lines.append("\(Self.short(approved)) → \(Self.short(decided))")
+        }
+        if automaticMerges > 0 {
+            lines.append("Re-merged automatically \(automaticMerges)×")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func short(_ sha: String) -> String { String(sha.prefix(7)) }
 }

@@ -139,6 +139,7 @@ pub use boss_engine_live_worker_state as live_worker_state;
 pub use boss_engine_live_worker_state::semantic_progress;
 pub mod lost_workspace_sweep;
 pub mod materializer;
+pub mod merge_intent;
 pub mod merge_mechanism;
 pub mod merge_when_ready;
 pub mod run_cost;

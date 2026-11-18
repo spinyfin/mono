@@ -81,6 +81,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "reviewRequiredDetail",
         "mergeQueueState",
         "mergeQueueDetail",
+        "mergeIntent",
         "prMergeableState",
         "conflictResolutionDeferred",
         "reviewGuideLifecycle",
@@ -833,6 +834,24 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.mergeQueueDetail = "{\"position\":2}"; return t
+                }
+            ),
+            Case(
+                name: "mergeIntent",
+                context: review,
+                base: {
+                    var t = Self.makeTask(
+                        id: "task_1",
+                        status: "in_review",
+                        prURL: "https://github.com/x/y/pull/4"
+                    )
+                    t.mergeIntent = WorkMergeIntent(status: "active")
+                    return t
+                },
+                mutate: {
+                    var t = $0
+                    t.mergeIntent = WorkMergeIntent(status: "needs_review", detail: "The PR changed.")
+                    return t
                 }
             ),
             Case(

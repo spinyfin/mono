@@ -383,6 +383,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: merge_evidence::migrate,
         },
         Migration {
+            id: merge_intent::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: merge_intent::migrate,
+        },
+        Migration {
             id: "20261117_0212_no_op_completion_ready".into(),
             legacy_version: None,
             apply: |conn| {

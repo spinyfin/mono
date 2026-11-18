@@ -286,10 +286,21 @@ struct WorkCardSnapshot: Equatable {
         // non-pending path in `WorkBoardCardItem`.
         // The engine's merge explanation only describes a card that is under
         // review or merging; in Doing the worker's live status is what matters.
+        // A merge request that ended explains why the card is back in
+        // Review. Outside Merging it is the engine's latest word on the
+        // merge, so it outranks an earlier "Merge paused" label and a worker
+        // status. A request that still stands is only a fallback line.
+        let endedMergeRequest = (column == .doing || task.isInMergingSection) ? nil : task.mergeIntent?.endedDetail
         let engineStatusLabel: String? = column == .doing
             ? nil
             : MergeQueueDetail.parse(task.mergeQueueDetail)?.statusLabel
-        let liveStatus = engineStatusLabel ?? context.liveStatus
+        let standingMergeRequest = column == .doing
+            ? nil
+            : task.mergeIntent?.standingLabel(inMergingSection: task.isInMergingSection)
+        let liveStatus = endedMergeRequest
+            ?? engineStatusLabel
+            ?? context.liveStatus
+            ?? standingMergeRequest
         let liveStatusActivity: WorkerActivity? = {
             if isDispatchPending { return nil }
             if let explicit = context.liveStatusActivity { return explicit }

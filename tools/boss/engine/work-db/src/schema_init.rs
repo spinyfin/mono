@@ -911,6 +911,10 @@ mod floor_tests {
                 Box::new(|c| merge_evidence::migrate(c).unwrap()),
             ),
             (
+                merge_intent::MIGRATION_ID,
+                Box::new(|c| merge_intent::migrate(c).unwrap()),
+            ),
+            (
                 "20261117_0212_no_op_completion_ready",
                 Box::new(|c| {
                     c.execute_batch(

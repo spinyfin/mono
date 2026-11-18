@@ -892,6 +892,7 @@ mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
 mod merge_conflict_merging;
+mod merge_intent;
 mod operator_answer_outcome;
 pub mod parking;
 pub mod parking_reconcile;
@@ -1101,6 +1102,7 @@ pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
 pub use mappers::ProducerConflictInsertInput;
 pub use mappers::SpeculativeConflictInsertInput;
+pub use merge_intent::{MergeIntentEnd, MergeIntentRemediation, MergeQueueDeparture};
 // Metrics vocabulary, owned by the metrics framework rather than by
 // `work`. Re-exported here so the `WorkDb::metrics_*` signatures read
 // the same as every other row type in this module.

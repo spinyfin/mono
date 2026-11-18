@@ -223,6 +223,8 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                 action = merge_when_ready::MergeAction::Requested.as_str(),
                                 "merge_when_ready: GitHub merge request recorded",
                             );
+                            let remembered =
+                                remember_merge_request(&work_db2, &work_item_id2, &pr_url2, Some(&success.head_sha));
                             tracing::info!(request_id = %request_id2, elapsed_ms = record_started.elapsed().as_secs_f64() * 1000.0, "merge request durable write completed");
                             // Acknowledge durable acceptance before publication takes
                             // the shared decision-feed lock or wakes board readers.
@@ -240,7 +242,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                 pr_url: pr_url2.clone(),
                             });
                             let publication_started = std::time::Instant::now();
-                            if record.merge_queue_state_changed {
+                            if record.merge_queue_state_changed || remembered {
                                 publisher
                                     .publish_work_item_changed(&product_id2, &work_item_id2, "gh_merge_queue_submitted")
                                     .await;
@@ -338,6 +340,22 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
     }
 }
 
+/// Record the person's merge request so it stands through a failed merge
+/// attempt and the automatic fix that follows (`WorkDb::record_merge_intent`).
+/// Returns whether it was recorded. The submission it belongs to has already
+/// been accepted, so a failed write is logged rather than surfaced: the item
+/// then simply returns to Review after a failed attempt, as it did before
+/// requests were remembered.
+fn remember_merge_request(work_db: &WorkDb, work_item_id: &str, pr_url: &str, approved_head_sha: Option<&str>) -> bool {
+    match work_db.record_merge_intent(work_item_id, pr_url, approved_head_sha) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(%work_item_id, %pr_url, ?err, "merge_when_ready: could not record the standing merge request");
+            false
+        }
+    }
+}
+
 /// End the deferral of a merge conflict on `pr_url` because a merge was
 /// requested for it, and wake the merge poller so the resolution starts on
 /// its next pass rather than its next sweep. Returns `true` when a conflict
@@ -371,6 +389,9 @@ async fn release_deferred_conflict_for_merge(
         // The durable request also releases deferral on the next watcher pass.
         tracing::warn!(%work_item_id, %pr_url, ?err, "merge_when_ready: deferred conflict will be released by the poller");
     }
+    // GitHub refused the submission, so there is no accepted head to record:
+    // the request is for the PR as the merge poller last saw it.
+    remember_merge_request(work_db, work_item_id, pr_url, None);
     publisher
         .publish_work_item_changed(product_id, work_item_id, "merge_conflict_resolution_requested")
         .await;
@@ -560,6 +581,9 @@ async fn handle_trunk_queue_merge(
                         "merge_when_ready: trunk submit succeeded but optimistic merge_queue_state write failed",
                     );
                 }
+                // Trunk reports no head for the submission, so the request is
+                // for the PR as the merge poller last saw it.
+                let remembered = remember_merge_request(&work_db, &work_item_id, &pr_url, None);
                 tracing::info!(
                     %work_item_id,
                     %pr_url,
@@ -576,7 +600,7 @@ async fn handle_trunk_queue_merge(
                         action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
                     },
                 );
-                if recorded.is_ok() {
+                if recorded.is_ok() || remembered {
                     publisher
                         .publish_work_item_changed(&product_id, &work_item_id, "trunk_merge_submitted")
                         .await;
@@ -1139,6 +1163,10 @@ mod trunk_queue_tests {
             panic!("expected a chore");
         };
         assert_eq!(task.merge_queue_state.as_deref(), Some("queued"));
+        assert!(
+            task.merge_intent.as_ref().is_some_and(|intent| intent.is_active()),
+            "the person's merge request must be remembered beyond this submission"
+        );
         assert!(
             task.merge_queue_detail.as_deref().unwrap_or("").contains("trunk"),
             "expected merge_queue_detail to carry source=trunk, got: {:?}",
@@ -1912,6 +1940,16 @@ mod trunk_queue_tests {
                 .is_some(),
             "the successful request must persist before its reconcile kick"
         );
+        let standing = task
+            .merge_intent
+            .as_ref()
+            .expect("the person's merge request must be remembered beyond this submission");
+        assert!(standing.is_active());
+        assert_eq!(
+            standing.approved_head_sha.as_deref(),
+            Some("head-993"),
+            "the request is for the head GitHub accepted"
+        );
         assert_eq!(
             task.status,
             TaskStatus::InReview,
@@ -2023,6 +2061,10 @@ mod trunk_queue_tests {
         };
         assert_eq!(task.status, TaskStatus::InReview);
         assert_eq!(task.merge_queue_state.as_deref(), Some("resolving_conflicts"));
+        assert!(
+            task.merge_intent.as_ref().is_some_and(|intent| intent.is_active()),
+            "a request GitHub refused over the conflict still stands"
+        );
         assert!(
             task.merge_queue_detail
                 .unwrap()

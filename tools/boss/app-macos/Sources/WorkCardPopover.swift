@@ -115,6 +115,9 @@ struct WorkCardPopoverView: View {
                     metadataRow("Phase", value: "\(ordinal)")
                 }
                 metadataPRRow(prURL: task.prURL)
+                if let mergeIntent = task.mergeIntent {
+                    metadataRow("Merge request", value: mergeIntent.popoverText)
+                }
                 docRow
                 reviewGuideRow
                 if let origin = task.followupOriginDescription {
