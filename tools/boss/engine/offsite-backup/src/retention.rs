@@ -247,6 +247,8 @@ mod tests {
         for name in [
             "state.db.bak-20260101-000000",
             "state.db.bak-20260101-000000.123.4.tmp",
+            "state.db.bak-20260101-000000.123-4.relay.123.5.tmp",
+            "state.db.bak-20260101-000000.123-4.relay",
             "unrelated",
         ] {
             let file = std::fs::File::create(tmp.path().join(name)).unwrap();
@@ -255,7 +257,7 @@ mod tests {
         std::fs::write(tmp.path().join("state.db.bak-20260102-000000.2.2.tmp"), b"active").unwrap();
         let result = prune_staging(tmp.path()).unwrap();
         assert!(result.failures.is_empty());
-        assert_eq!(result.removed.len(), 2);
+        assert_eq!(result.removed.len(), 4);
         assert_eq!(
             names(tmp.path()),
             vec!["state.db.bak-20260102-000000.2.2.tmp", "unrelated"]

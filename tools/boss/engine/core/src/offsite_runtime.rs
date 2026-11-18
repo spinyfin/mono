@@ -238,7 +238,11 @@ impl OffsiteRuntime {
                 OFFSITE_CONFIG_INVALID.inc(&self.registry);
             })
             .and_then(|dest| {
-                self.prune_staging();
+                for dir in std::iter::once(self.staging_dir.clone())
+                    .chain(boss_engine_offsite_backup::relay_candidates(&dest.host_dir))
+                {
+                    self.prune_staging(&dir);
+                }
                 let outcome =
                     boss_engine_offsite_backup::copy_open_to_offsite(file, &name, &dest.host_dir, &self.staging_dir)?;
                 Ok((dest, outcome))
@@ -292,12 +296,12 @@ impl OffsiteRuntime {
     }
 
     /// Clear staging files a crashed copy left behind. Never blocks the copy.
-    fn prune_staging(&self) {
-        let failures = match boss_engine_offsite_backup::prune_staging(&self.staging_dir) {
+    fn prune_staging(&self, staging_dir: &Path) {
+        let failures = match boss_engine_offsite_backup::prune_staging(staging_dir) {
             Ok(outcome) => outcome.failures,
             Err(error) => {
                 OFFSITE_RETENTION_FAILED.inc(&self.registry);
-                tracing::error!(error = %format!("{error:#}"), "database-backup: cannot clean off-machine staging");
+                tracing::error!(path = %staging_dir.display(), error = %format!("{error:#}"), "database-backup: cannot clean off-machine staging");
                 return;
             }
         };

@@ -22,10 +22,10 @@
 //! directory with a single rename and checked there. The agent sees each
 //! backup as one complete new file that is never modified afterwards.
 //!
-//! If the destination is on another volume a rename cannot cross over, so
-//! the copy is staged as an exclusive `state.db.bak-….<pid>.<sequence>.tmp`
-//! sibling inside the host directory and renamed there. The final name still
-//! only ever appears fully written.
+//! If the destination is on another volume, the complete local copy is
+//! relayed to outside staging on that volume and renamed in. No route streams
+//! partial bytes into the configured destination. Publication requires a
+//! writable outside staging location from which the destination accepts a rename.
 //!
 //! This crate returns errors and outcomes; metrics and the "never fail the
 //! local backup" policy live in the engine, which depends on this crate and
@@ -36,5 +36,7 @@ mod copy;
 mod retention;
 
 pub use config::{CONFIG_SECTION, OffsiteConfig, ValidatedDestination, sanitize_host_component};
-pub use copy::{BACKUP_FILE_PREFIX, CopyOutcome, backup_file_name, copy_open_to_offsite, copy_to_offsite};
+pub use copy::{
+    BACKUP_FILE_PREFIX, CopyOutcome, backup_file_name, copy_open_to_offsite, copy_to_offsite, relay_candidates,
+};
 pub use retention::{PruneOutcome, prune, prune_staging};

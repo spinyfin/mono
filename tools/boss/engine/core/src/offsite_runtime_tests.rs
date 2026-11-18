@@ -300,6 +300,27 @@ fn copy_is_staged_beside_settings_and_orphans_are_cleared() {
     let recent = rt.staging_dir.join("state.db.bak-20200102-000000.1.1.tmp");
     std::fs::write(&recent, b"in flight").unwrap();
 
+    let relay = tmp.path().join(".boss-offsite-relay");
+    assert!(boss_engine_offsite_backup::relay_candidates(&host_dir(&dest)).contains(&relay));
+    std::fs::create_dir(&relay).unwrap();
+    let orphan_names = [
+        "state.db.bak-20200101-000000.123-1.relay.123.2.tmp",
+        "state.db.bak-20200101-000000.123-1.relay",
+    ];
+    for name in orphan_names {
+        File::create(relay.join(name))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    let active = relay.join("state.db.bak-20200101-000000.123-2.relay");
+    std::fs::write(&active, b"active").unwrap();
+    let unrelated = relay.join("notes");
+    File::create(&unrelated)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
     let snap = tmp.path().join("state.db.bak-20260101-120000");
     std::fs::write(&snap, b"snapshot").unwrap();
     rt.copy_and_prune(rt.open_snapshot(&snap).unwrap());
@@ -309,6 +330,11 @@ fn copy_is_staged_beside_settings_and_orphans_are_cleared() {
         b"snapshot"
     );
     assert_eq!(std::fs::read_dir(host_dir(&dest)).unwrap().count(), 1);
+    for name in orphan_names {
+        assert!(!relay.join(name).exists(), "day-old relay orphan removed");
+    }
+    assert!(active.exists());
+    assert!(unrelated.exists());
     assert!(!orphan.exists(), "day-old staging orphan removed");
     assert!(recent.exists(), "recent staging file left alone");
     assert_eq!(std::fs::read_dir(&rt.staging_dir).unwrap().count(), 1);
