@@ -292,3 +292,33 @@ fn continuing_after_permission_without_a_stop_preserves_the_wait() {
     reg.apply_event(1, &stop());
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingOnWork);
 }
+
+#[test]
+fn resumed_wait_cannot_hide_a_later_human_prompt() {
+    for wait in [DeclaredWait::Live, DeclaredWait::Lapsed] {
+        for resume in [
+            working(),
+            WorkerEvent::UserPromptSubmit {
+                session_id: "s".into(),
+                prompt: "Continue".into(),
+            },
+        ] {
+            let (reg, waits) = fixture();
+            reg.apply_event(1, &working());
+            waits.set(wait);
+            reg.apply_event(1, &stop());
+            assert!(!reg.get(1).unwrap().activity.needs_human());
+
+            reg.apply_event(1, &resume);
+            assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+            assert_eq!(waits.declared_wait("run-1", now()), DeclaredWait::None);
+            reg.apply_event(1, &stop());
+            reg.apply_event(1, &notification(IDLE_PROMPT));
+            let parked = &reg.snapshot()[0];
+            assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+            assert!(parked.activity.needs_human());
+            assert_eq!(parked.live_status.as_deref(), Some(crate::AWAITING_INPUT_SUBTITLE));
+            assert!(reg.reconcile_declared_waits(now()).is_empty());
+        }
+    }
+}

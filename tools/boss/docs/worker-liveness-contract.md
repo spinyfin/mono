@@ -278,22 +278,22 @@ Three things close the ordering hole:
   from the pane's activity at write time, inside a gate that serializes the
   writes, so an older handler that stalls can never leave `waiting_human`
   over a pane that has since moved on.
-- **A declared wait survives turns until its bounded deadline.** A wait
-  (`boss propose wait`) reserves time for a background job. A human asking
-  for status, a coordinator prompt, or an autonomous wakeup does not prove
-  that job finished. Main-session hooks, including late or reordered hooks,
-  therefore neither revoke nor extend the grant. The live snapshot hides
-  its wait caption during an active turn (and keeps permission prompts
-  visible); after Stop the unexpired wait is visible again. The declaration
-  still records hook order so a Stop before the declaration cannot turn a
-  current permission prompt into a job wait.
+- **A declared wait belongs to one park.** A wait (`boss propose wait`)
+  reserves time for a background job until its deadline or the next
+  main-session turn after Stop. Resuming consumes the declaration without
+  refunding its charged duration; it does not assert that the job finished.
+  The worker must declare another wait if it parks on that job again.
+  Emission-order turn boundaries protect newer declarations from late hooks,
+  and subagent activity does not consume the main session's wait. The live
+  snapshot hides the wait caption during an active turn and keeps permission
+  prompts visible.
 
-  Completion checks the active wait before recording a nudge: status replies
-  consume no consecutive or total breaker strikes, and do not clear earlier
-  legitimate strikes. A renewal replaces the deadline and charges its full
-  duration against the existing per-execution cap. The two-hour declaration
-  limit, cumulative cap, expiry, teardown cleanup, and other safety checks
-  are unchanged. Workers need to renew only when the job needs more time.
+  Completion checks the active wait before recording a nudge: while the
+  declaration is active, checks consume no consecutive or total breaker
+  strikes and do not clear earlier legitimate strikes. A renewal replaces
+  the deadline and charges its full duration against the existing
+  per-execution cap. The two-hour declaration limit, cumulative cap, expiry,
+  teardown cleanup, and other safety checks still apply.
 
   Expiry does not itself run a timer callback or fail the execution. The
   merge poller retains a `WorkerWait` nudge intent and calls
