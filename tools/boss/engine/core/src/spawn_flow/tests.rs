@@ -1370,9 +1370,9 @@ async fn declared_checkleft_exports_the_worker_bin_launcher() {
     std::fs::write(workspace.path().join("REPOBIN.toml"), "[tools.checkleft]\n").unwrap();
     let worker_bin_dir = TempDir::new().unwrap();
     // CHECKLEFT_BIN must only be exported when the launcher was actually
-    // written -- create it here to model the real `ensure_worker_bin_dir`
-    // success path, distinct from the write-failed case covered by
-    // `declared_checkleft_without_a_written_launcher_is_not_exported`.
+    // written -- create it here to model the spawn path's launcher sync
+    // having succeeded, distinct from the missing-launcher case covered
+    // by `declared_checkleft_without_a_written_launcher_is_not_exported`.
     std::fs::write(worker_bin_dir.path().join("checkleft"), b"#!/bin/sh\n").unwrap();
     let spawner = ok_spawner_capturing();
     let mut input = sample_input(&workspace, spawner.tmux_runner.clone());

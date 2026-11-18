@@ -253,7 +253,9 @@ fn apply_checkleft_bin_env(env: &mut Vec<EnvVar>, workspace_path: &Path) {
     // CHECKLEFT_BIN being set, a bare `checkleft` would be blocked at the
     // same time with nothing that works left.
     let checkleft_bin = boss_engine_worker_bin::checkleft_bin_in(Path::new(&worker_bin_dir));
-    if boss_engine_worker_bin::repobin_declares_tool(workspace_path, "checkleft") && checkleft_bin.is_file() {
+    if boss_engine_worker_bin::environment::workspace_declares_repo_tool(workspace_path, "checkleft")
+        && checkleft_bin.is_file()
+    {
         set_env_var(
             env,
             boss_engine_worker_bin::CHECKLEFT_BIN_ENV,
