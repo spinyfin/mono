@@ -630,7 +630,7 @@ fn prepush_gate_text(
         Some(true) if conflict_resolution => bazel_conflict_resolution_gate_text(worker_signal_seam_enabled),
         Some(true) => bazel_prepush_gate_text(worker_signal_seam_enabled, run_done_seam_enabled),
         Some(false) => repo_gate::non_bazel_gate_text(workspace_path, conflict_resolution, worker_signal_seam_enabled),
-        None => repo_gate::unresolved_gate_text(conflict_resolution, worker_signal_seam_enabled),
+        None => repo_gate::unresolved_gate_text(conflict_resolution, worker_signal_seam_enabled, run_done_seam_enabled),
     }
 }
 
@@ -1945,14 +1945,9 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
-    // The pre-push gate above (Bazel or non-Bazel, including the unresolved
-    // discovery gate) points a build-failure sentence at `"$BOSS_BIN" propose
-    // blocked` and, on the non-conflict-resolution variant, at the "If you
-    // are blocked or the work is bigger than estimated" section for the
-    // exact syntax. Revisions never received that section, leaving the
-    // cross-reference dangling and the worker with no `--level` sibling
-    // verb or bootstrap-fallback guidance. Push it here so every path that
-    // renders the gate also renders what it points at.
+    // Include the escalation section so every revision gate (Bazel, non-Bazel
+    // or unresolved) has the blocker syntax, --level sibling verb, and
+    // bootstrap-fallback guidance it references.
     out.push_str(&worker_escalation_protocol_directive(
         worker_signal_proposals_seam_enabled,
     ));
@@ -2053,16 +2048,17 @@ fn compose_queue_ci_fragment(attempt: &CiRemediation, bazel_workspace: Option<bo
             "<Bazel result summary>",
         ),
         Some(false) => (
-            "3. On that main-rebased tree, re-run each failing job's own documented invocation in full — the captured verification contract (`BOSS_CI_VERIFICATION.json`) when present, otherwise the job's own npm/pnpm/yarn invocation (for example `npm ci && npm run build && npm test`) or `checkleft run` for a lint job. The engine accepts only those commands as evidence; cargo, go, make, and other undocumented invocations are rejected. If a job has no declaration and is not an npm/pnpm/yarn or lint job, stop as blocked naming that the engine will not accept the job's command as evidence. A fast whole-job failure requires that full invocation and its documented target set, not one isolated test. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
+            "3. On that main-rebased tree, re-run each failing job's own documented invocation in full — the captured verification contract (`BOSS_CI_VERIFICATION.json`) when present, otherwise the job's own npm/pnpm/yarn invocation (for example `npm ci && npm run build && npm test`) or `checkleft run` for a lint job. The engine accepts only those commands as evidence; cargo, go, make, and other undocumented invocations are rejected. If a job has no declaration and is not an npm/pnpm/yarn or lint job, use the evidence-unavailable escalation below naming the rejected command. A fast whole-job failure requires that full invocation and its documented target set, not one isolated test. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
             "<the failing job's documented invocation, copied in full>",
             "<command result summary with the real exit code>",
         ),
         None => (
-            "3. On that main-rebased tree, identify the build system on this execution host (`MODULE.bazel`, `WORKSPACE`, `WORKSPACE.bazel`, or `BUILD.bazel` at the workspace root). If Bazel markers are present, use `bazel test` for EVERY failed test target and `bazel build` for every failed build target (a fast whole-job failure requires the job's FULL build/test invocation). If they are not, re-run each failing job's captured verification contract (`BOSS_CI_VERIFICATION.json`) in full; for jobs without a declaration the engine accepts only the job's own npm/pnpm/yarn invocation or `checkleft run` for a lint job. If nothing discoverable matches those, stop as blocked. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
+            "3. On that main-rebased tree, identify the build system on this execution host (`MODULE.bazel`, `WORKSPACE`, `WORKSPACE.bazel` at the workspace root). If Bazel markers are present, use `bazel test` for EVERY failed test target and `bazel build` for every failed build target (a fast whole-job failure requires the job's FULL build/test invocation). If they are not, re-run each failing job's captured verification contract (`BOSS_CI_VERIFICATION.json`) in full; for jobs without a declaration the engine accepts only the job's own npm/pnpm/yarn invocation or `checkleft run` for a lint job. If nothing discoverable matches those, use the evidence-unavailable escalation below. Include all shards; do not use test filters, suppress tests, or bypass caches. Fix failures and repeat the affected verification. Record each command, output and real exit code. A passing rerun on the old PR branch does not count.",
             "<the command the engine accepts for this job>",
             "<command result summary with the real exit code>",
         ),
     };
+    out.push_str(crate::work::queue_ci_evidence::EVIDENCE_UNAVAILABLE);
     out.push_str(&format!(
         r#"
 Before any verdict (including flaky, infra, unfixable or cannot complete):
@@ -2558,12 +2554,13 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: Opt
         let verify_failed_targets = match bazel_workspace {
             Some(true) => "run every failed target with Bazel (the full job invocation for whole-job failures)",
             Some(false) => {
-                "run every failed target with that job's own documented invocation in full (the command the job's CI script actually runs)"
+                "run every failed target with that job's own documented invocation in full: the captured BOSS_CI_VERIFICATION.json contract when present, otherwise the job's own npm/pnpm/yarn invocation or `checkleft run` for a lint job; other undeclared commands (cargo, go, make) are not accepted as evidence"
             }
             None => {
                 "identify the job's build system on this execution host and re-run the command the engine accepts as evidence (a Bazel build/test of the job's targets if Bazel markers are present; otherwise the job's own npm/pnpm/yarn invocation, `checkleft run` for a lint job, or the exact command in BOSS_CI_VERIFICATION.json)"
             }
         };
+        out.push_str(crate::work::queue_ci_evidence::EVIDENCE_UNAVAILABLE);
         out.push_str("### If there is no failing build to find (STOP — do not invent one)\n\n");
         out.push_str(&format!(
             "The engine could not identify a failing build for this eviction, and its own \
