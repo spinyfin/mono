@@ -1,5 +1,7 @@
 use super::*;
-// Run by `:work_db_scale_test`, which selects tests by `scale` in their path.
+// Run by `:work_db_scale_test`. The module is named `scale` so
+// TESTBRIDGE_TEST_ONLY=scale selects it; `tests::scale_selection_guard` checks
+// that pairing.
 #[cfg(boss_scale_tests)]
 #[path = "spoke_ingress_scale.rs"]
 mod scale;

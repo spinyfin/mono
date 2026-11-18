@@ -32,6 +32,7 @@ mod review_recovery_ownership;
 mod review_stage_metadata;
 mod review_verdict_apply_tests;
 mod stalled_reviewer;
+#[cfg(boss_scale_tests)]
 mod sweep_reads;
 mod work_item_lifecycle;
 

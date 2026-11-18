@@ -130,7 +130,8 @@ fn in_flight_plan_avoids_terminal_history_and_sort() {
 
 /// The 61-way contention reproduction runs over a 50,000-row, 100 MB history
 /// and reports timings: a scale measurement, built and run only by
-/// `:work_db_scale_test` (which selects tests by `scale` in their path).
+/// `:work_db_scale_test`. The module is named `scale` so the target's name
+/// filter selects it.
 #[cfg(boss_scale_tests)]
 mod scale {
     use super::*;
