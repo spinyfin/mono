@@ -158,6 +158,7 @@ struct WorkCardSnapshot: Equatable {
     let mergeQueueState: String?
     let mergeQueueDetail: String?
     let prMergeableState: String?
+    let conflictResolutionDeferred: Bool
     let externalRefLink: ExternalRefLinkPresentation?
     /// Review-card guide affordance, derived from `task.reviewGuideLifecycle`
     /// / `reviewGuideReadableVersionId`. Only rendered in Review (matching
@@ -421,6 +422,7 @@ struct WorkCardSnapshot: Equatable {
             mergeQueueState: mergeQueueState,
             mergeQueueDetail: mergeQueueDetail,
             prMergeableState: task.prMergeableState,
+            conflictResolutionDeferred: task.conflictResolutionDeferred,
             externalRefLink: context.externalRefLink,
             reviewGuidePresentation: reviewGuidePresentation,
             ambiguousRepoNames: context.ambiguousRepoNames,

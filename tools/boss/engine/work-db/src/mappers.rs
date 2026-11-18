@@ -315,6 +315,8 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         merge_queue_detail: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
         driver: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
         pr_mergeable_state: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
+        // Derived from the conflict ledger during board assembly.
+        conflict_resolution_deferred: false,
         // Base task mapping leaves external_ref unset; map_task_with_external_ref
         // populates it from columns 36-40.
         external_ref: None,

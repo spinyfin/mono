@@ -34,6 +34,48 @@ final class PrCiIndicatorConflictTests: XCTestCase {
         XCTAssertEqual(ci.tint, .yellow)
     }
 
+    func testDeferredConflictIsVisibleAndInformational() {
+        let indicator = PrConflictIndicator(prMergeableState: "conflicting", resolutionDeferred: true)
+        XCTAssertTrue(indicator.isVisible)
+        XCTAssertEqual(indicator.labelText, "Conflicts — resolves on merge")
+        XCTAssertEqual(indicator.tint, .secondary)
+        XCTAssertEqual(indicator.systemImage, "info.circle")
+        XCTAssertTrue(indicator.tooltipText.contains("automatically when you request a merge"))
+    }
+
+    func testReleasedOrFailedResolutionKeepsErrorPresentation() {
+        let indicator = PrConflictIndicator(prMergeableState: "conflicting", resolutionDeferred: false)
+        XCTAssertTrue(indicator.isVisible)
+        XCTAssertEqual(indicator.labelText, "conflicts")
+        XCTAssertEqual(indicator.tint, .red)
+        XCTAssertEqual(indicator.systemImage, "exclamationmark.triangle.fill")
+    }
+
+    func testDeferralDoesNotInventAConflict() {
+        XCTAssertFalse(PrConflictIndicator(prMergeableState: "mergeable", resolutionDeferred: true).isVisible)
+        XCTAssertFalse(PrConflictIndicator(prMergeableState: nil, resolutionDeferred: true).isVisible)
+    }
+
+    @MainActor
+    func testEngineDeferralPayloadReachesFooterAndDefaultsToError() throws {
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var payload: [String: Any] = [
+            "id": "conflict-card", "product_id": "product", "kind": "chore",
+            "name": "Conflict card", "description": "", "status": "in_review",
+            "created_at": "2026-11-14", "updated_at": "2026-11-14",
+            "pr_mergeable_state": "conflicting",
+            "pr_url": "https://github.com/x/y/pull/42",
+        ]
+        for deferred in [nil, true, false] as [Bool?] {
+            payload["conflict_resolution_deferred"] = deferred
+            let task = try XCTUnwrap(client.parseTask(payload))
+            let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .review))
+            let footer = WorkBoardCardFooterSlice(snapshot: snapshot)
+            XCTAssertEqual(footer.conflictResolutionDeferred, deferred ?? false)
+            XCTAssertEqual(footer.prMergeableState, "conflicting")
+        }
+    }
+
     // MARK: - Shared predicate
 
     /// `PrMergeability` is the single spelling of the conflicting state,
