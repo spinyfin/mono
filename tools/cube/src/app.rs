@@ -23,6 +23,7 @@ mod lease_reclaim;
 mod periodic_cleanup;
 mod pr;
 mod pr_head;
+mod process_guard;
 mod provision;
 mod reclaim;
 mod reconcile;

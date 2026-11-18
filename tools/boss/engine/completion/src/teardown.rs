@@ -245,6 +245,9 @@ impl WorkerCompletionHandler {
         }
         let driver_ms = driver_started.elapsed().as_millis();
 
+        // Cube verifies lease ownership before its awaited release sweep.
+        // A workspace path alone can already belong to a later execution.
+
         let cube_started = Instant::now();
         let mut cube_timed_out = false;
         let mut lease_released = false;
