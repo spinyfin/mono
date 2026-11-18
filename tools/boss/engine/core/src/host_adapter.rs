@@ -753,19 +753,24 @@ fn non_empty(stderr: &str, status: i32) -> String {
 /// Mirrors `wrapper_distribution`'s staging pattern.
 fn stage_local_file(run_id: &str, label: &str, contents: &str) -> Result<StagedFile> {
     use std::os::unix::fs::DirBuilderExt;
-    let dir = std::env::temp_dir()
-        .join("boss-remote-input")
-        .join(crate::ssh_transport::sanitize_for_path(run_id));
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let root = std::env::temp_dir().join("boss-remote-input");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
+    // Each guard owns its directory as well as its file: removing a shared
+    // empty directory can race another transfer opening its staging file.
     // Clock resolution can repeat across concurrent transfers in one process.
-    // Each guard must own a distinct path so one drop cannot unlink another.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = format!(
         "{}-{}",
         boss_engine_utils::epoch_time::now_epoch_nanos(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let path = dir.join(format!("boss-remote-{label}.{}.{}.tmp", std::process::id(), nonce));
+    let dir = root.join(format!(
+        "{}-{}-{nonce}",
+        crate::ssh_transport::sanitize_for_path(run_id),
+        std::process::id(),
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let path = dir.join(format!("boss-remote-{label}.tmp"));
     let staged = StagedFile(path);
     crate::driver::initial_prompt::write_private(staged.path(), contents.as_bytes())?;
     Ok(staged)
@@ -2088,9 +2093,16 @@ mod tests {
     fn stage_local_file_writes_contents_and_embeds_label() {
         use std::os::unix::fs::PermissionsExt;
         let staged = stage_local_file("staging-mode-test", "mylabel", "hello world").expect("staging file");
-        assert_eq!(
-            staged.path().parent().unwrap().file_name().unwrap(),
-            "staging-mode-test"
+        assert!(
+            staged
+                .path()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("staging-mode-test-")
         );
         assert_eq!(
             std::fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777,
@@ -2111,6 +2123,17 @@ mod tests {
             file_name.contains("mylabel"),
             "filename {file_name:?} should embed the label",
         );
+    }
+
+    #[test]
+    fn same_run_staging_guards_own_separate_directories() {
+        let first = stage_local_file("same-run-staging", "input", "first").unwrap();
+        let second = stage_local_file("same-run-staging", "input", "second").unwrap();
+        let first_directory = first.path().parent().unwrap().to_path_buf();
+        assert_ne!(Some(first_directory.as_path()), second.path().parent());
+        drop(first);
+        assert!(!first_directory.exists());
+        assert_eq!(std::fs::read_to_string(second.path()).unwrap(), "second");
     }
 
     #[test]

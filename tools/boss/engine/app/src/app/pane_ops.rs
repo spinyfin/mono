@@ -9,6 +9,8 @@
 
 use super::*;
 
+mod interrupt_recovery_prep;
+
 /// Surfaced by [`ServerState::focus_worker_pane`]. Distinguishes
 /// engine-side resolution failures (run id has no allocated slot)
 /// from transport/app failures so the `bossctl` handler can produce
@@ -526,8 +528,7 @@ impl ServerState {
         let press_interval = plan.map(|p| p.gesture.press_interval).unwrap_or(Duration::ZERO);
         let recovery_prep = boss_engine_completion::driver_transcript::driver_for_execution(&self.work_db, run_id)
             .and_then(|driver| {
-                driver
-                    .prepare_interrupt_recovery(run_id)
+                interrupt_recovery_prep::prepare(&self.work_db, driver.as_ref(), run_id)
                     .map(|snapshot| (driver, snapshot))
             });
         let mut result = Ok(slot_id);

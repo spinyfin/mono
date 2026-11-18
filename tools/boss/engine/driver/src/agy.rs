@@ -22,10 +22,10 @@ use boss_ssh_transport::shell_quote;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
-    InterruptDelivery, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput,
-    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ProgressSessionConfig,
-    ProgressSessionNormalizer, SettingsLogCheckSpec, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    InterruptDelivery, InterruptPlan, InterruptRecoverySnapshot, MidTurnPaneInput, ModelMenu, PermissionArtifacts,
+    PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
+    ProgressSessionConfig, ProgressSessionNormalizer, SettingsLogCheckSpec, SpawnPlan, SpawnRequest,
+    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 
 mod environment;
@@ -37,6 +37,8 @@ mod progress;
 #[cfg(test)]
 mod test_environment;
 mod transcript;
+mod turn_boundary;
+mod turn_end_recovery;
 
 use progress::AgyProgressSession;
 
@@ -420,8 +422,8 @@ impl AgentDriver for AgyDriver {
         )))
     }
 
-    fn turn_boundary(&self, _event: &WorkerEvent) -> Option<TurnEnd> {
-        None
+    fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
+        turn_boundary::turn_boundary(event)
     }
 
     fn tool_use_interception_wiring(&self, _config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
@@ -489,11 +491,30 @@ impl AgentDriver for AgyDriver {
         InterruptDelivery::Unsupported
     }
 
-    // Pane viability study Q6: one Esc cancels and skips Stop. The plain-text
-    // --log-file line is "Cancelling in-progress response for conversation <cid>".
-    // No JSONL recovery source exists, so interrupts remain unsupported.
+    // Recovery is implemented below, but control verbs stay unsupported
+    // until the startup contract makes this driver launch-ready.
     fn interrupt_plan(&self) -> Option<InterruptPlan> {
         None
+    }
+
+    fn prepare_interrupt_recovery(
+        &self,
+        run_id: &str,
+        claimed_session_id: Option<&str>,
+    ) -> Option<InterruptRecoverySnapshot> {
+        turn_end_recovery::prepare_snapshot(run_id, claimed_session_id)
+    }
+
+    // This shape check is deliberately identity-free; is_interrupt_recovery_line
+    // is the authoritative matcher against the persisted parent identity.
+    fn is_interrupt_recovery_turn_end(&self, raw: &serde_json::Value) -> bool {
+        raw.as_str()
+            .and_then(turn_end_recovery::cancelled_conversation)
+            .is_some()
+    }
+
+    fn is_interrupt_recovery_line(&self, line: &str, snapshot: &InterruptRecoverySnapshot) -> bool {
+        turn_end_recovery::cancelled_conversation(line) == Some(snapshot.session_id.as_str())
     }
 
     fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
@@ -864,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupts_are_unsupported_without_recovery() {
+    fn interrupts_remain_unsupported_until_launch_is_ready() {
         let driver = AgyDriver::default();
         assert_eq!(driver.interrupt(), InterruptDelivery::Unsupported);
         assert!(driver.interrupt_plan().is_none());

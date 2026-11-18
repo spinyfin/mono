@@ -336,7 +336,7 @@ impl AgyProgressSession {
             "PostInvocation" => Ok(None),
             "Stop" => match self.accept_identity(&session_id, false)? {
                 IdentityDecision::Drop => Ok(None),
-                IdentityDecision::Accept { .. } => normalize_hook_event(&canonical).map(Some),
+                IdentityDecision::Accept { .. } => super::turn_boundary::normalize_stop(&canonical),
             },
             "PreToolUse" | "PostToolUse" => {
                 self.refresh_identity()?;
