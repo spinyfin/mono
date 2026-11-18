@@ -167,7 +167,7 @@ impl Fx {
     fn fail_to_launch(&self, run: &str) {
         self.sql(&format!(
             "UPDATE work_executions
-             SET pre_start_failure_count = 1, last_error = '{LAUNCH_ERROR}' WHERE id = '{run}'"
+             SET launch_failed = 1, pre_start_failure_count = 1, last_error = '{LAUNCH_ERROR}' WHERE id = '{run}'"
         ));
     }
 
@@ -713,6 +713,40 @@ fn failed_runs_with_driver_sessions_still_file_the_infrastructure_question() {
     assert!(next.retracted.is_empty(), "{next:?}");
     assert_eq!(fx.open_question(&id).unwrap().question.id, question.question.id);
     assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+}
+
+/// A pre-run failure that was retried leaves `pre_start_failure_count` set on a
+/// run whose agent then started: if it dies, it is an infrastructure failure
+/// of the item, not a failed launch.
+#[test]
+fn a_run_retried_after_a_pre_run_failure_that_started_and_died_counts_as_a_failure() {
+    let fx = fx();
+    let id = fx.conflicted("Retried, started, died");
+    for (ago, error) in [(2 * HOUR, "driver error"), (HOUR, "no disposition")] {
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        fx.sql(&format!(
+            "UPDATE work_executions SET pre_start_failure_count = 1 WHERE id = '{}'",
+            execution.id
+        ));
+        fx.db
+            .start_progression_run_on_local_host(&execution.id, "progression-41", "/tmp/scratch", true)
+            .unwrap();
+        fx.db.fail_progression_execution(&execution.id, error).unwrap().unwrap();
+        fx.finish(&execution.id, "failed", None, ago, "fp", S5);
+    }
+    assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (0, 1), "{pass:?}");
+    assert_eq!(pass.asked[0].reason, LadderReason::InfrastructureFailure);
 }
 
 #[test]

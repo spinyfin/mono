@@ -275,3 +275,36 @@ fn launch_failure_migration_preserves_started_runs_and_is_applied_once() {
         .unwrap();
     assert_eq!(row, ("failed".into(), "123".into(), false));
 }
+
+#[test]
+fn launch_failed_backfill_marks_old_unstarted_progression_failures() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(CREATE_LEDGER).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE work_executions (
+             id TEXT PRIMARY KEY, kind TEXT, status TEXT, started_at TEXT,
+             pre_start_failure_count INTEGER NOT NULL DEFAULT 0,
+             launch_failed INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO work_executions (id, kind, status, started_at, pre_start_failure_count) VALUES
+             ('counted', 'progression', 'failed', '5', 1),
+             ('unstarted', 'progression', 'failed', NULL, 0),
+             ('died', 'progression', 'failed', '5', 0),
+             ('other_kind', 'work', 'failed', NULL, 1);",
+    )
+    .unwrap();
+    let migration = registry::all()
+        .into_iter()
+        .find(|m| m.id == "20261118_1200_backfill_progression_launch_failed")
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    apply(&tx, std::slice::from_ref(&migration), None).unwrap();
+    tx.commit().unwrap();
+    let marked: Vec<String> = conn
+        .prepare("SELECT id FROM work_executions WHERE launch_failed = 1 ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(marked, vec!["counted", "unstarted"]);
+}

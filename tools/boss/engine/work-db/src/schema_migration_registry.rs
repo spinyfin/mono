@@ -259,6 +259,21 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: "20261118_1200_backfill_progression_launch_failed".into(),
+            legacy_version: None,
+            apply: |conn| {
+                // Runs that failed before the marker existed were classified by
+                // their pre-start count or missing start time; record that
+                // classification so the predicate no longer needs the count.
+                conn.execute_batch(
+                    "UPDATE work_executions SET launch_failed = 1
+                     WHERE kind = 'progression' AND status = 'failed' AND launch_failed = 0
+                       AND (pre_start_failure_count > 0 OR started_at IS NULL)",
+                )?;
+                Ok(())
+            },
+        },
+        Migration {
             id: conflict_mismatch::MIGRATION_ID.into(),
             legacy_version: None,
             apply: conflict_mismatch::migrate,
