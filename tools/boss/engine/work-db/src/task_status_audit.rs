@@ -150,7 +150,13 @@ pub fn execute<P: rusqlite::Params>(
     params: P,
 ) -> rusqlite::Result<usize> {
     conn.execute_batch("SAVEPOINT task_status_write")?;
-    let operation = begin_operation_if_absent(conn)?;
+    let operation = match begin_operation_if_absent(conn) {
+        Ok(operation) => operation,
+        Err(err) => {
+            conn.execute_batch("ROLLBACK TO task_status_write; RELEASE task_status_write")?;
+            return Err(err);
+        }
+    };
     let result = (|| {
         conn.execute(
             "INSERT INTO task_status_audit_context (basis, actor) VALUES (?1, ?2)",
@@ -291,7 +297,13 @@ pub(crate) fn abandon<P: rusqlite::Params>(
     params: P,
 ) -> rusqlite::Result<usize> {
     conn.execute_batch("SAVEPOINT task_status_abandon")?;
-    let operation = begin_operation_if_absent(conn)?;
+    let operation = match begin_operation_if_absent(conn) {
+        Ok(operation) => operation,
+        Err(err) => {
+            conn.execute_batch("ROLLBACK TO task_status_abandon; RELEASE task_status_abandon")?;
+            return Err(err);
+        }
+    };
     let result = (|| {
         conn.execute(
             "INSERT INTO task_status_audit_context (basis, actor, reason_code, detail) VALUES (?1, ?2, ?3, ?4)",

@@ -245,6 +245,9 @@ fn park_behind(
     let enabled_dispatch = needs_fresh_run && !prerequisite.autostart;
     let actor = attribution.actor;
     let basis = attribution.basis("approve_in_tx");
+    // One operation across the autostart enable, the todo reset and the
+    // dependency-edge demotion to `blocked`, so the history correlates them.
+    let operation = crate::task_status_audit::begin_operation_on(conn)?;
     if enabled_dispatch {
         crate::task_status_audit::execute(
             conn,
@@ -297,6 +300,7 @@ fn park_behind(
     add_dependency_edge_in_tx(pending, conn, &task.id, &prerequisite.id, RELATION_BLOCKS, now)?;
     queue_gated_execution(conn, task, question)?;
     stamp_answered_waiting(conn, &task.id)?;
+    operation.end()?;
     tracing::info!(
         work_item_id = %task.id,
         prerequisite_id = %prerequisite.id,

@@ -1671,6 +1671,21 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
     is_live: F,
     actor: &str,
 ) -> Result<WorkExecution> {
+    // One operation for this request: stale-governing abandonment, status
+    // clears, and flag writes share an `operation_id`.
+    let operation = crate::task_status_audit::begin_operation_on(conn)?;
+    let execution = request_execution_in_tx_body(pending, conn, input, is_live, actor)?;
+    operation.end()?;
+    Ok(execution)
+}
+
+fn request_execution_in_tx_body<F: FnOnce(&str) -> bool>(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    input: RequestExecutionInput,
+    is_live: F,
+    actor: &str,
+) -> Result<WorkExecution> {
     super::local_worker_quarantine_store::ensure_work_item_not_quarantined_in(conn, &input.work_item_id)?;
     let RequestExecutionInput {
         work_item_id,
@@ -1699,10 +1714,6 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // created or refreshed it; it must never become a work-item field.
         requested_host_id: _,
     } = input;
-
-    // One operation for this request: stale-governing abandonment, status
-    // clears, and flag writes share an `operation_id`.
-    let _operation = crate::task_status_audit::begin_operation_on(conn)?;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     // An explicit start does not override a park: the row stays skipped by every
