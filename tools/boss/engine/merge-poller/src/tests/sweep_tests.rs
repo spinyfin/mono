@@ -580,13 +580,17 @@ async fn sweep_drives_full_ci_failure_cycle() {
     // only "ci_revision_in_flight" fires (pass 1). "ci_failure_resolved" is
     // NOT emitted when the parent stayed in_review throughout — symmetric
     // with the conflict path (merge_conflict_resolved is also suppressed
-    // when the parent never blocked). Poll-state events excluded.
+    // when the parent never blocked). Poll-state events excluded, and so are
+    // the blocked-PR sweep's own `blocked_pr_*` publishes: those carry the
+    // card's stored reason, not a lifecycle transition.
     let reasons: Vec<String> = publisher
         .events
         .lock()
         .await
         .iter()
-        .filter(|(p, w, r)| p == &product && w == &chore && r != "pr_poll_state_updated")
+        .filter(|(p, w, r)| {
+            p == &product && w == &chore && r != "pr_poll_state_updated" && !r.starts_with("blocked_pr_")
+        })
         .map(|(_, _, r)| r.clone())
         .collect();
     assert_eq!(reasons, vec!["ci_revision_in_flight".to_owned()],);

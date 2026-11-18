@@ -5,10 +5,10 @@ An open Boss-tracked PR can sit in the Review column's **Blocked** section for h
 Code:
 
 - `tools/boss/engine/blocked-pr-diagnosis/` — the pure rules (`BlockedFacts` → `Diagnosis { category, reason, action }`), unit-tested per category.
-- `tools/boss/engine/core/src/blocked_pr_sweep.rs` — gathers facts from the DB, applies the action, stores the reason. Runs at the end of `merge_poller::run_one_pass_observed`.
-- `tools/boss/engine/core/src/ci_transient_retry.rs` — the transient-CI job retry, run inside `ci_watch::on_ci_failure_detected_with` where the failing checks are known.
+- `tools/boss/engine/merge-poller/src/blocked_pr_sweep.rs` — gathers facts from the DB, applies the action, stores the reason. Runs at the end of `merge_poller::run_one_pass_observed`.
+- `tools/boss/engine/merge-poller/src/ci_transient_retry.rs` — the transient-CI job retry, run inside `ci_watch::on_ci_failure_detected_with` where the failing checks are known.
 - `tools/boss/engine/ci-log-reader/src/transient.rs` — the transient-vs-deterministic classifier for a failed Buildkite job.
-- `tools/boss/engine/core/src/work/blocked_pr.rs` — storage: `pr_blocked_diagnoses` (the card's reason) and `pr_blocked_remediations` (the ledger every budget is counted from).
+- `tools/boss/engine/work-db/src/blocked_pr.rs` — storage: `pr_blocked_diagnoses` (the card's reason) and `pr_blocked_remediations` (the ledger every budget is counted from).
 - `Task::review_blocked_reason` / `review_blocked_category` on the wire; `WorkBoardCardTitleRow` renders the reason under the title as `Blocked: …`.
 
 ## Inventory: what blocks or stalls a Review-lane PR
@@ -28,6 +28,8 @@ Code:
 | `status = blocked` with another reason (`deletion_signoff`, free-form)                                                               | —                                                                                                                                                  | human                                                                                                                                   | —                                                                                                                                                                                                | **Surface**: `Needs you: blocked: <reason> — <detail>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 The sweep never: marks a check passed, overrides branch protection, retries anything not positively classified, acts on `main` or a merge queue build, merges, or relabels a card without a stored diagnosis.
+
+A parked card is never a sweep candidate (`list_blocked_pr_sweep_candidates` applies `parking::upkeep_eligible_task_sql`): it gets no stored reason and no re-dispatch, and a reason stored before it was parked is removed on the next pass. The transient-CI retry is equally withheld, because the merge poller gates its open-PR reactions for parked cards before `ci_watch` runs.
 
 ## Transient classification
 
