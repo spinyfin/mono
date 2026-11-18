@@ -527,9 +527,18 @@ impl ExecutionCoordinator {
             self.validate_requested_host(&input.work_item_id, &host_id)?;
         }
         let requested_host_id = input.requested_host_id.clone();
+        let work_item_id = input.work_item_id.clone();
         let execution = self
             .work_db
-            .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))?;
+            .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))
+            .inspect_err(|_| {
+                // A failed startup worker scan holds every item, so a refusal
+                // by the hold is a global outage, not one item's problem. Any
+                // other error (an unresolvable repo, say) is not the hold.
+                if self.work_db.ensure_work_item_not_quarantined(&work_item_id).is_err() {
+                    self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+                }
+            })?;
         if let Some(host_id) = requested_host_id {
             if execution.status != ExecutionStatus::Ready {
                 // Reached only after the live-execution pre-check above has

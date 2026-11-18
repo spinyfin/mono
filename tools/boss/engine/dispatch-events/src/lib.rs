@@ -543,6 +543,23 @@ pub enum Stage {
     /// `pause_duration_secs` (how long the episode this closes actually
     /// lasted), and a human-readable `reason`.
     DispatchResumed,
+    /// A host selection was refused because every registered host is excluded
+    /// for a reason that does not depend on the work item (a disabled host,
+    /// the local host under the startup quarantine): a global dispatch outage,
+    /// not one item failing to fit one host. Emitted once, by the refusal that
+    /// starts the outage (`outcome=error`, execution id `engine`); the further
+    /// refusals it absorbs are counted in the outage record, not emitted. The
+    /// `details` object carries `started_epoch_s`, `triggering_execution_id`
+    /// and `host_exclusions` — per host: `host_id`, `kind`, `cause`, the
+    /// engine's `reason` verbatim, and the `recovery_action` when one exists.
+    /// `bossctl dispatch diagnose` reads this stage and its recovery partner.
+    DispatchOutageStarted,
+    /// The first dispatch to claim a host after a [`Stage::DispatchOutageStarted`]:
+    /// the outage is over. Recovery is this launch, never a flag clearing.
+    /// The `details` object carries `started_epoch_s`, `recovered_epoch_s`,
+    /// `duration_secs`, `refused_attempts`, `refused_work_items`, the last
+    /// `host_exclusions`, and `claimed_by_execution_id` / `claimed_host_id`.
+    DispatchOutageRecovered,
     /// A `RequestExecution { bypass_dispatch_pause: true, .. }` request was
     /// actually admitted through an active, overridable (operator-origin)
     /// global dispatch pause — see
@@ -871,7 +888,7 @@ pub enum TimelineStageClass {
 
 impl Stage {
     /// Every stable stage name, for exhaustive schema-contract tests.
-    pub const ALL: [Stage; 68] = [
+    pub const ALL: [Stage; 70] = [
         Stage::StatusTransition,
         Stage::RequestRecorded,
         Stage::WorkerClaimed,
@@ -920,6 +937,8 @@ impl Stage {
         Stage::ExecutionLivenessReconcile,
         Stage::DispatchPaused,
         Stage::DispatchResumed,
+        Stage::DispatchOutageStarted,
+        Stage::DispatchOutageRecovered,
         Stage::DispatchPauseOverride,
         Stage::DispatchPauseOverrideRefused,
         Stage::DispatchHeldByPause,
@@ -1008,6 +1027,8 @@ impl Stage {
             Stage::ExecutionLivenessReconcile => "execution_liveness_reconcile",
             Stage::DispatchPaused => "dispatch_paused",
             Stage::DispatchResumed => "dispatch_resumed",
+            Stage::DispatchOutageStarted => "dispatch_outage_started",
+            Stage::DispatchOutageRecovered => "dispatch_outage_recovered",
             Stage::DispatchPauseOverride => "dispatch_pause_override",
             Stage::DispatchPauseOverrideRefused => "dispatch_pause_override_refused",
             Stage::DispatchHeldByPause => "dispatch_held_by_pause",
@@ -1098,6 +1119,8 @@ impl Stage {
             // held; the held run is still waiting on the pipeline.
             | Stage::DispatchPaused
             | Stage::DispatchResumed
+            | Stage::DispatchOutageStarted
+            | Stage::DispatchOutageRecovered
             | Stage::DispatchPauseOverride
             | Stage::DispatchPauseOverrideRefused
             | Stage::DispatchHeldByPause
@@ -1922,6 +1945,8 @@ mod tests {
         );
         assert_eq!(Stage::DispatchPaused.as_str(), "dispatch_paused");
         assert_eq!(Stage::DispatchResumed.as_str(), "dispatch_resumed");
+        assert_eq!(Stage::DispatchOutageStarted.as_str(), "dispatch_outage_started");
+        assert_eq!(Stage::DispatchOutageRecovered.as_str(), "dispatch_outage_recovered");
         assert_eq!(Stage::AutomationPreempted.as_str(), "automation_preempted");
         assert_eq!(Stage::LiveWorkerReadopted.as_str(), "live_worker_readopted");
         assert_eq!(
