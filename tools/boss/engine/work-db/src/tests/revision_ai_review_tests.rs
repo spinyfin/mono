@@ -353,17 +353,33 @@ fn a_batch_created_before_the_implementation_is_finalized_still_counts() {
     let exec = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
         held.db.connect().unwrap().execute(sql, params).unwrap();
     };
-    // The implementation's finish time is written after the push's batch exists.
-    exec(
-        "UPDATE work_executions SET finished_at = CAST(CAST(created_at AS INTEGER) + 5 AS TEXT)
-         WHERE kind = 'revision_implementation'",
-        &[],
-    );
+    // The implementation started before the push's batch was created and its
+    // finish time is written after the batch exists (the production ordering).
+    let anchor_implementation = |started_offset: i64, finished_offset: i64| {
+        exec(
+            "UPDATE work_executions SET
+                started_at = CAST((SELECT CAST(created_at AS INTEGER) FROM pr_review_batches WHERE id = ?1) + ?2 AS TEXT),
+                finished_at = CAST((SELECT CAST(created_at AS INTEGER) FROM pr_review_batches WHERE id = ?1) + ?3 AS TEXT)
+             WHERE kind = 'revision_implementation'",
+            &[&batch, &started_offset, &finished_offset],
+        );
+    };
+    anchor_implementation(-10, 5);
     // No reviewer process running: only the batch itself keeps the card active.
     exec(
         "UPDATE work_executions SET status = 'orphaned' WHERE kind = 'pr_review'",
         &[],
     );
+    let assert_reviewing = |label: &str, stage: &str| {
+        assert_eq!(
+            held.db.list_revisions_under_ai_review().unwrap(),
+            vec![held.revision_id.clone()],
+            "{label}"
+        );
+        let projected = projected_revision(&held);
+        assert!(projected.ai_reviewing, "{label}");
+        assert_eq!(projected.ai_review_stage.as_deref(), Some(stage), "{label}");
+    };
     for (status, stage) in [
         ("collecting", "reviewers"),
         ("supervising", "consolidation"),
@@ -373,51 +389,122 @@ fn a_batch_created_before_the_implementation_is_finalized_still_counts() {
             "UPDATE pr_review_batches SET status = ?2 WHERE id = ?1",
             &[&batch, &status],
         );
-        assert_eq!(
-            held.db.list_revisions_under_ai_review().unwrap(),
-            vec![held.revision_id.clone()],
-            "{status}"
-        );
-        let projected = projected_revision(&held);
-        assert!(projected.ai_reviewing, "{status}");
-        assert_eq!(projected.ai_review_stage.as_deref(), Some(stage), "{status}");
+        assert_reviewing(status, stage);
     }
     // A failed generation with a started member stays reviewing until re-admitted.
     exec(
         "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
         &[&batch],
     );
-    assert!(projected_revision(&held).ai_reviewing);
+    assert_reviewing("failed", "reviewers");
+
+    // Re-admission: the replacement generation is ready with unstarted reviewers.
+    let replacement = start_review_batch_for_target(&held, "replacement-fixture");
+    exec(
+        "UPDATE pr_review_batches SET generation = 2, target_sha = 'head-sha' WHERE id = ?1",
+        &[&replacement],
+    );
+    exec(
+        "UPDATE work_executions SET status = 'ready', started_at = NULL WHERE id IN (
+            SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)",
+        &[&replacement],
+    );
+    assert_reviewing("re-admitted", "reviewers");
+
+    // A batch created before the implementation started belongs to an older push.
+    anchor_implementation(10, 20);
+    assert!(held.db.list_revisions_under_ai_review().unwrap().is_empty());
+    assert!(!projected_revision(&held).ai_reviewing);
 }
 
+fn task_row(item: WorkItem) -> Task {
+    match item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("unexpected row {other:?}"),
+    }
+}
+
+/// Every revision, task and chore row, in every status and blocked reason,
+/// must agree between the point read and the board's work-tree projection.
 #[test]
 fn only_review_phase_revision_states_are_folded_by_the_engine() {
     let held = held_revision("revision-fold-negatives");
-    let set = |status: &str, reason: Option<&str>| {
-        held.db
-            .connect()
-            .unwrap()
-            .execute(
-                "UPDATE tasks SET status = ?2, blocked_reason = ?3 WHERE id = ?1",
-                rusqlite::params![held.revision_id, status, reason],
-            )
-            .unwrap();
-        projected_revision(&held).board_folded_revision
-    };
-    for status in ["in_review", "done"] {
-        assert!(set(status, None), "{status}");
+    let root = task_row(held.db.get_work_item(&held.root_id).unwrap());
+    let product_id = root.product_id.clone();
+    let project = held
+        .db
+        .create_project(CreateProjectInput {
+            product_id: product_id.clone(),
+            name: "fold matrix".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let task = held
+        .db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.clone())
+                .project_id(project.id)
+                .name("fold matrix task")
+                .build(),
+        )
+        .unwrap();
+    let chore = create_test_chore_manual(&held.db, product_id.clone(), "fold matrix chore");
+    let rows = [
+        ("revision", held.revision_id.clone(), true),
+        ("task", task.id, false),
+        ("chore", chore.id, false),
+    ];
+    let reasons = [
+        None,
+        Some("merge_conflict"),
+        Some("ci_failure"),
+        Some("ci_failure_exhausted"),
+        Some("review_feedback"),
+        Some("dependency"),
+        Some("awaiting_operator_answer"),
+        Some("worker_failed"),
+    ];
+    for status in ["todo", "active", "in_review", "done", "blocked"] {
+        for reason in reasons {
+            // A blocked reason only exists on blocked rows.
+            if status != "blocked" && reason.is_some() {
+                continue;
+            }
+            for (kind, id, is_revision) in &rows {
+                held.db
+                    .connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE tasks SET status = ?2, blocked_reason = ?3 WHERE id = ?1",
+                        rusqlite::params![id, status, reason],
+                    )
+                    .unwrap();
+                let review_phase_block = matches!(
+                    reason,
+                    Some("merge_conflict" | "ci_failure" | "ci_failure_exhausted" | "review_feedback")
+                );
+                let expected = *is_revision
+                    && (matches!(status, "in_review" | "done") || (status == "blocked" && review_phase_block));
+                let context = format!("{kind} {status} {reason:?}");
+                assert_eq!(
+                    task_row(held.db.get_work_item(id).unwrap()).board_folded_revision,
+                    expected,
+                    "get_work_item {context}"
+                );
+                let tree = held.db.get_work_tree(&product_id).unwrap();
+                let projected = tree
+                    .chores
+                    .iter()
+                    .chain(tree.tasks.iter())
+                    .find(|row| &row.id == id)
+                    .unwrap_or_else(|| panic!("work tree is missing {context}"));
+                assert_eq!(projected.board_folded_revision, expected, "work tree {context}");
+            }
+        }
     }
-    for status in ["todo", "active"] {
-        assert!(!set(status, None), "{status}");
-    }
-    for reason in ["dependency", "awaiting_operator_answer", "worker_failed"] {
-        assert!(!set("blocked", Some(reason)), "{reason}");
-    }
-    assert!(!set("blocked", None));
-    // Non-revision kinds are never folded.
-    let root = match held.db.get_work_item(&held.root_id).unwrap() {
-        WorkItem::Task(task) | WorkItem::Chore(task) => task,
-        other => panic!("unexpected row {other:?}"),
-    };
-    assert!(!root.board_folded_revision);
 }
