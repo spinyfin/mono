@@ -101,6 +101,26 @@ final class QueuedWaitTests: XCTestCase {
         }
     }
 
+    func testClaimedStartupUsesEnginePhraseAndKeepsUnknownStateAlarm() {
+        for (reason, label) in [
+            ("dispatching", "dispatching: preparing the worker launch"),
+            ("leasing_workspace", "dispatching: leasing a workspace"),
+            ("preparing_workspace", "dispatching: preparing the worker workspace")
+        ] {
+            let starting = runtime(reason: reason, label: label, status: "claimed")
+            XCTAssertTrue(WorkCardLiveStatus.isQueued(task: task(status: "active"), runtime: starting))
+            XCTAssertEqual(WorkCardLiveStatus.resolve(
+                task: task(status: "active"), column: .doing, runtime: starting, liveState: nil
+            ), "Queued — \(label)")
+        }
+        for reason in [nil, "unclassified"] as [String?] {
+            let unknown = runtime(reason: reason, label: nil, status: "claimed")
+            XCTAssertEqual(WorkCardLiveStatus.resolve(
+                task: task(status: "active"), column: .doing, runtime: unknown, liveState: nil
+            ), "Unexpected state — the engine sent no reason for this wait")
+        }
+    }
+
     /// The card renders the engine's phrase as given, for a wait code and
     /// for a scheduler sentence alike. It holds no code-to-text table.
     func testEnginePhraseIsRenderedAsGiven() {
@@ -325,14 +345,14 @@ final class QueuedWaitTests: XCTestCase {
         XCTAssertEqual(row.blocker, blocker)
         XCTAssertEqual(model.revealCardTarget(for: blocker.workItemID), .revealed(cardID: blocking.id))
 
-        // Reproduce a claimed execution with stale wait fields: the state wins,
-        // and both the text and the clickable target disappear in the same snapshot.
+        // The engine replaces the dependency hold with its startup phase,
+        // clearing the old blocker in the same snapshot.
         model.taskRuntimesByID[waiting.id] = runtime(
-            reason: "waiting_dependency", label: "waiting for T\(42)", status: "claimed", blocker: blocker
+            reason: "dispatching", label: "dispatching: preparing the worker launch", status: "claimed"
         )
         let claimed = self.snapshot(model, waiting)
         XCTAssertNotEqual(snapshot, claimed)
-        XCTAssertEqual(claimed.liveStatus, "Starting worker")
+        XCTAssertEqual(claimed.liveStatus, "Queued — dispatching: preparing the worker launch")
         XCTAssertNil(WorkBoardCardLiveStatusRowSlice(snapshot: claimed)?.blocker)
         model.taskRuntimesByID[waiting.id] = runtime(reason: nil, label: nil, status: "running")
         let running = self.snapshot(model, task(id: waiting.id, status: "active"))
@@ -461,7 +481,7 @@ final class QueuedWaitTests: XCTestCase {
     }
 
     func testEngineWaitDoesNotOverrideLiveOrHumanWork() {
-        for status in ["claimed", "running", "waiting_human"] {
+        for status in ["running", "waiting_human"] {
             XCTAssertFalse(WorkCardLiveStatus.isQueued(
                 task: task(status: "active"),
                 runtime: runtime(reason: "awaiting_redispatch", label: "stale", status: status)))

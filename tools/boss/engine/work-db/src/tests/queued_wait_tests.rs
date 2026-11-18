@@ -585,6 +585,21 @@ fn every_waiting_state_yields_a_named_reason() {
     );
     covered.insert(DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED.to_owned());
 
+    let (starting, execution) = ready_chore(&db, pid, "startup phases");
+    db.claim_execution_for_dispatch(&execution.id).unwrap();
+    for reason in [
+        DISPATCH_WAIT_REASON_DISPATCHING,
+        DISPATCH_WAIT_REASON_LEASING_WORKSPACE,
+        DISPATCH_WAIT_REASON_PREPARING_WORKSPACE,
+    ] {
+        db.set_dispatch_wait_reason(&execution.id, reason).unwrap();
+        covered.insert(assert_named(
+            "claimed startup phase",
+            &wait_of(&db, pid, &starting.id),
+            reason,
+        ));
+    }
+
     // Every reason in the vocabulary is reachable from a state above, so a
     // reason cannot be added without a state that produces it.
     covered.extend(review_states_use_admission_and_current_head_evidence_on_every_surface());
@@ -757,13 +772,14 @@ fn a_wait_nothing_explains_is_unclassified_and_never_given_a_default() {
 }
 
 #[test]
-fn a_running_claimed_or_finished_item_carries_no_wait() {
+fn a_running_or_finished_item_does_not_carry_a_stale_dispatch_hold() {
     let db = db();
     let product = create_test_product(&db);
     let (chore, execution) = ready_chore(&db, &product.id, "moves through its lifecycle");
     set_status(&db, &chore.id, "active");
     db.set_dispatch_wait_reason(&execution.id, DISPATCH_WAIT_REASON_POOL_EXHAUSTED)
         .unwrap();
+    db.claim_execution_for_dispatch(&execution.id).unwrap();
     for status in ["claimed", "running", "waiting_human", "completed"] {
         db.connect()
             .unwrap()
@@ -773,6 +789,14 @@ fn a_running_claimed_or_finished_item_carries_no_wait() {
             )
             .unwrap();
         let runtime = wait_of(&db, &product.id, &chore.id);
+        if status == "claimed" {
+            assert_eq!(
+                runtime.dispatch_wait_reason.as_deref(),
+                Some(DISPATCH_WAIT_REASON_DISPATCHING),
+                "claiming replaces the stale pool hold with startup progress"
+            );
+            continue;
+        }
         if status == "completed" {
             // An active item whose run ended waits for the orphan sweep.
             assert_eq!(

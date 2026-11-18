@@ -91,9 +91,8 @@ pub(crate) enum ReviewNaming {
     Deferred,
 }
 
-/// Classify a pending execution. Only pending state is projected: an old hold
-/// is never leaked onto a claimed, live or finished run, which is not waiting
-/// on dispatch at all.
+/// Classify a pending execution, including its claimed startup phase.
+/// Live and finished runs never inherit an old dispatch hold.
 pub(super) fn for_execution(conn: &Connection, execution: Option<&WorkExecution>, now: i64) -> Result<DispatchWait> {
     for_execution_naming(conn, execution, now, ReviewNaming::Inline)
 }
@@ -109,7 +108,24 @@ pub(super) fn for_execution_naming(
     let Some(execution) = execution else {
         return Ok(DispatchWait::default());
     };
-    match execution.status {
+    let wait = match execution.status {
+        // The durable claim itself records that the dispatcher owns startup.
+        // Preserve the prior queue hold until admission succeeds: a failed
+        // pickup must not reset its age or notify the board on every pass.
+        ExecutionStatus::Claimed => {
+            use boss_engine_storage_values::dispatch_wait::{
+                DISPATCH_WAIT_REASON_DISPATCHING, DISPATCH_WAIT_REASON_LEASING_WORKSPACE,
+                DISPATCH_WAIT_REASON_PREPARING_WORKSPACE,
+            };
+            let reason = match execution.dispatch_wait_reason.as_deref() {
+                Some(reason @ (DISPATCH_WAIT_REASON_LEASING_WORKSPACE | DISPATCH_WAIT_REASON_PREPARING_WORKSPACE)) => {
+                    reason
+                }
+                Some(reason) if is_unlabelled_wait_code(reason) => DISPATCH_WAIT_REASON_UNCLASSIFIED,
+                _ => DISPATCH_WAIT_REASON_DISPATCHING,
+            };
+            Ok(DispatchWait::named(reason))
+        }
         ExecutionStatus::WaitingDependency => for_gated(conn, execution),
         ExecutionStatus::Ready | ExecutionStatus::Queued => for_ready(conn, execution, now),
         ExecutionStatus::WaitingReview if review == ReviewNaming::Deferred => Ok(DispatchWait::default()),
@@ -121,7 +137,11 @@ pub(super) fn for_execution_naming(
         }
         ExecutionStatus::WaitingMerge => unscheduled_wait::merge_wait(conn, &execution.work_item_id),
         _ => Ok(DispatchWait::default()),
+    }?;
+    if wait.is_unclassified() {
+        super::wait_diagnostics::log_unclassified(conn, &[(&execution.work_item_id, Some(&execution.id))]);
     }
+    Ok(wait)
 }
 
 /// A `waiting_dependency` row is off the scheduler's walk, so a hold a drain
@@ -385,6 +405,7 @@ pub(super) fn for_item(
             ExecutionStatus::WaitingDependency
                 | ExecutionStatus::Ready
                 | ExecutionStatus::Queued
+                | ExecutionStatus::Claimed
                 | ExecutionStatus::WaitingReview
                 | ExecutionStatus::WaitingMerge
         )
@@ -557,7 +578,7 @@ impl WorkDb {
         let pending: Vec<WorkExecution> = {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {} FROM work_executions we
-                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency', 'waiting_review', 'waiting_merge')
+                 WHERE we.status IN ('queued', 'ready', 'claimed', 'waiting_dependency', 'waiting_review', 'waiting_merge')
                  ORDER BY we.created_at ASC, we.id ASC",
                 super::executions_runs::EXECUTION_COLUMNS
             ))?;

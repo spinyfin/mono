@@ -120,13 +120,13 @@ fn queued_wait_payload_names_the_actual_revision_prerequisite() {
     let after = db.get_task_runtime(&second.id).unwrap();
     assert_eq!(after.execution_status, Some(ExecutionStatus::Ready));
     assert!(after.dispatch_wait_blocker.is_none());
-    db.connect().unwrap().execute(
-        "UPDATE work_executions SET status = 'claimed', dispatch_wait_reason = 'waiting_dependency', dispatch_wait_blocker_id = ?2 WHERE id = ?1",
-        params![after.execution_id.unwrap(), first.id],
-    ).unwrap();
+    let execution_id = after.execution_id.unwrap();
+    db.set_dispatch_wait_with_blocker(&execution_id, "waiting_dependency", Some(&first.id))
+        .unwrap();
+    db.claim_execution_for_dispatch(&execution_id).unwrap();
     let claimed = db.get_task_runtime(&second.id).unwrap();
     assert_eq!(claimed.execution_status, Some(ExecutionStatus::Claimed));
-    assert!(claimed.dispatch_wait_reason.is_none());
+    assert_eq!(claimed.dispatch_wait_reason.as_deref(), Some("dispatching"));
     assert!(claimed.dispatch_wait_blocker.is_none());
 }
 
@@ -204,7 +204,12 @@ fn queued_wait_payload_exposes_backoff_without_a_prior_failure_and_hides_stale_h
     // The chore is still `todo` with automatic start on, so once its only run
     // has ended the card is queued with nothing pending: that is its own
     // reason, not the finished run's hold.
-    for (state, reason) in [("claimed", None), ("running", None), ("completed", Some("run_ended"))] {
+    db.claim_execution_for_dispatch(&execution.id).unwrap();
+    for (state, reason) in [
+        ("claimed", Some("dispatching")),
+        ("running", None),
+        ("completed", Some("run_ended")),
+    ] {
         db.connect()
             .unwrap()
             .execute(

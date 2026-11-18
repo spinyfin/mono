@@ -533,7 +533,9 @@ enum WorkCardLiveStatus {
             && task.blockedReason == "ci_failure"
         let isAIReviewing = task.aiReviewing && task.status == "active"
 
-        if runtime?.executionStatus == "claimed" { return "Starting worker" }
+        if runtime?.executionStatus == "claimed" {
+            return queuedLabel(runtime: runtime, now: now)
+        }
         // Transient-recovery banner wins outright — a worker being
         // auto-resumed after a Claude API error looks idle to every
         // other signal, so without this the card would silently show

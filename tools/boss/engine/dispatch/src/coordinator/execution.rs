@@ -578,6 +578,11 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         }
+        self.record_dispatch_wait_reason(
+            execution,
+            boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_DISPATCHING,
+            None,
+        );
         // Double-spawn guard (Bug A): if another execution for this
         // work_item is already live (running or waiting_human), this
         // execution is a redundant duplicate created by the orphan sweep
@@ -1326,6 +1331,13 @@ impl ExecutionCoordinator {
             pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
         };
 
+        self.record_dispatch_wait_reason(
+            execution,
+            boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_LEASING_WORKSPACE,
+            None,
+        );
+        self.publish_dispatch_runtime_changed(std::slice::from_ref(execution), "workspace_leasing")
+            .await;
         let lease_result = self
             .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
             .await;
@@ -1381,6 +1393,13 @@ impl ExecutionCoordinator {
         // Record the lease before any fallible work so a later cube-release
         // failure still leaves columns the leftover-lease sweep can retry.
         self.persist_acquired_lease(execution, &lease);
+        self.record_dispatch_wait_reason(
+            execution,
+            boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_PREPARING_WORKSPACE,
+            None,
+        );
+        self.publish_dispatch_runtime_changed(std::slice::from_ref(execution), "workspace_preparing")
+            .await;
         self.resolve_spoke_in_doubt_attention(&execution.id);
 
         // The answer-agent run is already bound to this execution before it

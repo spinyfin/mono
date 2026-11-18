@@ -615,7 +615,7 @@ pub(crate) fn compute_task_runtime(
             };
             let dispatch_wait_since = if wait.reason.is_some()
                 && wait.reason == execution.dispatch_wait_reason
-                && execution.status == ExecutionStatus::Ready
+                && matches!(execution.status, ExecutionStatus::Ready | ExecutionStatus::Claimed)
             {
                 execution.dispatch_wait_since.clone()
             } else {

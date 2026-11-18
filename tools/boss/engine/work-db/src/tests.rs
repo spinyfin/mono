@@ -569,6 +569,7 @@ mod metrics_store_tests;
 mod predecessor_lease_hold_tests;
 mod queued_display_tests;
 mod queued_wait_tests;
+mod startup_wait_tests;
 mod t01;
 mod t02;
 mod t03;

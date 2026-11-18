@@ -184,6 +184,12 @@ pub(super) fn classify(
         holds,
     };
     name_deferred_conflicts(conn, &mut waits)?;
+    let unexplained: Vec<_> = waits
+        .iter()
+        .filter(|(_, wait)| wait.is_unclassified())
+        .map(|(id, _)| (id.as_str(), None))
+        .collect();
+    super::wait_diagnostics::log_unclassified(conn, &unexplained);
     Ok((waits, cost))
 }
 

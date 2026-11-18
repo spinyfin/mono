@@ -7,7 +7,7 @@ Every work item that is waiting rather than running carries a named reason. The 
 `engine/work-db/src/queued_wait.rs` classifies a wait. It is the only place that decides why an item is waiting:
 
 - `for_item` is the item-level entry point every surface calls. It classifies a pending latest execution with `for_execution`, and otherwise the item itself with `for_unscheduled`.
-- `for_execution` classifies a pending execution (`ready`, `waiting_dependency`, `waiting_review`, `waiting_merge`, or the legacy `queued`).
+- `for_execution` classifies a pending execution (`ready`, `claimed`, `waiting_dependency`, `waiting_review`, `waiting_merge`, or the legacy `queued`).
 - `for_unscheduled` classifies an item with nothing pending: a card the board queues (`todo` with automatic start on), an `active` item with no run pending or live, or an `in_review` item.
 
 The result travels on `TaskRuntime` as `dispatch_wait_reason` (a wait code, or the scheduler's own sentence for one hold) and `dispatch_wait_label` (the phrase to show). A `failure_backoff` wait also carries `dispatch_failures`: each failed attempt's error text and when it was recorded, newest last. The vocabulary and its phrases live in `engine/storage-values/src/dispatch_wait.rs`.
@@ -96,6 +96,8 @@ The engine population timing log splits `db.task_runtimes` into `.cache`, `.comp
 
 `unclassified` is not a reason. It marks a wait that none of the conditions above explains, which is a defect in the engine's state model.
 
+The classifier logs an error immediately when it exposes an unclassified wait, including waits shorter than a heartbeat. The structured record includes the work item and execution ids, execution status, task and execution fields consulted, and the task status ledger's transition timestamp and age in seconds (with its legacy lower-bound flag). These diagnostics are independent of the heartbeat's attention grace period.
+
 - The card reads "Unexpected state" with the engine's phrase. It never reads "unknown", and the app never substitutes a reason of its own.
 - The scheduler heartbeat (`engine/dispatch/src/coordinator/unexplained_wait.rs`) checks every beat, over pending executions, queued cards and idle `active` items. Once a wait has stayed unexplained for 60 s it logs an error naming the item, the execution and their states, and files a `dispatch_wait_unclassified` attention item. Nothing is promoted or repaired: a repair would hide the defect.
 - A `ready` row that passes neither claim nor hold for 60 s is reclassified from `awaiting_dispatch` to `unclassified`, so its card stops saying a dispatch is imminent.
@@ -110,6 +112,12 @@ A hold recorded under a code that has no phrase is also reported as `unclassifie
 3. Add the state to `every_waiting_state_yields_a_named_reason` in `engine/work-db/src/tests/queued_wait_tests.rs`. That test fails while a code in the vocabulary has no state that produces it.
 
 No client change is needed: the phrase reaches every surface through `dispatch_wait_label`.
+
+## Creation and worker startup
+
+A review-findings follow-up and its eligible initial execution are committed together. Before this atomic queueing, the new autostart card could be read before product reconciliation minted its execution and therefore appeared unclassified. Manual-start follow-ups remain unqueued. A successful run start consumes the single-shot `autostart` flag, so a running follow-up with `autostart: false` does not imply that automatic dispatch ignored the flag.
+
+The startup sequence is `ready` → `claimed` → `running`. The durable claim projects as `dispatching` (“preparing the worker launch”); admission preserves the old queue hold and its age until it succeeds, then records the startup phase. Before the cube lease call, the engine records `leasing_workspace`; after acquisition it records `preparing_workspace` while positioning and preparing the worker's checkout. The card renders those engine phrases. Starting the run clears the reason; releasing a claim or recovering it after a restart clears startup phases so the ready row can acquire its next queue reason. The claim itself names dispatch in progress; genuinely unexplained waiting states remain unclassified.
 
 ## A move to Doing stays queued
 

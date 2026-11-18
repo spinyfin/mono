@@ -2052,7 +2052,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
     }
 
-    func testLiveStatusDispatchPendingClaimedIsStartingWorker() {
+    func testLiveStatusClaimedWithoutEngineReasonIsUnexpected() {
         let task = Self.makeTask(status: "todo", autostart: true)
         let runtime = WorkTaskRuntime(
             workItemID: task.id,
@@ -2067,7 +2067,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkCardLiveStatus.resolve(
                 task: task, column: .doing, runtime: runtime, liveState: nil
             ),
-            "Starting worker"
+            "Unexpected state — the engine sent no reason for this wait"
         )
     }
 

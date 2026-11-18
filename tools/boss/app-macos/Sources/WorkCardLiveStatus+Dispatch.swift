@@ -2,12 +2,12 @@ import Foundation
 
 extension WorkCardLiveStatus {
     static func isPendingExecution(_ runtime: WorkTaskRuntime?) -> Bool {
-        ["queued", "ready", "waiting_dependency"].contains(runtime?.executionStatus ?? "")
+        ["queued", "ready", "waiting_dependency", "claimed"].contains(runtime?.executionStatus ?? "")
     }
 
     static func isQueued(task: WorkTask, runtime: WorkTaskRuntime?) -> Bool {
         if task.humanDriven && task.status == "active" { return false }
-        if ["claimed", "running", "waiting_human"].contains(runtime?.executionStatus ?? "") {
+        if ["running", "waiting_human"].contains(runtime?.executionStatus ?? "") {
             return false
         }
         let hasWait = !(runtime?.dispatchWaitReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)

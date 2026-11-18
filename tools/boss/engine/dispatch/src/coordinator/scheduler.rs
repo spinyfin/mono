@@ -2702,10 +2702,6 @@ impl ExecutionCoordinator {
                 "failed to resolve dispatch_stage_stalled attention item on successful claim",
             );
         }
-        if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
-            tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
-        }
-
         self.publish_dispatch_runtime_changed(std::slice::from_ref(execution), "dispatch_claimed")
             .await;
 

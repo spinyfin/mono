@@ -235,6 +235,16 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = insert_review_findings_followup(&tx, input)?;
+        // Publish the task and its initial queue state atomically.
+        if task_accepts_execution(&task) {
+            reconcile_work_item_execution(
+                &tx,
+                &mut ExecutionReconcileResult::default(),
+                &task.id,
+                ExecutionKind::ChoreImplementation,
+                ExecutionStatus::Ready,
+            )?;
+        }
         tx.commit()?;
         Ok(task)
     }
