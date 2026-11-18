@@ -83,9 +83,7 @@ async fn confirm_one(ctx: &SpawnReapCtx<'_>, id: &str, slot: u8, pid: i32) -> an
         .workspace_path
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing workspace"))?;
-    let home = crate::driver::initial_prompt::delivery_home(
-        &std::path::Path::new(workspace).join(driver.descriptor().config_dir),
-    );
+    let home = driver.delivery_home(std::path::Path::new(workspace), id);
     let policy = PromptSubmitPolicy::for_driver(driver.as_ref(), crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT);
     let result = confirm_prompt_submitted(
         driver.descriptor().name,

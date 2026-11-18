@@ -16,18 +16,10 @@ use std::path::Path;
 use boss_ssh_transport::shell_quote;
 
 use super::environment::AgyProcessEnvironment;
-
-/// Effort rungs `agy` accepts as `--effort`, which are also the model-id suffixes.
-const MODEL_ID_RUNGS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+use super::model_menu::model_id_rung;
 
 /// Values `agy` accepts for `--effort` (`max` is a flag value, not a model id suffix).
 const EFFORT_VALUES: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-
-/// The rung a model id encodes in its suffix (`gemini-4-hydrogen-xhigh`).
-fn model_id_rung(model: &str) -> Option<&str> {
-    let (_, suffix) = model.rsplit_once('-')?;
-    MODEL_ID_RUNGS.contains(&suffix).then_some(suffix)
-}
 
 /// The `--effort` value to pass, or `None` to pass none.
 ///

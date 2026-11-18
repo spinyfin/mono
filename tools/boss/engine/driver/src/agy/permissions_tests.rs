@@ -717,16 +717,19 @@ fn log_check_requires_the_hooks_file_to_have_loaded() {
     );
     // Settings alone are not admission: with no hooks the CLI still starts,
     // in review mode, with no authorization hook and no progress ingress.
+    assert_eq!(
+        verify_settings_log(&file, &init).unwrap(),
+        SettingsLogCheck::NotYetInitialized,
+    );
+    // A definitive "loaded 0" line is a failure, not a wait: the CLI will
+    // not later load the guards.
     for log in [
-        init.clone(),
         format!("{init}\nI1117 hooks_manager.go:54] loaded 0 named hooks from 0 hooks.json file(s)"),
         format!("{init}\nI1117 hooks_manager.go:54] loaded 0 named hooks from 1 hooks.json file(s)"),
     ] {
-        assert_eq!(
-            verify_settings_log(&file, &log).unwrap(),
-            SettingsLogCheck::NotYetInitialized,
-            "{log}"
-        );
+        let error = format!("{:#}", verify_settings_log(&file, &log).unwrap_err());
+        assert!(error.contains("no authorization hook is armed"), "{error}");
+        assert!(error.contains("loaded 0 named hooks"), "{error}");
     }
     // A hooks file the CLI cannot parse is a failure, not a wait.
     let unparseable = format!(

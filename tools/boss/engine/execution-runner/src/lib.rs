@@ -74,6 +74,35 @@ pub mod test_exports {
         )
         .await
     }
+
+    pub async fn confirm_local_spawn(
+        tmux_host: &crate::host::TmuxWorkerHost,
+        driver: &dyn crate::driver::AgentDriver,
+        live_states: Option<&dyn crate::host::DriverSignals>,
+        work_db: &crate::work::WorkDb,
+        run_id: &str,
+        workspace_path: &Path,
+    ) -> anyhow::Result<()> {
+        crate::pane_spawn::confirm_local_spawn(
+            tmux_host,
+            driver,
+            live_states,
+            work_db,
+            run_id,
+            workspace_path,
+            crate::pane_spawn::SpawnConfirmBounds {
+                composer_timeout: Duration::from_millis(40),
+                turn_timeout: Duration::from_millis(40),
+                prompt: crate::spawn_confirmation::PromptSubmitPolicy {
+                    delivery_timeout: Duration::from_millis(20),
+                    confirm_timeout: Duration::from_millis(20),
+                    retries: 0,
+                    poll: Duration::from_millis(5),
+                },
+            },
+        )
+        .await
+    }
 }
 
 pub use boss_execution_contracts::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};

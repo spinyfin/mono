@@ -264,6 +264,16 @@ impl AgentDriver for AgyDriver {
         })
     }
 
+    fn delivery_home(&self, workspace: &Path, run_id: &str) -> PathBuf {
+        // The launcher writes markers next to the brief in the run's
+        // control directory, not under the descriptor's `.agy` config-dir
+        // name. Do not record that path as `initial_prompt_home` on
+        // runtime state: owned-home reclamation would then treat the
+        // control directory as a Codex/Claude home.
+        control_dir_for_run(run_id)
+            .unwrap_or_else(|_| crate::initial_prompt::delivery_home(&workspace.join(self.descriptor().config_dir)))
+    }
+
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
         let Some(run_id) = request.run_id.filter(|id| !id.is_empty()) else {
             return refuse_agy_plan(
@@ -681,6 +691,7 @@ impl AgentDriver for AgyDriver {
 mod tests {
     use super::*;
     use crate::AbsenceDisposition;
+    use crate::AgentDriver;
     use crate::EnvDirective;
     use crate::test_support::home_override;
     use boss_protocol::{EffortLevel, ReasoningMode, ReviewModelTier};
@@ -720,6 +731,33 @@ mod tests {
                 .design_investigation_model
                 .expect("agy names a strong family"))(),
             model_menu::STRONG_FAMILY,
+        );
+    }
+
+    #[test]
+    fn delivery_home_is_the_run_control_dir_not_the_workspace_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let _guard = env_for_provision(&homes);
+        let run_id = "run-delivery-home";
+        let driver = AgyDriver::default();
+        let home = driver.delivery_home(&workspace, run_id);
+        assert_eq!(home, control_dir_for_run(run_id).unwrap());
+        assert_ne!(home, workspace.join(driver.descriptor().config_dir));
+
+        let runtime = AgyRuntimeState {
+            process_home: PathBuf::from("/tmp/process-home"),
+            control_dir: PathBuf::from("/tmp/control"),
+            session_settings_path: PathBuf::from("/tmp/control/session-settings.json"),
+            log_file: PathBuf::from("/tmp/control/agy.log"),
+            workspace_path: PathBuf::from("/tmp/ws"),
+            agy_binary: PathBuf::from("/tmp/agy"),
+        };
+        assert!(
+            crate::initial_prompt::owned_home_from_runtime_state(&runtime.to_driver_runtime_state()).is_none(),
+            "the control dir must not be handed to owned-home reclamation"
         );
     }
 

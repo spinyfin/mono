@@ -82,6 +82,17 @@ fn existing_rung<'a>(model: &'a str, prefix: &str) -> Option<&'a str> {
         .filter(|suffix| matches!(*suffix, "low" | "medium" | "high" | "xhigh"))
 }
 
+/// The effort rung a catalogue model id encodes as its suffix, if any.
+///
+/// Family-aware: an unknown-family id, a bare family, or a non-rung suffix
+/// (`-max`) yields `None`. Used by the pane command so `--effort` cannot
+/// contradict a rung the catalogue already named.
+pub(super) fn model_id_rung(model: &str) -> Option<&'static str> {
+    let lower = model.to_ascii_lowercase();
+    let (prefix, _) = family_entry(&lower)?;
+    existing_rung(&lower, prefix).and_then(|suffix| RUNGS.into_iter().find(|rung| *rung == suffix))
+}
+
 /// Compose a catalogue model id from a family (or already-suffixed id) and
 /// a Boss effort knob. Clamps to the family's own ceiling so Large reaches
 /// `xhigh` on Hydrogen and `high` on Carbon / Argon / Flash.
