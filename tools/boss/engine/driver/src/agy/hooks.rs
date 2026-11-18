@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use boss_engine_codex_hook_trust::sha256_hex_prefixed;
+use boss_engine_structured_output::StructuredOutputKind;
 use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -173,6 +174,16 @@ fn private_forwarder_config(process_home: &Path, config: &ProgressObservationCon
     }
 }
 
+fn artifact_write_paths_json(worker_kind: WorkerKind, run_id: &str) -> Value {
+    match worker_kind {
+        WorkerKind::Reviewer => json!([boss_engine_structured_output::default_path_string(
+            run_id,
+            StructuredOutputKind::ReviewResult,
+        )]),
+        _ => json!([]),
+    }
+}
+
 fn authorization_command(process_home: &Path, config: &ProgressObservationConfig) -> String {
     let adapter_config = ProgressObservationConfig {
         forwarder_binary: adapter_path(process_home),
@@ -197,10 +208,9 @@ fn pre_tool_use_entry(process_home: &Path, obs: &ProgressObservationConfig) -> V
     })
 }
 
-/// Declared PreToolUse wiring. Other lifecycle events are installed by the
-/// global-root progress forwarder, not duplicated here. Fails when the run's
-/// private home cannot be resolved, rather than declaring a path that does
-/// not exist.
+/// Returns the six-event forwarder map with its PreToolUse entry replaced by
+/// the authorization adapter. Fails when the run's private home cannot be
+/// resolved, rather than declaring a path that does not exist.
 pub fn authorization_hooks_map(config: &ProgressObservationConfig) -> anyhow::Result<serde_json::Map<String, Value>> {
     let process_home = process_home_for_run(&config.run_id)?;
     let config = private_forwarder_config(&process_home, config);
@@ -314,6 +324,7 @@ pub(super) fn expected_authorization_policy(
         "workspace_path": obs.workspace_path.display().to_string(),
         "process_home": process_home.display().to_string(),
         "protected_paths": protected_paths(process_home, interception),
+        "artifact_write_paths": artifact_write_paths_json(worker_kind, &obs.run_id),
         "forwarder": obs.forwarder_binary.display().to_string(),
         "attestation_path": attestation_path(process_home).display().to_string(),
         "guards": guards_json(&guards),

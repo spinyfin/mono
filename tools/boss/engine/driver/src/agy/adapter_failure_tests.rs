@@ -252,8 +252,6 @@ fn native_searches_reach_the_path_guard_as_traversals() {
         "search_codebase",
         "view_file",
         "read_url",
-        "define_subagent",
-        "send_message",
     ] {
         assert_deny(&authorize(&fx.process_home, &json!({"toolCall":{"name":tool,"args":{}}})).1);
     }

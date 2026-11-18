@@ -480,11 +480,14 @@ fn permission_input(
     run_id: &str,
     remote: bool,
 ) -> PermissionInput {
+    fs::create_dir_all(data_dir).unwrap();
+    let forwarder = data_dir.join("boss-event");
+    crate::hook_guards::write_executable(&forwarder, "#!/bin/sh\ncat >/dev/null\n").unwrap();
     PermissionInput::builder()
         .worker_kind(kind)
         .workspace_path(workspace.to_path_buf())
         .events_socket_path(data_dir.join("events.sock"))
-        .boss_event_path(data_dir.join("boss-event"))
+        .boss_event_path(forwarder)
         .run_id(run_id)
         .lease_id("lease")
         .execution_kind("task_implementation")
@@ -525,7 +528,11 @@ fn write_permission_config_renders_settings_over_the_provisioned_trust_only_file
 
         let settings_path = session_settings_path_for_run(&run_id).unwrap();
         assert_eq!(settings_path, runtime.session_settings_path);
-        assert_eq!(artifacts.config_files, vec![settings_path.clone()]);
+        assert!(
+            artifacts.config_files.contains(&settings_path),
+            "config_files must include session settings: {:?}",
+            artifacts.config_files
+        );
         // `--settings` is the only per-run flag; no posture is carried by
         // `--mode`, `--sandbox` or the skip-permissions flag, and no env.
         assert_eq!(

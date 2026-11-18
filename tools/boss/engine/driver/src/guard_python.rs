@@ -20,36 +20,229 @@ DELIMS = {'&&', '||', ';', '|', '&'}
 WRAPPERS = {'env', 'command', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic'}
 ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
-def heredoc_delim(line):
-    index = line.find('<<')
-    if index < 0:
-        return None
-    rest = line[index + 2:]
-    if rest.startswith('-'):
-        rest = rest[1:]
-    rest = rest.lstrip()
-    if not rest:
-        return None
-    quote = rest[0] if rest[0] in (chr(39), chr(34)) else None
-    if quote:
-        rest = rest[1:]
-    end = 0
-    while end < len(rest) and (rest[end].isalnum() or rest[end] == '_'):
+SHLEX_WS = ' \t\r\n'
+
+def skip_arithmetic(line, index):
+    # Double-paren and dollar-bracket arithmetic hold shifts, not redirections. Returns the index after the construct, or None if unclosed.
+    if line.startswith(chr(36) + '[', index):
+        depth, end = 1, index + 2
+        opener, closer = '[', ']'
+    else:
+        depth, end = 2, index + 2
+        opener, closer = '(', ')'
+    while end < len(line) and depth:
+        if line[end] == opener:
+            depth += 1
+        elif line[end] == closer:
+            depth -= 1
         end += 1
-    word = rest[:end]
-    if not word:
-        return None
-    if quote and (end == len(rest) or rest[end] != quote):
-        return None
-    return word, bool(quote)
+    return None if depth else end
+
+
+def heredoc_word(rest):
+    # Read the whole delimiter word, applying bash quote removal. Any quote or
+    # backslash anywhere in it makes the body non-expanding. False means the
+    # syntax cannot be parsed safely.
+    word, quoted, index = [], False, 0
+    while index < len(rest):
+        char = rest[index]
+        if char in SHLEX_WS or char in ';&|()<>':
+            break
+        if char == chr(92):
+            if index + 1 >= len(rest):
+                return False
+            word.append(rest[index + 1])
+            quoted, index = True, index + 2
+            continue
+        if char == '$' and rest[index + 1:index + 2] in (chr(39), chr(34)):
+            return False
+        if char in (chr(39), chr(34)):
+            quoted = True
+            index += 1
+            while index < len(rest) and rest[index] != char:
+                if char == chr(34) and rest[index] == chr(92) and rest[index + 1:index + 2] in ('$', chr(96), chr(34), chr(92)):
+                    index += 1
+                word.append(rest[index])
+                index += 1
+            if index >= len(rest):
+                return False
+            index += 1
+            continue
+        word.append(char)
+        index += 1
+    return (''.join(word), quoted) if word else False
+
+
+def heredoc_delim(line):
+    # Unquoted << only. A quoted substring is an argument, not an operator.
+    quote, escaped, index = None, False, 0
+    while index < len(line):
+        char = line[index]
+        if escaped:
+            escaped, index = False, index + 1
+            continue
+        if quote != chr(39) and char == chr(92):
+            escaped, index = True, index + 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in (chr(39), chr(34)):
+            quote = char
+            index += 1
+            continue
+        if line.startswith(chr(36) + '[', index) or line.startswith('((', index):
+            index = skip_arithmetic(line, index)
+            if index is None:
+                return False
+            continue
+        if char == '<' and index + 1 < len(line) and line[index + 1] == '<':
+            rest = line[index + 2:]
+            if rest.startswith('<'):
+                return None
+            if rest.startswith('-'):
+                rest = rest[1:]
+            rest = rest.lstrip(SHLEX_WS)
+            return heredoc_word(rest)
+        index += 1
+    return None
 
 class CommandGroup(list):
-    def __init__(self, tokens, body='', boundary=None, error=None):
+    def __init__(self, tokens, body='', boundary=None, error=None, literal_chars=None):
         super().__init__(tokens)
         self.body = body
+        self.body_span = None
+        self.literal_chars = literal_chars or [[] for _ in tokens]
         self.expanding_body = False
         self.boundary = boundary
         self.error = error
+
+
+def split_punct_word(word, mask):
+    if word and all(c in '();&|' for c in word):
+        parts, masks, offset = [], [], 0
+        for part in re.findall(r'[()]|[;&|]+', word):
+            parts.append(part)
+            masks.append(mask[offset:offset + len(part)])
+            offset += len(part)
+        return parts, masks
+    return [word], [mask]
+
+
+def quote_provenance(text, tokens):
+    # Mirror shlex boundaries while retaining each literal character.
+    words, masks, word, mask = [], [], [], []
+    quote, index, active = None, 0, False
+    def finish():
+        nonlocal word, mask, active
+        if active:
+            parts, part_masks = split_punct_word(''.join(word), mask)
+            words.extend(parts)
+            masks.extend(part_masks)
+        word, mask, active = [], [], False
+    while index < len(text):
+        char = text[index]
+        if quote != chr(39) and char == chr(92) and index + 1 < len(text):
+            following = text[index + 1]
+            if quote != chr(34) or following in (chr(34), chr(92)):
+                word.append(following)
+                mask.append(True)
+                active = True
+                index += 2
+                continue
+        if char == quote:
+            quote = None
+        elif quote is None and char in (chr(39), chr(34)):
+            quote = char
+            active = True
+        elif quote is None and char in SHLEX_WS:
+            finish()
+        elif quote is None and char in ';&|()':
+            finish()
+            end = index + 1
+            while end < len(text) and text[end] in ';&|()':
+                end += 1
+            for part in re.findall(r'[()]|[;&|]+', text[index:end]):
+                words.append(part)
+                masks.append([False] * len(part))
+            index = end
+            continue
+        else:
+            word.append(char)
+            mask.append(quote == chr(39) or char == chr(2))
+            active = True
+        index += 1
+    finish()
+    restored = []
+    for position, word in enumerate(words):
+        for marker, value in [('__GUARD_FD_AMP__', '&'), ('__GUARD_REDIRECT_PIPE__', '|'), (chr(2), '$')]:
+            while marker in word:
+                start = word.index(marker)
+                masks[position][start:start + len(marker)] = [masks[position][start]]
+                word = word[:start] + value + word[start + len(marker):]
+        restored.append(word)
+    if restored != tokens:
+        return [[False] * len(token) for token in tokens]
+    return masks
+
+
+def open_quote(text):
+    # The quote left open after lexing text, mirroring shlex posix quoting.
+    quote, index = None, 0
+    while index < len(text):
+        char = text[index]
+        if quote != chr(39) and char == chr(92):
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in (chr(39), chr(34)):
+            quote = char
+        index += 1
+    return quote
+
+
+def odd_trailing_backslashes(text):
+    return (len(text) - len(text.rstrip(chr(92)))) % 2 == 1
+
+
+def strip_line_continuations(text):
+    # Remove backslash-newline only where the shell does: not inside comments,
+    # single quotes or non-expanding heredoc bodies.
+    lines = text.split(chr(10))
+    out, current, pending, carry = [], '', '', ''
+    heredoc_end, expanding = None, False
+    for number, line in enumerate(lines):
+        last = number == len(lines) - 1
+        if heredoc_end is not None:
+            joined = carry + line
+            if expanding and not last and odd_trailing_backslashes(joined):
+                carry = joined[:-1]
+                continue
+            carry = ''
+            out.append(joined)
+            if joined.lstrip(chr(9)) == heredoc_end:
+                heredoc_end = None
+            continue
+        shaped = shell_text(pending + line + chr(10))
+        body = shaped[:-1]
+        if not last and odd_trailing_backslashes(body) and open_quote(body[:-1]) != chr(39):
+            pending = body[:-1]
+            current += line[:-1]
+            continue
+        out.append(current + line)
+        current = ''
+        if open_quote(shaped):
+            pending = shaped
+            continue
+        pending = ''
+        delim = heredoc_delim(shaped)
+        if delim:
+            heredoc_end, expanding = delim[0], not delim[1]
+    return chr(10).join(out + ([current] if current else []))
 
 
 def shell_text(text):
@@ -66,6 +259,8 @@ def shell_text(text):
             # shell consumes them before executing an extracted -c body.
             if quote == chr(34) and char in (chr(36), chr(96)):
                 out.pop()
+                if char == chr(36):
+                    char = chr(2)
             out.append(char)
             escaped = False
             continue
@@ -92,26 +287,31 @@ def shell_text(text):
     return ''.join(out)
 
 
-def command_records(command):
+def command_records(command, stripped=False):
     groups = []
     pending = ''
     receiver = None
     heredoc_end = None
-    # Shell escaped newlines do not delimit commands.
-    command = command.replace(chr(92) + chr(10), '')
+    if not stripped:
+        command = strip_line_continuations(command)
+    offset = 0
     for line in command.split(chr(10)):
+        line_start = offset
+        offset += len(line) + 1
         if heredoc_end is not None:
             if line.lstrip(chr(9)) == heredoc_end:
                 heredoc_end = None
             else:
                 receiver.body += line + chr(10)
+                start = receiver.body_span[0] if receiver.body_span else line_start
+                receiver.body_span = (start, min(offset, len(command)))
             continue
         pending = shell_text(pending + line + chr(10))
         try:
             lexer = shlex.shlex(pending, posix=True, punctuation_chars=';&|()')
             lexer.whitespace_split = True
             lexer.commenters = ''
-            tokens = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|') for token in lexer]
+            tokens = [token.replace('__GUARD_FD_AMP__', '&').replace('__GUARD_REDIRECT_PIPE__', '|').replace(chr(2), '$') for token in lexer]
         except ValueError:
             # A quote can span physical lines. Never reinterpret failed lexing
             # as whitespace-separated argv.
@@ -120,18 +320,29 @@ def command_records(command):
         pending = ''
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
-        for token in tokens:
+        try:
+            literal = quote_provenance(logical_line, tokens)
+        except Exception:
+            literal = [[False] * len(token) for token in tokens]
+        if len(literal) != len(tokens):
+            literal = [[False] * len(token) for token in tokens]
+        current_literal = []
+        for index, token in enumerate(tokens):
             if token in DELIMS or (token and all(c in '()' for c in token)):
                 if current:
-                    groups.append(CommandGroup(current))
+                    groups.append(CommandGroup(current, literal_chars=current_literal))
                 current = []
+                current_literal = []
                 groups.append(CommandGroup([], boundary=token))
             else:
                 current.append(token)
+                current_literal.append(literal[index])
         if current:
-            groups.append(CommandGroup(current))
+            groups.append(CommandGroup(current, literal_chars=current_literal))
         delim = heredoc_delim(logical_line)
-        if delim and groups:
+        if delim is False:
+            groups.append(CommandGroup([], error='incomplete shell syntax'))
+        elif delim and groups:
             heredoc_end, quoted = delim
             receiver = groups[-1]
             receiver.expanding_body = not quoted

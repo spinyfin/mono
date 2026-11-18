@@ -238,16 +238,14 @@ fn engine_executable_variables_cannot_evade_structural_denies() {
         let (body, stderr) = authorize_tools(&fx, command);
         assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
-    // Without an engine-provided value the variable stays unresolved.
-    let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload("\"$BOSS_BIN\" propose done"));
-    assert_eq!(decision(&body), "deny", "{body} {stderr}");
-    // A relative value is not an engine-provided executable.
-    let (_, body, stderr) = authorize_with_env(
-        &fx.process_home,
-        &run_command_payload("\"$BOSS_BIN\" propose done"),
-        &[("BOSS_BIN", "boss")],
-    );
-    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    for value in ["", "boss"] {
+        let (_, body, stderr) = authorize_with_env(
+            &fx.process_home,
+            &run_command_payload("\"$BOSS_BIN\" propose done"),
+            &[("BOSS_BIN", value)],
+        );
+        assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    }
 }
 
 #[test]
@@ -432,16 +430,18 @@ fn engine_executable_variable_names_are_plain_data_outside_binding_positions() {
         "grep -E 'foo$' f",
         "awk '{print $1}' f",
         "rg 'bar$' .",
+        "grep -n x'$' f",
+        "grep -n x\\$ f",
+        "echo cost$",
+        "printf '%s' a$",
+        "grep \"$X\" f",
         "sed -n '10,$p' f",
     ] {
         let (body, stderr) = authorize_tools(&fx, command);
         assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
-    // A `$` the shell would expand still fails closed.
-    for command in ["grep \"$X\" f", "grep $X f", "grep \"a$X\" f", "cat \"$HOME_CONFIG\""] {
-        let (body, stderr) = authorize_tools(&fx, command);
-        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
-    }
+    let (body, stderr) = authorize_tools(&fx, "cat \"$HOME_CONFIG\"");
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
 }
 
 #[test]
@@ -471,4 +471,101 @@ fn non_writing_kinds_deny_rebinding_and_sed_option_permutation() {
         let (body, stderr) = authorize_tools(&fx, "sed -n '10,$p' f");
         assert_ne!(decision(&body), "deny", "{kind:?}: {body} {stderr}");
     }
+}
+
+#[test]
+fn quoted_worker_clis_and_literal_dollar_operands_are_not_fail_closed() {
+    let fx = Fixture::new("run-dollar-ok");
+    fx.install(WorkerKind::Standard);
+    for command in [
+        r#""$BOSS_BIN" propose done --outcome completed --summary x"#,
+        r#"grep -n 'x$' f"#,
+        r#"awk '{print $1}' f"#,
+        "cat <<'EOF'\n`whoami` $(id)\nEOF",
+    ] {
+        let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
+        assert_eq!(code, 0, "{command} stderr={stderr}");
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(r#"cat "$HOME_CONFIG""#));
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unresolved shell path expansion"),
+        "{body}"
+    );
+}
+
+#[test]
+fn cube_pr_create_reaches_pr_redirect_and_checkleft() {
+    let fx = Fixture::new("run-cube-pr");
+    let marker = fx.tmp.path().join("checkleft-reached");
+    let checkleft = fx.tmp.path().join("boss-checkleft-push-guard.py");
+    write_exec(
+        &checkleft,
+        &format!(
+            "#!/usr/bin/env python3\nimport json,pathlib\npathlib.Path({:?}).write_text('1')\nprint(json.dumps({{'decision':'block','reason':'checkleft-reached'}}))\n",
+            marker
+        ),
+    );
+    fx.install_with(WorkerKind::Standard, |c| {
+        c.checkleft_guard_script = Some(checkleft);
+    });
+    let (code, body, stderr) = authorize(
+        &fx.process_home,
+        &run_command_payload(r#""$CUBE_BIN" pr create --title x --body-file f"#),
+    );
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{body} {stderr}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("checkleft-reached"),
+        "must reach checkleft after PR-redirect: {body} {stderr}"
+    );
+    assert!(!reason.contains("unresolved shell path expansion"), "{body}");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "1");
+}
+
+#[test]
+fn protected_tilde_user_and_symlink_glob_are_denied() {
+    let fx = Fixture::new("run-tilde-glob");
+    fx.install(WorkerKind::Standard);
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".into());
+    let tilde = format!("cat ~{user}/.gemini/config/hooks.json");
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&tilde));
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{tilde}: {body} {stderr}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unresolved shell path expansion"),
+        "{body}"
+    );
+
+    let real = fx.tmp.path().join("real");
+    fs::create_dir_all(real.join("protected")).unwrap();
+    std::os::unix::fs::symlink(&real, fx.tmp.path().join("link")).unwrap();
+    let policy = policy_path(&fx.process_home);
+    let mut doc: Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
+    doc["protected_paths"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(real.join("protected")));
+    write_json_atomic(&policy, &doc).unwrap();
+    rebind(&fx);
+    let globbed = format!("{}/lin?/protected/hooks.json", fx.tmp.path().display());
+    let glob_cmd = format!("cat {globbed}");
+    let (code, body, stderr) = authorize(&fx.process_home, &run_command_payload(&glob_cmd));
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{glob_cmd}: {body} {stderr}");
+    assert!(
+        body["reason"].as_str().unwrap_or_default().contains("protected"),
+        "{body}"
+    );
 }

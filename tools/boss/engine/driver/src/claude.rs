@@ -2056,6 +2056,11 @@ mod tests {
             // `#` inside a word or after a delimiter must not truncate the
             // command: the blocked program following it must still be seen.
             "echo a#b && bazel test //x",
+            ": '()'; bazel test //x",
+            // Arithmetic `<<` is a shift, not a heredoc that would hide the
+            // following lines; a comment does not continue onto the next line.
+            "(( 1 << 2 ))\nbazel test //x\n2",
+            "true # x \\\nbazel test //x",
         ] {
             assert_eq!(
                 reviewer_static_guard_decision(command)["decision"],

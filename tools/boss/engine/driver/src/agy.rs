@@ -394,10 +394,10 @@ impl AgentDriver for AgyDriver {
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
         // Destination is DriverOwned: hooks are discovered from
         // `$HOME/.gemini/config/hooks.json`, never from the Claude worker
-        // settings file. This map declares the PreToolUse authorization
-        // entry; other lifecycle events are installed by the global-root
-        // progress forwarder. Must not return StdoutJsonl — the registry
-        // refuses that topology for built-in drivers.
+        // settings file. The map is the six-event forwarder wiring with
+        // PreToolUse replaced by the authorization adapter. Must not return
+        // StdoutJsonl — the registry refuses that topology for built-in
+        // drivers.
         let hooks = hooks::authorization_hooks_map(config).unwrap_or_else(|error| {
             // The trait cannot return an error. Declare the forwarder events
             // only: `install_authorization` resolves the same paths and

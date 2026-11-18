@@ -174,9 +174,10 @@ fn authorize_with_env(process_home: &Path, payload: &Value, env: &[(&str, &str)]
         .env("BOSS_AGY_POLICY", &policy)
         .env("BOSS_AGY_FORWARDER", policy_doc["forwarder"].as_str().unwrap())
         .env("BOSS_RUN_ID", run_id)
-        .env_remove("BOSS_BIN")
-        .env_remove("CUBE_BIN")
         .env_remove("BOSS_STRUCTURED_OUTPUT")
+        .env("HOME", process_home)
+        .env("BOSS_BIN", "/opt/boss-tools/boss")
+        .env("CUBE_BIN", "/opt/boss-tools/cube")
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -235,11 +236,13 @@ fn install_writes_adapter_policy_attestation_and_single_pre_tool_use_entry() {
     let policy_doc: Value = serde_json::from_str(&fs::read_to_string(&policy).unwrap()).unwrap();
     assert_eq!(policy_doc["approval"], "auto_approve");
     assert_eq!(policy_doc["worker_kind"], "standard");
+    assert!(policy_doc.get("exported_paths").is_none());
+    assert!(policy_doc["artifact_write_paths"].as_array().unwrap().is_empty());
     verify_attestation(&fx.process_home).unwrap();
 }
 
 #[test]
-fn install_merges_sibling_lifecycle_hooks_and_drops_only_the_canary() {
+fn install_replaces_provisioned_hooks_with_the_boss_group() {
     let fx = Fixture::new("run-merge-1");
     let hooks_path = hooks_file_path(&fx.process_home);
     fs::write(
@@ -546,6 +549,61 @@ fn reviewer_native_and_shell_writes_are_denied() {
 }
 
 #[test]
+fn reviewer_may_write_the_engine_owned_review_result_artifact() {
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
+    let fx = Fixture::new("run-reviewer-artifact");
+    fx.install_with(WorkerKind::Reviewer, |c| {
+        c.is_standard_worker = false;
+        c.is_reviewer = true;
+    });
+    let policy: Value = serde_json::from_str(&fs::read_to_string(policy_path(&fx.process_home)).unwrap()).unwrap();
+    let artifact = policy["artifact_write_paths"][0]
+        .as_str()
+        .expect("reviewer artifact path");
+    assert!(Path::new(artifact).is_absolute(), "{artifact}");
+    let write = json!({
+        "toolCall": {
+            "name": "write_file",
+            "args": {"Path": artifact, "Contents": "{\"findings\":[]}"},
+        }
+    });
+    let (code, body, stderr) = authorize(&fx.process_home, &write);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "auto_approve", "{body} stderr={stderr}");
+
+    let sibling = Path::new(artifact).with_file_name("sibling.review-result.json");
+    let sibling_write = json!({
+        "toolCall": {
+            "name": "write_file",
+            "args": {"Path": sibling.display().to_string(), "Contents": "{}"},
+        }
+    });
+    let (code, body, stderr) = authorize(&fx.process_home, &sibling_write);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must not modify files"),
+        "{body}"
+    );
+
+    let workspace_write = json!({
+        "toolCall": {
+            "name": "write_file",
+            "args": {"Path": fx.workspace().join("lib.rs").display().to_string(), "Contents": "x"},
+        }
+    });
+    let (code, body, stderr) = authorize(&fx.process_home, &workspace_write);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(decision(&body), "deny", "{body}");
+}
+
+#[test]
 fn allowlist_kinds_return_deny_unless_prior_grant() {
     assert!(
         super::python3_available(),
@@ -579,6 +637,32 @@ fn child_calls_share_the_same_authorization_entry() {
     let (code, body, stderr) = authorize(&fx.process_home, &denied_child);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(decision(&body), "deny", "{body}");
+}
+
+#[test]
+fn measured_parent_child_subagent_flow_is_approved() {
+    assert!(
+        super::python3_available(),
+        "python3 is required for adapter acceptance tests"
+    );
+    let fx = Fixture::new("run-subagent-flow");
+    fx.install(WorkerKind::Standard);
+    for payload in [
+        json!({"toolCall": {"name": "define_subagent", "args": {"name": "helper", "prompt": "work"}}}),
+        json!({"toolCall": {"name": "invoke_subagent", "args": {"prompt": "hello"}}}),
+        json!({
+            "conversationId": "child-1",
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "echo ok"}},
+        }),
+        json!({
+            "conversationId": "child-1",
+            "toolCall": {"name": "send_message", "args": {"text": "done"}},
+        }),
+    ] {
+        let (code, body, stderr) = authorize(&fx.process_home, &payload);
+        assert_eq!(code, 0, "{payload} stderr={stderr}");
+        assert_eq!(decision(&body), "auto_approve", "{payload}: {body} {stderr}");
+    }
 }
 
 #[test]
@@ -713,3 +797,6 @@ mod review_regression_tests;
 
 #[path = "startup_tests.rs"]
 mod startup_tests;
+
+#[path = "protected_operand_tests.rs"]
+mod protected_operand_tests;
