@@ -15,6 +15,7 @@ use anyhow::{Context, bail};
 
 use super::environment::GrokProcessEnvironment;
 use super::oauth_refresh::{GROK_LOGIN_AFFIRMATION, with_credential_reprobe};
+use crate::ExecutionWorkspaceKind;
 use crate::bounded_command::run_bounded_as;
 
 /// Wall-clock limit for the OAuth-sensitive `grok models` probe.
@@ -93,18 +94,34 @@ pub(super) fn run_bounded(command: &mut Command, timeout: Duration) -> anyhow::R
 /// spawned. Each check requires affirmative output in addition to exit zero;
 /// this matters because `grok models` returns zero while printing "not
 /// authenticated" when no credential is usable.
-pub fn run_worker_preflight(workspace: &Path, environment: &GrokProcessEnvironment) -> anyhow::Result<()> {
-    run_worker_preflight_with(&RealPreflightRunner, workspace, environment)
+pub fn run_worker_preflight(
+    workspace: &Path,
+    environment: &GrokProcessEnvironment,
+    kind: ExecutionWorkspaceKind,
+) -> anyhow::Result<()> {
+    run_worker_preflight_with(&RealPreflightRunner, workspace, environment, kind)
 }
 
 fn run_worker_preflight_with(
     runner: &dyn PreflightRunner,
     workspace: &Path,
     environment: &GrokProcessEnvironment,
+    kind: ExecutionWorkspaceKind,
 ) -> anyhow::Result<()> {
     assert_grok_oauth_with_reprobe(runner, workspace, environment)?;
 
-    probe_cube_workspace(runner, workspace, environment)?;
+    match kind {
+        ExecutionWorkspaceKind::Cube => probe_cube_workspace(runner, workspace, environment)?,
+        ExecutionWorkspaceKind::Scratch => {
+            // Enter and enumerate the actual directory with the worker's tool
+            // environment. Scratch runs have no Cube registry entry or checkout.
+            let output = runner.run("/bin/ls", &["-a", "."], workspace, environment)?;
+            require_success("Scratch workspace access", &output)?;
+            if !output.stdout.lines().any(|line| line == ".") {
+                bail!("Grok worker preflight failed: scratch directory listing omitted .");
+            }
+        }
+    }
 
     let gh = runner.run(
         "gh",
@@ -114,11 +131,13 @@ fn run_worker_preflight_with(
     )?;
     assert_gh_keyring(&gh)?;
 
-    let jj_root = runner.run("jj", &["root"], workspace, environment)?;
-    assert_jj_root(&jj_root, workspace)?;
+    if kind == ExecutionWorkspaceKind::Cube {
+        let jj_root = runner.run("jj", &["root"], workspace, environment)?;
+        assert_jj_root(&jj_root, workspace)?;
 
-    let jj_remotes = runner.run("jj", &["git", "remote", "list"], workspace, environment)?;
-    assert_jj_remotes(&jj_remotes)?;
+        let jj_remotes = runner.run("jj", &["git", "remote", "list"], workspace, environment)?;
+        assert_jj_remotes(&jj_remotes)?;
+    }
 
     assert_session_store_writable(runner, workspace, environment)?;
 
@@ -366,11 +385,83 @@ mod tests {
             success(""),
         ]);
 
-        run_worker_preflight_with(&runner, workspace, &environment()).unwrap();
+        run_worker_preflight_with(&runner, workspace, &environment(), ExecutionWorkspaceKind::Cube).unwrap();
         assert_eq!(
             runner.programs.into_inner(),
             ["grok", "/bundle/bin/cube", "gh", "jj", "jj", "/usr/bin/touch"]
         );
+    }
+
+    #[test]
+    fn progression_scratch_preflight_needs_no_cube_or_checkout() {
+        let runner = FakeRunner::new(vec![
+            success("You are logged in with grok.com.\n"),
+            success(".\n..\n.grok\n"),
+            success("Logged in to github.com account worker (keyring)\n"),
+            success(""),
+        ]);
+        // No bundle is required when dispatch explicitly supplies a scratch workspace.
+        let environment = environment().with_bundled_cube(None);
+        run_worker_preflight_with(
+            &runner,
+            Path::new("/arbitrary-directory"),
+            &environment,
+            ExecutionWorkspaceKind::Scratch,
+        )
+        .unwrap();
+        assert_eq!(
+            runner.programs.into_inner(),
+            ["grok", "/bin/ls", "gh", "/usr/bin/touch"]
+        );
+        assert!(runner.outputs.into_inner().is_empty());
+    }
+
+    #[test]
+    fn cube_workspace_registry_failure_is_not_treated_as_scratch() {
+        let runner = FakeRunner::new(vec![
+            success("You are logged in with grok.com.\n"),
+            PreflightOutput {
+                success: false,
+                status: "exit status: 5".into(),
+                stdout: String::new(),
+                stderr: "workspace is not tracked".into(),
+            },
+        ]);
+        let error = run_worker_preflight_with(
+            &runner,
+            Path::new("/scratch-looking-directory"),
+            &environment(),
+            ExecutionWorkspaceKind::Cube,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Cube workspace access command exited exit status: 5"),
+            "{error}"
+        );
+        assert_eq!(runner.programs.into_inner(), ["grok", "/bundle/bin/cube"]);
+    }
+
+    #[test]
+    fn inaccessible_scratch_directory_fails_preflight() {
+        let runner = FakeRunner::new(vec![
+            success("You are logged in with grok.com.\n"),
+            PreflightOutput {
+                success: false,
+                status: "exit status: 1".into(),
+                stdout: String::new(),
+                stderr: "Permission denied".into(),
+            },
+        ]);
+        let error = run_worker_preflight_with(
+            &runner,
+            Path::new("/scratch"),
+            &environment(),
+            ExecutionWorkspaceKind::Scratch,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Scratch workspace access command exited"), "{error}");
     }
 
     /// With no bundled `cube`, the preflight must fail loudly and name the
@@ -381,9 +472,14 @@ mod tests {
         let runner = FakeRunner::new(vec![success("You are logged in with grok.com.\n")]);
         let environment = environment().with_bundled_cube(None);
 
-        let error = run_worker_preflight_with(&runner, Path::new("/workspace"), &environment)
-            .unwrap_err()
-            .to_string();
+        let error = run_worker_preflight_with(
+            &runner,
+            Path::new("/workspace"),
+            &environment,
+            ExecutionWorkspaceKind::Cube,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("Boss-bundled `cube` could not be located"), "{error}");
         assert!(error.contains("refusing a PATH lookup"), "{error}");
         assert_eq!(
@@ -523,9 +619,14 @@ mod tests {
             },
         ]);
 
-        let error = run_worker_preflight_with(&runner, Path::new("/workspace"), &environment())
-            .unwrap_err()
-            .to_string();
+        let error = run_worker_preflight_with(
+            &runner,
+            Path::new("/workspace"),
+            &environment(),
+            ExecutionWorkspaceKind::Cube,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("not writable by the worker"), "{error}");
         assert!(error.contains("FS_PERMISSION_DENIED"), "{error}");
         assert!(error.contains("Operation not permitted"), "{error}");

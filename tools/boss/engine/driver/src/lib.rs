@@ -1201,6 +1201,13 @@ impl ProgressFidelity {
     }
 }
 
+/// Filesystem contract established by dispatch, independent of the directory name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionWorkspaceKind {
+    Cube,
+    Scratch,
+}
+
 /// Inputs the rich-tier ProgressObservation wiring needs to point a worker's
 /// event source at the engine: the events-socket endpoint, the run/lease
 /// identity tags, the worker's workspace, and the event-forwarder binary the
@@ -2051,6 +2058,17 @@ pub trait AgentDriver: Send + Sync {
         prompt_text: &str,
         run_id: &str,
     ) -> anyhow::Result<Option<DriverRuntimeState>>;
+
+    /// Provision with the workspace contract selected by dispatch.
+    async fn provision_workspace_with_kind(
+        &self,
+        workspace: &Path,
+        prompt_text: &str,
+        run_id: &str,
+        _kind: ExecutionWorkspaceKind,
+    ) -> anyhow::Result<Option<DriverRuntimeState>> {
+        self.provision_workspace(workspace, prompt_text, run_id).await
+    }
 
     /// Tear down whatever per-run state the driver created *outside* the cube
     /// workspace — a per-worker config/cache dir, a socket, a temp credential

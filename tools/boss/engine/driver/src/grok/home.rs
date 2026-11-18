@@ -370,7 +370,12 @@ pub fn read_workspace_path_stamp(grok_home: &Path) -> anyhow::Result<PathBuf> {
 /// remains outside this directory and is shared through `GROK_AUTH_PATH`.
 /// Everything under this home is temporary except `sessions/`, which is a
 /// link into Boss's durable per-execution transcript store.
-pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<GrokRuntimeState> {
+pub fn provision_grok_home_with_kind(
+    workspace: &Path,
+    prompt_text: &str,
+    run_id: &str,
+    kind: crate::ExecutionWorkspaceKind,
+) -> anyhow::Result<GrokRuntimeState> {
     let container = grok_run_container_for_run(run_id)?;
     let grok_home = container.join(GROK_HOME_LEAF);
     let process_home = container.join(PROCESS_HOME_LEAF);
@@ -486,7 +491,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     let grok_version =
         assert_grok_posture_with_environment(&grok_home, &process_home, workspace, &process_environment)?;
     if !skip_posture_assert() {
-        run_worker_preflight(workspace, &process_environment)
+        run_worker_preflight(workspace, &process_environment, kind)
             .context("running fail-fast Grok worker capability preflight")?;
     }
 

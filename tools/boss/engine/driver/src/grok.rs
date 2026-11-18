@@ -61,7 +61,7 @@ pub use home::{
 
 use classify_error::classify_grok_error;
 use environment::GrokProcessEnvironment;
-use home::{provision_grok_home, read_session_id, read_workspace_path_stamp};
+use home::{read_session_id, read_workspace_path_stamp};
 pub use oauth_refresh::{GROK_LOGIN_AFFIRMATION, GrokOauthLiveness, refresh_shared_oauth_credential_blocking};
 use progress::GrokProgressSession;
 use transcript::GrokTranscriptSession;
@@ -422,16 +422,28 @@ impl AgentDriver for GrokDriver {
         prompt_text: &str,
         run_id: &str,
     ) -> anyhow::Result<Option<DriverRuntimeState>> {
+        self.provision_workspace_with_kind(workspace, prompt_text, run_id, crate::ExecutionWorkspaceKind::Cube)
+            .await
+    }
+
+    async fn provision_workspace_with_kind(
+        &self,
+        workspace: &Path,
+        prompt_text: &str,
+        run_id: &str,
+        kind: crate::ExecutionWorkspaceKind,
+    ) -> anyhow::Result<Option<DriverRuntimeState>> {
         // Provisioning shells out (`grok inspect`, the capability preflight) and
         // is synchronous, so it runs on the blocking pool: a wedged tool must
         // never occupy an async worker thread.
         let (workspace_owned, prompt_owned, run_id_owned) =
             (workspace.to_path_buf(), prompt_text.to_owned(), run_id.to_owned());
-        let runtime =
-            tokio::task::spawn_blocking(move || provision_grok_home(&workspace_owned, &prompt_owned, &run_id_owned))
-                .await
-                .context("Grok workspace provisioning task did not complete")?
-                .with_context(|| format!("provisioning Boss-owned GROK_HOME for run_id {run_id:?}"))?;
+        let runtime = tokio::task::spawn_blocking(move || {
+            home::provision_grok_home_with_kind(&workspace_owned, &prompt_owned, &run_id_owned, kind)
+        })
+        .await
+        .context("Grok workspace provisioning task did not complete")?
+        .with_context(|| format!("provisioning Boss-owned GROK_HOME for run_id {run_id:?}"))?;
         Ok(Some(runtime.to_driver_runtime_state()))
     }
 
