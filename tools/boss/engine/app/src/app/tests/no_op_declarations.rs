@@ -35,7 +35,7 @@ async fn agy_refused_tools_reject_repeated_no_ops_and_file_bounded_audit_with_ov
         );
         let events = session
             .normalize_progress_events(&json!({
-                "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true, "error": ""
+                "hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": true, "error": ""
             }))
             .unwrap();
         for event in events {
@@ -181,7 +181,7 @@ async fn no_stop_boundaries_do_not_stage_or_latch_until_idle_stop() {
     assert_pending_without_latch(&state, &execution_id, session.as_ref());
     for raw in [
         json!({"hookEventName": "PostInvocation", "conversationId": "parent"}),
-        json!({"hookEventName": "Stop", "conversationId": "parent", "fullyIdle": false}),
+        json!({"hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": false}),
     ] {
         let events = session.normalize_progress_events(&raw).unwrap();
         assert!(events.is_empty());
@@ -190,7 +190,7 @@ async fn no_stop_boundaries_do_not_stage_or_latch_until_idle_stop() {
     }
     let events = session
         .normalize_progress_events(&json!({
-            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true
+            "hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": true
         }))
         .unwrap();
     assert!(matches!(
@@ -255,7 +255,7 @@ async fn completed_but_failed_empty_error_does_not_latch_or_refuse_no_op() {
         .unwrap();
     let events = session
         .normalize_progress_events(&json!({
-            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true
+            "hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": true
         }))
         .unwrap();
     assert!(matches!(events.as_slice(), [boss_protocol::WorkerEvent::Stop { .. }]));
@@ -338,7 +338,7 @@ async fn following_idle_stop_waits_for_refused_tool_staging_before_no_op() {
     let stream = send(
         &listener,
         &sock,
-        json!({"hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true}),
+        json!({"hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": true}),
         &execution_id,
     )
     .await;
@@ -368,7 +368,7 @@ async fn following_idle_stop_waits_for_refused_tool_staging_before_no_op() {
         &listener,
         &sock,
         json!({
-            "hookEventName": "Stop", "conversationId": "parent", "fullyIdle": true,
+            "hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": true,
             "_boss_delivery_id": "second-idle-stop"
         }),
         &execution_id,
