@@ -1533,6 +1533,8 @@ pub(crate) fn attach_task_derived_projections_traced(
     if let Some(projected) = tasks.iter().chain(chores.iter()).find(|t| t.id == task.id) {
         copy_derived_projection_fields(task, projected);
     }
+    // Single-item reads and mutation replies must agree with board snapshots.
+    crate::merge_conflict_merging::project(std::slice::from_mut(task), &mut []);
     Ok(())
 }
 

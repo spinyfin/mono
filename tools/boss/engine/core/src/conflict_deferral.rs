@@ -90,6 +90,12 @@ pub(crate) fn merge_requested(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> Option<&'static str> {
+    if work_db
+        .merge_conflict_resolution_requested(&candidate.work_item_id, &candidate.pr_url)
+        .unwrap_or(true)
+    {
+        return Some("merge_conflict_resolution_requested");
+    }
     if probe.in_merge_queue {
         return Some("github_merge_queue");
     }

@@ -86,6 +86,15 @@ pub trait ConflictHandling: Send + Sync {
         cleared: ConflictCleared<'_>,
     ) -> bool;
 
+    /// Continue a human-requested merge after a definitive clean probe.
+    async fn resume_merge_after_conflict(
+        &self,
+        _work_db: &WorkDb,
+        _publisher: &dyn ExecutionPublisher,
+        _candidate: &PendingMergeCheck,
+    ) {
+    }
+
     /// Archives conflict-fix revisions that are moot now the PR is mergeable.
     /// Returns how many were closed.
     fn retire_moot_conflict_revisions(

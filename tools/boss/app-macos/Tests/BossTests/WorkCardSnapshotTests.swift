@@ -1421,6 +1421,22 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNil(review.mergeQueueState)
     }
 
+    func testEngineMergeProgressAndFailureAreVisibleOnTheCard() {
+        var task = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/4")
+        task.mergeQueueState = "resolving_conflicts"
+        task.mergeQueueDetail = #"{"status_label":"Resolving conflicts with main…"}"#
+        let merging = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .done))
+        XCTAssertTrue(task.isInMergingSection)
+        XCTAssertEqual(merging.liveStatus, "Resolving conflicts with main…")
+        XCTAssertTrue(merging.hasLiveStatus)
+        task.mergeQueueState = nil
+        task.mergeQueueDetail = #"{"status_label":"Merge paused: Conflict resolution needs a revision"}"#
+        let stopped = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .review))
+        XCTAssertFalse(task.isInMergingSection)
+        XCTAssertEqual(stopped.liveStatus, "Merge paused: Conflict resolution needs a revision")
+        XCTAssertTrue(stopped.hasLiveStatus)
+    }
+
     // MARK: - Live status + activity
 
     func testLiveStatusFromContext() {

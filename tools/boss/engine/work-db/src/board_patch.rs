@@ -173,6 +173,7 @@ pub(super) fn attach_board_derivations(
     // Resolve which labelled Review-column section each card is grouped
     // under. Reads ready_for_review, has_in_progress_revision and
     // ai_review_state, so it must run after all three attaches above.
+    crate::merge_conflict_merging::project(&mut tasks, chores);
     attach_review_section(&mut tasks, chores);
     if let Err(err) = attach_pr_updated_at(conn, &mut tasks, chores) {
         tracing::warn!(?err, "{caller}: failed to attach pr_updated_at; ignoring");

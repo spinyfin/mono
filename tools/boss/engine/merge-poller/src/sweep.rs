@@ -1529,6 +1529,12 @@ pub(crate) async fn sweep_one(
             caller,
         )
         .await;
+        if !parked
+            && open.mergeability == OpenPrMergeability::Clean
+            && let Some(host) = host
+        {
+            host.resume_merge_after_conflict(work_db, publisher, candidate).await;
+        }
         // Trunk merge-queue episodes Boss did not initiate. Runs for every
         // open PR regardless of which mergeability arm above fired: a
         // merge-side eviction lands on a CONFLICTING PR and a test-failure

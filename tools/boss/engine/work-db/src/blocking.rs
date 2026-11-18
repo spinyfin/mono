@@ -398,6 +398,24 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // A conflict encountered during an accepted merge remains part of
+        // that merge until resolution fails or requires a revision.
+        let merging: bool = tx.query_row(
+            "SELECT merge_queue_state IS NOT NULL AND COALESCE((SELECT merge_mechanism FROM products WHERE id = tasks.product_id), 'direct') = 'direct' FROM tasks WHERE id = ?1",
+            [work_item_id], |row| row.get(0),
+        )?;
+        if merging {
+            let base: Option<String> = tx.query_row(
+                "SELECT base_branch FROM conflict_resolutions WHERE work_item_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                [work_item_id], |row| row.get(0),
+            ).optional()?;
+            crate::merge_conflict_merging::start(
+                &tx,
+                work_item_id,
+                pr_url,
+                base.as_deref().filter(|s| !s.is_empty()).unwrap_or("main"),
+            )?;
+        }
         // Phase 10 #31: keep the multi-signal side table in sync with
         // the scalar flip. `attempt_id` is `None` here because
         // `insert_conflict_resolution` runs immediately after this
@@ -450,6 +468,7 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        crate::merge_conflict_merging::stop(&tx, work_item_id, "Resolution needs approval for deleted files")?;
         // Leaving the merge_conflict state for deletion_signoff — clear the
         // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
         tx.execute(

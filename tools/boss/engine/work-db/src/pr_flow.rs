@@ -1846,7 +1846,13 @@ impl WorkDb {
         // (via CASE, so the stored value passes through unchanged) and the
         // merge-queue arms of the changed-check, so a preserved row's
         // `changed` outcome reflects only CI/review movement.
-        let preserve = input.preserve_merge_queue_state;
+        // The local merge request owns its progress and terminal explanation.
+        // GitHub may still report auto-merge armed after a failed resolution.
+        let conflict_merge: bool = tx.query_row(
+            "SELECT CASE WHEN json_valid(merge_queue_detail) THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution' ELSE 0 END FROM tasks WHERE id = ?1",
+            [work_item_id], |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        ).optional()?.unwrap_or(false);
+        let preserve = input.preserve_merge_queue_state || conflict_merge;
         let changed = tx.execute(
             "UPDATE tasks
              SET ci_required_state      = ?2,

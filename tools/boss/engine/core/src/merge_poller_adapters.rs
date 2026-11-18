@@ -121,6 +121,21 @@ impl ConflictHandling for CoreSweepHost {
         .await
     }
 
+    async fn resume_merge_after_conflict(
+        &self,
+        work_db: &WorkDb,
+        publisher: &dyn ExecutionPublisher,
+        candidate: &PendingMergeCheck,
+    ) {
+        crate::merge_when_ready::resume_after_conflict(
+            work_db,
+            publisher,
+            candidate,
+            &crate::merge_when_ready::CommandDirectMergeExecutor,
+        )
+        .await;
+    }
+
     fn retire_moot_conflict_revisions(
         &self,
         work_db: &WorkDb,

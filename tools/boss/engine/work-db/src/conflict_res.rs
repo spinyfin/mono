@@ -259,6 +259,25 @@ impl WorkDb {
                 params![input.work_item_id, id, now],
             )?;
         }
+        if churn_tripped {
+            crate::merge_conflict_merging::stop(
+                &tx,
+                &input.work_item_id,
+                "Conflict resolution stopped after repeated attempts",
+            )?;
+        } else {
+            let merging: bool = tx
+                .query_row(
+                    "SELECT merge_queue_state = 'resolving_conflicts' FROM tasks WHERE id = ?1",
+                    [&input.work_item_id],
+                    |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if merging {
+                crate::merge_conflict_merging::start(&tx, &input.work_item_id, &input.pr_url, &input.base_branch)?;
+            }
+        }
         let inserted = query_conflict_resolution(&tx, &id)?
             .with_context(|| format!("unknown conflict_resolution after insert: {id}"))?;
         if churn_tripped {
@@ -531,6 +550,11 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id, revision_task_id],
         )?;
+        if rows > 0
+            && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+        {
+            crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, "Conflict resolution needs a revision")?;
+        }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
@@ -615,6 +639,11 @@ impl WorkDb {
                 retire_superseded_pending_conflict_attempts_in_tx(&tx, &updated.work_item_id, attempt_id, &now)?;
             }
             conflict_stop::surface_conflict_stop(&tx, attempt_id)?;
+        }
+        if rows > 0
+            && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+        {
+            crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, reason)?;
         }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
@@ -882,6 +911,11 @@ impl WorkDb {
         }
         if rows > 0 && reason != "superseded_stale_head" {
             conflict_stop::surface_conflict_stop(&tx, attempt_id)?;
+        }
+        if rows > 0
+            && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+        {
+            crate::merge_conflict_merging::stop(&tx, &attempt.work_item_id, reason)?;
         }
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
