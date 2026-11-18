@@ -325,6 +325,7 @@ legacy_conflicts_remain_untouched_and_never_prevent_start! {
 }
 
 async fn legacy_conflict_remains_untouched_and_never_prevents_start(kind: ExecutionKind) {
+    crate::test_support::install_peak_memory_report();
     use boss_engine_test_git::jj::JjRepo;
     let mut h = chain_harness(true, true, false).await;
     let db = &h.coordinator.work_db();

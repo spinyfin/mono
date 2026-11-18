@@ -267,11 +267,15 @@ pub fn apply_pending_review_verdicts(
     })
 }
 
-/// Test-process vs child-process peak memory, for isolated `--test_filter`
-/// runs. `getrusage(RUSAGE_SELF)` / `RUSAGE_CHILDREN` for RSS;
-/// `malloc_zone_statistics` live-heap peak on macOS. Installed once per
-/// process from [`open_db`] and from tests that do not open a database.
+/// Test-process vs child-process peak RSS, for isolated `--test_filter`
+/// runs. Opt-in: set `BOSS_TEST_PEAK_MEMORY=1`. `getrusage(RUSAGE_SELF)` /
+/// `RUSAGE_CHILDREN` for RSS; on macOS, `malloc_zone_statistics().size_in_use`
+/// is live heap at process exit (this allocator reports `max_size_in_use`
+/// as 0, so that field is not printed).
 pub fn install_peak_memory_report() {
+    if std::env::var_os("BOSS_TEST_PEAK_MEMORY").is_none() {
+        return;
+    }
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -279,15 +283,17 @@ pub fn install_peak_memory_report() {
             let filter = std::env::var("TESTBRIDGE_TEST_ONLY").unwrap_or_else(|_| "all".to_owned());
             let self_rss = rusage_max_rss(libc::RUSAGE_SELF);
             let child_rss = rusage_max_rss(libc::RUSAGE_CHILDREN);
+            let (user_s, sys_s) = rusage_cpu_seconds(libc::RUSAGE_SELF);
             match live_heap_bytes() {
-                Some((live, peak)) => eprintln!(
+                Some(live) => eprintln!(
                     "peak_memory filter={filter} test_process_rss_bytes={self_rss} \
                      child_process_rss_bytes={child_rss} test_process_live_heap_bytes={live} \
-                     test_process_live_heap_peak_bytes={peak}"
+                     test_process_user_s={user_s:.3} test_process_sys_s={sys_s:.3}"
                 ),
                 None => eprintln!(
                     "peak_memory filter={filter} test_process_rss_bytes={self_rss} \
-                     child_process_rss_bytes={child_rss} test_process_live_heap_bytes="
+                     child_process_rss_bytes={child_rss} test_process_live_heap_bytes= \
+                     test_process_user_s={user_s:.3} test_process_sys_s={sys_s:.3}"
                 ),
             }
         }
@@ -296,12 +302,26 @@ pub fn install_peak_memory_report() {
 }
 
 fn rusage_max_rss(who: i32) -> i64 {
+    rusage(who).map(max_rss_bytes).unwrap_or(0)
+}
+
+fn rusage_cpu_seconds(who: i32) -> (f64, f64) {
+    match rusage(who) {
+        Some(usage) => (timeval_seconds(usage.ru_utime), timeval_seconds(usage.ru_stime)),
+        None => (0.0, 0.0),
+    }
+}
+
+fn rusage(who: i32) -> Option<libc::rusage> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: getrusage initializes the supplied rusage on success.
     if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
-        return 0;
+        return None;
     }
-    let usage = unsafe { usage.assume_init() };
+    Some(unsafe { usage.assume_init() })
+}
+
+fn max_rss_bytes(usage: libc::rusage) -> i64 {
     if cfg!(target_os = "macos") {
         usage.ru_maxrss
     } else {
@@ -309,7 +329,11 @@ fn rusage_max_rss(who: i32) -> i64 {
     }
 }
 
-fn live_heap_bytes() -> Option<(u64, u64)> {
+fn timeval_seconds(tv: libc::timeval) -> f64 {
+    tv.tv_sec as f64 + (tv.tv_usec as f64) / 1_000_000.0
+}
+
+fn live_heap_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         #[repr(C)]
@@ -332,7 +356,7 @@ fn live_heap_bytes() -> Option<(u64, u64)> {
             size_allocated: 0,
         };
         unsafe { malloc_zone_statistics(malloc_default_zone(), &mut stats) };
-        Some((stats.size_in_use as u64, stats.max_size_in_use as u64))
+        Some(stats.size_in_use as u64)
     }
     #[cfg(not(target_os = "macos"))]
     {

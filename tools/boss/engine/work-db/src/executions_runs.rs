@@ -786,13 +786,14 @@ impl WorkDb {
             ci_fix = CREATED_VIA_CI_FIX_PREFIX,
             pr_review = CREATED_VIA_PR_REVIEW_PREFIX,
         );
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let sql = format!(
             "SELECT {EXECUTION_COLUMNS} \
              FROM work_executions we \
              LEFT JOIN tasks t ON t.id = we.work_item_id \
              WHERE we.status = 'ready' \
                AND (we.dispatch_not_before IS NULL \
-                    OR CAST(we.dispatch_not_before AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER)) \
+                    OR CAST(we.dispatch_not_before AS INTEGER) <= ?1) \
              ORDER BY CASE WHEN t.priority = '{critical}' AND we.kind <> 'progression' THEN 0 ELSE 1 END ASC, \
                       CASE WHEN t.priority = '{critical}' AND we.kind <> 'progression' THEN we.created_at END ASC, \
                       {class_case} ASC, we.priority DESC, we.created_at ASC, we.id ASC",
@@ -800,7 +801,7 @@ impl WorkDb {
             EXECUTION_COLUMNS = EXECUTION_COLUMNS,
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], map_execution)?;
+        let rows = stmt.query_map(params![now], map_execution)?;
         collect_rows(rows)
     }
 
@@ -810,17 +811,18 @@ impl WorkDb {
     /// cards as queued without a dispatch position.
     pub fn list_unranked_pending_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let sql = format!(
             "SELECT {EXECUTION_COLUMNS} \
              FROM work_executions we \
              WHERE we.status IN ('queued', 'waiting_dependency') \
                 OR (we.status = 'ready' \
                     AND we.dispatch_not_before IS NOT NULL \
-                    AND CAST(we.dispatch_not_before AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER)) \
+                    AND CAST(we.dispatch_not_before AS INTEGER) > ?1) \
              ORDER BY we.created_at ASC, we.id ASC",
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], map_execution)?;
+        let rows = stmt.query_map(params![now], map_execution)?;
         collect_rows(rows)
     }
 
@@ -829,11 +831,12 @@ impl WorkDb {
     /// without any write happening.
     pub fn next_ready_dispatch_deadline(&self) -> Result<Option<i64>> {
         let conn = self.connect()?;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
         conn.query_row(
             "SELECT MIN(CAST(dispatch_not_before AS INTEGER)) FROM work_executions \
              WHERE status = 'ready' AND dispatch_not_before IS NOT NULL \
-               AND CAST(dispatch_not_before AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER)",
-            [],
+               AND CAST(dispatch_not_before AS INTEGER) > ?1",
+            params![now],
             |row| row.get::<_, Option<i64>>(0),
         )
         .map_err(Into::into)

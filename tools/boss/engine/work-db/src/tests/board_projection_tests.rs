@@ -34,7 +34,8 @@ fn board_projection_evicts_oversized_content_without_truncating_the_response() {
     let task = create_test_chore_manual(&db, product.clone(), "large card").id;
     let mut model = None;
     check(&db, &product, &mut model, 100);
-    let large = "x".repeat(32 * 1024 * 1024);
+    const LIMIT: usize = 8 * 1024;
+    let large = "x".repeat(LIMIT + 1024);
     db.connect()
         .unwrap()
         .execute("UPDATE tasks SET description = ?2 WHERE id = ?1", params![task, large])
@@ -42,16 +43,17 @@ fn board_projection_evicts_oversized_content_without_truncating_the_response() {
     drop(large);
     for expected in [Refresh::Incremental(1), Refresh::Snapshot("cold")] {
         let (tree, refresh) = db
-            .refresh_board_projection(
+            .refresh_board_projection_limited(
                 &product,
                 &mut model,
                 &mut PopulationTrace::disabled(),
                 &BoardCaches::default(),
                 100,
+                LIMIT,
             )
             .unwrap();
         assert_eq!(refresh, expected);
-        assert_eq!(tree.chores[0].description.len(), 32 * 1024 * 1024);
+        assert_eq!(tree.chores[0].description.len(), LIMIT + 1024);
         assert!(model.is_none());
     }
     db.connect()

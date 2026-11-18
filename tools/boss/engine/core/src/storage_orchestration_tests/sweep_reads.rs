@@ -75,6 +75,7 @@ fn clone_row(conn: &Connection, table: &str, columns: &[String], template_id: &s
 /// slow host.
 #[test]
 fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
+    crate::test_support::install_peak_memory_report();
     const ROOTS: usize = 1500;
     const REVISIONS_PER_ROOT: usize = 3;
     /// The full projection is slow enough on this fixture that timing it
@@ -336,5 +337,4 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
         single_elapsed,
         single_elapsed / ROOTS as u32,
     );
-    crate::test_support::install_peak_memory_report();
 }
