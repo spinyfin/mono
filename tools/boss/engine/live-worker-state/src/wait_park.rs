@@ -1,5 +1,11 @@
 //! Park/resume bookkeeping for a declared wait, keyed by declaration
 //! identity so a later wait cannot inherit an earlier park's resume flag.
+//!
+//! The park's own ingress sequence is the resume watermark. `boss propose
+//! wait` runs inside a tool call, so that call's `PostToolUse` (and any
+//! later tool hook before `Stop`) is numbered above `declared_after_seq`
+//! without being a wake-up. Once a declaration has been parked on, only
+//! main-session activity numbered above the park counts as a resume.
 
 use boss_protocol::{LiveWorkerState, WorkerActivity};
 
@@ -53,31 +59,44 @@ pub(super) fn observe_wait_declaration(meta: &mut SlotMeta, snapshot: WaitSnapsh
         meta.parked_on_declared_wait = false;
         meta.resumed_after_wait_park = false;
         meta.parked_wait = None;
+        meta.wait_park_seq = None;
     }
 }
 
-pub(super) fn lapsed_wait_consumed(meta: &SlotMeta, identity: Option<&DeclaredWaitIdentity>) -> bool {
-    let resumed_after_this_wait = meta.resumed_after_wait_park
+fn parked_on_this_wait(meta: &SlotMeta, identity: Option<&DeclaredWaitIdentity>) -> bool {
+    meta.parked_on_declared_wait
         && match (meta.parked_wait, identity) {
             (_, None) => true,
             (None, Some(_)) => true,
             (Some(parked), Some(current)) => parked.generation == current.generation,
-        };
-    let worked_past_declaration = match (
+        }
+}
+
+pub(super) fn lapsed_wait_consumed(meta: &SlotMeta, identity: Option<&DeclaredWaitIdentity>) -> bool {
+    // Pre-park tool hooks from the declaring turn sit above
+    // `declared_after_seq`. Once this declaration has been parked on,
+    // only a resume past the park watermark consumes it.
+    if parked_on_this_wait(meta, identity) {
+        return meta.resumed_after_wait_park;
+    }
+    match (
         meta.last_main_activity_seq,
         identity.and_then(|id| id.declared_after_seq),
     ) {
         (Some(main), Some(declared)) => main > declared,
         _ => false,
-    };
-    resumed_after_this_wait || worked_past_declaration
+    }
 }
 
 pub(super) fn note_wait_park(meta: &mut SlotMeta, activity: WorkerActivity, identity: Option<DeclaredWaitIdentity>) {
     if matches!(activity, WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue) {
+        let same_park = parked_on_this_wait(meta, identity.as_ref());
         meta.parked_on_declared_wait = true;
         meta.resumed_after_wait_park = false;
         meta.parked_wait = identity;
+        if !same_park {
+            meta.wait_park_seq = meta.last_stop_seq;
+        }
     }
 }
 
@@ -92,7 +111,11 @@ pub(super) fn note_wait_resume(meta: &mut SlotMeta, seq: Option<u64>, identity: 
         {
             return;
         }
-        if id.declared_after_seq.is_some_and(|declared| seq <= declared) {
+        if let Some(park_seq) = meta.wait_park_seq {
+            if seq <= park_seq {
+                return;
+            }
+        } else if id.declared_after_seq.is_some_and(|declared| seq <= declared) {
             return;
         }
     }
@@ -115,4 +138,5 @@ pub(super) fn note_overtaken_wait_park(meta: &mut SlotMeta, stop_seq: u64, snaps
     meta.parked_on_declared_wait = true;
     meta.parked_wait = snapshot.identity;
     meta.resumed_after_wait_park = true;
+    meta.wait_park_seq = Some(stop_seq);
 }

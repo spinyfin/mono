@@ -495,6 +495,10 @@ struct SlotMeta {
     /// refer to. A later declaration resets those flags so they cannot
     /// suppress a new wait's overdue state.
     parked_wait: Option<declared_wait::DeclaredWaitIdentity>,
+    /// Ingress sequence of the `Stop` that opened [`Self::parked_wait`].
+    /// Tool hooks from the declaring turn sit at or below this value and
+    /// are not a resume; only main-session activity numbered above it is.
+    wait_park_seq: Option<u64>,
     /// Ordered clearing events retained for this slot lifetime so a late
     /// notification is attributed to its first consumer, not the newest one.
     #[builder(default)]
