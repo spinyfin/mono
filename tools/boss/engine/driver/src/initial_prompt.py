@@ -258,6 +258,16 @@ class BriefDropped(RuntimeError):
 # reported within seconds; later output is the turn itself.
 POST_SUBMIT_WATCH = 30
 
+
+def _squash(text):
+    return b" ".join(text.split())
+
+
+def _is_vendor_error(row, marker):
+    # `<marker>: <reason>: <4xx/5xx status>`: the shape the CLI prints when it
+    # discards a brief.
+    return bool(re.match(re.escape(marker) + rb":\s.*\b[45][0-9][0-9]\b", row))
+
 PROMPT_MARK = "❯".encode()
 _BOX_PREFIXES = (b"|", "│".encode(), "┃".encode(), "║".encode())
 
@@ -532,6 +542,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
     drain_until = None
     watch_until = 0
     submit_rows = set()
+    payload_squashed = _squash(prompt)
     try:
         if outer_tty:
             tty.setraw(0, termios.TCSANOW)
@@ -593,13 +604,15 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     # An accepted paste does not prove a turn started: the CLI
                     # can discard the brief with a vendor error and fire no hook.
                     view.feed(output)
-                    # Only rows that appeared after submit count: the pasted
-                    # brief and earlier output are in `submit_rows`. A vendor
-                    # error row starts with the marker, so quoted text mid-row
-                    # does not qualify.
+                    # Only rows that appeared after submit count, and only
+                    # ones that are not a piece of the brief itself (however
+                    # far it scrolled or however it was re-wrapped) and that
+                    # carry the full vendor error shape, so a half-painted row
+                    # cannot qualify.
                     rows = [_dialog_line(row) for row in view.text().splitlines()]
                     dropped = next((m for m in post_submit_failure_markers
-                                    if any(row.startswith(m) and row not in submit_rows for row in rows)), None)
+                                    if any(_is_vendor_error(row, m) and row not in submit_rows
+                                           and _squash(row) not in payload_squashed for row in rows)), None)
                     if dropped is not None:
                         log("post_submit_failure", marker=dropped.decode("utf-8", "replace"))
                         raise BriefDropped(dropped)

@@ -200,6 +200,71 @@ async fn shared_dialog_fixture_corpus() {
     }
 }
 
+fn fixture_markers(case: &serde_json::Value) -> Vec<String> {
+    case["markers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|marker| marker.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn every_fixture_menu_layout_receives_no_paste_or_submit() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!("../../blocking_dialog_cases.json")).unwrap();
+    let mut blocked = 0;
+    for case in cases.as_array().unwrap() {
+        let Some(expected) = case["expected_marker"].as_str() else {
+            continue;
+        };
+        if !case["payload"].as_str().unwrap().is_empty() {
+            continue;
+        }
+        blocked += 1;
+        let name = case["name"].as_str().unwrap();
+        for path in ["literal", "paste", "return"] {
+            let (tmux, runner) = tmux([success(case["screen"].as_str().unwrap())]);
+            let tmux = tmux.with_blocking_dialog_markers(fixture_markers(case));
+            let result = match path {
+                "literal" => tmux.send_keys("worker", "status?").await,
+                "paste" => tmux.send_keys("worker", "first\nsecond").await,
+                _ => tmux.send_submit("worker").await,
+            };
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<BlockingDialogOnScreen>().unwrap().marker,
+                expected,
+                "{name}/{path}"
+            );
+            // Only the screen capture ran: no send-keys, no paste buffer.
+            assert_eq!(runner.calls().len(), 1, "{name}/{path}: {:?}", runner.calls());
+            assert_eq!(runner.calls()[0][2], "capture-pane", "{name}/{path}");
+        }
+    }
+    assert!(blocked >= 8, "fixture corpus lost its blocked layouts: {blocked}");
+}
+
+#[tokio::test]
+async fn every_fixture_transcript_copy_is_still_delivered() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!("../../blocking_dialog_cases.json")).unwrap();
+    let mut clear = 0;
+    for case in cases.as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        if !case["expected_marker"].is_null() || !name.contains("transcript") {
+            continue;
+        }
+        clear += 1;
+        let screen = case["screen"].as_str().unwrap();
+        let (tmux, runner) = tmux([success(screen), success("")]);
+        tmux.with_blocking_dialog_markers(fixture_markers(case))
+            .send_submit("worker")
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(runner.calls().last().unwrap().last().unwrap(), "Enter", "{name}");
+    }
+    assert!(clear >= 4, "fixture corpus lost its transcript copies: {clear}");
+}
+
 #[test]
 fn spawn_rejection_round_trips_marker_and_rejects_unrelated_errors() {
     for marker in [MARKER, "quoted \"marker\"", "Unicode ❯", "line\nbreak", "control\u{1b}"] {
