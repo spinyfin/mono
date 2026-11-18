@@ -40,6 +40,7 @@ mod model_menu;
 mod pending_tools;
 pub mod permissions;
 mod progress;
+pub use environment::MIN_QUALIFIED_AGY_VERSION;
 pub use pending_tools::REFUSED_TOOL_PREFIX;
 #[cfg(test)]
 mod test_environment;

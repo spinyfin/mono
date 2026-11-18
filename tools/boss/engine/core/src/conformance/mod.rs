@@ -4,13 +4,16 @@
 //! extraction. Five surfaces:
 //!
 //! 1. **Byte-for-byte goldens** — Claude's spawn line, settings.json,
-//!    CLAUDE.md, and deny rules (`claude_goldens`), and Grok's pane spawn
-//!    command (`grok_goldens`), all produced *through the driver interface*
-//!    (or a pure builder the real driver method delegates to) — never by
-//!    reaching past the trait into driver-only helpers.
+//!    CLAUDE.md, and deny rules (`claude_goldens`), Grok's pane spawn
+//!    command (`grok_goldens`), and Antigravity's session-settings posture
+//!    plus captured hook payloads (`agy_goldens`), all produced *through the
+//!    driver interface* (or a pure builder the real driver method delegates
+//!    to) — never by reaching past the trait into driver-only helpers.
 //! 2. **Ingress equivalence** — stdout-JSONL (Codex) and hook ingress
-//!    (Claude, Grok) produce the same [`WorkerEvent`] sequence shape for an
-//!    equivalent session.
+//!    (Claude, Grok, agy) produce the same [`WorkerEvent`] sequence shape for an
+//!    equivalent session. agy's dialect has no `UserPromptSubmit` hook and
+//!    `PostToolUse` carries no command output; those gaps are pinned, not
+//!    filled in.
 //! 3. **Boundary equivalence** — (a) every transport produces equal `TurnEnd`
 //!    via `turn_boundary`; (b) the decoded `WorkerEvent` sequence drives the
 //!    live-worker activity machine to Idle. See `boundary_equivalence`.
@@ -27,6 +30,13 @@
 //!    hidden `--trust` flag still parses, and `grok models` still matches the
 //!    pinned descriptor's single-SKU menu; set `BOSS_REQUIRE_GROK_CLI=1` to
 //!    require the binary instead of soft-skipping — see `version_pin`.
+//!    agy is pinned at **1.5.7 or later** (`MIN_QUALIFIED_AGY_VERSION`).
+//!    Live `agy --version` soft-skips when the binary is absent; set
+//!    `BOSS_REQUIRE_AGY_CLI=1` to require it. CI cannot authenticate `agy`,
+//!    so that live check is meaningful only on a signed-in developer machine;
+//!    fixture-side pins carry the contract everywhere else. Authenticated
+//!    probes (rules discovery) are the non-test `agy_rules_probe` binary,
+//!    not tests under the mandatory sandbox.
 //! 5. **Native-dialect transcript normalize** — every registry slug has a
 //!    fixture in that driver's on-disk dialect, and normalizing it surfaces a
 //!    `[blocked]` marker. Fails closed when a driver is registered without a
@@ -48,6 +58,7 @@
 
 #![cfg(test)]
 
+mod agy_goldens;
 mod boundary_equivalence;
 mod claude_goldens;
 mod fixtures;
@@ -58,8 +69,8 @@ mod native_transcript;
 mod version_pin;
 
 /// Truthy-env-var parsing shared by every driver's "require the live CLI"
-/// gate (`BOSS_REQUIRE_CODEX_CLI`, `BOSS_REQUIRE_GROK_CLI`, …), so a future
-/// third driver's pin does not add yet another copy of the same parsing.
+/// gate (`BOSS_REQUIRE_CODEX_CLI`, `BOSS_REQUIRE_GROK_CLI`, `BOSS_REQUIRE_AGY_CLI`),
+/// so a new driver's pin does not add yet another copy of the same parsing.
 fn truthy_env(var: &str) -> bool {
     match std::env::var(var) {
         Ok(v) => {
@@ -101,6 +112,23 @@ fn codex_cli_binary() -> Option<std::path::PathBuf> {
 
 fn require_grok_cli() -> bool {
     truthy_env("BOSS_REQUIRE_GROK_CLI")
+}
+
+fn require_agy_cli() -> bool {
+    truthy_env("BOSS_REQUIRE_AGY_CLI")
+}
+
+/// Resolve the agy CLI the live pin exercises: `BOSS_AGY_BIN` first (the
+/// production selector, also used by `agy_rules_probe`), else `agy` on
+/// `PATH`. `None` is the caller's soft-skip case. CI images have neither a
+/// signed-in account nor, usually, the binary; fixture-side pins still
+/// defend the hook contract.
+fn agy_cli_binary() -> Option<std::path::PathBuf> {
+    if let Some(raw) = std::env::var_os("BOSS_AGY_BIN").filter(|v| !v.is_empty()) {
+        let path = std::path::PathBuf::from(raw);
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    which("agy")
 }
 
 /// Resolve `bin` on `PATH` via `which`, same lookup every live-CLI pin needs

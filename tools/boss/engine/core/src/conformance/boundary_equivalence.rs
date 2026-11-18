@@ -22,16 +22,16 @@
 use boss_protocol::{StopReason, WorkerEvent};
 
 use crate::conformance::fixtures::{
-    CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, GROK_HOOK_SESSION_JSONL,
-    codex_shaped_driver, decode_jsonl,
+    AGY_HOOK_SESSION_JSONL, CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL,
+    GROK_HOOK_SESSION_JSONL, codex_shaped_driver, decode_progress,
 };
 use boss_protocol::WorkerActivity;
 
-use crate::driver::{AgentDriver, ClaudeDriver, GrokDriver, TurnEnd};
+use crate::driver::{AgentDriver, AgyDriver, ClaudeDriver, GrokDriver, TurnEnd};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 
 fn last_turn_end(driver: &dyn AgentDriver, jsonl: &str) -> TurnEnd {
-    let events = decode_jsonl(driver, jsonl);
+    let events = decode_progress(driver, jsonl);
     let mut last = None;
     for event in &events {
         if let Some(end) = driver.turn_boundary(event) {
@@ -88,21 +88,46 @@ fn hook_stop_and_grok_stop_produce_identical_turn_end() {
 }
 
 #[test]
+fn hook_stop_and_agy_stop_produce_identical_turn_end() {
+    // agy's idle parent Stop with terminationReason=NO_TOOL_CALL maps to
+    // Completed with continuation=false — the same TurnEnd Claude and Grok
+    // produce for a completed turn. fullyIdle=false never reaches
+    // turn_boundary (the progress session drops it).
+    let from_claude_hooks = last_turn_end(&ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL);
+    let from_agy_hooks = last_turn_end(&AgyDriver::default(), AGY_HOOK_SESSION_JSONL);
+
+    assert_eq!(
+        from_claude_hooks,
+        TurnEnd {
+            session_id: CANONICAL_SESSION_ID.to_owned(),
+            reason: StopReason::Completed,
+            continuation: false,
+        },
+    );
+    assert_eq!(
+        from_claude_hooks, from_agy_hooks,
+        "TurnEnd from Claude's hook Stop and agy's idle parent Stop must be identical",
+    );
+}
+
+#[test]
 fn decoded_event_sequence_drives_activity_machine_to_idle_from_either_source() {
     // Claim 2: apply_event is fed WorkerEvents (not TurnEnd). Every
     // transport's decoded sequence leaves the live-worker slot Idle after
     // the turn.
     let codex = codex_shaped_driver();
     let grok = GrokDriver::default();
-    let cases: [(&str, &dyn AgentDriver, &str); 3] = [
+    let agy = AgyDriver::default();
+    let cases: [(&str, &dyn AgentDriver, &str); 4] = [
         ("hook-claude", &ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL),
         ("stdout-jsonl-codex", &codex, CODEX_STDOUT_SESSION_JSONL),
         ("hook-grok", &grok, GROK_HOOK_SESSION_JSONL),
+        ("hook-agy", &agy, AGY_HOOK_SESSION_JSONL),
     ];
     for (label, driver, jsonl) in cases {
         let reg = LiveWorkerStateRegistry::new();
         reg.register_spawn(1, "run-boundary", "model", 42, None);
-        let events = decode_jsonl(driver, jsonl);
+        let events = decode_progress(driver, jsonl);
         assert!(!events.is_empty(), "{label}: fixture must produce events",);
         for event in &events {
             assert!(
@@ -176,6 +201,10 @@ fn only_stop_shaped_events_are_turn_boundaries_on_any_driver() {
         assert!(
             GrokDriver::default().turn_boundary(event).is_none(),
             "Grok must not treat {event:?} as a turn boundary",
+        );
+        assert!(
+            AgyDriver::default().turn_boundary(event).is_none(),
+            "agy must not treat {event:?} as a turn boundary",
         );
     }
 }
