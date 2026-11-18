@@ -33,7 +33,7 @@ pub use preserved::{
     preserved_work_unpublished,
 };
 mod preserved_restore;
-pub use preserved_restore::restore_preserved;
+pub use preserved_restore::{restore_preserved, restore_preserved_for};
 
 mod preserved_cleanup;
 pub use preserved_cleanup::{PreservedScope, forget_preserved_references};
@@ -189,6 +189,30 @@ impl std::error::Error for UncontainedPreservedWork {}
 
 pub fn uncontained_preserved_work(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UncontainedPreservedWork(message.into()))
+}
+
+/// The refusal as it crosses the spoke transport: a JSON object that no other
+/// workspace diagnostic shares a key with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UncontainedRefusalWire {
+    pub uncontained_preserved_work: String,
+}
+
+/// Encode `error` for the wire when it is an uncontained refusal.
+pub fn uncontained_refusal_to_wire(error: &anyhow::Error) -> Option<Vec<u8>> {
+    let cause = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<UncontainedPreservedWork>())?;
+    serde_json::to_vec(&UncontainedRefusalWire {
+        uncontained_preserved_work: cause.0.clone(),
+    })
+    .ok()
+}
+
+/// Rebuild the typed refusal from a host's rejected workspace result.
+pub fn uncontained_refusal_from_wire(bytes: &[u8]) -> Option<anyhow::Error> {
+    let wire: UncontainedRefusalWire = serde_json::from_slice(bytes).ok()?;
+    Some(uncontained_preserved_work(wire.uncontained_preserved_work))
 }
 
 /// True when `error` (or any cause in its chain) is an uncontained preserved-work refusal.

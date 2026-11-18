@@ -1710,6 +1710,15 @@ pub mod workspace {
                 Ok(Err(error)) => {
                     result.code = phase.failure().into();
                     result.reason = format!("workspace operation failed: {error:#}");
+                    if let Some(refusal) = boss_engine_recovery::execution_bookmark::uncontained_refusal_to_wire(&error)
+                    {
+                        // Containment refusal is definitive: the restage was undone.
+                        result.code = ResultCode::Rejected.into();
+                        result.value = Some(command_result::Value::Workspace(WorkspaceResult {
+                            cube_result_json: refusal,
+                            ..Default::default()
+                        }));
+                    }
                     if let Some(cube_error) = error.downcast_ref::<cube::CubeCliError>()
                         && cube_error.positioning_refused()
                     {

@@ -1173,6 +1173,68 @@ async fn structured_positioning_refusal_survives_the_spoke_transport() {
 }
 
 #[tokio::test]
+async fn uncontained_preserved_work_refusal_survives_the_spoke_transport() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let peer = fx
+        .spoke(
+            Box::new(|c| {
+                if workspace_kind(c) == Some(Kind::RestorePreserved) {
+                    let wire = boss_engine_recovery::execution_bookmark::uncontained_refusal_to_wire(
+                        &boss_engine_recovery::execution_bookmark::uncontained_preserved_work(
+                            "head abc is missing work def",
+                        ),
+                    )
+                    .unwrap();
+                    let mut result = refused(
+                        c,
+                        ResultCode::Rejected,
+                        "workspace operation failed: head abc is missing work def",
+                    );
+                    result.value = Some(workspace(c, serde_json::from_slice(&wire).unwrap()));
+                    Some(result)
+                } else {
+                    standard(c)
+                }
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    let record = ExecutionBookmark::builder()
+        .execution_id("exec_1")
+        .repo_path("/spoke/repo".into())
+        .host_id(HOST)
+        .build();
+    let error = adapter
+        .restore_preserved_work(&record, Path::new(PATH), None, true)
+        .await
+        .unwrap_err();
+    assert!(
+        boss_engine_recovery::execution_bookmark::is_uncontained_preserved_work(&error),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("head abc is missing work def"),
+        "{error:#}"
+    );
+    let sent = peer
+        .commands()
+        .into_iter()
+        .find(|c| workspace_kind(c) == Some(Kind::RestorePreserved))
+        .expect("the restore reached the host");
+    let Some(command::Body::Workspace(op)) = sent.body else {
+        panic!("restore is a workspace op")
+    };
+    let request: boss_engine_recovery::execution_bookmark::HostRecoveryRequest =
+        serde_json::from_slice(&op.request_json).unwrap();
+    assert!(request.pr_bound, "dispatch's PR binding crosses the transport");
+    peer.disconnect();
+}
+
+#[tokio::test]
 async fn spoke_ready_host_cleans_the_legacy_store_and_gcs_through_the_provider() {
     let fx = Fixture::new().await;
     fx.ready(HOST);

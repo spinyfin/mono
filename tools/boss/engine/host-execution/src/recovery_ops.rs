@@ -69,7 +69,9 @@ pub async fn restore_preserved(
     workspace: &Path,
     request: &HostRecoveryRequest,
 ) -> Result<Value> {
-    let report = recovery::restore_preserved(&LocalJj, record, workspace, request.recorded.as_ref()).await?;
+    let report =
+        recovery::restore_preserved_for(&LocalJj, record, workspace, request.recorded.as_ref(), request.pr_bound)
+            .await?;
     Ok(serde_json::to_value(report)?)
 }
 
@@ -130,6 +132,7 @@ mod tests {
             since_unix: Some(1_700_000_000),
             tip_source: Some(WorkspaceTipSource::Live),
             scope: recovery::PreservedScope::TipAndArchives,
+            pr_bound: true,
         };
         let request_json = serde_json::json!({
             "recorded": {
@@ -139,7 +142,8 @@ mod tests {
             },
             "since_unix": 1_700_000_000,
             "tip_source": "Live",
-            "scope": "TipAndArchives"
+            "scope": "TipAndArchives",
+            "pr_bound": true
         });
         assert_eq!(serde_json::to_value(&request).unwrap(), request_json);
         assert_eq!(

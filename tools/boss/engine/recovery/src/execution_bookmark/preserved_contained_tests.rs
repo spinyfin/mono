@@ -85,7 +85,7 @@ async fn work_equal_to_the_rebased_pr_head_is_contained_not_restaged() {
     let positioned = log(&repo.replacement, "@", "commit_id");
     let head = log(&repo.replacement, "@-", "commit_id");
 
-    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+    let report = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
         .unwrap()
         .expect("a contained predecessor still yields a report");
@@ -123,7 +123,7 @@ async fn work_equal_to_the_rebased_pr_head_is_contained_not_restaged() {
     // A pre-start retry repositions and restores again. It must find nothing
     // to do, not a missing pointer or a foreign edit of the recorded commit.
     JjRepo::run(&repo.replacement, &["new", PR]);
-    let retried = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+    let retried = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
         .unwrap()
         .expect("the preserved name still resolves");
@@ -142,7 +142,7 @@ async fn only_the_work_the_pr_head_lacks_is_restaged() {
     sibling_rebase(&repo, "one\ntwo\n");
     let head = log(&repo.replacement, "@-", "commit_id");
 
-    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+    let report = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
         .unwrap()
         .unwrap();
@@ -182,7 +182,7 @@ async fn only_the_work_the_pr_head_lacks_is_restaged() {
     // A pre-start retry repositions and restores again: the follow-up is
     // still the only work, and the dropped duplicates do not come back.
     JjRepo::run(&repo.replacement, &["new", PR]);
-    let retried = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+    let retried = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
         .unwrap()
         .unwrap();
@@ -208,7 +208,7 @@ async fn work_the_pr_head_does_not_carry_is_refused_with_current_state() {
     let positioned = log(&repo.replacement, "@", "commit_id");
     let head = log(&repo.replacement, "@-", "commit_id");
 
-    let err = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+    let err = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
         .unwrap_err();
     assert!(is_uncontained_preserved_work(&err), "{err:#}");
@@ -242,6 +242,104 @@ async fn work_the_pr_head_does_not_carry_is_refused_with_current_state() {
     );
 }
 
+/// One preserved commit that carries all of the work, as a patch recovered
+/// without its original commit split.
+async fn single_commit_run(repo: &JjRepo, execution: &str) -> ExecutionBookmark {
+    let record = create(&LocalJj, &repo.worker, execution, "local").await.unwrap();
+    std::fs::write(repo.worker.join("feature.txt"), "feature\n").unwrap();
+    std::fs::write(repo.worker.join("src.txt"), "revision\n").unwrap();
+    std::fs::write(repo.worker.join("deps.lock"), "one\ntwo\n").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "All the work"]);
+    JjRepo::run(&repo.worker, &["new"]);
+    record
+}
+
+#[tokio::test]
+async fn a_single_partly_contained_conflicting_commit_on_a_pr_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = single_commit_run(&repo, "exec_single_commit").await;
+    let saved = teardown(&repo, &record).await;
+    let original_tip = saved.commit_id.clone();
+    sibling_rebase(&repo, "one\nthree\n");
+    let positioned = log(&repo.replacement, "@", "commit_id");
+    let head = log(&repo.replacement, "@-", "commit_id");
+
+    let err = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
+        .await
+        .unwrap_err();
+
+    assert!(is_uncontained_preserved_work(&err), "{err:#}");
+    let detail = format!("{err:#}");
+    assert!(
+        detail.contains(&head) && detail.contains(&original_tip),
+        "the refusal names the PR head and the preserved tip: {detail}"
+    );
+    assert_eq!(log(&repo.replacement, "@", "commit_id"), positioned);
+    assert_eq!(
+        log(&repo.replacement, &preserved_name(&record.execution_id), "commit_id"),
+        original_tip
+    );
+}
+
+#[tokio::test]
+async fn trunk_restore_with_one_contained_and_one_conflicting_change_is_restaged() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = first_run(&repo, "exec_trunk_conflict", false, false).await;
+    let saved = teardown(&repo, &record).await;
+    sibling_rebase(&repo, "one\nthree\n");
+
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .expect("a non-PR restore is never refused");
+
+    assert!(!report.pr_bound, "{report:#?}");
+    assert!(
+        !report.conflicts.trim().is_empty(),
+        "the conflict is reported: {report:#?}"
+    );
+    let prompt = report.instructions();
+    assert!(
+        prompt.contains("resolve the following rebase conflicts") && !prompt.contains("cube pr update"),
+        "a trunk restore carries no PR-rewrite instructions: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_puts_back_names_on_descendants_of_the_rebased_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = first_run(&repo, "exec_refusal_names", false, false).await;
+    let saved = teardown(&repo, &record).await;
+    // A variant name on a commit that shares an ancestor with the tip.
+    JjRepo::run(
+        &repo.worker,
+        &["bookmark", "set", "variant-marker", "-r", "@", "--allow-backwards"],
+    );
+    let before = log(&repo.worker, "variant-marker", "commit_id");
+    sibling_rebase(&repo, "one\nthree\n");
+    let head = log(&repo.replacement, "@-", "commit_id");
+
+    let err = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
+        .await
+        .unwrap_err();
+
+    assert!(is_uncontained_preserved_work(&err), "{err:#}");
+    assert_eq!(
+        log(&repo.replacement, "variant-marker", "commit_id"),
+        before,
+        "a name the rebase carried along is back on its original commit"
+    );
+    let restaged = log(
+        &repo.replacement,
+        &format!("({head}:: ~ {head}) ~ working_copies() ~ ::variant-marker"),
+        "commit_id ++ \"\\n\"",
+    );
+    assert!(restaged.trim().is_empty(), "no rebased copies remain: {restaged}");
+}
+
 #[tokio::test]
 async fn a_contained_tip_is_replaced_by_the_remaining_head() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,7 +358,7 @@ async fn a_contained_tip_is_replaced_by_the_remaining_head() {
     let saved = teardown(&repo, &record).await;
     sibling_rebase(&repo, "one\ntwo\n");
 
-    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+    let report = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
         .unwrap()
         .unwrap();
@@ -304,7 +402,7 @@ async fn a_contained_merge_tip_stays_as_the_connector_of_two_heads() {
     let saved = teardown(&repo, &record).await;
     sibling_rebase(&repo, "one\ntwo\n");
 
-    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+    let report = restore_preserved_for(&LocalJj, &record, &repo.replacement, Some(&saved), true)
         .await
         .unwrap()
         .unwrap();
@@ -332,4 +430,23 @@ async fn a_contained_merge_tip_stays_as_the_connector_of_two_heads() {
         std::fs::read_to_string(repo.replacement.join("b.txt")).unwrap(),
         "line b\n"
     );
+}
+
+#[test]
+fn the_refusal_round_trips_the_wire_and_nothing_else_decodes_as_one() {
+    let refusal = uncontained_preserved_work("PR head abc is missing work def");
+    let wire = uncontained_refusal_to_wire(&refusal).expect("a refusal encodes");
+    let rebuilt = uncontained_refusal_from_wire(&wire).expect("and decodes");
+    assert!(is_uncontained_preserved_work(&rebuilt), "{rebuilt:#}");
+    assert_eq!(format!("{rebuilt:#}"), "PR head abc is missing work def");
+    // Context added on the way out does not hide the typed cause.
+    let wrapped = refusal.context("restoring preserved work");
+    assert!(uncontained_refusal_to_wire(&wrapped).is_some());
+    assert!(uncontained_refusal_to_wire(&anyhow::anyhow!("other failure")).is_none());
+    // A host's other typed diagnostic (a cube refusal) is not mistaken for one.
+    let cube_refusal = serde_json::to_vec(&serde_json::json!({
+        "host": "h", "exit_code": 2, "stdout": "", "stderr": "{\"error_kind\":\"workspace_positioning_refused\"}"
+    }))
+    .unwrap();
+    assert!(uncontained_refusal_from_wire(&cube_refusal).is_none());
 }

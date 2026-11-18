@@ -135,7 +135,7 @@ async fn same_workspace_basename_does_not_cross_stores() {
             .await
             .unwrap_err(),
         adapter
-            .restore_preserved_work(&record, Path::new(PATH), None)
+            .restore_preserved_work(&record, Path::new(PATH), None, false)
             .await
             .unwrap_err(),
     ] {

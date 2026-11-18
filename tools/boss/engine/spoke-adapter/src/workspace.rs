@@ -111,6 +111,13 @@ impl SpokeHostAdapter {
         {
             return Err(error.into());
         }
+        if result.code == ResultCode::Rejected as i32
+            && let Some(command_result::Value::Workspace(value)) = &result.value
+            && let Some(error) =
+                boss_engine_recovery::execution_bookmark::uncontained_refusal_from_wire(&value.cube_result_json)
+        {
+            return Err(error);
+        }
         Self::workspace_value(self.host_name(), name, expect_ok(self.host_name(), name, result)?)
     }
 
@@ -739,9 +746,11 @@ impl SpokeHostAdapter {
         assignment: &SpokeAssignment,
         record: &ExecutionBookmark,
         recorded: Option<&PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<RestoreReport>> {
         let request = serde_json::to_vec(&HostRecoveryRequest {
             recorded: recorded.cloned(),
+            pr_bound,
             ..Default::default()
         })?;
         let result = self

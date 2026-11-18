@@ -1069,9 +1069,10 @@ impl crate::host_adapter::HostAdapter for ScratchDestination {
         record: &recovery::ExecutionBookmark,
         workspace: &Path,
         recorded: Option<&recovery::PreservedTip>,
+        pr_bound: bool,
     ) -> Result<Option<recovery::RestoreReport>> {
         self.inner
-            .restore_preserved_work(&self.on_inner_store(record), workspace, recorded)
+            .restore_preserved_work(&self.on_inner_store(record), workspace, recorded, pr_bound)
             .await
     }
 

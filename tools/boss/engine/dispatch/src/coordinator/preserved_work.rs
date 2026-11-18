@@ -41,15 +41,12 @@ impl ExecutionCoordinator {
                 .ok_or_else(|| pointer_integrity_error("preserved work store location is unavailable"))?;
             let recorded = self.work_db.preserved_tip(&prior.id)?;
             adapter
-                .restore_preserved_work(&record, &lease.workspace_path, recorded.as_ref())
+                .restore_preserved_work(&record, &lease.workspace_path, recorded.as_ref(), pr.is_some())
                 .await
         }
         .await;
         match restored {
-            Ok(Some(mut report)) => {
-                if pr.is_some() {
-                    report.pr_bound = true;
-                }
+            Ok(Some(report)) => {
                 let has_work = !report.commits.trim().is_empty();
                 self.work_db.record_execution_restore_report(&execution.id, &report)?;
                 if !report.unrestaged_unpublished.trim().is_empty()

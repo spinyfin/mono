@@ -152,15 +152,31 @@ async fn select_variant(
     )))
 }
 
-/// The destination is the PR head or trunk already positioned by cube.
-/// When more than one preserved variant exists, this step points
-/// `preserved/<exec>` at the selected commit (`jj bookmark set --allow-backwards`)
-/// and archives unselected unpublished variants so they remain named.
+/// Restore for a destination that is not a PR head (trunk): conflicts are
+/// reported to the worker, never refused. See [`restore_preserved_for`].
 pub async fn restore_preserved(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
     workspace: &Path,
     recorded: Option<&PreservedTip>,
+) -> Result<Option<RestoreReport>> {
+    restore_preserved_for(jj, record, workspace, recorded, false).await
+}
+
+/// The destination is the PR head or trunk already positioned by cube.
+/// `pr_bound` is dispatch's authoritative answer to "is the destination a PR
+/// head": it is never inferred from the store. A PR-bound restage that leaves
+/// conflicts is refused, because containment in the rewritten head is
+/// unproven and the remainder is not a clean restage.
+/// When more than one preserved variant exists, this step points
+/// `preserved/<exec>` at the selected commit (`jj bookmark set --allow-backwards`)
+/// and archives unselected unpublished variants so they remain named.
+pub async fn restore_preserved_for(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    recorded: Option<&PreservedTip>,
+    pr_bound: bool,
 ) -> Result<Option<RestoreReport>> {
     if jj.shared_repo(workspace).await? != record.repo_path {
         return Err(pointer_integrity_error("preserved work belongs to another store"));
@@ -245,13 +261,24 @@ pub async fn restore_preserved(
         // Include empty connectors in the roots; exclude published history.
         // `all:` is required when two unpublished lines share the preserved tip
         // (a merge): `roots(...)` then names more than one revision.
-        let roots = format!("all:roots(::{tip} ~ (::remote_bookmarks() | ::{base}))");
-        jj.run(workspace, &["rebase", "-s", &roots, "-d", base]).await?;
+        let roots = format!("roots(::{tip} ~ (::remote_bookmarks() | ::{base}))");
+        // `rebase -s` also moves descendants of the roots (the old working
+        // copy, archived variants). Remember where their names point so a
+        // refusal can put every one back.
+        let (moved_names, rewritten_under_work) = if pr_bound {
+            (
+                names_on(jj, &record.repo_path, &format!("descendants({roots})")).await?,
+                destination_carries_part_of(jj, &record.repo_path, &sources, &tip, base).await?,
+            )
+        } else {
+            (Vec::new(), false)
+        };
+        jj.run(workspace, &["rebase", "-s", &format!("all:{roots}"), "-d", base])
+            .await?;
         let restaged = evolved_from(jj, &record.repo_path, &change, base, &tip)
             .await?
             .ok_or_else(|| pointer_integrity_error("rebased preserved change has no identifiable evolution"))?;
         let range = format!("{base}..{restaged}");
-        let listing = log(jj, &record.repo_path, &range, CONTAINMENT_LINE).await?;
         let restaged_conflicts = log(
             jj,
             &record.repo_path,
@@ -259,18 +286,19 @@ pub async fn restore_preserved(
             "change_id ++ \" \" ++ description.first_line() ++ \"\\n\"",
         )
         .await?;
-        if restage_is_uncontained(&commits, &listing, &restaged_conflicts) {
+        if pr_bound && !restaged_conflicts.trim().is_empty() && rewritten_under_work {
             return refuse_uncontained(
                 jj,
                 record,
                 workspace,
-                UncontainedRestage {
-                    base,
-                    original_tip: &tip,
-                    restaged: &restaged,
-                    positioned,
-                    conflicts: &restaged_conflicts,
-                },
+                UncontainedRestage::builder()
+                    .base(base)
+                    .original_tip(&tip)
+                    .restaged(&restaged)
+                    .positioned(positioned)
+                    .conflicts(&restaged_conflicts)
+                    .moved_names(&moved_names)
+                    .build(),
             )
             .await;
         }
@@ -348,15 +376,6 @@ pub async fn restore_preserved(
             unrestaged.push(format!("{commit} ({name})"));
         }
     }
-    let pr_bound = !log(
-        jj,
-        &record.repo_path,
-        &format!("{base} & remote_bookmarks()"),
-        "commit_id",
-    )
-    .await?
-    .trim()
-    .is_empty();
     Ok(Some(
         RestoreReport::builder()
             .pointer(preserved_name(&record.execution_id))
@@ -398,35 +417,76 @@ async fn evolved_from(jj: &dyn Jj, repo: &Path, change: &str, base: &str, versio
     Ok(None)
 }
 
-/// True when a sibling rebase emptied some preserved changes (they are in
-/// the destination) but the rest still conflict: containment is unproven
-/// and the remainder is not a clean restage.
-fn restage_is_uncontained(commits: &str, listing: &str, conflicts: &str) -> bool {
-    if conflicts.trim().is_empty() {
-        return false;
-    }
-    let held_work: std::collections::HashSet<&str> = commits
-        .lines()
-        .filter_map(|line| line.split_once(' ').map(|(change, _)| change))
-        .collect();
-    listing.lines().any(|line| {
-        let mut fields = line.split(' ');
-        matches!(
-            (fields.next(), fields.next(), fields.next()),
-            (Some(_), Some(change), Some("contained")) if held_work.contains(change)
+/// Evaluated before the rebase hides the original commits.
+/// True when the destination already holds the final content of at least one
+/// file the unpublished preserved work touched: the PR was rewritten under
+/// that work, so a conflict in the rest means containment is unproven. A
+/// conflict with no such overlap is an ordinary one the worker resolves.
+async fn destination_carries_part_of(jj: &dyn Jj, repo: &Path, sources: &str, tip: &str, base: &str) -> Result<bool> {
+    let touched = log(
+        jj,
+        repo,
+        sources,
+        "diff.files().map(|entry| entry.path().display() ++ \"\\n\").join(\"\")",
+    )
+    .await?;
+    let differing = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "diff",
+                "--from",
+                base,
+                "--to",
+                tip,
+                "--name-only",
+            ],
         )
-    })
+        .await?;
+    let differing: std::collections::HashSet<&str> = differing.lines().collect();
+    Ok(touched
+        .lines()
+        .filter(|path| !path.is_empty())
+        .any(|path| !differing.contains(path)))
 }
 
 /// Undo the restage, restore `preserved/<exec>` onto the original tip, and
 /// fail with a detail that names the live PR head, preserved tip, baseline
 /// and bookmark positions.
+#[derive(bon::Builder)]
 struct UncontainedRestage<'a> {
     base: &'a str,
     original_tip: &'a str,
     restaged: &'a str,
     positioned: &'a str,
     conflicts: &'a str,
+    /// `(name, commit)` of every bookmark on a descendant of the rebased
+    /// roots before the rebase.
+    moved_names: &'a [(String, String)],
+}
+
+/// Local bookmarks on the commits `revset` names, as `(name, commit)`.
+async fn names_on(jj: &dyn Jj, repo: &Path, revset: &str) -> Result<Vec<(String, String)>> {
+    let listing = jj
+        .run(
+            repo,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "-r",
+                revset,
+                "-T",
+                "if(normal_target, name ++ \" \" ++ normal_target.commit_id() ++ \"\\n\", \"\")",
+            ],
+        )
+        .await?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(name, commit)| (name.to_owned(), commit.to_owned()))
+        .collect())
 }
 
 async fn refuse_uncontained(
@@ -441,8 +501,26 @@ async fn refuse_uncontained(
         restaged,
         positioned,
         conflicts,
+        moved_names,
     } = restage;
     let name = preserved_name(&record.execution_id);
+    // Put every name the rebase moved back on its original commit (which
+    // makes that commit visible again), so the store is as it was before.
+    for (moved, commit) in moved_names {
+        jj.run(
+            &record.repo_path,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "set",
+                moved,
+                "-r",
+                commit,
+                "--allow-backwards",
+            ],
+        )
+        .await?;
+    }
     jj.run(
         &record.repo_path,
         &[
@@ -464,10 +542,11 @@ async fn refuse_uncontained(
     } else {
         jj.run(workspace, &["new", base]).await?;
     }
-    let restaged_range = format!("{base}..{restaged}");
-    let remaining = log(jj, &record.repo_path, &restaged_range, "commit_id").await?;
+    // The restaged copies and everything the rebase carried along with them.
+    let rebased = format!("descendants(roots({base}..{restaged})) ~ ::{base}");
+    let remaining = log(jj, &record.repo_path, &rebased, "commit_id").await?;
     if !remaining.trim().is_empty() {
-        jj.run(workspace, &["abandon", &restaged_range]).await?;
+        jj.run(workspace, &["abandon", "--retain-bookmarks", &rebased]).await?;
     }
     let current = log(jj, &record.repo_path, &revision(&name), "commit_id").await?;
     let dest_names = log(jj, &record.repo_path, base, "bookmarks.join(\", \")").await?;

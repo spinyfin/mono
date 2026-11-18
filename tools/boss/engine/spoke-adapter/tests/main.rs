@@ -526,7 +526,7 @@ async fn recovery_operations_are_typed_workspace_commands() {
     assert_eq!(outcome.tip.unwrap().count, 2);
     assert!(
         adapter
-            .restore_preserved_work(&record, path, None)
+            .restore_preserved_work(&record, path, None, false)
             .await
             .unwrap()
             .is_none()
