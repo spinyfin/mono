@@ -223,16 +223,25 @@ impl WaitRegistry {
         None
     }
 
-    /// True iff `execution_id` declared a wait whose deadline has passed and
-    /// that has not been cleared. Read-only: unlike [`active`](Self::active)
+    /// The expired wait still held for `execution_id`, if any. The record
+    /// stays until [`forget`](Self::forget) or a new declaration so overdue
+    /// UI can still name what expired. Read-only: unlike [`active`](Self::active)
     /// it logs nothing.
-    pub fn lapsed(&self, execution_id: &str, now_epoch_secs: i64) -> bool {
+    pub fn lapsed_record(&self, execution_id: &str, now_epoch_secs: i64) -> Option<WaitRecord> {
         self.inner
             .lock()
             .expect("WaitRegistry mutex poisoned")
             .get(execution_id)
             .and_then(|state| state.active.as_ref())
-            .is_some_and(|record| record.expires_at_epoch <= now_epoch_secs)
+            .filter(|record| record.expires_at_epoch <= now_epoch_secs)
+            .cloned()
+    }
+
+    /// True iff `execution_id` declared a wait whose deadline has passed and
+    /// that has not been cleared. Read-only: unlike [`active`](Self::active)
+    /// it logs nothing.
+    pub fn lapsed(&self, execution_id: &str, now_epoch_secs: i64) -> bool {
+        self.lapsed_record(execution_id, now_epoch_secs).is_some()
     }
 
     /// Cumulative seconds already granted to `execution_id`.
@@ -386,6 +395,18 @@ mod tests {
         );
         registry.forget("exec_a");
         assert!(!registry.lapsed("exec_a", 1_060));
+        assert!(registry.lapsed_record("exec_a", 1_060).is_none());
+    }
+
+    #[test]
+    fn lapsed_record_keeps_reason_and_deadline() {
+        let registry = WaitRegistry::new();
+        registry.declare("exec_a", "bazel".into(), None, 60, 1_000).unwrap();
+        assert!(registry.lapsed_record("exec_a", 1_000).is_none());
+        let record = registry.lapsed_record("exec_a", 1_060).expect("expired record remains");
+        assert_eq!(record.reason, "bazel");
+        assert_eq!(record.expires_at_epoch, 1_060);
+        assert_eq!(record.granted_secs, 60);
     }
 
     #[test]
