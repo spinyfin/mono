@@ -174,3 +174,176 @@ fn unexplained_wait_is_logged_on_read_without_waiting_for_a_heartbeat() {
         assert!(record.contains(field), "missing {field}: {record}");
     }
 }
+
+fn anomaly_records(logs: &crate::test_support::log_capture::SharedBuffer, needle: &str) -> Vec<String> {
+    String::from_utf8(logs.lock().clone())
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(needle) && line.contains("exposed waiting state without a reason"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn unexplained_wait_is_logged_once_per_distinct_anomaly() {
+    let logs = crate::test_support::log_capture::install();
+    let db = WorkDb::open(temp_db_path("unexplained-log-dedup")).unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore(&db, &product.id, "Persistent unexplained wait");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Queued)
+                .build(),
+        )
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            db.get_task_runtime(&task.id).unwrap().dispatch_wait_reason.as_deref(),
+            Some("unclassified")
+        );
+    }
+    assert_eq!(anomaly_records(&logs, &execution.id).len(), 1);
+}
+
+#[test]
+fn unexplained_wait_age_follows_the_execution_transition_not_the_task_status() {
+    let logs = crate::test_support::log_capture::install();
+    let db = WorkDb::open(temp_db_path("unexplained-log-exec-age")).unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore(&db, &product.id, "Execution transition age");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Queued)
+                .build(),
+        )
+        .unwrap();
+    // `connect` holds the database's only connection until it is dropped, so
+    // each statement takes its own.
+    let age_of = || -> i64 {
+        let changed_at: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT changed_at FROM execution_state_transitions WHERE execution_id = ?1",
+                [&execution.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        boss_engine_utils::epoch_time::now_epoch_secs() - changed_at
+    };
+    // The task's own status never moves, and the wait has no recorded start.
+    assert!(execution.dispatch_wait_since.is_none());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE execution_state_transitions SET changed_at = changed_at - 7200 WHERE execution_id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    assert!(age_of() >= 7200);
+    db.get_task_runtime(&task.id).unwrap();
+    let record = anomaly_records(&logs, &execution.id).remove(0);
+    let age = record
+        .split("execution_state_age_secs=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("no execution age: {record}"));
+    assert!((7200..7260).contains(&age), "age {age}: {record}");
+    // An execution-level change restarts the clock without touching the task.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_wait_reason = 'leasing_workspace' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    assert!(age_of() < 60);
+    let after = crate::query_task(&db.connect().unwrap(), &task.id).unwrap().unwrap();
+    assert_eq!(after.status, task.status, "the task status did not move");
+}
+
+#[test]
+fn unexplained_wait_log_uses_the_given_execution_never_the_newest_row() {
+    let logs = crate::test_support::log_capture::install();
+    let db = WorkDb::open(temp_db_path("unexplained-log-selection")).unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore(&db, &product.id, "Shadowed execution");
+    let selected = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Queued)
+                .build(),
+        )
+        .unwrap();
+    let progression = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task.id)
+                .kind(ExecutionKind::Progression)
+                .status(ExecutionStatus::Queued)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = '9999999999' WHERE id = ?1",
+            [&progression.id],
+        )
+        .unwrap();
+    let conn = db.connect().unwrap();
+    crate::wait_diagnostics::log_unclassified(
+        &conn,
+        &[crate::wait_diagnostics::Unclassified {
+            work_item_id: &task.id,
+            execution_id: Some(&selected.id),
+            execution_status: Some("queued"),
+        }],
+    );
+    assert_eq!(anomaly_records(&logs, &selected.id).len(), 1);
+    assert!(anomaly_records(&logs, &progression.id).is_empty());
+    crate::wait_diagnostics::log_unclassified(
+        &conn,
+        &[crate::wait_diagnostics::Unclassified {
+            work_item_id: &task.id,
+            execution_id: None,
+            execution_status: None,
+        }],
+    );
+    assert!(anomaly_records(&logs, &progression.id).is_empty());
+    assert!(
+        anomaly_records(&logs, "execution_id=\"(none)\"")
+            .iter()
+            .any(|line| line.contains(&task.id))
+    );
+}
+
+#[test]
+fn stale_startup_phase_on_a_ready_row_is_not_rendered_as_a_hold() {
+    let db = WorkDb::open(temp_db_path("stale-startup-phase")).unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore(&db, &product.id, "Stale phase");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&task.id)).unwrap().remove(0);
+    db.claim_execution_for_dispatch(&execution.id).unwrap();
+    db.set_dispatch_wait_reason(&execution.id, "leasing_workspace").unwrap();
+    // A path that moves the row off `claimed` without clearing the phase.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let reason = db.get_task_runtime(&task.id).unwrap().dispatch_wait_reason;
+    assert_ne!(reason.as_deref(), Some("leasing_workspace"));
+}

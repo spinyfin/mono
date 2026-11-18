@@ -139,7 +139,14 @@ pub(super) fn for_execution_naming(
         _ => Ok(DispatchWait::default()),
     }?;
     if wait.is_unclassified() {
-        super::wait_diagnostics::log_unclassified(conn, &[(&execution.work_item_id, Some(&execution.id))]);
+        super::wait_diagnostics::log_unclassified(
+            conn,
+            &[super::wait_diagnostics::Unclassified {
+                work_item_id: &execution.work_item_id,
+                execution_id: Some(&execution.id),
+                execution_status: Some(execution.status.as_str()),
+            }],
+        );
     }
     Ok(wait)
 }
@@ -170,6 +177,21 @@ fn for_gated(conn: &Connection, execution: &WorkExecution) -> Result<DispatchWai
     Ok(wait)
 }
 
+/// Codes that describe a claimed run's startup. A row that left `claimed` by a
+/// path that does not clear them must not render them as a recorded hold.
+fn is_startup_phase_code(reason: &str) -> bool {
+    use boss_engine_storage_values::dispatch_wait::{
+        DISPATCH_WAIT_REASON_DISPATCHING, DISPATCH_WAIT_REASON_LEASING_WORKSPACE,
+        DISPATCH_WAIT_REASON_PREPARING_WORKSPACE,
+    };
+    matches!(
+        reason,
+        DISPATCH_WAIT_REASON_DISPATCHING
+            | DISPATCH_WAIT_REASON_LEASING_WORKSPACE
+            | DISPATCH_WAIT_REASON_PREPARING_WORKSPACE
+    )
+}
+
 /// A `ready` row waits out a dispatch deadline, sits behind a hold the
 /// scheduler recorded on its last pass, or has not been reached by a pass yet.
 fn for_ready(conn: &Connection, execution: &WorkExecution, now: i64) -> Result<DispatchWait> {
@@ -186,7 +208,7 @@ fn for_ready(conn: &Connection, execution: &WorkExecution, now: i64) -> Result<D
     if let Some(reason) = execution
         .dispatch_wait_reason
         .as_ref()
-        .filter(|reason| !reason.trim().is_empty())
+        .filter(|reason| !reason.trim().is_empty() && !is_startup_phase_code(reason))
     {
         let blocker_id: Option<String> = conn.query_row(
             "SELECT dispatch_wait_blocker_id FROM work_executions WHERE id = ?1",
@@ -412,7 +434,13 @@ pub(super) fn for_item(
     }) {
         return for_execution(conn, latest, now);
     }
-    Ok(for_unscheduled(conn, task, latest.map(|execution| &execution.status))?.unwrap_or_default())
+    Ok(for_unscheduled(
+        conn,
+        task,
+        latest.map(|execution| &execution.status),
+        latest.map(|execution| execution.id.as_str()),
+    )?
+    .unwrap_or_default())
 }
 
 /// Classify an item with nothing pending for it: a card the board lists as
@@ -428,8 +456,17 @@ pub(super) fn for_unscheduled(
     conn: &Connection,
     task: &Task,
     latest: Option<&ExecutionStatus>,
+    execution_id: Option<&str>,
 ) -> Result<Option<DispatchWait>> {
-    let (mut waits, _) = unscheduled_wait::classify(conn, &[Candidate { task, latest }], None)?;
+    let (mut waits, _) = unscheduled_wait::classify(
+        conn,
+        &[Candidate {
+            task,
+            latest,
+            execution_id,
+        }],
+        None,
+    )?;
     Ok(waits.remove(&task.id))
 }
 
@@ -471,6 +508,7 @@ pub(super) fn annotate_unscheduled_many<'a>(
             .map(|(task, runtime)| Candidate {
                 task,
                 latest: runtime.execution_status.as_ref(),
+                execution_id: runtime.execution_id.as_deref(),
             })
             .collect();
         unscheduled_wait::classify(conn, &candidates, counter)?
@@ -635,10 +673,14 @@ impl WorkDb {
         // Most idle `active` items are `awaiting_redispatch`, because the
         // orphan sweep starts a replacement. The classifier decides them all
         // together; any it cannot name is reported.
-        let unscheduled: Vec<(Task, Option<ExecutionStatus>)> = {
+        let unscheduled: Vec<(Task, Option<ExecutionStatus>, Option<String>)> = {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {columns},
                         (SELECT e.status FROM work_executions e
+                         WHERE e.work_item_id = tasks.id AND e.kind <> 'progression'
+                         ORDER BY e.created_at DESC, e.id DESC
+                         LIMIT 1),
+                        (SELECT e.id FROM work_executions e
                          WHERE e.work_item_id = tasks.id AND e.kind <> 'progression'
                          ORDER BY e.created_at DESC, e.id DESC
                          LIMIT 1)
@@ -657,24 +699,26 @@ impl WorkDb {
             ))?;
             let rows = stmt.query_map([], |row| {
                 let task = map_task_with_parent_provenance_and_archived_reason(row)?;
-                let column = row.as_ref().column_count() - 1;
+                let column = row.as_ref().column_count() - 2;
                 let latest: Option<String> = row.get(column)?;
                 let latest = latest
                     .map(|raw| parse_text_column::<ExecutionStatus>(column, &raw))
                     .transpose()?;
-                Ok((task, latest))
+                let execution_id: Option<String> = row.get(column + 1)?;
+                Ok((task, latest, execution_id))
             })?;
             collect_rows(rows)?
         };
         let candidates: Vec<Candidate<'_>> = unscheduled
             .iter()
-            .map(|(task, latest)| Candidate {
+            .map(|(task, latest, execution_id)| Candidate {
                 task,
                 latest: latest.as_ref(),
+                execution_id: execution_id.as_deref(),
             })
             .collect();
         let (classified, cost) = unscheduled_wait::classify(&conn, &candidates, Some(&counter))?;
-        for (task, _) in &unscheduled {
+        for (task, _, _) in &unscheduled {
             if classified.get(&task.id).is_some_and(DispatchWait::is_unclassified) {
                 waits.push(UnexplainedWait {
                     work_item_id: task.id.clone(),

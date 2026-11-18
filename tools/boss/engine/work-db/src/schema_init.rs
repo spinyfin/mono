@@ -879,6 +879,10 @@ mod floor_tests {
                 Box::new(|c| super::super::progression_candidates::migrate_execution_provenance(c).unwrap()),
             ),
             (
+                super::super::wait_diagnostics::MIGRATION_ID,
+                Box::new(|c| super::super::wait_diagnostics::migrate(c).unwrap()),
+            ),
+            (
                 execution_wait_history::MIGRATION_ID,
                 Box::new(|c| execution_wait_history::migrate(c).unwrap()),
             ),

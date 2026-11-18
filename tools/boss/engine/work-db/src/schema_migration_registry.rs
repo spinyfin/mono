@@ -316,6 +316,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: wait_diagnostics::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: wait_diagnostics::migrate,
+        },
+        Migration {
             id: execution_wait_history::MIGRATION_ID.into(),
             legacy_version: None,
             apply: execution_wait_history::migrate,
