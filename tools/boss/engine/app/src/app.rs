@@ -2921,12 +2921,7 @@ async fn handle_frontend_connection(
             .recv_instant(recv_instant)
             .decode_ms(decode_ms)
             .build();
-        // Name the request kind to the DB layer so a SQLite lock wait under
-        // this handler is logged against it (see `boss_work_db::contention`).
-        let dispatch_fut = boss_work_db::contention::REQUEST_KIND.scope(
-            Arc::from(verb.as_str()),
-            dispatch::dispatch_request(ctx, request, bulk_read),
-        );
+        let dispatch_fut = dispatch::dispatch_request(ctx, request, bulk_read);
         if let Some(waiting) = waiting_read {
             read_task::spawn(
                 waiting,

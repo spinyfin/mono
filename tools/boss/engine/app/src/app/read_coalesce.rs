@@ -61,6 +61,7 @@ impl Stats {
 /// shares only its database load, per waiter (see `work_tree_loads`).
 pub(in crate::app) fn coalescable(request: &FrontendRequest) -> bool {
     !matches!(request, FrontendRequest::GetWorkTree { .. })
+        && boss_protocol::request_contract(request).replay == boss_protocol::ReplayContract::Always
 }
 
 /// Owned by one session's reader loop: the open batch per exact request.

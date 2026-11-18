@@ -408,6 +408,8 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
+    // Opening a short-lived reader per poll intentionally avoids retaining a
+    // connection and serializing concurrent health reports.
     // Read through an independent WAL reader, not the shared writer
     // connection: that connection is exactly what an engine write holds while
     // it waits out a stuck SQLite lock, and this report has to be produced

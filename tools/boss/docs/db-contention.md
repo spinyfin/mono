@@ -68,8 +68,8 @@ response funnel logs at `ERROR`:
 did not absorb it`. The error text is passed through unchanged.
 
 Slow admission waits log `read admission holders` with `reason` set to
-one of `read waiting: admission queue full`, `read waiting: behind an
-earlier identical read` or `read waiting: admission permits taken`, plus
+either `read waiting: admission queue full` or
+`read waiting: admission permits taken`, plus
 the reads holding the waiter up. The `BOSS_RPC_*_READ_WAIT_MS` settings
 now set that slow-wait log threshold; they were deadlines before.
 

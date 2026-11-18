@@ -12,7 +12,7 @@ use std::{
 const MAX_BLOCKERS: usize = 16;
 /// Holder dumps are rate limited per wait kind so a flood of slow queue
 /// waits adds neither lock contention nor log volume of its own, yet cannot
-/// suppress the rare slow permit or ordering dump that names the real
+/// suppress the rare slow-permit dump that names the real
 /// blocker.
 const DUMP_INTERVAL: Duration = Duration::from_secs(1);
 

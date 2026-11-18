@@ -91,10 +91,8 @@ async fn more_background_waiters_than_workers_keep_read_admission_running() {
         .unwrap();
 }
 
-/// Over the wire: a read behind an identical earlier read that cannot be
-/// admitted for longer than the old 60 s ordering deadline is still
-/// answered with data once the permit frees — and shares the earlier
-/// read's handler run. Paused time lets the minutes pass without waiting.
+/// A read queued behind an identical read past the slow-wait threshold is
+/// answered once the permit frees, sharing one handler run with that read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_behind_a_long_held_identical_read_is_answered_not_rejected() {
     use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope};

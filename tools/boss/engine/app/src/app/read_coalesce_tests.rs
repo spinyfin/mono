@@ -602,3 +602,76 @@ async fn identical_reads_join_a_leader_blocked_on_a_sqlite_lock_and_cost_one_run
         Role::Lead { .. }
     ));
 }
+
+#[test]
+fn only_replay_safe_reads_coalesce() {
+    assert!(coalescable(&FrontendRequest::ListProducts));
+    assert!(coalescable(&FrontendRequest::GetCoordinatorHandoff {
+        redeliver: false
+    }));
+    assert!(!coalescable(&FrontendRequest::GetCoordinatorHandoff {
+        redeliver: true
+    }));
+    assert!(!coalescable(&FrontendRequest::ResolveProjectDesignDoc {
+        project_id: "project".into()
+    }));
+}
+
+/// A snapshot held behind the connection guard cannot accept later reads,
+/// even when the handler previously waited for an external writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_after_contention_cannot_accept_a_later_read() {
+    let (state, _dir) = crate::app::tests::test_server_state();
+    let gate = Arc::new(ReadAdmission::new(8, 8, 64, Duration::from_secs(3600)));
+    let connection = gate.connection();
+    let stats = Stats::default();
+    let mut coalescer = ReadCoalescer::default();
+    let request = FrontendRequest::ListProducts;
+    let Role::Lead { batch, waiting } =
+        coalescer.join(&request, "first", gate.enqueue(&connection).await, &stats, || {})
+    else {
+        panic!("first must lead")
+    };
+    state.work_db.set_metadata("snapshot_value", "before").unwrap();
+    let holder = hold_write_lock(&state.work_db, Duration::from_millis(200));
+    let (snapshot, taken) = tokio::sync::oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let runtime = tokio::runtime::Handle::current();
+    let path = state.work_db.path().to_owned();
+    let leader = tokio::task::spawn_blocking({
+        let batch = batch.clone();
+        let db = state.work_db.clone();
+        move || {
+            runtime.block_on(boss_work_db::contention::READ_WAIT.scope(batch.wait(), async move {
+                let _waiting = waiting;
+                batch.start();
+                let mut conn = db.connect().unwrap();
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap()
+                    .commit()
+                    .unwrap();
+                let value: String = conn
+                    .query_row("SELECT value FROM metadata WHERE key = 'snapshot_value'", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                snapshot.send(value).unwrap();
+                resume.recv_timeout(Duration::from_secs(10)).unwrap();
+                drop(conn);
+            }))
+        }
+    });
+    assert_eq!(taken.await.unwrap(), "before");
+    holder.join().unwrap();
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute("UPDATE metadata SET value = 'after' WHERE key = 'snapshot_value'", [])
+        .unwrap();
+    assert!(!batch.wait().is_waiting());
+    assert!(matches!(
+        coalescer.join(&request, "later", gate.enqueue(&connection).await, &stats, || {}),
+        Role::Lead { .. }
+    ));
+    release.send(()).unwrap();
+    leader.await.unwrap();
+}

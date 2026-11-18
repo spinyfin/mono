@@ -81,7 +81,20 @@ pub struct Attribution {
     pub background: String,
 }
 
-tokio::task_local! { static CONTEXT: Attribution; }
+tokio::task_local! { pub(crate) static CONTEXT: Attribution; }
+
+/// Request verb shared with contention diagnostics, including spawned work.
+pub(crate) fn current_request_kind() -> std::sync::Arc<str> {
+    CONTEXT
+        .try_with(|context| {
+            std::sync::Arc::from(if context.verb.is_empty() {
+                "internal"
+            } else {
+                &context.verb
+            })
+        })
+        .unwrap_or_else(|_| std::sync::Arc::from("internal"))
+}
 
 impl Attribution {
     pub async fn scope<F: Future>(self, future: F) -> F::Output {
@@ -301,6 +314,9 @@ pub(super) fn install_update_observer(conn: &rusqlite::Connection) {
 }
 
 fn observe(call: rusqlite::trace::CallObservation) {
+    if matches!(call.result, rusqlite::ffi::SQLITE_ROW | rusqlite::ffi::SQLITE_DONE) {
+        crate::contention::statement_returned();
+    }
     ACTIVE.with_borrow(|active| {
         let Some(observation) = active.get(&call.connection) else {
             return;

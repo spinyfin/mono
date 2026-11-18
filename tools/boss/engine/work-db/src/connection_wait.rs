@@ -63,7 +63,7 @@ impl<'a> ConnectionGuard<'a> {
         let (connection_id, observation) = super::db_diagnostics::start(&guard, caller, metrics);
         let holder = super::contention::HolderScope::enter(super::contention::Holder {
             caller,
-            request: super::contention::current_request_kind(),
+            request: super::db_diagnostics::current_request_kind(),
             health: health.clone(),
         });
         Self::builder()

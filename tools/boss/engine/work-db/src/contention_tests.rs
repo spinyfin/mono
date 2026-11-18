@@ -21,7 +21,13 @@ fn wait_lines(buffer: &log_capture::SharedBuffer, from: usize, needle: &str, req
 /// Run `work` as the engine does while serving a frontend request of kind
 /// `kind`.
 fn as_request<T>(kind: &str, work: impl FnOnce() -> T) -> T {
-    REQUEST_KIND.sync_scope(Arc::from(kind), work)
+    crate::db_diagnostics::CONTEXT.sync_scope(
+        crate::db_diagnostics::Attribution {
+            verb: kind.into(),
+            ..Default::default()
+        },
+        work,
+    )
 }
 
 /// Take the write lock on an independent connection to `db` and hold it
@@ -176,15 +182,18 @@ fn read_in_a_transaction_under_external_write_lock_waits_and_succeeds() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_kind_reaches_the_db_layer_through_the_task_local() {
-    assert_eq!(&*current_request_kind(), "internal");
-    let kind = REQUEST_KIND
-        .scope(Arc::from("ListProducts"), async {
-            tokio::task::yield_now().await;
-            current_request_kind()
-        })
-        .await;
+    assert_eq!(&*crate::db_diagnostics::current_request_kind(), "internal");
+    let kind = crate::db_diagnostics::Attribution {
+        verb: "ListProducts".into(),
+        ..Default::default()
+    }
+    .scope(async {
+        tokio::task::yield_now().await;
+        crate::db_diagnostics::current_request_kind()
+    })
+    .await;
     assert_eq!(&*kind, "ListProducts");
-    assert_eq!(&*current_request_kind(), "internal");
+    assert_eq!(&*crate::db_diagnostics::current_request_kind(), "internal");
 }
 
 /// A wait past the health threshold shows up in the engine-health snapshot
@@ -406,4 +415,32 @@ fn a_stuck_wait_clears_when_it_stops_retrying_not_when_the_guard_drops() {
         db.contention_health().snapshot().stuck
     );
     writer.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_blocking_wait_keeps_request_attribution() {
+    let buffer = log_capture::install();
+    let (_dir, db) = open_db();
+    let from = buffer.lock().len();
+    let holder = hold_write_lock(&db, Duration::from_millis(200));
+    crate::db_diagnostics::Attribution {
+        verb: "SpawnedWait".into(),
+        ..Default::default()
+    }
+    .scope(async move {
+        crate::db_diagnostics::spawn(async move {
+            crate::db_diagnostics::spawn_blocking(move || db.set_metadata("spawned", "yes"))
+                .await
+                .unwrap()
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    })
+    .await;
+    holder.join().unwrap();
+    assert_eq!(
+        wait_lines(&buffer, from, "SQLite lock wait cleared", "SpawnedWait").len(),
+        1
+    );
 }

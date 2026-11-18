@@ -34,7 +34,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -120,38 +120,31 @@ const BACKOFF_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
 const STALE_AFTER: Duration = Duration::from_secs(2);
 
 tokio::task_local! {
-    /// The frontend request kind being served by the current task, set by
-    /// the dispatch loop so the DB layer can name it in contention logs.
-    pub static REQUEST_KIND: Arc<str>;
     /// Whether the read being served is blocked in the busy handler, set for
     /// reads that coalesce (see `read_coalesce` in the app crate).
     pub static READ_WAIT: Arc<ReadWait>;
 }
 
-/// Request kind for the current task, or `"internal"` outside a frontend
-/// dispatch (sweeps, pollers, and handlers that moved their DB call to a
-/// separate blocking task).
-pub(crate) fn current_request_kind() -> Arc<str> {
-    REQUEST_KIND
-        .try_with(|kind| kind.clone())
-        .unwrap_or_else(|_| Arc::from("internal"))
-}
-
-/// Set while a read's database call is waiting for a SQLite lock. A read
-/// that is still waiting has not taken its snapshot yet, so an identical read
-/// that arrives meanwhile can be answered from it without being answered
-/// from older data.
+/// Eligibility to join a read before its first SQLite statement completes.
+/// Visible only inside the busy callback; sealed by the statement observer
+/// so subsequent statements cannot reopen it.
 #[derive(Debug, Default)]
-pub struct ReadWait(AtomicBool);
+pub struct ReadWait(AtomicU8);
 
 impl ReadWait {
     pub fn is_waiting(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::Acquire) == 1
     }
 
     fn set(&self, waiting: bool) {
-        self.0.store(waiting, Ordering::Release);
+        let _ = self.0.try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            (state != 2).then_some(u8::from(waiting))
+        });
     }
+}
+
+pub(crate) fn statement_returned() {
+    let _ = READ_WAIT.try_with(|wait| wait.0.store(2, Ordering::Release));
 }
 
 /// Who holds the connection on this thread: pushed by the connection guard
@@ -171,7 +164,7 @@ impl Holder {
     pub(crate) fn here(health: &Arc<Health>) -> Self {
         Self {
             caller: std::panic::Location::caller(),
-            request: current_request_kind(),
+            request: crate::db_diagnostics::current_request_kind(),
             health: health.clone(),
         }
     }
@@ -294,6 +287,7 @@ fn absorb(attempt: i32) -> bool {
         finish_wait();
         begin_wait();
     }
+    let _ = READ_WAIT.try_with(|wait| wait.set(true));
     let step = WAIT.with(|wait| {
         let mut wait = wait.borrow_mut();
         let Some(wait) = wait.as_mut() else {
@@ -335,6 +329,9 @@ fn absorb(attempt: i32) -> bool {
                     wait.last_attempt = Instant::now();
                 }
             });
+            // Fence before SQLite retries: success can take a snapshot
+            // before any Rust code runs again.
+            let _ = READ_WAIT.try_with(|wait| wait.set(false));
             true
         }
         Step::GiveUp => {
@@ -355,7 +352,7 @@ fn give_up() {
         return;
     };
     if let Some(read_wait) = &wait.read_wait {
-        read_wait.set(false);
+        read_wait.0.store(2, Ordering::Release);
     }
     tracing::error!(
         caller = %wait.holder.caller,
@@ -374,7 +371,7 @@ fn finish_wait() {
         return;
     };
     if let Some(read_wait) = &wait.read_wait {
-        read_wait.set(false);
+        read_wait.0.store(2, Ordering::Release);
     }
     let waited = wait.waited();
     if let Some(id) = wait.reported {
