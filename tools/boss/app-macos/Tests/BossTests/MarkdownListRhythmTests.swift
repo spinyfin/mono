@@ -43,16 +43,22 @@ final class MarkdownListRhythmTests: XCTestCase {
         super.tearDown()
     }
 
+    private final class HeightProbe {
+        var height: CGFloat = 0
+    }
+
     /// Lays `markdown` out through the production theme in a real window and
     /// returns its natural height at a fixed width.
     private func height(
         _ markdown: String, editorial: Bool, file: StaticString = #filePath, line: UInt = #line
     ) -> CGFloat {
+        let probe = HeightProbe()
         let view = StructuredText(markdown: markdown)
             .bossMarkdown()
             .environment(\.markdownEditorialStyle, editorial)
             .frame(width: Self.width, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self, of: \.size.height) { probe.height = $0 }
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 400),
             styleMask: [.titled], backing: .buffered, defer: false)
@@ -66,7 +72,10 @@ final class MarkdownListRhythmTests: XCTestCase {
         XCTAssertFalse(
             window.isVisible, "layout window must never be presented", file: file, line: line)
         hosted.append((window, hosting))
-        let measured = hosting.fittingSize.height
+        // AppKit rounds fittingSize to whole points; subtracting rounded
+        // heights can invent a one-point difference between identical gaps.
+        // Read the laid-out SwiftUI height before that rounding instead.
+        let measured = probe.height
         XCTAssertGreaterThan(measured, 0, "nothing laid out for \(markdown)", file: file, line: line)
         return measured
     }
