@@ -143,7 +143,7 @@ fn retry_of_same_execution_uses_latest_run_and_then_clears_when_claimed() {
         .unwrap();
     assert_eq!(
         display(&db, &item, NOW).text,
-        "Restarting after the previous run was orphaned 1 minute ago. Retrying dispatch — next attempt in 2 min"
+        "Restarting after the previous run was orphaned 1 minute ago. Retrying after error (attempt 2) — next attempt in 2 min"
     );
     db.connect()
         .unwrap()
@@ -151,7 +151,7 @@ fn retry_of_same_execution_uses_latest_run_and_then_clears_when_claimed() {
         .unwrap();
     assert_eq!(
         display(&db, &item, NOW).text,
-        "Retrying dispatch — next attempt in 2 min"
+        "Retrying after error (attempt 2) — next attempt in 2 min"
     );
     db.connect()
         .unwrap()
@@ -263,13 +263,16 @@ fn queued_variants_and_wait_age_are_engine_selected() {
     let (db, _, item) = setup_product_and_chore();
     let execution = pending(&db, &item);
     for (reason, expected) in [
-        ("unknown", "reason unknown"),
-        ("not_before", "reason unknown"),
-        ("waiting_dependency", "waiting for a dependency"),
-        ("dispatch_paused", "dispatch paused"),
-        ("automation_paused", "automation paused"),
-        ("pool_exhausted", "worker pool full"),
-        ("blocked by an earlier review", "blocked by an earlier review"),
+        (
+            "unknown",
+            "Unexpected state — the engine has no reason recorded for this wait (unrecognised wait code `unknown`)",
+        ),
+        ("not_before", "Queued — held until its scheduled dispatch time"),
+        ("waiting_dependency", "Queued — waiting for a dependency"),
+        ("dispatch_paused", "Queued — dispatch paused"),
+        ("automation_paused", "Queued — automation paused"),
+        ("pool_exhausted", "Queued — worker pool full"),
+        ("blocked by an earlier review", "Queued — blocked by an earlier review"),
     ] {
         db.connect()
             .unwrap()
@@ -279,7 +282,7 @@ fn queued_variants_and_wait_age_are_engine_selected() {
             )
             .unwrap();
         let result = display(&db, &item, NOW);
-        assert_eq!(result.text, format!("Queued — {expected} (1 minute ago)"));
+        assert_eq!(result.text, format!("{expected} (1 minute ago)"));
         assert_eq!(
             result.tooltip_times,
             vec![QueuedTooltipTime {
@@ -287,5 +290,101 @@ fn queued_variants_and_wait_age_are_engine_selected() {
                 epoch: NOW - 60,
             }]
         );
+    }
+}
+
+#[test]
+fn deadline_source_preserves_host_wait_and_retry_attempts() {
+    for (source, expected) in [
+        (
+            "host_lease_park",
+            "Queued — waiting for the host to confirm the workspace lease",
+        ),
+        ("failure_backoff", "Retrying after error (attempt 4)"),
+    ] {
+        let (db, _, item) = setup_product_and_chore();
+        let execution = pending(&db, &item);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET pre_start_failure_count = 3, dispatch_not_before = ?2,
+             dispatch_not_before_source = ?3 WHERE id = ?1",
+                params![execution.id, (NOW + 120).to_string(), source],
+            )
+            .unwrap();
+        let result = display(&db, &item, NOW);
+        assert_eq!(result.text, format!("{expected} — next attempt in 2 min"));
+        assert_eq!(result.tooltip_times[0].epoch, NOW + 120);
+    }
+}
+
+#[test]
+fn countdown_cache_expires_one_second_after_exact_minute() {
+    let (db, _, item) = setup_product_and_chore();
+    let execution = pending(&db, &item);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_not_before = ?2 WHERE id = ?1",
+            params![execution.id, (NOW + 60).to_string()],
+        )
+        .unwrap();
+    let before = db.queued_displays(NOW, &Default::default()).unwrap();
+    assert_eq!(before[&item].display.text, "Queued — next attempt in 1 min");
+    let after = db.queued_displays(NOW + 1, &before).unwrap();
+    assert_eq!(after[&item].display.text, "Queued — next attempt in less than a minute");
+}
+
+#[test]
+fn next_up_keeps_restart_for_plain_dispatch_and_cap_holds() {
+    for (reason, expected) in [
+        ("awaiting_dispatch", "Next up"),
+        ("pool_exhausted", "Next up — worker pool full"),
+    ] {
+        let (db, _, item) = setup_product_and_chore();
+        let execution = pending(&db, &item);
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_runs(id, execution_id, agent_id, status, created_at, finished_at)
+             VALUES ('previous', ?1, 'agent', 'orphaned', ?2, ?3)",
+                params![execution.id, (NOW - 300).to_string(), (NOW - 60).to_string()],
+            )
+            .unwrap();
+        db.set_dispatch_wait_reason(&execution.id, reason).unwrap();
+        clear_wait_since(&db, &execution.id);
+        let result = display(&db, &item, NOW);
+        assert_eq!(
+            result.next_up_text.as_deref(),
+            Some(format!("Restarting after the previous run was orphaned 1 minute ago. {expected}").as_str())
+        );
+        assert_eq!(result.tooltip_times[0].epoch, NOW - 60);
+    }
+}
+
+#[test]
+fn missing_and_unclassified_labels_surface_anomalies() {
+    let (db, _, item) = setup_product_and_chore();
+    let execution = pending(&db, &item);
+    for label in [None, Some(""), Some("the engine has no reason recorded for this wait")] {
+        let wait = super::super::queued_wait::DispatchWait {
+            reason: Some("unclassified".into()),
+            label: label.map(str::to_owned),
+            ..Default::default()
+        };
+        let result = super::super::queued_display::for_execution(
+            &db.connect().unwrap(),
+            Some(&execution),
+            &wait,
+            NOW,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        let expected = label
+            .filter(|label| !label.is_empty())
+            .unwrap_or("the engine sent no reason for this wait");
+        assert_eq!(result.text, format!("Unexpected state — {expected}"));
+        assert!(!result.text.contains("unknown"));
     }
 }

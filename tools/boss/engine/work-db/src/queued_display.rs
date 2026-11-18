@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use super::queued_wait::ReviewNaming;
 use super::*;
 use boss_engine_storage_values::dispatch_wait::{
-    DISPATCH_WAIT_REASON_FAILURE_BACKOFF, DISPATCH_WAIT_REASON_NOT_BEFORE, DISPATCH_WAIT_REASON_UNCLASSIFIED,
+    DISPATCH_WAIT_REASON_AWAITING_DISPATCH, DISPATCH_WAIT_REASON_FAILURE_BACKOFF, DISPATCH_WAIT_REASON_NOT_BEFORE,
+    DISPATCH_WAIT_REASON_UNCLASSIFIED,
 };
 use boss_engine_utils::iso8601::format_elapsed_ago;
 use boss_protocol::{QueuedDisplay, QueuedTooltipTime};
@@ -52,6 +53,8 @@ pub(super) fn for_execution(
         let remaining = deadline - now;
         let next_change = if remaining < 60 {
             deadline
+        } else if remaining == 60 {
+            now + 1
         } else {
             deadline - ((remaining - 1) / 60) * 60
         };
@@ -61,25 +64,26 @@ pub(super) fn for_execution(
         } else {
             format!("in {} min", (remaining + 59) / 60)
         };
-        if wait.reason.as_deref() == Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
-            || dispatch_helpers::dispatch_retry_at_for_execution(execution, now).is_some()
-        {
-            format!("Retrying dispatch — next attempt {relative}")
-        } else {
-            format!("Queued — next attempt {relative}")
-        }
-    } else {
-        let reason = match wait.reason.as_deref() {
-            None | Some("" | "unknown") | Some(DISPATCH_WAIT_REASON_UNCLASSIFIED | DISPATCH_WAIT_REASON_NOT_BEFORE) => {
-                "reason unknown".into()
-            }
-            Some(_) => wait
-                .label
-                .clone()
-                .filter(|label| !label.is_empty())
-                .unwrap_or_else(|| "reason unknown".into()),
+        let lead = match (wait.reason.as_deref(), wait.label.as_deref()) {
+            (Some(DISPATCH_WAIT_REASON_NOT_BEFORE), _) => "Queued".to_owned(),
+            (Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF), Some(label)) => label.to_owned(),
+            (_, Some(label)) if !label.trim().is_empty() => format!("Queued — {label}"),
+            _ => "Unexpected state — the engine sent no reason for this wait".to_owned(),
         };
-        let mut hold = format!("Queued — {reason}");
+        format!("{lead} — next attempt {relative}")
+    } else {
+        let mut hold = match wait.label.as_deref().filter(|label| !label.trim().is_empty()) {
+            None => "Unexpected state — the engine sent no reason for this wait".to_owned(),
+            Some(label)
+                if matches!(
+                    wait.reason.as_deref(),
+                    None | Some("" | "unknown" | DISPATCH_WAIT_REASON_UNCLASSIFIED)
+                ) =>
+            {
+                format!("Unexpected state — {label}")
+            }
+            Some(label) => format!("Queued — {label}"),
+        };
         if execution.status == ExecutionStatus::Ready
             && let Some(since) = execution
                 .dispatch_wait_since
@@ -98,6 +102,11 @@ pub(super) fn for_execution(
         hold
     };
 
+    let mut next_up_text = if wait.reason.as_deref() == Some(DISPATCH_WAIT_REASON_AWAITING_DISPATCH) {
+        "Next up".to_owned()
+    } else {
+        format!("Next up — {}", hold.strip_prefix("Queued — ").unwrap_or(&hold))
+    };
     let mut text = hold;
     if let Some((outcome, finished)) = previous_abnormal_outcome(conn, execution)? {
         let verb = if outcome == "failed" {
@@ -117,8 +126,13 @@ pub(super) fn for_execution(
             });
         }
         text = format!("{restart}. {text}");
+        next_up_text = format!("{restart}. {next_up_text}");
     }
-    Ok(Some(QueuedDisplay { text, tooltip_times }))
+    Ok(Some(QueuedDisplay {
+        text,
+        next_up_text: Some(next_up_text),
+        tooltip_times,
+    }))
 }
 
 /// Distinct predecessor executions use the execution row's terminal outcome.

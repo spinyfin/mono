@@ -696,11 +696,13 @@ struct QueuedTooltipTime: Hashable {
 
 struct QueuedDisplay: Hashable {
     let text: String
+    let nextUpText: String?
     let tooltipTimes: [QueuedTooltipTime]
 
     init?(_ payload: [String: Any]) {
         guard let text = payload["text"] as? String else { return nil }
         self.text = text
+        self.nextUpText = payload["next_up_text"] as? String
         let raw = payload["tooltip_times"] as? [[String: Any]] ?? []
         self.tooltipTimes = raw.compactMap { QueuedTooltipTime(payload: $0) }
     }

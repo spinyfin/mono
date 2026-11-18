@@ -32,7 +32,9 @@ extension WorkCardLiveStatus {
     /// waiting for the dispatcher's next pass needs nothing after it.
     static func nextUpLabel(runtime: WorkTaskRuntime?, now: Date) -> String {
         if let display = runtime?.queuedDisplay {
-            if runtime?.dispatchWaitReason == awaitingDispatchReason { return "Next up" }
+            if let nextUpText = display.nextUpText { return nextUpText }
+            if runtime?.dispatchWaitReason == awaitingDispatchReason,
+               !display.text.hasPrefix("Restarting after ") { return "Next up" }
             let queuedPrefix = "Queued — "
             if display.text.hasPrefix(queuedPrefix) {
                 return "Next up — \(display.text.dropFirst(queuedPrefix.count))"

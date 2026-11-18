@@ -406,7 +406,11 @@ struct WorkCardSnapshot: Equatable {
             dispatchWaitBlocker: context.dispatchWaitBlocker,
             dispatchFailures: context.dispatchFailures,
             liveStatus: liveStatus,
-            liveStatusTooltip: liveStatus == context.runtime?.queuedDisplay?.text
+            liveStatusTooltip: liveStatus != nil
+                && WorkCardLiveStatus.isPendingExecution(context.runtime)
+                && WorkCardLiveStatus.isQueued(task: task, runtime: context.runtime)
+                && !isAIReviewing
+                && (context.liveState?.recoveryStatus?.isEmpty ?? true)
                 ? context.runtime?.queuedDisplay?.tooltip : nil,
             liveStatusActivity: liveStatusActivity,
             liveStatusLastEventAt: liveStatusLastEventAt,

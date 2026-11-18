@@ -1479,6 +1479,9 @@ pub struct QueuedTooltipTime {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueuedDisplay {
     pub text: String,
+    /// Next-up line preserves restart context and suppresses only a plain dispatch-pass wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_up_text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tooltip_times: Vec<QueuedTooltipTime>,
 }
