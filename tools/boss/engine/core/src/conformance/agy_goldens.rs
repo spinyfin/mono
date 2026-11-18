@@ -1,21 +1,14 @@
-//! Antigravity (`agy`) conformance goldens: session-settings posture and
-//! captured hook payloads.
+//! Antigravity conformance: published samples and reconstructed regressions.
 //!
-//! Settings are produced through [`crate::driver::agy::permissions::render_settings`],
-//! the same renderer production `write_permission_config` uses. Hook payloads
-//! are the published 1.5.5 shapes from the pane-viability evidence
-//! (`ghostty-agy-pane-viability-artifacts/evidence/09-hook-payloads.json`)
-//! plus reconstructed timelines from the hook-surface and permission studies.
-//! They are decoded through a progress session — agy boundary events reject
-//! the stateless path.
-//!
-//! The qualified pin is 1.5.7 or later. 1.5.5 payloads still name the event
-//! on every envelope and remain the published capture; 1.1.12 (missing
-//! `hookEventName`, missing parent idle Stop) is a regression fixture.
-//!
-//! Untested, and not asserted here: nested/concurrent children, ingress
-//! reordering, multi-hook rewrite composition, reachability of other
-//! `terminationReason` enum members.
+//! `agy_captured` replays unchanged sanitized 1.5.5 home payload samples.
+//! All helper-built timelines are synthetic regressions based on study
+//! observations, not recordings. Settings tests check Boss's renderer and
+//! validator only; they provide no live CLI permission evidence.
+//! Qualified 1.5.7+ hook and permission recaptures remain unavailable here.
+//! Nested/concurrent children, reordering and rewrite composition are untested.
+
+#[path = "agy_captured.rs"]
+mod captured;
 
 use std::path::Path;
 
@@ -24,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::conformance::fixtures::{
     AGY_HOOK_SESSION_JSONL, CANONICAL_SESSION_ID, decode_progress, expected_agy_session_events, normalize_session_id,
+    project_command,
 };
 use crate::driver::agy::permissions::{
     AGENT_MODE, RuleList, SettingsPlan, TOOL_PERMISSION, parse_rendered, render_settings, validate_rule,
@@ -221,13 +215,14 @@ fn command_deny_next_to_read_file_is_refused() {
     validate_rule(RuleList::Deny, "read_file(/boss-test-absent/data)").unwrap();
 }
 
-// ── Captured hook payloads ──────────────────────────────────────────────────
+// ── Reconstructed regression timelines ──────────────────────────────────────────────────
 
 #[test]
-fn captured_one_tool_turn_matches_the_canonical_sequence() {
+fn reconstructed_one_tool_turn_matches_the_canonical_sequence() {
     let events: Vec<_> = decode_agy(AGY_HOOK_SESSION_JSONL)
         .into_iter()
         .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(project_command)
         .collect();
     assert_eq!(events, expected_agy_session_events());
     for event in &events {
@@ -241,29 +236,8 @@ fn captured_one_tool_turn_matches_the_canonical_sequence() {
 
 #[test]
 fn captured_1_5_5_payloads_decode_and_strip_the_prompt() {
-    // Pane-viability 09-hook-payloads.json, agy 1.5.5 "home" scenario, with
-    // placeholder paths kept and lastUserInput restored to a full canary
-    // (the published file truncates it). Qualified pin is 1.5.7+; these
-    // envelopes already stamp hookEventName.
     let cid = "ee51fade-a19c-42d1-bf36-e96a9c531813";
-    let stream = jsonl(&[
-        session_start(cid),
-        pre_invocation(cid, 0),
-        pre_tool(
-            cid,
-            "call_11038061015641962774",
-            r#"{ echo "HOME=$HOME"; echo "USER=$(id -un)"; }"#,
-        ),
-        post_tool(
-            cid,
-            "call_11038061015641962774",
-            r#"{ echo "HOME=$HOME"; echo "USER=$(id -un)"; }"#,
-            "",
-        ),
-        post_invocation(cid, 0),
-        stop(cid, true, "NO_TOOL_CALL"),
-    ]);
-    let events = decode_agy(&stream);
+    let events = decode_agy(captured::HOME_1_5_5);
     assert!(
         matches!(events.as_slice(),
             [WorkerEvent::SessionStart { session_id, .. }, WorkerEvent::PreToolUse { .. }, WorkerEvent::PostToolUse { tool_response, .. }, WorkerEvent::Stop { stop_reason, .. }]
@@ -274,7 +248,10 @@ fn captured_1_5_5_payloads_decode_and_strip_the_prompt() {
         "got {events:?}"
     );
     let dump = format!("{events:?}");
-    assert!(!dump.contains(BRIEF_CANARY), "prompt leaked into WorkerEvent: {dump}");
+    assert!(
+        !dump.contains("HOME_PROBE_DONE"),
+        "prompt leaked into WorkerEvent: {dump}"
+    );
 }
 
 #[test]
@@ -339,21 +316,23 @@ fn overwrite_rewrite_pair_stays_one_call_by_id() {
 
 #[test]
 fn denied_and_unknown_verdict_calls_have_no_post_tool_use() {
-    // Hook-surface study: deny / not_a_verdict produce PreToolUse and no
-    // matching PostToolUse; the turn still ends with an idle parent Stop.
-    let stream = jsonl(&[
-        session_start(PARENT_1_5_5),
-        pre_tool(PARENT_1_5_5, "call_denied", "printf DENIED_MARKER"),
-        stop(PARENT_1_5_5, true, "NO_TOOL_CALL"),
-    ]);
-    let events = decode_agy(&stream);
-    assert!(
-        matches!(events.as_slice(),
-            [WorkerEvent::SessionStart { .. }, WorkerEvent::PreToolUse { .. }, WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
-            if message.contains(REFUSED_TOOL_PREFIX) && message.contains("call_denied") && !message.contains(BRIEF_CANARY)
-        ),
-        "hook-refused tool must surface as PreToolUse without PostToolUse; got {events:?}"
-    );
+    // Separate synthetic streams model the two observed missing-post cases.
+    for id in ["call_denied", "call_unknown_verdict"] {
+        let stream = jsonl(&[
+            session_start(PARENT_1_5_5),
+            pre_tool(PARENT_1_5_5, id, "printf REFUSED_MARKER"),
+            stop(PARENT_1_5_5, true, "NO_TOOL_CALL"),
+        ]);
+        let events = decode_agy(&stream);
+        assert!(
+            matches!(events.as_slice(),
+                [WorkerEvent::SessionStart { .. }, WorkerEvent::PreToolUse { .. },
+                 WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+                if message.contains(REFUSED_TOOL_PREFIX) && message.contains(id)
+            ),
+            "refused call {id}: {events:?}"
+        );
+    }
 }
 
 #[test]
@@ -446,21 +425,42 @@ fn missing_hook_event_name_is_a_real_error_on_the_1_1_12_shape() {
 }
 
 #[test]
-fn declined_dialog_produces_no_stop() {
+fn declined_dialog_retains_pending_call_until_next_boundary() {
     // Permission study: declining the approval dialog ended the turn like
     // Escape — no Stop in 57 of 57 declined turns.
-    let stream = jsonl(&[
+    let mut session = AgyDriver::default()
+        .progress_session(&ProgressSessionConfig::default())
+        .unwrap();
+    for line in [
         session_start(PARENT_1_5_5),
         pre_tool(PARENT_1_5_5, "call_dialog", "touch /tmp/declined"),
-    ]);
+    ] {
+        let events = session
+            .normalize_progress_events(&serde_json::from_str(&line).unwrap())
+            .unwrap();
+        assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Stop { .. })));
+        if line.contains("PreToolUse") {
+            assert!(
+                matches!(events.as_slice(), [WorkerEvent::PreToolUse { tool_input, .. }] if tool_input["command"] == "touch /tmp/declined")
+            );
+        }
+    }
+    let events = session
+        .normalize_progress_events(&serde_json::from_str(&stop(PARENT_1_5_5, true, "NO_TOOL_CALL")).unwrap())
+        .unwrap();
     assert!(
-        turn_ends(&stream).is_empty(),
-        "a declined dialog must not synthesise a turn boundary"
+        matches!(events.as_slice(),
+            [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+            if message.contains("call_dialog") && message.contains(REFUSED_TOOL_PREFIX)
+        ),
+        "pending declined call must survive to the next boundary: {events:?}"
     );
-    let events = decode_agy(&stream);
-    assert!(
-        !events.iter().any(|e| matches!(e, WorkerEvent::Stop { .. })),
-        "got {events:?}"
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|e| AgyDriver::default().turn_boundary(e))
+            .count(),
+        1
     );
 }
 

@@ -161,12 +161,10 @@ pub const GROK_HOOK_SESSION_JSONL: &str = concat!(
 
 /// agy-hook ingress for the same logical one-tool turn, in the 1.5.5+
 /// camelCase dialect (`hookEventName` on every envelope, `toolCall`,
-/// `fullyIdle`). Shape-aligned so canonicalisation produces
-/// [`expected_agy_session_events`]: `run_command` maps to `"Bash"`, and
-/// `args.command` (not `CommandLine`) keeps `tool_input` PartialEq-equal
-/// to Claude's `{"command":…}` object. `lastUserInput` is present because
-/// every 1.5.5+ hook repeats the whole prompt; the normaliser must strip
-/// it.
+/// `fullyIdle`). This synthetic turn uses native `args.CommandLine`.
+/// The normalizer preserves native fields and adds canonical `command`.
+/// Equivalence projects tool input onto that shared command field.
+/// `lastUserInput` repeats the prompt and must be stripped.
 ///
 /// Documented dialect gaps versus [`expected_session_events`]:
 /// - no `UserPromptSubmit` hook (PreInvocation is dropped once the parent
@@ -179,9 +177,9 @@ pub const AGY_HOOK_SESSION_JSONL: &str = concat!(
     "\n",
     r#"{"hookEventName":"PreInvocation","conversationId":"019f974c-3d59-7533-b320-3963123c809b","invocationNum":0,"initialNumSteps":1,"lastUserInput":"the whole brief must not be logged"}"#,
     "\n",
-    r#"{"hookEventName":"PreToolUse","conversationId":"019f974c-3d59-7533-b320-3963123c809b","modelName":"gemini-3.8-flash-low","lastUserInput":"the whole brief must not be logged","toolCall":{"id":"call_fixture","name":"run_command","args":{"command":"echo hooktest-exec"}}}"#,
+    r#"{"hookEventName":"PreToolUse","conversationId":"019f974c-3d59-7533-b320-3963123c809b","modelName":"gemini-3.8-flash-low","lastUserInput":"the whole brief must not be logged","toolCall":{"id":"call_fixture","name":"run_command","args":{"CommandLine":"echo hooktest-exec"}}}"#,
     "\n",
-    r#"{"hookEventName":"PostToolUse","conversationId":"019f974c-3d59-7533-b320-3963123c809b","error":"","lastUserInput":"the whole brief must not be logged","toolCall":{"id":"call_fixture","name":"run_command","args":{"command":"echo hooktest-exec"}}}"#,
+    r#"{"hookEventName":"PostToolUse","conversationId":"019f974c-3d59-7533-b320-3963123c809b","error":"","lastUserInput":"the whole brief must not be logged","toolCall":{"id":"call_fixture","name":"run_command","args":{"CommandLine":"echo hooktest-exec"}}}"#,
     "\n",
     r#"{"hookEventName":"PostInvocation","conversationId":"019f974c-3d59-7533-b320-3963123c809b","invocationNum":0,"lastUserInput":"the whole brief must not be logged"}"#,
     "\n",
@@ -719,6 +717,15 @@ fn decode_jsonl_session(session: &mut dyn ProgressSessionNormalizer, jsonl: &str
         }
     }
     events
+}
+
+/// Compare the canonical command without vendor-specific argument metadata.
+/// Callers separately assert native CommandLine translation before projecting.
+pub fn project_command(mut event: WorkerEvent) -> WorkerEvent {
+    if let WorkerEvent::PreToolUse { tool_input, .. } | WorkerEvent::PostToolUse { tool_input, .. } = &mut event {
+        *tool_input = serde_json::json!({"command": tool_input["command"]});
+    }
+    event
 }
 
 #[cfg(test)]

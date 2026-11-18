@@ -7,7 +7,7 @@
 use crate::conformance::fixtures::{
     AGY_HOOK_SESSION_JSONL, CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL,
     GROK_HOOK_SESSION_JSONL, codex_shaped_driver, decode_jsonl, decode_progress, expected_agy_session_events,
-    expected_session_events, normalize_session_id, normalize_session_start_source,
+    expected_session_events, normalize_session_id, normalize_session_start_source, project_command,
 };
 use crate::driver::{AgyDriver, ClaudeDriver, GrokDriver};
 
@@ -92,9 +92,19 @@ fn claude_and_grok_hook_ingress_produce_identical_worker_event_sequences() {
 
 #[test]
 fn agy_hook_ingress_matches_expected_session_sequence() {
+    for event in decode_progress(&AgyDriver::default(), AGY_HOOK_SESSION_JSONL) {
+        if let boss_protocol::WorkerEvent::PreToolUse { tool_input, .. }
+        | boss_protocol::WorkerEvent::PostToolUse { tool_input, .. } = event
+        {
+            assert_eq!(tool_input["CommandLine"], "echo hooktest-exec");
+            assert_eq!(tool_input["command"], "echo hooktest-exec");
+        }
+    }
+
     let events: Vec<_> = decode_progress(&AgyDriver::default(), AGY_HOOK_SESSION_JSONL)
         .into_iter()
         .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(project_command)
         .collect();
     assert_eq!(
         events,
@@ -113,6 +123,7 @@ fn claude_and_agy_hook_ingress_agree_except_documented_dialect_gaps() {
     let claude_events: Vec<_> = decode_jsonl(&ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL)
         .into_iter()
         .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(project_command)
         .filter(|e| !matches!(e, boss_protocol::WorkerEvent::UserPromptSubmit { .. }))
         .map(|mut event| {
             if let boss_protocol::WorkerEvent::PostToolUse { tool_response, .. } = &mut event {
@@ -124,6 +135,7 @@ fn claude_and_agy_hook_ingress_agree_except_documented_dialect_gaps() {
     let agy_events: Vec<_> = decode_progress(&AgyDriver::default(), AGY_HOOK_SESSION_JSONL)
         .into_iter()
         .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(project_command)
         .collect();
     assert_eq!(
         claude_events, agy_events,

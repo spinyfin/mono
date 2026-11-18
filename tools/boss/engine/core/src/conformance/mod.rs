@@ -124,7 +124,7 @@ fn require_agy_cli() -> bool {
 /// signed-in account nor, usually, the binary; fixture-side pins still
 /// defend the hook contract.
 fn agy_cli_binary() -> Option<std::path::PathBuf> {
-    if let Some(raw) = std::env::var_os("BOSS_AGY_BIN").filter(|v| !v.is_empty()) {
+    if let Some(raw) = std::env::var_os(crate::driver::agy::AGY_BIN_ENV).filter(|v| !v.is_empty()) {
         let path = std::path::PathBuf::from(raw);
         return Some(path.canonicalize().unwrap_or(path));
     }

@@ -28,7 +28,10 @@ use crate::conformance::fixtures::{
     assert_codex_spawn_contract, codex_shaped_driver, decode_jsonl,
 };
 use crate::conformance::{agy_cli_binary, codex_cli_binary, require_agy_cli, require_codex_cli, require_grok_cli};
-use crate::driver::agy::MIN_QUALIFIED_AGY_VERSION;
+use crate::driver::agy::{
+    AGY_VERSION_TIMEOUT, DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE, MIN_QUALIFIED_AGY_VERSION,
+    parse_agy_version, run_agy_bounded, version_at_least,
+};
 use crate::driver::{AgentDriver, GrokDriver};
 
 /// Parse `codex-cli X.Y.Z` (or `codex X.Y.Z`) stdout from `codex --version`.
@@ -618,7 +621,7 @@ fn grok_models_menu_matches_pinned_descriptor() {
 // Qualified floor is [`MIN_QUALIFIED_AGY_VERSION`] (1.5.7): `auto_approve` and
 // `deny_unless_prior_grant` were measured on 1.5.7 and 1.5.9, not 1.5.5
 // (permission / shared-HOME studies). This is a minimum, not an exact pin —
-// the vendor binary self-updates, and a checksum-pinned copy is not in the
+// Boss freezes installed bytes and disables updates; a checksum-pinned copy is not in the
 // Bazel graph the way Codex is.
 //
 // Live `agy --version` soft-skips when the binary is absent, or when the
@@ -631,37 +634,23 @@ fn grok_models_menu_matches_pinned_descriptor() {
 // are the non-test `agy_rules_probe` binary, which cannot run under
 // `bazel test`'s mandatory sandbox.
 
-/// Parse `1.5.9` or `agy 1.5.9` stdout from `agy --version`.
-fn parse_agy_version(stdout: &str) -> Option<String> {
-    let token = stdout
-        .split_whitespace()
-        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .unwrap_or(stdout.trim());
-    let version = token.trim().trim_start_matches('v');
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_owned())
-    }
-}
+// Boss driver maintainers own qualification; the deployment operator owns
+// replacing the installed pin. Before adoption, maintainers run the pane,
+// hook-surface and permission recipes, commit sanitized captures with version
+// and hash provenance, and run conformance with BOSS_REQUIRE_AGY_CLI=1.
+// The operator stops Boss and all workers, archives homes-root bin/agy for
+// rollback, removes that copy, and provisions with BOSS_AGY_BIN pointing at
+// the qualified signed candidate. First-install copying verifies identity
+// and version and protects the copy. Restart only after provisioning succeeds.
+// Overrides cannot replace an existing pin; bumping the floor is not an upgrade.
 
-fn agy_version_at_least(observed: &str, minimum: &str) -> bool {
-    match (parse_semver_prefix(observed), parse_semver_prefix(minimum)) {
-        (Some(obs), Some(min)) => obs >= min,
-        _ => false,
-    }
-}
-
-fn parse_semver_prefix(version: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts
-        .next()
-        .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
-    Some((major, minor, patch))
+#[test]
+fn agy_version_examples_match_qualification() {
+    assert_eq!(parse_agy_version("agy 1.5.9").unwrap(), "1.5.9");
+    assert!(version_at_least("1.5.7", "1.5.7"));
+    assert!(version_at_least("1.5.9", "1.5.7"));
+    assert!(!version_at_least("1.5.5", "1.5.7"));
+    assert!(!version_at_least("invalid", "1.5.7"));
 }
 
 #[test]
@@ -682,12 +671,12 @@ fn installed_agy_meets_qualified_minimum_when_present() {
         return;
     };
     let tmp = tempfile::TempDir::new().expect("tempdir for agy --version HOME");
-    let output = match Command::new(&agy_bin)
+    let mut command = Command::new(&agy_bin);
+    command
         .env("HOME", tmp.path())
-        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
-        .arg("--version")
-        .output()
-    {
+        .env(DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE)
+        .arg("--version");
+    let output = match run_agy_bounded(&mut command, AGY_VERSION_TIMEOUT) {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             if require {
@@ -719,10 +708,10 @@ fn installed_agy_meets_qualified_minimum_when_present() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let version = parse_agy_version(&stdout)
-        .or_else(|| parse_agy_version(&stderr))
-        .unwrap_or_else(|| panic!("could not parse agy --version from stdout={stdout:?} stderr={stderr:?}"));
+        .or_else(|_| parse_agy_version(&stderr))
+        .unwrap_or_else(|_| panic!("could not parse agy --version from stdout={stdout:?} stderr={stderr:?}"));
     assert!(
-        agy_version_at_least(&version, MIN_QUALIFIED_AGY_VERSION),
+        version_at_least(&version, MIN_QUALIFIED_AGY_VERSION),
         "installed agy is {version}, but the conformance harness requires \
          {MIN_QUALIFIED_AGY_VERSION} or later (auto_approve was measured on 1.5.7+). \
          Re-run the investigations, update fixtures, and bump MIN_QUALIFIED_AGY_VERSION \
