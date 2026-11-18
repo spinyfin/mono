@@ -175,6 +175,48 @@ fn cross_volume_route_relays_outside_the_destination() {
 }
 
 #[test]
+fn relay_attempts_use_unique_names_and_leave_only_unrelated_files() {
+    let tmp = TempDir::new().unwrap();
+    let relay = tmp.path().join("relay");
+    std::fs::create_dir_all(&relay).unwrap();
+    let stale = relay.join("state.db.bak-20200101-000000.1-1.relay");
+    std::fs::write(&stale, b"stale").unwrap();
+    // Back to back: a fixed relay name would let one attempt clobber the other.
+    for _ in 0..2 {
+        let (host, staging) = dirs(&tmp);
+        let out = copy_via_route(
+            &mut &b"payload"[..],
+            NAME,
+            &host,
+            &staging,
+            false,
+            std::slice::from_ref(&relay),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out.copied_path).unwrap(), b"payload");
+    }
+    // Concurrent attempts sharing one relay folder.
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let relay = relay.clone();
+            let root = tmp.path().join(format!("conc{i}"));
+            std::thread::spawn(move || {
+                let host = root.join("dest").join("host");
+                std::fs::create_dir_all(&host).unwrap();
+                let staging = root.join("staging");
+                let out = copy_via_route(&mut &b"payload"[..], NAME, &host, &staging, false, &[relay]).unwrap();
+                std::fs::read(out.copied_path).unwrap()
+            })
+        })
+        .collect();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), b"payload");
+    }
+    assert_eq!(names(&relay), ["state.db.bak-20200101-000000.1-1.relay"]);
+    assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
+}
+
+#[test]
 fn cross_volume_without_relay_leaves_destination_empty() {
     let tmp = TempDir::new().unwrap();
     let (host, staging, out) = route(&tmp, &[], &mut &b"payload"[..]);
