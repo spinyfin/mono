@@ -163,6 +163,81 @@ fn review_badge_unknown_head_and_clean_pending_have_distinct_explanations() {
 }
 
 #[test]
+fn badge_displays_rejections_without_putting_them_in_revision_instructions() {
+    for kept in [true, false] {
+        let findings = if kept {
+            serde_json::json!([{
+                "id": "C1", "severity": "high", "category": "correctness",
+                "confidence": "high", "file": "src/lib.rs", "title": "Unchecked index",
+                "detail": "Out of bounds read.", "sources": ["claude-1"]
+            }])
+        } else {
+            serde_json::json!([])
+        };
+        let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(serde_json::json!({
+            "batch_id": "batch", "pr_url": "https://github.com/spinyfin/mono/pull/1",
+            "target_sha": "head", "phase": "pre_merge", "summary": "Review complete",
+            "revision_warranted": kept, "findings": findings, "contradictions": [],
+            "rejected": [{"leaf_finding_id": "codex-1", "reason": "Already guarded"}]
+        }))
+        .unwrap();
+        let history = ReviewBadgeHistory::builder()
+            .verdict_payload(serde_json::json!({"batch_id": "batch", "verdict": verdict}).to_string())
+            .build();
+        let markdown = findings_markdown(
+            &history,
+            if kept {
+                AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS
+            } else {
+                AI_REVIEW_STATE_REVIEWED_ALL_CLEAR
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(markdown.contains("### Rejected leaf findings"));
+        assert!(markdown.contains(r"codex\-1: Already guarded"));
+        assert_eq!(markdown.contains("Unchecked index"), kept);
+        if !kept {
+            for state in [
+                AI_REVIEW_STATE_REVIEWED_ALL_CLEAR,
+                AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING,
+            ] {
+                let markdown = findings_markdown(&history, state).unwrap().unwrap();
+                assert!(markdown.starts_with("Review complete"));
+                assert!(!markdown.contains("requiring attention"));
+                assert!(!markdown.contains("HARD RULE"));
+            }
+        }
+        let instructions = boss_pr_review::render_revision_instructions(
+            &verdict.to_review_result(),
+            boss_pr_review::ReviewOrigin { pr_number: Some(1) },
+        );
+        assert!(!instructions.contains("Already guarded"));
+        assert!(!instructions.contains("Rejected leaf findings"));
+    }
+}
+
+#[test]
+fn clean_badges_without_rejections_have_no_findings_document() {
+    let history = ReviewBadgeHistory::builder()
+        .verdict_payload(
+            serde_json::json!({"batch_id": "batch", "verdict": {
+                "batch_id": "batch", "pr_url": "https://github.com/spinyfin/mono/pull/1",
+                "target_sha": "head", "phase": "pre_merge", "summary": "Review complete",
+                "revision_warranted": false, "findings": [], "contradictions": [], "rejected": []
+            }})
+            .to_string(),
+        )
+        .build();
+    for state in [
+        AI_REVIEW_STATE_REVIEWED_ALL_CLEAR,
+        AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING,
+    ] {
+        assert_eq!(findings_markdown(&history, state).unwrap(), None);
+    }
+}
+
+#[test]
 fn owner_keyed_family_matches_the_card_walk_for_resolved_owners() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -234,7 +309,7 @@ fn review_badge_self_link_is_decided_per_card() {
 }
 
 #[test]
-fn trimming_keeps_findings_text_only_for_the_findings_state() {
+fn trimming_keeps_findings_text_for_states_that_can_render_a_document() {
     let history = || {
         ReviewBadgeHistory::builder()
             .verdict_payload("{}")
@@ -246,10 +321,14 @@ fn trimming_keeps_findings_text_only_for_the_findings_state() {
     assert_eq!(kept.verdict_payload.as_deref(), Some("{}"));
     assert_eq!(kept.revision_description.as_deref(), Some("brief"));
     for state in [
-        Some(AI_REVIEW_STATE_NOT_REVIEWED),
         Some(AI_REVIEW_STATE_REVIEWED_ALL_CLEAR),
-        None,
+        Some(AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING),
     ] {
+        let trimmed = history().trimmed_for(state);
+        assert_eq!(trimmed.verdict_payload.as_deref(), Some("{}"));
+        assert_eq!(trimmed.revision_description.as_deref(), Some("brief"));
+    }
+    for state in [Some(AI_REVIEW_STATE_NOT_REVIEWED), None] {
         let trimmed = history().trimmed_for(state);
         assert!(trimmed.verdict_payload.is_none() && trimmed.revision_description.is_none());
         assert_eq!(trimmed.reviewed_sha.as_deref(), Some("abc"));
