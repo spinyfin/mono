@@ -20,7 +20,7 @@ async fn agy_refused_tools_reject_repeated_no_ops_and_file_bounded_audit_with_ov
             }))
             .unwrap();
     }
-    for turn in 0..2 {
+    for turn in 0..1 {
         submitted(
             call_with_peer(
                 &state,
@@ -48,11 +48,7 @@ async fn agy_refused_tools_reject_repeated_no_ops_and_file_bounded_audit_with_ov
             );
             crate::app::worker_events::dispatch_codex_unobserved_command_on_notification(&state, &incoming);
             if let Some(boundary) = incoming.turn_boundary() {
-                let expected = if turn == 0 {
-                    boss_engine_completion::StopOutcome::AwaitingInput
-                } else {
-                    boss_engine_completion::StopOutcome::NudgeDebounced
-                };
+                let expected = boss_engine_completion::StopOutcome::AwaitingInput;
                 assert_eq!(
                     state
                         .completion_handler
@@ -83,9 +79,42 @@ async fn agy_refused_tools_reject_repeated_no_ops_and_file_bounded_audit_with_ov
             items
                 .iter()
                 .filter(|item| item.kind == UNOBSERVED_COMMAND_ATTENTION_KIND)
-                .all(|item| item.body_markdown.contains("rest of this run"))
+                .all(|item| item.body_markdown.contains("declare again"))
         );
     }
+    // The gate is read-and-clear: with no new refused tool, the re-declared
+    // no-op is accepted rather than dead-ending behind a run-long latch.
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "no_changes_needed", "summary": "No changes, re-declared"}),
+            ),
+        )
+        .await,
+    );
+    let events = session
+        .normalize_progress_events(&json!({
+            "hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": true, "error": ""
+        }))
+        .unwrap();
+    assert!(matches!(events.as_slice(), [boss_protocol::WorkerEvent::Stop { .. }]));
+    let incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+        &driver,
+        events.into_iter().next().unwrap(),
+        Some(execution_id.clone()),
+        None,
+        None,
+    );
+    let boundary = incoming.turn_boundary().unwrap();
+    state
+        .completion_handler
+        .on_stop_with_turn_end(&execution_id, Some(boundary))
+        .await;
+    assert!(!state.work_db.get_execution(&execution_id).unwrap().status.is_live());
 }
 
 fn stage_agy_events(
@@ -112,7 +141,13 @@ fn assert_pending_without_latch(
     session: &dyn boss_engine_driver::ProgressSessionNormalizer,
 ) {
     let snapshot = session.resume_state().unwrap();
-    assert!(snapshot["pending_tools"]["calls"].get("call_1").is_some());
+    assert!(
+        snapshot["pending_tools"]["calls"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|key| key.ends_with("/call_1"))
+    );
     assert!(state.staged_unobserved_commands.list(execution_id).is_empty());
     assert!(!state.staged_unobserved_commands.consume_unresolved(execution_id));
 }
@@ -741,4 +776,87 @@ async fn hook_accept_overflow_is_counted_once_and_does_not_rearm_after_staging()
         state.metrics.counter_value("codex.unobserved_command_overflow"),
         Some(1)
     );
+}
+
+/// Drives a refused agy tool through the real wiring (`transcript_path_for_execution` →
+/// `driver_for_execution` → containment root → transcript context) and returns the
+/// filed attention body.
+async fn refused_tool_attention_body(transcript_in_process_home: bool) -> String {
+    use boss_engine_completion::codex_unobserved_command::UNOBSERVED_COMMAND_ATTENTION_KIND;
+    use boss_engine_driver::{AgentDriver, ProgressSessionConfig};
+    let (state, dir, execution_id, _) = live_chore_execution();
+    let product_id = match state
+        .work_db
+        .get_work_item(&state.work_db.get_execution(&execution_id).unwrap().work_item_id)
+        .unwrap()
+    {
+        boss_work_db::WorkItem::Task(task) | boss_work_db::WorkItem::Chore(task) => task.product_id,
+        other => panic!("expected chore: {other:?}"),
+    };
+    state
+        .work_db
+        .update_work_item(
+            &product_id,
+            boss_protocol::WorkItemPatch {
+                default_driver: Some("agy".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let driver = boss_engine_driver::agy::AgyDriver::default();
+    let dir_for_transcript = if transcript_in_process_home {
+        driver.transcript_containment_root(&execution_id).unwrap().unwrap()
+    } else {
+        dir.path().join("outside-process-home")
+    };
+    std::fs::create_dir_all(&dir_for_transcript).unwrap();
+    let transcript = dir_for_transcript.join("refused.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"status\":\"ERROR\",\"error\":\"blocked by deny rule: run_command\"}\n",
+    )
+    .unwrap();
+    state
+        .work_db
+        .set_run_transcript_path_if_unset(&execution_id, transcript.to_str().unwrap())
+        .unwrap();
+    let mut session = driver.progress_session(&ProgressSessionConfig::default()).unwrap();
+    session
+        .normalize_progress_events(&json!({"hookEventName": "SessionStart", "conversationId": "parent"}))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "hookEventName": "PreToolUse", "conversationId": "parent",
+            "toolCall": {"id": "call_1", "name": "run_command", "args": {}}
+        }))
+        .unwrap();
+    let events = session
+        .normalize_progress_events(&json!({
+            "hookEventName": "Stop", "conversationId": "parent", "terminationReason": "NO_TOOL_CALL", "fullyIdle": true
+        }))
+        .unwrap();
+    stage_agy_events(&state, &execution_id, events);
+    state.completion_handler.on_stop(&execution_id).await;
+    state
+        .work_db
+        .list_attention_items(&execution_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == UNOBSERVED_COMMAND_ATTENTION_KIND)
+        .expect("refused-tool attention item")
+        .body_markdown
+}
+
+#[tokio::test]
+async fn refused_tool_attention_carries_contained_transcript_error_reason() {
+    let body = refused_tool_attention_body(true).await;
+    assert!(body.contains("status: ERROR"), "{body}");
+    assert!(body.contains("blocked by deny rule: run_command"), "{body}");
+}
+
+#[tokio::test]
+async fn refused_tool_attention_reports_uncontained_transcript_as_unavailable() {
+    let body = refused_tool_attention_body(false).await;
+    assert!(body.contains("Transcript corroboration unavailable"), "{body}");
+    assert!(!body.contains("blocked by deny rule"), "{body}");
 }

@@ -2,7 +2,7 @@
 //! start record (`item.started` on the stdout dialect, a rollout
 //! `function_call`/`custom_tool_call`) was observed but no matching
 //! completion (`item.completed` / `function_call_output`) ever arrived
-//! before the turn boundary, or an Antigravity parent `PreToolUse` with no
+//! before the turn boundary, or an Antigravity `PreToolUse` with no
 //! matching `PostToolUse` at that conversation's idle `Stop`. Reproduced for
 //! Codex in probe 6 of the exit-code investigation: a shell command that
 //! outlives the model's chosen `yield_time_ms` with no further polling leaves
@@ -18,7 +18,7 @@
 //! [`crate::proposal_channel_error`]'s staging pattern); `on_stop_inner`
 //! consumes the staged state to file an attention item AND to refuse the
 //! worker's `no-changes-needed` ("validation passed, nothing to do") claim.
-//! Codex is read-and-clear; Antigravity latches for the rest of the run. An
+//! The gate is read-and-clear for every driver (Codex and Antigravity alike). An
 //! unobserved tool means Boss never actually confirmed that tool's outcome,
 //! so a downstream claim resting on it is unconfirmed, not verified.
 
@@ -91,7 +91,6 @@ struct ExecutionState {
     commands: Vec<String>,
     unresolved: bool,
     overflowed: bool,
-    refused_tool: bool,
 }
 
 /// In-memory `execution_id → unobserved tools` staging map. Populated by
@@ -100,8 +99,7 @@ struct ExecutionState {
 /// [`boss_engine_driver::codex::UNOBSERVED_COMMAND_MARKER`]; read by
 /// [`crate::WorkerCompletionHandler`]'s unobserved-tool pass
 /// (the permanent audit trail, via [`Self::list`]) and its `no-changes-needed`
-/// refusal gate (via [`Self::consume_unresolved`]: Codex is read-and-clear,
-/// Antigravity latches for the run).
+/// refusal gate (via [`Self::consume_unresolved`], read-and-clear).
 ///
 /// **Why this is two views, not [`crate::proposal_channel_error::ProposalChannelErrorTracker`]'s
 /// single accumulate-forever slot.** The Codex driver now runs a long-lived
@@ -159,7 +157,6 @@ impl UnobservedCommandTracker {
     pub fn record(&self, execution_id: &str, command: &str) -> RecordOutcome {
         let mut guard = self.inner.lock().expect("UnobservedCommandTracker mutex poisoned");
         let state = guard.entry(execution_id.to_owned()).or_default();
-        state.refused_tool |= command.starts_with(boss_engine_driver::agy::REFUSED_TOOL_PREFIX);
         if state.commands.iter().any(|existing| existing == command) {
             return RecordOutcome::Duplicate;
         }
@@ -201,11 +198,15 @@ impl UnobservedCommandTracker {
             .is_some_and(|state| state.overflowed)
     }
 
-    /// Antigravity refused tools latch refusal for the run. Codex retains its
-    /// read-and-clear recovery behavior; the shared bounded audit trail and
-    /// overflow signal are independent of both policies.
+    /// Read-and-clear for every driver, Antigravity included: Antigravity
+    /// panes are multi-turn sessions that emit an idle `Stop` on every turn,
+    /// and a Boss guard denial (a `PreToolUse` `deny` verdict) produces the
+    /// same refused-tool signal as any other refusal, so a run-long latch
+    /// would permanently disable `no-changes-needed` after one routine
+    /// denial. The permanent audit trail and attention items keep every
+    /// refusal visible regardless.
     ///
-    /// Read-and-clear for Codex: has an abandoned command been staged for
+    /// Has an abandoned command been staged for
     /// `execution_id` since the last call to this method (or since the
     /// execution's first staged command, if this is the first call)? This is
     /// the `no-changes-needed` refusal gate's signal — see the type-level
@@ -234,7 +235,7 @@ impl UnobservedCommandTracker {
     pub fn consume_unresolved(&self, execution_id: &str) -> bool {
         let mut guard = self.inner.lock().expect("UnobservedCommandTracker mutex poisoned");
         match guard.get_mut(execution_id) {
-            Some(state) => std::mem::take(&mut state.unresolved) || state.refused_tool,
+            Some(state) => std::mem::take(&mut state.unresolved),
             None => false,
         }
     }
@@ -268,13 +269,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refused_tools_latch_without_weakening_the_bounded_audit_or_other_runs() {
+    fn refused_tools_clear_on_read_without_weakening_the_bounded_audit_or_other_runs() {
         let tracker = UnobservedCommandTracker::new();
         for i in 0..MAX_COMMANDS_PER_EXECUTION {
             tracker.record("agy", &format!("{}{i}", boss_engine_driver::agy::REFUSED_TOOL_PREFIX));
         }
         assert!(tracker.consume_unresolved("agy"));
-        assert!(tracker.consume_unresolved("agy"));
+        assert!(!tracker.consume_unresolved("agy"));
         assert!(!tracker.consume_unresolved("other"));
         assert_eq!(tracker.record("agy", "overflow"), RecordOutcome::CapExceeded);
         assert_eq!(tracker.list("agy").len(), MAX_COMMANDS_PER_EXECUTION);
@@ -284,7 +285,7 @@ mod tests {
             tracker.record("agy", &format!("{}0", boss_engine_driver::agy::REFUSED_TOOL_PREFIX)),
             RecordOutcome::Duplicate
         );
-        assert!(tracker.consume_unresolved("agy"));
+        assert!(!tracker.consume_unresolved("agy"));
     }
 
     #[test]

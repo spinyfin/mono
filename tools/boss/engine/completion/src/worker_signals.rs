@@ -715,7 +715,7 @@ impl WorkerCompletionHandler {
                 (
                     "Antigravity left a tool unobserved",
                     format!(
-                        "Antigravity emitted PreToolUse without a matching PostToolUse at the claimed parent's idle Stop. The call may have been refused; a clean Stop does not prove it ran.\n\n{command}\n\nBoss refuses every no-changes-needed declaration for the rest of this run.\n\n{context}",
+                        "Antigravity emitted PreToolUse without a matching PostToolUse at the claimed parent's idle Stop (this includes calls made by native subagent conversations). The call may have been refused; a clean Stop does not prove it ran.\n\n{command}\n\nThe next no-changes-needed claim after this is refused: the declaration is discarded and the worker is asked to re-verify and declare again.\n\n{context}",
                         context = agy_context.as_deref().unwrap_or(""),
                     ),
                 )

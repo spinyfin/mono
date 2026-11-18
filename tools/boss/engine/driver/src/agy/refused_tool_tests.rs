@@ -16,7 +16,7 @@ fn pending_call_ids(session: &AgyProgressSession) -> Vec<String> {
                     .get("calls")?
                     .as_object()?
                     .keys()
-                    .cloned()
+                    .map(|key| key.rsplit('/').next().unwrap_or(key).to_owned())
                     .collect(),
             )
         })
@@ -109,10 +109,32 @@ fn rewritten_and_background_calls_match_by_id_even_when_the_command_fails() {
             .as_slice(),
         [WorkerEvent::Stop { .. }]
     ));
+}
+
+#[test]
+fn denied_child_call_is_flagged_and_child_post_cannot_clear_parent_call() {
+    let mut session = started();
+    session.normalize_progress_events(&session_start(CHILD)).unwrap();
     session
         .normalize_progress_events(&pre_tool_use(CHILD, "child denied"))
         .unwrap();
-    assert_eq!(session.normalize_progress_events(&stop(PARENT, true)).unwrap().len(), 1);
+    let events = session.normalize_progress_events(&stop(PARENT, true)).unwrap();
+    assert!(
+        matches!(events.as_slice(), [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+        if message.contains(&format!("conversation={CHILD}")))
+    );
+
+    let mut session = started();
+    session.normalize_progress_events(&session_start(CHILD)).unwrap();
+    session
+        .normalize_progress_events(&pre_tool_use(PARENT, "parent denied"))
+        .unwrap();
+    session.normalize_progress_events(&post_tool_use(CHILD)).unwrap();
+    let events = session.normalize_progress_events(&stop(PARENT, true)).unwrap();
+    assert!(
+        matches!(events.as_slice(), [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+        if message.contains(&format!("conversation={PARENT}")))
+    );
 }
 
 #[test]
