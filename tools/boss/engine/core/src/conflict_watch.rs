@@ -233,6 +233,32 @@ pub async fn on_conflict_detected_with(
     {
         return recorded;
     }
+    // A failed or abandoned latest attempt with no live fix vehicle must be
+    // explained on the card and in an attention item. This also repairs
+    // terminal rows written before the explanation was recorded.
+    if let Ok(Some(latest)) = work_db.latest_actionable_conflict_resolution(&candidate.work_item_id)
+        && latest.pr_url == candidate.pr_url
+        && matches!(latest.status.as_str(), "failed" | "abandoned")
+        && !work_db
+            .has_live_conflict_revision_for_pr(&candidate.pr_url)
+            .unwrap_or(true)
+    {
+        match work_db.ensure_conflict_stop_visible(&latest.id) {
+            Ok(true) => {
+                publisher
+                    .publish_work_item_changed(
+                        &candidate.product_id,
+                        &candidate.work_item_id,
+                        "conflict_remediation_stopped",
+                    )
+                    .await
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(attempt_id = %latest.id, ?err, "conflict_watch: failed to surface stopped remediation")
+            }
+        }
+    }
     // Pre-flight: when an active revision fix vehicle already exists for this
     // work item, the detection flow is essentially a no-op for an `in_review`
     // parent (signal already armed, revision already in Doing). Skip the
@@ -534,7 +560,7 @@ pub async fn on_conflict_detected_with(
                     Ok(None) => {
                         // No active crz. Check the most recent crz to decide
                         // whether to re-arm.
-                        let latest = match work_db.latest_conflict_attempt_for_work_item(&candidate.work_item_id) {
+                        let latest = match work_db.latest_actionable_conflict_resolution(&candidate.work_item_id) {
                             Ok(latest) => latest,
                             Err(err) => {
                                 tracing::warn!(
@@ -816,7 +842,7 @@ pub async fn on_conflict_detected_with(
             // then fall back to a lookup so the started-event still fires
             // if that row happens to be active.
             let colliding = work_db
-                .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
+                .latest_actionable_conflict_resolution(&candidate.work_item_id)
                 .ok()
                 .flatten();
             // Only the live attempt that actually holds this probe's
@@ -1657,7 +1683,8 @@ async fn maybe_spawn_conflict_revision(
                 "spawn_failed",
                 &format!("create revision: {err:#}"),
             );
-            if let Err(abandon_err) = work_db.mark_conflict_resolution_abandoned(&attempt.id, "revision_create_failed")
+            if let Err(abandon_err) =
+                work_db.mark_conflict_resolution_abandoned(&attempt.id, &format!("revision_create_failed: {err:#}"))
             {
                 tracing::warn!(
                     attempt_id = %attempt.id,
@@ -1767,6 +1794,15 @@ pub async fn on_resolved(
         return false;
     }
     crate::conflict_ladder::clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
+    if let Err(err) = work_db.resolve_external_tracker_attention(
+        &candidate.work_item_id,
+        crate::work::CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
+    ) {
+        tracing::warn!(
+            ?err,
+            "conflict_watch: could not clear stopped-remediation attention for clean PR"
+        );
+    }
     let result = match work_db.clear_resolved_pr_signal(&candidate.work_item_id, &candidate.pr_url, false) {
         Ok(ClearResolvedSignal::Applied(result)) => *result,
         Ok(ClearResolvedSignal::QueueSideUnresolved { .. } | ClearResolvedSignal::Nothing) => return false,

@@ -180,7 +180,16 @@ async fn create_revision_failure_abandons_attempt() {
     let attempts = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].status, "abandoned");
-    assert_eq!(attempts[0].failure_reason.as_deref(), Some("revision_create_failed"),);
+    let expected_reason = format!(
+        "revision_create_failed: {}",
+        crate::work::RevisionGateError::closed(&task(&db, &chore), pr)
+    );
+    assert_eq!(attempts[0].failure_reason.as_deref(), Some(expected_reason.as_str()));
+    let parent = task(&db, &chore);
+    assert!(parent.blocked_detail.as_deref().unwrap().contains(&expected_reason));
+    let attention = db.list_attention_items_for_work_item(&chore).unwrap();
+    assert_eq!(attention.len(), 1);
+    assert!(attention[0].body_markdown.contains(&expected_reason));
     assert!(attempts[0].revision_task_id.is_none());
 }
 

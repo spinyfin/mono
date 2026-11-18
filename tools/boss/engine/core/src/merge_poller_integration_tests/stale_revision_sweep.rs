@@ -50,6 +50,17 @@ async fn moot_events(publisher: &RecordingPublisher) -> usize {
         .count()
 }
 
+/// Notifications telling the board the stale revision's block ended: either
+/// the moot-revision sweep's or the conflict retire path's, whichever ran.
+async fn closure_events(publisher: &RecordingPublisher) -> usize {
+    publisher
+        .lifecycle_reasons()
+        .await
+        .iter()
+        .filter(|r| *r == REASON || *r == "merge_conflict_resolved")
+        .count()
+}
+
 /// Flag a CI failure, then end the attempt and park its revision `blocked`.
 async fn stale_ci_fix(
     db: &WorkDb,
@@ -117,10 +128,13 @@ async fn clean_pr_closes_stale_conflict_revision_and_publishes_once() {
     put(&probe, pr, OpenPrStatus::clean(), "head-1", &[]);
     run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, Some(&core_host())).await;
     assert_eq!(status(&db, &revision), TaskStatus::Archived);
-    assert_eq!(moot_events(&publisher).await, 1);
+    // The failed attempt now blocks the parent, so the clean probe retires
+    // the block and the stale revision in one transaction and the board
+    // hears `merge_conflict_resolved` once.
+    assert_eq!(closure_events(&publisher).await, 1);
 
     run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, Some(&core_host())).await;
-    assert_eq!(moot_events(&publisher).await, 1, "a repeat sweep must not re-emit");
+    assert_eq!(closure_events(&publisher).await, 1, "a repeat sweep must not re-emit");
 }
 
 #[tokio::test]
